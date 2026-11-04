@@ -56,8 +56,9 @@ import kotlin.math.abs
  * (a phone held upright) it shows the number of tabs and the current tab's title, and tapping them
  * opens the list of tabs.
  *
- * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark);
- * the activity itself stays a framework one, and so do the views it builds.
+ * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark),
+ * and the tab bar and the extra keys take the theme's colours; the activity itself stays a
+ * framework one, and so do the views it builds.
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
@@ -81,6 +82,21 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
     private var shortcutKey = 0
+
+    // The theme's colours, from the wallpaper on Android 12 and later, so read after onCreate has
+    // applied them
+
+    /** The tab bar, the extra keys and what lies under the system bars. */
+    private val barColor by lazy { themeColor(com.google.android.material.R.attr.colorSurfaceContainer) }
+
+    /** The bar's buttons and other tabs, and an ended tab's title. */
+    private val mutedColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant) }
+
+    /** The title of the tab shown (not "titleColor", which Activity already has). */
+    private val textColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurface) }
+
+    /** The current tab in the row of tabs. */
+    private val currentTabColor by lazy { themeColor(androidx.appcompat.R.attr.colorPrimary) }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -108,7 +124,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             setBackgroundColor(Color.BLACK)
         }
         status = TextView(this).apply {
-            setTextColor(Color.LTGRAY)
+            setTextColor(mutedColor)
             gravity = Gravity.CENTER
             setText(R.string.starting)
         }
@@ -119,7 +135,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         // The number of tabs in a box, like a browser's tab switcher
         tabCount = TextView(this).apply {
-            setTextColor(Color.LTGRAY)
+            setTextColor(mutedColor)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
@@ -127,7 +143,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             minHeight = dp(20)
             setPadding(dp(4), 0, dp(4), 0)
             background = GradientDrawable().apply {
-                setStroke(dp(2), Color.LTGRAY)
+                setStroke(dp(2), mutedColor)
                 cornerRadius = dp(4).toFloat()
             }
         }
@@ -158,7 +174,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(BAR_COLOR)
+            setBackgroundColor(barColor)
             addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(switcher, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) })
@@ -172,7 +188,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(BAR_COLOR)
+            setBackgroundColor(barColor)
             addView(bar)
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
@@ -417,7 +433,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             tabCount.text = "%d".format(sessions.size)
             tabCount.contentDescription = resources.getQuantityString(R.plurals.tabs, sessions.size, sessions.size)
             tabTitle.text = if (i < 0) "" else label(i, sessions[i])
-            tabTitle.setTextColor(if (current?.isRunning == false) Color.GRAY else Color.WHITE)
+            tabTitle.setTextColor(if (current?.isRunning == false) mutedColor else textColor)
             return
         }
         sessions.forEachIndexed { i, session ->
@@ -425,7 +441,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                 maxWidth = dp(TAB_MAX_DP)
                 isSingleLine = true
                 ellipsize = TextUtils.TruncateAt.END
-                setTextColor(if (session == current) Color.WHITE else Color.GRAY)
+                setTextColor(if (session == current) currentTabColor else mutedColor)
                 setOnLongClickListener { v ->
                     showTabMenu(v, session)
                     true
@@ -528,7 +544,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
         text = label
-        setTextColor(Color.LTGRAY)
+        setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         setPadding(dp(12), dp(10), dp(12), dp(10))
         background = touchFeedback()
@@ -542,6 +558,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun themeColor(attr: Int) = MaterialColors.getColor(this, attr, Color.WHITE)
 
     /**
      * A horizontal swipe over the switcher shows the next tab (to the left) or the previous one (to
@@ -616,10 +634,8 @@ class MainActivity : Activity(), TerminalService.Listener {
                 notifyDataSetChanged()
             }
 
-        private val currentBackground by lazy { color(com.google.android.material.R.attr.colorSecondaryContainer) }
-        private val currentText by lazy { color(com.google.android.material.R.attr.colorOnSecondaryContainer) }
-        private val runningText by lazy { color(com.google.android.material.R.attr.colorOnSurface) }
-        private val endedText by lazy { color(com.google.android.material.R.attr.colorOnSurfaceVariant) }
+        private val currentBackground by lazy { themeColor(com.google.android.material.R.attr.colorSecondaryContainer) }
+        private val currentText by lazy { themeColor(com.google.android.material.R.attr.colorOnSecondaryContainer) }
 
         override fun getCount() = items.size
 
@@ -635,8 +651,8 @@ class MainActivity : Activity(), TerminalService.Listener {
                 setTextColor(
                     when {
                         session == current -> currentText
-                        session.isRunning -> runningText
-                        else -> endedText
+                        session.isRunning -> textColor
+                        else -> mutedColor
                     }
                 )
             }
@@ -644,8 +660,6 @@ class MainActivity : Activity(), TerminalService.Listener {
             row.findViewById<View>(R.id.close).setOnClickListener { close(session) }
             return row
         }
-
-        private fun color(attr: Int) = MaterialColors.getColor(this@MainActivity, attr, Color.WHITE)
     }
 
     /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
@@ -683,7 +697,6 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     companion object {
-        val BAR_COLOR = Color.rgb(0x20, 0x20, 0x20)
         private const val PREF_FONT_SIZE = "font_size"
 
         /** From this window width (dp, the usual tablet breakpoint) the bar lists every tab in a row. */

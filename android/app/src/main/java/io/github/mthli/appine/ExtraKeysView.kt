@@ -14,6 +14,7 @@ import android.view.ViewConfiguration
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
+import com.google.android.material.color.MaterialColors
 import kotlin.math.roundToInt
 
 /**
@@ -70,9 +71,16 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
+    // The theme's colours, as the tab bar's: the bar, the labels, a modifier that is on, a key
+    // while pressed and the popup above one
+    private val barColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainer)
+    private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
+    private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
+
     init {
         orientation = VERTICAL
-        setBackgroundColor(MainActivity.BAR_COLOR)
+        setBackgroundColor(barColor)
         row(
             special("ESC", KeyEvent.KEYCODE_ESCAPE),
             char("/"),
@@ -106,6 +114,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         if (changed) post { refresh() }
     }
 
+    private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
+
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }
 
@@ -127,7 +137,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private fun label(text: String) = TextView(context).apply {
         this.text = text
         gravity = Gravity.CENTER
-        setTextColor(Color.LTGRAY)
+        setTextColor(labelColor)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
         isSingleLine = true
     }
@@ -150,7 +160,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     private fun refresh() {
         for (m in arrayOf(ctrlKey, altKey)) {
-            m.view.setTextColor(if (m.on) Color.CYAN else Color.LTGRAY)
+            m.view.setTextColor(if (m.on) onColor else labelColor)
             m.view.paintFlags = if (m.locked) {
                 m.view.paintFlags or Paint.UNDERLINE_TEXT_FLAG
             } else {
@@ -174,7 +184,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
                 MotionEvent.ACTION_DOWN -> {
                     held = 0
                     cancelled = false
-                    v.setBackgroundColor(PRESSED_COLOR)
+                    v.setBackgroundColor(pressedColor)
                     if (key.repeats || key.modifier != null) {
                         v.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
                     }
@@ -235,7 +245,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         /** The popup key, as large as this one, right above it. */
         private fun showPopup(popupKey: Key) {
             view.removeCallbacks(this)
-            val label = label(popupKey.label).apply { setBackgroundColor(PRESSED_COLOR) }
+            val label = label(popupKey.label).apply { setBackgroundColor(pressedColor) }
             window = PopupWindow(label, view.width, view.height).apply {
                 isTouchable = false
                 animationStyle = 0
@@ -250,7 +260,5 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L
-
-        private val PRESSED_COLOR = Color.rgb(0x50, 0x50, 0x50)
     }
 }
