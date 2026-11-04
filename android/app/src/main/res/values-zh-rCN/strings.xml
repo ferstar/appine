@@ -77,6 +77,9 @@
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
     <string name="settings_system_documents">在"文件"App 里显示整个系统</string>
     <string name="system_documents_summary">除了家目录，"文件"App 里还列出从 / 开始的所有文件，只读。</string>
+    <string name="settings_fill_wide">中日韩文字占满两格</string>
+    <string name="fill_wide_on">汉字、假名、谚文等比放大到正好占满两格，字之间不再空得很宽。</string>
+    <string name="fill_wide_off">汉字、假名、谚文保持系统字体的大小，居中放在两格里，字距较宽。</string>
     <string name="documents_system">整个系统（只读）· %1$s</string>
     <plurals name="sessions_running">
         <item quantity="other">%d 个会话运行中</item>

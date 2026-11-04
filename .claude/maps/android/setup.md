@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1)
+> Maintained: 2026-11-04 (targeted verification: the execution-tier row only in debug builds; release builds always run Tier 1; a switch for CJK characters filling two cells)
 
 ## Responsibilities
 
@@ -33,9 +33,10 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe), `Download`
   (urls, sha256, size), `Cancelled`, `Account`, `access` (a `ReentrantReadWriteLock`).
 - Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`, read
-  by debug builds only; `login`, `keep_awake`, `system_documents`).
+  by debug builds only; `login`, `keep_awake`, `system_documents`, `fill_wide`).
 - `SettingsActivity` — rows for distro, mirror, reset, login account, keep-awake, system
-  documents, tier (debug builds only) and licenses.
+  documents, CJK characters filling two cells (`android/terminal`), tier (debug builds only) and
+  licenses.
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 
 ## Public entry points

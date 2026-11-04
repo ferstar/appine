@@ -345,6 +345,17 @@ class TerminalService : Service() {
     }
 
     /**
+     * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
+     * on by default, the android/terminal map); [MainActivity] reads it whenever it starts.
+     */
+    val fillWide: Boolean get() = fillWide(this)
+
+    fun setFillWide(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FILL_WIDE, on).apply()
+        settingsChanged()
+    }
+
+    /**
      * Starts the kernel; when [distro] is non-null, prepares its rootfs first (the store must
      * already be deleted).
      */
@@ -1083,6 +1094,7 @@ class TerminalService : Service() {
         private const val KEY_TIER = "tier"
         private const val KEY_LOGIN = "login"
         private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
+        private const val KEY_FILL_WIDE = "fill_wide"
 
         /**
          * The login account in Settings (see the instance's [login]); the DocumentsProvider needs
@@ -1094,6 +1106,10 @@ class TerminalService : Service() {
         /** See the instance's [systemDocuments]. */
         fun showSystemDocuments(context: Context): Boolean =
             context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
+
+        /** See the instance's [fillWide]; the activity reads it before the service is bound. */
+        fun fillWide(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_FILL_WIDE, true)
         private const val TRIM_DELAY_MS = 60_000L
         private const val SAVE_MS = 60_000L
         private const val SAVE_SOON_MS = 2_000L

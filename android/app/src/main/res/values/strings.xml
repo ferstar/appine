@@ -79,6 +79,9 @@
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
     <string name="settings_system_documents">Show the whole system in Files</string>
     <string name="system_documents_summary">Besides your home directory, the Files app also lists everything from /, read-only.</string>
+    <string name="settings_fill_wide">CJK characters fill two cells</string>
+    <string name="fill_wide_on">Chinese, Japanese and Korean characters are enlarged to fill their two cells, without wide gaps between them.</string>
+    <string name="fill_wide_off">Chinese, Japanese and Korean characters keep the system font\'s size, centred in their two cells, with wide gaps between them.</string>
     <string name="documents_home" translatable="false">%1$s · %2$s</string>
     <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">

@@ -53,8 +53,9 @@ import kotlin.math.roundToInt
  * them into a bitmap the size of the grid; the cursor and the input method's composing text are
  * drawn over it. Glyphs are placed cell by cell: runs of ASCII share one draw call (the font size
  * is chosen so their advance is exactly one cell), every other glyph is centred in its one or two
- * cells, or shrunk evenly when it is wider, never stretched. Box drawing, block elements and the
- * Powerline triangles are drawn as shapes ([VtGlyphs]).
+ * cells, enlarged evenly to fill two cells when it is wide (the setting, for CJK fallback glyphs
+ * narrower than two cells) or shrunk evenly when it is wider, never stretched. Box drawing, block
+ * elements and the Powerline triangles are drawn as shapes ([VtGlyphs]).
  *
  * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
  * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
@@ -142,6 +143,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var strikeY = 0
     private var dotted = DashPathEffect(floatArrayOf(1f, 1f), 0f)
     private var dashed = DashPathEffect(floatArrayOf(3f, 2f), 0f)
+
+    /** Whether glyphs in wide cells are enlarged to fill them ([setFillWide]). */
+    private var fillWide = true
+
+    /**
+     * How much glyphs in wide cells are enlarged: so that an ideograph's advance fills two cells
+     * when [fillWide], else 1. The system's CJK fallback draws ideographs one em wide, short of two
+     * cells of JetBrains Mono (1.2 em), which leaves wide gaps between them; measured, so a font
+     * with its own ideographs two cells wide gets 1.
+     */
+    private var wideScale = 1f
 
     /** Advances of single codepoints, per paint (index << 32 | codepoint). */
     private val widths = HashMap<Long, Float>()
@@ -287,6 +299,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         dotted = DashPathEffect(floatArrayOf(light.toFloat(), light.toFloat()), 0f)
         dashed = DashPathEffect(floatArrayOf(light * 3f, light * 2f), 0f)
         stroke.strokeWidth = light.toFloat()
+        val ideograph = paints[0].measureText("水")
+        wideScale = if (fillWide && ideograph > 0f) max(1f, 2 * cellWidth / ideograph) else 1f
         widths.clear()
     }
 
@@ -325,6 +339,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         fontPx = size
         measureCells()
         regrid()
+    }
+
+    /** Enlarges glyphs in wide cells to fill them, or draws them at their size (the setting). */
+    fun setFillWide(on: Boolean) {
+        if (on == fillWide) return
+        fillWide = on
+        measureCells()
+        full = true
+        invalidate()
     }
 
     private fun zoom(step: Int) {
@@ -560,7 +583,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         c.restore()
     }
 
-    /** One cell's glyph, centred in its [span] cells, or shrunk evenly to fit them. */
+    /**
+     * One cell's glyph, centred in its [span] cells: a wide one enlarged by [wideScale], and any
+     * shrunk evenly to fit them.
+     */
     private fun drawGlyph(c: Canvas, i: Int, x: Int, span: Int, top: Int, color: Int, paint: Paint) {
         val code = cp[i]
         val cluster = clusters[i]
@@ -579,13 +605,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             widths.getOrPut(key) { paint.measureText(text) }
         }
         paint.color = color
-        if (advance <= w + 0.5f) {
-            c.drawText(text, left + (w - advance) / 2, (top + baseline).toFloat(), paint)
+        var s = if (span == 2) wideScale else 1f
+        if (advance * s > w + 0.5f) s = w / advance
+        val l = left + (w - advance * s) / 2
+        if (s == 1f) {
+            c.drawText(text, l, (top + baseline).toFloat(), paint)
         } else {
-            val s = w / advance
             c.save()
-            c.scale(s, s, left.toFloat(), top + cellHeight / 2f)
-            c.drawText(text, left.toFloat(), (top + baseline).toFloat(), paint)
+            c.scale(s, s, l, top + cellHeight / 2f)
+            c.drawText(text, l, (top + baseline).toFloat(), paint)
             c.restore()
         }
     }

@@ -24,10 +24,11 @@ import kotlin.concurrent.thread
 /**
  * Settings: distro, package mirror, reset rootfs, execution tier (debug builds only; the
  * android/setup map), login account (likewise), keep running with the screen off (the
- * android/service map), open source licenses (design doc §13.4). All the state is in
- * [TerminalService]; this only displays and forwards it, and while the kernel is not running
- * (starting, replacing the store) everything can be viewed but not changed. When replacing the
- * store or a restart begins, it goes back to the terminal, which shows the progress.
+ * android/service map), CJK characters filling two cells (the android/terminal map), open source
+ * licenses (design doc §13.4). All the state is in [TerminalService]; this only displays and
+ * forwards it, and while the kernel is not running (starting, replacing the store) everything can
+ * be viewed but not changed. When replacing the store or a restart begins, it goes back to the
+ * terminal, which shows the progress.
  */
 class SettingsActivity : Activity(), TerminalService.Listener {
 
@@ -47,6 +48,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
     private var tier: Row? = null
     private lateinit var keepAwake: Row
     private lateinit var systemDocuments: Row
+    private lateinit var fillWide: Row
     private lateinit var licenses: Row
 
     private val connection = object : ServiceConnection {
@@ -122,6 +124,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         systemDocuments = Row(R.string.settings_system_documents, toggle = true) {
             service?.let { it.setSystemDocuments(!it.systemDocuments) }
         }
+        fillWide = Row(R.string.settings_fill_wide, toggle = true) { service?.let { it.setFillWide(!it.fillWide) } }
         // AGPL sections 0 and 5's "Appropriate Legal Notices": copyright, no warranty, the license,
         // and where to read the full text
         licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
@@ -146,7 +149,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         }
         val list = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            for (row in listOfNotNull(distro, mirror, reset, account, keepAwake, systemDocuments, tier, licenses)) {
+            for (row in listOfNotNull(distro, mirror, reset, account, keepAwake, systemDocuments, fillWide, tier, licenses)) {
                 addView(row.view)
             }
         }
@@ -245,6 +248,7 @@ class SettingsActivity : Activity(), TerminalService.Listener {
         // lock is held accordingly once it is up
         keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
         systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
+        fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
     }
 
     // ---- Actions ----

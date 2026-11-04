@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1; ended tabs no longer marked ✕; tab names: `renameSession`, saved and restored with the tabs)
+> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1; ended tabs no longer marked ✕; tab names: `renameSession`, saved and restored with the tabs; the wide-cell setting for the terminal)
 
 ## Responsibilities
 
@@ -20,7 +20,8 @@ outlives an Activity:
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories) and turns them into tab messages, notifications and lifecycle actions;
 - the settings state that the activities only display and forward (tier in debug builds,
-  keep-awake, login account, system documents, distro switch, mirror).
+  keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
+  mirror).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Tabs.kt`.
 
@@ -52,8 +53,9 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`,
   `renameSession`, `exitAll`,
   `setTier` (ignored in a release build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
-  `setMirror`/`autoMirror`, `setLogin`, `setSystemDocuments`, `takeNotice`.
-- Static settings read by `Documents`: `login()`, `showSystemDocuments()`.
+  `setMirror`/`autoMirror`, `setLogin`, `setSystemDocuments`, `setFillWide`, `takeNotice`.
+- Static settings read without the service: `login()` and `showSystemDocuments()` by `Documents`,
+  `fillWide()` by `MainActivity` (whenever it starts).
 
 ## Data flow / lifecycle
 
@@ -142,7 +144,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 ### Inbound
 
 - `MainActivity`, `SettingsActivity` (binder and listeners), notification `PendingIntent`s,
-  `ConnectivityManager`, system trim callbacks, `Documents` (static settings).
+  `ConnectivityManager`, system trim callbacks, `Documents` and `MainActivity` (static settings).
 
 ### Outbound
 

@@ -189,6 +189,8 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onStart() {
         super.onStart()
+        // Settings may have changed it while this activity was stopped
+        screen.setFillWide(TerminalService.fillWide(this))
         val intent = Intent(this, TerminalService::class.java)
         startForegroundService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
@@ -286,6 +288,11 @@ class MainActivity : Activity(), TerminalService.Listener {
             // Tabs restored after a kill: show the one that was being viewed
             show(current?.takeIf { it in s.sessions } ?: s.focus?.takeIf { it in s.sessions } ?: s.sessions.last())
         }
+    }
+
+    /** Settings changed while this activity is visible too (split screen). */
+    override fun onSettingsChanged() {
+        screen.setFillWide(TerminalService.fillWide(this))
     }
 
     override fun onProgress(text: String) {

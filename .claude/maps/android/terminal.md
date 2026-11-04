@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings)
 
 ## Responsibilities
 
@@ -66,7 +66,7 @@ libghostty-vt with Zig (`android/native`).
 
 - Launcher activity `MainActivity` (`singleTask`, `adjustResize`, handles most configuration
   changes itself); listener callbacks `onMachineReady`, `onProgress`, `onSessionsChanged`,
-  `onExitAll`, `onRestarting`, `onNotice`.
+  `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`.
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`,
   `paste`, `mouse`, `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`,
@@ -111,6 +111,9 @@ libghostty-vt with Zig (`android/native`).
 ### Input and display
 
 - The font size (pixels) is kept in the activity's preferences.
+- Whether glyphs in wide cells fill them is a setting kept by the service
+  (`TerminalService.fillWide`, on by default, switched in Settings); the activity applies it to
+  the view in `onStart` and `onSettingsChanged`, and a change repaints the whole screen.
 - Extra keys: a key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed. Held past the long-press
   timeout, the arrows, PGUP and PGDN repeat every 80 ms (no act on release then); swiping up from
@@ -156,23 +159,26 @@ libghostty-vt with Zig (`android/native`).
   (all rows when the view asks for a full frame) in the format documented in `vt.c`; the direct
   `ByteBuffer` is valid until the next `frame`.
 - A hold (mode 2026) captures the screen when it begins and is ended by force after 1 s.
-- The view asks for a full frame after a regrid, a new bitmap, new default colours, attaching
-  another tab or the attached tab's shell starting; a frame captured at an old size is dropped and
-  a full one requested. Attaching also resizes the tab's terminal and console to the view's grid
-  when it differs.
+- The view asks for a full frame after a regrid, a new bitmap, new default colours, a change of
+  the wide-cell setting, attaching another tab or the attached tab's shell starting; a frame
+  captured at an old size is dropped and a full one requested. Attaching also resizes the tab's
+  terminal and console to the view's grid when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
   focus events 1004, a selection exists) and the selection's first and last cells in the
   viewport; each row carries its selected columns.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
-  centred; the light line width is the font's underline thickness.
+  centred; the light line width is the font's underline thickness. The wide scale is two cells over
+  the advance of "水" (the system's CJK fallback, one em, so 1.2 with JetBrains Mono; a font's own
+  ideograph when it has one), at least 1, or 1 with the setting off.
 - Each dirty row is repainted into the bitmap under a clip: default background, runs of other
   backgrounds, the selection's translucent highlight, then text. Plain ASCII runs of one paint,
   colour and decoration go out in one draw call; other glyphs are centred in their one or two
-  cells, or shrunk evenly when wider (never stretched); `VtGlyphs` characters are shapes; four
-  paints (regular/bold × upright/italic) from the variable font with ligatures off. Underlines
-  (single, double, curly, dotted, dashed), strikethrough and overline are drawn; inverse, faint and
-  invisible apply; blink is ignored.
+  cells, a wide cell's glyph enlarged evenly by the wide scale about the cell's vertical middle,
+  and any glyph still wider than its cells shrunk evenly to fit (never stretched); `VtGlyphs`
+  characters are shapes; four paints (regular/bold × upright/italic) from the variable font with
+  ligatures off. Underlines (single, double, curly, dotted, dashed), strikethrough and overline are
+  drawn; inverse, faint and invisible apply; blink is ignored.
 - The cursor (bar, block with the glyph redrawn in the background colour, underline, hollow; hollow
   when unfocused), the IME's composing text (shifted left at the right edge) and the theme's text
   selection handles are drawn over the bitmap each draw.
@@ -245,7 +251,8 @@ libghostty-vt with Zig (`android/native`).
   encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
   (`android/native`); `Machine::read_console`, `write_console` and `resize_console` called from
   `vt.rs` directly; the system clipboard; JetBrains Mono 2.304 (variable, upright and italic) in
-  the assets.
+  the assets, and the system's fallback fonts for everything else (CJK from Noto Sans CJK on AOSP
+  images); the wide-cell setting `TerminalService.fillWide`.
 
 ## Invariants and gotchas
 
