@@ -6,6 +6,8 @@
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
 > Maintained: 2026-11-04 (targeted verification: IPv6-only binds get their own host port, so IPv4 and IPv6 can bind one port side by side; the dual-stack bug narrowed to the remaining address cases)
+>
+> Maintained: 2026-11-05 (targeted verification: `DELTABLE` with family 0 or without a name and handle flushes tables, so `nft flush ruleset` works; removed the bug)
 
 ## Responsibilities
 
@@ -175,9 +177,11 @@ structure (`kernel/procfs`); host sockets (`hal`).
   expressions; position, append, replace — a replaced rule gets a new handle), sets and elements
   (key length 1..64, `%d` names, anonymous sets dropped when unused; `EBUSY` while referenced).
   Stateful objects and flowtables `EOPNOTSUPP`; `DESTROY*` maps to delete ignoring `ENOENT`.
-  Family 0 is rejected (`EAFNOSUPPORT`) and `DELTABLE` needs a name or handle, so the
-  ruleset-wide flush Linux performs for those requests does not exist; `DELTABLE` ignores
-  `NLM_F_NONREC`; verdict-map references are not counted as chain uses.
+  `DELTABLE`/`DESTROYTABLE` with family 0 or without a name and handle flush instead (Linux's
+  `nft_flush`, what `nft flush ruleset` sends): every table of the family, of all families for 0,
+  only those with the name when one is given; matching nothing succeeds. Other requests with
+  family 0 are `EAFNOSUPPORT`. `DELTABLE` ignores `NLM_F_NONREC`; verdict-map references are not
+  counted as chain uses.
 - Validation: expression names must be known (39); jump targets must exist and not be base chains;
   loops `EMLINK`; set references rewritten to names. Arguments are not validated.
 - Queries outside batches: `GETGEN`, dumps of tables, chains, rules (filters by table and chain),
@@ -269,9 +273,6 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Confirmed bugs / technical debt
 
-- **Flushing the whole ruleset fails:** requests with family 0, and `DELTABLE` without a name or
-  handle, are rejected (`EAFNOSUPPORT`/`EINVAL`) where Linux flushes everything; `nft flush
-  ruleset`, the first line of most `nftables.conf` files, is expected to fail (no test covers it).
 - **`limit` and `quota` ignore "over":** the expressions always match, so `limit rate over N drop`
   and `quota over N drop` (and meters) drop every packet, while `limit rate N accept` accepts
   everything; the xt `limit`, `hashlimit` and `recent` matches never match (ufw's `limit` rules
@@ -319,7 +320,6 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## To verify
 
-- That `nft flush ruleset` sends a family-0 `DELTABLE` (libnftables behaviour) and so fails here.
 - Linux 6.1's results for `NLM_F_NONREC` on `DELTABLE` and generation bumps for no-op batches (taken
   from knowledge, not a source checkout).
 - How docker (with and without docker-proxy) and podman listeners interact with the dual-stack

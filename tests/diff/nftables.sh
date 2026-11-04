@@ -8,7 +8,8 @@
 #   dnat, redirect), and look at the listing with handles, port forwarding, and the state after
 #   deleting rules;
 # - error cases: jumping to a missing chain, loops, deleting a referenced chain, an already
-#   existing chain, no privilege.
+#   existing chain, no privilege;
+# - flush ruleset, of one family and of all, also as the first line of a file loaded with nft -f.
 # The native side is a privileged container, where the rules really run in the kernel. Counters
 # (always 0 in appine) are all removed.
 exec 2>&1
@@ -192,6 +193,18 @@ nft delete table inet nv; echo "[$?] delete table"
 nft list ruleset; echo "[$?] empty"
 nft -f /tmp/nv.nft; echo "reload: $?"
 nft -a list chain inet nv OUTPUT | nocount
+echo "== flush ruleset"
+nft add table ip t4; nft add chain ip t4 c; nft add table ip6 t6; nft add table ip t4b
+nft flush ruleset ip; echo "[$?] flush ruleset ip"
+nft list tables
+nft flush ruleset; echo "[$?] flush ruleset"
+nft list ruleset; echo "[$?] empty"
+nft flush ruleset; echo "[$?] flush an empty ruleset"
+printf "flush ruleset\ntable ip conf {\n  chain c {\n    type filter hook output priority 0; policy accept;\n  }\n}\n" > /tmp/conf.nft
+nft -f /tmp/conf.nft; echo "[$?] load a file starting with flush ruleset"
+nft -f /tmp/conf.nft; echo "[$?] load it again"
+nft list tables
+nft flush ruleset
 echo "== without CAP_NET_ADMIN"
 python3 -c "import os; os.setgid(65534); os.setuid(65534); os.execvp(\"nft\", [\"nft\", \"list\", \"ruleset\"])"; echo "[$?]"
 python3 -c "import os; os.setgid(65534); os.setuid(65534); os.execvp(\"iptables\", [\"iptables\", \"-t\", \"nat\", \"-S\"])"; echo "[$?]"

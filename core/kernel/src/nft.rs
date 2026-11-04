@@ -702,6 +702,15 @@ impl Nft {
 
     /// One change in a batch (`nf_tables_newtable` and so on).
     fn apply(&mut self, r: &Req<'_>) -> Result<(), Fail> {
+        // nf_tables_deltable: family NFPROTO_UNSPEC, or neither a name nor a handle, flushes
+        // instead (`nft flush ruleset`, the first line of most nftables.conf files), for any family
+        if matches!(r.msg, DELTABLE | DESTROYTABLE)
+            && (r.family == 0
+                || get(&r.attrs, TABLE_NAME).is_none() && get(&r.attrs, TABLE_HANDLE).is_none())
+        {
+            self.flush(r);
+            return Ok(());
+        }
         if !valid_family(r.family) {
             return Err(fail(Errno::EAFNOSUPPORT));
         }
@@ -736,6 +745,16 @@ impl Nft {
             // NFNL_CB_BATCH)
             _ => Err(fail(Errno::EINVAL)),
         }
+    }
+
+    /// `nft_flush`: deletes every table of the request's family (of all families for
+    /// NFPROTO_UNSPEC), only those with its name when it has one; a handle is ignored. Matching
+    /// nothing is not an error.
+    fn flush(&mut self, r: &Req<'_>) {
+        let name = get_str(&r.attrs, TABLE_NAME);
+        self.tables.retain(|t| {
+            !((r.family == 0 || t.family == r.family) && name.is_none_or(|n| t.name == n))
+        });
     }
 
     fn new_table(&mut self, r: &Req<'_>) -> Result<(), Fail> {
