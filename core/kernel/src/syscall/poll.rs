@@ -803,10 +803,14 @@ pub(crate) fn send_to_owner(
 
 /// Waits until at least one file in `items` is ready, a timeout, or an interruption by a signal,
 /// and returns the ready events of each item. `None` means an invalid fd, reported as POLLNVAL.
+/// With `only_wanted` (select) only events in an item's mask count: POLLHUP and POLLERR outside
+/// it are returned but do not end the wait, as in Linux's `do_select`, which counts only what
+/// matches the sets.
 fn wait_ready(
     cx: &mut Cx<'_>,
     items: &[(Option<FileRef>, i16)],
     deadline: Option<Instant>,
+    only_wanted: bool,
 ) -> Result<Vec<i16>, Errno> {
     loop {
         let ready: Vec<i16> = items
@@ -816,16 +820,27 @@ fn wait_ready(
                 None => POLLNVAL,
             })
             .collect();
-        if ready.iter().any(|&e| e != 0) || deadline.is_some_and(|d| Instant::now() >= d) {
+        let counts = |(&e, (_, wanted)): (&i16, &(Option<FileRef>, i16))| {
+            if only_wanted { e & wanted != 0 } else { e != 0 }
+        };
+        if ready.iter().zip(items).any(counts) || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(ready);
         }
         if cx.interrupted() {
             return Err(Errno::ERESTARTNOHAND);
         }
         let mut waits = Waits::default();
-        for (f, wanted) in items {
-            if let Some(f) = f {
-                waits.add(&f.borrow(), *wanted, 0);
+        for ((f, wanted), &e) in items.iter().zip(&ready) {
+            let Some(f) = f else { continue };
+            let f = f.borrow();
+            if e & (POLLHUP | POLLERR) != 0 {
+                // A hangup or error that does not count (select's write or except set): the host
+                // poll always reports these bits and would end every wait at once, so wait only
+                // on the file's in-process objects, as epoll does after reporting a hangup
+                waits.files = true;
+                wake_objects(&f, &mut waits.objects);
+            } else {
+                waits.add(&f, *wanted, 0);
             }
         }
         waits.wait(cx, deadline)?;
@@ -891,7 +906,7 @@ pub(super) fn ppoll(
         .map(|(f, e, _)| (f.clone(), *e))
         .collect();
     set_temp_mask(cx, sigmask, sigsetsize)?;
-    let r = wait_ready(cx, &wanted, deadline);
+    let r = wait_ready(cx, &wanted, deadline, false);
     restore_mask(cx, &r);
     let r = write_back_timeout(cx, timeout, deadline.filter(|_| !zero), r);
     let mut ready = r?.into_iter();
@@ -912,11 +927,13 @@ pub(super) fn pselect6(
     timeout: u64,
     sigdata: u64,
 ) -> SysResult {
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_NOFILE as usize].0 as i32;
-    if nfds < 0 || nfds > limit {
+    if nfds < 0 {
         return Err(Errno::EINVAL);
     }
-    let words = (nfds as usize).div_ceil(64);
+    // core_sys_select clamps nfds to the size of the fd table (`select(FD_SETSIZE, ...)` works
+    // whatever the fd limit): bits above it are neither read nor written back
+    let nfds = (nfds as usize).min(fd_table_size(cx.fds().open_fds().last().copied()));
+    let words = nfds.div_ceil(64);
     // The three fd_sets: read, write and except
     let mut bits = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
     for (set, &addr) in bits.iter_mut().zip(&sets) {
@@ -930,19 +947,20 @@ pub(super) fn pselect6(
         }
     }
     let is_set = |set: &[u64], fd: usize| set[fd / 64] >> (fd % 64) & 1 != 0;
+    // The events that make an fd ready in the read, write and except sets (Linux's POLLIN_SET,
+    // POLLOUT_SET and POLLEX_SET). POLLNVAL, an fd select cannot poll (O_PATH), is in all three, so
+    // select does not sleep on it forever
+    let masks = [
+        POLLIN | POLLRDNORM | POLLHUP | POLLERR | POLLNVAL,
+        POLLOUT | POLLWRNORM | POLLERR | POLLNVAL,
+        POLLPRI | POLLNVAL,
+    ];
     let mut items = Vec::new();
     let mut fds = Vec::new();
-    for fd in 0..nfds as usize {
-        let mut ev = 0;
-        if is_set(&bits[0], fd) {
-            ev |= POLLIN | POLLRDNORM | POLLHUP | POLLERR;
-        }
-        if is_set(&bits[1], fd) {
-            ev |= POLLOUT | POLLWRNORM | POLLERR;
-        }
-        if is_set(&bits[2], fd) {
-            ev |= POLLPRI;
-        }
+    for fd in 0..nfds {
+        let ev = (0..3)
+            .filter(|&i| is_set(&bits[i], fd))
+            .fold(0, |ev, i| ev | masks[i]);
         if ev != 0 {
             items.push((Some(cx.fds().get(fd as i32)?), ev));
             fds.push(fd);
@@ -962,18 +980,13 @@ pub(super) fn pselect6(
         let len = u64::from_le_bytes(d[8..].try_into().unwrap()) as usize;
         set_temp_mask(cx, ss, len)?;
     }
-    let r = wait_ready(cx, &items, deadline);
+    let r = wait_ready(cx, &items, deadline, true);
     restore_mask(cx, &r);
     let ready = write_back_timeout(cx, timeout, deadline.filter(|_| !zero), r)?;
     let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
     let mut n = 0;
     for (&fd, &ev) in fds.iter().zip(&ready) {
-        let checks = [
-            (POLLIN | POLLRDNORM | POLLHUP | POLLERR, 0),
-            (POLLOUT | POLLWRNORM | POLLERR, 1),
-            (POLLPRI, 2),
-        ];
-        for (mask, i) in checks {
+        for (i, mask) in masks.into_iter().enumerate() {
             if is_set(&bits[i], fd) && ev & mask != 0 {
                 out[i][fd / 64] |= 1 << (fd % 64);
                 n += 1;
@@ -987,6 +1000,16 @@ pub(super) fn pselect6(
         }
     }
     Ok(n)
+}
+
+/// The size of Linux's fd table (`fdt->max_fds`) for a process whose highest open fd is
+/// `highest`: 64 (`NR_OPEN_DEFAULT`) until a higher fd is opened, then `alloc_fdtable`'s
+/// 128 · 2^k. Linux's table never shrinks; this assumes it was never larger than now.
+fn fd_table_size(highest: Option<i32>) -> usize {
+    match highest {
+        Some(fd) if fd >= 64 => (fd as usize / 128 + 1).next_power_of_two() * 128,
+        _ => 64,
+    }
 }
 
 /// As Linux's `poll_select_finish` does, writes the remaining time back to the guest's `timeout`

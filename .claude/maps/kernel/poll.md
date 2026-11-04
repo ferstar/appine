@@ -6,6 +6,8 @@
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
 > Maintained: 2026-11-04 (targeted verification: timeouts saturate at `KTIME_MAX`; removed the huge-timeout panic)
+>
+> Maintained: 2026-11-05 (targeted verification: pselect6 clamps `nfds` to the fd table size, counts only events in the sets, reports `POLLNVAL` in all three; removed the early-return bug)
 
 ## Responsibilities
 
@@ -82,9 +84,13 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
 - ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`) and, as
   in every timed wait here, saturated at `KTIME_MAX` (the `kernel/process` map); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted.
-- pselect6: `nfds` negative or above the soft limit `EINVAL`; sets read in 64-bit words; read →
-  `IN|RDNORM|HUP|ERR`, write → `OUT|WRNORM|ERR`, except → `PRI`; a set bit on a closed fd `EBADF`;
-  results rebuilt per set (one count per bit).
+- pselect6: `nfds` negative `EINVAL`, otherwise clamped to Linux's fd table size computed from
+  the highest open fd (64, then `alloc_fdtable`'s 128 · 2^k), so bits above it are neither read
+  nor written back; sets read in 64-bit words; read → `IN|RDNORM|HUP|ERR|NVAL`, write →
+  `OUT|WRNORM|ERR|NVAL`, except → `PRI|NVAL` (an `O_PATH` fd is ready in every set); a set bit on a
+  closed fd `EBADF`; results rebuilt per set (one count per bit). Only events in an fd's sets end
+  the wait: a hangup or error outside them is not counted, and its host fd is left out of the
+  host poll (which would always report it) while its in-process objects are still waited on.
 - Both: temporary signal mask (size 8, SIGKILL/SIGSTOP removed; kept on `ERESTARTNOHAND`/`EINTR`
   so the handler runs with it); loop scan → return if ready or past the deadline → interrupted →
   `ERESTARTNOHAND` → wait; remaining time written back whenever a nonzero timeout was given (a
@@ -173,11 +179,9 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   owner to a root process, `F_SETSIG(SIGKILL)` (or leave the default `SIGIO`, which terminates),
   turn on `O_ASYNC` and kill it with one write. Unknown owners are accepted without `ESRCH`;
   `F_SETOWN` ignores pid namespaces and overflows on `INT_MIN`.
-- **pselect6 returns 0 early:** an fd in a set whose mask does not include its pending
-  `POLLHUP`/`POLLERR`/`POLLNVAL` (a hung-up pipe only in the except or write set, an `O_PATH`
-  fd) ends the scan with nothing to report, so select returns 0 immediately even with no timeout
-  and looping callers spin. pselect6 also fails with `EINVAL` when `nfds` exceeds the soft fd limit
-  (Linux clamps), breaking `select(FD_SETSIZE, …)` after `ulimit -n 256`.
+- **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
+  sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
+  bit on a closed fd just above that can be ignored where Linux returns `EBADF`.
 - **`EPOLLEXCLUSIVE` timerfds may never fire:** gated interests skip collecting timerfd deadlines
   and the timer thread does not watch them, so expiry is noticed only when something unrelated
   wakes the timer thread or the epoll times out. Gate wakeups also ignore the interest's

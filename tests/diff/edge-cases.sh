@@ -2,7 +2,9 @@
 # whole app), MADV_DONTNEED, large PROT_NONE reservations, nanosleep sleeping only the remaining
 # time after a stop and continue, waiters getting EOWNERDEAD after a process holding a robust
 # lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS), timeouts
-# too long for Linux to represent saturating
+# too long for Linux to represent saturating, select ignoring hangups and errors its sets do not
+# take (waiting without spinning), reporting fds it cannot poll (O_PATH) in every set and
+# clamping nfds to the fd table
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -413,3 +415,116 @@ int main(void)
 C
 gcc -O2 -o edges edges.c
 ./edges
+
+cat > sel.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+static double now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static double cpu(void)
+{
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
+}
+
+/* select on `fd` in one set (0 read, 1 write, 2 except) with a 500 ms timeout: the result,
+ * whether it waited the whole timeout, and whether it waited without spinning */
+static void one(const char *what, int fd, int which)
+{
+    static const char *names[] = {"read", "write", "except"};
+    fd_set s[3];
+    for (int i = 0; i < 3; i++)
+        FD_ZERO(&s[i]);
+    FD_SET(fd, &s[which]);
+    struct timeval tv = {0, 500000};
+    double t0 = now(), c0 = cpu();
+    int r = select(fd + 1, &s[0], &s[1], &s[2], &tv);
+    int e = errno;
+    double waited = now() - t0, used = cpu() - c0;
+    printf("%s in the %s set: select %d %s, waited %d", what, names[which], r,
+           r < 0 ? strerror(e) : "", waited > 0.4);
+    if (waited > 0.4)
+        printf(", idle %d", used < 0.2);
+    printf("\n");
+}
+
+int main(void)
+{
+    /* A pipe whose writer is gone (POLLHUP) and one whose reader is gone (POLLERR) */
+    int hup[2], err[2];
+    pipe(hup);
+    close(hup[1]);
+    pipe(err);
+    close(err[0]);
+    one("hung-up pipe", hup[0], 0);
+    one("hung-up pipe", hup[0], 2);
+    one("readerless pipe", err[1], 1);
+    one("readerless pipe", err[1], 2);
+    /* O_PATH: select cannot poll it (POLLNVAL), which counts as ready in every set */
+    int path = open("/", O_PATH);
+    one("O_PATH fd", path, 0);
+    one("O_PATH fd", path, 2);
+    /* A TCP socket shut down both ways (POLLHUP from the host) */
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t len = sizeof a;
+    bind(l, (struct sockaddr *)&a, sizeof a);
+    listen(l, 1);
+    getsockname(l, (struct sockaddr *)&a, &len);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    shutdown(c, SHUT_RDWR);
+    one("shut-down TCP socket", c, 0);
+    one("shut-down TCP socket", c, 2);
+
+    /* nfds above the soft fd limit is clamped to the fd table, not EINVAL; set bits above the
+     * table are neither checked nor written back, a closed fd inside it is EBADF */
+    struct rlimit rl;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    rl.rlim_cur = 256;
+    setrlimit(RLIMIT_NOFILE, &rl);
+    int ready[2];
+    pipe(ready);
+    write(ready[1], "x", 1);
+    int sizes[] = {FD_SETSIZE, INT_MAX};
+    for (int i = 0; i < 2; i++) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(ready[0], &rd);
+        FD_SET(1000, &rd);
+        struct timeval tv = {0, 0};
+        int r = select(sizes[i], &rd, NULL, NULL, &tv);
+        printf("select(%d) with the limit at 256: %d %s, ready %d, fd 1000 bit %d\n", sizes[i], r,
+               r < 0 ? strerror(errno) : "", FD_ISSET(ready[0], &rd), FD_ISSET(1000, &rd));
+    }
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(50, &rd);
+    struct timeval tv = {0, 0};
+    int r = select(FD_SETSIZE, &rd, NULL, NULL, &tv);
+    printf("select with closed fd 50: %d %s\n", r, r < 0 ? strerror(errno) : "");
+    r = select(-1, NULL, NULL, NULL, &tv);
+    printf("select(-1): %d %s\n", r, r < 0 ? strerror(errno) : "");
+    return 0;
+}
+C
+gcc -O2 -o sel sel.c
+./sel
