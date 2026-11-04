@@ -1508,21 +1508,36 @@ pub(crate) fn send(
         Socket::Unix(_) => unreachable!("handled above"),
     };
     if to_stub {
-        // DNS stub: release the BKL and let the host resolve it, and queue the answer on this
-        // socket
+        // DNS stub: a host thread resolves it while the send returns at once, as a UDP send does
+        // on Linux; the answer arrives later like any datagram (deliver_dns), so nonblocking
+        // sockets and event loops never wait here, and their own timeouts and parallel queries
+        // keep working
         let query = data.to_vec();
-        let answer = cx
-            .unlocked(|| appine_hal::net::dns_query(&query))
-            .unwrap_or_else(|e| {
-                crate::debug::log(format_args!("DNS stub: query failed: errno {e}"));
-                servfail(&query)
+        let id = {
+            let k = cx.k();
+            k.dns_last += 1;
+            k.dns_queries.insert(k.dns_last, Rc::downgrade(sock));
+            k.dns_last
+        };
+        let answers = cx.shared.dns_answers.clone();
+        let timers = cx.shared.timers.clone();
+        let started = std::thread::Builder::new()
+            .name("dns-stub".into())
+            .spawn(move || {
+                let answer = appine_hal::net::dns_query(&query).unwrap_or_else(|e| {
+                    crate::debug::log(format_args!("DNS stub: query failed: errno {e}"));
+                    servfail(&query)
+                });
+                answers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((id, answer));
+                timers.signal();
             });
-
-        if let Socket::Inet(s) = &mut *sock.borrow_mut() {
-            s.answers.push_back(answer);
-            s.answered += 1;
+        if started.is_err() {
+            cx.k().dns_queries.remove(&id);
+            return Err(Errno::EAGAIN);
         }
-        request_wake_object(wake::of(sock));
         return Ok(data.len());
     }
     // Translate the destination address to the host's (crate::netns: ENETUNREACH when
@@ -2983,6 +2998,27 @@ pub(crate) fn arrivals(sock: &Socket) -> [u64; 2] {
         Socket::Inet(s) => [s.answered, 0],
         Socket::Netlink(s) => [s.arrivals, 0],
         Socket::Unix(u) => u.arrivals(),
+    }
+}
+
+/// Queues the DNS stub answers that host threads have resolved on the sockets the queries came
+/// from, and wakes the sockets' waiters (the timer thread, holding the BKL). Answers for sockets
+/// closed meanwhile are dropped.
+pub(crate) fn deliver_dns(k: &mut crate::kernel::Kernel, answers: &crate::kernel::DnsAnswers) {
+    let done = std::mem::take(
+        &mut *answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for (id, answer) in done {
+        let Some(sock) = k.dns_queries.remove(&id).and_then(|w| w.upgrade()) else {
+            continue;
+        };
+        if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+            s.answers.push_back(answer);
+            s.answered += 1;
+        }
+        request_wake_object(wake::of(&*sock));
     }
 }
 

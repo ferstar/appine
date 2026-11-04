@@ -323,6 +323,8 @@ static void test_dns_stub_fionread(void)
     struct mmsghdr msgs[2] = {{.msg_hdr = {.msg_iov = &iov[0], .msg_iovlen = 1}},
                               {.msg_hdr = {.msg_iov = &iov[1], .msg_iovlen = 1}}};
     CHECK(sendmmsg(fd, msgs, 2, 0) == 2, "sendmmsg");
+    /* The queries are resolved in parallel, so the answers may come in either order */
+    int seen = 0;
     for (int i = 0; i < 2; i++) {
         struct pollfd p = {fd, POLLIN, 0};
         CHECK(poll(&p, 1, 30000) == 1, "answer %d", i);
@@ -331,8 +333,10 @@ static void test_dns_stub_fionread(void)
         unsigned char buf[4096];
         ssize_t n = recv(fd, buf, sizeof buf, 0);
         CHECK(n >= 12 && avail == n, "answer %d: FIONREAD %d, recv %zd", i, avail, n);
-        CHECK(buf[0] == (i ? 0x56 : 0x12) && buf[1] == 0x34, "answer %d id", i);
+        CHECK((buf[0] == 0x12 || buf[0] == 0x56) && buf[1] == 0x34, "answer %d id", i);
+        seen |= buf[0] == 0x12 ? 1 : 2;
     }
+    CHECK(seen == 3, "both answers");
     int avail = -1;
     CHECK(ioctl(fd, FIONREAD, &avail) == 0 && avail == 0, "FIONREAD when empty: %d", avail);
     close(fd);

@@ -894,6 +894,13 @@ fn timers(shared: Arc<Shared>) {
                 }
             }
         }
+        // DNS stub answers resolved by host threads: queue them on their sockets
+        if crate::bug::catch(|| crate::syscall::deliver_dns(&mut k, &shared.dns_answers)).is_none()
+        {
+            crate::bug::report(format_args!(
+                "kernel panic while delivering DNS stub answers"
+            ));
+        }
         // Collection point of raw ICMP sockets: takes arrived packets for poll and epoll waiters
         match crate::bug::catch(|| crate::rawicmp::check_taps(&mut k)) {
             Some(fds) => host.extend(fds),

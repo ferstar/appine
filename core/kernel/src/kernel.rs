@@ -25,7 +25,7 @@
 //! on locks and condition variables; they wait with [`Cx::wait_alone`] and are notified directly,
 //! only by FUTEX_WAKE, signals and the ending of the thread group.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
@@ -342,6 +342,11 @@ pub(crate) struct Kernel {
     pub fasync: Vec<crate::syscall::Fasync>,
     /// The ICMP taps of the network namespaces ([`crate::rawicmp`]), watched by the timer thread.
     pub icmp_taps: Vec<std::rc::Weak<crate::cell::RefCell<crate::rawicmp::Tap>>>,
+    /// DNS stub queries being resolved by host threads: the socket each answer goes to
+    /// ([`Shared::dns_answers`], `syscall::net`).
+    pub dns_queries: HashMap<u64, std::rc::Weak<crate::cell::RefCell<crate::net::Socket>>>,
+    /// The number of the last DNS stub query sent.
+    pub dns_last: u64,
     /// File leases, by inode (`syscall::lease`).
     pub leases: BTreeMap<Ino, Vec<crate::syscall::Lease>>,
     /// `/proc/sys/fs/lease-break-time`: the most seconds to wait when breaking a lease.
@@ -451,6 +456,8 @@ impl Kernel {
             ex_gates: Vec::new(),
             fasync: Vec::new(),
             icmp_taps: Vec::new(),
+            dns_queries: HashMap::new(),
+            dns_last: 0,
             leases: BTreeMap::new(),
             lease_break_time: 45,
             seccomp_logged: crate::seccomp::logged::DEFAULT,
@@ -748,6 +755,10 @@ fn max_spinners() -> u32 {
     *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
 }
 
+/// DNS stub answers resolved by host threads: (query number, answer message)
+/// ([`Shared::dns_answers`]).
+pub(crate) type DnsAnswers = Mutex<Vec<(u64, Vec<u8>)>>;
+
 /// Kernel objects shared by all guest threads.
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
@@ -760,6 +771,10 @@ pub(crate) struct Shared {
     spinning: AtomicU32,
     /// Wakes the timer thread.
     pub timers: Arc<Event>,
+    /// DNS stub answers the host threads resolved, by query number ([`Kernel::dns_queries`]), for
+    /// the timer thread to queue on their sockets. The host threads hold only this and
+    /// [`Shared::timers`], never the kernel.
+    pub dns_answers: Arc<DnsAnswers>,
     /// The timer thread's periodic checks (memory limit [`crate::oom`], load average
     /// [`crate::loadavg`]) have stopped: all threads are waiting.
     pub checks_idle: AtomicBool,
@@ -787,6 +802,7 @@ impl Shared {
             held: AtomicBool::new(false),
             spinning: AtomicU32::new(0),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
+            dns_answers: Arc::new(Mutex::new(Vec::new())),
             checks_idle: AtomicBool::new(false),
             fast: AtomicU64::new(0),
             futexes: Mutex::new(Futexes::default()),

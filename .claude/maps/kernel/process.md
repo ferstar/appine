@@ -301,9 +301,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - One host thread ("timers") loops: take the BKL; expire interval timers, POSIX timers and CPU-time
   limits; run the OOM check, the translator code-view release, load-average sampling, deferred
-  store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks and raw ICMP taps; then wait (BKL released)
-  until the earliest deadline or its event. It listens on `OTHER` (or all channels while `O_ASYNC`
-  files or exclusive gates exist).
+  store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks, DNS stub answers (`kernel/net`) and raw
+  ICMP taps; then wait (BKL released) until the earliest deadline or its event. It listens on
+  `OTHER` (or all channels while `O_ASYNC` files or exclusive gates exist).
 - Setting a timer writes the deadline into the thread group and signals the timer thread's event.
 - `ITIMER_REAL` uses wall time; `ITIMER_VIRTUAL`/`PROF` and process CPU-time timers use host thread
   CPU clocks. Armed CPU timers or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the soft

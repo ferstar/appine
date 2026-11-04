@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces)
+> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces; DNS stub queries resolved on host threads, removed the blocking bug)
 
 ## Responsibilities
 
@@ -126,7 +126,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - Limits: at most 1 MiB per call, 1024 iovecs (`EMSGSIZE`), 4096 bytes of send control data;
   recvmsg sums the guest's iovec lengths before clamping (unchecked); setsockopt values are cut to
   256 bytes (longer ones then fail on the host) and getsockopt asks the host for at most 256.
-- Host sendmsg/recvmsg run under the BKL (nonblocking); only waits and the DNS query release it.
+- Host sendmsg/recvmsg run under the BKL (nonblocking); only waits release it.
   There is no BKL-free fast path for sockets.
 
 ### Options and ioctls
@@ -159,13 +159,16 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   IPv4-mapped form), by address or after connecting to it; checked before routing, so nftables
   never sees these queries; TCP and other ports are not intercepted; sockets in new namespaces
   are not either.
-- The query runs synchronously in the caller's thread with the BKL released, even for nonblocking
-  sockets and `MSG_DONTWAIT` and regardless of `SO_SNDTIMEO`: Android uses `android_res_nsend`
-  (so Private DNS, VPNs and per-network routing apply; 30 s limit, then cancel); other hosts send
-  to up to three servers from the host's `/etc/resolv.conf` (3 s each, ID checked, TCP retry on
-  truncation with its own waits). Failures become a synthesized SERVFAIL. The answer is
-  queued on the socket with source `127.0.0.53:53`, readiness and `FIONREAD` follow the queue,
-  and the send returns the query length.
+- Each query is registered by number in `Kernel::dns_queries` (a weak reference to the socket)
+  and handed to a new host thread (`dns-stub`); the send returns the query length at once, as a
+  UDP send does. The thread resolves it — Android uses `android_res_nsend` (so Private DNS, VPNs
+  and per-network routing apply; 30 s limit, then cancel); other hosts send to up to three servers
+  from the host's `/etc/resolv.conf` (3 s each, ID checked, TCP retry on truncation with its own
+  waits) — turning failures into a synthesized SERVFAIL, then puts the answer in
+  `Shared::dns_answers` and wakes the timer thread, which queues it on the socket (dropped if the
+  socket has closed) with source `127.0.0.53:53` and wakes its waiters. Until then reads are
+  `EAGAIN` or wait as for any datagram; readiness and `FIONREAD` follow the queue. The thread holds
+  no kernel object, only the answer queue and the timer event.
 
 ### Low ports and traffic counters
 
@@ -288,16 +291,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - Addresses are rewritten at the boundary in both directions (namespaces, ports, nat, DNS stub);
   anything returning an address to the guest must go through the same unmapping.
 - Netlink replies are snapshots taken at send time.
-- The portmap key has no address or family, so IPv4/IPv6 and wildcard/specific binds of one guest
-  port share one host port and the host decides conflicts.
+- The portmap key has no address, so binds of one guest port share one host port and the host
+  decides their conflicts, except that IPv6-only binds in new namespaces get their own.
 - The raw ICMP id rewrite assumes one echo id per raw socket (the last one sent).
 
 ## Confirmed bugs / technical debt
 
-- **DNS queries block nonblocking sockets:** a send to the stub resolves synchronously in the
-  sending thread even with `O_NONBLOCK`/`MSG_DONTWAIT` and ignores `SO_SNDTIMEO` (up to 30 s on
-  Android). Event-loop resolvers freeze their loop for the whole lookup (c-ares and with it Node's
-  `dns.resolve*`); their own timeouts and parallel queries stop working.
 - **`MSG_PEEK|MSG_WAITALL` returns duplicated data** on stream sockets: each pass peeks the queue
   head again into the next part of the buffer, so 10 queued bytes and a 100-byte read return the
   same 10 bytes ten times. Without `MSG_PEEK`, `MSG_WAITALL` returns short reads instead of
