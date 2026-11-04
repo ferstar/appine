@@ -1,9 +1,9 @@
-//! The experimental terminal view (the `vt` feature, android/terminal map): each tab of `VtView`
-//! has a libghostty-vt terminal here, fed straight from its kernel console, so console output never
+//! The libghostty-vt terminals of the app's tabs (the `vt` feature, android/terminal map): each
+//! `VtSession` has a terminal here, fed straight from its kernel console, so console output never
 //! crosses JNI as bytes.
 //!
 //! The matching Kotlin declarations are in
-//! `android/app/src/debug/java/io/github/mthli/appine/VtNative.kt`. Like [`Machine`]s in the crate
+//! `android/app/src/main/java/io/github/mthli/appine/VtNative.kt`. Like [`Machine`]s in the crate
 //! root, tabs are registered in a table and Kotlin holds a handle.
 //!
 //! A tab names its kernel by the crate root's handle too and looks it up for each call, as the
@@ -14,7 +14,8 @@
 //!
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
-//! scrolls, encodes keys, mouse and focus events and pastes, and selects and copies. The terminal is not thread-safe, so every call into vt.c holds the
+//! scrolls, encodes keys, mouse and focus events and pastes, selects and copies, and reads the title
+//! and transcript. The terminal is not thread-safe, so every call into vt.c holds the
 //! tab's lock; the frame buffer it returns is only written by `frame`, which only the main thread
 //! calls, so the main thread may read it after the lock is released.
 //!
@@ -79,6 +80,10 @@ unsafe extern "C" {
     fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
     fn appine_vt_select_clear(vt: *mut AppineVt);
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
+    fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_message(vt: *mut AppineVt, text: *const u8, len: usize) -> bool;
+    fn appine_vt_transcript(vt: *mut AppineVt, len: *mut usize) -> *const u8;
 }
 
 /// Owns one vt.c terminal.
@@ -92,6 +97,18 @@ impl Term {
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         unsafe { appine_vt_feed(self.0, data.as_ptr(), data.len()) };
         self.take_replies()
+    }
+
+    /// Text vt.c returned (`len` bytes at `p`, kept until its next text call) as a Java string;
+    /// null for a null `p`. Called with the lock held.
+    fn text(&self, env: &mut JNIEnv<'_>, p: *const u8, len: usize) -> jstring {
+        if p.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: vt.c keeps len bytes at p until its next text call, which needs the lock
+        let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) });
+        env.new_string(text)
+            .map_or(std::ptr::null_mut(), JString::into_raw)
     }
 
     /// The bytes the terminal wrote for the console since the last call (replies, a paste).
@@ -235,13 +252,14 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_destroy<'l>(
 }
 
 /// Moves the console's output into the terminal until the session ends or the console is closed;
-/// calls `view.onOutput()` whenever the screen changed after the view took its last frame.
+/// calls `session.onOutput()` whenever the screen changed after the last frame was taken, and
+/// `session.onTitle()` when a program set the title.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-    view: JObject<'l>,
+    session: JObject<'l>,
 ) {
     let Some(tab) = tab(handle) else { return };
     let mut buf = vec![0u8; 64 * 1024];
@@ -252,15 +270,20 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let replies = tab.term().feed(&buf[..n]);
+        let (replies, titled) = {
+            let mut term = tab.term();
+            let replies = term.feed(&buf[..n]);
+            (replies, unsafe { appine_vt_take_title_changed(term.0) })
+        };
         // A program waiting for an answer (DA, DSR) does not read further until it comes
         if !replies.is_empty() && !tab.write(&m, &replies) {
             break;
         }
-        // Not kept across the call into Java either
+        // Not kept across the calls into Java either
         drop(m);
-        if !tab.dirty.swap(true, Ordering::AcqRel)
-            && env.call_method(&view, "onOutput", "()V", &[]).is_err()
+        let output = !tab.dirty.swap(true, Ordering::AcqRel);
+        if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
+            || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
         {
             let _ = env.exception_clear();
             break;
@@ -517,25 +540,64 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectClear<'l>(
 /// no selection or it is empty.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_copy<'l>(
-    env: JNIEnv<'l>,
+    mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
 ) -> jstring {
     let Some(tab) = tab(handle) else {
         return std::ptr::null_mut();
     };
-    let text = {
-        let term = tab.term();
-        let mut len = 0;
-        let p = unsafe { appine_vt_copy(term.0, &mut len) };
-        if p.is_null() || len == 0 {
-            return std::ptr::null_mut();
-        }
-        // SAFETY: vt.c keeps the text until the next copy, which needs the lock held here
-        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
+    let term = tab.term();
+    let mut len = 0;
+    let p = unsafe { appine_vt_copy(term.0, &mut len) };
+    term.text(&mut env, p, len)
+}
+
+/// The title a program set (OSC 0/2); null when none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
     };
-    env.new_string(text)
-        .map_or(std::ptr::null_mut(), JString::into_raw)
+    let term = tab.term();
+    let mut len = 0;
+    let p = unsafe { appine_vt_title(term.0, &mut len) };
+    term.text(&mut env, p, len)
+}
+
+/// Shows a yellow line of app notice above the cursor's line; false on the alternate screen.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_message<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    text: JString<'l>,
+) -> jboolean {
+    let (Some(tab), Some(text)) = (tab(handle), string(&mut env, &text)) else {
+        return 0;
+    };
+    (unsafe { appine_vt_message(tab.term().0, text.as_ptr(), text.len()) }) as jboolean
+}
+
+/// The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed);
+/// null on the alternate screen or on failure.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let term = tab.term();
+    let mut len = 0;
+    let p = unsafe { appine_vt_transcript(term.0, &mut len) };
+    term.text(&mut env, p, len)
 }
 
 /// Shows bytes from the app itself (not the program) as if the console had printed them; replies

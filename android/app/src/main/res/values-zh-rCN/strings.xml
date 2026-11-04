@@ -16,7 +16,6 @@
     <string name="listening_mapped">其他设备请连接端口 %1$d：这台手机上的 App 用不了端口 %2$d，appine 把它换到了这里。</string>
     <string name="listening_direct">同一网络里的其他设备连得上它。</string>
     <string name="menu_settings">设置</string>
-    <string name="menu_experimental_terminal">新终端（实验）</string>
     <string name="settings">设置</string>
     <string name="settings_distro">发行版</string>
     <string name="settings_mirror">软件源镜像</string>
@@ -74,4 +73,6 @@
     <plurals name="boot_failed_title">
         <item quantity="other">%d 个服务没有起来</item>
     </plurals>
+    <string name="paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
+    <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
 </resources>

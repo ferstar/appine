@@ -5,28 +5,29 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService` behind the `Session` interface, `VtActivity` removed)
 
 ## Responsibilities
 
 `android/terminal` is the terminal screen and the pieces that render the service's sessions:
 
 - `MainActivity`: the tab bar, the terminal view, font zoom, extra keys, insets and the IME;
-- `ConsolePty`: the adapter between a Termux `TerminalSession` and a kernel console
-  (`/dev/pts/N`);
+- `Session`: a tab as the service holds it, on one of two emulators — the vendored Termux one
+  (`TermuxSession`, the default) or libghostty-vt (`VtSession`, when the native library has the
+  `vt` feature, so far only debug builds with `-Pappine.vt=true`);
+- `ConsolePty`: the adapter between a session and a kernel console (`/dev/pts/N`);
 - the vendored Termux `terminal-emulator` and `terminal-view`, with appine's changes to
   `TerminalSession`;
+- the libghostty-vt terminal: `VtSession` (the tab's shell, pump and writer threads), `VtView`
+  (drawing with bundled JetBrains Mono, input, selection), the emulator shim and JNI in the native
+  library (`vt.c`, `vt.rs`); meant to replace the Termux emulator;
 - `LicensesActivity`: the notices generated at build time;
-- the app's strings and themes;
-- the experimental terminal (debug builds only): `VtActivity` with one login shell shown by
-  `VtView`, which draws a libghostty-vt terminal held in the native library (`vt.c`, `vt.rs`) with
-  bundled JetBrains Mono; a prototype for replacing the Termux view, not a tab of the service.
+- the app's strings and themes.
 
-Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `ConsolePty.kt`,
-`ExtraKeysView.kt`, `LicensesActivity.kt`, `android/terminal-emulator/`, `android/terminal-view/`,
-`android/app/src/main/res/`; for the experimental terminal, `VtActivity.kt`, `VtView.kt`,
-`VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt` in `android/app/src/debug/java/io/github/mthli/appine/`,
-`android/app/src/debug/assets/fonts/`, `android/app/src/debug/res/values*/`,
+Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `Session.kt`,
+`ConsolePty.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `VtSession.kt`, `VtView.kt`,
+`VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `android/terminal-emulator/`,
+`android/terminal-view/`, `android/app/src/main/res/`, `android/app/src/debug/assets/fonts/`,
 `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
 
 Outside the module: session lifecycle, saving and kill routing (`android/service`); the host console
@@ -35,23 +36,31 @@ feature that compiles libghostty-vt (`android/native`).
 
 ## Key types
 
-- `MainActivity` — a `TerminalService.Listener`; `ViewClient : TerminalViewClient`.
-- `ExtraKeysView` — one row: ESC, TAB, CTRL, ALT, `-`, `/`, `|`, arrows.
+- `MainActivity` — a `TerminalService.Listener`; it creates exactly one terminal view, a `VtView`
+  when `VtNative.available`, else a Termux `TerminalView`; `ViewClient : TerminalViewClient`,
+  `VtHost : VtView.Host`, `Keys : ExtraKeysView.Target`.
+- `Session` (public interface) — `console`, `login`, `title`, `isRunning`, `transcriptText`,
+  `setRestored`, `showMessage`, `finishIfRunning`, `release`. `TermuxSession` wraps a
+  `TerminalSession` and its `ConsolePty`.
+- `ExtraKeysView` — one row: ESC, TAB, CTRL, ALT, `-`, `/`, `|`, arrows; keeps the one-shot CTRL
+  and ALT and sends keys and text to a `Target`.
 - `ConsolePty : TerminalSession.Pty` — `start` (open console, spawn `login.sh`), `read`, `write`,
   `resize`, `close`; `console` is −1 until started.
 - `TerminalSession` (vendored, rewritten) — takes a `Pty` instead of creating a subprocess; adds
   `setRestored`, `showMessage`, `getTranscriptText`.
 - `LicensesActivity` — list from `assets/notices/index.tsv`, full text view.
 
-### Experimental terminal
+### libghostty-vt
 
-- `VtActivity` — a `TerminalService.Listener` and `VtView.Host`: its own extra-keys row, one
-  `ConsolePty` (used only to open the console, spawn the login, wait and close), one tab handle, a
-  `vt-pump` thread and a single-thread `vt-writer` executor.
-- `VtView` — the view: cell metrics, a mirror of the screen (codepoint, colours, attributes,
-  grapheme clusters per cell, each row's selected columns), a backing bitmap of the grid, the modes
-  and selection bounds of the last frame, the IME connection, gestures, selection handles and the
-  floating menu; `Host.onGrid` / `Host.onInput` go to the activity.
+- `VtSession` — a tab owned by the service: its `ConsolePty`, the terminal handle (0 until the
+  shell starts), the view showing it (`view`, read on the pump thread), pending restored text and
+  messages, a `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer`
+  executor; `Events` (title changed, finished) go to the service.
+- `VtView` — the view: the attached `VtSession`, cell metrics, a mirror of the screen (codepoint,
+  colours, attributes, grapheme clusters per cell, each row's selected columns), a backing bitmap
+  of the grid, the modes and selection bounds of the last frame, the IME connection, gestures,
+  selection handles and the floating menu. `Host` (the activity): `onGrid`, `onInput`, `onZoom`,
+  the extra keys' `ctrl`, `alt` and `modifiersUsed`.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
@@ -67,11 +76,10 @@ feature that compiles libghostty-vt (`android/native`).
   changes itself); listener callbacks `onMachineReady`, `onProgress`, `onSessionsChanged`,
   `onTextChanged`, `onExitAll`, `onRestarting`, `onNotice`.
 - `LicensesActivity`, opened from Settings.
-- `VtActivity` (debug manifest, not exported), opened from the main screen's `⋮` menu item "New
-  terminal (experimental)", which exists only when `BuildConfig.DEBUG`; without the `vt` feature
-  in the native library it shows a toast and finishes.
-- `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`, `paste`, `mouse`,
-  `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`, `copy`, `print`.
+- `VtNative`: `available`, `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`,
+  `paste`, `mouse`, `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`,
+  `copy`, `title`, `message`, `transcript`, `print`; `pump` calls `VtSession.onOutput` and
+  `onTitle` back.
 
 ## Data flow / lifecycle
 
@@ -80,12 +88,14 @@ feature that compiles libghostty-vt (`android/native`).
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
 - Tab bar: `N: title` (`sh` by default, ` ✕` once the shell ended); tap switches, long-press closes
-  at once (hang-up), `+` opens a session while the kernel runs, `⋮` has Settings (and the
-  experimental terminal in debug builds). Closing the last
+  at once (hang-up), `+` opens a session while the kernel runs, `⋮` has Settings. Closing the last
   tab while the kernel runs finishes the activity (the service stays). After a reconnect the focused
   tab is the service's `focus` or the last one.
+- Showing a tab attaches it to the one view: `TerminalView.attachSession` for a `TermuxSession`,
+  `VtView.attach` for a `VtSession`; `onRestarting` and `onDestroy` detach the `VtView`, so sessions
+  never keep a destroyed Activity's view.
 
-### A tab's console
+### A Termux tab's console
 
 - When the view first knows its size, `initializeEmulator` calls `Pty.start`: open a console with
   that size and spawn `/bin/sh -c <login.sh> appine-login <login> <cwd>` with a fixed environment.
@@ -102,39 +112,51 @@ feature that compiles libghostty-vt (`android/native`).
 
 - Pinch zoom changes the font by 1 dp steps beyond a 0.9–1.1 scale band, within 6–32 dp, stored as
   pixels in the activity's preferences.
-- Extra keys: CTRL and ALT are one-shot toggles consumed when the next key is read; special keys go
-  through the view's key-code path (cursor application mode applies), characters through code-point
-  input.
+- Extra keys: CTRL and ALT are one-shot toggles consumed when the next key is read; for Termux,
+  special keys go through the view's key-code path (cursor application mode applies) and characters
+  through code-point input, both only once a session is attached; for libghostty-vt they go to
+  `VtView.press` and `type`, which read the one-shot modifiers through the host.
 - A tap opens the IME; the content is edge-to-edge with the root padded by system-bar and IME
   insets; long-press selects text; copy and paste go through the service.
 
-### Experimental terminal
+### libghostty-vt tabs
 
 #### Start and end
 
-- `VtActivity` binds the service (it does not start it) and starts once both the kernel and the
-  grid are known: `ConsolePty.start` opens a console of the grid's size and spawns the same login as
-  a tab; `VtNative.create` makes the libghostty-vt terminal for it (scrollback 10,000 lines;
-  grapheme clustering, mode 2027, on by default as in Ghostty) and the `vt-pump` thread runs
-  `VtNative.pump`.
+- A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
+  and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
+  opens a console of the grid's size and spawns the login; `VtNative.create` makes the terminal
+  (scrollback 10,000 lines; grapheme clustering, mode 2027, on by default as in Ghostty); restored
+  text and queued messages are printed into it; then the pump, the waiter and the writer start.
+  If spawning fails, the reason is printed, the console is closed and the tab counts as ended
+  (127).
 - The pump reads the console into a 64 KB buffer, feeds the terminal under the tab's lock, writes
   the terminal's replies (DA, DSR, XTVERSION, size reports) back to the console before reading
-  again, and calls `view.onOutput()` only when it sets `dirty`, so a burst asks for one frame. It
-  ends at EOF or a console error; the thread then waits for the shell and prints "[Process completed
-  (code)]" locally through `VtNative.print`.
-- `onDestroy` closes the console (ending the pump) and destroys the tab; the terminal is freed when
-  the last `Arc<Tab>` (the table's or a running pump's) goes.
+  again, calls `VtSession.onOutput` only when it sets `dirty` (so a burst asks for one frame, and
+  nothing is asked while no view takes frames) and `onTitle` after OSC 0/2. It runs whether or not
+  a view shows the tab.
+- The waiter waits for the shell, gives the pump up to 0.5 s to take the last output, then on the
+  main thread closes the console (once) and prints "[Process completed (code N | signal N) - press
+  Enter]" as a Termux tab does. Enter from a key or the IME then closes the tab (`VtHost.onInput`).
+- `release` (the tab closed, or its kernel going away) hangs up the console once, stops the writer
+  and destroys the terminal handle; a running pump keeps the terminal until it returns.
+- Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
+  wraps joined, trailing blanks trimmed); on the alternate screen it returns the last transcript
+  taken on the primary one. Kill reports go through `VtNative.message` (the same insertion above
+  the cursor line as Termux, skipped on the alternate screen) or wait until the terminal exists.
 
 #### Frames and drawing
 
-- `onOutput` posts an invalidate on animation; `onDraw` takes a frame (`VtNative.frame`, main thread
-  only) and applies it: `frame` clears `dirty`, updates the render state (unless a
-  synchronized-output hold is active), and writes the header plus the dirty rows (all rows when the
-  view asks for a full frame) in the format documented in `vt.c`; the direct `ByteBuffer` is valid
-  until the next `frame`.
+- `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
+  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, updates the render
+  state (unless a synchronized-output hold is active), and writes the header plus the dirty rows
+  (all rows when the view asks for a full frame) in the format documented in `vt.c`; the direct
+  `ByteBuffer` is valid until the next `frame`.
 - A hold (mode 2026) captures the screen when it begins and is ended by force after 1 s.
-- The view asks for a full frame after a regrid, a new bitmap or new default colours; a frame
-  captured at an old size is dropped and a full one requested.
+- The view asks for a full frame after a regrid, a new bitmap, new default colours, attaching
+  another tab or the attached tab's shell starting; a frame captured at an old size is dropped and
+  a full one requested. Attaching also resizes the tab's terminal and console to the view's grid
+  when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
   focus events 1004, a selection exists) and the selection's first and last cells in the
   viewport; each row carries its selected columns.
@@ -145,8 +167,9 @@ feature that compiles libghostty-vt (`android/native`).
   backgrounds, the selection's translucent highlight, then text. Plain ASCII runs of one paint,
   colour and decoration go out in one draw call; other glyphs are centred in their one or two
   cells, or shrunk evenly when wider (never stretched); `VtGlyphs` characters are shapes; four
-  paints (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single, double, curly, dotted, dashed),
-  strikethrough and overline are drawn; inverse, faint and invisible apply; blink is ignored.
+  paints (regular/bold × upright/italic) from the variable font with ligatures off. Underlines
+  (single, double, curly, dotted, dashed), strikethrough and overline are drawn; inverse, faint and
+  invisible apply; blink is ignored.
 - The cursor (bar, block with the glyph redrawn in the background colour, underline, hollow; hollow
   when unfocused), the IME's composing text (shifted left at the right edge) and the theme's text
   selection handles are drawn over the bitmap each draw.
@@ -160,7 +183,7 @@ feature that compiles libghostty-vt (`android/native`).
   and also apply to one typed character (turned back into a key event). Ctrl+Shift+C and V and the
   dedicated copy and paste keys copy and paste.
 - Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom,
-  then goes to the `vt-writer` thread (`Native.write`).
+  then goes through the host to the tab's `vt-writer` thread (`Native.write`).
 - IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
   paste, which covers the IME's clipboard); the editor action is Enter; composing text is only
   drawn at the cursor; the editable is kept empty so Backspace with nothing composed arrives as
@@ -194,7 +217,8 @@ feature that compiles libghostty-vt (`android/native`).
   the selected rows. Copy takes the selection as plain text with soft wraps joined and trailing
   blanks trimmed (as Ghostty copies), puts it on the clipboard and ends the selection.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
-  and resizes the terminal and then the console (SIGWINCH).
+  and resizes the terminal and then the console (SIGWINCH); the size is kept in the same preference
+  as the Termux view's.
 
 ### Licenses
 
@@ -206,17 +230,15 @@ feature that compiles libghostty-vt (`android/native`).
 
 ### Inbound
 
-- `TerminalService` (sessions, focus, listener callbacks, `showMessage`, `setRestored`,
-  `getTranscriptText`); `SettingsActivity` (licenses).
-- Experimental terminal: `MainActivity`'s menu (debug builds); `TerminalService` gives `machine`,
-  `login` and listener callbacks.
+- `TerminalService` (creates sessions of either kind, holds them as `Session`s: `showMessage`,
+  `setRestored`, `transcriptText`, `release`; listener callbacks); `SettingsActivity` (licenses).
 
 ### Outbound
 
 - `Native` (`openConsole`, `spawn`, `read`, `write`, `resize`, `closeConsole`, `waitFor`), hence
   the kernel's host console; `login.sh`; `assets/notices`.
-- Experimental terminal: libghostty-vt 1.4.0 (the terminal state, render state, key and mouse
-  encoders, paste, focus encoding, selection and its plain-text formatting), linked into
+- libghostty-vt tabs: libghostty-vt 1.4.0 (the terminal state, render state, key and mouse
+  encoders, paste, focus encoding, selection, plain-text formatting, title and width), linked into
   `libappine.so` by the `vt` feature (`android/native`); `Machine::read_console`,
   `write_console` and `resize_console` called from `vt.rs` directly; `ConsolePty` and
   `Native.write`; the system clipboard; JetBrains Mono (variable, upright and italic) from the
@@ -224,22 +246,28 @@ feature that compiles libghostty-vt (`android/native`).
 
 ## Invariants and gotchas
 
-- The console opens lazily, so restored tabs that were never shown have no console and no shell.
+- The console opens lazily (both kinds), so restored tabs that were never shown have no console and
+  no shell.
+- The kind of tab follows the native library: the service and the Activity both ask
+  `VtNative.available`, so one process never mixes kinds; saved tabs carry no kind and restore into
+  whichever the running build has.
 - `openConsole`, `spawn`, `resize` and `closeConsole` run on the main thread and take the kernel's
   BKL (the `Pty` javadoc wrongly says everything but `start` runs on background threads).
-- Typing blocks the main thread once Termux's 4 KB input queue is full (inherited).
+- Typing blocks the main thread once Termux's 4 KB input queue is full (inherited); a
+  libghostty-vt tab writes on its own thread, so only that tab's input waits.
 - Console numbers are freed at close and reused lowest-first by the kernel, and a close carries no
   generation, so closing a stale number closes whichever console now has it.
 
-### Experimental terminal
+### libghostty-vt
 
 - A tab refers to its kernel by handle and looks it up for each call (each console read of the
   pump, each reply write, each resize), like the `Native` functions: `Native.stop` and `shutdown`
   only end the processes, and the store is closed when the last `Arc<Machine>` goes, so a tab
   holding one would keep the old store open after a reboot, tier change or distro switch, and the
-  next kernel would start without the boot cleanup. The pump still holds the kernel during a read,
-  which returns once the shutdown has ended the shell; the service does not wait for that, since
-  `VtActivity` does not close its console on `onRestarting` as the service's own tabs are closed.
+  next kernel would start without the boot cleanup. The service releases its tabs (closing their
+  consoles) before shutting the kernel down, so the pump's read returns first.
+- A `VtSession` closes its console exactly once (`hangUp`), so the Termux double close (below)
+  cannot happen to it.
 - libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock; the frame buffer is
   written only by `frame`, which only the main thread calls, so the main thread reads it after the
   lock is released.
@@ -256,40 +284,34 @@ feature that compiles libghostty-vt (`android/native`).
   full one (the render state redraws everything when the screen's selection changes).
 - With the IME shown, a hardware Esc press is taken by the IME (Gboard hides itself), so a program
   using the Kitty protocol's release events sees only the release.
-- The session is not a `TerminalService` tab: it is not saved or restored, kill reports do not reach
-  it, and `VtActivity` ignores `onExitAll` and `onRestarting`, so after a reboot, tier change or
-  exit it stays open with an ended session (a later `onMachineReady` does not start another).
-- Zoom is not saved. Opening the app from the launcher brings the `singleTask` `MainActivity` to the
-  front and so closes `VtActivity` above it.
+- `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
+  injected keys) the system would cover the whole view with a translucent grey.
+- `VtView`, `VtSession` and `VtNative` are in the main source set, but only debug builds with
+  `vt` use them; the fonts they load are only in the debug assets.
 
 ## Confirmed bugs / technical debt
 
-- **Closing a tab can hang up another tab.** A running tab's console is closed by `finishIfRunning`
-  and again by `cleanupResources` once the old shell has exited (plus up to 0.5 s; unbounded if it
-  ignores SIGHUP); a tab opened or first shown in between (a restored tab revealed by the close, or
-  "+") can get the same number and is hung up by the second close.
-- **Special extra keys crash without a session.** The extra-keys row stays tappable during startup,
-  progress and a failed first start; ESC, TAB and the arrows reach `TerminalView.handleKeyCode`,
-  which dereferences the null session (character keys are guarded).
-- **A console leaks when spawning the shell fails.** `Pty.start` opens the console first; if `spawn`
-  throws the session is marked finished without closing it, and nothing closes it until the kernel
-  stops. `VtActivity` leaks the same way and tries again on every later grid change (zoom,
-  rotation, IME), leaking one more console each time.
-- **The experimental terminal lacks** titles and the bell, tabs, mouse drags and motion for
-  programs (only clicks and the wheel are sent), double- and triple-tap or rectangular selection,
-  and handles that flip at the screen edges (a selection starting at column 0 has its start
-  handle mostly off-screen); the plan is tabs in `TerminalService` next (save and restore, kill
-  reports), then removing the Termux view.
-- **Tab saves during full-screen programs lose the scrollback.** `getTranscriptText` reads the
-  current screen, which is the alternate buffer (no scrollback) while vim or less runs, and replaces
-  the earlier save.
-- **Enter from the IME does not close a finished tab.** Only a `KEYCODE_ENTER` key event closes it;
-  keyboards that commit `\n` as text go to the dead session and are dropped.
+- **Closing a Termux tab can hang up another tab.** A running tab's console is closed by
+  `finishIfRunning` and again by `cleanupResources` once the old shell has exited (plus up to 0.5 s;
+  unbounded if it ignores SIGHUP); a tab opened or first shown in between (a restored tab revealed
+  by the close, or "+") can get the same number and is hung up by the second close.
+- **A Termux tab leaks its console when spawning the shell fails.** `Pty.start` opens the console
+  first; if `spawn` throws the session is marked finished without closing it, and nothing closes it
+  until the kernel stops (a `VtSession` closes it).
+- **libghostty-vt tabs lack** the bell (Termux ignores it too), mouse drags and motion for programs
+  (only clicks and the wheel are sent), double- and triple-tap or rectangular selection, and
+  handles that flip at the screen edges (a selection starting at column 0 has its start handle
+  mostly off-screen). Making them the only kind (removing the Termux emulator) needs Zig in CI, the
+  Ghostty and JetBrains Mono notices and sources (`android/native`) and the fonts in the main
+  assets.
+- **Termux tab saves during full-screen programs lose the scrollback.** `getTranscriptText` reads
+  the current screen, which is the alternate buffer (no scrollback) while vim or less runs, and
+  replaces the earlier save (a `VtSession` keeps its last primary-screen transcript instead).
+- **Enter from the IME does not close a finished Termux tab.** Only a `KEYCODE_ENTER` key event
+  closes it; keyboards that commit `\n` as text go to the dead session and are dropped.
 
 ## Open questions
 
-- Should the extra keys be disabled until a session is attached?
-- Should saved transcripts come from the main buffer rather than the alternate screen?
 - Does the libghostty-vt view replace the Termux view (pending a check on a real device)? Should a
   Nerd Font or a CJK fallback font be bundled?
 
@@ -297,6 +319,6 @@ feature that compiles libghostty-vt (`android/native`).
 
 - Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
   (the root ignores cutout insets).
-- The experimental terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing
+- libghostty-vt tabs on real devices and 16 KB-page devices, and with CJK IMEs' composing
   text and floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34
   emulator with Gboard in English.

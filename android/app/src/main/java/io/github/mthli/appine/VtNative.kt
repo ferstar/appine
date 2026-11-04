@@ -3,10 +3,10 @@ package io.github.mthli.appine
 import java.nio.ByteBuffer
 
 /**
- * The JNI side of the experimental terminal view (`hosts/android/src/vt.rs`, the android/terminal
- * map): a libghostty-vt terminal per tab, fed from its kernel console inside the native library.
- * Present only when the native library was built with the `vt` feature (`-Pappine.vt=true`);
- * check [available] first.
+ * The JNI side of the libghostty-vt terminal (`hosts/android/src/vt.rs`, the android/terminal map):
+ * a terminal per [VtSession], fed from its kernel console inside the native library. Present only
+ * when the native library was built with the `vt` feature (debug builds with `-Pappine.vt=true`);
+ * check [available] first. Without it, tabs use the Termux emulator.
  */
 internal object VtNative {
     init {
@@ -32,10 +32,10 @@ internal object VtNative {
 
     /**
      * Blocks, moving console output into the terminal until the session ends or the console is
-     * closed; calls `view.onOutput()` (on this thread) when the screen changed after the last
-     * [frame].
+     * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
+     * [frame], and `session.onTitle()` when a program set the title.
      */
-    @JvmStatic external fun pump(tab: Long, view: VtView)
+    @JvmStatic external fun pump(tab: Long, session: VtSession)
 
     /**
      * The rows that changed since the last frame, all of them with [full] (the frame format is in
@@ -94,6 +94,21 @@ internal object VtNative {
 
     /** The selection as plain text (soft wraps joined, trailing blanks trimmed), null for none. */
     @JvmStatic external fun copy(tab: Long): String?
+
+    /** The title a program set (OSC 0/2); null when none. */
+    @JvmStatic external fun title(tab: Long): String?
+
+    /**
+     * Shows a yellow line of app notice above the cursor's line (a kill report); false on the
+     * alternate screen, where nothing is written.
+     */
+    @JvmStatic external fun message(tab: Long, text: String): Boolean
+
+    /**
+     * The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed),
+     * for saving tabs; null on the alternate screen or on failure.
+     */
+    @JvmStatic external fun transcript(tab: Long): String?
 
     /** Shows bytes from the app as if the console had printed them. */
     @JvmStatic external fun print(tab: Long, data: ByteArray)

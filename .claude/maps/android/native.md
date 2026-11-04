@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the `vt` feature and Gradle property that build libghostty-vt for the experimental terminal)
+> Maintained: 2026-11-04 (targeted verification: the `vt` feature and Gradle property that build libghostty-vt, which the tabs use when present)
 
 ## Responsibilities
 
@@ -16,7 +16,7 @@
 - `Native.kt`, the Kotlin facade;
 - the Gradle build: the native library via cargo-ndk, the rootfs, doas and notice assets,
   per-variant features, SDK levels, packaging;
-- building libghostty-vt with Zig for the experimental terminal (the `vt` feature);
+- building libghostty-vt with Zig for the tabs' terminal (the `vt` feature);
 - the manifest and debug-only resources;
 - the instrumentation tests (`MachineTest`);
 - the source bundles released with the APK (`scripts/release-sources`).
@@ -24,12 +24,12 @@
 Root: `hosts/android/` (except `src/vt.c` and `src/vt.rs`),
 `android/app/src/main/java/io/github/mthli/appine/Native.kt`, `android/app/build.gradle.kts` and
 the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app/src/debug/`
-(except the experimental terminal's code, fonts and strings), `android/app/src/androidTest/`,
+(except the libghostty-vt fonts), `android/app/src/androidTest/`,
 `scripts/release-sources`, `scripts/fetch-ghostty`.
 
 Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
-what the app does with them (the other `android/*` modules), including the experimental terminal's
-emulator shim, its JNI functions and its views (`android/terminal`).
+what the app does with them (the other `android/*` modules), including the libghostty-vt
+terminal's emulator shim, JNI functions, sessions and views (`android/terminal`).
 
 ## Key types
 
@@ -62,8 +62,8 @@ emulator shim, its JNI functions and its views (`android/terminal`).
   `waitFor` −9, `openConsole`/`spawn` throw, the rest do nothing.
 - Errors become `IOException` (`FileNotFoundException` for browse calls) or sentinel values.
 - Callers are JVM threads (the service's worker and boot threads, the terminal's reader, writer and
-  waiter threads, the main thread, provider binder threads, the experimental terminal's pump
-  thread, which `vt.rs` calls back into Java from inside `pump`); guest and timer threads never
+  waiter threads, the main thread, provider binder threads, the libghostty-vt tabs' pump
+  threads, which `vt.rs` calls back into Java from inside `pump`); guest and timer threads never
   call back into Java.
 
 ### stderr and panics
@@ -94,8 +94,7 @@ emulator shim, its JNI functions and its views (`android/terminal`).
   so 16 KB-aligned `LOAD` segments (NDK 29's default) map directly from the APK.
 - Manifest: launcher and settings activities, the `specialUse` foreground service with its subtype
   property, the documents provider, a handful of normal permissions (no storage permission); the
-  debug network security config allows cleartext to 127.0.0.1 only, and the debug manifest declares
-  the non-exported `VtActivity`.
+  debug network security config allows cleartext to 127.0.0.1 only.
 
 ### Released sources
 
@@ -117,18 +116,19 @@ emulator shim, its JNI functions and its views (`android/terminal`).
 
 ### Inbound
 
-- `TerminalService`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; the experimental
+- `TerminalService`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; the libghostty-vt
   terminal (`android/terminal`) through the `vt` feature's build.
 
 ### Outbound
 
 - `appine_kernel` (`Machine`, store and browse functions), `jni` 0.21, `libc`, Android `liblog`;
   cargo-ndk and NDK 29; AGP.
-- With `vt`: Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate.
+- With `vt`: Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate;
+  the app's tabs then use libghostty-vt instead of the Termux emulator.
 
 ## Invariants and gotchas
 
-- JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the experimental
+- JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the libghostty-vt
   terminal's functions).
 - The crate is empty on non-Android hosts; `build.rs` does nothing there or without `vt`.
 - Zig's HTTP client fails through some proxies (HTTP 400), so `scripts/fetch-ghostty` and `build.rs`

@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="vt_unavailable">这个版本没有实验终端：构建时加上 -Pappine.vt=true</string>
-    <string name="vt_exited">[进程已结束（%1$d）]</string>
-    <string name="vt_paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
-    <string name="vt_paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
-</resources>

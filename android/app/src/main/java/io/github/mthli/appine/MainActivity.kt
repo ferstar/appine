@@ -28,6 +28,7 @@ import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import com.termux.terminal.KeyHandler
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
@@ -35,17 +36,22 @@ import com.termux.view.TerminalViewClient
 /**
  * The terminal screen: the tab bar on top, the terminal in the middle, and below it the keys the
  * soft keyboard lacks (Esc, Ctrl, arrows and so on).
- * Sessions belong to [TerminalService]; this only handles display and input.
+ * Sessions belong to [TerminalService]; this only handles display and input. The terminal is a
+ * [VtView] when the native library has libghostty-vt ([VtNative.available], as the service's
+ * sessions then are [VtSession]s), else Termux's [TerminalView].
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
-    private lateinit var terminal: TerminalView
+    /** Exactly one of the two views exists, the one the service's sessions need. */
+    private var terminal: TerminalView? = null
+    private var vtView: VtView? = null
+    private lateinit var screen: View
     private lateinit var tabs: LinearLayout
     private lateinit var status: TextView
     private lateinit var keys: ExtraKeysView
 
     private var service: TerminalService? = null
-    private var current: TerminalSession? = null
+    private var current: Session? = null
     private var fontSize = 0
 
     private val connection = object : ServiceConnection {
@@ -68,13 +74,20 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         fontSize = getPreferences(MODE_PRIVATE).getInt(PREF_FONT_SIZE, dp(12))
-        terminal = TerminalView(this, null).apply {
-            setTerminalViewClient(ViewClient())
-            setTextSize(fontSize)
-            setTypeface(Typeface.MONOSPACE)
-            setBackgroundColor(Color.BLACK)
-            isFocusable = true
-            isFocusableInTouchMode = true
+        screen = if (VtNative.available) {
+            VtView(this, VtHost()).apply {
+                setFontSize(fontSize.toFloat())
+                setBackgroundColor(Color.BLACK)
+            }.also { vtView = it }
+        } else {
+            TerminalView(this, null).apply {
+                setTerminalViewClient(ViewClient())
+                setTextSize(fontSize)
+                setTypeface(Typeface.MONOSPACE)
+                setBackgroundColor(Color.BLACK)
+                isFocusable = true
+                isFocusableInTouchMode = true
+            }.also { terminal = it }
         }
         status = TextView(this).apply {
             setTextColor(Color.LTGRAY)
@@ -82,7 +95,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             setText(R.string.starting)
         }
         tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        keys = ExtraKeysView(this) { terminal }
+        keys = ExtraKeysView(this, Keys())
 
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -96,7 +109,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
-            addView(terminal)
+            addView(screen)
             addView(status)
         }
         val root = LinearLayout(this).apply {
@@ -137,18 +150,24 @@ class MainActivity : Activity(), TerminalService.Listener {
         super.onStop()
     }
 
+    override fun onDestroy() {
+        // Sessions outlive the Activity: do not leave them pointing at this view
+        vtView?.attach(null)
+        super.onDestroy()
+    }
+
     // ---- TerminalService.Listener ----
 
     override fun onMachineReady(error: String?) {
         val s = service ?: return
         if (error != null) {
-            terminal.visibility = View.INVISIBLE
+            screen.visibility = View.INVISIBLE
             status.visibility = View.VISIBLE
             status.text = getString(R.string.start_failed, error)
             return
         }
         status.visibility = View.GONE
-        terminal.visibility = View.VISIBLE
+        screen.visibility = View.VISIBLE
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
@@ -158,7 +177,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onProgress(text: String) {
-        terminal.visibility = View.INVISIBLE
+        screen.visibility = View.INVISIBLE
         status.visibility = View.VISIBLE
         status.text = text
     }
@@ -190,8 +209,8 @@ class MainActivity : Activity(), TerminalService.Listener {
         renderTabs()
     }
 
-    override fun onTextChanged(session: TerminalSession) {
-        if (session == current) terminal.onScreenUpdated()
+    override fun onTextChanged(session: Session) {
+        if (session === current) terminal?.onScreenUpdated()
     }
 
     override fun onExitAll() {
@@ -200,7 +219,8 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onRestarting() {
         current = null
-        terminal.visibility = View.INVISIBLE
+        vtView?.attach(null)
+        screen.visibility = View.INVISIBLE
         status.visibility = View.VISIBLE
         status.setText(R.string.restarting)
     }
@@ -210,14 +230,6 @@ class MainActivity : Activity(), TerminalService.Listener {
             menu.add(R.string.menu_settings).setOnMenuItemClickListener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                 true
-            }
-            // The experimental terminal on libghostty-vt exists only in the debug source set
-            if (BuildConfig.DEBUG) {
-                menu.add(R.string.menu_experimental_terminal).setOnMenuItemClickListener {
-                    val name = MainActivity::class.java.name.substringBeforeLast('.') + ".VtActivity"
-                    startActivity(Intent().setClassName(this@MainActivity, name))
-                    true
-                }
             }
             show()
         }
@@ -231,16 +243,22 @@ class MainActivity : Activity(), TerminalService.Listener {
         show(s.createSession())
     }
 
-    private fun show(session: TerminalSession) {
+    private fun show(session: Session) {
         current = session
         service?.current = session
-        terminal.attachSession(session)
-        terminal.onScreenUpdated()
-        terminal.requestFocus()
+        when (session) {
+            is TermuxSession -> terminal?.apply {
+                attachSession(session.terminal)
+                onScreenUpdated()
+            }
+            // Starts the shell once the view knows the grid (VtHost.onGrid)
+            is VtSession -> vtView?.attach(session)
+        }
+        screen.requestFocus()
         renderTabs()
     }
 
-    private fun close(session: TerminalSession) {
+    private fun close(session: Session) {
         service?.removeSession(session)
     }
 
@@ -271,8 +289,62 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun showKeyboard() {
-        terminal.requestFocus()
-        getSystemService(InputMethodManager::class.java).showSoftInput(terminal, 0)
+        screen.requestFocus()
+        getSystemService(InputMethodManager::class.java).showSoftInput(screen, 0)
+    }
+
+    /** The extra keys go to the tab's view. */
+    private inner class Keys : ExtraKeysView.Target {
+        override fun key(keyCode: Int) {
+            vtView?.let {
+                it.press(keyCode)
+                return
+            }
+            // Through TerminalView, so modifiers and the terminal's key modes (application cursor
+            // keys, say) take effect; it needs a session
+            val view = terminal?.takeIf { it.currentSession != null } ?: return
+            var mod = 0
+            if (keys.consumeCtrl()) mod = mod or KeyHandler.KEYMOD_CTRL
+            if (keys.consumeAlt()) mod = mod or KeyHandler.KEYMOD_ALT
+            view.handleKeyCode(keyCode, mod)
+        }
+
+        override fun text(text: String) {
+            vtView?.let {
+                it.type(text)
+                return
+            }
+            // TerminalView reads Ctrl and Alt itself (ViewClient.readControlKey)
+            val view = terminal?.takeIf { it.currentSession != null } ?: return
+            for (c in text) view.inputCodePoint(KeyEvent.KEYCODE_UNKNOWN, c.code, false, false)
+        }
+    }
+
+    /** The [VtView]'s side: starting the shell, input, zoom and the extra keys' modifiers. */
+    private inner class VtHost : VtView.Host {
+        override fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {
+            (current as? VtSession)?.start(cols, rows, cellWidth, cellHeight)
+        }
+
+        override fun onInput(data: ByteArray) {
+            val session = current as? VtSession ?: return
+            if (session.isRunning) {
+                session.write(data)
+            } else if (data.any { it == '\r'.code.toByte() || it == '\n'.code.toByte() }) {
+                // When the session has ended, Enter closes it, as in Termux (from the IME too)
+                close(session)
+            }
+        }
+
+        override fun onZoom(fontPx: Int) {
+            fontSize = fontPx
+            getPreferences(MODE_PRIVATE).edit().putInt(PREF_FONT_SIZE, fontSize).apply()
+        }
+
+        override val ctrl: Boolean get() = keys.ctrl
+        override val alt: Boolean get() = keys.alt
+
+        override fun modifiersUsed() = keys.modifiersUsed()
     }
 
     /** TerminalView callbacks: input, zoom, key modifiers. */
@@ -280,7 +352,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun onScale(scale: Float): Float {
             if (scale in 0.9f..1.1f) return scale
             fontSize = (fontSize + if (scale > 1f) dp(1) else -dp(1)).coerceIn(dp(6), dp(32))
-            terminal.setTextSize(fontSize)
+            terminal?.setTextSize(fontSize)
             getPreferences(MODE_PRIVATE).edit().putInt(PREF_FONT_SIZE, fontSize).apply()
             return 1f
         }
@@ -300,7 +372,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun onKeyDown(keyCode: Int, e: KeyEvent, session: TerminalSession): Boolean {
             // When the session has ended, Enter closes it, as in Termux
             if (!session.isRunning && keyCode == KeyEvent.KEYCODE_ENTER) {
-                close(session)
+                current?.let { close(it) }
                 return true
             }
             return false

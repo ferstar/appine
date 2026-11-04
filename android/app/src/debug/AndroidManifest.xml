@@ -1,14 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <application android:networkSecurityConfig="@xml/network_security_config">
-
-        <!-- The experimental terminal on libghostty-vt (the android/terminal map), opened from the
-             main screen's menu in debug builds -->
-        <activity
-            android:name=".VtActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
-            android:exported="false"
-            android:windowSoftInputMode="adjustResize" />
-    </application>
+    <application android:networkSecurityConfig="@xml/network_security_config" />
 </manifest>

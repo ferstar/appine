@@ -45,8 +45,10 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * The experimental terminal view (android/terminal map): draws one tab's libghostty-vt terminal
- * ([VtNative]) with JetBrains Mono on a fixed cell grid.
+ * The terminal view on libghostty-vt (the android/terminal map), used for the tabs when the native
+ * library has the `vt` feature: draws the [VtSession] attached to it with JetBrains Mono on a fixed
+ * cell grid. Sessions belong to [TerminalService] and keep parsing output while no view shows them;
+ * [attach] switches the view to another tab.
  *
  * Each frame takes the rows that changed ([VtNative.frame]) into a mirror of the screen and paints
  * them into a bitmap the size of the grid; the cursor and the input method's composing text are
@@ -64,26 +66,60 @@ import kotlin.math.roundToInt
 @SuppressLint("ViewConstructor") // Created only in code
 internal class VtView(context: Context, private val host: Host) : View(context) {
 
+    /** The Activity's side (all on the main thread). */
     interface Host {
-        /** The grid's size, first known or changed (main thread). */
+        /** The grid's size, first known or changed. */
         fun onGrid(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int)
 
-        /** Bytes for the program: keys and text (main thread). */
+        /** Bytes for the program: keys, text, pastes, mouse and focus events. */
         fun onInput(data: ByteArray)
+
+        /** Pinch zoom changed the font size (pixels), to keep for next time. */
+        fun onZoom(fontPx: Int)
+
+        /** The extra keys' one-shot Ctrl and Alt, which apply to the next key or character. */
+        val ctrl: Boolean
+        val alt: Boolean
+
+        /** The next key or character took the one-shot modifiers. */
+        fun modifiersUsed()
     }
 
-    /** The tab shown, 0 for none; frames are taken only once it is set. */
-    var tab = 0L
-        set(value) {
-            field = value
-            full = true
-            invalidate()
-        }
+    /** The tab shown, null for none. */
+    var session: VtSession? = null
+        private set
 
-    /** One-shot modifiers from the extra keys: they apply to the next key or character. */
-    var ctrlOnce = false
-    var altOnce = false
-    var onModifiersUsed: (() -> Unit)? = null
+    /** The shown tab's terminal, 0 when there is none or its shell has not started. */
+    private val tab: Long get() = session?.tab ?: 0L
+
+    /**
+     * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
+     * again, and a selection drag or menu of the previous tab ends.
+     */
+    fun attach(s: VtSession?) {
+        if (s === session) return
+        session?.let { if (it.view === this) it.view = null }
+        menu?.finish()
+        drag = DRAG_NONE
+        autoscroll = 0
+        removeCallbacks(autoscrollTick)
+        selected = false
+        session = s
+        s?.view = this
+        if (s != null && cols > 0) {
+            s.resize(cols, rows, cellWidth, cellHeight)
+            // A tab whose shell has not started yet starts on this grid
+            host.onGrid(cols, rows, cellWidth, cellHeight)
+        }
+        full = true
+        invalidate()
+    }
+
+    /** The session's shell started: take the whole screen. */
+    fun onStarted() {
+        full = true
+        invalidate()
+    }
 
     private val upright = font("fonts/JetBrainsMono.ttf", 400)
     private val paints = arrayOf(
@@ -97,7 +133,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private val curl = Path()
     private val glyphs = VtGlyphs()
 
-    /** The same default as the main screen's Termux view (12 dp), for comparing the two. */
+    /** The font size in pixels; [MainActivity] keeps it across starts, as for the Termux view. */
     private var fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics)
     private var cellWidth = 1
     private var cellHeight = 1
@@ -205,6 +241,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+        // Otherwise, focused outside touch mode (after hardware keys), the whole view is covered by
+        // the system's translucent focus highlight
+        defaultFocusHighlightEnabled = false
         measureCells()
     }
 
@@ -274,25 +313,28 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         bitmap?.recycle()
         bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888).also { canvas = Canvas(it) }
         full = true
-        if (tab != 0L) VtNative.resize(tab, c, r, cellWidth, cellHeight)
+        session?.resize(c, r, cellWidth, cellHeight)
         host.onGrid(c, r, cellWidth, cellHeight)
         invalidate()
     }
 
-    private fun zoom(step: Int) {
+    /** Sets the font size in pixels (kept within 6–32 dp). */
+    fun setFontSize(px: Float) {
         val density = resources.displayMetrics.density
-        val px = (fontPx + step * density).coerceIn(6 * density, 32 * density)
-        if (px == fontPx) return
-        fontPx = px
+        val size = px.coerceIn(6 * density, 32 * density)
+        if (size == fontPx) return
+        fontPx = size
         measureCells()
         regrid()
     }
 
-    // ---- Frames ----
+    private fun zoom(step: Int) {
+        val before = fontPx
+        setFontSize(fontPx + step * resources.displayMetrics.density)
+        if (fontPx != before) host.onZoom(fontPx.roundToInt())
+    }
 
-    /** Called by [VtNative.pump] on its thread when the screen changed. */
-    @Suppress("unused") // From vt.rs
-    fun onOutput() = postInvalidateOnAnimation()
+    // ---- Frames ----
 
     override fun onDraw(c: Canvas) {
         c.drawColor(defaultBg)
@@ -656,7 +698,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /** Text from the input method or the extra keys; one character with a one-shot modifier is a key. */
     fun type(text: String) {
-        if ((ctrlOnce || altOnce) && text.codePointCount(0, text.length) == 1) {
+        if ((host.ctrl || host.alt) && text.codePointCount(0, text.length) == 1) {
             val events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(text.toCharArray())
             val down = events?.firstOrNull { it.action == KeyEvent.ACTION_DOWN && it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT }
             if (down != null && key(down)) return
@@ -696,8 +738,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             return true
         }
         var mods = VtKeys.mods(event.metaState)
-        if (ctrlOnce) mods = mods or VtKeys.MOD_CTRL
-        if (altOnce) mods = mods or VtKeys.MOD_ALT
+        if (host.ctrl) mods = mods or VtKeys.MOD_CTRL
+        if (host.alt) mods = mods or VtKeys.MOD_ALT
         val plain = event.getUnicodeChar(
             event.metaState and (KeyEvent.META_CTRL_MASK or KeyEvent.META_ALT_MASK or KeyEvent.META_META_MASK).inv(),
         )
@@ -716,11 +758,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val unshifted = event.getUnicodeChar(0)
         val consumed = if (mods and VtKeys.MOD_SHIFT != 0 && text != null && plain != unshifted) VtKeys.MOD_SHIFT else 0
         val bytes = VtNative.key(tab, key, mods, consumed, action, text, unshifted) ?: return true
-        if (ctrlOnce || altOnce) {
-            ctrlOnce = false
-            altOnce = false
-            onModifiersUsed?.invoke()
-        }
+        if (host.ctrl || host.alt) host.modifiersUsed()
         input(bytes)
         return true
     }
@@ -866,8 +904,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
         AlertDialog.Builder(context)
-            .setTitle(R.string.vt_paste_unsafe_title)
-            .setMessage(context.getString(R.string.vt_paste_unsafe, preview))
+            .setTitle(R.string.paste_unsafe_title)
+            .setMessage(context.getString(R.string.paste_unsafe, preview))
             .setPositiveButton(android.R.string.paste) { _, _ ->
                 if (tab != 0L) input(VtNative.paste(tab, text, true))
             }

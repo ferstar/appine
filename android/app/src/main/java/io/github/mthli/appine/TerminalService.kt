@@ -64,8 +64,8 @@ class TerminalService : Service() {
         /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
 
-        /** A session's screen content changed. */
-        fun onTextChanged(session: TerminalSession) {}
+        /** A Termux session's screen content changed (libghostty-vt sessions redraw their view themselves). */
+        fun onTextChanged(session: Session) {}
 
         /** Exit all: the user chose "Exit all" in the notification, or the guest shut down. */
         fun onExitAll() {}
@@ -201,16 +201,17 @@ class TerminalService : Service() {
     /** [network] is registered. */
     private var watchingNetwork = false
 
-    val sessions = mutableListOf<TerminalSession>()
-
-    /** Each session's PTY (saving tabs needs its console and login account). */
-    private val ptys = HashMap<TerminalSession, ConsolePty>()
+    /**
+     * The tabs, on libghostty-vt when the native library has it ([VtNative.available]), else on the
+     * Termux emulator.
+     */
+    val sessions = mutableListOf<Session>()
 
     /**
      * The saved copy of restored sessions not shown yet (their emulator is not created yet, so the
      * transcript and the directory are still the original ones).
      */
-    private val unshown = HashMap<TerminalSession, Tabs.Tab>()
+    private val unshown = HashMap<Session, Tabs.Tab>()
 
     /**
      * Tabs saved when the system last killed the app, restored after the kernel first comes up (the
@@ -219,11 +220,11 @@ class TerminalService : Service() {
     private var restore: Tabs.Saved? = null
 
     /** The tab to show after restoring (taken by the Activity). */
-    var focus: TerminalSession? = null
+    var focus: Session? = null
         private set
 
     /** The tab the Activity is showing (saving tabs records which one it is). */
-    var current: TerminalSession? = null
+    var current: Session? = null
 
     /**
      * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
@@ -282,13 +283,18 @@ class TerminalService : Service() {
     /** A UI may remove itself during a callback, so iterate over a copy. */
     private fun each(f: (Listener) -> Unit) = listeners.toList().forEach(f)
 
+    /** The [Session] of a Termux session. */
+    private fun termux(terminal: TerminalSession): Session? =
+        sessions.firstOrNull { it is TermuxSession && it.terminal === terminal }
+
     /**
-     * Callbacks shared by all sessions: sessions outlive the Activity, so events go to the current
-     * Activity (if any).
+     * Callbacks shared by all Termux sessions: sessions outlive the Activity, so events go to the
+     * current Activity (if any).
      */
     private val client = object : TerminalSessionClient {
         override fun onTextChanged(changedSession: TerminalSession) {
-            each { it.onTextChanged(changedSession) }
+            val session = termux(changedSession) ?: return
+            each { it.onTextChanged(session) }
         }
 
         override fun onTitleChanged(changedSession: TerminalSession) {
@@ -313,7 +319,8 @@ class TerminalService : Service() {
         override fun onBell(session: TerminalSession) {}
 
         override fun onColorsChanged(session: TerminalSession) {
-            each { it.onTextChanged(session) }
+            val s = termux(session) ?: return
+            each { it.onTextChanged(s) }
         }
 
         override fun onTerminalCursorStateChange(state: Boolean) {}
@@ -348,6 +355,17 @@ class TerminalService : Service() {
 
         override fun logStackTrace(tag: String?, e: Exception?) {
             Log.e(tag, "", e)
+        }
+    }
+
+    /** What libghostty-vt sessions report; their screens go to their views directly. */
+    private val vtEvents = object : VtSession.Events {
+        override fun onTitleChanged(session: VtSession) {
+            each { it.onSessionsChanged() }
+        }
+
+        override fun onFinished(session: VtSession) {
+            each { it.onSessionsChanged() }
         }
     }
 
@@ -738,9 +756,8 @@ class TerminalService : Service() {
         updateWakeLock()
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
-        for (s in sessions) s.finishIfRunning()
+        for (s in sessions) s.release()
         sessions.clear()
-        ptys.clear()
         unshown.clear()
         sessionsChanged()
         return m
@@ -768,7 +785,7 @@ class TerminalService : Service() {
         // never gets here
         Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        for (s in sessions) s.finishIfRunning()
+        for (s in sessions) s.release()
         sessions.clear()
         val m = machine
         machine = 0
@@ -809,22 +826,25 @@ class TerminalService : Service() {
 
     /**
      * Opens a new terminal session (a login shell), logged in as [account] and starting in [cwd]
-     * (null is the home directory). The shell starts when the window size is first known.
+     * (null is the home directory), on libghostty-vt when the native library has it, else on the
+     * Termux emulator. The shell starts when the window size is first known.
      */
-    fun createSession(account: String = login, cwd: String? = null): TerminalSession {
+    fun createSession(account: String = login, cwd: String? = null): Session {
         val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
-        val session = TerminalSession(pty, TRANSCRIPT_ROWS, client)
+        val session = if (VtNative.available) {
+            VtSession(pty, machine, vtEvents)
+        } else {
+            TermuxSession(TerminalSession(pty, TRANSCRIPT_ROWS, client), pty)
+        }
         sessions.add(session)
-        ptys[session] = pty
         sessionsChanged()
         return session
     }
 
     /** Closes a session: the shell receives SIGHUP. */
-    fun removeSession(session: TerminalSession) {
-        session.finishIfRunning()
+    fun removeSession(session: Session) {
+        session.release()
         sessions.remove(session)
-        ptys.remove(session)
         unshown.remove(session)
         sessionsChanged()
     }
@@ -862,21 +882,20 @@ class TerminalService : Service() {
         val m = machine
         if (m == 0L) return
         main.removeCallbacks(saveSoon)
-        val live = sessions.filter { it.isRunning && it in ptys }
+        val live = sessions.filter { it.isRunning }
         val snapshot = live.map { s ->
-            val pty = ptys.getValue(s)
             val text = s.transcriptText
             // A restored tab not shown yet: its shell has not started, so save the original copy
             val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
-            Triple(pty, text ?: old?.transcript.orEmpty(), old?.cwd)
+            Triple(s, text ?: old?.transcript.orEmpty(), old?.cwd)
         }
         val index = live.indexOf(current).coerceAtLeast(0)
         runCatching {
             worker.execute {
-                val tabs = snapshot.map { (pty, text, oldCwd) ->
-                    val console = pty.console
+                val tabs = snapshot.map { (session, text, oldCwd) ->
+                    val console = session.console
                     val cwd = if (console >= 0) Native.consoleCwd(m, console) else oldCwd
-                    Tabs.Tab(pty.login, cwd, text)
+                    Tabs.Tab(session.login, cwd, text)
                 }
                 Tabs.save(this, tabs, index)
             }
@@ -931,7 +950,7 @@ class TerminalService : Service() {
             }
             else -> getString(R.string.killed_bug, comm, pid)
         }
-        val session = sessions.firstOrNull { ptys[it]?.console == console && console >= 0 }
+        val session = sessions.firstOrNull { it.console == console && console >= 0 }
         val shown = session?.showMessage("[appine] $text") == true
         if (shown && listeners.isNotEmpty() && !bug) return
         val id = KILL_NOTIFICATION_BASE + pid % 1000

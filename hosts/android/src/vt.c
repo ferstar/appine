@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The experimental terminal view's emulator (the `vt` feature, android/terminal map): one
+// The tabs' emulator when the app is built with the `vt` feature (android/terminal map): one
 // libghostty-vt terminal per tab, behind a small C ABI that vt.rs calls. This file only talks to
 // libghostty-vt; the console, threads and locking are vt.rs's.
 //
@@ -49,6 +49,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -135,8 +136,10 @@ typedef struct AppineVt {
   size_t grapheme_cap;
   // Scratch for one row's further codepoints
   Buf extras;
-  // The last text copied from the selection
-  Buf clip;
+  // The last text handed out (copy, title, transcript), valid until the next such call
+  Buf text;
+  // A program set the title (OSC 0/2) since appine_vt_take_title_changed
+  bool title_changed;
   // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -197,6 +200,12 @@ static GhosttyString on_xtversion(GhosttyTerminal t, void *userdata) {
   return (GhosttyString){.ptr = (const uint8_t *)name, .len = sizeof(name) - 1};
 }
 
+static void on_title_changed(GhosttyTerminal t, void *userdata) {
+  (void)t;
+  AppineVt *vt = userdata;
+  vt->title_changed = true;
+}
+
 // A hold began: capture the screen now, which is the frame the program wants to keep showing
 static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   AppineVt *vt = userdata;
@@ -243,6 +252,8 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
                        (const void *)on_device_attributes);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_XTVERSION, (const void *)on_xtversion);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, (const void *)on_render_hold);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
+                       (const void *)on_title_changed);
   size_t lines = SCROLLBACK_LINES;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
   // Grapheme clustering (mode 2027) by default, as in Ghostty (grapheme-width-method = unicode):
@@ -271,7 +282,7 @@ void appine_vt_free(AppineVt *vt) {
   free(vt->replies.ptr);
   free(vt->frame.ptr);
   free(vt->extras.ptr);
-  free(vt->clip.ptr);
+  free(vt->text.ptr);
   free(vt->grapheme);
   free(vt);
 }
@@ -621,6 +632,20 @@ ptrdiff_t appine_vt_focus(AppineVt *vt, bool gained, char *out, size_t cap) {
   return (ptrdiff_t)len;
 }
 
+// Copies text allocated by libghostty-vt into vt->text and frees it; NULL with len 0 when empty
+// or out of memory
+static const uint8_t *keep_text(AppineVt *vt, uint8_t *data, size_t data_len, size_t *len) {
+  vt->text.len = 0;
+  bool ok = data_len > 0 && buf_reserve(&vt->text, data_len);
+  if (ok) {
+    memcpy(vt->text.ptr, data, data_len);
+    vt->text.len = data_len;
+  }
+  ghostty_free(NULL, data, data_len);
+  *len = vt->text.len;
+  return ok ? vt->text.ptr : NULL;
+}
+
 // ---- Selection ----
 //
 // The selection itself is the terminal's (GHOSTTY_TERMINAL_OPT_SELECTION): it follows its cells
@@ -759,14 +784,118 @@ const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
       GHOSTTY_SUCCESS) {
     return NULL;
   }
-  vt->clip.len = 0;
-  bool ok = text_len > 0 && buf_reserve(&vt->clip, text_len);
-  if (ok) {
-    memcpy(vt->clip.ptr, text, text_len);
-    vt->clip.len = text_len;
+  return keep_text(vt, text, text_len, len);
+}
+
+// ---- Title, messages, transcript ----
+
+// Whether a program set the title since the last call
+bool appine_vt_take_title_changed(AppineVt *vt) {
+  bool changed = vt->title_changed;
+  vt->title_changed = false;
+  return changed;
+}
+
+// The title set by the program (OSC 0/2), empty when none; valid until the next text call
+const uint8_t *appine_vt_title(AppineVt *vt, size_t *len) {
+  *len = 0;
+  GhosttyString title = {0};
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_TITLE, &title) != GHOSTTY_SUCCESS ||
+      title.len == 0 || !buf_reserve(&vt->text, title.len)) {
+    return NULL;
   }
-  ghostty_free(NULL, text, text_len);
-  if (!ok) return NULL;
-  *len = vt->clip.len;
-  return vt->clip.ptr;
+  memcpy(vt->text.ptr, title.ptr, title.len);
+  vt->text.len = title.len;
+  *len = title.len;
+  return vt->text.ptr;
+}
+
+static bool is_alternate(AppineVt *vt) {
+  GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+  ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+  return screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
+}
+
+// Display width of UTF-8 text in cells (per codepoint; malformed bytes count as one cell each)
+static size_t utf8_width(const uint8_t *s, size_t len) {
+  size_t width = 0;
+  for (size_t i = 0; i < len;) {
+    uint32_t cp = s[i];
+    size_t n = cp < 0x80 ? 1 : (cp >> 5) == 0x6 ? 2 : (cp >> 4) == 0xe ? 3 : (cp >> 3) == 0x1e ? 4 : 0;
+    if (n == 0 || i + n > len) {
+      width++;
+      i++;
+      continue;
+    }
+    if (n > 1) cp &= 0x7f >> n;
+    for (size_t k = 1; k < n; k++) cp = (cp << 6) | (s[i + k] & 0x3f);
+    width += ghostty_unicode_codepoint_width(cp);
+    i += n;
+  }
+  return width;
+}
+
+// Shows a yellow line of app notice (a kill report) above the cursor's line, as the Termux
+// session does: move down and back as many lines as it takes (scrolling at the bottom), save the
+// cursor, insert the lines, write, restore the cursor and move it down. The prompt and a half-typed
+// command move down with it and the shell's line editing is unaffected. False on the alternate
+// screen (a full-screen program), where nothing is written.
+bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
+  if (is_alternate(vt)) return false;
+  size_t width = utf8_width(text, len);
+  size_t rows = (width + vt->cols - 1) / vt->cols;
+  if (rows > (size_t)vt->height - 1) rows = (size_t)vt->height - 1;
+  if (rows < 1) rows = 1;
+  char head[64], tail[32];
+  int head_len = snprintf(head, sizeof(head), "\x1b[%zuA\x1b" "7\r\x1b[%zuL\x1b[33m", rows, rows);
+  int tail_len = snprintf(tail, sizeof(tail), "\x1b[0m\x1b" "8\x1b[%zuB", rows);
+  Buf seq = {0};
+  bool ok = head_len > 0 && tail_len > 0 &&
+            buf_reserve(&seq, rows + (size_t)head_len + len + (size_t)tail_len);
+  if (ok) {
+    memset(seq.ptr, '\n', rows);
+    seq.len = rows;
+    memcpy(seq.ptr + seq.len, head, (size_t)head_len);
+    seq.len += (size_t)head_len;
+    memcpy(seq.ptr + seq.len, text, len);
+    seq.len += len;
+    memcpy(seq.ptr + seq.len, tail, (size_t)tail_len);
+    seq.len += (size_t)tail_len;
+    size_t replies = vt->replies.len;
+    ghostty_terminal_vt_write(vt->term, seq.ptr, seq.len);
+    // Nothing above asks for an answer; keep the console's replies as they were
+    vt->replies.len = replies;
+  }
+  free(seq.ptr);
+  return ok;
+}
+
+// The primary screen's text with its scrollback, soft-wrapped lines joined and trailing blanks
+// trimmed (saving tabs); valid until the next text call. NULL on the alternate screen, whose text
+// is not what the tab should come back with, and on failure.
+const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
+  *len = 0;
+  if (is_alternate(vt)) return NULL;
+  GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  options.unwrap = true;
+  options.trim = true;
+  options.extra = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalExtra);
+  options.extra.screen = GHOSTTY_INIT_SIZED(GhosttyFormatterScreenExtra);
+  GhosttyFormatter formatter = NULL;
+  if (ghostty_formatter_terminal_new(NULL, &formatter, vt->term, options) != GHOSTTY_SUCCESS) {
+    return NULL;
+  }
+  uint8_t *data = NULL;
+  size_t data_len = 0;
+  GhosttyResult r = ghostty_formatter_format_alloc(formatter, NULL, &data, &data_len);
+  ghostty_formatter_free(formatter);
+  if (r != GHOSTTY_SUCCESS) return NULL;
+  if (data_len == 0) {
+    // An empty screen: an empty transcript, not a failure
+    ghostty_free(NULL, data, 0);
+    static const uint8_t empty = 0;
+    return &empty;
+  }
+  return keep_text(vt, data, data_len, len);
 }

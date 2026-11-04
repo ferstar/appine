@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="vt_unavailable">This build has no experimental terminal: build with -Pappine.vt=true</string>
-    <string name="vt_exited">[Process completed (%1$d)]</string>
-    <string name="vt_paste_unsafe_title">Paste text that may run commands?</string>
-    <string name="vt_paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n%1$s</string>
-</resources>

@@ -8,23 +8,30 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.widget.LinearLayout
 import android.widget.TextView
-import com.termux.terminal.KeyHandler
-import com.termux.view.TerminalView
 
 /**
  * The keys the soft keyboard lacks. Ctrl and Alt are one-shot modifiers: pressed once, they apply
- * to the next key typed.
+ * to the next key typed, which reads them ([consumeCtrl], [consumeAlt], or [ctrl], [alt] and
+ * [modifiersUsed]).
  * Termux's extra keys bar belongs to its GPLv3 main module, so this is a rewrite (the
  * android/terminal map).
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
-internal class ExtraKeysView(
-    context: Context,
-    private val terminal: () -> TerminalView,
-) : LinearLayout(context) {
+internal class ExtraKeysView(context: Context, private val target: Target) : LinearLayout(context) {
 
-    private var ctrl = false
-    private var alt = false
+    /** Where the keys go: the terminal view of the tab shown. */
+    interface Target {
+        /** A special key (Esc, Tab, arrows); the one-shot modifiers are still to be read. */
+        fun key(keyCode: Int)
+
+        /** Plain characters; the one-shot modifiers are still to be read. */
+        fun text(text: String)
+    }
+
+    var ctrl = false
+        private set
+    var alt = false
+        private set
     private val ctrlKey: TextView
     private val altKey: TextView
 
@@ -65,6 +72,14 @@ internal class ExtraKeysView(
         }
     }
 
+    /** The next key or character took both one-shot modifiers. */
+    fun modifiersUsed() {
+        if (!ctrl && !alt) return
+        ctrl = false
+        alt = false
+        post { refresh() }
+    }
+
     private fun refresh() {
         ctrlKey.setTextColor(if (ctrl) Color.CYAN else Color.LTGRAY)
         altKey.setTextColor(if (alt) Color.CYAN else Color.LTGRAY)
@@ -84,20 +99,7 @@ internal class ExtraKeysView(
         return view
     }
 
-    /**
-     * Special keys: they go through TerminalView, so modifiers and the terminal's key modes
-     * (application cursor keys, say) take effect.
-     */
-    private fun send(keyCode: Int) {
-        var mod = 0
-        if (consumeCtrl()) mod = mod or KeyHandler.KEYMOD_CTRL
-        if (consumeAlt()) mod = mod or KeyHandler.KEYMOD_ALT
-        terminal().handleKeyCode(keyCode, mod)
-    }
+    private fun send(keyCode: Int) = target.key(keyCode)
 
-    /** Plain characters: Ctrl and Alt are read by TerminalView ([consumeCtrl], [consumeAlt]). */
-    private fun type(text: String) {
-        val view = terminal()
-        for (c in text) view.inputCodePoint(KeyEvent.KEYCODE_UNKNOWN, c.code, false, false)
-    }
+    private fun type(text: String) = target.text(text)
 }

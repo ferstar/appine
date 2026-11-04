@@ -470,11 +470,11 @@ abstract class NoticesTask : DefaultTask() {
 }
 
 /**
- * The experimental terminal view built on libghostty-vt (VtActivity in the debug source set, the
- * android/terminal map): with `-Pappine.vt=true` (or `appine.vt=true` in a gradle.properties) the
- * debug app's native library gets the `vt` feature, which needs Zig 0.17 and the source from
- * `scripts/fetch-ghostty`. Off by default, so builds without Zig (CI) still work; VtActivity then
- * says the library lacks it.
+ * The terminal on libghostty-vt (VtSession and VtView, the android/terminal map): with
+ * `-Pappine.vt=true` (or `appine.vt=true` in a gradle.properties) the debug app's native library
+ * gets the `vt` feature, which needs Zig 0.17 and the source from `scripts/fetch-ghostty`, and its
+ * tabs use it instead of the Termux emulator. Off by default, so builds without Zig (CI) still
+ * work.
  */
 val experimentalTerminal = providers.gradleProperty("appine.vt").map { it.toBoolean() }.getOrElse(false)
 

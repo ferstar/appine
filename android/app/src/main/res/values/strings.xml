@@ -17,7 +17,6 @@
     <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use port %2$d on this phone, so appine moved it there.</string>
     <string name="listening_direct">Other devices on the network can connect to it.</string>
     <string name="menu_settings">Settings</string>
-    <string name="menu_experimental_terminal">New terminal (experimental)</string>
     <string name="settings">Settings</string>
     <string name="settings_distro">Distribution</string>
     <string name="settings_mirror">Package mirror</string>
@@ -78,4 +77,6 @@
         <item quantity="one">%d service did not start</item>
         <item quantity="other">%d services did not start</item>
     </plurals>
+    <string name="paste_unsafe_title">Paste text that may run commands?</string>
+    <string name="paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n%1$s</string>
 </resources>

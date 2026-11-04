@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-04 (targeted verification: sessions are `Session`s, on libghostty-vt or Termux)
 
 ## Responsibilities
 
@@ -14,8 +14,8 @@ outlives an Activity:
 
 - the kernel handle (`machine`), starting, booting (inittab), shutting down, rebooting and
   replacing the kernel;
-- all terminal sessions and their PTY adapters, and restoring tabs after the process was killed
-  (`Tabs`);
+- all terminal sessions (`Session`s on libghostty-vt or on the Termux emulator, both
+  `android/terminal`), and restoring tabs after the process was killed (`Tabs`);
 - the ongoing notification and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories) and turns them into tab messages, notifications and lifecycle actions;
@@ -32,13 +32,15 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `TerminalService` — a same-process service; `LocalBinder` hands activities a direct reference.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onMachineReady(error)`,
-  `onProgress`, `onSessionsChanged`, `onTextChanged`, `onExitAll`, `onRestarting`,
-  `onSettingsChanged`, `onNotice`. Activities register in `onServiceConnected` and leave in
-  `onStop`; "UI visible" means at least one listener (Settings included).
+  `onProgress`, `onSessionsChanged`, `onTextChanged` (Termux sessions only; a libghostty-vt
+  session redraws its view itself), `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`.
+  Activities register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least
+  one listener (Settings included).
 - `worker` — a single-thread executor (`appine-worker`) that serialises native calls taking the
   BKL: poll, shutdown, stop, trim, routes, `consoleCwd`.
-- Session state: `sessions`, `ptys` (session → `ConsolePty`), `unshown` (restored tabs not yet
-  displayed), `restore` (saved tabs from a killed run), `focus`, `current`.
+- Session state: `sessions` (`Session`s, all of one kind per process), `unshown` (restored tabs not
+  yet displayed), `restore` (saved tabs from a killed run), `focus`, `current`; `client` (the Termux
+  sessions' callbacks, mapped back to their `Session`) and `vtEvents` (title changed, finished).
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`).
 - `Tabs` — the `files/tabs/` store: `running` marker, `index.json`, `t<i>.txt`; `Tab(login, cwd,
   transcript)`, `Saved(tabs, current, time)`.
@@ -84,8 +86,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   wake lock and clear saved tabs; restart the kernel if a listener came back meanwhile, else
   `stopSelf`.
 - `detach`: unregister the network callback, clear `machine` (before sessions end, so the UI does
-  not treat it as the last tab closing), update the wake lock, cancel poll and saves, finish and
-  clear all sessions.
+  not treat it as the last tab closing), update the wake lock, cancel poll and saves, release
+  (hang up and free) and clear all sessions; it runs before the kernel is shut down or stopped.
 - `restart` (guest reboot, tier change): `detach`, `onRestarting`, shutdown on the worker, then
   `start(null)`; the UI opens a new tab when the new kernel is ready and no sessions exist.
 - Distro switch/reset: download in the background (progress in Settings and the notification, both
@@ -103,11 +105,15 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ### Sessions, saving and restore
 
-- `createSession(login, cwd)` builds a `ConsolePty` and a `TerminalSession` (2000 rows); the shell
-  starts when the view first knows its size. The shared session client forwards events to all
-  listeners; clipboard requests are handled in the service.
-- Saving (`saveTabs`): for running sessions only, the transcript (plain text, last 256 K chars) on
-  the main thread and the foreground group's cwd (`consoleCwd`) on the worker; unshown restored tabs
+- `createSession(login, cwd)` builds a `ConsolePty` and, when the native library has the `vt`
+  feature (`VtNative.available`), a `VtSession`, else a `TermuxSession` around a `TerminalSession`
+  (2000 rows); the shell starts when the view first knows its size. The Termux client forwards
+  events to all listeners (clipboard requests are handled in the service); libghostty-vt sessions
+  report title changes and ends, and both become `onSessionsChanged`. `removeSession` releases the
+  session.
+- Saving (`saveTabs`): for running sessions only, the transcript (plain text, last 256 K chars;
+  `Session.transcriptText`) on the main thread and the foreground group's cwd (`consoleCwd` of the
+  session's console) on the worker; unshown restored tabs
   keep their saved data; files are written temp-then-rename and skipped when unchanged. Triggers:
   every 60 s, 2 s after a tab opens or closes, when the last listener leaves, on memory trim.
 - The `running` marker is written after a successful start and removed (with saved tabs) on a
@@ -117,12 +123,12 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ### Reports and notifications
 
-- Kill reports (one tab-separated line each): written into the tab whose console matches, in
-  yellow above the cursor line (skipped on the alternate screen); a notification follows when the
-  message could not be shown, when no listener exists (Settings counts as one) or when it is an
-  appine bug. Bugs always notify with "copy
-  report": app version and build, device (Android release and API, maker and model, ABI, page
-  size), distro and tier setting, the kernel's report line, and up to 10 earlier kernel log records.
+- Kill reports (one tab-separated line each): written into the tab whose console matches
+  (`Session.showMessage`), in yellow above the cursor line (skipped on the alternate screen); a
+  notification follows when the message could not be shown, when no listener exists (Settings
+  counts as one) or when it is an appine bug. Bugs always notify with "copy report": app version
+  and build, device (Android release and API, maker and model, ABI, page size), distro and tier
+  setting, the kernel's report line, and up to 10 earlier kernel log records.
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.
 - Listens: the first listen on a non-loopback address per (guest port, host port) pair and kernel
   (the kernel queues at most 32), with remap text when the ports differ.
@@ -140,8 +146,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `Native` (start, boot, shutdown, stop, trim, poll calls, routes, spawn, waitFor, consoleCwd);
   `Rootfs` (prepare, download, mirrors, ensure-files, access lock, reset, failed services); `Tabs`;
-  `ConsolePty` and the vendored `TerminalSession` (`setRestored`, `showMessage`,
-  `getTranscriptText`); `Documents` (`rootsChanged`, `dirsChanged`).
+  `ConsolePty`, `Session` (`TermuxSession` around the vendored `TerminalSession`, `VtSession`) and
+  `VtNative.available`; `Documents` (`rootsChanged`, `dirsChanged`).
 
 ## Invariants and gotchas
 
@@ -181,7 +187,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   only to its tab and no notification is posted.
 - **A restored "auto" tab may log in as another user**, since the saved value is the setting, which
   `login.sh` resolves again.
-- The console of a closed tab is closed twice, which can hang up a newly opened tab (see
+- The console of a closed Termux tab is closed twice, which can hang up a newly opened tab (see
   `android/terminal`).
 
 ## Open questions
