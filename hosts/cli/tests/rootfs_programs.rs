@@ -390,6 +390,28 @@ fn every_kind_of_wait_releases_the_bkl_without_borrows() {
 }
 
 #[test]
+fn tiocsti_needs_the_controlling_terminal_or_cap_sys_admin() {
+    // TIOCSTI as Linux 6.1 checks it (tests/guest/tiocsti.c); the differential test cannot
+    // compare the unprivileged cases, which newer distribution kernels refuse outright
+    let (Some(store), Some(program)) = (store(), build_static("tiocsti")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/tiocsti && chmod +x /tmp/tiocsti && /tmp/tiocsti";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn kernel_log_is_empty_and_keeps_console_levels() {
     // A new kernel's log is empty (appine writes no boot messages): dmesg prints nothing; the
     // console level dmesg -n changes is visible in /proc/sys/kernel/printk; with dmesg_restrict at

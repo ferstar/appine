@@ -1,3 +1,4 @@
+# docker-run-options: --cap-add SYS_ADMIN
 # PTY modes: TCGETS2, TCSETS2, TCSETSW2 and TCSETSF2 of struct termios2 (from glibc 2.42 on
 # tcgetattr, tcsetattr and isatty use only these), speed fields converted by CBAUD and CIBAUD
 # (Linux's set_termios), a PTY always being 8-bit, without parity and with receiving enabled
@@ -440,4 +441,58 @@ print("our master TIOCNOTTY", ask(m, TIOCNOTTY))
 os.kill(pid, 9)
 os.waitpid(pid, 0)
 print("leader gone: master pgrp", ask(m, TIOCGPGRP), "sid", ask(m, TIOCGSID))
+PY
+
+# TIOCSTI fakes input: only on the caller's controlling terminal, or with CAP_SYS_ADMIN (Linux's
+# tiocsti), so a process holding a terminal fd it got some other way (inherited after setsid or
+# su -c, passed over a socket) cannot type commands into the shell reading it. On a master the
+# byte goes to the master's own input (what master reads return), and a master is never the
+# controlling terminal. Since 6.2 dev.tty.legacy_tiocsti off (as distribution kernels ship it)
+# refuses everyone without CAP_SYS_ADMIN with EIO before 6.1's EPERM, so both count as refused, and
+# typing into one's own controlling terminal is tested only in appine (tests/guest/tiocsti.c)
+python3 - <<'PY'
+import errno, fcntl, functools, os, select
+
+print = functools.partial(print, flush=True)
+TIOCSCTTY, TIOCSTI = 0x540E, 0x5412
+
+
+def sti(fd, text):
+    try:
+        for c in text:
+            fcntl.ioctl(fd, TIOCSTI, c.encode())
+        return "ok"
+    except OSError as e:
+        return "refused" if e.errno in (errno.EPERM, errno.EIO) else errno.errorcode[e.errno]
+
+
+def pending(fd):
+    out = b""
+    while select.select([fd], [], [], 0.2)[0]:
+        out += os.read(fd, 100)
+    return out
+
+
+m, s = os.openpty()
+print("CAP_SYS_ADMIN on a slave that is not the ctty:", sti(s, "ab\n"), "slave reads", pending(s),
+      "master reads the echo", pending(m))
+print("CAP_SYS_ADMIN on the master:", sti(m, "z"), "master reads", pending(m), "slave reads",
+      pending(s))
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(r)
+    os.setgid(65534)
+    os.setuid(65534)
+    out = ["unprivileged, slave not its ctty: " + sti(s, "x")]
+    out.append("unprivileged, master: " + sti(m, "x"))
+    os.setsid()
+    fcntl.ioctl(s, TIOCSCTTY, 0)
+    out.append("unprivileged, master of its ctty: " + sti(m, "y"))
+    os.write(w, "\n".join(out).encode())
+    os._exit(0)
+os.close(w)
+print(os.read(r, 1000).decode())
+os.waitpid(pid, 0)
+print("nothing typed: slave reads", pending(s), "master reads", pending(m))
 PY

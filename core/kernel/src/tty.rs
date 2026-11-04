@@ -708,8 +708,9 @@ impl Tty {
         }
     }
 
-    /// TCIOFF and TCION on the slave: sends the STOP or START character to the master, regardless
-    /// of stopped output, ahead of the held echoes (Linux's `tty_send_xchar`).
+    /// TCIOFF and TCION on the slave send the STOP or START character to the master, and TIOCSTI
+    /// on the master puts a byte in its input: readable by the master regardless of stopped
+    /// output, ahead of the held echoes (Linux's `tty_send_xchar`).
     pub fn send_xchar(&mut self, c: u8) {
         let at = self.visible();
         self.output.insert(at, c);

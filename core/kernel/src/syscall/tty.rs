@@ -742,8 +742,21 @@ pub(crate) fn ioctl(
             let n = tty.borrow().output_len() as i32;
             put(cx, arg, n.to_le_bytes()).map(|()| 0)
         }
+        // Linux's tiocsti: only on the caller's controlling terminal, which a master never is, or
+        // with CAP_SYS_ADMIN; otherwise anyone holding a terminal fd (inherited across setsid or
+        // su -c, passed over a socket) could type commands into the shell reading it. On a master
+        // the byte goes to the master's own input, which master reads return (6.2's
+        // dev.tty.legacy_tiocsti, EIO without CAP_SYS_ADMIN when off, is not emulated)
         TIOCSTI => {
+            if (master || !is_ctty(cx, tty)) && !cx.cred().capable(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
             let c: [u8; 1] = get(cx, arg)?;
+            if master {
+                tty.borrow_mut().send_xchar(c[0]);
+                request_wake_object(wake::of(tty));
+                return Ok(0);
+            }
             let signals = tty.borrow_mut().write_input(&c);
             for sig in signals {
                 signal_fg(cx.kr(), tty, sig);

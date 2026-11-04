@@ -6,6 +6,8 @@
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
 > Maintained: 2026-11-04 (targeted verification: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty, `TIOCNOTTY` on a master is `ENOTTY`)
+>
+> Maintained: 2026-11-05 (targeted verification: `TIOCSTI` needs the controlling terminal or `CAP_SYS_ADMIN`, and on a master feeds the master's reads; removed the bug)
 
 ## Responsibilities
 
@@ -86,6 +88,11 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   line end can get through, and other bytes past 4095 are dropped silently (no bell, no echo). A
   full queue blocks the writer, returns `EAGAIN` or a short count. `TIOCSTI` bypasses the room
   check, so in raw mode it can grow the queue without limit.
+- `TIOCSTI` (Linux 6.1's `tiocsti`): on a slave that is the caller's controlling terminal, or with
+  `CAP_SYS_ADMIN`, the byte goes through `input_char`; otherwise `EPERM`. A master is never the
+  controlling terminal; with `CAP_SYS_ADMIN` its byte is added to what the master reads, ahead of
+  held output (`send_xchar`). 6.2's `dev.tty.legacy_tiocsti` (off in distribution kernels, `EIO`
+  for everyone without `CAP_SYS_ADMIN`) is not emulated.
 - Not implemented: `IUCLC`, `IMAXBEL`, `ECHOPRT`, `PARMRK`, `BRKINT`/`IGNBRK`, `HUPCL`,
   `VDISCARD`; `EXTPROC` only reports a packet-mode `IOCTL` and leaves local editing on.
 
@@ -220,11 +227,6 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 ## Confirmed bugs / technical debt
 
-- **`TIOCSTI` lets anyone type into a terminal:** it checks neither that the terminal is the
-  caller's controlling terminal nor `CAP_SYS_ADMIN`, so any process holding an fd to a pty
-  (inherited, passed over a socket, kept after `setsid` or util-linux `su -c`) can inject commands
-  into the shell reading it; on a master fd it injects into the slave instead of the master's own
-  queue (Linux 6.1 returns `EPERM`).
 - **`TIOCSCTTY` steals terminals without privilege:** argument 1 takes a terminal from another
   session with no `CAP_SYS_ADMIN` check, and neither it nor acquisition on open requires read
   access; a process that calls `setsid` and holds even a write-only fd (group tty has write access
