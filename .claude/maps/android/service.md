@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1; ended tabs no longer marked ✕)
+> Maintained: 2026-11-04 (targeted verification: sessions are libghostty-vt `VtSession`s; the Termux emulator removed; the tier setting read in debug builds only, release builds always start Tier 1; ended tabs no longer marked ✕; tab names: `renameSession`, saved and restored with the tabs)
 
 ## Responsibilities
 
@@ -42,14 +42,15 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   (saved tabs from a killed run), `focus`, `current`; `sessionEvents` (title changed, finished).
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`).
 - `Tabs` — the `files/tabs/` store: `running` marker, `index.json`, `t<i>.txt`; `Tab(login, cwd,
-  transcript)`, `Saved(tabs, current, time)`.
+  transcript, name)`, `Saved(tabs, current, time)`.
 - Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s.
 
 ## Public entry points
 
 - Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
   `START_NOT_STICKY`), `onTrimMemory`, `onDestroy`.
-- Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`, `exitAll`,
+- Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`,
+  `renameSession`, `exitAll`,
   `setTier` (ignored in a release build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setMirror`/`autoMirror`, `setLogin`, `setSystemDocuments`, `takeNotice`.
 - Static settings read by `Documents`: `login()`, `showSystemDocuments()`.
@@ -108,15 +109,18 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `createSession(login, cwd)` builds a `ConsolePty` and a `VtSession`; the shell starts when a
   view first knows its size. Sessions report title changes and ends, which become
-  `onSessionsChanged`. `removeSession` releases the session.
-- Saving (`saveTabs`): for running sessions only, the transcript (plain text, last 256 K chars;
-  `VtSession.transcriptText`) on the main thread and the foreground group's cwd (`consoleCwd` of
-  the session's console) on the worker; unshown restored tabs keep their saved data; files are
-  written temp-then-rename and skipped when unchanged. Triggers: every 60 s, 2 s after a tab opens
-  or closes, when the last listener leaves, on memory trim.
+  `onSessionsChanged`. `removeSession` releases the session. `renameSession` sets the tab's name
+  (`VtSession.name`; trimmed, blank clears it) and reports it like an opened or closed tab.
+- Saving (`saveTabs`): for running sessions only, the login setting, the name and the transcript
+  (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread and the foreground
+  group's cwd (`consoleCwd` of the session's console) on the worker; unshown restored tabs keep
+  their saved transcript and cwd; the name is an optional key of `index.json`, absent in tabs
+  saved before tabs had names. Files are written temp-then-rename and skipped when unchanged.
+  Triggers: every 60 s, 2 s after a tab opens, closes or is renamed, when the last listener leaves,
+  on memory trim.
 - The `running` marker is written after a successful start and removed (with saved tabs) on a
   normal exit; `takeKilled` deletes it and loads the tabs when it is present at service creation.
-- Restore: each saved tab reopens with its saved login setting and cwd, preceded by its old
+- Restore: each saved tab reopens with its saved login setting, cwd and name, preceded by its old
   transcript and a yellow notice with the save time; the saved current tab is focused.
 
 ### Reports and notifications

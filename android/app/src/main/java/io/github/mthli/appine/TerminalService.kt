@@ -769,6 +769,16 @@ class TerminalService : Service() {
         sessionsChanged()
     }
 
+    /**
+     * Names a tab ([VtSession.name]); a blank [name] clears it, so the program's title shows again.
+     * Saved with the tabs soon after.
+     */
+    internal fun renameSession(session: VtSession, name: String) {
+        if (session !in sessions) return
+        session.name = name.trim().takeIf { it.isNotEmpty() }
+        sessionsChanged()
+    }
+
     private fun sessionsChanged() {
         updateNotification()
         each { it.onSessionsChanged() }
@@ -786,6 +796,7 @@ class TerminalService : Service() {
         val notice = "\u001b[33m[appine] " + getString(R.string.restored_notice, time) + "\u001b[0m\r\n\r\n"
         for (tab in saved.tabs) {
             val session = createSession(tab.login, tab.cwd)
+            session.name = tab.name
             val body = tab.transcript.trimEnd().replace("\r\n", "\n").replace("\n", "\r\n")
             session.setRestored(((if (body.isEmpty()) "" else body + "\r\n") + notice).toByteArray())
             unshown[session] = tab
@@ -807,15 +818,15 @@ class TerminalService : Service() {
             val text = s.transcriptText
             // A restored tab not shown yet: its shell has not started, so save the original copy
             val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
-            Triple(s, text ?: old?.transcript.orEmpty(), old?.cwd)
+            // The directory is filled in on the worker
+            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty(), s.name)
         }
         val index = live.indexOf(current).coerceAtLeast(0)
         runCatching {
             worker.execute {
-                val tabs = snapshot.map { (session, text, oldCwd) ->
+                val tabs = snapshot.map { (session, tab) ->
                     val console = session.console
-                    val cwd = if (console >= 0) Native.consoleCwd(m, console) else oldCwd
-                    Tabs.Tab(session.login, cwd, text)
+                    if (console >= 0) tab.copy(cwd = Native.consoleCwd(m, console)) else tab
                 }
                 Tabs.save(this, tabs, index)
             }

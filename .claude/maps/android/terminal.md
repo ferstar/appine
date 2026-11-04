@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard)
 
 ## Responsibilities
 
@@ -31,8 +31,9 @@ libghostty-vt with Zig (`android/native`).
 ## Key types
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
-  tabs and a switcher, one of them shown) and the list of tabs while open (`ListPopupWindow` over
-  the `TabList` adapter); `Host : VtView.Host`, `Keys : ExtraKeysView.Target`.
+  tabs and a switcher with its `Swipe` touch listener, one of them shown) and the list of tabs
+  while open (`ListPopupWindow` over the `TabList` adapter); `Host : VtView.Host`,
+  `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — one row: ESC, TAB, CTRL, ALT, `-`, `/`, `|`, arrows; keeps the one-shot CTRL
   and ALT and sends keys and text to a `Target`.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
@@ -42,7 +43,8 @@ libghostty-vt with Zig (`android/native`).
 ### The terminal
 
 - `VtSession` — a tab owned by the service: its `ConsolePty`, the terminal handle (0 until the
-  shell starts), the view showing it (`view`, read on the pump thread), pending restored text and
+  shell starts), the name the user gave it (`name`, null when none), the view showing it (`view`,
+  read on the pump thread), pending restored text and
   messages, a `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer`
   executor; `Events` (title changed, finished) go to the service.
 - `VtView` — the view: the attached `VtSession`, cell metrics, a mirror of the screen (codepoint,
@@ -76,18 +78,29 @@ libghostty-vt with Zig (`android/native`).
 
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
-- Tabs are labelled `N: title` (`sh` when the program set no title), grey with "(ended)" once the
-  shell ended. The bar ends with `+` (opens a session while the kernel runs) and `⋮` (Settings);
-  its other part depends on the window's width, checked again on every configuration change:
+- Tabs are labelled `N: name` with the name the user gave them, else `N: title` (`sh` when the
+  program set no title), grey with "(ended)" once the shell ended. The bar ends with `+` (opens a
+  session while the kernel runs) and `⋮` (Settings); its other part depends on the window's width,
+  checked again on every configuration change:
   - at least 600 dp: a scrolling row of all tabs, each at most 220 dp wide with an ellipsis, the
-    current one white and scrolled into view after each change; tap switches, long-press opens a
-    menu with "Close tab";
-  - narrower (a phone held upright): the number of tabs in an outlined box and the current tab's
-    label; tapping either opens the list of tabs below the bar: one row per tab, the current one
-    highlighted, each with a ✕ that closes it; tapping a row switches and closes the list. The
-    list is modal and leaves the IME up, follows tab and title changes while open, and is closed
-    on configuration changes, when the activity stops, when the tab bar switches to the row and
-    when no tabs are left.
+    current one white and scrolled into view after each change; tap switches;
+  - narrower (a phone held upright): the switcher, with the number of tabs in an outlined box and
+    the current tab's label; tapping it opens the list of tabs below the bar: one row per tab, the
+    current one highlighted, each with a ✕ that closes it; tapping a row switches and closes the
+    list. The list is modal and leaves the IME up, follows tab and title changes while open, and
+    is closed on configuration changes, when the activity stops, when the tab bar switches to the
+    row and when no tabs are left. A horizontal swipe of at least 48 dp over the switcher shows
+    the next tab (to the left) or the previous one (to the right), without going round; the title
+    follows the finger, with more resistance where there is no tab.
+- A long press on a tab in the row, on the switcher (the current tab) or on a row of the list
+  opens a menu: "Rename tab" (closes the list; a dialog with the name selected and the program's
+  title as hint; Enter confirms; an empty name shows the program's title again;
+  `TerminalService.renameSession`) and "Close tab".
+- Hardware-keyboard shortcuts, taken by the activity (`dispatchKeyEvent`) before the terminal sees
+  them, together with the matching key release: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
+  current one (both once per press), Ctrl+Tab and Ctrl+Shift+Tab show the next and the previous
+  one, going round and repeating while held. They are also listed in the system's keyboard
+  shortcuts screen (Meta+/).
 - Closing a tab hangs it up at once. Closing the last tab while the kernel runs finishes the
   activity (the service stays). After a reconnect the focused tab is the service's `focus` or the
   last one.
@@ -214,7 +227,7 @@ libghostty-vt with Zig (`android/native`).
 ### Inbound
 
 - `TerminalService` (creates and holds the `VtSession`s: `showMessage`, `setRestored`,
-  `transcriptText`, `release`; listener callbacks); `SettingsActivity` (licenses).
+  `transcriptText`, `name`, `release`; listener callbacks); `SettingsActivity` (licenses).
 
 ### Outbound
 
@@ -234,6 +247,9 @@ libghostty-vt with Zig (`android/native`).
   tab.
 - Console numbers are freed at close and reused lowest-first by the kernel, and a close carries no
   generation, so closing a stale number closes whichever console now has it.
+- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab from a hardware
+  keyboard (the tab shortcuts); the release of the shortcut's key is swallowed too, so the Kitty
+  protocol sees no release without a press.
 
 ### The terminal
 

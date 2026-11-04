@@ -381,15 +381,15 @@ class MachineTest {
 
     /**
      * Saved tabs (the android/service map): while the marker is still there (killed) they read back
-     * unchanged, and after one read the marker is gone; after a normal exit (clear) nothing is
-     * read.
+     * unchanged (names included), and after one read the marker is gone; after a normal exit
+     * (clear) nothing is read.
      */
     @Test
     fun tabsComeBackOnlyAfterAKill() {
         Tabs.clear(context)
         val tabs = listOf(
-            Tabs.Tab("auto", "/etc", "line 1\nline 2"),
-            Tabs.Tab("root", null, ""),
+            Tabs.Tab("auto", "/etc", "line 1\nline 2", "build"),
+            Tabs.Tab("root", null, "", null),
         )
         Tabs.markRunning(context)
         Tabs.save(context, tabs, 1)

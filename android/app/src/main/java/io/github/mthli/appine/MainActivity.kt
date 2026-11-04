@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ComponentName
@@ -19,9 +20,18 @@ import android.os.IBinder
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
+import android.view.KeyboardShortcutGroup
+import android.view.KeyboardShortcutInfo
+import android.view.Menu
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
 import android.widget.BaseAdapter
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -31,6 +41,7 @@ import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import kotlin.math.abs
 
 /**
  * The terminal screen: the tab bar on top, the terminal ([VtView]) in the middle, and below it the
@@ -61,6 +72,9 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The list of tabs while it is open (narrow windows), showing [tabList]. */
     private var list: ListPopupWindow? = null
     private val tabList = TabList()
+
+    /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
+    private var shortcutKey = 0
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -121,10 +135,17 @@ class MainActivity : Activity(), TerminalService.Listener {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = touchFeedback(borderless = false)
             addView(tabCount)
-            addView(tabTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = dp(12)
-            })
+            // The title moves with a swipe; its own frame clips it, so it never covers the count
+            addView(FrameLayout(this@MainActivity).apply { addView(tabTitle) },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    marginStart = dp(12)
+                })
             setOnClickListener { openList() }
+            setOnLongClickListener { v ->
+                current?.let { showTabMenu(v, it) }
+                true
+            }
+            setOnTouchListener(Swipe())
         }
         keys = ExtraKeysView(this, Keys())
 
@@ -194,6 +215,57 @@ class MainActivity : Activity(), TerminalService.Listener {
         // The list is as wide as the bar was when it opened
         list?.dismiss()
         renderTabs()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && shortcut(event)) {
+            shortcutKey = event.keyCode
+            return true
+        }
+        // Its release too, or the terminal would send a release (Kitty protocol) for a key it never
+        // saw pressed
+        if (event.action == KeyEvent.ACTION_UP && event.keyCode == shortcutKey) {
+            shortcutKey = 0
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * The tab shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
+     * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
+     * previous one (going round). They are taken before the terminal sees them; false for any other
+     * key.
+     */
+    private fun shortcut(event: KeyEvent): Boolean {
+        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
+        // Holding Ctrl+Tab keeps switching; holding the others acts once
+        val first = event.repeatCount == 0
+        when {
+            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1, wrap = true)
+            !event.isShiftPressed -> return false
+            event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
+            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            else -> return false
+        }
+        return true
+    }
+
+    /** Lists the tab shortcuts in the system's keyboard shortcuts screen (Meta+/). */
+    override fun onProvideKeyboardShortcuts(data: MutableList<KeyboardShortcutGroup>, menu: Menu?, deviceId: Int) {
+        val ctrl = KeyEvent.META_CTRL_ON
+        val ctrlShift = KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
+        data.add(
+            KeyboardShortcutGroup(
+                getString(R.string.shortcuts_tabs),
+                listOf(
+                    KeyboardShortcutInfo(getString(R.string.new_tab), KeyEvent.KEYCODE_T, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.close_tab), KeyEvent.KEYCODE_W, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.next_tab), KeyEvent.KEYCODE_TAB, ctrl),
+                    KeyboardShortcutInfo(getString(R.string.previous_tab), KeyEvent.KEYCODE_TAB, ctrlShift),
+                ),
+            ),
+        )
     }
 
     // ---- TerminalService.Listener ----
@@ -294,6 +366,20 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
+     * Shows the tab [delta] places after the current one, going round from the last to the first
+     * when [wrap] is set; false when there is no such tab.
+     */
+    private fun switchBy(delta: Int, wrap: Boolean): Boolean {
+        val sessions = service?.sessions ?: return false
+        val i = sessions.indexOf(current)
+        if (i < 0 || sessions.size < 2) return false
+        val j = if (wrap) Math.floorMod(i + delta, sessions.size) else i + delta
+        if (j !in sessions.indices) return false
+        show(sessions[j])
+        return true
+    }
+
+    /**
      * Shows the tabs: a row of all of them in wide windows, else their number and the current one's
      * title (and the open list, kept up to date). Called whenever tabs, titles, the current tab or
      * the window's width change.
@@ -327,13 +413,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                 ellipsize = TextUtils.TruncateAt.END
                 setTextColor(if (session == current) Color.WHITE else Color.GRAY)
                 setOnLongClickListener { v ->
-                    PopupMenu(this@MainActivity, v).apply {
-                        menu.add(R.string.close_tab).setOnMenuItemClickListener {
-                            close(session)
-                            true
-                        }
-                        show()
-                    }
+                    showTabMenu(v, session)
                     true
                 }
             })
@@ -349,10 +429,59 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** `N: title` (`sh` when the program set none), marked once the shell has ended. */
+    /**
+     * `N: name`, else `N: title` (`sh` when the program set none), marked once the shell has ended.
+     */
     private fun label(i: Int, session: VtSession): String {
-        val text = "${i + 1}: ${session.title?.takeIf { it.isNotBlank() } ?: "sh"}"
+        val text = "${i + 1}: ${session.name ?: session.title?.takeIf { it.isNotBlank() } ?: "sh"}"
         return if (session.isRunning) text else getString(R.string.tab_ended, text)
+    }
+
+    /** What a long press on a tab offers: renaming and closing it. */
+    private fun showTabMenu(anchor: View, session: VtSession) {
+        PopupMenu(this, anchor).apply {
+            menu.add(R.string.rename_tab).setOnMenuItemClickListener {
+                list?.dismiss()
+                rename(session)
+                true
+            }
+            menu.add(R.string.close_tab).setOnMenuItemClickListener {
+                close(session)
+                true
+            }
+            show()
+        }
+    }
+
+    /** Asks for a tab's name; an empty one shows the program's title again. */
+    private fun rename(session: VtSession) {
+        val input = EditText(this).apply {
+            isSingleLine = true
+            setText(session.name.orEmpty())
+            selectAll()
+            hint = session.title?.takeIf { it.isNotBlank() } ?: "sh"
+            imeOptions = EditorInfo.IME_ACTION_DONE
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.rename_tab)
+            .setMessage(R.string.rename_tab_hint)
+            .setView(FrameLayout(this).apply {
+                setPadding(dp(20), 0, dp(20), 0)
+                addView(input)
+            })
+            .setPositiveButton(android.R.string.ok) { _, _ -> service?.renameSession(session, input.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        input.setOnEditorActionListener { _, action, _ ->
+            if (action != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+            true
+        }
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+        // The terminal takes the keyboard again
+        dialog.setOnDismissListener { screen.requestFocus() }
+        dialog.show()
+        input.requestFocus()
     }
 
     /** Opens the list of tabs below the bar: tap a tab to show it, ✕ to close it. */
@@ -373,6 +502,11 @@ class MainActivity : Activity(), TerminalService.Listener {
             setOnDismissListener { list = null }
             show()
             setSelection(tabList.items.indexOf(current).coerceAtLeast(0))
+            // The list view exists once shown
+            listView?.setOnItemLongClickListener { _, row, position, _ ->
+                tabList.items.getOrNull(position)?.let { showTabMenu(row, it) }
+                true
+            }
         }
     }
 
@@ -397,6 +531,68 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    /**
+     * A horizontal swipe over the switcher shows the next tab (to the left) or the previous one (to
+     * the right); the title follows the finger, with more resistance where there is no tab. Taps and
+     * long presses still reach the switcher's own listeners.
+     */
+    private inner class Swipe : View.OnTouchListener {
+        private val slop = ViewConfiguration.get(this@MainActivity).scaledTouchSlop
+        private var downX = 0f
+        private var downY = 0f
+        private var swiping = false
+
+        // Taps go on to the switcher's own onTouchEvent, which calls performClick
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouch(v: View, e: MotionEvent): Boolean {
+            val dx = e.rawX - downX
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX
+                    downY = e.rawY
+                    swiping = false
+                    tabTitle.animate().cancel()
+                    tabTitle.translationX = 0f
+                    tabTitle.alpha = 1f
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (!swiping && abs(dx) > slop && abs(dx) > abs(e.rawY - downY)) {
+                        swiping = true
+                        // A swipe, not a tap: end the switcher's press, so it neither clicks nor
+                        // long-clicks
+                        val cancel = MotionEvent.obtain(e).apply { action = MotionEvent.ACTION_CANCEL }
+                        v.onTouchEvent(cancel)
+                        cancel.recycle()
+                    }
+                    if (swiping) tabTitle.translationX = dx * if (hasTab(dx)) 0.5f else 0.15f
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (swiping) {
+                    swiping = false
+                    val far = e.actionMasked == MotionEvent.ACTION_UP && abs(dx) >= dp(SWIPE_DP)
+                    if (far && switchBy(if (dx < 0) 1 else -1, wrap = false)) {
+                        // The new title comes in from the side the finger moved away from
+                        tabTitle.translationX = if (dx < 0) dp(SWIPE_DP).toFloat() else -dp(SWIPE_DP).toFloat()
+                        tabTitle.alpha = 0f
+                        tabTitle.animate().translationX(0f).alpha(1f).setDuration(SWIPE_MS)
+                    } else {
+                        tabTitle.animate().translationX(0f).setDuration(SWIPE_MS)
+                    }
+                    return true
+                }
+            }
+            return swiping
+        }
+
+        /** Whether a tab lies in the direction of a swipe [dx] (to the left: the next one). */
+        private fun hasTab(dx: Float): Boolean {
+            val sessions = service?.sessions ?: return false
+            val i = sessions.indexOf(current)
+            return i >= 0 && (if (dx < 0) i + 1 else i - 1) in sessions.indices
+        }
+    }
 
     /** The rows of the list of tabs: `N: title`, the current one highlighted, and a close button. */
     private inner class TabList : BaseAdapter() {
@@ -496,5 +692,11 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The widest a tab in the row gets; longer titles end in "…". */
         private const val TAB_MAX_DP = 220
+
+        /** How far (dp) a swipe over the switcher goes to change tabs. */
+        private const val SWIPE_DP = 48
+
+        /** How long the title takes to slide into place after a swipe. */
+        private const val SWIPE_MS = 150L
     }
 }

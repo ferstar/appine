@@ -15,8 +15,8 @@ import kotlin.concurrent.thread
  * and takes the console's output on a pump thread whether or not a [VtView] shows it ([view]); the
  * shell starts when a view first knows the grid ([start]), and until then restored text and
  * messages wait. Input goes out on the tab's own writer thread, so a program that stops reading
- * blocks only its tab. Calls are on the main thread, except [console] and [login], which saving
- * reads on the service's worker.
+ * blocks only its tab. Calls are on the main thread, except [console], which saving reads on the
+ * service's worker.
  */
 internal class VtSession(
     private val pty: ConsolePty,
@@ -67,6 +67,12 @@ internal class VtSession(
 
     /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
     val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
+
+    /**
+     * The name the user gave the tab ([TerminalService.renameSession]), shown instead of [title];
+     * null when none. Saved and restored with the tab.
+     */
+    var name: String? = null
 
     /** True until the shell has exited (also before it starts). */
     val isRunning: Boolean get() = exit == null

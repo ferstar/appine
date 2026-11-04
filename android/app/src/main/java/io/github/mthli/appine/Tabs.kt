@@ -27,9 +27,9 @@ internal object Tabs {
 
     /**
      * A tab: the login account ([ConsolePty]'s `login`), the foreground process's current directory
-     * (null when unavailable), the transcript.
+     * (null when unavailable), the transcript, and the name the user gave it (null when none).
      */
-    data class Tab(val login: String, val cwd: String?, val transcript: String)
+    data class Tab(val login: String, val cwd: String?, val transcript: String, val name: String?)
 
     /** The saved tabs, which one is current, and when they were saved (ms). */
     data class Saved(val tabs: List<Tab>, val current: Int, val time: Long)
@@ -83,7 +83,13 @@ internal object Tabs {
         val tabs = (0 until list.length()).map { i ->
             val t = list.getJSONObject(i)
             val transcript = File(dir(context), t.getString("transcript")).takeIf { it.isFile }?.readText().orEmpty()
-            Tab(t.getString("login"), t.optString("cwd").takeIf { it.isNotEmpty() }, transcript)
+            Tab(
+                t.getString("login"),
+                t.optString("cwd").takeIf { it.isNotEmpty() },
+                transcript,
+                // Absent in tabs saved before tabs had names
+                t.optString("name").takeIf { it.isNotEmpty() },
+            )
         }
         return Saved(tabs, json.optInt("current"), json.optLong("time"))
     }
@@ -101,7 +107,10 @@ internal object Tabs {
             tabs.forEachIndexed { i, tab ->
                 val name = "t$i.txt"
                 changed = writeIfChanged(File(dir, name), tab.transcript.takeLast(MAX_TRANSCRIPT)) || changed
-                entries.put(JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name))
+                entries.put(
+                    JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name)
+                        .apply { tab.name?.let { put("name", it) } },
+                )
             }
             // Leftover old transcripts (tabs that were closed)
             dir.listFiles { f -> f.name.matches(Regex("t\\d+\\.txt")) }?.forEach { f ->
