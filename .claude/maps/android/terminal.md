@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers)
 
 ## Responsibilities
 
@@ -34,8 +34,9 @@ libghostty-vt with Zig (`android/native`).
   tabs and a switcher with its `Swipe` touch listener, one of them shown) and the list of tabs
   while open (`ListPopupWindow` over the `TabList` adapter); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
-- `ExtraKeysView` — one row: ESC, TAB, CTRL, ALT, `-`, `/`, `|`, arrows; keeps the one-shot CTRL
-  and ALT and sends keys and text to a `Target`.
+- `ExtraKeysView` — Termux's default layout, two rows of seven (ESC, `/`, `-`, HOME, ↑, END, PGUP;
+  TAB, CTRL, ALT, ←, ↓, →, PGDN); keeps CTRL and ALT (one-shot or locked) and sends keys and text
+  to a `Target`; `Press` handles the touch on one key.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
   until started.
 - `LicensesActivity` — list from `assets/notices/index.tsv`, full text view.
@@ -110,8 +111,14 @@ libghostty-vt with Zig (`android/native`).
 ### Input and display
 
 - The font size (pixels) is kept in the activity's preferences.
-- Extra keys: CTRL and ALT are one-shot toggles; keys go to `VtView.press` and `type`, which read
-  the one-shot modifiers through the host and report when a key took them.
+- Extra keys: a key acts when the finger lifts (with a key-click haptic), not at all if the finger
+  left it by more than the touch slop, and is shaded while pressed. Held past the long-press
+  timeout, the arrows, PGUP and PGDN repeat every 80 ms (no act on release then); swiping up from
+  `-` shows `|` in a popup right above it, sent on release (sliding back down sends `-`). CTRL and
+  ALT: a tap turns them on for the next key (cyan) or off; a long press locks them on (cyan,
+  underlined) until tapped, or turns them off. Keys go to `VtView.press` and `type`, which read the
+  modifiers through the host and report when a key took them; that clears one-shot modifiers and
+  leaves locked ones on.
 - The content is edge-to-edge with the root padded by system-bar and IME insets.
 
 ### Tabs
@@ -175,9 +182,10 @@ libghostty-vt with Zig (`android/native`).
 - Keys: mapped keys go through `VtNative.key`, which encodes them in the terminal's current modes
   (cursor and keypad modes, Kitty keyboard protocol, including releases from `onKeyUp` and lone
   modifiers, which are sent only when the encoder emits something); unmapped keys that type a
-  character without Ctrl or Alt are sent as text. CTRL and ALT on the extra-keys row are one-shot
-  and also apply to one typed character (turned back into a key event). Ctrl+Shift+C and V and the
-  dedicated copy and paste keys copy and paste.
+  character without Ctrl or Alt are sent as text. CTRL and ALT on the extra keys apply to the
+  next key or one typed character (turned back into a key event), or to every one while locked.
+  The extra keys send presses only (a held key repeats as new presses), never releases.
+  Ctrl+Shift+C and V and the dedicated copy and paste keys copy and paste.
 - Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom,
   then goes through the host to the tab's `vt-writer` thread (`Native.write`).
 - IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
