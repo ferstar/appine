@@ -14,7 +14,7 @@
 //!
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
-//! scrolls and encodes keys. The terminal is not thread-safe, so every call into vt.c holds the
+//! scrolls, encodes keys, mouse and focus events and pastes, and selects and copies. The terminal is not thread-safe, so every call into vt.c holds the
 //! tab's lock; the frame buffer it returns is only written by `frame`, which only the main thread
 //! calls, so the main thread may read it after the lock is released.
 //!
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use appine_kernel::Machine;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString};
-use jni::sys::{jboolean, jbyteArray, jint, jlong, jobject};
+use jni::sys::{jboolean, jbyteArray, jfloat, jint, jlong, jobject, jstring};
 
 use super::{machine, string, throw};
 
@@ -59,7 +59,26 @@ unsafe extern "C" {
         out: *mut c_char,
         cap: usize,
     ) -> isize;
-    fn appine_vt_bracketed_paste(vt: *mut AppineVt) -> bool;
+    fn appine_vt_paste(vt: *mut AppineVt, data: *const u8, len: usize, allow_unsafe: bool) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn appine_vt_mouse(
+        vt: *mut AppineVt,
+        action: i32,
+        button: i32,
+        mods: u16,
+        x: f32,
+        y: f32,
+        pressed: bool,
+        out: *mut c_char,
+        cap: usize,
+    ) -> isize;
+    fn appine_vt_focus(vt: *mut AppineVt, gained: bool, out: *mut c_char, cap: usize) -> isize;
+    fn appine_vt_select_word(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_grab(vt: *mut AppineVt, end: bool) -> bool;
+    fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
+    fn appine_vt_select_clear(vt: *mut AppineVt);
+    fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
 }
 
 /// Owns one vt.c terminal.
@@ -72,6 +91,11 @@ impl Term {
     /// Feeds bytes and returns the replies they produced.
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         unsafe { appine_vt_feed(self.0, data.as_ptr(), data.len()) };
+        self.take_replies()
+    }
+
+    /// The bytes the terminal wrote for the console since the last call (replies, a paste).
+    fn take_replies(&mut self) -> Vec<u8> {
         let mut len = 0;
         let p = unsafe { appine_vt_take_replies(self.0, &mut len) };
         if len == 0 {
@@ -138,6 +162,27 @@ fn size(cols: jint, rows: jint, cell_width: jint, cell_height: jint) -> (u16, u1
         cell_width.max(1) as u32,
         cell_height.max(1) as u32,
     )
+}
+
+/// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
+fn cell(v: jint) -> u16 {
+    v.clamp(0, 0xffff) as u16
+}
+
+fn bytes_array(env: &mut JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
+    env.byte_array_from_slice(bytes)
+        .map_or(std::ptr::null_mut(), JByteArray::into_raw)
+}
+
+/// The first `n` bytes of an encoder's output, null when it failed (`n` < 0).
+fn encoded(env: &mut JNIEnv<'_>, out: &[c_char], n: isize) -> jbyteArray {
+    let Ok(n) = usize::try_from(n) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: c_char and u8 have the same layout, and the encoder wrote n <= out.len() bytes
+    bytes_array(env, unsafe {
+        std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), n)
+    })
 }
 
 /// Creates the terminal of an open console; returns the tab handle.
@@ -322,23 +367,175 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_key<'l>(
             out.len(),
         )
     };
-    let Ok(n) = usize::try_from(n) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: c_char and u8 have the same layout
-    let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), n) };
-    env.byte_array_from_slice(bytes)
-        .map_or(std::ptr::null_mut(), JByteArray::into_raw)
+    encoded(&mut env, &out, n)
 }
 
-/// Whether the program asked for bracketed paste (mode 2004).
+/// Pastes clipboard text as the terminal's modes ask (bracketed paste, line breaks, unsafe
+/// control bytes); returns the bytes for the console, or null when the text could run commands
+/// and `allow_unsafe` is false (the view asks first and tries again). An empty array when it
+/// failed.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_bracketedPaste<'l>(
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_paste<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    text: JString<'l>,
+    allow_unsafe: jboolean,
+) -> jbyteArray {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let Some(text) = string(&mut env, &text) else {
+        return std::ptr::null_mut();
+    };
+    let bytes = {
+        let mut term = tab.term();
+        match unsafe { appine_vt_paste(term.0, text.as_ptr(), text.len(), allow_unsafe != 0) } {
+            0 => term.take_replies(),
+            1 => return std::ptr::null_mut(),
+            _ => Vec::new(),
+        }
+    };
+    bytes_array(&mut env, &bytes)
+}
+
+/// Encodes a mouse event at pixel (`x`, `y`) of the grid; empty when the program does not take
+/// it, null when encoding failed. `action`: 0 press, 1 release, 2 motion; `button`: 0 none,
+/// 1 left, 4 and 5 the wheel.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouse<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    action: jint,
+    button: jint,
+    mods: jint,
+    x: jfloat,
+    y: jfloat,
+    pressed: jboolean,
+) -> jbyteArray {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let mut out = [0 as c_char; 64];
+    let n = unsafe {
+        appine_vt_mouse(
+            tab.term().0,
+            action,
+            button,
+            mods as u16,
+            x,
+            y,
+            pressed != 0,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    encoded(&mut env, &out, n)
+}
+
+/// Encodes focus gained or lost; empty when the program did not ask for focus events.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_focus<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    gained: jboolean,
+) -> jbyteArray {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let mut out = [0 as c_char; 16];
+    let n = unsafe { appine_vt_focus(tab.term().0, gained != 0, out.as_mut_ptr(), out.len()) };
+    encoded(&mut env, &out, n)
+}
+
+/// Selects the word at viewport cell (`x`, `y`) and anchors drags to it; false when there is no
+/// word there (the selection is then cleared).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectWord<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jboolean {
+    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_word(tab.term().0, cell(x), cell(y)) })
+        as jboolean
+}
+
+/// Starts dragging the handle of the selection's last cell (`end`) or first cell: the other
+/// end becomes the anchor. False when there is no selection.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectGrab<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    end: jboolean,
+) -> jboolean {
+    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_grab(tab.term().0, end != 0) })
+        as jboolean
+}
+
+/// Extends the selection from its anchor to viewport cell (`x`, `y`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectTo<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jboolean {
+    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_to(tab.term().0, cell(x), cell(y)) })
+        as jboolean
+}
+
+/// Selects everything, scrollback included.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectAll<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
 ) -> jboolean {
-    tab(handle).is_some_and(|tab| unsafe { appine_vt_bracketed_paste(tab.term().0) }) as jboolean
+    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_all(tab.term().0) }) as jboolean
+}
+
+/// Clears the selection.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectClear<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    if let Some(tab) = tab(handle) {
+        unsafe { appine_vt_select_clear(tab.term().0) };
+    }
+}
+
+/// The selection as plain text (soft wraps joined, trailing blanks trimmed); null when there is
+/// no selection or it is empty.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_copy<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let text = {
+        let term = tab.term();
+        let mut len = 0;
+        let p = unsafe { appine_vt_copy(term.0, &mut len) };
+        if p.is_null() || len == 0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: vt.c keeps the text until the next copy, which needs the lock held here
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
+    };
+    env.new_string(text)
+        .map_or(std::ptr::null_mut(), JString::into_raw)
 }
 
 /// Shows bytes from the app itself (not the program) as if the console had printed them; replies

@@ -55,8 +55,45 @@ internal object VtNative {
      */
     @JvmStatic external fun key(tab: Long, key: Int, mods: Int, consumed: Int, action: Int, text: String?, unshifted: Int): ByteArray?
 
-    /** Whether the program asked for bracketed paste. */
-    @JvmStatic external fun bracketedPaste(tab: Long): Boolean
+    /**
+     * Encodes clipboard text for the program as its modes ask (bracketed paste, line breaks, unsafe
+     * control bytes). Null when the text could run commands and [allowUnsafe] is false: ask, then
+     * call again with it set. Empty when it failed.
+     */
+    @JvmStatic external fun paste(tab: Long, text: String, allowUnsafe: Boolean): ByteArray?
+
+    /**
+     * Encodes a mouse event at pixel ([x], [y]) of the grid in the program's tracking mode and
+     * format: [action] 0 press, 1 release, 2 motion; [button] 0 none, 1 left, 4 and 5 the wheel;
+     * [mods] as for [key]. Empty when the program does not take it, null when it fails.
+     */
+    @JvmStatic external fun mouse(tab: Long, action: Int, button: Int, mods: Int, x: Float, y: Float, pressed: Boolean): ByteArray?
+
+    /** Encodes focus gained or lost; empty when the program did not ask for focus events. */
+    @JvmStatic external fun focus(tab: Long, gained: Boolean): ByteArray?
+
+    /**
+     * Selects the word at viewport cell ([x], [y]) and anchors later [selectTo] calls to it;
+     * false when there is no word there (the selection is then cleared).
+     */
+    @JvmStatic external fun selectWord(tab: Long, x: Int, y: Int): Boolean
+
+    /**
+     * Starts dragging the handle of the selection's last cell ([end]) or first cell: the other end
+     * becomes the anchor of [selectTo]. False when there is no selection.
+     */
+    @JvmStatic external fun selectGrab(tab: Long, end: Boolean): Boolean
+
+    /** Extends the selection from its anchor to viewport cell ([x], [y]). */
+    @JvmStatic external fun selectTo(tab: Long, x: Int, y: Int): Boolean
+
+    /** Selects everything, scrollback included. */
+    @JvmStatic external fun selectAll(tab: Long): Boolean
+
+    @JvmStatic external fun selectClear(tab: Long)
+
+    /** The selection as plain text (soft wraps joined, trailing blanks trimmed), null for none. */
+    @JvmStatic external fun copy(tab: Long): String?
 
     /** Shows bytes from the app as if the console had printed them. */
     @JvmStatic external fun print(tab: Long, data: ByteArray)

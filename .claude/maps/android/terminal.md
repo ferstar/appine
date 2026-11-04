@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle)
+> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases)
 
 ## Responsibilities
 
@@ -49,16 +49,17 @@ feature that compiles libghostty-vt (`android/native`).
   `ConsolePty` (used only to open the console, spawn the login, wait and close), one tab handle, a
   `vt-pump` thread and a single-thread `vt-writer` executor.
 - `VtView` — the view: cell metrics, a mirror of the screen (codepoint, colours, attributes,
-  grapheme clusters per cell), a backing bitmap of the grid, the IME connection, gestures;
-  `Host.onGrid` / `Host.onInput` go to the activity.
+  grapheme clusters per cell, each row's selected columns), a backing bitmap of the grid, the modes
+  and selection bounds of the last frame, the IME connection, gestures, selection handles and the
+  floating menu; `Host.onGrid` / `Host.onInput` go to the activity.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
 - `VtNative` — `@JvmStatic external` functions on the native library; `available` probes for them.
 - In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
   flag) in a table `TABS` keyed by handles from 1, never reused. In `vt.c`: `AppineVt` (the
-  terminal, its render state and key encoder, reply and frame buffers, the synchronized-output
-  hold).
+  terminal, its render state, key and mouse encoders, reply, frame and copy buffers, the
+  synchronized-output hold, and the tracked anchor of a selection drag).
 
 ## Public entry points
 
@@ -69,8 +70,8 @@ feature that compiles libghostty-vt (`android/native`).
 - `VtActivity` (debug manifest, not exported), opened from the main screen's `⋮` menu item "New
   terminal (experimental)", which exists only when `BuildConfig.DEBUG`; without the `vt` feature
   in the native library it shows a toast and finishes.
-- `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`, `bracketedPaste`,
-  `print`.
+- `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`, `paste`, `mouse`,
+  `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`, `copy`, `print`.
 
 ## Data flow / lifecycle
 
@@ -134,31 +135,66 @@ feature that compiles libghostty-vt (`android/native`).
 - A hold (mode 2026) captures the screen when it begins and is ended by force after 1 s.
 - The view asks for a full frame after a regrid, a new bitmap or new default colours; a frame
   captured at an old size is dropped and a full one requested.
+- The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
+  focus events 1004, a selection exists) and the selection's first and last cells in the
+  viewport; each row carries its selected columns.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness.
 - Each dirty row is repainted into the bitmap under a clip: default background, runs of other
-  backgrounds, then text. Plain ASCII runs of one paint, colour and decoration go out in one draw
-  call; other glyphs are centred in their one or two cells, or shrunk evenly when wider (never
-  stretched); `VtGlyphs` characters are shapes; four paints (regular/bold × upright/italic) from the
-  variable font with ligatures off. Underlines (single, double, curly, dotted, dashed),
+  backgrounds, the selection's translucent highlight, then text. Plain ASCII runs of one paint,
+  colour and decoration go out in one draw call; other glyphs are centred in their one or two
+  cells, or shrunk evenly when wider (never stretched); `VtGlyphs` characters are shapes; four
+  paints (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single, double, curly, dotted, dashed),
   strikethrough and overline are drawn; inverse, faint and invisible apply; blink is ignored.
 - The cursor (bar, block with the glyph redrawn in the background colour, underline, hollow; hollow
-  when unfocused) and the IME's composing text are drawn over the bitmap each draw.
+  when unfocused), the IME's composing text (shifted left at the right edge) and the theme's text
+  selection handles are drawn over the bitmap each draw.
 
-#### Input and gestures
+#### Input
 
 - Keys: mapped keys go through `VtNative.key`, which encodes them in the terminal's current modes
-  (cursor and keypad modes, Kitty keyboard protocol); unmapped keys that type a character without
-  Ctrl or Alt are sent as text. CTRL and ALT on the extra-keys row are one-shot and also apply to
-  one typed character (turned back into a key event). Input first scrolls the viewport back to the
-  bottom, then goes to the `vt-writer` thread (`Native.write`).
-- IME: committed text is sent at once (`\n` as `\r`); composing text is only drawn at the cursor;
-  the editable is kept empty so Backspace with nothing composed arrives as `deleteSurroundingText`
-  and becomes DEL.
-- A tap opens the IME; a vertical drag scrolls the viewport by whole rows; pinch zoom changes the
-  font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids and resizes the terminal
-  and then the console (SIGWINCH).
+  (cursor and keypad modes, Kitty keyboard protocol, including releases from `onKeyUp` and lone
+  modifiers, which are sent only when the encoder emits something); unmapped keys that type a
+  character without Ctrl or Alt are sent as text. CTRL and ALT on the extra-keys row are one-shot
+  and also apply to one typed character (turned back into a key event). Ctrl+Shift+C and V and the
+  dedicated copy and paste keys copy and paste.
+- Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom,
+  then goes to the `vt-writer` thread (`Native.write`).
+- IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
+  paste, which covers the IME's clipboard); the editor action is Enter; composing text is only
+  drawn at the cursor; the editable is kept empty so Backspace with nothing composed arrives as
+  `deleteSurroundingText` and becomes DEL. `requestCursorUpdates` is answered with the cursor and
+  composing text's position (`CursorAnchorInfo`), again whenever the cursor moves while the IME
+  monitors it.
+- Paste (`VtNative.paste`, through `ghostty_terminal_paste`): bracketed with mode 2004, else line
+  breaks become carriage returns; unsafe control bytes become spaces. Text that could run commands
+  (line breaks without bracketed paste, or the bracketed terminator) is refused, and the view asks
+  in a dialog with a preview before pasting it anyway.
+- Focus: window focus changes are sent as focus events when the program asked (mode 1004).
+
+#### Gestures and selection
+
+- A tap ends a selection or its menu; otherwise it opens the IME and, when the program tracks the
+  mouse, also sends a left click (press and release at the tap's pixel position, in the program's
+  format).
+- A vertical drag, or a mouse wheel (3 rows a notch), scrolls by whole rows: wheel events when the
+  program tracks the mouse, arrow keys on the alternate screen with alternate scroll (1007, on by
+  default), else the viewport.
+- A long press selects the word under it (`ghostty_terminal_select_word`, installed as the
+  terminal's selection) and keeps it as the anchor: moving on extends the selection from the far
+  side of the word to the cell under the finger. On blank cells it selects nothing and shows a menu
+  with Paste and Select all only. Long press selects even when the program tracks the mouse.
+- The two handles (start below the first cell, end below the last, when in the viewport) drag the
+  selection's ends; the other end is the anchor, kept as tracked grid references so output does not
+  move it. The finger keeps its offset from the dragged cell; held above or below the grid, the
+  viewport scrolls one row every 50 ms and the selection follows.
+- After a drag, a floating action mode (`TYPE_FLOATING`) offers Copy (with a selection), Paste
+  (with a clipboard), Select all (scrollback included), with the system's own labels, placed over
+  the selected rows. Copy takes the selection as plain text with soft wraps joined and trailing
+  blanks trimmed (as Ghostty copies), puts it on the clipboard and ends the selection.
+- Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
+  and resizes the terminal and then the console (SIGWINCH).
 
 ### Licenses
 
@@ -179,10 +215,12 @@ feature that compiles libghostty-vt (`android/native`).
 
 - `Native` (`openConsole`, `spawn`, `read`, `write`, `resize`, `closeConsole`, `waitFor`), hence
   the kernel's host console; `login.sh`; `assets/notices`.
-- Experimental terminal: libghostty-vt 1.4.0 (the terminal state, render state and key encoder),
-  linked into `libappine.so` by the `vt` feature (`android/native`); `Machine::read_console`,
+- Experimental terminal: libghostty-vt 1.4.0 (the terminal state, render state, key and mouse
+  encoders, paste, focus encoding, selection and its plain-text formatting), linked into
+  `libappine.so` by the `vt` feature (`android/native`); `Machine::read_console`,
   `write_console` and `resize_console` called from `vt.rs` directly; `ConsolePty` and
-  `Native.write`; JetBrains Mono (variable, upright and italic) from the debug assets.
+  `Native.write`; the system clipboard; JetBrains Mono (variable, upright and italic) from the
+  debug assets.
 
 ## Invariants and gotchas
 
@@ -213,11 +251,16 @@ feature that compiles libghostty-vt (`android/native`).
   DA1/DA2 (VT220) and XTVERSION ("appine") and reports a dark colour scheme.
 - With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
   emoji sequences; they can turn mode 2027 off.
+- Grid references from libghostty-vt are valid only until the terminal changes, so every selection
+  call takes fresh ones; the anchor of a drag is tracked. A changed selection makes the next frame a
+  full one (the render state redraws everything when the screen's selection changes).
+- With the IME shown, a hardware Esc press is taken by the IME (Gboard hides itself), so a program
+  using the Kitty protocol's release events sees only the release.
 - The session is not a `TerminalService` tab: it is not saved or restored, kill reports do not reach
   it, and `VtActivity` ignores `onExitAll` and `onRestarting`, so after a reboot, tier change or
   exit it stays open with an ended session (a later `onMachineReady` does not start another).
-- Zoom is not saved; a drag in a full-screen program scrolls only the (empty) scrollback rather than
-  sending arrows or mouse wheel events.
+- Zoom is not saved. Opening the app from the launcher brings the `singleTask` `MainActivity` to the
+  front and so closes `VtActivity` above it.
 
 ## Confirmed bugs / technical debt
 
@@ -232,9 +275,11 @@ feature that compiles libghostty-vt (`android/native`).
   throws the session is marked finished without closing it, and nothing closes it until the kernel
   stops. `VtActivity` leaks the same way and tries again on every later grid change (zoom,
   rotation, IME), leaking one more console each time.
-- **The experimental terminal lacks** selection and copy, paste (`VtNative.bracketedPaste` exists
-  but nothing calls it), mouse reporting, titles and the bell, and tabs; the plan is input next,
-  then tabs in `TerminalService` (save and restore, kill reports), then removing the Termux view.
+- **The experimental terminal lacks** titles and the bell, tabs, mouse drags and motion for
+  programs (only clicks and the wheel are sent), double- and triple-tap or rectangular selection,
+  and handles that flip at the screen edges (a selection starting at column 0 has its start
+  handle mostly off-screen); the plan is tabs in `TerminalService` next (save and restore, kill
+  reports), then removing the Termux view.
 - **Tab saves during full-screen programs lose the scrollback.** `getTranscriptText` reads the
   current screen, which is the alternate buffer (no scrollback) while vim or less runs, and replaces
   the earlier save.
@@ -253,4 +298,5 @@ feature that compiles libghostty-vt (`android/native`).
 - Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
   (the root ignores cutout insets).
 - The experimental terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing
-  text (tried only on a 4 KB-page API 34 emulator).
+  text and floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34
+  emulator with Gboard in English.

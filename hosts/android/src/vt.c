@@ -11,7 +11,7 @@
 // Frame format (little-endian), written by appine_vt_frame and read by VtView.kt; the two change
 // together:
 //
-//   header, 32 bytes:
+//   header, 40 bytes:
 //     u16 cols, u16 rows
 //     u8  dirty            0 nothing changed, 1 some rows, 2 every row
 //     u8  cursor_visible   1 when visible and inside the viewport
@@ -23,10 +23,18 @@
 //     u32 cursor_color     0 when the program did not set one (OSC 12)
 //     u16 row_count        number of rows that follow
 //     u8  viewport_bottom  1 when the viewport shows the active area (not scrolled back)
-//     u8  reserved
+//     u8  flags            bit 0 mouse tracking on, 1 alternate screen, 2 alternate scroll
+//                          (mode 1007), 3 focus events (mode 1004), 4 a selection exists
+//     u16 selection_start_x, u16 selection_start_y
+//                          the selection's first cell (in terminal order) in the viewport,
+//                          0xffff for both when there is none or it is outside the viewport
+//     u16 selection_end_x, u16 selection_end_y
+//                          its last cell, likewise
 //     u32 reserved
 //   row_count rows:
 //     u16 y, u16 cell_count, u32 extra_count
+//     u16 selection_from, u16 selection_to
+//                          the row's selected columns (inclusive), 0xffff for both when none
 //     cell_count cells of 16 bytes:
 //       u32 codepoint      first codepoint of the cell's grapheme, 0 for an empty cell
 //       u32 fg             0xAARRGGBB, 0 for the default foreground
@@ -47,9 +55,17 @@
 
 #include <ghostty/vt.h>
 
-#define HEADER_BYTES 32
-#define ROW_HEADER_BYTES 8
+#define HEADER_BYTES 40
+#define ROW_HEADER_BYTES 12
 #define CELL_BYTES 16
+
+#define FLAG_MOUSE 0x01
+#define FLAG_ALT_SCREEN 0x02
+#define FLAG_ALT_SCROLL 0x04
+#define FLAG_FOCUS_EVENTS 0x08
+#define FLAG_SELECTION 0x10
+
+#define NONE16 0xffff
 
 // Scrollback kept per terminal, in lines (libghostty-vt rounds up to whole pages)
 #define SCROLLBACK_LINES ((size_t)10000)
@@ -104,6 +120,8 @@ typedef struct AppineVt {
   GhosttyRenderStateRowCells cells;
   GhosttyKeyEncoder encoder;
   GhosttyKeyEvent event;
+  GhosttyMouseEncoder mouse;
+  GhosttyMouseEvent mouse_event;
   uint16_t cols;
   uint16_t height;
   uint32_t cell_width;
@@ -117,6 +135,12 @@ typedef struct AppineVt {
   size_t grapheme_cap;
   // Scratch for one row's further codepoints
   Buf extras;
+  // The last text copied from the selection
+  Buf clip;
+  // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
+  // or the end opposite the handle being dragged; tracked, so output does not move it
+  GhosttyTrackedGridRef anchor_start;
+  GhosttyTrackedGridRef anchor_end;
   // Synchronized output: the render state was captured when the hold began and is not updated
   // again until it ends (or HOLD_LIMIT_NS passes)
   bool held;
@@ -201,7 +225,9 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
       ghostty_render_state_row_iterator_new(NULL, &vt->rows) != GHOSTTY_SUCCESS ||
       ghostty_render_state_row_cells_new(NULL, &vt->cells) != GHOSTTY_SUCCESS ||
       ghostty_key_encoder_new(NULL, &vt->encoder) != GHOSTTY_SUCCESS ||
-      ghostty_key_event_new(NULL, &vt->event) != GHOSTTY_SUCCESS) {
+      ghostty_key_event_new(NULL, &vt->event) != GHOSTTY_SUCCESS ||
+      ghostty_mouse_encoder_new(NULL, &vt->mouse) != GHOSTTY_SUCCESS ||
+      ghostty_mouse_event_new(NULL, &vt->mouse_event) != GHOSTTY_SUCCESS) {
     appine_vt_free(vt);
     return NULL;
   }
@@ -229,8 +255,13 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   return vt;
 }
 
+static void drop_anchor(AppineVt *vt);
+
 void appine_vt_free(AppineVt *vt) {
   if (vt == NULL) return;
+  drop_anchor(vt);
+  if (vt->mouse_event) ghostty_mouse_event_free(vt->mouse_event);
+  if (vt->mouse) ghostty_mouse_encoder_free(vt->mouse);
   if (vt->event) ghostty_key_event_free(vt->event);
   if (vt->encoder) ghostty_key_encoder_free(vt->encoder);
   if (vt->cells) ghostty_render_state_row_cells_free(vt->cells);
@@ -240,6 +271,7 @@ void appine_vt_free(AppineVt *vt) {
   free(vt->replies.ptr);
   free(vt->frame.ptr);
   free(vt->extras.ptr);
+  free(vt->clip.ptr);
   free(vt->grapheme);
   free(vt);
 }
@@ -276,6 +308,12 @@ void appine_vt_scroll(AppineVt *vt, int32_t delta) {
     s.value.delta = delta;
   }
   ghostty_terminal_scroll_viewport(vt->term, s);
+}
+
+static bool mode_on(AppineVt *vt, GhosttyMode mode) {
+  GhosttyTerminalModeConfig m = {.mode = mode};
+  return ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_MODE, &m) == GHOSTTY_SUCCESS &&
+         m.value;
 }
 
 // ---- Frames ----
@@ -366,11 +404,32 @@ static bool put_row(AppineVt *vt, uint16_t y) {
   memcpy(vt->frame.ptr + vt->frame.len, vt->extras.ptr, vt->extras.len);
   vt->frame.len += vt->extras.len;
 
+  GhosttyRenderStateRowSelection sel = GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+  bool selected = ghostty_render_state_row_get(vt->rows, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+                                               &sel) == GHOSTTY_SUCCESS;
+
   uint8_t *h = vt->frame.ptr + row_at;
   put_u16(h, y);
   put_u16(h + 2, count);
   put_u32(h + 4, (uint32_t)(vt->extras.len / 4));
+  put_u16(h + 8, selected ? sel.start_x : NONE16);
+  put_u16(h + 10, selected ? sel.end_x : NONE16);
   return true;
+}
+
+// Writes a grid reference's viewport coordinates, or 0xffff for both when it is not in the
+// viewport
+static void put_viewport(AppineVt *vt, uint8_t *p, const GhosttyGridRef *ref) {
+  GhosttyPointCoordinate c;
+  if (ghostty_terminal_point_from_grid_ref(vt->term, ref, GHOSTTY_POINT_TAG_VIEWPORT, &c) ==
+          GHOSTTY_SUCCESS &&
+      c.y < NONE16) {
+    put_u16(p, c.x);
+    put_u16(p + 2, (uint16_t)c.y);
+  } else {
+    put_u16(p, NONE16);
+    put_u16(p + 2, NONE16);
+  }
 }
 
 // Captures the screen and writes a frame with the rows that changed since the last frame (all of
@@ -414,6 +473,29 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   put_u32(h + 16, argb(colors.background));
   put_u32(h + 20, colors.cursor_has_value ? argb(colors.cursor) : 0);
   h[26] = bottom;
+  uint8_t flags = 0;
+  bool mouse = false;
+  ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse);
+  if (mouse) flags |= FLAG_MOUSE;
+  GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+  ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+  if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE) flags |= FLAG_ALT_SCREEN;
+  if (mode_on(vt, GHOSTTY_MODE_ALT_SCROLL)) flags |= FLAG_ALT_SCROLL;
+  if (mode_on(vt, GHOSTTY_MODE_FOCUS_EVENT)) flags |= FLAG_FOCUS_EVENTS;
+  put_u16(h + 28, NONE16);
+  put_u16(h + 30, NONE16);
+  put_u16(h + 32, NONE16);
+  put_u16(h + 34, NONE16);
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) == GHOSTTY_SUCCESS &&
+      ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) == GHOSTTY_SUCCESS) {
+    flags |= FLAG_SELECTION;
+    put_viewport(vt, h + 28, &ordered.start);
+    put_viewport(vt, h + 32, &ordered.end);
+  }
+  h[27] = flags;
   vt->frame.len = HEADER_BYTES;
 
   uint16_t count = 0;
@@ -462,8 +544,229 @@ ptrdiff_t appine_vt_key(AppineVt *vt, int key, uint16_t mods, uint16_t consumed,
   return (ptrdiff_t)len;
 }
 
-bool appine_vt_bracketed_paste(AppineVt *vt) {
-  GhosttyTerminalModeConfig mode = {.mode = GHOSTTY_MODE_BRACKETED_PASTE};
-  return ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_MODE, &mode) == GHOSTTY_SUCCESS &&
-         mode.value;
+// ---- Paste ----
+
+typedef struct {
+  const uint8_t *ptr;
+  size_t len;
+} PasteText;
+
+static bool paste_read(void *userdata, GhosttyString mime, GhosttyWriter writer) {
+  (void)mime;
+  const PasteText *text = userdata;
+  return writer.write(writer.userdata, text->ptr, text->len);
+}
+
+// Pastes text from the clipboard as the terminal's modes ask (bracketed with mode 2004, else
+// newlines as carriage returns; unsafe control bytes become spaces); the bytes for the console
+// are left in the replies. Returns 0 when pasted, 1 when refused because the text could run
+// commands (a line break without bracketed paste, or the bracketed paste terminator) and
+// allow_unsafe is false, -1 on failure. Nothing is written unless it returns 0.
+int appine_vt_paste(AppineVt *vt, const uint8_t *data, size_t len, bool allow_unsafe) {
+  static const char plain[] = "text/plain";
+  GhosttyString mime = {.ptr = (const uint8_t *)plain, .len = sizeof(plain) - 1};
+  PasteText text = {.ptr = data, .len = len};
+  GhosttyPaste paste = GHOSTTY_INIT_SIZED(GhosttyPaste);
+  paste.location = GHOSTTY_CLIPBOARD_LOCATION_STANDARD;
+  paste.source = GHOSTTY_PASTE_SOURCE_CLIPBOARD;
+  paste.mimes = &mime;
+  paste.mimes_len = 1;
+  paste.reader = (GhosttyMimeReader){.read = paste_read, .userdata = &text};
+  paste.allow_unsafe = allow_unsafe;
+  GhosttyResult r = ghostty_terminal_paste(vt->term, &paste, NULL);
+  if (r == GHOSTTY_REJECTED) return 1;
+  return r == GHOSTTY_SUCCESS ? 0 : -1;
+}
+
+// ---- Mouse and focus ----
+
+// Encodes a mouse event at pixel (x, y) of the grid for the program, in its tracking mode and
+// format; returns the length, 0 when the program does not take it (no tracking, or a motion it
+// did not ask for), -1 when it does not fit. button 0 is none (motion), 1 left, 4 and 5 the wheel.
+ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, float x, float y,
+                          bool pressed, char *out, size_t cap) {
+  ghostty_mouse_encoder_setopt_from_terminal(vt->mouse, vt->term);
+  GhosttyMouseEncoderSize size = GHOSTTY_INIT_SIZED(GhosttyMouseEncoderSize);
+  size.screen_width = (uint32_t)vt->cols * vt->cell_width;
+  size.screen_height = (uint32_t)vt->height * vt->cell_height;
+  size.cell_width = vt->cell_width;
+  size.cell_height = vt->cell_height;
+  ghostty_mouse_encoder_setopt(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
+  ghostty_mouse_encoder_setopt(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &pressed);
+  ghostty_mouse_event_set_action(vt->mouse_event, (GhosttyMouseAction)action);
+  if (button == 0) {
+    ghostty_mouse_event_clear_button(vt->mouse_event);
+  } else {
+    ghostty_mouse_event_set_button(vt->mouse_event, (GhosttyMouseButton)button);
+  }
+  ghostty_mouse_event_set_mods(vt->mouse_event, mods);
+  ghostty_mouse_event_set_position(vt->mouse_event, (GhosttyMousePosition){.x = x, .y = y});
+  size_t len = 0;
+  if (ghostty_mouse_encoder_encode(vt->mouse, vt->mouse_event, out, cap, &len) !=
+      GHOSTTY_SUCCESS) {
+    return -1;
+  }
+  return (ptrdiff_t)len;
+}
+
+// Encodes focus gained or lost when the program asked for focus events (mode 1004); returns the
+// length, 0 when it did not ask, -1 when it does not fit.
+ptrdiff_t appine_vt_focus(AppineVt *vt, bool gained, char *out, size_t cap) {
+  if (!mode_on(vt, GHOSTTY_MODE_FOCUS_EVENT)) return 0;
+  size_t len = 0;
+  if (ghostty_focus_encode(gained ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST, out, cap, &len) !=
+      GHOSTTY_SUCCESS) {
+    return -1;
+  }
+  return (ptrdiff_t)len;
+}
+
+// ---- Selection ----
+//
+// The selection itself is the terminal's (GHOSTTY_TERMINAL_OPT_SELECTION): it follows its cells
+// through output and scrolling, and frames report it. Grid references from the API are only
+// valid until the terminal changes, so every function takes fresh ones.
+
+static bool viewport_ref(AppineVt *vt, uint16_t x, uint16_t y, GhosttyGridRef *out) {
+  if (x >= vt->cols) x = vt->cols - 1;
+  if (y >= vt->height) y = vt->height - 1;
+  GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value.coordinate = {.x = x, .y = y}};
+  *out = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  return ghostty_terminal_grid_ref(vt->term, p, out) == GHOSTTY_SUCCESS;
+}
+
+static void drop_anchor(AppineVt *vt) {
+  if (vt->anchor_start) ghostty_tracked_grid_ref_free(vt->anchor_start);
+  if (vt->anchor_end) ghostty_tracked_grid_ref_free(vt->anchor_end);
+  vt->anchor_start = NULL;
+  vt->anchor_end = NULL;
+}
+
+// Tracks the cells at the screen coordinates (start, end) as the anchor
+static bool set_anchor(AppineVt *vt, GhosttyPointCoordinate start, GhosttyPointCoordinate end) {
+  drop_anchor(vt);
+  GhosttyPoint a = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = start};
+  GhosttyPoint b = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = end};
+  if (ghostty_terminal_grid_ref_track(vt->term, a, &vt->anchor_start) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_grid_ref_track(vt->term, b, &vt->anchor_end) != GHOSTTY_SUCCESS) {
+    drop_anchor(vt);
+    return false;
+  }
+  return true;
+}
+
+static bool screen_point(AppineVt *vt, const GhosttyGridRef *ref, GhosttyPointCoordinate *out) {
+  return ghostty_terminal_point_from_grid_ref(vt->term, ref, GHOSTTY_POINT_TAG_SCREEN, out) ==
+         GHOSTTY_SUCCESS;
+}
+
+static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end) {
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  sel.start = start;
+  sel.end = end;
+  return ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
+}
+
+// Selects the word at viewport cell (x, y) and anchors later drags to it; false when there is no
+// word there (blank cells), with any earlier selection cleared.
+bool appine_vt_select_word(AppineVt *vt, uint16_t x, uint16_t y) {
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  drop_anchor(vt);
+  GhosttyTerminalSelectWordOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+  GhosttySelection word = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate start, end;
+  if (!viewport_ref(vt, x, y, &options.ref) ||
+      ghostty_terminal_select_word(vt->term, &options, &word) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_selection_ordered(vt->term, &word, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &ordered.start, &start) || !screen_point(vt, &ordered.end, &end)) {
+    return false;
+  }
+  // Tracking may change the terminal's page list, so the word is selected from fresh references
+  GhosttyGridRef a = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef b = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  return set_anchor(vt, start, end) &&
+         ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &a) == GHOSTTY_SUCCESS &&
+         ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &b) == GHOSTTY_SUCCESS &&
+         set_selection(vt, a, b);
+}
+
+// Starts dragging a selection handle: the other end becomes the anchor. end is the handle of the
+// selection's last cell, else its first. False when there is no selection.
+bool appine_vt_select_grab(AppineVt *vt, bool end) {
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate fixed;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, end ? &ordered.start : &ordered.end, &fixed)) {
+    return false;
+  }
+  return set_anchor(vt, fixed, fixed);
+}
+
+// Extends the selection from the anchor to viewport cell (x, y): the anchor stays selected
+// whole, and the selection runs from its far side to the cell. False without an anchor.
+bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
+  if (vt->anchor_start == NULL || vt->anchor_end == NULL) return false;
+  GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef cell;
+  if (ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &start) != GHOSTTY_SUCCESS ||
+      ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &end) != GHOSTTY_SUCCESS ||
+      !viewport_ref(vt, x, y, &cell)) {
+    return false;
+  }
+  GhosttySelection probe = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelectionOrder order = GHOSTTY_SELECTION_ORDER_FORWARD;
+  probe.start = start;
+  probe.end = cell;
+  ghostty_terminal_selection_order(vt->term, &probe, &order);
+  if (order == GHOSTTY_SELECTION_ORDER_REVERSE) return set_selection(vt, end, cell);
+  probe.start = end;
+  ghostty_terminal_selection_order(vt->term, &probe, &order);
+  return set_selection(vt, start, order == GHOSTTY_SELECTION_ORDER_REVERSE ? end : cell);
+}
+
+// Selects everything, scrollback included; false when there is nothing to select.
+bool appine_vt_select_all(AppineVt *vt) {
+  drop_anchor(vt);
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  return ghostty_terminal_select_all(vt->term, &sel) == GHOSTTY_SUCCESS &&
+         ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
+}
+
+void appine_vt_select_clear(AppineVt *vt) {
+  drop_anchor(vt);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+}
+
+// The selection as plain text, soft-wrapped lines joined and trailing blanks trimmed (as
+// Ghostty copies); NULL with len 0 when there is no selection or it is empty. Valid until the
+// next call.
+const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
+  *len = 0;
+  GhosttyTerminalSelectionFormatOptions options =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
+  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  options.unwrap = true;
+  options.trim = true;
+  uint8_t *text = NULL;
+  size_t text_len = 0;
+  if (ghostty_terminal_selection_format_alloc(vt->term, NULL, options, &text, &text_len) !=
+      GHOSTTY_SUCCESS) {
+    return NULL;
+  }
+  vt->clip.len = 0;
+  bool ok = text_len > 0 && buf_reserve(&vt->clip, text_len);
+  if (ok) {
+    memcpy(vt->clip.ptr, text, text_len);
+    vt->clip.len = text_len;
+  }
+  ghostty_free(NULL, text, text_len);
+  if (!ok) return NULL;
+  *len = vt->clip.len;
+  return vt->clip.ptr;
 }

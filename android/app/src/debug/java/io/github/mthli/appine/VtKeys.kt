@@ -7,6 +7,7 @@ import android.view.KeyEvent
  * Ghostty 1.4.0; the numbers change only with that header), and its modifier bits.
  */
 internal object VtKeys {
+    const val ACTION_RELEASE = 0
     const val ACTION_PRESS = 1
     const val ACTION_REPEAT = 2
 
@@ -54,7 +55,33 @@ internal object VtKeys {
         put(KeyEvent.KEYCODE_NUMPAD_MULTIPLY, 104)
         put(KeyEvent.KEYCODE_NUMPAD_SUBTRACT, 107)
         put(KeyEvent.KEYCODE_ESCAPE, 120)
+        // Modifiers and locks: the encoder reports them only with the Kitty keyboard protocol's
+        // "report all keys as escape codes"
+        put(KeyEvent.KEYCODE_ALT_LEFT, 51)
+        put(KeyEvent.KEYCODE_ALT_RIGHT, 52)
+        put(KeyEvent.KEYCODE_CAPS_LOCK, 54)
+        put(KeyEvent.KEYCODE_MENU, 55) // Context menu
+        put(KeyEvent.KEYCODE_CTRL_LEFT, 56)
+        put(KeyEvent.KEYCODE_CTRL_RIGHT, 57)
+        put(KeyEvent.KEYCODE_META_LEFT, 59)
+        put(KeyEvent.KEYCODE_META_RIGHT, 60)
+        put(KeyEvent.KEYCODE_SHIFT_LEFT, 61)
+        put(KeyEvent.KEYCODE_SHIFT_RIGHT, 62)
+        put(KeyEvent.KEYCODE_NUM_LOCK, 79)
+        put(KeyEvent.KEYCODE_SYSRQ, 148) // Print Screen
+        put(KeyEvent.KEYCODE_SCROLL_LOCK, 149)
+        put(KeyEvent.KEYCODE_BREAK, 150) // Pause
     }
+
+    private val modifiers = setOf(
+        KeyEvent.KEYCODE_ALT_LEFT, KeyEvent.KEYCODE_ALT_RIGHT, KeyEvent.KEYCODE_CTRL_LEFT,
+        KeyEvent.KEYCODE_CTRL_RIGHT, KeyEvent.KEYCODE_META_LEFT, KeyEvent.KEYCODE_META_RIGHT,
+        KeyEvent.KEYCODE_SHIFT_LEFT, KeyEvent.KEYCODE_SHIFT_RIGHT, KeyEvent.KEYCODE_CAPS_LOCK,
+        KeyEvent.KEYCODE_NUM_LOCK, KeyEvent.KEYCODE_SCROLL_LOCK,
+    )
+
+    /** Modifier and lock keys, which programs normally never see on their own. */
+    fun isModifier(keyCode: Int) = keyCode in modifiers
 
     /** The physical key, 0 (unidentified) for keys libghostty-vt has no number for. */
     fun of(keyCode: Int): Int = keys[keyCode] ?: 0

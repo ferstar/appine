@@ -1,32 +1,47 @@
 package io.github.mthli.appine
 
 import android.annotation.SuppressLint
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.os.SystemClock
 import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
+import android.view.ActionMode
 import android.view.GestureDetector
+import android.view.HapticFeedbackConstants
+import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
+import android.view.Menu
+import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -39,6 +54,12 @@ import kotlin.math.roundToInt
  * is chosen so their advance is exactly one cell), every other glyph is centred in its one or two
  * cells, or shrunk evenly when it is wider, never stretched. Box drawing, block elements and the
  * Powerline triangles are drawn as shapes ([VtGlyphs]).
+ *
+ * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
+ * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
+ * alternate screen (alternate scroll, mode 1007); a long press selects a word, and dragging on
+ * extends the selection, as do its two handles; a floating menu copies, pastes and selects all.
+ * The selection is the terminal's, so it stays on its text through output and scrolling.
  */
 @SuppressLint("ViewConstructor") // Created only in code
 internal class VtView(context: Context, private val host: Host) : View(context) {
@@ -109,6 +130,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var cursorY = 0
     private var atBottom = true
 
+    // Modes and the selection, as of the last frame (vt.c's header flags)
+    private var mouseTracking = false
+    private var altScreen = false
+    private var altScroll = false
+
+    /** Whether the terminal has a selection; also set at once by the view's own changes. */
+    private var selected = false
+
+    /** The selection's first and last cell in the viewport, -1 when outside it. */
+    private var selStartX = -1
+    private var selStartY = -1
+    private var selEndX = -1
+    private var selEndY = -1
+
+    /** Each row's selected columns (inclusive), -1 when none. */
+    private var selFrom = IntArray(0)
+    private var selTo = IntArray(0)
+
     private var bitmap: Bitmap? = null
     private var canvas: Canvas? = null
 
@@ -128,10 +167,54 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var scrollRemainder = 0f
     private var scaleRemainder = 1f
 
+    // Selection drags: by the long-pressed word, or by a handle
+    private var drag = DRAG_NONE
+    private var dragOffsetX = 0f
+    private var dragOffsetY = 0f
+    private var dragCellX = -1
+    private var dragCellY = -1
+
+    /** Rows the viewport scrolls by while a drag is held above (-1) or below (1) the grid. */
+    private var autoscroll = 0
+    private var autoscrollX = 0
+    private val autoscrollTick = object : Runnable {
+        override fun run() {
+            if (autoscroll == 0 || tab == 0L) return
+            VtNative.scroll(tab, autoscroll)
+            VtNative.selectTo(tab, autoscrollX, if (autoscroll < 0) 0 else rows - 1)
+            invalidate()
+            postDelayed(this, AUTOSCROLL_MS)
+        }
+    }
+
+    private val handleStart = themeDrawable(android.R.attr.textSelectHandleLeft)
+    private val handleEnd = themeDrawable(android.R.attr.textSelectHandleRight)
+
+    private var menu: ActionMode? = null
+
+    /** Where a menu without a selection (paste only) points, or -1 to point at the selection. */
+    private var menuX = -1f
+    private var menuY = -1f
+
+    /** Show the menu after the next frame, which has the selection's new bounds. */
+    private var menuPending = false
+
+    /** The IME asked for cursor positions as they change (its candidate window follows them). */
+    private var monitorCursor = false
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true
         measureCells()
+    }
+
+    private fun themeDrawable(attr: Int): Drawable? {
+        val a = context.obtainStyledAttributes(intArrayOf(attr))
+        try {
+            return a.getDrawable(0)
+        } finally {
+            a.recycle()
+        }
     }
 
     private fun font(path: String, weight: Int): Typeface =
@@ -186,6 +269,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         bg = IntArray(n)
         attrs = IntArray(n)
         clusters = arrayOfNulls(n)
+        selFrom = IntArray(r) { -1 }
+        selTo = IntArray(r) { -1 }
         bitmap?.recycle()
         bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888).also { canvas = Canvas(it) }
         full = true
@@ -222,6 +307,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         c.drawBitmap(bmp, 0f, 0f, null)
         drawCursor(c)
         drawPreedit(c)
+        drawHandles(c)
+        if (menuPending) {
+            menuPending = false
+            post { showMenu() }
+        } else {
+            menu?.invalidateContentRect()
+        }
     }
 
     private fun stats(nanos: Long) {
@@ -253,6 +345,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             postInvalidateOnAnimation()
             return
         }
+        val oldCursorX = cursorX
+        val oldCursorY = cursorY
         cursorShown = b.get(5).toInt() != 0
         cursorStyle = b.get(6).toInt()
         cursorX = b.getShort(8).toInt() and 0xffff
@@ -262,6 +356,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         cursorColor = b.getInt(20)
         val count = b.getShort(24).toInt() and 0xffff
         atBottom = b.get(26).toInt() != 0
+        val flags = b.get(27).toInt()
+        mouseTracking = flags and FLAG_MOUSE != 0
+        altScreen = flags and FLAG_ALT_SCREEN != 0
+        altScroll = flags and FLAG_ALT_SCROLL != 0
+        val hadSelection = selected
+        selected = flags and FLAG_SELECTION != 0
+        if (hadSelection && !selected && menuX < 0) menu?.finish()
+        selStartX = coordinate(b, 28)
+        selStartY = coordinate(b, 30)
+        selEndX = coordinate(b, 32)
+        selEndY = coordinate(b, 34)
+        if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
         if (newFg != defaultFg || newBg != defaultBg) {
             // Rows that did not change still have the old default colours
             defaultFg = newFg
@@ -271,14 +377,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         frameRows += count
         val target = canvas ?: return
-        var pos = 32
+        var pos = HEADER_BYTES
         repeat(count) {
             val y = b.getShort(pos).toInt() and 0xffff
             val n = b.getShort(pos + 2).toInt() and 0xffff
             val extra = b.getInt(pos + 4)
-            pos += 8
+            val from = coordinate(b, pos + 8)
+            val to = coordinate(b, pos + 10)
+            pos += ROW_HEADER_BYTES
             var e = pos + n * 16
             if (y < rows) {
+                selFrom[y] = if (to >= 0) from else -1
+                selTo[y] = to
                 val base = y * cols
                 for (x in 0 until cols) {
                     val i = base + x
@@ -314,6 +424,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
+    /** A u16 coordinate of the frame, -1 for 0xffff (none). */
+    private fun coordinate(b: ByteBuffer, at: Int): Int =
+        (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
+
     // ---- Painting ----
 
     private fun fgOf(i: Int): Int {
@@ -344,6 +458,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
             }
             x = end
+        }
+        val from = selFrom[y]
+        if (from >= 0) {
+            // The highlight covers a wide character whose first cell ends the selection
+            val to = selTo[y] + if ((attrs[base + selTo[y]] shr 12) and 3 == WIDE) 2 else 1
+            fill.color = SELECTION
+            c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
         }
 
         // Runs of plain ASCII in one style go out in one call; other cells one at a time
@@ -502,9 +623,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun drawPreedit(c: Canvas) {
         if (preedit.isEmpty() || cursorY >= rows) return
         val p = paints[0]
-        val l = (cursorX * cellWidth).toFloat()
-        val t = (cursorY * cellHeight).toFloat()
         val w = p.measureText(preedit)
+        // Shifted left when it would run past the right edge
+        val l = min((cursorX * cellWidth).toFloat(), cols * cellWidth - w).coerceAtLeast(0f)
+        val t = (cursorY * cellHeight).toFloat()
         fill.color = defaultBg
         c.drawRect(l, t, l + w, t + cellHeight, fill)
         p.color = defaultFg
@@ -515,13 +637,21 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Input ----
 
-    private fun send(data: ByteArray) {
-        if (data.isEmpty()) return
+    /** Bytes for the program; the viewport returns to the bottom first. */
+    private fun send(data: ByteArray?) {
+        if (data == null || data.isEmpty()) return
         if (!atBottom && tab != 0L) {
             VtNative.scroll(tab, 0)
             invalidate()
         }
         host.onInput(data)
+    }
+
+    /** Typed or pasted input, which also ends a selection. */
+    private fun input(data: ByteArray?) {
+        if (data == null || data.isEmpty()) return
+        if (selected) clearSelection()
+        send(data)
     }
 
     /** Text from the input method or the extra keys; one character with a one-shot modifier is a key. */
@@ -531,7 +661,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             val down = events?.firstOrNull { it.action == KeyEvent.ACTION_DOWN && it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT }
             if (down != null && key(down)) return
         }
-        send(text.replace('\n', '\r').toByteArray())
+        input(text.replace('\n', '\r').toByteArray())
     }
 
     /** A key from the extra keys row. */
@@ -542,10 +672,29 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
         key(event) || super.onKeyDown(keyCode, event)
 
+    /** Releases matter only to programs using the Kitty keyboard protocol's event types. */
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        val key = VtKeys.of(keyCode)
+        if (tab == 0L || event.isSystem || key == 0) return super.onKeyUp(keyCode, event)
+        val bytes = VtNative.key(tab, key, VtKeys.mods(event.metaState), 0, VtKeys.ACTION_RELEASE, null, event.getUnicodeChar(0))
+        if (bytes == null || bytes.isEmpty()) return super.onKeyUp(keyCode, event)
+        send(bytes)
+        return true
+    }
+
     /** Encodes a key press for the program; false for keys it does not take (Back, volume). */
     private fun key(event: KeyEvent): Boolean {
         if (tab == 0L || event.isSystem) return false
+        if (shortcut(event)) return true
         val key = VtKeys.of(event.keyCode)
+        val action = if (event.repeatCount > 0) VtKeys.ACTION_REPEAT else VtKeys.ACTION_PRESS
+        if (VtKeys.isModifier(event.keyCode)) {
+            // Sent only when the program asked for every key (Kitty keyboard protocol)
+            val bytes = VtNative.key(tab, key, VtKeys.mods(event.metaState), 0, action, null, 0)
+            if (bytes == null || bytes.isEmpty()) return false
+            send(bytes)
+            return true
+        }
         var mods = VtKeys.mods(event.metaState)
         if (ctrlOnce) mods = mods or VtKeys.MOD_CTRL
         if (altOnce) mods = mods or VtKeys.MOD_ALT
@@ -560,21 +709,43 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (key == 0) {
             if (text == null) return false
             if (mods and (VtKeys.MOD_CTRL or VtKeys.MOD_ALT) == 0) {
-                send(text.toByteArray())
+                input(text.toByteArray())
                 return true
             }
         }
         val unshifted = event.getUnicodeChar(0)
         val consumed = if (mods and VtKeys.MOD_SHIFT != 0 && text != null && plain != unshifted) VtKeys.MOD_SHIFT else 0
-        val action = if (event.repeatCount > 0) VtKeys.ACTION_REPEAT else VtKeys.ACTION_PRESS
         val bytes = VtNative.key(tab, key, mods, consumed, action, text, unshifted) ?: return true
         if (ctrlOnce || altOnce) {
             ctrlOnce = false
             altOnce = false
             onModifiersUsed?.invoke()
         }
-        send(bytes)
+        input(bytes)
         return true
+    }
+
+    /** Copy and paste keys of hardware keyboards: Ctrl+Shift+C and V, and the dedicated keys. */
+    private fun shortcut(event: KeyEvent): Boolean {
+        val both = event.isCtrlPressed && event.isShiftPressed
+        return when {
+            event.keyCode == KeyEvent.KEYCODE_PASTE || both && event.keyCode == KeyEvent.KEYCODE_V -> {
+                pasteClipboard()
+                true
+            }
+            event.keyCode == KeyEvent.KEYCODE_COPY || both && event.keyCode == KeyEvent.KEYCODE_C -> {
+                if (selected) copySelection()
+                true
+            }
+            else -> false
+        }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        // Focus events (mode 1004): editors reload changed files when they regain focus
+        if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
+        invalidate()
     }
 
     override fun onCheckIsTextEditor() = true
@@ -586,24 +757,44 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         return Connection()
     }
 
+    /** Tells the IME where the cursor and the composing text are, for a candidate window next to them. */
+    private fun updateCursorAnchor() {
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
+        val x = (cursorX * cellWidth).toFloat() + paints[0].measureText(preedit)
+        val top = (cursorY * cellHeight).toFloat()
+        val info = CursorAnchorInfo.Builder()
+            .setMatrix(matrix)
+            .setSelectionRange(preedit.length, preedit.length)
+            .setComposingText(0, preedit)
+            .setInsertionMarkerLocation(x, top, top + baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
+            .build()
+        context.getSystemService(InputMethodManager::class.java).updateCursorAnchorInfo(this, info)
+    }
+
     /**
      * Committed text goes to the program at once; composing text is only shown at the cursor
      * until committed. The editable is kept empty otherwise, so Backspace with nothing composed
-     * arrives as deleteSurroundingText and becomes DEL.
+     * arrives as deleteSurroundingText and becomes DEL. A commit of several lines (the IME's
+     * clipboard) is a paste.
      */
     private inner class Connection : BaseInputConnection(this, true) {
         override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
             editable?.clear()
-            preedit = ""
-            invalidate()
-            type(text.toString())
+            setPreedit("")
+            val s = text.toString()
+            when {
+                s == "\n" -> press(KeyEvent.KEYCODE_ENTER)
+                s.length > 1 && (s.contains('\n') || s.contains('\r')) -> paste(s)
+                else -> type(s)
+            }
             return true
         }
 
         override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
             super.setComposingText(text, newCursorPosition)
-            preedit = text.toString()
-            invalidate()
+            setPreedit(text.toString())
             return true
         }
 
@@ -611,8 +802,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             val text = editable?.toString().orEmpty()
             super.finishComposingText()
             editable?.clear()
-            preedit = ""
-            invalidate()
+            setPreedit("")
             if (text.isNotEmpty()) type(text)
             return true
         }
@@ -624,14 +814,265 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
             return super.deleteSurroundingText(beforeLength, afterLength)
         }
+
+        override fun deleteSurroundingTextInCodePoints(beforeLength: Int, afterLength: Int): Boolean =
+            deleteSurroundingText(beforeLength, afterLength)
+
+        override fun performEditorAction(editorAction: Int): Boolean {
+            press(KeyEvent.KEYCODE_ENTER)
+            return true
+        }
+
+        override fun requestCursorUpdates(cursorUpdateMode: Int): Boolean {
+            monitorCursor = cursorUpdateMode and InputConnection.CURSOR_UPDATE_MONITOR != 0
+            if (cursorUpdateMode and InputConnection.CURSOR_UPDATE_IMMEDIATE != 0) updateCursorAnchor()
+            return true
+        }
+    }
+
+    private fun setPreedit(text: String) {
+        if (text == preedit) return
+        preedit = text
+        invalidate()
+        if (monitorCursor) updateCursorAnchor()
+    }
+
+    // ---- Clipboard ----
+
+    private val clipboard get() = context.getSystemService(ClipboardManager::class.java)
+
+    private fun copySelection() {
+        val text = VtNative.copy(tab) ?: return
+        clipboard.setPrimaryClip(ClipData.newPlainText("appine", text))
+        clearSelection()
+    }
+
+    private fun pasteClipboard() {
+        val clip = clipboard.primaryClip?.takeIf { it.itemCount > 0 } ?: return
+        val text = clip.getItemAt(0).coerceToText(context)?.toString()
+        if (!text.isNullOrEmpty()) paste(text)
+    }
+
+    /**
+     * Pastes [text] as the program's modes ask; text that could run commands at once (line breaks
+     * without bracketed paste) is pasted only after the user agrees.
+     */
+    private fun paste(text: String) {
+        if (tab == 0L) return
+        val bytes = VtNative.paste(tab, text, false)
+        if (bytes != null) {
+            input(bytes)
+            return
+        }
+        val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
+        AlertDialog.Builder(context)
+            .setTitle(R.string.vt_paste_unsafe_title)
+            .setMessage(context.getString(R.string.vt_paste_unsafe, preview))
+            .setPositiveButton(android.R.string.paste) { _, _ ->
+                if (tab != 0L) input(VtNative.paste(tab, text, true))
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    // ---- Selection ----
+
+    private fun clearSelection() {
+        if (tab != 0L) VtNative.selectClear(tab)
+        selected = false
+        menu?.finish()
+        invalidate()
+    }
+
+    /** Handles at the selection's ends (when they are in the viewport), as text fields have. */
+    private fun drawHandles(c: Canvas) {
+        if (!selected) return
+        handleBounds(true)?.let { b -> handleStart?.let { it.bounds = b; it.draw(c) } }
+        handleBounds(false)?.let { b -> handleEnd?.let { it.bounds = b; it.draw(c) } }
+    }
+
+    /**
+     * Where a handle is drawn: below its end's cell, pointing at the cell's left edge (start) or
+     * right edge (end), as Android's own text handles do.
+     */
+    private fun handleBounds(start: Boolean): Rect? {
+        val d = (if (start) handleStart else handleEnd) ?: return null
+        val x = if (start) selStartX else selEndX
+        val y = if (start) selStartY else selEndY
+        if (x < 0 || y < 0 || x >= cols || y >= rows) return null
+        val edge = if (start) {
+            x * cellWidth
+        } else {
+            (x + if ((attrs[y * cols + x] shr 12) and 3 == WIDE) 2 else 1) * cellWidth
+        }
+        val w = d.intrinsicWidth
+        val left = if (start) edge - w * 3 / 4 else edge - w / 4
+        val top = (y + 1) * cellHeight
+        return Rect(left, top, left + w, top + d.intrinsicHeight)
+    }
+
+    /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE. */
+    private fun handleAt(x: Float, y: Float): Int {
+        if (!selected) return DRAG_NONE
+        val slop = (8 * resources.displayMetrics.density).toInt()
+        for (start in booleanArrayOf(false, true)) {
+            val b = handleBounds(start) ?: continue
+            b.inset(-slop, -slop)
+            if (b.contains(x.toInt(), y.toInt())) return if (start) DRAG_START else DRAG_END
+        }
+        return DRAG_NONE
+    }
+
+    private fun startDrag(kind: Int, x: Float, y: Float) {
+        drag = kind
+        menu?.finish()
+        // The finger stays at the same offset from the dragged end's cell centre
+        val (cx, cy) = when (kind) {
+            DRAG_START -> selStartX to selStartY
+            DRAG_END -> selEndX to selEndY
+            else -> -1 to -1
+        }
+        dragOffsetX = if (cx < 0) 0f else (cx + 0.5f) * cellWidth - x
+        dragOffsetY = if (cy < 0) 0f else (cy + 0.5f) * cellHeight - y
+        dragCellX = -1
+        dragCellY = -1
+        parent?.requestDisallowInterceptTouchEvent(true)
+    }
+
+    private fun dragTo(x: Float, y: Float) {
+        val px = x + dragOffsetX
+        val py = y + dragOffsetY
+        val cx = floor(px / cellWidth).toInt().coerceIn(0, cols - 1)
+        val edge = when {
+            py < 0 -> -1
+            py >= rows * cellHeight -> 1
+            else -> 0
+        }
+        if (edge != autoscroll) {
+            autoscroll = edge
+            removeCallbacks(autoscrollTick)
+            if (edge != 0) postDelayed(autoscrollTick, AUTOSCROLL_MS)
+        }
+        autoscrollX = cx
+        val cy = floor(py / cellHeight).toInt().coerceIn(0, rows - 1)
+        if (cx == dragCellX && cy == dragCellY) return
+        dragCellX = cx
+        dragCellY = cy
+        if (VtNative.selectTo(tab, cx, cy)) {
+            selected = true
+            invalidate()
+        }
+    }
+
+    private fun endDrag() {
+        drag = DRAG_NONE
+        autoscroll = 0
+        removeCallbacks(autoscrollTick)
+        menuX = -1f
+        menuPending = true
+        invalidate()
+    }
+
+    /** The floating menu: Copy with a selection, Paste with text on the clipboard, Select all. */
+    private fun showMenu() {
+        menu?.finish()
+        if (tab == 0L || (!selected && menuX < 0)) return
+        menu = startActionMode(
+            object : ActionMode.Callback2() {
+                override fun onCreateActionMode(mode: ActionMode, m: Menu): Boolean {
+                    if (selected) m.add(Menu.NONE, MENU_COPY, 0, android.R.string.copy)
+                    if (clipboard.hasPrimaryClip()) m.add(Menu.NONE, MENU_PASTE, 1, android.R.string.paste)
+                    m.add(Menu.NONE, MENU_SELECT_ALL, 2, android.R.string.selectAll)
+                    return true
+                }
+
+                override fun onPrepareActionMode(mode: ActionMode, m: Menu) = false
+
+                override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                    when (item.itemId) {
+                        MENU_COPY -> copySelection()
+                        MENU_PASTE -> {
+                            mode.finish()
+                            pasteClipboard()
+                        }
+                        MENU_SELECT_ALL -> if (VtNative.selectAll(tab)) {
+                            selected = true
+                            menuX = -1f
+                            menuPending = true
+                            mode.finish()
+                            invalidate()
+                        }
+                    }
+                    return true
+                }
+
+                override fun onDestroyActionMode(mode: ActionMode) {
+                    if (menu === mode) menu = null
+                }
+
+                override fun onGetContentRect(mode: ActionMode, view: View, outRect: Rect) {
+                    if (menuX >= 0) {
+                        outRect.set(menuX.toInt(), menuY.toInt(), menuX.toInt() + 1, menuY.toInt() + 1)
+                        return
+                    }
+                    // The selected rows in the viewport; the top when none is
+                    val first = selFrom.indexOfFirst { it >= 0 }
+                    val last = selFrom.indexOfLast { it >= 0 }
+                    if (first < 0) {
+                        outRect.set(0, 0, width, cellHeight)
+                        return
+                    }
+                    val l = if (first == last) selFrom[first] * cellWidth else 0
+                    val r = if (first == last) (selTo[last] + 1) * cellWidth else cols * cellWidth
+                    outRect.set(l, first * cellHeight, r, (last + 1) * cellHeight)
+                }
+            },
+            ActionMode.TYPE_FLOATING,
+        )
     }
 
     // ---- Gestures ----
+
+    private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
+
+    private fun cellY(y: Float) = floor(y / cellHeight).toInt().coerceIn(0, rows - 1)
+
+    /** A left click at a tap, for a program tracking the mouse. */
+    private fun click(e: MotionEvent) {
+        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
+        send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    }
+
+    /**
+     * Scrolls by [n] rows (positive: towards the newest output): wheel events for a program
+     * tracking the mouse, arrow keys on the alternate screen with alternate scroll, else the
+     * viewport.
+     */
+    private fun scrollBy(n: Int, x: Float, y: Float) {
+        when {
+            mouseTracking -> repeat(abs(n)) {
+                send(VtNative.mouse(tab, MOUSE_PRESS, if (n > 0) MOUSE_WHEEL_DOWN else MOUSE_WHEEL_UP, 0, x, y, false))
+            }
+            altScreen && altScroll -> {
+                val arrow = VtKeys.of(if (n > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
+                repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0)) }
+            }
+            else -> {
+                VtNative.scroll(tab, n)
+                invalidate()
+            }
+        }
+    }
 
     private val gestures = GestureDetector(
         context,
         object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
+                if (selected || menu != null) {
+                    clearSelection()
+                    return true
+                }
+                if (tab != 0L && mouseTracking) click(e)
                 requestFocus()
                 context.getSystemService(InputMethodManager::class.java).showSoftInput(this@VtView, 0)
                 return true
@@ -643,10 +1084,26 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 val n = (scrollRemainder / cellHeight).toInt()
                 if (n != 0) {
                     scrollRemainder -= n * cellHeight
-                    VtNative.scroll(tab, n)
-                    invalidate()
+                    scrollBy(n, e2.x, e2.y)
                 }
                 return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                if (tab == 0L || scaler.isInProgress) return
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                if (VtNative.selectWord(tab, cellX(e.x), cellY(e.y))) {
+                    selected = true
+                    startDrag(DRAG_WORD, e.x, e.y)
+                    invalidate()
+                } else {
+                    // Nothing to select there: only Paste and Select all
+                    selected = false
+                    invalidate()
+                    menuX = e.x
+                    menuY = e.y
+                    showMenu()
+                }
             }
         },
     )
@@ -665,11 +1122,45 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         },
     )
 
-    @SuppressLint("ClickableViewAccessibility") // Taps only open the keyboard
+    @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // A handle drag owns the whole gesture
+        if (event.actionMasked == MotionEvent.ACTION_DOWN && tab != 0L) {
+            val handle = handleAt(event.x, event.y)
+            if (handle != DRAG_NONE && VtNative.selectGrab(tab, handle == DRAG_END)) {
+                startDrag(handle, event.x, event.y)
+                return true
+            }
+        }
+        if (drag == DRAG_START || drag == DRAG_END) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
+            }
+            return true
+        }
         scaler.onTouchEvent(event)
         if (!scaler.isInProgress) gestures.onTouchEvent(event)
+        // After a long press selected a word, moving on extends the selection
+        if (drag == DRAG_WORD) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
+            }
+        }
         return true
+    }
+
+    /** A mouse wheel (or touchpad scroll) scrolls like a drag. */
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER) && event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            if (v != 0f) {
+                scrollBy(if (v > 0) -WHEEL_ROWS else WHEEL_ROWS, event.x, event.y)
+                return true
+            }
+        }
+        return super.onGenericMotionEvent(event)
     }
 
     private companion object {
@@ -697,5 +1188,39 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val CURSOR_BAR = 0
         const val CURSOR_UNDERLINE = 2
         const val CURSOR_HOLLOW = 3
+
+        // The frame format (vt.c)
+        const val HEADER_BYTES = 40
+        const val ROW_HEADER_BYTES = 12
+        const val FLAG_MOUSE = 1
+        const val FLAG_ALT_SCREEN = 1 shl 1
+        const val FLAG_ALT_SCROLL = 1 shl 2
+        const val FLAG_SELECTION = 1 shl 4
+
+        // VtNative.mouse
+        const val MOUSE_PRESS = 0
+        const val MOUSE_RELEASE = 1
+        const val MOUSE_LEFT = 1
+        const val MOUSE_WHEEL_UP = 4
+        const val MOUSE_WHEEL_DOWN = 5
+
+        /** Rows per mouse wheel notch. */
+        const val WHEEL_ROWS = 3
+
+        const val DRAG_NONE = 0
+        const val DRAG_WORD = 1
+        const val DRAG_START = 2
+        const val DRAG_END = 3
+        const val AUTOSCROLL_MS = 50L
+
+        const val MENU_COPY = 1
+        const val MENU_PASTE = 2
+        const val MENU_SELECT_ALL = 3
+
+        /** Characters of a paste shown when asking whether to paste it. */
+        const val PASTE_PREVIEW = 300
+
+        /** The selection's highlight, over cell backgrounds and under text. */
+        const val SELECTION = 0x604A90E2
     }
 }
