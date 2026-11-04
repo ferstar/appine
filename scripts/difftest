@@ -42,6 +42,9 @@
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+# The lanes call this script again after the cd below, so a path relative to the caller's directory
+# would no longer lead to it
+self=$root/scripts/$(basename "$0")
 cd "$root"
 tier=1
 rebuild=0
@@ -135,6 +138,11 @@ fi
 # Run one group: run both sides once and compare; return 1 on a mismatch
 run_group() {
     name=$1
+    # A misspelt name would run an empty script on both sides, whose outputs match
+    if [ ! -f "tests/diff/$name.sh" ]; then
+        echo "FAIL $name: there is no tests/diff/$name.sh"
+        return 1
+    fi
     script="exec 2>&1; $(cat "tests/diff/$name.sh")"
     # The whole script is handed over as one argument of sh -c, and Linux does not allow a single
     # argument over 128 KB (MAX_ARG_STRLEN): beyond that neither side can execute it (E2BIG), the
@@ -231,8 +239,16 @@ else
     printf '%s\n' "$@" >"$out/.groups"
     awk 'FILENAME == ARGV[1] { d[$1] = $2; next } { print ($1 in d ? d[$1] : 0), $1 }' \
         "$durations" "$out/.groups" | sort -s -k1,1 -nr | cut -d' ' -f2 |
-        xargs -P "$jobs" -I '{}' "$0" -t "$tier" -s "$store" -j "$jobs" -G '{}' | tee "$reports" || true
+        xargs -P "$jobs" -I '{}' "$self" -t "$tier" -s "$store" -j "$jobs" -G '{}' | tee "$reports" || true
     failed=$(grep -c '^FAIL ' "$reports" || true)
+    # Every group must have reported ok or FAIL: one whose lane died (or never started) printed
+    # nothing, and the pipeline above hides xargs' exit status
+    missing=$(awk 'FILENAME == ARGV[1] { if ($1 == "ok" || $1 == "FAIL") { sub(/:$/, "", $2); seen[$2] = 1 }; next }
+        !($1 in seen) { print }' "$reports" "$out/.groups")
+    for name in $missing; do
+        echo "FAIL $name: no result (its lane did not finish)"
+        failed=$((failed + 1))
+    done
     # Record the times of the groups that passed this time; those that did not pass keep last time's
     sed -n 's/^ok   \([^ ]*\) (\([0-9]*\)s native, \([0-9]*\)s appine)$/\1 \2 \3/p' "$reports" \
         >"$out/.times"

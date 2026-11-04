@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the Android job installs Zig and fetches the Ghostty source; counting processes inside a difftest case)
+> Maintained: 2026-11-05 (targeted verification: difftest fails a case it did not run or that no lane reported; removed the bug)
 
 ## Responsibilities
 
@@ -118,6 +118,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Lanes (`-j`, default 4 on macOS, 1 elsewhere): each lane uses its own store clone (APFS clone or
   reflink copy), cases go slowest first by recorded time, and each lane prints its report in one
   write; failures are copied to `failed/`.
+- A case name without `tests/diff/<name>.sh` is a failure, and so is every requested case that no
+  lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
+  from another directory works.
 
 ### LTP
 
@@ -186,10 +189,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Confirmed bugs / technical debt
 
-- **Difftest can pass without running a case.** A missing or misspelt case name runs an empty
-  script on both sides (`ok` with one lane); with several lanes the parent counts only `FAIL` lines
-  and the pipeline hides `xargs`' status, so a lane that dies, or a run started as a relative path
-  from another directory (no lane starts at all), still exits 0.
 - **Concurrent difftest runs collide.** Per-case outputs and the report files are not
   tier-qualified, each run wipes the other's lane claims, `-r` deletes clones another run is using,
   and there is no lock.
