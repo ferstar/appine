@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none)
+> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces)
 
 ## Responsibilities
 
@@ -50,8 +50,8 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `Tap` (per-namespace aggregation point on a host epoll: sources and receivers), `Source`,
   `Receiver` (data queue, arrivals, error queue), `Item`/`ErrItem`; `Kernel::icmp_taps` (weak).
 - `PortMap` (kernel-wide: offset, `always_map`, entries keyed by `(namespace, protocol, guest
-  port)`, `by_host`, `released`, `reported`, listen events), `Lease` (RAII refcount on an entry),
-  `ListenEvent`.
+  port, IPv6-only)`, `by_host` (by host port), `released`, `reported`, listen events), `Lease`
+  (RAII refcount on an entry), `ListenEvent`.
 - `Traffic` (per-interface `IfStats`, address table, `Protocols` counters), `traffic::Route`.
 - `origdst::Table` (host 4-tuple → original destinations per namespace, with age and a cap).
 
@@ -171,7 +171,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 - Mapping applies to TCP/UDP (MPTCP as TCP) non-raw sockets: in the initial namespace for guest
   ports 1..1023 (when the offset is nonzero), in new namespaces for every explicitly bound port
-  (`bind_any`: reuse the namespace's host port or let the host pick).
+  (`bind_any`: reuse the namespace's host port or let the host pick; an AF_INET6 socket with
+  `IPV6_V6ONLY` gets its own entry and host port). Destinations are rewritten by `map_dest` with
+  `host_port`, which takes an IPv6 destination (as seen in the target namespace) to an IPv6-only
+  entry first, then the dual-stack one, and an IPv4 destination only to the latter.
 - `bind` candidates: if the key is live or was released within 120 s, bind that host port and
   return its error (so `TIME_WAIT` gives `EADDRINUSE`); otherwise the original port (unless
   `always_map`), the other protocol's host port for the same guest port, port + k×offset for

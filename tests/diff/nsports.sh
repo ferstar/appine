@@ -8,7 +8,8 @@
 # 127.0.0.1, or only to the eth0 address, cannot be reached from other addresses; A's own
 # conflicts are EADDRINUSE as usual, and SO_REUSEPORT works as usual; /proc/net/tcp shows the
 # guest's ports; a reply read only after the service has replied and exited still comes from the
-# guest's port. The native side is a privileged container.
+# guest's port; IPv4 and IPv6 with IPV6_V6ONLY bind the same port side by side, each taking its own
+# family. The native side is a privileged container.
 exec 2>&1
 cd /tmp
 cat > srv.py <<'PY'
@@ -184,6 +185,62 @@ for l in open("/proc/net/tcp").read().splitlines()[1:]:
         rows.append("listening " + f[1])
 print("\n".join(sorted(rows)))
 print("getsockname", a.getsockname(), c.getsockname())
+'
+echo "== IPv4 and IPv6 on one port in A (nginx: listen 80; listen [::]:80)"
+nsenter -t "$A" -n python3 -c '
+import errno, select, socket
+
+def bind(kind, fam, addr, port, v6only=None):
+    s = socket.socket(fam, socket.SOCK_STREAM if kind == "tcp" else socket.SOCK_DGRAM)
+    if v6only is not None:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
+    try:
+        s.bind((addr, port))
+        if kind == "tcp":
+            s.listen()
+        return s, "ok"
+    except OSError as e:
+        return s, errno.errorcode[e.errno]
+
+def taker(socks):
+    ready, _, _ = select.select(list(socks), [], [], 2)
+    return ",".join(socks[r] for r in ready) or "nobody"
+
+for kind in ("tcp", "udp"):
+    port = 7008 if kind == "tcp" else 7011
+    v4, r4 = bind(kind, socket.AF_INET, "0.0.0.0", port)
+    v6, r6 = bind(kind, socket.AF_INET6, "::", port, 1)
+    print(kind, "0.0.0.0 and [::] with IPV6_V6ONLY:", r4, r6)
+    socks = {v4: "ipv4", v6: "ipv6"}
+    for dst in ("127.0.0.1", "::1"):
+        c = socket.socket(socket.AF_INET6 if ":" in dst else socket.AF_INET,
+                          socket.SOCK_STREAM if kind == "tcp" else socket.SOCK_DGRAM)
+        if kind == "tcp":
+            c.connect((dst, port))
+        else:
+            c.sendto(b"x", (dst, port))
+        who = taker(socks)
+        print(" ", dst, "->", who)
+        for s, name in socks.items():
+            if name == who:
+                if kind == "tcp":
+                    s.accept()[0].close()
+                else:
+                    s.recvfrom(10)
+        c.close()
+# Without IPV6_V6ONLY [::] covers IPv4 too: a conflict
+v4, _ = bind("tcp", socket.AF_INET, "0.0.0.0", 7013)
+_, r = bind("tcp", socket.AF_INET6, "::", 7013, 0)
+print("tcp 0.0.0.0 and dual-stack [::]:", r)
+# Only an IPv6-only listener: IPv4 is refused, IPv6 accepted
+only, _ = bind("tcp", socket.AF_INET6, "::", 7014, 1)
+for dst in ("127.0.0.1", "::1"):
+    c = socket.socket(socket.AF_INET6 if ":" in dst else socket.AF_INET)
+    try:
+        c.connect((dst, 7014))
+        print("IPv6-only listener,", dst, "ok")
+    except OSError as e:
+        print("IPv6-only listener,", dst, errno.errorcode[e.errno])
 '
 kill $holders "$A" "$B" 2>/dev/null; wait 2>/dev/null
 ip link del br0

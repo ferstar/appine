@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; binding 127.0.0.1 with lo down matches native Linux in the namespaces differential test)
+> Maintained: 2026-11-04 (targeted verification: IPv6-only binds get their own host port, so IPv4 and IPv6 can bind one port side by side; the dual-stack bug narrowed to the remaining address cases)
 
 ## Responsibilities
 
@@ -111,10 +111,13 @@ structure (`kernel/procfs`); host sockets (`hal`).
 ### Ports and listeners in a namespace
 
 - Explicit nonzero binds keep the guest port and let the host choose (`portmap::bind_any`, keyed
-  by namespace, protocol and guest port — no family or address, and the guest's `IPV6_V6ONLY` is
-  never set on the host socket; no linger, so the next bind gets a new host port); bind(0) and
-  implicit binds use host ephemeral ports directly (`ip_local_port_range` is stored only), which
-  can equal a guest port bound explicitly in the same namespace.
+  by namespace, protocol, guest port and whether the socket takes only IPv6 — an AF_INET6 socket
+  with `IPV6_V6ONLY`, which gets a host port of its own; no address in the key, and the guest's
+  `IPV6_V6ONLY` is never set on the host socket; no linger, so the next bind gets a new host
+  port). Connects and sends to the port pick the host port by destination: an IPv6 address goes
+  to the IPv6-only binding first, an IPv4 address never does. bind(0) and implicit binds use host
+  ephemeral ports directly (`ip_local_port_range` is stored only), which can equal a guest port
+  bound explicitly in the same namespace.
 - TCP listens and bound UDP sockets register `Listener`s with the guest address (or wildcard).
   Matching: same port and protocol; AF_INET wildcards accept IPv4, AF_INET6 wildcards IPv6 and —
   unless `v6only` — IPv4; specific addresses only themselves.
@@ -276,10 +279,10 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
   guests (and other apps on the device) reach a container's host sockets directly, including
   services bound only to the container's 127.0.0.1.
-- **Dual-stack port pairs conflict in namespaces:** IPv4 and IPv6 binds of one guest port share a
-  host port and `IPV6_V6ONLY` never reaches the host, so `0.0.0.0:P` plus `[::]:P` with
-  `V6ONLY` (nginx's `listen 80; listen [::]:80`) is `EADDRINUSE`; 127.0.0.1:P and the virtual
-  address:P conflict too, while wildcard:P plus 127.0.0.2:P wrongly succeed.
+- **Same-port binds are judged by host address, not guest address:** 127.0.0.1:P and the virtual
+  address:P conflict (both are 127.a.b.1 on the host) where Linux allows them, while wildcard:P
+  plus 127.0.0.2:P succeed, and so do an IPv6-only `[::]:P` plus a dual-stack `[::]:P` (separate
+  host ports), where Linux refuses the second.
 - **Ephemeral ports can alias explicit ports:** bind(0) and implicit binds take host ephemeral
   ports, which may equal a guest port bound explicitly in the same namespace; connects to that
   number then go to the explicit socket, and a later explicit bind to an ephemeral number succeeds.

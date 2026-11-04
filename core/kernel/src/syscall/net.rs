@@ -465,11 +465,14 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                             .ok()
                             .and_then(|a| port_of(&a))
                     };
+                    // An IPv6-only binding gets a host port of its own (crate::portmap::bind_any)
+                    let v6only = s.family == AF_INET6 && s.v6only && ipv6_proper(&addr);
                     let (host, lease) = crate::portmap::bind_any(
                         &map,
                         ns_key(s),
                         map_proto(s),
                         port,
+                        v6only,
                         try_bind,
                         bound,
                     )?;
@@ -784,7 +787,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 } else {
                     m.addr
                 };
-                let (host_addr, pm) = map_dest(&map, s, to, key);
+                let (host_addr, pm) = map_dest(&map, s, to, key, ipv6_proper(&there));
                 s.peer_map = pm;
                 // A datagram socket bound to the wildcard address on the host connects to a mapped
                 // destination: the host socket is not connected and the peer is recorded here
@@ -1529,6 +1532,8 @@ pub(crate) fn send(
     let init = cx.kr().init_ns.net.clone();
     let cred = cx.cred();
     let mut key = None;
+    // The destination as seen in its namespace is an IPv6 address (map_dest)
+    let mut dest_v6 = false;
     // A socket bound to the host's wildcard address sending to a mapped destination: specify the
     // source address (Socket::wide)
     let mut pktinfo = None;
@@ -1613,6 +1618,7 @@ pub(crate) fn send(
                     ensure_bound(s, source)?;
                 }
                 key = Some(m.target.as_ref().map_or(0, key_of));
+                dest_v6 = ipv6_proper(&there);
                 if s.wide && m.target.is_some() {
                     pktinfo = crate::netns::implicit_bind(&me, s.family, false);
                 }
@@ -1646,7 +1652,7 @@ pub(crate) fn send(
     let mapped = match &*sock.borrow() {
         Socket::Inet(s) if !addr.is_empty() => {
             let k = key.unwrap_or_else(|| ns_key(s));
-            let (a, pm) = map_dest(&cx.kr().portmap, s, addr.to_vec(), k);
+            let (a, pm) = map_dest(&cx.kr().portmap, s, addr.to_vec(), k, dest_v6);
             pm.map(|_| a)
         }
         _ => None,
@@ -1818,7 +1824,7 @@ fn forward_target(k: &crate::kernel::Kernel, s: &InetSocket) -> Option<crate::fo
     let key = m.target.as_ref().map_or(0, key_of);
     let map = k.portmap.borrow();
     if let Some(p) = port_of(&addr)
-        && let Some(h) = map.host_port(key, proto, p)
+        && let Some(h) = map.host_port(key, proto, p, ipv6_proper(&dst))
     {
         set_port(&mut addr, h);
     }
@@ -2100,6 +2106,11 @@ fn ns_key(s: &InetSocket) -> usize {
     s.net.as_ref().map_or(0, |n| Rc::as_ptr(n) as usize)
 }
 
+/// Whether a sockaddr holds an IPv6 address proper (not an IPv4-mapped one).
+fn ipv6_proper(addr: &[u8]) -> bool {
+    matches!(ip_of(addr), Some(std::net::IpAddr::V6(_)))
+}
+
 /// The IP in a sockaddr (the IPv4 part of an IPv4-mapped IPv6 address).
 fn ip_of(addr: &[u8]) -> Option<std::net::IpAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2140,7 +2151,9 @@ fn is_local(addr: &[u8]) -> bool {
 
 /// Connecting or sending to host address `addr`: a mapped low port on the local machine becomes
 /// the host port ([`crate::portmap`]), by the registration of the network namespace the
-/// destination is in (`key`, [`key_of`]). Returns the rewritten address and (guest port, host
+/// destination is in (`key`, [`key_of`]); `v6` says whether the destination as seen in that
+/// namespace is an IPv6 address, which picks an IPv6-only binding first
+/// ([`crate::portmap::PortMap::host_port`]). Returns the rewritten address and (guest port, host
 /// port). Not rewritten when no program in the guest binds this port: if another app on the
 /// phone happens to hold the host port, connecting there would be wrong, and it should fail to
 /// connect as before.
@@ -2149,6 +2162,7 @@ fn map_dest(
     s: &InetSocket,
     mut addr: Vec<u8>,
     key: usize,
+    v6: bool,
 ) -> (Vec<u8>, Option<(u16, u16)>) {
     let Some(port) = port_of(&addr) else {
         return (addr, None);
@@ -2159,7 +2173,7 @@ fn map_dest(
         }
         // Only low ports and ports bound explicitly in new namespaces are registered; unregistered
         // ones are not rewritten
-        map.borrow().host_port(key, map_proto(s), port)
+        map.borrow().host_port(key, map_proto(s), port, v6)
     };
     match host {
         Some(h) if is_local(&addr) => {
