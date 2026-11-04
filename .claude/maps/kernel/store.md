@@ -129,8 +129,8 @@ provider and rootfs installation UI (`android`).
   orderings mimic ext4 (`data=ordered`, `auto_da_alloc`):
   - `fsync`/`fdatasync`: sync a regular file's object (BKL released; directories skip this, host
     fds return 0), commit (BKL held), then sync the WAL (BKL released); `sync`/`syncfs`: commit,
-    then `syncfs` the host filesystem; synchronous writes sync the object only (in practice only
-    `pwritev2` with `RWF_SYNC`/`RWF_DSYNC`: open drops `O_SYNC`/`O_DSYNC`, a `kernel/vfs` bug);
+    then `syncfs` the host filesystem; synchronous writes (`O_SYNC`/`O_DSYNC` files, `pwritev2`
+    with `RWF_SYNC`/`RWF_DSYNC`) sync the object only;
     `Machine::sync` and `trim_memory` only commit (protection against being killed, not against
     power loss).
   - A regular file renamed over an existing name (not exchanges, not symlinks) has its data

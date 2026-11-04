@@ -57,6 +57,10 @@ pub mod oflags {
     pub const O_NOFOLLOW: u32 = 0o100000;
     /// Large file (always true on 64-bit).
     pub const O_LARGEFILE: u32 = 0o400000;
+    /// Writes to a regular file wait for the data to reach disk (fdatasync after each write).
+    pub const O_DSYNC: u32 = 0o10000;
+    /// `__O_SYNC`: with [`O_DSYNC`] it is `O_SYNC`, waiting as fsync does.
+    pub const O_SYNC_BIT: u32 = 0o4000000;
     /// Do not update the access time (only for the owner or a process with `CAP_FOWNER`).
     pub const O_NOATIME: u32 = 0o1000000;
     /// Close on exec.

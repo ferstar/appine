@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-04 (targeted verification: open keeps `O_SYNC`/`O_DSYNC` and writes sync accordingly; execve and `CLOSE_RANGE_UNSHARE` copy the fd table only when shared, keeping POSIX locks; removed both bugs)
 
 ## Responsibilities
 
@@ -238,15 +238,16 @@ mapped).
   process's own rlimit).
 - dup and fork share one `OpenFile` (offset and status flags shared). Clone without
   `CLONE_FILES` copies the slots and resets `holds_locks`. Every thread holds two references to its
-  table (task state and task resources): `unshare(CLONE_FILES)` copies when there are more than
-  two, but execve and `CLOSE_RANGE_UNSHARE` test for more than one and so always copy; execve then
-  applies close-on-exec.
+  table (task state and task resources): `unshare(CLONE_FILES)`, execve (after the other threads
+  are gone) and `CLOSE_RANGE_UNSHARE` copy only when there are more than two, that is when another
+  thread or process shares the table; a copy is a new owner of POSIX locks, so an unshared table
+  keeps its locks. execve then applies close-on-exec.
 - Closing (close, dup3 over an fd, close_range, close-on-exec) removes the slot, runs
   `locks::closed` (POSIX locks of this table on that file) and `unix::released`; the last
   reference's `Drop` wakes lock and host-socket waiters and reports `IN_CLOSE_*`.
-- `OpenFile` keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH` and `O_LARGEFILE` from
-  open (so `F_GETFL` never shows `O_SYNC`, `O_DSYNC`, `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given at
-  open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
+- `OpenFile` keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`
+  and `O_LARGEFILE` from open (so `F_GETFL` never shows `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given
+  at open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
   when `O_ASYNC` turns on, with no `O_NOATIME` ownership check). `F_SETOWN_EX`/`F_GETOWN_EX`
   translate pids through the caller's pid namespace (owners are stored as global ids); plain
   `F_SETOWN`/`F_GETOWN` do not. `F_SETSIG`, pipe size and seals are also handled in fcntl.
@@ -279,8 +280,9 @@ mapped).
   and the copy path take `pos_busy`; lseek and `O_APPEND` writes update the position without it
   (directories never do unlocked I/O, so getdents is unaffected).
 - `O_APPEND` writes run under the BKL at the current host length; `pwrite` on an `O_APPEND` file
-  also appends unless `RWF_NOAPPEND`. After a write, `write_sync` fsyncs the object when the open
-  file has `O_DSYNC` — which open never keeps — or the call passed `RWF_DSYNC`/`RWF_SYNC`.
+  also appends unless `RWF_NOAPPEND`. After a write, `write_sync` syncs the object (with the BKL
+  released) when the open file has `O_DSYNC` (fdatasync) or `O_SYNC` (fsync), or the call passed
+  `RWF_DSYNC`/`RWF_SYNC`; `sendfile`, `copy_file_range` and `splice` into such a file do not.
 - No holes: `SEEK_DATA` returns the offset and `SEEK_HOLE` the size. `fallocate` mode 0 extends
   the length, `PUNCH_HOLE` (with `KEEP_SIZE`) and `ZERO_RANGE` write zeros under the BKL, other
   modes `EOPNOTSUPP`.
@@ -471,15 +473,6 @@ mapped).
   other users' open files and follow the links to their nodes, reaching files in directories it
   cannot search, and reopen their pipes with no permission check (Linux denies with `EACCES`).
   See the matching `kernel/procfs` item.
-- **Open-time `O_SYNC`/`O_DSYNC` do nothing:** open drops them, so writes return before the data is
-  durable (only `pwritev2` with `RWF_SYNC`/`RWF_DSYNC` fsyncs), contradicting Linux's
-  `generic_write_sync`; `F_GETFL` also hides them. Programs relying on `O_SYNC`/`O_DSYNC` instead of
-  fsync (databases, loggers) can lose acknowledged writes on power loss.
-- **execve drops POSIX record locks:** execve and `close_range(CLOSE_RANGE_UNSHARE)` always copy
-  the fd table (the reference test ignores the second per-thread reference), the copy does not own
-  the old table's POSIX locks, and the old owner dies, so a process's `fcntl` locks vanish at
-  execve (or at close_range with unshare, even on files it keeps open). Lock-file protocols that
-  exec while holding a lock break.
 - **Relinking unlinked files creates dangling names:** `linkat` accepts an nlink-0 source (through
   `AT_EMPTY_PATH`, which also lacks Linux's `CAP_DAC_READ_SEARCH` check, or `/proc/self/fd/N`
   with `AT_SYMLINK_FOLLOW`); the inode stays doomed, so after commit the reaper deletes its object
@@ -512,7 +505,8 @@ mapped).
   `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
   fallocate writes zeros); `TFD_TIMER_CANCEL_ON_SET` never cancels; `RLIMIT_NOFILE` set by prlimit
   applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared; propagation is not
-  emulated.
+  emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
+  sync it (Linux's write path does).
 
 ## Open questions
 

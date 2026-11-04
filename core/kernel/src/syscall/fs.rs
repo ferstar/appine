@@ -964,7 +964,7 @@ fn open_path_with(
     {
         display = None;
     }
-    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
+    let keep = KEPT_AT_OPEN;
     let file = OpenFile::with_path(kind, flags & keep | largefile(flags), display);
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
@@ -975,6 +975,15 @@ fn open_path_with(
     }
     Ok(file)
 }
+
+/// The status flags an open file keeps from open, as Linux keeps them in `f_flags`: F_GETFL
+/// shows them, and `O_DSYNC`/`O_SYNC` make every write wait for the disk ([`write_sync`]).
+const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
+    | oflags::O_APPEND
+    | oflags::O_NONBLOCK
+    | oflags::O_PATH
+    | oflags::O_DSYNC
+    | oflags::O_SYNC_BIT;
 
 /// Files opened by open, openat2 and open_by_handle_at carry `O_LARGEFILE` (on 64-bit Linux
 /// always adds it, and drops it with `O_PATH`), visible in F_GETFL and fdinfo; files created by
@@ -1140,7 +1149,7 @@ pub(super) fn open_by_handle_at(
     } else {
         open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, (None, None))?
     };
-    let keep = oflags::O_ACCMODE | oflags::O_APPEND | oflags::O_NONBLOCK | oflags::O_PATH;
+    let keep = KEPT_AT_OPEN;
     let file = OpenFile::new(kind, flags & keep | largefile(flags));
     file.borrow_mut().mnt = mnt;
     cx.fds_mut()
@@ -1673,7 +1682,10 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
         return Err(Errno::EINVAL);
     }
-    if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 1 {
+    // Only when the table is shared with another thread or process (each thread holds two
+    // references): copying an unshared one would make a new lock owner and drop the POSIX record
+    // locks held through it
+    if flags & CLOSE_RANGE_UNSHARE != 0 && Rc::strong_count(&cx.t.fds) > 2 {
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }
@@ -5147,11 +5159,9 @@ pub(super) fn write_file(
 /// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
 /// generic_write_sync). Data, length and times are all in the host object, so the host flushes
 /// them, waited for with the BKL released; names are not among them, and on Linux the directory
-/// also needs a separate fsync. Unlike Linux, open does not keep `O_DSYNC` or `O_SYNC` in the
-/// open file's flags, so only `rwf` leads to a flush.
+/// also needs a separate fsync.
 fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
-    const O_DSYNC: u32 = 0o10000;
-    const O_SYNC_BIT: u32 = 0o4000000; // __O_SYNC; O_SYNC is it plus O_DSYNC
+    use oflags::{O_DSYNC, O_SYNC_BIT};
     const RWF_DSYNC: u32 = 2;
     const RWF_SYNC: u32 = 4;
     let (fd, data_only) = {

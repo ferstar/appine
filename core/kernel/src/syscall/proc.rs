@@ -959,7 +959,11 @@ fn exec(
             cx.shared.fast_changed();
         }
     }
-    if Rc::strong_count(&cx.t.fds) > 1 {
+    // Copy the fd table only when another process shares it (CLONE_FILES; Linux's
+    // unshare_files): this thread's TaskState and TaskRes hold the only two references once the
+    // other threads are gone. A copy is a new owner, so the POSIX record locks this process holds
+    // would be lost (crate::locks)
+    if Rc::strong_count(&cx.t.fds) > 2 {
         let copy = cx.fds().clone();
         cx.set_fds(Rc::new(RefCell::new(copy)));
     }

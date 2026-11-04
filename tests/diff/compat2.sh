@@ -2,7 +2,8 @@
 # not exceed 128 KB): raw ICMP sockets, PR_SET_CHILD_SUBREAPER, positional writes on O_APPEND
 # files, readlink with an empty path, O_LARGEFILE in F_GETFL, /proc/<pid>/task/<tid>/children,
 # PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
-# itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat
+# itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat, POSIX locks
+# across execve and close_range, O_SYNC and O_DSYNC kept at open
 set -e
 cd /tmp
 # raw ICMP sockets (appine emulates them with ping sockets on the host): data received on IPv4
@@ -1544,3 +1545,54 @@ int main(void)
 }
 C
 gcc -O1 -o btime btime.c && ./btime
+
+# POSIX record locks belong to the process's fd table: they survive close_range with
+# CLOSE_RANGE_UNSHARE (closing other fds) and execve, as checked by another process with F_GETLK.
+# open keeps O_SYNC and O_DSYNC in the status flags, and F_SETFL cannot clear them
+cat > locks.py <<'PY'
+import ctypes, fcntl, os, struct, subprocess, sys
+
+FLOCK = "hh4xqqi4x"
+
+if len(sys.argv) > 2 and sys.argv[1] == "holder":
+    fd = os.open(sys.argv[2], os.O_RDWR)
+    got = fcntl.fcntl(fd, fcntl.F_GETLK, struct.pack(FLOCK, fcntl.F_WRLCK, 0, 0, 0, 0))
+    t, _, _, _, pid = struct.unpack(FLOCK, got)
+    print(pid if t != fcntl.F_UNLCK else 0)
+    sys.exit(0)
+
+
+def held_by_me(path):
+    out = subprocess.run([sys.executable, __file__, "holder", path], capture_output=True, text=True)
+    return out.stdout.strip() == str(os.getpid())
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "after-exec":
+    print("after execve, still held:", held_by_me("/tmp/lock-exec"))
+    sys.exit(0)
+
+fd = os.open("/tmp/lock-cr", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+print("locked:", held_by_me("/tmp/lock-cr"))
+spare = os.open("/dev/null", os.O_RDONLY)
+libc = ctypes.CDLL(None, use_errno=True)
+r = libc.syscall(436, spare, spare, 2)  # close_range(spare, spare, CLOSE_RANGE_UNSHARE)
+print("close_range with unshare", r, "still held:", held_by_me("/tmp/lock-cr"))
+
+for name, flag in (("O_SYNC", os.O_SYNC), ("O_DSYNC", os.O_DSYNC)):
+    f = os.open("/tmp/sync-file", os.O_WRONLY | os.O_CREAT | flag, 0o644)
+    fl = fcntl.fcntl(f, fcntl.F_GETFL)
+    fcntl.fcntl(f, fcntl.F_SETFL, fl & ~flag)
+    after = fcntl.fcntl(f, fcntl.F_GETFL)
+    print(name, "in F_GETFL:", fl & flag == flag, "kept after F_SETFL:", after & flag == flag,
+          "write:", os.write(f, b"x"))
+    os.close(f)
+
+fd2 = os.open("/tmp/lock-exec", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+fcntl.lockf(fd2, fcntl.LOCK_EX)
+os.set_inheritable(fd2, True)
+sys.stdout.flush()
+os.execv(sys.executable, [sys.executable, __file__, "after-exec"])
+PY
+python3 locks.py
+rm -f locks.py /tmp/lock-cr /tmp/lock-exec /tmp/sync-file
