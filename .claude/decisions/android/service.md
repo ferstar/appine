@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-03 (HEAD = c3df5d3) — seeded by hand from the retired design doc §11.2 and
-> the round records in `docs/rounds/`; no `MODULE: android/service` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D6 were seeded by hand from the retired design
+> doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
+> cite commits.
 
 ## Active
 
@@ -44,3 +44,21 @@
 - **Why**: Tabs used to show only "Killed" or "Segmentation fault", which does not tell an OOM kill from an appine bug; after release the copied report is what a user can bring to the developer.
 - **Tradeoffs**: Reports are polled, so they arrive after the shell's prompt (hence the insertion above the cursor, `android/terminal` D2).
 - **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`)
+
+### D7: The service is a module of its own, split from the app by responsibility
+- **What**: android/service holds `TerminalService.kt` and `Tabs.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
+- **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
+- **Tradeoffs**: The code stays in one Gradle module, so cross-module statics remain (the login setting, the store lock).
+- **Watch out**: "Exit all" during a start leaks a kernel, and reboots and distro switches run without the wake lock.
+- **Source**: 12c4afa
+
+### D8: The service holds `VtSession`s and releases them before the kernel stops
+- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports find the tab by console; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
+- **Why**: The service held Termux `TerminalSession`s directly with a separate session → `ConsolePty` map, so the libghostty-vt terminal could not be one of its tabs (android/terminal D8).
+- **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly.
+- **Watch out**: Finished tabs keep the service alive, saved tabs can be lost or mismatched, and notification ids collide.
+- **Source**: 6ffb912
+
+## Superseded
+
+- ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)

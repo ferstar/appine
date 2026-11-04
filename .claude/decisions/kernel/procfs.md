@@ -2,9 +2,9 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-03 (HEAD = 9e5be2b) — seeded by hand from the retired design doc §8.2 and
-> the round records in `docs/rounds/`; no `MODULE: kernel/procfs` Decision blocks exist yet, so
-> sources cite rounds instead of commits.
+> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D8 were seeded by hand from the retired design
+> doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
+> commits.
 
 ## Active
 
@@ -63,3 +63,17 @@
 - **Tradeoffs**: Counters and routes are real only in the initial namespace.
 - **Watch out**: `/proc/sys/net` follows the reader's namespace, `/proc/<pid>/net` the target's.
 - **Source**: round 96 (`96-proc-pid-net`)
+
+### D9: procfs, sysfs, devpts, cgroup2 and the bpf device subset are one module
+- **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
+- **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
+- **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check, `/proc/<tid>` returning `ENOENT` for non-leader threads, and no poll notifications.
+- **Source**: c5236a1
+
+### D10: `/proc/stat`'s btime is computed in nanoseconds on every read and follows the time namespace
+- **What**: Each read takes realtime in nanoseconds minus `with_boot_offset(uptime_ns())`, then whole seconds (no less than 0), so btime stays fixed and moves back by the reader's boottime offset.
+- **Why**: Subtracting two clocks already truncated to seconds made btime alternate between two values, so `ps -o lstart` (procps-ng: btime plus start time / HZ) changed between reads, and the time-namespace offset Linux 6.1 subtracts (`timens_sub_boottime`) was ignored.
+- **Tradeoffs**: The two clocks are read microseconds apart, so btime can still be one second off when the boot instant's fraction falls in that gap; unlike a cached value it follows host clock steps, as Linux does.
+- **Watch out**: A host clock step (Android network time) moves btime and programs that cached it disagree until they reread it; the difftest cases (compat2, containers) compare only stability and offsets, not exact values.
+- **Source**: eb3bc8b

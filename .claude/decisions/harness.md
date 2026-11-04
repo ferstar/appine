@@ -2,9 +2,8 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-03 (HEAD = 12c4afa) — seeded by hand from the design doc §13.3 and the
-> round records in `docs/rounds/`; no `MODULE: harness` Decision blocks exist yet, so sources cite
-> rounds instead of commits.
+> Last distilled: 2026-11-04 (HEAD = b38d29c). D1–D8 were seeded by hand from the design doc §13.3
+> and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
 
@@ -52,3 +51,17 @@
 - **Why**: Killing the app leaves the host page cache intact and never loses data; only a real power loss exposes ordering problems, such as renamed files turning into zero bytes.
 - **Tradeoffs**: Needs root, loop devices and dm-flakey in the VM, so it runs by hand, not in CI.
 - **Source**: rounds 190 (`190-settings-default-alpine`), 198 (`198-power-loss`)
+
+### D9: The harness module is appine-run plus the layers that drive it
+- **What**: harness holds `hosts/cli`, `tests/{guest,bench,diff,survey,crash}`, the dev container, the difftest, LTP and survey scripts and CI; lockstep stays with engine, `scripts/fetch-rootfs` with android/setup and `scripts/release-sources` with android/native, and design §13.3 remains the overview.
+- **Why**: hosts/cli was the last code with no module, its value lies in the test layers that drive it, and those layers' gotchas lived only in personal notes; `harness` names the drivers rather than every test.
+- **Tradeoffs**: "All tests" span two maps (lockstep is in engine), and the map repeats part of §13.3's overview.
+- **Watch out**: Recorded weaknesses let tests pass without running (missing cases, dead lanes, the low-ports early return, silent skips without a rootfs), and the two difftest sides start from different files, so results can be flaky.
+- **Source**: 16ac7a2
+
+### D10: CI installs a pinned Zig and fetches the Ghostty source for the Android job
+- **What**: The Android job downloads zig-x86_64-linux-0.17.0 from ziglang.org, checks it against the sha256 copied from ziglang.org/download/index.json, puts it on `PATH`, runs `scripts/fetch-ghostty`, and caches `target/ghostty` and `~/.cache/zig` keyed by the script's hash.
+- **Why**: The Android native library now always builds libghostty-vt, which needs Zig and the Ghostty source (android/native D6).
+- **Tradeoffs**: No third-party setup action, but ziglang.org asks CI users to prefer mirrors; the cache key ignores Zig's own build cache, so later runs reuse only the first run's artifacts.
+- **Watch out**: A download failure from ziglang.org fails the job.
+- **Source**: b38d29c
