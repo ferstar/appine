@@ -1036,7 +1036,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
     if let Some(m) = machine(handle) {
         m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
     }
-    machines().remove(&handle);
+    // Dropped only after the table's lock is released: when this is the last reference, Machine's
+    // drop syncs the store and joins threads, and every other call would wait for it
+    let m = machines().remove(&handle);
+    drop(m);
 }
 
 /// Takes the guest's power request (busybox's reboot, halt, poweroff): 0 none, 1 reboot, 2 halt,

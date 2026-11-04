@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: libghostty-vt built with Zig in every Android build; its notices, fetch and released sources; the Material Components dependency, its notices and the activities' themes)
+> Maintained: 2026-11-04 (targeted verification: `shutdown` drops the last `Arc<Machine>` outside the table lock; removed that bug)
 
 ## Responsibilities
 
@@ -58,8 +58,10 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - `start` creates a `Machine` and registers it; every call clones the `Arc` under the table lock,
   drops the lock and works, so a blocked read keeps its kernel alive across a concurrent `stop`.
 - `stop` removes the handle and then kills everything; `shutdown` runs the inittab shutdown
-  (poweroff, 30 s) and then removes it. Later calls find nothing: reads and writes return −1,
-  `waitFor` −9, `openConsole`/`spawn` throw, the rest do nothing.
+  (poweroff, 30 s) and then removes it. Both drop the removed `Arc` only after the table lock is
+  released, since the last reference's drop syncs the store and joins threads. Later calls find
+  nothing: reads and writes return −1, `waitFor` −9, `openConsole`/`spawn` throw, the rest do
+  nothing.
 - Errors become `IOException` (`FileNotFoundException` for browse calls) or sentinel values.
 - Callers are JVM threads (the service's worker and boot threads, the terminal's reader, writer and
   waiter threads, the main thread, provider binder threads, the libghostty-vt tabs' pump
@@ -161,10 +163,6 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 ## Confirmed bugs / technical debt
 
-- **`shutdown` can run `Machine`'s drop under the table lock.** Its final `machines().remove(..)`
-  statement drops the removed `Arc` before the guard; when it is the last reference, the store sync
-  and thread joins block every other JNI call (including main-thread console calls). `stop` avoids
-  this on purpose.
 - **Panics outside the kernel's wrapped calls abort the app** (see the list above); for example
   `setRoutes`' route parsing slices bytes without an ASCII check.
 - The release build is signed with the debug key and not minified; the Alpine tarball is picked by
