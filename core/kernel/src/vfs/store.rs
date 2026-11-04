@@ -1964,15 +1964,22 @@ impl Store {
     }
 
     /// Changes the owner and group; `None` means unchanged. For non-directories the setuid bit is
-    /// cleared as well, and the setgid bit when the file is group-executable (Linux does this for
-    /// root too).
-    pub fn set_owner(&self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    /// cleared as well (Linux does this for root too), and the setgid bit when the file is
+    /// group-executable or `keep_sgid` is false: the caller is neither in the file's group nor has
+    /// `CAP_FSETID` (Linux's `setattr_should_drop_sgid`, since 6.2).
+    pub fn set_owner(
+        &self,
+        ino: Ino,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        keep_sgid: bool,
+    ) -> Result<(), Errno> {
         let st = self.stat_row(ino)?;
         let mut perm = st.mode & 0o7777;
         if !st.is_dir() {
-            perm &= !0o4000;
-            if perm & 0o010 != 0 {
-                perm &= !0o2000;
+            perm &= !mode::S_ISUID;
+            if perm & 0o010 != 0 || !keep_sgid {
+                perm &= !mode::S_ISGID;
             }
         }
         self.transaction(|s| {
@@ -2828,7 +2835,7 @@ mod tests {
         s.set_xattr(f, XATTR_NAME_CAPS, &caps, false, false)
             .unwrap();
         assert!(s.has_file_caps(f).unwrap());
-        s.set_owner(f, None, Some(0)).unwrap();
+        s.set_owner(f, None, Some(0), true).unwrap();
         assert!(!s.has_file_caps(f).unwrap());
         assert_eq!(s.get_xattr(f, XATTR_NAME_CAPS), Err(Errno::ENODATA));
         drop((other, s));

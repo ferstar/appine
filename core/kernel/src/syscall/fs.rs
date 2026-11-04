@@ -3411,8 +3411,22 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     if !(cred.capable_wrt(&st, cap::CHOWN) || uid_ok && gid_ok) {
         return Err(Errno::EPERM);
     }
+    // Changing a non-directory's owner, even chown(-1, -1), clears its setuid bit, and its setgid
+    // bit when group-executable or when the caller is neither in its group nor has CAP_FSETID
+    // (Linux's setattr_should_drop_sgid, since 6.2): a mode change, which only the owner or
+    // CAP_FOWNER may make (notify_change adds ATTR_MODE, checked by inode_owner_or_capable).
+    // Otherwise anyone could disable root's set-id programs (su, doas)
+    let keep_sgid = cred.in_group(st.gid) || cred.capable_wrt(&st, cap::FSETID);
+    if let Attrs::Store(_) = target
+        && !st.is_dir()
+        && (st.mode & mode::S_ISUID != 0
+            || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid))
+        && !cred.owns(&st)
+    {
+        return Err(Errno::EPERM);
+    }
     match target {
-        Attrs::Store(ino) => cx.vfs()?.store().set_owner(*ino, uid, gid)?,
+        Attrs::Store(ino) => cx.vfs()?.store().set_owner(*ino, uid, gid, keep_sgid)?,
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
             t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: open keeps `O_SYNC`/`O_DSYNC` and writes sync accordingly; execve and `CLOSE_RANGE_UNSHARE` copy the fd table only when shared, keeping POSIX locks; removed both bugs)
+> Maintained: 2026-11-05 (targeted verification: chown of set-id files needs the owner or `CAP_FOWNER`, and clears setgid as 6.2's `setattr_should_drop_sgid`; removed the set-id stripping bug)
 
 ## Responsibilities
 
@@ -307,9 +307,13 @@ mapped).
   the caller's namespace); `EROFS` for `W_OK` after the permission check.
 - chmod drops `S_ISGID` when the caller is not in the file's group and lacks `CAP_FSETID` over
   it. chown needs mapped IDs (`EINVAL`) and either `CAP_CHOWN` over the file or an owner keeping
-  the uid and choosing one of its groups; an argument of -1 always passes, so `chown(-1, -1)` is
-  allowed for anyone. The store then clears setuid, setgid (with group exec) and file caps on
-  non-directories, for every caller. utimensat: explicit times need the owner or `CAP_FOWNER`,
+  the uid and choosing one of its groups; an argument of -1 always passes. On a store
+  non-directory it then clears setuid, setgid when group-executable or when the caller is neither
+  in the file's group nor has `CAP_FSETID` (Linux 6.2's `setattr_should_drop_sgid`; 6.1 cleared
+  only group-executable setgid), and file caps; when a set-id bit would go, the caller must be the
+  owner or have `CAP_FOWNER` (`EPERM`, bits kept), so `chown(-1, -1)` by another user fails on
+  `su` but succeeds on a file with only caps (which lose them, as on Linux). utimensat: explicit
+  times need the owner or `CAP_FOWNER`,
   `UTIME_NOW` also accepts write permission; the both-`UTIME_OMIT` shortcut runs after path
   resolution. Writes and truncation call `remove_privs` (`CAP_FSETID` checked in the initial
   namespace).
@@ -462,12 +466,9 @@ mapped).
 
 ## Confirmed bugs / technical debt
 
-- **Anyone can strip set-id bits and file caps:** `chown(path, -1, -1)` passes the permission
-  check for every caller, and the store clears setuid, setgid (with group exec) and
-  `security.capability` on any non-directory. An unprivileged user can thus disable `su`,
-  `passwd`, `ping` and similar programs owned by root on a writable mount (Linux refuses with
-  `EPERM` for set-id files because the implied mode change needs the owner or `CAP_FOWNER`; a
-  `CAP_CHOWN` holder without `CAP_FOWNER` is refused the same way).
+- **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
+  exec, as 6.1 does, while chown follows 6.2 and also clears it when the caller is outside the
+  file's group without `CAP_FSETID`; since 6.2 Linux's writes do the same as its chown.
 - **`/proc/<pid>/fd` has no access check:** listing, readlink and following `fd/N` skip the
   ptrace-read check that `cwd`, `root`, `exe` and `ns/*` do, so any process can see the paths of
   other users' open files and follow the links to their nodes, reaching files in directories it

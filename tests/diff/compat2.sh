@@ -3,7 +3,7 @@
 # files, readlink with an empty path, O_LARGEFILE in F_GETFL, /proc/<pid>/task/<tid>/children,
 # PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
 # itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat, POSIX locks
-# across execve and close_range, O_SYNC and O_DSYNC kept at open
+# across execve and close_range, O_SYNC and O_DSYNC kept at open, chown(-1, -1) of set-id files
 set -e
 cd /tmp
 # raw ICMP sockets (appine emulates them with ping sockets on the host): data received on IPv4
@@ -1596,3 +1596,60 @@ os.execv(sys.executable, [sys.executable, __file__, "after-exec"])
 PY
 python3 locks.py
 rm -f locks.py /tmp/lock-cr /tmp/lock-exec /tmp/sync-file
+
+# chown(path, -1, -1) changes no owner but clears the set-id bits of a non-directory: setuid
+# always, setgid when group-executable or when the caller is neither in the file's group nor has
+# CAP_FSETID. That is a mode change only the owner (or CAP_FOWNER) may make: another user gets EPERM
+# on such files and their bits stay; on other files it succeeds. Whether a file capability goes too
+# is compared as well. Run once as uid 65534 and once as root
+cat > chown.py <<'PY'
+import errno, os, struct
+
+caps = struct.pack("<IIIII", 0x02000000, 1 << 13, 0, 0, 0)  # v2, cap_net_raw permitted
+cases = (("setuid", 0o4755, 0, 0, False), ("setgid", 0o2755, 0, 0, False),
+         ("setgid-noexec", 0o2745, 0, 0, False), ("caps", 0o755, 0, 0, True),
+         ("plain", 0o755, 0, 0, False), ("own-setuid", 0o4755, 65534, 65534, False),
+         ("own-setgid-noexec", 0o2745, 65534, 65534, False),
+         ("own-setgid-noexec-other-group", 0o2745, 65534, 0, False))
+for who in ("uid 65534", "root"):
+    files = {}
+    for name, mode, uid, gid, cap in cases:
+        p = "/tmp/chown-" + name
+        open(p, "w").close()
+        os.chown(p, uid, gid)
+        os.chmod(p, mode)
+        if cap:
+            os.setxattr(p, "security.capability", caps)
+        files[name] = p
+    r, w = os.pipe()
+    if os.fork() == 0:
+        os.close(r)
+        if who != "root":
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+        out = []
+        for name, p in files.items():
+            try:
+                os.chown(p, -1, -1)
+                out.append("%s ok" % name)
+            except OSError as e:
+                out.append("%s %s" % (name, errno.errorcode[e.errno]))
+        os.write(w, "\n".join(out).encode())
+        os._exit(0)
+    os.close(w)
+    results = os.read(r, 4096).decode().split("\n")
+    os.close(r)
+    os.wait()
+    for line in results:
+        name = line.split()[0]
+        p = files[name]
+        try:
+            cap = "cap kept" if os.getxattr(p, "security.capability") == caps else "cap changed"
+        except OSError:
+            cap = "no cap"
+        print("chown(-1, -1) by %s:" % who, line, "mode %o" % (os.stat(p).st_mode & 0o7777), cap)
+        os.unlink(p)
+PY
+python3 chown.py
+rm -f chown.py
