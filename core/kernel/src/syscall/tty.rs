@@ -784,7 +784,9 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TIOCGPGRP => {
-            if !is_ctty(cx, tty) {
+            // On the master, any holder may ask (Linux's tiocgpgrp): a tmux server, which has no
+            // controlling terminal, names windows and finds a pane's cwd this way
+            if !master && !is_ctty(cx, tty) {
                 return Err(Errno::ENOTTY);
             }
             let fg = tty.borrow().fg.map_or(0, |p| cx.pid_out(p));
@@ -821,7 +823,8 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TIOCGSID => {
-            if !is_ctty(cx, tty) {
+            // Like TIOCGPGRP, needs no controlling terminal on the master (Linux's tiocgsid)
+            if !master && !is_ctty(cx, tty) {
                 return Err(Errno::ENOTTY);
             }
             let sid = tty.borrow().session.ok_or(Errno::ENOTTY)?;
@@ -862,7 +865,8 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TIOCNOTTY => {
-            if !is_ctty(cx, tty) {
+            // A controlling terminal is always a slave, so the master never matches it
+            if master || !is_ctty(cx, tty) {
                 return Err(Errno::ENOTTY);
             }
             let (sid, tgid) = {

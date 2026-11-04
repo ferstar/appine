@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/tty.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty, `TIOCNOTTY` on a master is `ENOTTY`)
 
 ## Responsibilities
 
@@ -122,9 +124,10 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 - Foreground: `TIOCSPGRP` needs the caller's ctty (`ENOTTY`), passes the background check (an
   orphaned caller's `EIO` is returned as is), then `EINVAL` for negative values, translates
   through the pid namespace, `EPERM` unless a group with that id exists in the caller's session
-  (also for 0 and unknown ids); `TIOCGPGRP`/`TIOCGSID` need the caller's ctty and translate out
-  (0 when invisible). Because both ends share one `Tty`, these work on a master fd only when that
-  terminal is the caller's ctty, and `TIOCNOTTY` is accepted on a master fd.
+  (also for 0 and unknown ids); because both ends share one `Tty`, it works on a master fd only
+  when that terminal is the caller's ctty. `TIOCGPGRP`/`TIOCGSID` need the caller's ctty on a
+  slave but answer any holder of the master (a tmux server has no ctty), and translate out (0 when
+  invisible; `TIOCGSID` without a session is `ENOTTY`). `TIOCNOTTY` on a master is `ENOTTY`.
 - Background access (`check_background`, Linux's `__tty_check_change`): applies when the terminal
   is the caller's ctty and another group is in the foreground; an ignored or blocked signal makes
   reads `EIO` and lets writes proceed; an orphaned group gets `EIO`; otherwise the signal goes to
@@ -227,10 +230,6 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   access; a process that calls `setsid` and holds even a write-only fd (group tty has write access
   on console terminals) becomes the terminal's session and foreground, then reads the victim's
   input through `/dev/tty` and receives its `^C`/`^Z`.
-- **tmux's pane queries fail:** `TIOCGPGRP`/`TIOCGSID` on a master fd return `ENOTTY` unless the
-  pty is the caller's controlling terminal (a tmux server has none), breaking automatic window
-  names and `pane_current_command`/`pane_current_path`; `TIOCNOTTY` is accepted on a master where
-  Linux returns `ENOTTY`.
 - **Echo can grow output without limit:** echoes and `send_xchar` ignore the output limit, so a
   master that never reads while the slave reads input lets the output queue grow unbounded
   (Linux drops echoes when full); one write can also overshoot by `ONLCR` expansion.

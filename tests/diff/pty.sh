@@ -401,3 +401,43 @@ print("blocking read", os.read(m, 100))
 os.waitpid(pid, 0)
 print("after the child", st(m))
 PY
+
+# The master reports the slave's foreground group and session to any holder (Linux's tiocgpgrp and
+# tiocgsid): a tmux server, which has no controlling terminal, names windows and finds a pane's cwd
+# this way. A slave that is not the caller's controlling terminal answers ENOTTY, and so does
+# TIOCNOTTY on a master
+python3 - <<'PY'
+import errno, fcntl, functools, os, struct, time
+
+print = functools.partial(print, flush=True)
+TIOCSCTTY, TIOCGPGRP, TIOCNOTTY, TIOCGSID = 0x540E, 0x540F, 0x5422, 0x5429
+
+
+def ask(fd, req):
+    try:
+        return struct.unpack("i", fcntl.ioctl(fd, req, bytes(4)))[0]
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+
+m, s = os.openpty()
+print("no session: master pgrp", ask(m, TIOCGPGRP), "sid", ask(m, TIOCGSID))
+print("not our slave: pgrp", ask(s, TIOCGPGRP), "sid", ask(s, TIOCGSID))
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    fcntl.ioctl(s, TIOCSCTTY, 0)
+    os.write(w, str(ask(m, TIOCNOTTY)).encode().ljust(8))
+    time.sleep(30)
+    os._exit(0)
+os.close(w)
+print("leader's master TIOCNOTTY", os.read(r, 8).decode().strip())
+print("child's session: master pgrp is the child", ask(m, TIOCGPGRP) == pid,
+      "sid is the child", ask(m, TIOCGSID) == pid)
+print("still not our slave: pgrp", ask(s, TIOCGPGRP), "sid", ask(s, TIOCGSID))
+print("our master TIOCNOTTY", ask(m, TIOCNOTTY))
+os.kill(pid, 9)
+os.waitpid(pid, 0)
+print("leader gone: master pgrp", ask(m, TIOCGPGRP), "sid", ask(m, TIOCGSID))
+PY
