@@ -1,7 +1,8 @@
 # Kernel corners: another process truncating a mapped file (SIGBUS, which must not take down the
 # whole app), MADV_DONTNEED, large PROT_NONE reservations, nanosleep sleeping only the remaining
 # time after a stop and continue, waiters getting EOWNERDEAD after a process holding a robust
-# lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS)
+# lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS), timeouts
+# too long for Linux to represent saturating
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -9,6 +10,7 @@ cat > edges.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -19,7 +21,11 @@ cat > edges.c <<'C'
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -76,6 +82,18 @@ static long ms_since(struct timespec *t0)
 }
 
 static void on_usr1(int sig) { (void)sig; }
+
+/* Sends signal `sig` to this process in 100 ms */
+static pid_t poke_soon(int sig)
+{
+    pid_t parent = getpid(), poker = fork();
+    if (poker == 0) {
+        usleep(100000);
+        kill(parent, sig);
+        _exit(0);
+    }
+    return poker;
+}
 
 int main(void)
 {
@@ -280,6 +298,99 @@ int main(void)
     printf("exclusive oneshot %d %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, pipefd[1], &ev), errno);
     ev.events = EPOLLIN | EPOLLEXCLUSIVE;
     printf("exclusive epoll %d %d\n", epoll_ctl(ep, EPOLL_CTL_ADD, ep2, &ev), errno);
+
+    /* Timeouts too long for Linux to represent saturate at about 292 years (GNU `sleep infinity`
+     * sleeps for LONG_MAX seconds): the waits go on until a handler interrupts them, the timers
+     * report the saturated time left, and such a socket timeout reads back as none */
+    const struct timespec huge = {LONG_MAX, 999999999};
+    struct timespec t = huge, left = {0, 0};
+    su.sa_flags = 0;
+    sigaction(SIGUSR1, &su, NULL);
+    poker = poke_soon(SIGUSR1);
+    r = syscall(SYS_nanosleep, &t, &left);
+    printf("huge nanosleep %d %s left>9e9s %d\n", r, strerror(errno), left.tv_sec > 9000000000L);
+    waitpid(poker, NULL, 0);
+    poker = poke_soon(SIGUSR1);
+    r = clock_nanosleep(CLOCK_REALTIME, 0, &t, &left);
+    printf("huge clock_nanosleep %s left>9e9s %d\n", strerror(r), left.tv_sec > 9000000000L);
+    waitpid(poker, NULL, 0);
+    poker = poke_soon(SIGUSR1);
+    r = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+    printf("huge clock_nanosleep abs %s\n", strerror(r));
+    waitpid(poker, NULL, 0);
+    static int hword;
+    poker = poke_soon(SIGUSR1);
+    r = syscall(SYS_futex, &hword, 128, 0, &t, NULL, 0);
+    printf("huge futex %d %s\n", r, strerror(errno));
+    waitpid(poker, NULL, 0);
+    int hq[2];
+    pipe(hq);
+    struct pollfd hp = {hq[0], POLLIN, 0};
+    poker = poke_soon(SIGUSR1);
+    r = ppoll(&hp, 1, &t, NULL);
+    printf("huge ppoll %d %s\n", r, strerror(errno));
+    waitpid(poker, NULL, 0);
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(hq[0], &rd);
+    t = huge;
+    poker = poke_soon(SIGUSR1);
+    r = pselect(hq[0] + 1, &rd, NULL, NULL, &t, NULL);
+    printf("huge pselect %d %s\n", r, strerror(errno));
+    waitpid(poker, NULL, 0);
+    t = huge;
+    poker = poke_soon(SIGUSR1);
+    r = syscall(441 /* epoll_pwait2 */, ep2, &ev, 1, &t, NULL, 0);
+    printf("huge epoll_pwait2 %d %s\n", r, strerror(errno));
+    waitpid(poker, NULL, 0);
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &usr2, NULL);
+    t = huge;
+    poker = poke_soon(SIGUSR2);
+    r = sigtimedwait(&usr2, NULL, &t);
+    printf("huge sigtimedwait %s\n", r == SIGUSR2 ? "SIGUSR2" : strerror(errno));
+    waitpid(poker, NULL, 0);
+    sigprocmask(SIG_UNBLOCK, &usr2, NULL);
+
+    struct itimerval iv = {{0, 0}, {LONG_MAX, 999999}}, oiv;
+    printf("huge setitimer %d", setitimer(ITIMER_REAL, &iv, NULL));
+    getitimer(ITIMER_REAL, &oiv);
+    printf(" left>9e9s %d\n", oiv.it_value.tv_sec > 9000000000L);
+    iv.it_value.tv_sec = iv.it_value.tv_usec = 0;
+    setitimer(ITIMER_REAL, &iv, NULL);
+    struct itimerspec its = {huge, huge}, oits;
+    timer_t tid;
+    struct sigevent sev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+    timer_create(CLOCK_MONOTONIC, &sev, &tid);
+    printf("huge timer_settime %d", timer_settime(tid, 0, &its, NULL));
+    timer_gettime(tid, &oits);
+    printf(" left>9e9s %d interval>9e9s %d\n", oits.it_value.tv_sec > 9000000000L,
+           oits.it_interval.tv_sec > 9000000000L);
+    timer_delete(tid);
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    printf("huge timerfd_settime %d", timerfd_settime(tfd, 0, &its, NULL));
+    timerfd_gettime(tfd, &oits);
+    printf(" left>9e9s %d interval>9e9s %d\n", oits.it_value.tv_sec > 9000000000L,
+           oits.it_interval.tv_sec > 9000000000L);
+
+    int us[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, us);
+    int socks[] = {us[0], socket(AF_INET, SOCK_DGRAM, 0)};
+    for (int i = 0; i < 2; i++) {
+        struct timeval tv = {LONG_MAX, 0}, got = {1, 1};
+        socklen_t len = sizeof got;
+        r = setsockopt(socks[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        getsockopt(socks[i], SOL_SOCKET, SO_RCVTIMEO, &got, &len);
+        printf("huge SO_RCVTIMEO %s %d reads %ld.%06ld", i ? "inet" : "unix", r, (long)got.tv_sec,
+               (long)got.tv_usec);
+        char c;
+        poker = poke_soon(SIGUSR1);
+        r = recv(socks[i], &c, 1, 0);
+        printf(" recv %d %s\n", r, strerror(errno));
+        waitpid(poker, NULL, 0);
+    }
 
     /* Jumping to an unaligned address: SIGBUS (BUS_ADRALN) on instruction fetch, si_addr is the
      * target. Through a call via a function pointer and through ret */

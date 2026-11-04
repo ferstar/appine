@@ -437,10 +437,7 @@ fn read_timespec(cpu: &Cpu, addr: u64) -> Option<Duration> {
     read(cpu, addr, &mut b)?;
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return None;
-    }
-    Some(Duration::new(sec as u64, nsec as u32))
+    super::timespec(sec, nsec)
 }
 
 /// `struct timespec`, `struct timeval`.

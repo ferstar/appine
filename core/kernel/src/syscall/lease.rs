@@ -204,7 +204,7 @@ pub(super) fn break_leases(
     }
     // Notify the holders that are not being broken yet
     let secs = cx.kr().lease_break_time;
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = Instant::now() + Duration::from_secs(secs).min(super::KTIME_MAX);
     let mut notify = Vec::new();
     if let Some(list) = cx.k().leases.get_mut(&ino) {
         for l in list.iter_mut() {

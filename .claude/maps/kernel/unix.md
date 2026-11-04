@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/unix.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: socket timeouts share the inet parser)
 
 ## Responsibilities
 
@@ -119,7 +121,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 ### Options, readiness, listing
 
-- setsockopt: `SO_PASSCRED`, `SO_RCVTIMEO`/`SO_SNDTIMEO` (negative times mean none); other
+- setsockopt: `SO_PASSCRED`, `SO_RCVTIMEO`/`SO_SNDTIMEO` (parsed as for inet sockets: negative
+  times and times of at least `KTIME_MAX` mean none); other
   `SOL_SOCKET` names are accepted and ignored (`SO_*BUFFORCE` needs `CAP_NET_ADMIN`); other levels
   `EOPNOTSUPP`. getsockopt: `SO_TYPE`, `SO_DOMAIN` 1, `SO_PROTOCOL` 0, `SO_ERROR` 0, buffer sizes
   212992, `SO_PASSCRED`, `SO_ACCEPTCONN`, timeouts, `SO_PEERCRED` (pid, euid, egid recorded at

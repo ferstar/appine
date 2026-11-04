@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/poll.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: timeouts saturate at `KTIME_MAX`; removed the huge-timeout panic)
 
 ## Responsibilities
 
@@ -77,7 +79,8 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
 
 ### ppoll and pselect6
 
-- ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`); each fd
+- ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`) and, as
+  in every timed wait here, saturated at `KTIME_MAX` (the `kernel/process` map); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted.
 - pselect6: `nfds` negative or above the soft limit `EINVAL`; sets read in 64-bit words; read →
   `IN|RDNORM|HUP|ERR`, write → `OUT|WRNORM|ERR`, except → `PRI`; a set bit on a closed fd `EBADF`;
@@ -170,10 +173,6 @@ and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`)
   owner to a root process, `F_SETSIG(SIGKILL)` (or leave the default `SIGIO`, which terminates),
   turn on `O_ASYNC` and kill it with one write. Unknown owners are accepted without `ESRCH`;
   `F_SETOWN` ignores pid namespaces and overflows on `INT_MIN`.
-- **Huge timeouts panic:** a valid timespec with a very large `tv_sec` overflows
-  `Instant::now() + timeout` in ppoll, pselect6 and epoll_pwait2 (and in the same pattern in other
-  modules' waits — see the `kernel/process` item), killing the calling process with a kernel-bug
-  report; Linux saturates.
 - **pselect6 returns 0 early:** an fd in a set whose mask does not include its pending
   `POLLHUP`/`POLLERR`/`POLLNVAL` (a hung-up pipe only in the except or write set, an `O_PATH`
   fd) ends the scan with nothing to report, so select returns 0 immediately even with no timeout

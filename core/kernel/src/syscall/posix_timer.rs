@@ -166,10 +166,7 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
     let ts = |off: usize| -> Result<Duration, Errno> {
         let sec = i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
         let nsec = i64::from_le_bytes(b[off + 8..off + 16].try_into().unwrap());
-        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-            return Err(Errno::EINVAL);
-        }
-        Ok(Duration::new(sec as u64, nsec as u32))
+        super::timespec(sec, nsec).ok_or(Errno::EINVAL)
     };
     let (interval, value) = (ts(0)?, ts(16)?);
     if old != 0 {

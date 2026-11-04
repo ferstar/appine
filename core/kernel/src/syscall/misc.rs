@@ -393,10 +393,10 @@ fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno>
     let tv = |o: usize| {
         let sec = i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         let usec = i64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap());
-        if sec < 0 || !(0..1_000_000).contains(&usec) {
+        if !(0..1_000_000).contains(&usec) {
             return Err(Errno::EINVAL);
         }
-        Ok(Duration::new(sec as u64, usec as u32 * 1000))
+        super::timespec(sec, usec * 1000).ok_or(Errno::EINVAL)
     };
     Ok((tv(0)?, tv(16)?))
 }

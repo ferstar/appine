@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; kcmp(KCMP_IO) found while checking them)
+> Maintained: 2026-11-04 (targeted verification: guest timeouts and timer values saturate at `KTIME_MAX`; removed the long-sleep panic)
 
 ## Responsibilities
 
@@ -258,6 +258,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `block_for`: register the waiter (unless its interest is empty), release the BKL, poll, re-take
   the BKL, clear the event, deregister. Host `EINTR` counts as a wake. Callers re-check their
   condition, deadline and interruption.
+- Timeouts and timer values read from the guest (every `timespec` reader, `itimerval`, socket
+  timeouts) saturate at `KTIME_MAX` (about 292 years) as Linux's `timespec64_to_ktime` does, so
+  GNU `sleep infinity` waits until interrupted and timers report the saturated time left.
 - Wake requests made under the BKL are recorded per thread (several kernel instances may share the
   host process) as channels and objects; requests made without the BKL go to a global fallback.
   At BKL release, a waiter fires if its interest shares a channel with the request, or if objects
@@ -412,15 +415,11 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - The borrow-count assertion runs only at mid-syscall releases (`block_for`, `unlocked`), not at
   every BKL release.
 - A finite soft `RLIMIT_CPU` alone keeps the timer thread ticking every 10 ms even while idle.
+- A deadline is `Instant::now()` plus a guest duration, which panics on overflow: new readers of
+  guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.
 
 ## Confirmed bugs / technical debt
 
-- **Very long sleeps panic:** the fast-path `nanosleep`, relative `clock_nanosleep` and `FUTEX_WAIT`
-  compute `Instant::now() + timeout` for any valid timespec, which overflows and panics for
-  `tv_sec` near `i64::MAX`; the calling process is killed with a kernel-bug report. GNU coreutils'
-  `sleep infinity` (common in containers) passes exactly that through glibc's `clock_nanosleep`.
-  The same pattern appears in other timed waits (ppoll/pselect6/epoll_pwait2, signals, AIO, SysV
-  IPC); Linux saturates such timeouts.
 - **Pid-namespace teardown can hang:** after the namespace init exits, orphans of other members are
   reparented to the held, threadless init, which never reaps them; with a tree two or more levels
   deep inside the namespace, the init's exit is never reported and its parent's `waitpid` blocks

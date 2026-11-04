@@ -660,15 +660,28 @@ fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
     Ok(b)
 }
 
-/// Reads a `struct timespec`; returns EINVAL when the seconds or nanoseconds are out of range.
+/// The longest time span Linux represents (`KTIME_MAX`, about 292 years). Longer timeouts and
+/// timer values saturate to it, as in `timespec64_to_ktime`: they never expire in practice (GNU
+/// `sleep infinity` sleeps for `i64::MAX` seconds), and adding them to the current instant cannot
+/// overflow.
+const KTIME_MAX: std::time::Duration = std::time::Duration::from_nanos(i64::MAX as u64);
+
+/// The time span of a `struct timespec`, saturated at [`KTIME_MAX`]; None when the seconds or
+/// nanoseconds are out of range.
+fn timespec(sec: i64, nsec: i64) -> Option<std::time::Duration> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return None;
+    }
+    Some(std::time::Duration::new(sec as u64, nsec as u32).min(KTIME_MAX))
+}
+
+/// Reads a `struct timespec` ([`timespec`]); returns EINVAL when the seconds or nanoseconds are
+/// out of range.
 fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
     let b: [u8; 16] = get(cx, addr)?;
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return Err(Errno::EINVAL);
-    }
-    Ok(std::time::Duration::new(sec as u64, nsec as u32))
+    timespec(sec, nsec).ok_or(Errno::EINVAL)
 }
 
 /// Writes a pair of 64-bit integers (timespec, timeval, rlimit).

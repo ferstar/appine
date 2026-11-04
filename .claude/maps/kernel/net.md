@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/net.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none)
 
 ## Responsibilities
 
@@ -129,10 +131,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ### Options and ioctls
 
-- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers; short buffers or negative times mean
-  no timeout), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace owner; stored
-  only, inherited by accepted sockets, fed to nftables, cleared when entering another namespace),
-  `SO_TYPE` (`SOCK_RAW` for raw sockets), `SO_ERROR` (pending ICMP errors first),
+- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers; short buffers, negative times or times
+  of at least `KTIME_MAX` mean no timeout, the last read back as 0 like Linux's
+  `MAX_SCHEDULE_TIMEOUT`), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace
+  owner; stored only, inherited by accepted sockets, fed to nftables, cleared when entering
+  another namespace), `SO_TYPE` (`SOCK_RAW` for raw sockets), `SO_ERROR` (pending ICMP errors
+  first),
   `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE` (need `CAP_NET_ADMIN`, then become the plain options),
   `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF` (filter pointer rewritten, 1..4096 instructions),
   `IPV6_V6ONLY` in new namespaces, `IP_TTL`/`IP_RECVERR` on UDP (raw ICMP taps),

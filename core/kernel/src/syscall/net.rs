@@ -1014,11 +1014,13 @@ pub(super) fn getpeername(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64) -> 
     sockname(cx, fd, addr, addrlen, true)
 }
 
-fn timeval(b: &[u8]) -> Option<Duration> {
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`: None means no timeout, as for 0 or a value at least
+/// `KTIME_MAX` long (Linux treats such values as `MAX_SCHEDULE_TIMEOUT`).
+pub(super) fn timeval(b: &[u8]) -> Option<Duration> {
     let sec = i64::from_le_bytes(b.get(..8)?.try_into().ok()?);
     let usec = i64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
     let d = Duration::from_secs(sec.max(0) as u64) + Duration::from_micros(usec.max(0) as u64);
-    (!d.is_zero()).then_some(d)
+    (!d.is_zero() && d < super::KTIME_MAX).then_some(d)
 }
 
 pub(super) fn setsockopt(

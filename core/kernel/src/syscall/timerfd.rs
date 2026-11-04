@@ -63,14 +63,12 @@ fn timer_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<TimerFd>>, Errno> {
     }
 }
 
-/// Reads a `struct timespec`: EINVAL if the seconds are negative or the nanoseconds out of range.
+/// Reads a `struct timespec` (`super::timespec`): EINVAL if the seconds are negative or the
+/// nanoseconds out of range.
 fn timespec(b: &[u8]) -> Result<Duration, Errno> {
     let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        return Err(Errno::EINVAL);
-    }
-    Ok(Duration::new(sec as u64, nsec as u32))
+    super::timespec(sec, nsec).ok_or(Errno::EINVAL)
 }
 
 /// `struct itimerspec`: the interval and how long until the next expiration (both 0 when not

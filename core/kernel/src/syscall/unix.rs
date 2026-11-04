@@ -9,7 +9,7 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use super::fs::{AT_FDCWD, create_parent_at, lookup_at};
-use super::net::{Message, SocketRef, epipe};
+use super::net::{Message, SocketRef, epipe, timeval};
 use crate::cell::RefCell;
 use crate::cred::cap;
 use crate::errno::Errno;
@@ -684,13 +684,6 @@ fn push_cmsg(out: &mut Vec<u8>, ty: i32, data: &[u8]) {
     out.extend_from_slice(&ty.to_le_bytes());
     out.extend_from_slice(data);
     out.resize(out.len().next_multiple_of(8), 0);
-}
-
-fn timeval(b: &[u8]) -> Option<Duration> {
-    let sec = i64::from_le_bytes(b.get(..8)?.try_into().ok()?);
-    let usec = i64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
-    let d = Duration::from_secs(sec.max(0) as u64) + Duration::from_micros(usec.max(0) as u64);
-    (!d.is_zero()).then_some(d)
 }
 
 fn encode_timeval(t: Option<Duration>) -> Vec<u8> {
