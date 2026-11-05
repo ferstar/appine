@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -103,8 +104,22 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val scroll = object : HorizontalScrollView(context) {
         // It would take any sideways slide past the touch slop, cancelling the key under the
         // finger, even with nothing to scroll (360 dp and wider)
-        override fun onInterceptTouchEvent(e: MotionEvent) =
-            (canScrollHorizontally(1) || canScrollHorizontally(-1)) && super.onInterceptTouchEvent(e)
+        override fun onInterceptTouchEvent(e: MotionEvent) = scrolls() && super.onInterceptTouchEvent(e)
+
+        // With gesture navigation, a slide from the screen's left edge over keys that scroll
+        // scrolls them instead of going back; with nothing to scroll, the edge keeps its gesture.
+        // Reused: the framework copies the list and reads the rectangle when it updates, after
+        // each set
+        private val excluded = Rect()
+        private val exclusion = listOf(excluded)
+
+        override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+            super.onLayout(changed, l, t, r, b)
+            excluded.set(0, 0, width, height)
+            systemGestureExclusionRects = if (scrolls()) exclusion else emptyList()
+        }
+
+        private fun scrolls() = canScrollHorizontally(1) || canScrollHorizontally(-1)
     }.apply { isHorizontalScrollBarEnabled = false }
 
     /** The last column, fixed at the right edge. */

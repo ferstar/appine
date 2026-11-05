@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tab row returning to the current tab and taking left-edge slides)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the extra keys taking left-edge slides while they scroll, as the tab row does)
 
 ## Responsibilities
 
@@ -146,8 +146,10 @@ libghostty-vt with Zig (`android/native`).
   first seven columns of both rows scroll sideways together under the finger (turning the page
   keeps the scroll position), while the last stays
   at the right edge; a sideways slide past the touch slop then scrolls and cancels the key it
-  started on, unless that key is already held. With nothing to scroll the
-  keys keep every touch. No lines are drawn between or around the keys.
+  started on, unless that key is already held, and with gesture navigation a slide from the
+  screen's left edge scrolls them instead of going back: the scrolling part is excluded from the
+  system's back gesture. With nothing to scroll the keys keep every touch and the edge its
+  gesture. No lines are drawn between or around the keys.
 - A key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed (the highest surface container
   colour). Held past the
@@ -339,6 +341,8 @@ libghostty-vt with Zig (`android/native`).
 - A `HorizontalScrollView` takes any sideways slide past the touch slop even when it has nothing
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
   scroll, and a held key asks its parents not to intercept.
+- Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
+  bar's 32 dp and the scrolling extra keys' 64 dp leave room under it.
 - The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
   and the grids inside the scroll view are measured without a width limit, so they are forced to
   measure again whenever the column width changes, the page not shown too (it keeps the flag until
