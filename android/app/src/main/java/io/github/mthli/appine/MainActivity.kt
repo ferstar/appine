@@ -130,7 +130,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         strip = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            addView(tabs)
+            addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         // The number of tabs in a box, like a browser's tab switcher
         tabCount = TextView(this).apply {
@@ -154,7 +154,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         switcher = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(12), 0, dp(12), 0)
             background = touchFeedback()
             addView(tabCount)
             // The title moves with a swipe; its own frame clips it, so it never covers the count
@@ -174,10 +174,10 @@ class MainActivity : Activity(), TerminalService.Listener {
         bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.BLACK)
-            addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(switcher, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) })
-            addView(barButton("⋮") { showMenu(it) })
+            addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            addView(switcher, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) }, barItem())
+            addView(barButton("⋮") { showMenu(it) }, barItem())
         }
         renderTabs()
         val body = FrameLayout(this).apply {
@@ -188,7 +188,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
-            addView(bar)
+            addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(BAR_DP)))
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
@@ -366,7 +366,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                     showTabMenu(v, session)
                     true
                 }
-            })
+            }, barItem())
         }
         // Bring the current tab into view once the new row is laid out (this runs after the
         // layout pass that adding the tabs requested)
@@ -387,14 +387,18 @@ class MainActivity : Activity(), TerminalService.Listener {
         return if (session.isRunning) text else getString(R.string.tab_ended, text)
     }
 
+    /** A tab in the row or a button, as tall as the bar ([barItem]) with its label centred. */
     private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
         text = label
         setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        setPadding(dp(12), dp(10), dp(12), dp(10))
+        gravity = Gravity.CENTER
+        setPadding(dp(12), 0, dp(12), 0)
         background = touchFeedback()
         setOnClickListener(onClick)
     }
+
+    private fun barItem() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
 
     /** The theme's ripple for something that can be tapped. */
     private fun touchFeedback(): Drawable? {
@@ -698,6 +702,9 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     companion object {
         private const val PREF_FONT_SIZE = "font_size"
+
+        /** The tab bar's height. */
+        private const val BAR_DP = 32
 
         /** From this window width (dp, the usual tablet breakpoint) the bar lists every tab in a row. */
         private const val WIDE_DP = 600

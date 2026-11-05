@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column)
+> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys)
 
 ## Responsibilities
 
@@ -92,7 +92,8 @@ libghostty-vt with Zig (`android/native`).
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
 - Tabs are labelled `N: name` with the name the user gave them, else `N: title` (`sh` when the
-  program set no title), muted with "(ended)" once the shell ended. The bar ends with `+` (opens a
+  program set no title), muted with "(ended)" once the shell ended. The bar is 32 dp tall; its tabs,
+  switcher and buttons fill that height with their labels centred. It ends with `+` (opens a
   session while the kernel runs) and `⋮` (Settings); its other part depends on the window's width,
   checked again on every configuration change:
   - at least 600 dp: a scrolling row of all tabs, each at most 220 dp wide with an ellipsis, the
@@ -139,9 +140,7 @@ libghostty-vt with Zig (`android/native`).
   keeps the scroll position), while the last stays
   at the right edge; a sideways slide past the touch slop then scrolls and cancels the key it
   started on, unless that key is already held. With nothing to scroll the
-  keys keep every touch. Lines one pixel wide in the outline variant colour at half opacity run
-  above each row, below the last one and between the columns, drawn over the keys (a pressed key's
-  shading does not cover them); those of the first seven columns scroll with them.
+  keys keep every touch. No lines are drawn between or around the keys.
 - A key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed (the highest surface container
   colour). Held past the
@@ -382,6 +381,7 @@ libghostty-vt with Zig (`android/native`).
 
 - Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
   (the root ignores cutout insets).
+- Whether the 32 dp tab bar fits its 14 sp labels at large font scales.
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English.

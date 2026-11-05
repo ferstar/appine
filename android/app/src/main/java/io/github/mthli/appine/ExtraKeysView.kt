@@ -2,7 +2,6 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.TypedValue
@@ -12,7 +11,6 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.ViewGroup
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -38,7 +36,7 @@ import kotlin.math.roundToInt
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
  * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
- * sideways beside it. Faint lines one pixel wide put each key in a cell of its own.
+ * sideways beside it.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow
  * repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply to the next key typed,
@@ -106,15 +104,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }.apply { isHorizontalScrollBarEnabled = false }
 
     /** The last column, fixed at the right edge. */
-    private val fixed = object : LinearLayout(context) {
-        // Its left line also ends the grid where it scrolls out of sight
-        override fun dispatchDraw(canvas: Canvas) {
-            super.dispatchDraw(canvas)
-            vLine(canvas, 0, 0, height)
-            for (i in 0 until childCount) hLine(canvas, getChildAt(i).top, width)
-            hLine(canvas, height - 1, width)
-        }
-    }.apply { orientation = VERTICAL }
+    private val fixed = LinearLayout(context).apply { orientation = VERTICAL }
 
     /** The width of a column in the grid, in pixels, as last measured; 0 before that. */
     private var column = 0
@@ -127,15 +117,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
     private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
-
-    /**
-     * The lines around the keys: above each row, below the last one (the system bars and what lies
-     * under them are black too) and between the columns, in the divider colour at half opacity.
-     */
-    private val linePaint = Paint().apply {
-        color = themeColor(com.google.android.material.R.attr.colorOutlineVariant)
-        alpha = 128 // after color, which sets the alpha from the opaque theme colour
-    }
 
     /** The height of a row, in pixels. */
     private val rowHeight = (ROW_DP * density).roundToInt()
@@ -189,21 +170,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /** A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last]. */
     private fun page(vararg rows: Array<Key>, last: Key) {
-        val grid = object : LinearLayout(context) {
-            // Over the keys, so a pressed key's shading does not hide them; drawn here, inside
-            // the scroll view, the lines between columns scroll with the keys
-            override fun dispatchDraw(canvas: Canvas) {
-                super.dispatchDraw(canvas)
-                for (i in 0 until childCount) {
-                    val row = getChildAt(i) as ViewGroup
-                    hLine(canvas, row.top, width)
-                    for (j in 1 until row.childCount) {
-                        vLine(canvas, row.left + row.getChildAt(j).left, row.top, row.bottom)
-                    }
-                }
-                hLine(canvas, height - 1, width)
-            }
-        }.apply { orientation = VERTICAL }
+        val grid = LinearLayout(context).apply { orientation = VERTICAL }
         for (keys in rows) {
             check(keys.size == COLUMNS - 1)
             val row = LinearLayout(context).apply { orientation = HORIZONTAL }
@@ -284,14 +251,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
-
-    /** A line one pixel high from the left edge across [width], its top at [y]. */
-    private fun hLine(canvas: Canvas, y: Int, width: Int) =
-        canvas.drawRect(0f, y.toFloat(), width.toFloat(), y + 1f, linePaint)
-
-    /** A line one pixel wide from [top] to [bottom], its left at [x]. */
-    private fun vLine(canvas: Canvas, x: Int, top: Int, bottom: Int) =
-        canvas.drawRect(x.toFloat(), top.toFloat(), x + 1f, bottom.toFloat(), linePaint)
 
     /**
      * The touch on one key: highlights it while pressed, taps it on release (through
