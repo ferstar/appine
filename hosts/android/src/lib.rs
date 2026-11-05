@@ -32,36 +32,19 @@ use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, j
 
 mod vt;
 
-/// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.
-fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
-    let _ = env.throw_new("java/io/IOException", message.as_ref());
-}
-
-fn string(env: &mut JNIEnv<'_>, s: &JString<'_>) -> Option<String> {
-    env.get_string(s).ok().map(Into::into)
-}
-
-fn strings(env: &mut JNIEnv<'_>, array: &JObjectArray<'_>) -> Option<Vec<Vec<u8>>> {
-    let n = env.get_array_length(array).ok()?;
-    let mut out = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let item = JString::from(env.get_object_array_element(array, i).ok()?);
-        out.push(string(env, &item)?.into_bytes());
+/// Called before any other function: stderr goes to logcat, and with `verbose` the kernel layer's
+/// debug log is turned on.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_init<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    verbose: jboolean,
+) {
+    redirect_stderr();
+    if verbose != 0 {
+        // SAFETY: set before the kernel layer is used; no other thread reads the environment yet
+        unsafe { std::env::set_var("APPINE_LOG", "1") };
     }
-    Some(out)
-}
-
-/// Handle → Machine (module docs).
-static MACHINES: Mutex<BTreeMap<jlong, Arc<Machine>>> = Mutex::new(BTreeMap::new());
-static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
-
-fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, Arc<Machine>>> {
-    MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// The Machine of a handle, holding a reference for the duration of the call; None once stopped.
-fn machine(handle: jlong) -> Option<Arc<Machine>> {
-    machines().get(&handle).cloned()
 }
 
 /// Sends stderr (kernel-layer logs, internal errors) to logcat.
@@ -99,21 +82,6 @@ fn redirect_stderr() {
                 }
             });
     });
-}
-
-/// Called before any other function: stderr goes to logcat, and with `verbose` the kernel layer's
-/// debug log is turned on.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_init<'l>(
-    _: JNIEnv<'l>,
-    _: JClass<'l>,
-    verbose: jboolean,
-) {
-    redirect_stderr();
-    if verbose != 0 {
-        // SAFETY: set before the kernel layer is used; no other thread reads the environment yet
-        unsafe { std::env::set_var("APPINE_LOG", "1") };
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -207,38 +175,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
 // results are also prefixed with the name or path and a tab. Errors throw FileNotFoundException (a
 // subclass of IOException).
 
-fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
-    let kind = if st.is_dir() { 'd' } else { 'f' };
-    let perm = st.mode & 0o7777;
-    format!(
-        "{kind}\t{}\t{}\t{perm}",
-        st.size,
-        st.mtime_ns.div_euclid(1_000_000)
-    )
-}
-
-fn not_found(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
-    let _ = env.throw_new(
-        "java/io/FileNotFoundException",
-        format!("cannot {what} {path}: {e}"),
-    );
-}
-
-fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
-    let Ok(array) = env.new_object_array(items.len() as jint, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    for (i, item) in items.iter().enumerate() {
-        let Ok(s) = env.new_string(item) else {
-            return std::ptr::null_mut();
-        };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
-            return std::ptr::null_mut();
-        }
-    }
-    array.into_raw()
-}
+/// The most entries (directory entries) one search looks at: it does not search forever in a big
+/// tree like /usr.
+const SEARCH_BUDGET: usize = 50_000;
 
 /// The directory or regular file a path (document ID) points at (following symbolic links).
 #[unsafe(no_mangle)]
@@ -454,34 +393,6 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
     }
 }
 
-/// A file handed out by [browseOpenWrite] was closed: tells the running kernel it was written
-/// (programs watching in the guest receive `IN_MODIFY` and `IN_CLOSE_WRITE`). No error if the file
-/// disappeared meanwhile.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    store: JString<'l>,
-    top: JString<'l>,
-    path: JString<'l>,
-) {
-    let (Some(store), Some(top), Some(path)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-    ) else {
-        return;
-    };
-    let _ = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::written(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            changes,
-        )
-    });
-}
-
 /// Removes a file, a symbolic link or a whole directory tree.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
@@ -621,9 +532,56 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
     }
 }
 
-/// The most entries (directory entries) one search looks at: it does not search forever in a big
-/// tree like /usr.
-const SEARCH_BUDGET: usize = 50_000;
+/// A file handed out by [browseOpenWrite] was closed: tells the running kernel it was written
+/// (programs watching in the guest receive `IN_MODIFY` and `IN_CLOSE_WRITE`). No error if the file
+/// disappeared meanwhile.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    store: JString<'l>,
+    top: JString<'l>,
+    path: JString<'l>,
+) {
+    let (Some(store), Some(top), Some(path)) = (
+        string(&mut env, &store),
+        string(&mut env, &top),
+        string(&mut env, &path),
+    ) else {
+        return;
+    };
+    let _ = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+        browse::written(
+            s,
+            &browse::decode_path(&top),
+            &browse::decode_path(&path),
+            changes,
+        )
+    });
+}
+
+fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
+    let kind = if st.is_dir() { 'd' } else { 'f' };
+    let perm = st.mode & 0o7777;
+    format!(
+        "{kind}\t{}\t{}\t{perm}",
+        st.size,
+        st.mtime_ns.div_euclid(1_000_000)
+    )
+}
+
+fn not_found(env: &mut JNIEnv<'_>, what: &str, path: &str, e: appine_kernel::errno::Errno) {
+    let _ = env.throw_new(
+        "java/io/FileNotFoundException",
+        format!("cannot {what} {path}: {e}"),
+    );
+}
+
+// ---- The kernel ----
+
+/// Handle → Machine (module docs).
+static MACHINES: Mutex<BTreeMap<jlong, Arc<Machine>>> = Mutex::new(BTreeMap::new());
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
@@ -659,30 +617,44 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     }
 }
 
-/// Ends all guest processes and removes the handle from the table.
+/// Boots by `/etc/inittab` (the kernel/process map): blocks until the sysinit and wait commands
+/// have all finished.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
-    _: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-) {
-    // Remove first, then kill: kill_all waits, so the table's lock must not be held
-    let m = machines().remove(&handle);
-    if let Some(m) = m {
-        m.kill_all();
-    }
-}
-
-/// The host is short of memory: drop caches that can be rebuilt (translations kept in the pool and
-/// so on) and commit the deferred write transaction.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
+pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
 ) {
     if let Some(m) = machine(handle) {
-        m.trim_memory();
+        m.boot();
+    }
+}
+
+/// The host's default network changed: the routing table the guest sees becomes `routes` (each
+/// entry as in [`parse_route`]); with null it goes back to being synthesised from the interfaces'
+/// addresses.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    routes: JObject<'l>,
+) {
+    let routes = if routes.is_null() {
+        None
+    } else {
+        let Some(lines) = strings(&mut env, &JObjectArray::from(routes)) else {
+            return;
+        };
+        Some(
+            lines
+                .iter()
+                .filter_map(|l| parse_route(std::str::from_utf8(l).ok()?))
+                .collect(),
+        )
+    };
+    if let Some(m) = machine(handle) {
+        m.set_routes(routes);
     }
 }
 
@@ -726,123 +698,6 @@ fn parse_route(line: &str) -> Option<HostRoute> {
         iface,
         metric,
     })
-}
-
-/// The host's default network changed: the routing table the guest sees becomes `routes` (each
-/// entry as in [`parse_route`]); with null it goes back to being synthesised from the interfaces'
-/// addresses.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-    routes: JObject<'l>,
-) {
-    let routes = if routes.is_null() {
-        None
-    } else {
-        let Some(lines) = strings(&mut env, &JObjectArray::from(routes)) else {
-            return;
-        };
-        Some(
-            lines
-                .iter()
-                .filter_map(|l| parse_route(std::str::from_utf8(l).ok()?))
-                .collect(),
-        )
-    };
-    if let Some(m) = machine(handle) {
-        m.set_routes(routes);
-    }
-}
-
-/// Takes the guest processes the kernel layer ended (kernel bug, engine fault, OOM killer): each
-/// entry is `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the
-/// report and b the last few lines of the kernel log (separated by U+001E); for oom, a is the
-/// cgroup (empty for the app's limit), b and c the usage and the limit (bytes). Newlines, tabs and
-/// U+001E inside the fields are replaced by spaces.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-) -> jobjectArray {
-    let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
-    let Ok(array) = env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
-    for (i, k) in kills.iter().enumerate() {
-        let console = k.console.map_or(-1, i64::from);
-        let tail = match &k.reason {
-            appine_kernel::KillReason::Bug { report, log } => {
-                let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
-                format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
-            }
-            appine_kernel::KillReason::OutOfMemory {
-                cgroup,
-                used,
-                limit,
-            } => format!(
-                "oom\t{}\t{used}\t{limit}",
-                clean(cgroup.as_deref().unwrap_or(""))
-            ),
-        };
-        let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
-        let Ok(s) = env.new_string(line) else {
-            return std::ptr::null_mut();
-        };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
-            return std::ptr::null_mut();
-        }
-    }
-    array.into_raw()
-}
-
-/// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
-/// that is, document IDs): the Files app refreshes them.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-) -> jobjectArray {
-    let dirs: Vec<String> = machine(handle)
-        .map(|m| m.take_changed_dirs())
-        .unwrap_or_default()
-        .iter()
-        .map(|d| browse::encode_path(d))
-        .collect();
-    string_array(&mut env, &dirs)
-}
-
-/// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
-/// §12 item 7): each entry is `<process name>\t<port>\t<host port>`; an empty array when there are
-/// none.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-) -> jobjectArray {
-    let events = machine(handle)
-        .map(|m| m.take_listens())
-        .unwrap_or_default();
-    let Ok(array) = env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    for (i, e) in events.iter().enumerate() {
-        let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
-        let Ok(s) = env.new_string(line) else {
-            return std::ptr::null_mut();
-        };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
-            return std::ptr::null_mut();
-        }
-    }
-    array.into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -1011,35 +866,94 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     }
 }
 
-/// Boots by `/etc/inittab` (the kernel/process map): blocks until the sysinit and wait commands
-/// have all finished.
+/// The current directory of the console's foreground process group (for restoring tabs after the
+/// app was killed): null when it cannot be had (the shell has exited, the handle is invalid). A
+/// path that is not UTF-8 is converted with UTF-8 replacement rules.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
-    _: JNIEnv<'l>,
+pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(
+    env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-) {
-    if let Some(m) = machine(handle) {
-        m.boot();
-    }
+    console: jint,
+) -> jstring {
+    let Some(path) = machine(handle).and_then(|m| m.console_cwd(console as u32).ok()) else {
+        return std::ptr::null_mut();
+    };
+    env.new_string(String::from_utf8_lossy(&path))
+        .map(JString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
-/// Shuts down ([`Machine::shutdown`]): runs the shutdown commands in inittab, sends SIGTERM to all
-/// processes, ends those left, and then removes the handle from the table. Other calls keep working
-/// during the shutdown commands.
+/// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
+/// §12 item 7): each entry is `<process name>\t<port>\t<host port>`; an empty array when there are
+/// none.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
-    _: JNIEnv<'l>,
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
+    mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-) {
-    if let Some(m) = machine(handle) {
-        m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
+) -> jobjectArray {
+    let events = machine(handle)
+        .map(|m| m.take_listens())
+        .unwrap_or_default();
+    let Ok(array) = env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
+    else {
+        return std::ptr::null_mut();
+    };
+    for (i, e) in events.iter().enumerate() {
+        let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
+        let Ok(s) = env.new_string(line) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
     }
-    // Dropped only after the table's lock is released: when this is the last reference, Machine's
-    // drop syncs the store and joins threads, and every other call would wait for it
-    let m = machines().remove(&handle);
-    drop(m);
+    array.into_raw()
+}
+
+/// Takes the guest processes the kernel layer ended (kernel bug, engine fault, OOM killer): each
+/// entry is `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the
+/// report and b the last few lines of the kernel log (separated by U+001E); for oom, a is the
+/// cgroup (empty for the app's limit), b and c the usage and the limit (bytes). Newlines, tabs and
+/// U+001E inside the fields are replaced by spaces.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jobjectArray {
+    let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
+    let Ok(array) = env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
+    else {
+        return std::ptr::null_mut();
+    };
+    let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
+    for (i, k) in kills.iter().enumerate() {
+        let console = k.console.map_or(-1, i64::from);
+        let tail = match &k.reason {
+            appine_kernel::KillReason::Bug { report, log } => {
+                let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
+                format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
+            }
+            appine_kernel::KillReason::OutOfMemory {
+                cgroup,
+                used,
+                limit,
+            } => format!(
+                "oom\t{}\t{used}\t{limit}",
+                clean(cgroup.as_deref().unwrap_or(""))
+            ),
+        };
+        let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
+        let Ok(s) = env.new_string(line) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    array.into_raw()
 }
 
 /// Takes the guest's power request (busybox's reboot, halt, poweroff): 0 none, 1 reboot, 2 halt,
@@ -1068,20 +982,110 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     machine(handle).map_or(0, |m| m.processes() as jint)
 }
 
-/// The current directory of the console's foreground process group (for restoring tabs after the
-/// app was killed): null when it cannot be had (the shell has exited, the handle is invalid). A
-/// path that is not UTF-8 is converted with UTF-8 replacement rules.
+/// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
+/// that is, document IDs): the Files app refreshes them.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(
-    env: JNIEnv<'l>,
+pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
+    mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-    console: jint,
-) -> jstring {
-    let Some(path) = machine(handle).and_then(|m| m.console_cwd(console as u32).ok()) else {
+) -> jobjectArray {
+    let dirs: Vec<String> = machine(handle)
+        .map(|m| m.take_changed_dirs())
+        .unwrap_or_default()
+        .iter()
+        .map(|d| browse::encode_path(d))
+        .collect();
+    string_array(&mut env, &dirs)
+}
+
+/// The host is short of memory: drop caches that can be rebuilt (translations kept in the pool and
+/// so on) and commit the deferred write transaction.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    if let Some(m) = machine(handle) {
+        m.trim_memory();
+    }
+}
+
+/// Shuts down ([`Machine::shutdown`]): runs the shutdown commands in inittab, sends SIGTERM to all
+/// processes, ends those left, and then removes the handle from the table. Other calls keep working
+/// during the shutdown commands.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    if let Some(m) = machine(handle) {
+        m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
+    }
+    // Dropped only after the table's lock is released: when this is the last reference, Machine's
+    // drop syncs the store and joins threads, and every other call would wait for it
+    let m = machines().remove(&handle);
+    drop(m);
+}
+
+/// Ends all guest processes and removes the handle from the table.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    // Remove first, then kill: kill_all waits, so the table's lock must not be held
+    let m = machines().remove(&handle);
+    if let Some(m) = m {
+        m.kill_all();
+    }
+}
+
+/// The Machine of a handle, holding a reference for the duration of the call; None once stopped.
+fn machine(handle: jlong) -> Option<Arc<Machine>> {
+    machines().get(&handle).cloned()
+}
+
+fn machines() -> std::sync::MutexGuard<'static, BTreeMap<jlong, Arc<Machine>>> {
+    MACHINES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+// ---- Strings and errors ----
+
+/// Throws `java.io.IOException`; Kotlin sees it after the JNI call returns.
+fn throw(env: &mut JNIEnv<'_>, message: impl AsRef<str>) {
+    let _ = env.throw_new("java/io/IOException", message.as_ref());
+}
+
+fn string(env: &mut JNIEnv<'_>, s: &JString<'_>) -> Option<String> {
+    env.get_string(s).ok().map(Into::into)
+}
+
+fn strings(env: &mut JNIEnv<'_>, array: &JObjectArray<'_>) -> Option<Vec<Vec<u8>>> {
+    let n = env.get_array_length(array).ok()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let item = JString::from(env.get_object_array_element(array, i).ok()?);
+        out.push(string(env, &item)?.into_bytes());
+    }
+    Some(out)
+}
+
+fn string_array(env: &mut JNIEnv<'_>, items: &[String]) -> jobjectArray {
+    let Ok(array) = env.new_object_array(items.len() as jint, "java/lang/String", JObject::null())
+    else {
         return std::ptr::null_mut();
     };
-    env.new_string(String::from_utf8_lossy(&path))
-        .map(JString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
+    for (i, item) in items.iter().enumerate() {
+        let Ok(s) = env.new_string(item) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_object_array_element(&array, i as jint, s).is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    array.into_raw()
 }
