@@ -200,441 +200,25 @@ const FIDEDUPERANGE: u32 = 0xc018_9436;
 
 const POLLIN: i16 = 0x001;
 
-fn host_errno(e: std::io::Error) -> Errno {
-    Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
-}
-
-// ---- Paths ----
-
-/// Start directory of the `*at` family. An empty path is ENOENT at once (dirfd is not looked
-/// at), as on Linux.
-pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
-    if path.is_empty() {
-        return Err(Errno::ENOENT);
-    }
-    if path.first() == Some(&b'/') {
-        return Ok(cx.root());
-    }
-    if dirfd == AT_FDCWD {
-        return Ok(cx.cwd());
-    }
-    let file = cx.fds().get(dirfd)?;
-    let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
-    let vfs = cx.vfs()?;
-    if !vfs.is_dir(&cx.view(&vfs), &node)? {
-        return Err(Errno::ENOTDIR);
-    }
-    Ok(node)
-}
-
-/// Resolves the path argument of the `*at` family.
-pub(super) fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
-    resolve_at(cx, &cx.cred(), dirfd, path, follow)
-}
-
-/// Resolves the path argument of the `*at` family with credentials `cred`.
-fn resolve_at(
-    cx: &Cx<'_>,
-    cred: &Cred,
-    dirfd: i32,
-    path: &[u8],
-    follow: bool,
-) -> Result<Node, Errno> {
-    let start = start_dir(cx, dirfd, path)?;
-    let vfs = cx.vfs()?;
-    vfs.resolve(&cx.view(&vfs), cred, &cx.root(), &start, path, follow)
-}
-
-/// The common part of "an empty path acts on dirfd itself" (`AT_EMPTY_PATH`) in the `*at`
-/// family.
-fn lookup_at_or_fd(
-    cx: &Cx<'_>,
-    cred: &Cred,
-    dirfd: i32,
-    path: &[u8],
-    flags: u32,
-    follow: bool,
-) -> Result<Node, Errno> {
-    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        if dirfd == AT_FDCWD {
-            return Ok(cx.cwd());
-        }
-        return cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF);
-    }
-    resolve_at(cx, cred, dirfd, path, follow)
-}
-
-/// Resolves a path to create or delete: returns the mount the parent directory was reached
-/// through, the parent directory and the last component. Only directories in the store can be
-/// modified; whether the mount is read-only is checked by the caller in Linux's order.
-pub(super) fn parent_at<'p>(
-    cx: &Cx<'_>,
-    dirfd: i32,
-    path: &'p [u8],
-) -> Result<(MountId, Ino, &'p [u8]), Errno> {
-    let start = start_dir(cx, dirfd, path)?;
-    let vfs = cx.vfs()?;
-    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    let (mnt, dir) = store_dir(&vfs, &dir)?;
-    Ok((mnt, dir, name))
-}
-
-/// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
-/// filesystem an existing name is EEXIST, ahead of the error that the directory cannot be
-/// modified (Linux's `filename_create`: `mkdir -p /sys/fs/cgroup/x` relies on `mkdir /sys/fs`
-/// being EEXIST).
-pub(super) fn create_parent_at<'p>(
-    cx: &Cx<'_>,
-    dirfd: i32,
-    path: &'p [u8],
-) -> Result<(MountId, Ino, &'p [u8]), Errno> {
-    let start = start_dir(cx, dirfd, path)?;
-    let vfs = cx.vfs()?;
-    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
-        return Err(Errno::EEXIST);
-    }
-    let (mnt, dir) = store_dir(&vfs, &dir)?;
-    Ok((mnt, dir, name))
-}
-
-/// The directory to create or delete in: one in the store. Those in synthetic filesystems cannot
-/// be modified, and are EROFS in a read-only mount. In the root directory of the mqueue filesystem
-/// only queues can be created and deleted (openat and unlinkat handle them separately); everything
-/// else (mkdir, mknod, symlink, link, rename) is EPERM as on Linux: its directory has no such
-/// operations. cgroup2 directories are EPERM too (mkdirat and unlinkat handle child cgroups
-/// before this).
-fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
-    match dir {
-        Node::Store(mnt, ino) => Ok((*mnt, *ino)),
-        Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
-        Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) => Err(Errno::EPERM),
-        Node::Pseudo(..) => Err(Errno::EACCES),
-    }
-}
-
-/// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted
-/// one is ENOENT.
-fn mq_queue(cx: &Cx<'_>, ns: u64, ino: u64) -> Result<Rc<RefCell<super::MessageQueue>>, Errno> {
-    super::mqueue::find(cx.kr().ipc(ns), ino)
-        .map(|(_, q)| q.clone())
-        .ok_or(Errno::ENOENT)
-}
-
-/// Checks on the name and the mount before creating `name` in directory `dir` (Linux's
-/// `filename_create`): the directory must be searchable and the name must not exist, and only
-/// then comes the read-only mount (EROFS). Returns the directory's metadata.
-fn may_create_name(
-    vfs: &Vfs,
-    cred: &Cred,
-    (mnt, dir): (MountId, Ino),
-    name: &[u8],
-) -> Result<Stat, Errno> {
-    let store = vfs.store();
-    let st = store.stat(dir)?;
-    cred.permission(&st, MAY_EXEC)?;
-    if store.lookup(dir, name)?.is_some() {
-        return Err(Errno::EEXIST);
-    }
-    if vfs.readonly(&Node::Store(mnt, dir)) {
-        return Err(Errno::EROFS);
-    }
-    Ok(st)
-}
-
-/// Checks before creating `name` in directory `dir` (`may_create`): [`may_create_name`], then the
-/// directory must be writable. Returns the directory's metadata.
-pub(super) fn may_create(
-    vfs: &Vfs,
-    cred: &Cred,
-    dir: (MountId, Ino),
-    name: &[u8],
-) -> Result<Stat, Errno> {
-    let st = may_create_name(vfs, cred, dir, name)?;
-    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
-    Ok(st)
-}
-
-/// Before deleting or renaming: EROFS in a read-only mount (Linux's `mnt_want_write`, before the
-/// name is looked up).
-fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
-    if vfs.readonly(&Node::Store(mnt, dir)) {
-        return Err(Errno::EROFS);
-    }
-    Ok(())
-}
-
-/// What is being created is not a directory but its name ends in `/`: EEXIST when it exists,
-/// otherwise ENOENT (as in Linux's `filename_create`).
-fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> Result<(), Errno> {
-    if !path.ends_with(b"/") {
-        return Ok(());
-    }
-    Err(match store.lookup(dir, name)? {
-        Some(_) => Errno::EEXIST,
-        None => Errno::ENOENT,
-    })
-}
-
-/// Checks before deleting `name` in directory `dir` or moving it away (`may_delete`); returns its
-/// metadata.
-fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
-    let dir_st = store.stat(dir)?;
-    cred.permission(&dir_st, MAY_EXEC)?;
-    let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
-    cred.may_delete(&dir_st, &victim)?;
-    Ok(victim)
-}
-
-/// The store inode of the open file that fchmod, fchown and the like act on: not for files
-/// opened with `O_PATH`, and EROFS in a read-only mount (Linux's `mnt_want_write_file`).
-fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
-    let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    if f.flags & oflags::O_PATH != 0 {
-        return Err(Errno::EBADF);
-    }
-    let node = f.node().ok_or(Errno::EBADF)?;
-    let ino = node.ino().ok_or(Errno::EBADF)?;
-    if cx.vfs()?.readonly(&node) {
-        return Err(Errno::EROFS);
-    }
-    Ok(ino)
-}
-
-/// The store inode to modify: EROFS in a read-only mount; nodes in synthetic filesystems cannot
-/// be modified (EACCES).
-fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
-    if cx.vfs()?.readonly(node) {
-        return Err(Errno::EROFS);
-    }
-    node.ino().ok_or(Errno::EACCES)
-}
-
-/// The absolute path recorded at open (`/proc/<pid>/fd/<n>`, maps): as with Linux's `d_path`,
-/// symlinks are fully resolved, and it is computed from the directory and name `found` where the
-/// file was last found. valgrind reopens Debian's `/lib/ld-linux-aarch64.so.1` (whose last
-/// component is a link) by its name in `/proc/self/fd`, with `O_NOFOLLOW`. A file reached through
-/// a link like `/proc/<pid>/fd/<n>`, whose name is unknown, gets the lexically normalized path.
-fn display_path(
-    cx: &Cx<'_>,
-    vfs: &Vfs,
-    start: &Node,
-    path: &[u8],
-    node: &Node,
-    found: Option<&Dentry>,
-) -> Option<Rc<[u8]>> {
-    if let Ok(p) = vfs.found_path(&cx.view(vfs), &cx.root(), node, found) {
-        return Some(Rc::from(p));
-    }
-    let full = if path.first() == Some(&b'/') {
-        path.to_vec()
-    } else {
-        let mut p = vfs.path_of(&cx.view(vfs), &cx.root(), start).ok()?;
-        p.push(b'/');
-        p.extend_from_slice(path);
-        p
-    };
-    Some(Rc::from(normalize(&full)))
-}
-
-// ---- stat ----
-
-fn split_ns(ns: i64) -> (u64, u64) {
-    (
-        ns.div_euclid(1_000_000_000) as u64,
-        ns.rem_euclid(1_000_000_000) as u64,
-    )
-}
-
-/// Encodes as asm-generic's `struct stat` (128 bytes).
-pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
-    let mut b = [0u8; 128];
-    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
-    let (asec, ansec) = split_ns(st.atime_ns);
-    let (msec, mnsec) = split_ns(st.mtime_ns);
-    let (csec, cnsec) = split_ns(st.ctime_ns);
-    put(0, &dev.to_le_bytes());
-    put(8, &st.ino.to_le_bytes());
-    put(16, &st.mode.to_le_bytes());
-    put(20, &st.nlink.to_le_bytes());
-    put(24, &st.uid.to_le_bytes());
-    put(28, &st.gid.to_le_bytes());
-    put(32, &st.rdev.to_le_bytes());
-    // Directories in the store have no data; report one block, following ext4's habit
-    let size = if st.is_dir() && dev == ROOT_DEV {
-        4096
-    } else {
-        st.size
-    };
-    put(48, &size.to_le_bytes());
-    put(56, &4096u32.to_le_bytes());
-    // sysfs files report a size of one page but take no blocks. Short symlinks live in the inode
-    // and take no blocks: on ext4 targets shorter than 60 bytes (`ext4_symlink`; with the
-    // trailing NUL they fit in `i_data`), on others such as tmpfs within 128 bytes
-    // (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
-    let inline = if dev == ROOT_DEV { 60 } else { 128 };
-    let blocks = if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
-        0
-    } else {
-        size.div_ceil(4096) * 8
-    };
-    put(64, &blocks.to_le_bytes());
-    put(72, &asec.to_le_bytes());
-    put(80, &ansec.to_le_bytes());
-    put(88, &msec.to_le_bytes());
-    put(96, &mnsec.to_le_bytes());
-    put(104, &csec.to_le_bytes());
-    put(112, &cnsec.to_le_bytes());
-    b
-}
-
-/// The (st_dev, st_ino) fstat would report, the part known without querying the store (epoll's
-/// fdinfo). Device numbers of synthetic nodes are those of the boot instances (procfs and devpts
-/// instances mounted later have their own device numbers, [`Vfs::dev_of`]).
-pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
-    match (&f.kind, f.node()) {
-        (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
-        (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
-        (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
-        (_, Some(Node::Pseudo(_, p))) => (pseudo::fs_of(&p).dev(), pseudo::ino_of(&p)),
-        _ => (ANON_DEV, 1),
-    }
-}
-
-/// Metadata of a filesystem node.
-fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
-    let vfs = cx.vfs()?;
-    let view = cx.view(&vfs);
-    match node {
-        Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
-        // Namespaces are in nsfs
-        Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
-            Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
-        }
-        // The open file a magic link points at: report that file itself
-        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
-            let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
-            file_stat(cx, &file)
-        }
-        // A deleted program file
-        Node::Pseudo(_, PseudoNode::OpenExe(pid)) => {
-            let exe = exe_file(cx, *pid)?;
-            let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
-                return Err(Errno::ENOENT);
-            };
-            let st = vfs.store().stat_open(ino, host)?;
-            Ok(encode_stat(&st, vfs.dev_of(&Node::Store(mnt, ino))))
-        }
-        Node::Pseudo(_, p) => Ok(encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node))),
-    }
-}
-
-/// Metadata of a host fd.
-// The st_* fields have different widths on different hosts
-#[allow(clippy::unnecessary_cast)]
-fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
-    let s = appine_hal::fstat(fd).map_err(Errno)?;
-    let st = Stat {
-        ino: s.st_ino as u64,
-        mode: s.st_mode as u32,
-        nlink: s.st_nlink as u32,
-        uid: s.st_uid,
-        gid: s.st_gid,
-        rdev: s.st_rdev as u64,
-        size: s.st_size as u64,
-        atime_ns: s.st_atime as i64 * 1_000_000_000 + s.st_atime_nsec as i64,
-        mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
-        ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
-    };
-    Ok(encode_stat(&st, s.st_dev as u64))
-}
-
-fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
-    let f = file.borrow();
-    let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
-        let st = Stat {
-            ino,
-            mode,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
-            rdev,
-            size: 0,
-            atime_ns: 0,
-            mtime_ns: 0,
-            ctime_ns: 0,
-        };
-        encode_stat(&st, dev)
-    };
-    match &f.kind {
-        FileKind::Host(fd) => host_stat(*fd),
-        FileKind::Pipe(end) => match end.pipe.borrow().fifo {
-            Some(ino) => {
-                let vfs = cx.vfs()?;
-                let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
-                Ok(encode_stat(&vfs.store().stat(ino)?, dev))
-            }
-            None => Ok(anon(
-                end.pipe.borrow().ino,
-                mode::S_IFIFO | 0o600,
-                0,
-                PIPE_DEV,
-            )),
-        },
-        FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
-        FileKind::Socket(s) => Ok(anon(
-            pseudo::socket_ino(s),
-            mode::S_IFSOCK | 0o777,
-            0,
-            SOCK_DEV,
-        )),
-        // anon_inode: no file type bits
-        FileKind::Epoll(_)
-        | FileKind::EventFd(_)
-        | FileKind::TimerFd(_)
-        | FileKind::SignalFd(_)
-        | FileKind::Inotify(_)
-        | FileKind::Pidfd(_)
-        | FileKind::SeccompNotify(_)
-        | FileKind::Bpf(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
-        // The device number is that of the mqueue filesystem of the queue's IPC namespace
-        FileKind::MessageQueue(q) => {
-            let q = q.borrow();
-            Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)))
-        }
-        FileKind::Pty(end) => {
-            let t = end.tty.borrow();
-            let st = Stat {
-                ino: pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)),
-                mode: mode::S_IFCHR | t.mode,
-                nlink: 1,
-                uid: t.owner.0,
-                gid: t.owner.1,
-                rdev: rdev(PTS_MAJOR, t.index),
-                atime_ns: t.atime_ns,
-                mtime_ns: t.mtime_ns,
-                ctime_ns: t.ctime_ns,
-                ..Stat::default()
-            };
-            // The device number is that of the devpts instance the terminal is in (ttyname
-            // compares it with that of /dev/pts/<n>)
-            Ok(encode_stat(&st, t.fs))
-        }
-        FileKind::Regular { ino, file } => {
-            let vfs = cx.vfs()?;
-            let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
-            Ok(encode_stat(&vfs.store().stat_open(*ino, file)?, dev))
-        }
-        _ => {
-            let node = f.node().ok_or(Errno::EBADF)?;
-            drop(f);
-            node_stat(cx, &node)
-        }
-    }
-}
-
 // ---- Opening, closing, duplicating ----
+
+/// The status flags an open file keeps from open, as Linux keeps them in `f_flags`: F_GETFL
+/// shows them, and `O_DSYNC`/`O_SYNC` make every write wait for the disk ([`write_sync`]).
+const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
+    | oflags::O_APPEND
+    | oflags::O_NONBLOCK
+    | oflags::O_PATH
+    | oflags::O_DSYNC
+    | oflags::O_SYNC_BIT;
+
+/// Type and length in a file handle (`struct file_handle`): the handle is the store inode
+/// number.
+const FILE_HANDLE_TYPE: i32 = 1;
+const FILE_HANDLE_BYTES: u32 = 8;
+/// Type written back when the handle does not fit (Linux's `FILEID_INVALID`).
+const FILEID_INVALID: i32 = 255;
+const MAX_HANDLE_SZ: u32 = 128;
+const AT_HANDLE_FID: u32 = 0x200;
 
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
@@ -732,37 +316,6 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
         .map(|fd| fd as u64)
-}
-
-/// Start and root directory of openat2 (path_init). With a scope (`BENEATH`, `IN_ROOT`) the root
-/// is the start; absolute `IN_ROOT` paths also start at dirfd; other absolute paths ignore dirfd
-/// (resolution reports EXDEV for `BENEATH` ones).
-fn openat2_start(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u64) -> Result<(Node, Node), Errno> {
-    use crate::vfs::resolve;
-    if path.is_empty() {
-        return Err(Errno::ENOENT);
-    }
-    if path[0] == b'/' && flags & resolve::IN_ROOT == 0 {
-        let root = cx.root();
-        return Ok((root.clone(), root));
-    }
-    let start = if dirfd == AT_FDCWD {
-        cx.cwd()
-    } else {
-        let file = cx.fds().get(dirfd)?;
-        let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
-        let vfs = cx.vfs()?;
-        if !vfs.is_dir(&cx.view(&vfs), &node)? {
-            return Err(Errno::ENOTDIR);
-        }
-        node
-    };
-    let root = if flags & resolve::SCOPED != 0 {
-        start.clone()
-    } else {
-        cx.root()
-    };
-    Ok((start, root))
 }
 
 /// The kernel creates a file itself (core dump): relative to the current directory, EEXIST when
@@ -976,436 +529,35 @@ fn open_path_with(
     Ok(file)
 }
 
-/// The status flags an open file keeps from open, as Linux keeps them in `f_flags`: F_GETFL
-/// shows them, and `O_DSYNC`/`O_SYNC` make every write wait for the disk ([`write_sync`]).
-const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
-    | oflags::O_APPEND
-    | oflags::O_NONBLOCK
-    | oflags::O_PATH
-    | oflags::O_DSYNC
-    | oflags::O_SYNC_BIT;
-
-/// Files opened by open, openat2 and open_by_handle_at carry `O_LARGEFILE` (on 64-bit Linux
-/// always adds it, and drops it with `O_PATH`), visible in F_GETFL and fdinfo; files created by
-/// other syscalls, such as pipes and sockets, do not have it.
-fn largefile(flags: u32) -> u32 {
-    if flags & oflags::O_PATH != 0 {
-        0
+/// Start and root directory of openat2 (path_init). With a scope (`BENEATH`, `IN_ROOT`) the root
+/// is the start; absolute `IN_ROOT` paths also start at dirfd; other absolute paths ignore dirfd
+/// (resolution reports EXDEV for `BENEATH` ones).
+fn openat2_start(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u64) -> Result<(Node, Node), Errno> {
+    use crate::vfs::resolve;
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if path[0] == b'/' && flags & resolve::IN_ROOT == 0 {
+        let root = cx.root();
+        return Ok((root.clone(), root));
+    }
+    let start = if dirfd == AT_FDCWD {
+        cx.cwd()
     } else {
-        oflags::O_LARGEFILE
-    }
-}
-
-/// inotify events of open, in the same order as Linux: create (reported to the directory),
-/// truncation by `O_TRUNC`, open. Attaches an [`inotify::Opened`] to the open file.
-fn open_events(
-    cx: &Cx<'_>,
-    file: &FileRef,
-    ino: Ino,
-    parent: Option<(Node, Vec<u8>)>,
-    created: bool,
-    flags: u32,
-) {
-    let k = cx.kr();
-    let parent = match parent {
-        Some((Node::Store(_, dir), name)) => Some((dir, name)),
-        _ => None,
-    };
-    if inotify::active(k) {
-        open_notify(k, file, ino, parent.as_ref(), created, flags);
-    }
-    let watch = inotify::opened(k, &file.borrow(), parent);
-    file.borrow_mut().watch = watch;
-}
-
-fn open_notify(
-    k: &Kernel,
-    file: &FileRef,
-    ino: Ino,
-    parent: Option<&(Ino, Vec<u8>)>,
-    created: bool,
-    flags: u32,
-) {
-    let parent = parent.map(|(d, n)| (*d, n.as_slice()));
-    let (dir, truncated) = {
-        let f = file.borrow();
-        let regular = matches!(f.kind, FileKind::Regular { .. });
-        let dir = matches!(f.kind, FileKind::Directory { .. });
-        let truncated = regular && f.writable() && flags & oflags::O_TRUNC != 0;
-        (if dir { inotify::IN_ISDIR } else { 0 }, truncated)
-    };
-    match parent {
-        Some((d, name)) if created => inotify::dir_event(k, d, name, inotify::IN_CREATE, 0),
-        _ if truncated => inotify::path_event(k, ino, parent, inotify::IN_MODIFY),
-        _ => {}
-    }
-    inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
-}
-
-/// Type and length in a file handle (`struct file_handle`): the handle is the store inode
-/// number.
-const FILE_HANDLE_TYPE: i32 = 1;
-const FILE_HANDLE_BYTES: u32 = 8;
-/// Type written back when the handle does not fit (Linux's `FILEID_INVALID`).
-const FILEID_INVALID: i32 = 255;
-const MAX_HANDLE_SZ: u32 = 128;
-const AT_HANDLE_FID: u32 = 0x200;
-
-/// name_to_handle_at: the handle of a file in the store is its inode number; synthetic
-/// filesystems do not support handles.
-pub(super) fn name_to_handle_at(
-    cx: &mut Cx<'_>,
-    dirfd: i32,
-    path: u64,
-    handle: u64,
-    mount_id: u64,
-    flags: u32,
-) -> SysResult {
-    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let path = read_path(cx, path)?;
-    let node = lookup_at_or_fd(
-        cx,
-        &cx.cred(),
-        dirfd,
-        &path,
-        flags,
-        flags & AT_SYMLINK_FOLLOW != 0,
-    )?;
-    let Node::Store(mnt, ino) = node else {
-        return Err(Errno::EOPNOTSUPP);
-    };
-    let header: [u8; 8] = get(cx, handle)?;
-    let room = u32::from_le_bytes(header[..4].try_into().unwrap());
-    if room > MAX_HANDLE_SZ {
-        return Err(Errno::EINVAL);
-    }
-    // When it does not fit, only the handle header (the needed length, FILEID_INVALID) is
-    // written back and the result is EOVERFLOW. Both cases write mount_id, and failing to write
-    // it or the handle is EFAULT (Linux's do_sys_name_to_handle)
-    let mut b = FILE_HANDLE_BYTES.to_le_bytes().to_vec();
-    let ret = if room < FILE_HANDLE_BYTES {
-        b.extend_from_slice(&FILEID_INVALID.to_le_bytes());
-        Err(Errno::EOVERFLOW)
-    } else {
-        b.extend_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
-        b.extend_from_slice(&ino.to_le_bytes());
-        Ok(0)
-    };
-    put(cx, mount_id, (mnt as i32).to_le_bytes())?;
-    cx.mm().write(UserSlice::new(handle, b.len()), &b)?;
-    ret
-}
-
-/// open_by_handle_at: opens by inode number; requires `CAP_DAC_READ_SEARCH`.
-pub(super) fn open_by_handle_at(
-    cx: &mut Cx<'_>,
-    mount_fd: i32,
-    handle: u64,
-    flags: u32,
-) -> SysResult {
-    if !cx.cred().capable(cap::DAC_READ_SEARCH) {
-        return Err(Errno::EPERM);
-    }
-    // As in Linux's handle_to_path, read the handle header and check its length first, then the
-    // whole handle, and look at mount_fd only last
-    let header: [u8; 8] = get(cx, handle)?;
-    let bytes = u32::from_le_bytes(header[..4].try_into().unwrap());
-    if bytes == 0 || bytes > MAX_HANDLE_SZ {
-        return Err(Errno::EINVAL);
-    }
-    let ty = i32::from_le_bytes(header[4..].try_into().unwrap());
-    let mut f_handle = vec![0u8; bytes as usize];
-    cx.mm()
-        .read(UserSlice::new(handle + 8, f_handle.len()), &mut f_handle)?;
-    // The file is opened through the mount mount_fd is in. Handles decode only in the store: when
-    // mount_fd is on a pipe, a socket or a synthetic filesystem it is ESTALE, as on Linux where
-    // these filesystems have no export_operations
-    let node = if mount_fd == AT_FDCWD {
-        Some(cx.cwd())
-    } else {
-        cx.fds().get(mount_fd)?.borrow().node()
-    };
-    let Some(node @ Node::Store(..)) = node else {
-        return Err(Errno::ESTALE);
-    };
-    let mnt = node.mnt();
-    let ino = match f_handle.first_chunk::<8>() {
-        Some(b) if bytes == FILE_HANDLE_BYTES && ty == FILE_HANDLE_TYPE => u64::from_le_bytes(*b),
-        _ => return Err(Errno::ESTALE),
-    };
-    let vfs = cx.vfs()?;
-    // The file has been deleted (or the handle was not issued here): ESTALE
-    let st = match vfs.store().stat(ino) {
-        Ok(st) if st.nlink > 0 => st,
-        _ => return Err(Errno::ESTALE),
-    };
-    let kind = if flags & oflags::O_PATH != 0 {
-        if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
+        let file = cx.fds().get(dirfd)?;
+        let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
+        let vfs = cx.vfs()?;
+        if !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
         }
-        FileKind::Path(Node::Store(mnt, ino))
+        node
+    };
+    let root = if flags & resolve::SCOPED != 0 {
+        start.clone()
     } else {
-        open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, (None, None))?
+        cx.root()
     };
-    let keep = KEPT_AT_OPEN;
-    let file = OpenFile::new(kind, flags & keep | largefile(flags));
-    file.borrow_mut().mnt = mnt;
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
-        .map(|fd| fd as u64)
-}
-
-/// The PTY slave index of a device number: major 136, and the minor is the index (Linux's pts
-/// driver registers all 2^20 minors of 136).
-fn pts_index(r: u64) -> Option<u32> {
-    let major = ((r >> 8) & 0xfff) as u32;
-    let minor = ((r & 0xff) | ((r >> 12) & !0xff)) as u32;
-    (major == PTS_MAJOR).then_some(minor)
-}
-
-/// Which devpts instance a ptmx device node outside devpts opens (Linux's `devpts_acquire`): the
-/// one mounted on `pts` in the node's directory `dir` (its mount and device number). No `pts` is
-/// ENOENT, and a `pts` that is not a devpts root is ENODEV; when the node's directory is unknown
-/// (opened by handle) it is the boot one.
-fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno> {
-    let Some(dir) = dir else {
-        return Ok((crate::tty::BOOT_PTS, crate::vfs::PTS_MOUNT));
-    };
-    let Node::Store(mnt, ino) = dir else {
-        return Err(Errno::ENODEV);
-    };
-    let pts = vfs.store().lookup(*ino, b"pts")?.ok_or(Errno::ENOENT)?;
-    match vfs.mounted(Node::Store(*mnt, pts)) {
-        Node::Pseudo(m, PseudoNode::PtsRoot(fs)) => Ok((fs, m)),
-        _ => Err(Errno::ENODEV),
-    }
-}
-
-/// Whether some process is executing the program `ino` in the store (opening it for write is
-/// ETXTBSY).
-pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
-    cx.kr()
-        .tasks
-        .values()
-        .any(|t| t.res.borrow().mm.borrow().exe == Some(ino))
-}
-
-/// Whether `ino` is open for write (executing it is ETXTBSY).
-/// fds from memfd_create do not count ([`OpenFile::pseudo`]).
-pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
-    cx.kr().open_files().iter().any(|f| {
-        let f = f.borrow();
-        f.writable() && !f.pseudo && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
-    })
-}
-
-/// Turns access permissions (`MAY_*`) into device-filter access (`BPF_DEVCG_ACC_*`).
-fn device_access(mask: u32) -> u32 {
-    let mut access = 0;
-    if mask & MAY_WRITE != 0 {
-        access |= crate::bpf::ACC_WRITE;
-    }
-    if mask & MAY_READ != 0 {
-        access |= crate::bpf::ACC_READ;
-    }
-    access
-}
-
-/// The access permissions open requires (`MAY_*`).
-fn open_mask(flags: u32) -> u32 {
-    match flags & oflags::O_ACCMODE {
-        oflags::O_RDONLY => MAY_READ,
-        oflags::O_WRONLY => MAY_WRITE,
-        _ => MAY_READ | MAY_WRITE,
-    }
-}
-
-/// Opens a store inode reached through mount `mnt`. A file just created by this open
-/// (`created`) gets no permission check.
-fn open_store(
-    cx: &mut Cx<'_>,
-    cred: &Cred,
-    vfs: &Vfs,
-    (mnt, ino): (MountId, Ino),
-    flags: u32,
-    (created, beside): (Option<std::fs::File>, Option<&Node>),
-) -> Result<FileKind, Errno> {
-    let store = vfs.store();
-    let accmode = flags & oflags::O_ACCMODE;
-    // Only the type, permissions, owner and device number are used; no need to stat the object on
-    // the host
-    let st = store.attrs(ino)?;
-    if created.is_none() {
-        let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
-        let readonly = mnt_flags & ms::RDONLY != 0;
-        let mut mask = open_mask(flags);
-        match st.kind() {
-            mode::S_IFLNK => return Err(Errno::ELOOP),
-            mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
-                return Err(Errno::EISDIR);
-            }
-            // Truncation: EROFS comes first in a read-only mount (Linux's do_open, before
-            // may_open)
-            mode::S_IFREG if flags & oflags::O_TRUNC != 0 => {
-                if readonly {
-                    return Err(Errno::EROFS);
-                }
-                mask |= MAY_WRITE;
-            }
-            // Device nodes in a nodev mount cannot be opened (may_open_dev)
-            mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
-                return Err(Errno::EACCES);
-            }
-            _ => {}
-        }
-        cred.permission(&st, mask)?;
-        // Device nodes then go through the cgroup device filter (Linux's
-        // devcgroup_inode_permission)
-        if matches!(st.kind(), mode::S_IFCHR | mode::S_IFBLK) && st.rdev != 0 {
-            super::bpf::check_device(cx, st.kind(), st.rdev, device_access(mask))?;
-        }
-        if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
-            return Err(Errno::EPERM);
-        }
-        // Opening a regular file for write in a read-only mount is EROFS; devices and FIFOs as
-        // usual (do_dentry_open leaves special_file alone)
-        if readonly && st.kind() == mode::S_IFREG && accmode != oflags::O_RDONLY {
-            return Err(Errno::EROFS);
-        }
-    }
-    Ok(match st.kind() {
-        mode::S_IFLNK => return Err(Errno::ELOOP),
-        mode::S_IFDIR => {
-            if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 {
-                return Err(Errno::EISDIR);
-            }
-            FileKind::Directory {
-                node: Node::Store(mnt, ino),
-                entries: None,
-                process: None,
-            }
-        }
-        _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
-        mode::S_IFREG => {
-            let write = accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
-            if write && created.is_none() && executing(cx, ino) {
-                return Err(Errno::ETXTBSY);
-            }
-            // Leases of others: opening for write conflicts with every lease, opening for read
-            // only with write leases
-            if created.is_none() {
-                let nonblock = flags & oflags::O_NONBLOCK != 0;
-                super::lease::break_leases(cx, ino, write, nonblock, None)?;
-            }
-            let file = match created {
-                Some(f) => f,
-                None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
-            };
-            if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
-                remove_privs(cx, ino)?;
-                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), &file)?;
-                file.set_len(0).map_err(host_errno)?;
-                tmpfs_resized(vfs, tmpfs, 0);
-                truncated(cx, &file);
-            }
-            FileKind::Regular { ino, file }
-        }
-        mode::S_IFCHR => match st.rdev {
-            // /dev/tty, /dev/console: the caller's controlling terminal
-            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
-            PTMX_RDEV => {
-                let (fs, m) = devpts_beside(vfs, beside)?;
-                tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
-            }
-            // Terminal device nodes outside devpts: those in the boot instance
-            r => match pts_index(r) {
-                Some(index) => {
-                    let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
-                    tty::open_slave(cx, at, flags)?
-                }
-                None => {
-                    let dev = dev::open(store, ino)?;
-                    let kmsg = match dev {
-                        Device::Kmsg => Some(open_kmsg(cx, accmode)?),
-                        _ => None,
-                    };
-                    FileKind::Device { ino, dev, kmsg }
-                }
-            },
-        },
-        mode::S_IFIFO => open_fifo(cx, ino, flags)?,
-        // Block devices and socket files cannot be opened (socket files use connect)
-        _ => return Err(Errno::ENXIO),
-    })
-}
-
-/// Opens `/dev/kmsg` (`devkmsg_open`): when `printk_devkmsg` is `off` nobody can open it; a read
-/// open checks permission as syslog's read-all does (`dmesg_restrict`), and a write-only open is
-/// not checked. Reading starts at the oldest record.
-fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>, Errno> {
-    let log = cx.kr().klog.clone();
-    if log.borrow().devkmsg == crate::klog::Devkmsg::Off {
-        return Err(Errno::EPERM);
-    }
-    if accmode != oflags::O_WRONLY {
-        super::misc::check_syslog_permissions(cx, super::misc::syslog_action::READ_ALL, false)?;
-    }
-    Ok(Box::new(crate::klog::KmsgFile::new(log)))
-}
-
-/// Opens a named pipe (FIFO): all opens of one inode share one pipe. As on Linux, a read-only
-/// open waits until there is a writer, a write-only open waits until there is a reader (with
-/// `O_NONBLOCK` it returns ENXIO when there is no reader), and a read-write open does not wait.
-fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
-    let accmode = flags & oflags::O_ACCMODE;
-    let nonblock = flags & oflags::O_NONBLOCK != 0;
-    let (read, write) = match accmode {
-        oflags::O_RDONLY => (true, false),
-        oflags::O_WRONLY => (false, true),
-        _ => (true, true),
-    };
-    let capacity = pipe_capacity(cx);
-    let pipe = {
-        let k = cx.k();
-        k.fifos.retain(|_, w| w.strong_count() > 0);
-        match k.fifos.get(&ino).and_then(Weak::upgrade) {
-            Some(p) => p,
-            None => {
-                let p = Pipe::fifo(ino, capacity);
-                k.fifos.insert(ino, Rc::downgrade(&p));
-                p
-            }
-        }
-    };
-    if write && !read && nonblock && pipe.borrow().readers == 0 {
-        return Err(Errno::ENXIO);
-    }
-    let peer_opens = |p: &Pipe| if read { p.writer_opens } else { p.reader_opens };
-    let before = peer_opens(&pipe.borrow());
-    let mut end = PipeEnd::open(&pipe, read, write);
-    if read && !write && nonblock && pipe.borrow().writers == 0 {
-        end.hup_after = Some(before);
-    }
-    if read != write && !nonblock {
-        // Wait for the other end to open: it is enough that it came, even if it has closed
-        // already
-        loop {
-            {
-                let p = pipe.borrow();
-                let peers = if read { p.writers } else { p.readers };
-                if peers > 0 || peer_opens(&p) != before {
-                    break;
-                }
-            }
-            if cx.interrupted() {
-                return Err(Errno::ERESTARTSYS);
-            }
-            cx.wait_object(crate::pipe::object(&pipe))?;
-        }
-    }
-    Ok(FileKind::Pipe(end))
+    Ok((start, root))
 }
 
 /// Opens a queue in the mqueue filesystem: the resulting fd is the same as mq_open's (on Linux it
@@ -1623,14 +775,6 @@ fn reopen(
     }
 }
 
-/// The program file process `pid` is executing (`/proc/<pid>/exe`).
-pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
-    let group = pseudo::group_of(cx.kr(), pid)
-        .cloned()
-        .ok_or(Errno::ENOENT)?;
-    group.borrow().exe.clone().ok_or(Errno::ENOENT)
-}
-
 /// Opens a deleted program file through `/proc/<pid>/exe` ([`PseudoNode::OpenExe`]): duplicates
 /// the recorded host file, as [`reopen`] does for deleted regular files. A program still being
 /// executed cannot be opened for write (ETXTBSY); permission is checked first (Linux calls
@@ -1667,6 +811,402 @@ fn reopen_exe(
     }
     .map_err(host_errno)?;
     open_store(cx, cred, vfs, (mnt, ino), flags, (Some(new), None))
+}
+
+/// inotify events of open, in the same order as Linux: create (reported to the directory),
+/// truncation by `O_TRUNC`, open. Attaches an [`inotify::Opened`] to the open file.
+fn open_events(
+    cx: &Cx<'_>,
+    file: &FileRef,
+    ino: Ino,
+    parent: Option<(Node, Vec<u8>)>,
+    created: bool,
+    flags: u32,
+) {
+    let k = cx.kr();
+    let parent = match parent {
+        Some((Node::Store(_, dir), name)) => Some((dir, name)),
+        _ => None,
+    };
+    if inotify::active(k) {
+        open_notify(k, file, ino, parent.as_ref(), created, flags);
+    }
+    let watch = inotify::opened(k, &file.borrow(), parent);
+    file.borrow_mut().watch = watch;
+}
+
+fn open_notify(
+    k: &Kernel,
+    file: &FileRef,
+    ino: Ino,
+    parent: Option<&(Ino, Vec<u8>)>,
+    created: bool,
+    flags: u32,
+) {
+    let parent = parent.map(|(d, n)| (*d, n.as_slice()));
+    let (dir, truncated) = {
+        let f = file.borrow();
+        let regular = matches!(f.kind, FileKind::Regular { .. });
+        let dir = matches!(f.kind, FileKind::Directory { .. });
+        let truncated = regular && f.writable() && flags & oflags::O_TRUNC != 0;
+        (if dir { inotify::IN_ISDIR } else { 0 }, truncated)
+    };
+    match parent {
+        Some((d, name)) if created => inotify::dir_event(k, d, name, inotify::IN_CREATE, 0),
+        _ if truncated => inotify::path_event(k, ino, parent, inotify::IN_MODIFY),
+        _ => {}
+    }
+    inotify::path_event(k, ino, parent, inotify::IN_OPEN | dir);
+}
+
+/// name_to_handle_at: the handle of a file in the store is its inode number; synthetic
+/// filesystems do not support handles.
+pub(super) fn name_to_handle_at(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: u64,
+    handle: u64,
+    mount_id: u64,
+    flags: u32,
+) -> SysResult {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path = read_path(cx, path)?;
+    let node = lookup_at_or_fd(
+        cx,
+        &cx.cred(),
+        dirfd,
+        &path,
+        flags,
+        flags & AT_SYMLINK_FOLLOW != 0,
+    )?;
+    let Node::Store(mnt, ino) = node else {
+        return Err(Errno::EOPNOTSUPP);
+    };
+    let header: [u8; 8] = get(cx, handle)?;
+    let room = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if room > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    // When it does not fit, only the handle header (the needed length, FILEID_INVALID) is
+    // written back and the result is EOVERFLOW. Both cases write mount_id, and failing to write
+    // it or the handle is EFAULT (Linux's do_sys_name_to_handle)
+    let mut b = FILE_HANDLE_BYTES.to_le_bytes().to_vec();
+    let ret = if room < FILE_HANDLE_BYTES {
+        b.extend_from_slice(&FILEID_INVALID.to_le_bytes());
+        Err(Errno::EOVERFLOW)
+    } else {
+        b.extend_from_slice(&FILE_HANDLE_TYPE.to_le_bytes());
+        b.extend_from_slice(&ino.to_le_bytes());
+        Ok(0)
+    };
+    put(cx, mount_id, (mnt as i32).to_le_bytes())?;
+    cx.mm().write(UserSlice::new(handle, b.len()), &b)?;
+    ret
+}
+
+/// open_by_handle_at: opens by inode number; requires `CAP_DAC_READ_SEARCH`.
+pub(super) fn open_by_handle_at(
+    cx: &mut Cx<'_>,
+    mount_fd: i32,
+    handle: u64,
+    flags: u32,
+) -> SysResult {
+    if !cx.cred().capable(cap::DAC_READ_SEARCH) {
+        return Err(Errno::EPERM);
+    }
+    // As in Linux's handle_to_path, read the handle header and check its length first, then the
+    // whole handle, and look at mount_fd only last
+    let header: [u8; 8] = get(cx, handle)?;
+    let bytes = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if bytes == 0 || bytes > MAX_HANDLE_SZ {
+        return Err(Errno::EINVAL);
+    }
+    let ty = i32::from_le_bytes(header[4..].try_into().unwrap());
+    let mut f_handle = vec![0u8; bytes as usize];
+    cx.mm()
+        .read(UserSlice::new(handle + 8, f_handle.len()), &mut f_handle)?;
+    // The file is opened through the mount mount_fd is in. Handles decode only in the store: when
+    // mount_fd is on a pipe, a socket or a synthetic filesystem it is ESTALE, as on Linux where
+    // these filesystems have no export_operations
+    let node = if mount_fd == AT_FDCWD {
+        Some(cx.cwd())
+    } else {
+        cx.fds().get(mount_fd)?.borrow().node()
+    };
+    let Some(node @ Node::Store(..)) = node else {
+        return Err(Errno::ESTALE);
+    };
+    let mnt = node.mnt();
+    let ino = match f_handle.first_chunk::<8>() {
+        Some(b) if bytes == FILE_HANDLE_BYTES && ty == FILE_HANDLE_TYPE => u64::from_le_bytes(*b),
+        _ => return Err(Errno::ESTALE),
+    };
+    let vfs = cx.vfs()?;
+    // The file has been deleted (or the handle was not issued here): ESTALE
+    let st = match vfs.store().stat(ino) {
+        Ok(st) if st.nlink > 0 => st,
+        _ => return Err(Errno::ESTALE),
+    };
+    let kind = if flags & oflags::O_PATH != 0 {
+        if flags & oflags::O_DIRECTORY != 0 && !st.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        FileKind::Path(Node::Store(mnt, ino))
+    } else {
+        open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, (None, None))?
+    };
+    let keep = KEPT_AT_OPEN;
+    let file = OpenFile::new(kind, flags & keep | largefile(flags));
+    file.borrow_mut().mnt = mnt;
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+/// Opens a store inode reached through mount `mnt`. A file just created by this open
+/// (`created`) gets no permission check.
+fn open_store(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    (mnt, ino): (MountId, Ino),
+    flags: u32,
+    (created, beside): (Option<std::fs::File>, Option<&Node>),
+) -> Result<FileKind, Errno> {
+    let store = vfs.store();
+    let accmode = flags & oflags::O_ACCMODE;
+    // Only the type, permissions, owner and device number are used; no need to stat the object on
+    // the host
+    let st = store.attrs(ino)?;
+    if created.is_none() {
+        let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+        let readonly = mnt_flags & ms::RDONLY != 0;
+        let mut mask = open_mask(flags);
+        match st.kind() {
+            mode::S_IFLNK => return Err(Errno::ELOOP),
+            mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
+                return Err(Errno::EISDIR);
+            }
+            // Truncation: EROFS comes first in a read-only mount (Linux's do_open, before
+            // may_open)
+            mode::S_IFREG if flags & oflags::O_TRUNC != 0 => {
+                if readonly {
+                    return Err(Errno::EROFS);
+                }
+                mask |= MAY_WRITE;
+            }
+            // Device nodes in a nodev mount cannot be opened (may_open_dev)
+            mode::S_IFCHR | mode::S_IFBLK if mnt_flags & ms::NODEV != 0 => {
+                return Err(Errno::EACCES);
+            }
+            _ => {}
+        }
+        cred.permission(&st, mask)?;
+        // Device nodes then go through the cgroup device filter (Linux's
+        // devcgroup_inode_permission)
+        if matches!(st.kind(), mode::S_IFCHR | mode::S_IFBLK) && st.rdev != 0 {
+            super::bpf::check_device(cx, st.kind(), st.rdev, device_access(mask))?;
+        }
+        if flags & oflags::O_NOATIME != 0 && !cred.owns(&st) {
+            return Err(Errno::EPERM);
+        }
+        // Opening a regular file for write in a read-only mount is EROFS; devices and FIFOs as
+        // usual (do_dentry_open leaves special_file alone)
+        if readonly && st.kind() == mode::S_IFREG && accmode != oflags::O_RDONLY {
+            return Err(Errno::EROFS);
+        }
+    }
+    Ok(match st.kind() {
+        mode::S_IFLNK => return Err(Errno::ELOOP),
+        mode::S_IFDIR => {
+            if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 {
+                return Err(Errno::EISDIR);
+            }
+            FileKind::Directory {
+                node: Node::Store(mnt, ino),
+                entries: None,
+                process: None,
+            }
+        }
+        _ if flags & oflags::O_DIRECTORY != 0 => return Err(Errno::ENOTDIR),
+        mode::S_IFREG => {
+            let write = accmode != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
+            if write && created.is_none() && executing(cx, ino) {
+                return Err(Errno::ETXTBSY);
+            }
+            // Leases of others: opening for write conflicts with every lease, opening for read
+            // only with write leases
+            if created.is_none() {
+                let nonblock = flags & oflags::O_NONBLOCK != 0;
+                super::lease::break_leases(cx, ino, write, nonblock, None)?;
+            }
+            let file = match created {
+                Some(f) => f,
+                None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
+            };
+            if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
+                remove_privs(cx, ino)?;
+                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), &file)?;
+                file.set_len(0).map_err(host_errno)?;
+                tmpfs_resized(vfs, tmpfs, 0);
+                truncated(cx, &file);
+            }
+            FileKind::Regular { ino, file }
+        }
+        mode::S_IFCHR => match st.rdev {
+            // /dev/tty, /dev/console: the caller's controlling terminal
+            r if r == rdev(5, 0) || r == rdev(5, 1) => tty::open_ctty(cx)?,
+            PTMX_RDEV => {
+                let (fs, m) = devpts_beside(vfs, beside)?;
+                tty::open_ptmx(cx.k(), (fs, m, false), (cred.fsuid, cred.fsgid))?
+            }
+            // Terminal device nodes outside devpts: those in the boot instance
+            r => match pts_index(r) {
+                Some(index) => {
+                    let at = (crate::tty::BOOT_PTS, index, crate::vfs::PTS_MOUNT, false);
+                    tty::open_slave(cx, at, flags)?
+                }
+                None => {
+                    let dev = dev::open(store, ino)?;
+                    let kmsg = match dev {
+                        Device::Kmsg => Some(open_kmsg(cx, accmode)?),
+                        _ => None,
+                    };
+                    FileKind::Device { ino, dev, kmsg }
+                }
+            },
+        },
+        mode::S_IFIFO => open_fifo(cx, ino, flags)?,
+        // Block devices and socket files cannot be opened (socket files use connect)
+        _ => return Err(Errno::ENXIO),
+    })
+}
+
+/// The access permissions open requires (`MAY_*`).
+fn open_mask(flags: u32) -> u32 {
+    match flags & oflags::O_ACCMODE {
+        oflags::O_RDONLY => MAY_READ,
+        oflags::O_WRONLY => MAY_WRITE,
+        _ => MAY_READ | MAY_WRITE,
+    }
+}
+
+/// Turns access permissions (`MAY_*`) into device-filter access (`BPF_DEVCG_ACC_*`).
+fn device_access(mask: u32) -> u32 {
+    let mut access = 0;
+    if mask & MAY_WRITE != 0 {
+        access |= crate::bpf::ACC_WRITE;
+    }
+    if mask & MAY_READ != 0 {
+        access |= crate::bpf::ACC_READ;
+    }
+    access
+}
+
+/// Which devpts instance a ptmx device node outside devpts opens (Linux's `devpts_acquire`): the
+/// one mounted on `pts` in the node's directory `dir` (its mount and device number). No `pts` is
+/// ENOENT, and a `pts` that is not a devpts root is ENODEV; when the node's directory is unknown
+/// (opened by handle) it is the boot one.
+fn devpts_beside(vfs: &Vfs, dir: Option<&Node>) -> Result<(u64, MountId), Errno> {
+    let Some(dir) = dir else {
+        return Ok((crate::tty::BOOT_PTS, crate::vfs::PTS_MOUNT));
+    };
+    let Node::Store(mnt, ino) = dir else {
+        return Err(Errno::ENODEV);
+    };
+    let pts = vfs.store().lookup(*ino, b"pts")?.ok_or(Errno::ENOENT)?;
+    match vfs.mounted(Node::Store(*mnt, pts)) {
+        Node::Pseudo(m, PseudoNode::PtsRoot(fs)) => Ok((fs, m)),
+        _ => Err(Errno::ENODEV),
+    }
+}
+
+/// The PTY slave index of a device number: major 136, and the minor is the index (Linux's pts
+/// driver registers all 2^20 minors of 136).
+fn pts_index(r: u64) -> Option<u32> {
+    let major = ((r >> 8) & 0xfff) as u32;
+    let minor = ((r & 0xff) | ((r >> 12) & !0xff)) as u32;
+    (major == PTS_MAJOR).then_some(minor)
+}
+
+/// Opens `/dev/kmsg` (`devkmsg_open`): when `printk_devkmsg` is `off` nobody can open it; a read
+/// open checks permission as syslog's read-all does (`dmesg_restrict`), and a write-only open is
+/// not checked. Reading starts at the oldest record.
+fn open_kmsg(cx: &mut Cx<'_>, accmode: u32) -> Result<Box<crate::klog::KmsgFile>, Errno> {
+    let log = cx.kr().klog.clone();
+    if log.borrow().devkmsg == crate::klog::Devkmsg::Off {
+        return Err(Errno::EPERM);
+    }
+    if accmode != oflags::O_WRONLY {
+        super::misc::check_syslog_permissions(cx, super::misc::syslog_action::READ_ALL, false)?;
+    }
+    Ok(Box::new(crate::klog::KmsgFile::new(log)))
+}
+
+/// Opens a named pipe (FIFO): all opens of one inode share one pipe. As on Linux, a read-only
+/// open waits until there is a writer, a write-only open waits until there is a reader (with
+/// `O_NONBLOCK` it returns ENXIO when there is no reader), and a read-write open does not wait.
+fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
+    let accmode = flags & oflags::O_ACCMODE;
+    let nonblock = flags & oflags::O_NONBLOCK != 0;
+    let (read, write) = match accmode {
+        oflags::O_RDONLY => (true, false),
+        oflags::O_WRONLY => (false, true),
+        _ => (true, true),
+    };
+    let capacity = pipe_capacity(cx);
+    let pipe = {
+        let k = cx.k();
+        k.fifos.retain(|_, w| w.strong_count() > 0);
+        match k.fifos.get(&ino).and_then(Weak::upgrade) {
+            Some(p) => p,
+            None => {
+                let p = Pipe::fifo(ino, capacity);
+                k.fifos.insert(ino, Rc::downgrade(&p));
+                p
+            }
+        }
+    };
+    if write && !read && nonblock && pipe.borrow().readers == 0 {
+        return Err(Errno::ENXIO);
+    }
+    let peer_opens = |p: &Pipe| if read { p.writer_opens } else { p.reader_opens };
+    let before = peer_opens(&pipe.borrow());
+    let mut end = PipeEnd::open(&pipe, read, write);
+    if read && !write && nonblock && pipe.borrow().writers == 0 {
+        end.hup_after = Some(before);
+    }
+    if read != write && !nonblock {
+        // Wait for the other end to open: it is enough that it came, even if it has closed
+        // already
+        loop {
+            {
+                let p = pipe.borrow();
+                let peers = if read { p.writers } else { p.readers };
+                if peers > 0 || peer_opens(&p) != before {
+                    break;
+                }
+            }
+            if cx.interrupted() {
+                return Err(Errno::ERESTARTSYS);
+            }
+            cx.wait_object(crate::pipe::object(&pipe))?;
+        }
+    }
+    Ok(FileKind::Pipe(end))
+}
+
+/// Files opened by open, openat2 and open_by_handle_at carry `O_LARGEFILE` (on 64-bit Linux
+/// always adds it, and drops it with `O_PATH`), visible in F_GETFL and fdinfo; files created by
+/// other syscalls, such as pipes and sockets, do not have it.
+fn largefile(flags: u32) -> u32 {
+    if flags & oflags::O_PATH != 0 {
+        0
+    } else {
+        oflags::O_LARGEFILE
+    }
 }
 
 pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
@@ -1720,15 +1260,6 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     Ok(new as u64)
 }
 
-/// Capacity of a new pipe: as on Linux, at most pipe-max-size, except with `CAP_SYS_RESOURCE`.
-fn pipe_capacity(cx: &Cx<'_>) -> usize {
-    if cx.cred().capable(cap::SYS_RESOURCE) {
-        PIPE_CAPACITY
-    } else {
-        PIPE_CAPACITY.min(cx.kr().pipe_max_size)
-    }
-}
-
 pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
     const O_DIRECT: u32 = 0o200000;
     if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK | O_DIRECT) != 0 {
@@ -1759,6 +1290,56 @@ pub(super) fn pipe2(cx: &mut Cx<'_>, fds: u64, flags: u32) -> SysResult {
         return Err(e);
     }
     Ok(0)
+}
+
+/// Capacity of a new pipe: as on Linux, at most pipe-max-size, except with `CAP_SYS_RESOURCE`.
+fn pipe_capacity(cx: &Cx<'_>) -> usize {
+    if cx.cred().capable(cap::SYS_RESOURCE) {
+        PIPE_CAPACITY
+    } else {
+        PIPE_CAPACITY.min(cx.kr().pipe_max_size)
+    }
+}
+
+pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult {
+    const MFD_CLOEXEC: u32 = 0x1;
+    const MFD_ALLOW_SEALING: u32 = 0x2;
+    const MFD_NOEXEC_SEAL: u32 = 0x8;
+    const MFD_EXEC: u32 = 0x10;
+    // MFD_HUGETLB is not supported
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = cx.mm().read_cstr(name, 249).map_err(|e| {
+        if e == Errno::ENAMETOOLONG {
+            Errno::EINVAL
+        } else {
+            e
+        }
+    })?;
+    let noexec = flags & MFD_NOEXEC_SEAL != 0;
+    let (ino, file) = cx
+        .vfs()?
+        .store()
+        .create_anonymous(if noexec { 0o666 } else { 0o777 })?;
+    let seals = match (flags & MFD_ALLOW_SEALING != 0, noexec) {
+        (_, true) => F_SEAL_EXEC,
+        (true, false) => 0,
+        (false, false) => F_SEAL_SEAL,
+    };
+    cx.k().seals.insert(ino, seals);
+    let mut path = b"/memfd:".to_vec();
+    path.extend_from_slice(&name);
+    path.extend_from_slice(b" (deleted)");
+    let file = OpenFile::with_path(
+        FileKind::Regular { ino, file },
+        oflags::O_RDWR | oflags::O_LARGEFILE,
+        Some(Rc::from(path)),
+    );
+    file.borrow_mut().pseudo = true;
+    cx.fds_mut()
+        .install(file, flags & MFD_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
 }
 
 pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
@@ -2022,70 +1603,76 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
     }
 }
 
-/// Writes (write, pwrite) and length changes (ftruncate) forbidden by seals return EPERM.
-/// `grow_to` is the length after the write or truncation.
-fn check_seals(
-    cx: &Cx<'_>,
-    f: &OpenFile,
-    write: bool,
-    grow_to: impl FnOnce(u64) -> u64,
-) -> Result<(), Errno> {
-    let FileKind::Regular { ino, file } = &f.kind else {
-        return Ok(());
+/// Whether some address space maps this open file with a writable shared mapping.
+fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let FileKind::Regular { file, .. } = &f.kind else {
+        return false;
     };
-    let Some(&seals) = cx.kr().seals.get(ino) else {
-        return Ok(());
+    let Ok(meta) = file.metadata() else {
+        return false;
     };
-    if write && seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
-        return Err(Errno::EPERM);
-    }
-    let size = file.metadata().map_err(host_errno)?.len();
-    let new = grow_to(size);
-    if (new > size && seals & F_SEAL_GROW != 0) || (new < size && seals & F_SEAL_SHRINK != 0) {
-        return Err(Errno::EPERM);
-    }
-    Ok(())
+    cx.kr().tasks.values().any(|t| {
+        t.res
+            .borrow()
+            .mm
+            .borrow()
+            .writably_maps(meta.dev(), meta.ino())
+    })
 }
 
-pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult {
-    const MFD_CLOEXEC: u32 = 0x1;
-    const MFD_ALLOW_SEALING: u32 = 0x2;
-    const MFD_NOEXEC_SEAL: u32 = 0x8;
-    const MFD_EXEC: u32 = 0x10;
-    // MFD_HUGETLB is not supported
-    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let name = cx.mm().read_cstr(name, 249).map_err(|e| {
-        if e == Errno::ENAMETOOLONG {
-            Errno::EINVAL
-        } else {
-            e
-        }
-    })?;
-    let noexec = flags & MFD_NOEXEC_SEAL != 0;
-    let (ino, file) = cx
-        .vfs()?
-        .store()
-        .create_anonymous(if noexec { 0o666 } else { 0o777 })?;
-    let seals = match (flags & MFD_ALLOW_SEALING != 0, noexec) {
-        (_, true) => F_SEAL_EXEC,
-        (true, false) => 0,
-        (false, false) => F_SEAL_SEAL,
+pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
+    const LOCK_SH: u32 = 1;
+    const LOCK_EX: u32 = 2;
+    const LOCK_NB: u32 = 4;
+    const LOCK_UN: u32 = 8;
+    let file = cx.fds().get(fd)?;
+    // Files not in the store (pipes, sockets) have no lock to share: always succeeds
+    let Some(ino) = file.borrow().ino() else {
+        return Ok(0);
     };
-    cx.k().seals.insert(ino, seals);
-    let mut path = b"/memfd:".to_vec();
-    path.extend_from_slice(&name);
-    path.extend_from_slice(b" (deleted)");
-    let file = OpenFile::with_path(
-        FileKind::Regular { ino, file },
-        oflags::O_RDWR | oflags::O_LARGEFILE,
-        Some(Rc::from(path)),
-    );
-    file.borrow_mut().pseudo = true;
-    cx.fds_mut()
-        .install(file, flags & MFD_CLOEXEC != 0, 0)
-        .map(|fd| fd as u64)
+    let me = Rc::downgrade(&file);
+    let exclusive = match op & !LOCK_NB {
+        LOCK_SH => false,
+        LOCK_EX => true,
+        LOCK_UN => {
+            if let Some(locks) = cx.k().flocks.get_mut(&ino) {
+                locks.retain(|(f, _)| !f.ptr_eq(&me));
+            }
+            request_wake_locks();
+            return Ok(0);
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    loop {
+        let locks = cx.k().flocks.entry(ino).or_default();
+        locks.retain(|(f, _)| f.strong_count() > 0);
+        // Locking the same open file again converts the lock type
+        let conflict = locks
+            .iter()
+            .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
+        if !conflict {
+            // When converting the lock type, release the old one first (as on Linux): when an
+            // exclusive lock becomes shared, those waiting for a shared lock can take it
+            let before = locks.len();
+            locks.retain(|(f, _)| !f.ptr_eq(&me));
+            if locks.len() != before {
+                request_wake_locks();
+            }
+            locks.push((me, exclusive));
+            file.borrow_mut().holds_locks = true;
+            return Ok(0);
+        }
+        if op & LOCK_NB != 0 {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        // The file holding the lock requests a wakeup when it unlocks, converts or closes
+        // (OpenFile's destructor)
+        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+    }
 }
 
 pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResult {
@@ -2263,6 +1850,1691 @@ fn clone_range(src: &FileRef, dst: &FileRef) -> SysResult {
     Err(Errno::EOPNOTSUPP)
 }
 
+// ---- Reading and writing ----
+
+/// The route one read or write takes, carried out without holding a borrow of the open file.
+enum IoPath {
+    Host(i32),
+    Pipe(Rc<RefCell<Pipe>>),
+    /// A terminal, whether the open file is the master, and how many hangups it had seen when
+    /// opened ([`crate::tty::PtyEnd::born`]).
+    Pty(Rc<RefCell<Tty>>, (bool, u32)),
+    Socket(SocketRef),
+    EventFd(Rc<RefCell<EventFd>>),
+    TimerFd(Rc<RefCell<TimerFd>>),
+    SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
+    Inotify(Rc<RefCell<super::Inotify>>),
+    /// `/proc/<pid>/pagemap`: computed on the fly from the read position.
+    Pagemap(Tid),
+    /// `/proc/<pid>/mem`: the position is the address.
+    /// The address space of `/proc/<pid>/mem` at open, None when it has been released.
+    Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
+    /// `/dev/kmsg`: read and written by record, with the read position in the open file
+    /// ([`crate::klog::KmsgFile`]).
+    Kmsg,
+    /// `/proc/kmsg`: syslog's read.
+    ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
+    /// Everything else (files in the store, devices, other synthetic files, and files with no
+    /// read or write operation): never waits for data. Regular files are read and written with
+    /// the BKL released ([`unlocked_io`]), except `O_APPEND` writes; the rest is done directly
+    /// while holding the borrow.
+    Local,
+}
+
+const SPLICE_F_NONBLOCK: u32 = 2;
+
+pub(super) fn read(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    read_file(cx, &file, buf, len, None)
+}
+
+pub(super) fn write(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    write_file(cx, &file, buf, len, None)
+}
+
+pub(super) fn pread(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    read_file(cx, &file, buf, len, checked_offset(offset)?)
+}
+
+pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let offset = append_offset(&file, checked_offset(offset)?)?;
+    write_file(cx, &file, buf, len, offset)
+}
+
+pub(super) fn readv(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
+    vectored(cx, fd, iov, count, None, false)
+}
+
+pub(super) fn writev(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
+    vectored(cx, fd, iov, count, None, true)
+}
+
+/// preadv, pwritev; with `flags` not None, preadv2 and pwritev2, where an offset of -1 means the
+/// file position.
+pub(super) fn pvectored(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: i64,
+    flags: Option<u32>,
+    write: bool,
+) -> SysResult {
+    // RWF_HIPRI does not affect the result; RWF_DSYNC and RWF_SYNC wait for the write to reach
+    // disk ([`write_sync`]); RWF_NOAPPEND (since Linux 6.9, used by musl's pwrite) makes a write
+    // with an offset on an O_APPEND file also write at the given offset; RWF_NOWAIT and
+    // RWF_APPEND are not supported, and as on Linux every unknown flag is EOPNOTSUPP
+    const RWF_NOAPPEND: u32 = 0x20;
+    const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
+    let mut offset = match flags {
+        Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
+        Some(_) if offset == -1 => None,
+        _ => checked_offset(offset)?,
+    };
+    if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
+        offset = append_offset(&cx.fds().get(fd)?, offset)?;
+    }
+    let n = vectored(cx, fd, iov, count, offset, write)?;
+    if let Some(rwf) = flags.filter(|_| write && n > 0) {
+        let file = cx.fds().get(fd)?;
+        write_sync(cx, &file, rwf)?;
+    }
+    Ok(n)
+}
+
+fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
+    u64::try_from(offset).map(Some).map_err(|_| Errno::EINVAL)
+}
+
+/// A write with an offset on an `O_APPEND` regular file still writes at the end, leaving the
+/// file position unchanged (Linux's generic_write_checks, the BUGS section of pwrite(2)); only
+/// pwritev2's `RWF_NOAPPEND` writes at the given offset. Such writes are done with the BKL held
+/// ([`write_bytes`]), so they never write at the same place as other appends.
+fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
+    let f = file.borrow();
+    match &f.kind {
+        FileKind::Regular { file, .. } if offset.is_some() && f.flags & oflags::O_APPEND != 0 => {
+            Ok(Some(file.metadata().map_err(host_errno)?.len()))
+        }
+        _ => Ok(offset),
+    }
+}
+
+/// splice: moves data between a pipe and another file (or two pipes). Copies through a host
+/// buffer, not zero-copy; data taken from a pipe is copied first and removed from the pipe only
+/// after the write succeeds, so a failed write loses no data.
+pub(super) fn splice(
+    cx: &mut Cx<'_>,
+    fd_in: i32,
+    off_in: u64,
+    fd_out: i32,
+    off_out: u64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    let (in_pipe, out_pipe) = (pipe_of(&input), pipe_of(&output));
+    // Objects such as directories, eventfd and epoll do not support splice (Linux's splice_read,
+    // splice_write)
+    let splices = |f: &FileRef| {
+        matches!(
+            f.borrow().kind,
+            FileKind::Regular { .. }
+                | FileKind::Pipe(_)
+                | FileKind::Socket(_)
+                | FileKind::Device { kmsg: None, .. }
+                | FileKind::Pty(_)
+                | FileKind::Proc { .. }
+                | FileKind::Host(_)
+        )
+    };
+    if in_pipe.is_none() && out_pipe.is_none()
+        || output.borrow().flags & oflags::O_APPEND != 0
+        || !splices(&input)
+        || !splices(&output)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if in_pipe.is_some() && off_in != 0 || out_pipe.is_some() && off_out != 0 {
+        return Err(Errno::ESPIPE);
+    }
+    let read_off = |cx: &Cx<'_>, addr: u64| -> Result<Option<u64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(
+                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
+            )),
+        }
+    };
+    let (src, dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
+    if len == 0 {
+        return Ok(0);
+    }
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+    let wrote = if let Some((pipe, _)) = in_pipe {
+        if !pipe_wait_data(cx, &pipe, nonblock || input.borrow().nonblocking())? {
+            return Ok(0);
+        }
+        let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
+        let n = write_bytes(cx, &output, &data, dst)?;
+        let mut p = pipe.borrow_mut();
+        let before = p.space();
+        p.buf.drain(..n);
+        if p.drained(before) {
+            request_wake_object(crate::pipe::object(&pipe));
+        }
+        n
+    } else {
+        let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
+        // As on Linux, an unconnected socket cannot splice out data: EINVAL
+        let got = match read_bytes(cx, &input, &mut buf, src) {
+            Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
+            r => r?,
+        };
+        let n = write_bytes(cx, &output, &buf[..got], None)?;
+        // The unwritten part goes back to the input file
+        if src.is_none() && n < got {
+            input.borrow_mut().pos -= (got - n) as u64;
+        }
+        n
+    };
+    if let Some(s) = src {
+        put(cx, off_in, (s + wrote as u64).to_le_bytes())?;
+    }
+    if let Some(d) = dst {
+        put(cx, off_out, (d + wrote as u64).to_le_bytes())?;
+    }
+    Ok(wrote as u64)
+}
+
+/// tee: copies the data in one pipe to another without taking it from the source pipe.
+pub(super) fn tee(cx: &mut Cx<'_>, fd_in: i32, fd_out: i32, len: usize, flags: u32) -> SysResult {
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    let (Some((src, _)), Some((dst, _))) = (pipe_of(&input), pipe_of(&output)) else {
+        return Err(Errno::EINVAL);
+    };
+    if Rc::ptr_eq(&src, &dst) {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if !pipe_wait_data(cx, &src, flags & SPLICE_F_NONBLOCK != 0)? {
+        return Ok(0);
+    }
+    let data: Vec<u8> = src.borrow().buf.iter().take(len).copied().collect();
+    write_bytes(cx, &output, &data, None).map(|n| n as u64)
+}
+
+/// vmsplice: on a pipe's read end it is like readv; on the write end it waits for space, then
+/// writes the part that fits and returns (as on Linux, without waiting for everything to be
+/// written).
+pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: u32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let Some((pipe, read)) = pipe_of(&file) else {
+        return Err(Errno::EBADF);
+    };
+    if read {
+        return vectored(cx, fd, iov, count, None, false);
+    }
+    let iovecs = iovecs(cx, iov, count)?;
+    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || file.borrow().nonblocking();
+    let space = loop {
+        {
+            let p = pipe.borrow();
+            if p.readers == 0 {
+                return Err(broken_pipe(cx));
+            }
+            if p.space() > 0 {
+                break p.space();
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        pipe.borrow_mut().want_space(1);
+        cx.wait_object(crate::pipe::object(&pipe))?;
+    };
+    let mut data = Vec::new();
+    for (base, len) in iovecs {
+        let n = len.min(space - data.len());
+        let start = data.len();
+        data.resize(start + n, 0);
+        cx.mm().read(UserSlice::new(base, n), &mut data[start..])?;
+        if data.len() == space {
+            break;
+        }
+    }
+    {
+        let mut p = pipe.borrow_mut();
+        p.buf.extend(&data);
+        p.writes += 1;
+    }
+    request_wake_object(crate::pipe::object(&pipe));
+    Ok(data.len() as u64)
+}
+
+/// When the open file is a pipe, returns the pipe and whether it is the read end.
+fn pipe_of(file: &FileRef) -> Option<(Rc<RefCell<Pipe>>, bool)> {
+    match &file.borrow().kind {
+        FileKind::Pipe(end) => Some((end.pipe.clone(), end.read)),
+        _ => None,
+    }
+}
+
+/// Waits for data in the pipe: returns false when all write ends are closed (EOF).
+fn pipe_wait_data(
+    cx: &mut Cx<'_>,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+) -> Result<bool, Errno> {
+    loop {
+        {
+            let p = pipe.borrow();
+            if !p.buf.is_empty() {
+                return Ok(true);
+            }
+            if p.writers == 0 {
+                return Ok(false);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+    }
+}
+
+/// readv, writev and their positional variants: handle each iovec in order, stopping at an
+/// incomplete one. With `offset` None the file position is used and advanced.
+pub(super) fn vectored(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    iov: u64,
+    count: usize,
+    offset: Option<u64>,
+    write: bool,
+) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
+    if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
+        let vecs = iovecs(cx, iov, count)?;
+        let total: usize = vecs.iter().map(|&(_, len)| len).sum();
+        if !file.borrow().writable() {
+            return Err(Errno::EBADF);
+        }
+        // A writev with total length 0 does not call the file's write (do_iter_write)
+        if total == 0 {
+            return Ok(0);
+        }
+        if total > crate::klog::LOG_LINE_MAX {
+            return Err(Errno::EINVAL);
+        }
+        let mut data = Vec::new();
+        for (base, len) in vecs {
+            let start = data.len();
+            data.resize(start + len, 0);
+            cx.mm()
+                .read(UserSlice::new(base, len), &mut data[start..])?;
+        }
+        return kmsg_write(cx, &file, &data).map(|n| n as u64);
+    }
+    let mut total = 0;
+    for (base, len) in iovecs(cx, iov, count)? {
+        let at = offset.map(|o| o + total);
+        let r = if write {
+            write_file(cx, &file, base, len, at)
+        } else {
+            read_file(cx, &file, base, len, at)
+        };
+        match r {
+            Ok(n) => {
+                total += n;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(_) if total > 0 => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
+/// Reads an iovec array.
+fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errno> {
+    if count > UIO_MAXIOV {
+        return Err(Errno::EINVAL);
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut total: usize = 0;
+    for i in 0..count as u64 {
+        let raw: [u8; 16] = get(cx, iov.wrapping_add(i * 16))?;
+        let base = u64::from_le_bytes(raw[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[8..].try_into().unwrap()) as usize;
+        total = total
+            .checked_add(len)
+            .filter(|&t| t <= isize::MAX as usize)
+            .ok_or(Errno::EINVAL)?;
+        out.push((base, len));
+    }
+    Ok(out)
+}
+
+pub(super) fn sendfile(
+    cx: &mut Cx<'_>,
+    out_fd: i32,
+    in_fd: i32,
+    offset: u64,
+    count: usize,
+) -> SysResult {
+    let input = cx.fds().get(in_fd)?;
+    let output = cx.fds().get(out_fd)?;
+    if !input.borrow().readable() || !output.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    if !matches!(
+        input.borrow().kind,
+        FileKind::Regular { .. } | FileKind::Device { .. }
+    ) {
+        return Err(Errno::EINVAL);
+    }
+    let mut off = match offset {
+        0 => None,
+        addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
+    };
+    if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
+        let n = r?;
+        if let Some(o) = off {
+            put(cx, offset, (o + n as u64).to_le_bytes())?;
+        }
+        return Ok(n as u64);
+    }
+    let mut chunk = vec![0u8; count.min(IO_CHUNK)];
+    let mut done = 0;
+    while done < count {
+        let n = (count - done).min(IO_CHUNK);
+        let got = match read_bytes(cx, &input, &mut chunk[..n], off) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
+        let wrote = match write_bytes(cx, &output, &chunk[..got], None) {
+            Ok(k) => k,
+            Err(_) if done > 0 => 0,
+            Err(e) => {
+                if off.is_none() {
+                    input.borrow_mut().pos -= got as u64;
+                }
+                return Err(e);
+            }
+        };
+        // The part not written out goes back to the input
+        match &mut off {
+            Some(o) => *o += wrote as u64,
+            None => input.borrow_mut().pos -= (got - wrote) as u64,
+        }
+        done += wrote;
+        if wrote < got || got < n {
+            break;
+        }
+    }
+    if let Some(o) = off {
+        put(cx, offset, o.to_le_bytes())?;
+    }
+    Ok(done as u64)
+}
+
+/// copy_file_range: copies between two regular files without passing through guest memory. A
+/// null offset pointer uses and advances the file position; otherwise the offset it points at
+/// is used and updated.
+pub(super) fn copy_file_range(
+    cx: &mut Cx<'_>,
+    fd_in: i32,
+    off_in: u64,
+    fd_out: i32,
+    off_out: u64,
+    len: usize,
+    flags: u32,
+) -> SysResult {
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let input = cx.fds().get(fd_in)?;
+    let output = cx.fds().get(fd_out)?;
+    {
+        let (i, o) = (input.borrow(), output.borrow());
+        if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
+            return Err(Errno::EBADF);
+        }
+        for f in [&i, &o] {
+            match f.kind {
+                FileKind::Regular { .. } => {}
+                FileKind::Directory { .. } => return Err(Errno::EISDIR),
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+    }
+    let read_off = |addr: u64| -> Result<Option<u64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(
+                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
+            )),
+        }
+    };
+    let (mut src, mut dst) = (read_off(off_in)?, read_off(off_out)?);
+    let same = input.borrow().ino() == output.borrow().ino();
+    if same {
+        // Two ranges in the same file must not overlap
+        let s = src.unwrap_or(input.borrow().pos);
+        let d = dst.unwrap_or(output.borrow().pos);
+        if s < d + len as u64 && d < s + len as u64 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if let Some(r) = copy_regular(cx, &input, src, &output, dst, len) {
+        let n = r? as u64;
+        if let Some(s) = src {
+            put(cx, off_in, (s + n).to_le_bytes())?;
+        }
+        if let Some(d) = dst {
+            put(cx, off_out, (d + n).to_le_bytes())?;
+        }
+        return Ok(n);
+    }
+    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(IO_CHUNK);
+        let got = read_bytes(cx, &input, &mut chunk[..n], src)?;
+        if got == 0 {
+            break;
+        }
+        let wrote = write_bytes(cx, &output, &chunk[..got], dst)?;
+        if let Some(s) = &mut src {
+            *s += wrote as u64;
+        } else {
+            input.borrow_mut().pos -= (got - wrote) as u64;
+        }
+        if let Some(d) = &mut dst {
+            *d += wrote as u64;
+        }
+        done += wrote;
+        if wrote < got {
+            break;
+        }
+    }
+    if let Some(s) = src {
+        put(cx, off_in, s.to_le_bytes())?;
+    }
+    if let Some(d) = dst {
+        put(cx, off_out, d.to_le_bytes())?;
+    }
+    Ok(done as u64)
+}
+
+/// When sendfile and copy_file_range copy between two regular files, the copy is left to the
+/// host kernel ([`appine_hal::copy_file`]): the data does not pass through the kernel layer, and
+/// it takes only one host call, without the BKL. With `src`/`dst` None the file positions are
+/// used and advanced; the output fd's host position is also used, so the output's position is
+/// always taken as [`unlocked_io`] does, and while waiting neither is taken, so copies in the
+/// two directions do not wait for each other. When it does not apply (not two different regular
+/// files, appending writes, seals, unsupported by the host) returns None, and the caller reads
+/// and writes block by block.
+fn copy_regular(
+    cx: &mut Cx<'_>,
+    input: &FileRef,
+    src: Option<u64>,
+    output: &FileRef,
+    dst: Option<u64>,
+    len: usize,
+) -> Option<Result<usize, Errno>> {
+    let (fd_in, fd_out, ino) = {
+        let (i, o) = (input.borrow(), output.borrow());
+        if o.flags & oflags::O_APPEND != 0 || i.ino() == o.ino() {
+            return None;
+        }
+        (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
+    };
+    // Seals must be checked block by block; tmpfs must be accounted block by block and stop when
+    // full (write_bytes)
+    let in_tmpfs = cx.vfs().is_ok_and(|v| {
+        v.tmpfs_dev(&Node::Store(output.borrow().mnt, ino))
+            .is_some()
+    });
+    if cx.kr().seals.contains_key(&ino) || in_tmpfs {
+        return None;
+    }
+    let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY)) {
+        Ok(n) => n,
+        Err(e) => return Some(Err(e)),
+    };
+    if len > 0
+        && let Err(e) = remove_privs(cx, ino)
+    {
+        return Some(Err(e));
+    }
+    let busy = |f: &FileRef, used: bool| used && f.borrow().pos_busy != 0;
+    while busy(input, src.is_none()) || busy(output, true) {
+        if cx.task.killed.get() {
+            return Some(Err(Errno::EINTR));
+        }
+        for (f, used) in [(input, src.is_none()), (output, true)] {
+            if busy(f, used) {
+                f.borrow_mut().pos_busy = 2;
+            }
+        }
+        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
+            return Some(Err(e));
+        }
+    }
+    let from = src.unwrap_or_else(|| input.borrow().pos);
+    let to = dst.unwrap_or_else(|| output.borrow().pos);
+    if src.is_none() {
+        input.borrow_mut().pos_busy = 1;
+    }
+    output.borrow_mut().pos_busy = 1;
+    let r = cx.unlocked(|| appine_hal::copy_file(fd_in, from, fd_out, to, len));
+    let mut wake = false;
+    for (f, used, dst, at) in [(input, src.is_none(), src, from), (output, true, dst, to)] {
+        if used {
+            let mut f = f.borrow_mut();
+            if let (Ok(n), None) = (r, dst) {
+                f.pos = at + n as u64;
+            }
+            wake |= std::mem::take(&mut f.pos_busy) == 2;
+        }
+    }
+    if wake {
+        request_wake_locks();
+    }
+    match r.map_err(Errno) {
+        // The host does not support this pair of files: the caller reads and writes block by
+        // block
+        Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP | Errno::EXDEV) => None,
+        Err(e) => Some(Err(e)),
+        Ok(n) => {
+            if n > 0 {
+                inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+                inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+            }
+            Some(Ok(n))
+        }
+    }
+}
+
+/// Reads from an open file into a guest buffer (read, pread, readv).
+pub(super) fn read_file(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+) -> SysResult {
+    // Each read of a terminal or pipe returns only data already ready and must not block again
+    // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
+    // (`dd bs=256M` reads whole blocks)
+    let fill = matches!(
+        file.borrow().kind,
+        FileKind::Regular { .. }
+            | FileKind::Proc { klog: None, .. }
+            | FileKind::Device {
+                dev: Device::Zero | Device::Full | Device::Random,
+                ..
+            }
+    );
+    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(IO_CHUNK);
+        let k = match read_bytes(cx, file, &mut chunk[..n], offset.map(|o| o + done as u64)) {
+            Ok(k) => k,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
+        if k > 0 {
+            file.borrow_mut().reads += 1;
+            // Signal-driven I/O is checked by the timer thread (check_fasync): just wake it
+            if file.borrow().flags & oflags::O_ASYNC != 0 {
+                crate::kernel::signal_later(&cx.shared.timers);
+            }
+        }
+        if let Err(e) = cx.mm().write(
+            UserSlice::new(buf.wrapping_add(done as u64), k),
+            &chunk[..k],
+        ) {
+            // The data has already been consumed: as on Linux, return the partial length when
+            // part of it was copied
+            if done == 0 {
+                return Err(e);
+            }
+            break;
+        }
+        done += k;
+        if k < n || !fill {
+            break;
+        }
+    }
+    Ok(done as u64)
+}
+
+/// Writes a guest buffer into an open file (write, pwrite, writev).
+pub(super) fn write_file(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: u64,
+    len: usize,
+    offset: Option<u64>,
+) -> SysResult {
+    // ESPIPE and EBADF are reported before an unreadable buffer
+    positional(&file.borrow(), offset)?;
+    if !file.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    // write(2) does not skip zero-length writes: /dev/kmsg therefore logs an empty record
+    if len == 0 && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
+        return kmsg_write(cx, file, &[]).map(|n| n as u64);
+    }
+    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
+    let mut done = 0;
+    while done < len {
+        let n = (len - done).min(IO_CHUNK);
+        let copied = cx.mm().read(
+            UserSlice::new(buf.wrapping_add(done as u64), n),
+            &mut chunk[..n],
+        );
+        let step = copied
+            .and_then(|()| write_bytes(cx, file, &chunk[..n], offset.map(|o| o + done as u64)));
+        match step {
+            Ok(k) => {
+                done += k;
+                if k < n {
+                    break;
+                }
+            }
+            // When part was already written, return the bytes written, as Linux does
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        }
+    }
+    if done > 0 {
+        write_sync(cx, file, 0)?;
+    }
+    Ok(done as u64)
+}
+
+/// Regular files opened with `O_DSYNC` or `O_SYNC`, or pwritev2 with `RWF_DSYNC` or `RWF_SYNC`
+/// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
+/// generic_write_sync). Data, length and times are all in the host object, so the host flushes
+/// them, waited for with the BKL released; names are not among them, and on Linux the directory
+/// also needs a separate fsync.
+fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
+    use oflags::{O_DSYNC, O_SYNC_BIT};
+    const RWF_DSYNC: u32 = 2;
+    const RWF_SYNC: u32 = 4;
+    let (fd, data_only) = {
+        let f = file.borrow();
+        let FileKind::Regular { file: host, .. } = &f.kind else {
+            return Ok(());
+        };
+        if f.flags & O_DSYNC == 0 && rwf & (RWF_DSYNC | RWF_SYNC) == 0 {
+            return Ok(());
+        }
+        let full = f.flags & O_SYNC_BIT != 0 || rwf & RWF_SYNC != 0;
+        (std::os::fd::AsRawFd::as_raw_fd(host), !full)
+    };
+    // The open file is kept alive by file and not touched while the BKL is released
+    cx.unlocked(|| appine_hal::fsync(fd, data_only))
+        .map_err(Errno)
+}
+
+/// Does one read from an open file into a host buffer. With `offset` None the file position is
+/// used and advanced.
+fn read_bytes(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    buf: &mut [u8],
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
+    let (path, nonblock) = {
+        let f = file.borrow();
+        let path = positional(&f, offset)?;
+        if !f.readable() {
+            return Err(Errno::EBADF);
+        }
+        (path, f.nonblocking())
+    };
+    match path {
+        IoPath::Host(fd) => {
+            wait_host(cx, fd, POLLIN, nonblock)?;
+            cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
+        }
+        IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
+        IoPath::Pty(t, side) => tty::read(cx, &t, side, nonblock, buf),
+        IoPath::Socket(s) => {
+            let m = super::net::recv(cx, &s, nonblock, buf.len(), 0, 0)?;
+            buf[..m.data.len()].copy_from_slice(&m.data);
+            Ok(m.data.len())
+        }
+        IoPath::EventFd(e) => super::poll::eventfd_read(cx, &e, nonblock, buf),
+        IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
+        IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
+        IoPath::Inotify(i) => super::inotify::read(cx, &i, nonblock, buf),
+        IoPath::Pagemap(pid) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let n = pseudo::read_pagemap(cx.kr(), pid, buf, pos)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos + n as u64;
+            }
+            Ok(n)
+        }
+        IoPath::Kmsg => kmsg_read(cx, file, nonblock, buf),
+        IoPath::ProcKmsg(log) => proc_kmsg_read(cx, &log, nonblock, buf),
+        IoPath::Mem(mm) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let n = pseudo::read_mem(mm, buf, pos)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos.wrapping_add(n as u64);
+            }
+            Ok(n)
+        }
+        IoPath::Local => {
+            let regular = regular_fd(&file.borrow());
+            let n = match regular {
+                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
+                    appine_hal::pread(fd, buf, pos)
+                })?,
+                None => {
+                    refresh_pseudo(cx, file, offset)?;
+                    local_read(&mut file.borrow_mut(), buf, offset)?
+                }
+            };
+            if n > 0 {
+                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
+            }
+            Ok(n)
+        }
+    }
+}
+
+/// Waits until a host fd (the host stdio `appine-run` gives the guest) is readable or writable;
+/// does not wait when nonblocking. Waits only on the host fd itself and registers no object:
+/// nothing in the process can make it ready, and previously every pipe or PTY read or write in
+/// the system woke the threads blocked on host stdin once.
+fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<(), Errno> {
+    let mut pfd = [(fd, events, 0)];
+    loop {
+        appine_hal::poll(&mut pfd, Some(Duration::ZERO)).map_err(Errno)?;
+        if pfd[0].2 != 0 {
+            return Ok(());
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_objects(None, &mut pfd, crate::kernel::wake::FILE, &[])?;
+        if pfd[0].2 != 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn pipe_read(
+    cx: &mut Cx<'_>,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        {
+            let mut p = pipe.borrow_mut();
+            if !p.buf.is_empty() || buf.is_empty() {
+                let n = buf.len().min(p.buf.len());
+                let before = p.space();
+                for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
+                    *d = s;
+                }
+                if p.drained(before) {
+                    request_wake_object(crate::pipe::object(pipe));
+                }
+                return Ok(n);
+            }
+            if p.writers == 0 {
+                return Ok(0);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+    }
+}
+
+/// Read of `/dev/kmsg` (`devkmsg_read`): reads one record at a time
+/// ([`crate::klog::Klog::ext_text`]), waiting when there is no new record (EAGAIN when
+/// nonblocking). When the record to read has been pushed out it is EPIPE and the position jumps
+/// to the oldest record; a buffer too small for the record is EINVAL and the record counts as
+/// read, as on Linux.
+fn kmsg_read(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        let object = {
+            let mut f = file.borrow_mut();
+            let FileKind::Device {
+                kmsg: Some(user), ..
+            } = &mut f.kind
+            else {
+                return Err(Errno::EBADF);
+            };
+            let log = user.log.clone();
+            let l = log.borrow();
+            if let Some(r) = l.ext_text(user.seq) {
+                if r.seq != user.seq {
+                    user.seq = r.seq;
+                    return Err(Errno::EPIPE);
+                }
+                user.seq = r.seq + 1;
+                if r.text.len() > buf.len() {
+                    return Err(Errno::EINVAL);
+                }
+                buf[..r.text.len()].copy_from_slice(&r.text);
+                return Ok(r.text.len());
+            }
+            wake::of(&*log)
+        };
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(object)?;
+    }
+}
+
+/// Read of `/proc/kmsg` (`kmsg_read`): syslog's read, sharing the read position with syslog(2);
+/// what is read is gone. Nonblocking with no unread record is EAGAIN.
+fn proc_kmsg_read(
+    cx: &mut Cx<'_>,
+    log: &Rc<RefCell<crate::klog::Klog>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    if nonblock && log.borrow_mut().size_unread(true) == 0 {
+        return Err(Errno::EAGAIN);
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    while !log.borrow().syslog_readable() {
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(wake::of(&**log))?;
+    }
+    let text = log.borrow_mut().syslog_read(buf.len());
+    buf[..text.len()].copy_from_slice(&text);
+    Ok(text.len())
+}
+
+/// As with Linux's seq_file (`seq_read_iter` starts over at offset 0), reading a procfs, sysfs or
+/// cgroup2 file from offset 0 regenerates the content: programs that keep it open and seek back
+/// to 0 to read again (procps; runc writes `cgroup.freeze` and reads it back to confirm) read the
+/// current content. Content just generated at open and not yet read or written is not
+/// regenerated.
+fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<(), Errno> {
+    let (mnt, node) = {
+        let mut f = file.borrow_mut();
+        let pos = offset.unwrap_or(f.pos);
+        match &mut f.kind {
+            FileKind::Proc {
+                mnt,
+                node,
+                fresh,
+                ns: None,
+                klog: None,
+                ..
+            } if pos == 0 && !pseudo::unreadable(node) => {
+                if std::mem::take(fresh) {
+                    return Ok(());
+                }
+                (*mnt, node.clone())
+            }
+            _ => return Ok(()),
+        }
+    };
+    let vfs = cx.vfs()?;
+    let content = pseudo::content(&cx.view(&vfs), mnt, &node)?;
+    if let FileKind::Proc { data, .. } = &mut file.borrow_mut().kind {
+        *data = content;
+    }
+    Ok(())
+}
+
+fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<usize, Errno> {
+    let pos = offset.unwrap_or(f.pos);
+    let n = match &f.kind {
+        FileKind::Regular { file, .. } => file.read_at(buf, pos).map_err(host_errno)?,
+        FileKind::Device { dev, .. } => match dev {
+            Device::Null => 0,
+            Device::Zero | Device::Full => {
+                buf.fill(0);
+                buf.len()
+            }
+            Device::Random => {
+                appine_hal::fill_random(buf).map_err(Errno)?;
+                buf.len()
+            }
+            Device::Kmsg => return Err(Errno::EBADF),
+        },
+        // Namespaces (nsfs) cannot be read
+        FileKind::Proc {
+            node: PseudoNode::NsFile(..),
+            ..
+        } => return Err(Errno::EINVAL),
+        FileKind::Proc { node, .. } if pseudo::unreadable(node) => return Err(Errno::EINVAL),
+        FileKind::Proc { data, .. } => {
+            let start = (pos as usize).min(data.len());
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        }
+        // A message queue reads as its status line
+        FileKind::MessageQueue(q) => {
+            let data = q.borrow().status();
+            let start = (pos as usize).min(data.len());
+            let n = buf.len().min(data.len() - start);
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            n
+        }
+        FileKind::Directory { .. } => return Err(Errno::EISDIR),
+        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::SeccompNotify(_) | FileKind::Bpf(_) => {
+            return Err(Errno::EINVAL);
+        }
+        _ => return Err(Errno::EBADF),
+    };
+    let positioned = matches!(
+        f.kind,
+        FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
+    );
+    if offset.is_none() && positioned {
+        f.pos = pos + n as u64;
+    }
+    Ok(n)
+}
+
+/// Does one write to an open file. With `offset` None the file position is used and advanced,
+/// and with `O_APPEND` it first moves to the end of the file.
+fn write_bytes(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    data: &[u8],
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
+    let (path, nonblock) = {
+        let f = file.borrow();
+        let path = positional(&f, offset)?;
+        if !f.writable() {
+            return Err(Errno::EBADF);
+        }
+        (path, f.nonblocking())
+    };
+    match path {
+        IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
+            Ok(n) => Ok(n),
+            Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
+            Err(e) => Err(Errno(e)),
+        },
+        IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
+        IoPath::Pty(t, side) => tty::write(cx, &t, side, nonblock, data),
+        IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
+        IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
+        IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
+            Err(Errno::EINVAL)
+        }
+        IoPath::Kmsg => kmsg_write(cx, file, data),
+        // Opened read-only (no proc_write)
+        IoPath::ProcKmsg(_) => Err(Errno::EBADF),
+        IoPath::Mem(mm) => {
+            let pos = offset.unwrap_or(file.borrow().pos);
+            let sync = cx.task.sync.clone();
+            let n = pseudo::write_mem(mm, data, pos, &sync)?;
+            if offset.is_none() {
+                file.borrow_mut().pos = pos.wrapping_add(n as u64);
+            }
+            Ok(n)
+        }
+        IoPath::Local => {
+            let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
+            let (n, tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len())?;
+            let data = &data[..n];
+            check_seals(cx, &file.borrow(), true, |size| {
+                let f = file.borrow();
+                let pos = match offset {
+                    Some(off) => off,
+                    None if f.flags & oflags::O_APPEND != 0 => size,
+                    None => f.pos,
+                };
+                size.max(pos + data.len() as u64)
+            })?;
+            let proc_node = match &file.borrow().kind {
+                FileKind::Proc { node, .. } => Some(node.clone()),
+                _ => None,
+            };
+            let mut written = data.len();
+            if let Some(node) = proc_node {
+                let cred = cx.cred();
+                let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
+                let tid = cx.tid();
+                pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
+                written = pseudo::written(&node, data.len());
+                if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
+                    *fresh = false;
+                }
+                // The cgroup memory limit changed: wake the timer thread to measure once right
+                // away
+                if let PseudoNode::Cgroup(_, b"memory.max") = node {
+                    cx.k().oom.recheck();
+                    crate::kernel::signal_later(&cx.shared.timers);
+                }
+            }
+            let ino = match file.borrow().kind {
+                FileKind::Regular { ino, .. } => Some(ino),
+                _ => None,
+            };
+            if let Some(ino) = ino.filter(|_| !data.is_empty()) {
+                remove_privs(cx, ino)?;
+            }
+            // Regular files are written without the BKL; O_APPEND ones are still written with
+            // the lock held (including writes with an offset, [`append_offset`]), so several
+            // processes appending at once do not overwrite each other
+            let regular =
+                regular_fd(&file.borrow()).filter(|_| file.borrow().flags & oflags::O_APPEND == 0);
+            let n = match regular {
+                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
+                    appine_hal::pwrite(fd, data, pos)
+                })?,
+                None => local_write(&mut file.borrow_mut(), data, offset)?.min(written),
+            };
+            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind)
+                && let Ok(meta) = host.metadata()
+            {
+                tmpfs_resized(&*cx.vfs()?, Some(t), meta.len());
+            }
+            if n > 0 {
+                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
+            }
+            Ok(n)
+        }
+    }
+}
+
+fn pipe_write(
+    cx: &mut Cx<'_>,
+    pipe: &Rc<RefCell<Pipe>>,
+    nonblock: bool,
+    data: &[u8],
+) -> Result<usize, Errno> {
+    let mut done = 0;
+    loop {
+        let progress = {
+            let mut p = pipe.borrow_mut();
+            if p.readers == 0 {
+                drop(p);
+                let e = broken_pipe(cx);
+                return if done > 0 { Ok(done) } else { Err(e) };
+            }
+            let want = data.len() - done;
+            // Writes up to PIPE_BUF must complete at once and not interleave with other writes
+            let space = p.space();
+            if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
+                let n = want.min(space);
+                // Readers wait only while the pipe is empty, and poll reports it unreadable only
+                // while empty; when it is not empty only edge-triggered epoll needs to know that
+                // more data came
+                if p.buf.is_empty() {
+                    request_wake_object(crate::pipe::object(pipe));
+                } else {
+                    super::poll::arrived(cx);
+                }
+                p.buf.extend(&data[done..done + n]);
+                p.writes += 1;
+                done += n;
+                true
+            } else {
+                // Wait for the reader to make room: a small write needs room for all of it at
+                // once; a large write waits until at least a page fits, so it is not woken every
+                // time the reader reads a little
+                p.want_space(if data.len() <= PIPE_BUF {
+                    want
+                } else {
+                    want.min(PIPE_BUF)
+                });
+                false
+            }
+        };
+        if done == data.len() {
+            return Ok(done);
+        }
+        if progress {
+            continue;
+        }
+        if nonblock || cx.interrupted() {
+            let e = if nonblock {
+                Errno::EAGAIN
+            } else {
+                Errno::ERESTARTSYS
+            };
+            return if done > 0 { Ok(done) } else { Err(e) };
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+    }
+}
+
+/// The write end has no readers left: EPIPE, and SIGPIPE to the current thread.
+fn broken_pipe(cx: &mut Cx<'_>) -> Errno {
+    let task = cx.task.clone();
+    signal::send_to_task(cx.kr(), &task, Signal::PIPE, SigInfo::kernel());
+    Errno::EPIPE
+}
+
+/// Write of `/dev/kmsg` (`devkmsg_write`): one write is one record
+/// ([`crate::klog::KmsgFile::write`]), and more than `LOG_LINE_MAX` is EINVAL; without a prefix
+/// the level is the default message level of `/proc/sys/kernel/printk`.
+fn kmsg_write(cx: &mut Cx<'_>, file: &FileRef, data: &[u8]) -> Result<usize, Errno> {
+    if data.len() > crate::klog::LOG_LINE_MAX {
+        return Err(Errno::EINVAL);
+    }
+    let level = cx.kr().printk[1];
+    if let FileKind::Device {
+        kmsg: Some(user), ..
+    } = &mut file.borrow_mut().kind
+    {
+        user.write(data, level);
+    }
+    Ok(data.len())
+}
+
+/// `RLIMIT_FSIZE`: a write to a regular file past the limit writes only up to the limit; when
+/// not a single byte can be written, sends SIGXFSZ to the current thread and returns EFBIG.
+/// Returns the number of bytes allowed.
+fn fsize_allowed(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    offset: Option<u64>,
+    len: usize,
+) -> Result<usize, Errno> {
+    let FileKind::Regular { file, .. } = &f.kind else {
+        return Ok(len);
+    };
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
+    if limit == u64::MAX || len == 0 {
+        return Ok(len);
+    }
+    let pos = match offset {
+        Some(off) => off,
+        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
+        None => f.pos,
+    };
+    if pos >= limit {
+        return Err(file_too_big(cx));
+    }
+    Ok(len.min((limit - pos) as usize))
+}
+
+fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usize, Errno> {
+    match &f.kind {
+        FileKind::Regular { file, .. } => {
+            let pos = match offset {
+                Some(off) => off,
+                None if f.flags & oflags::O_APPEND != 0 => {
+                    file.metadata().map_err(host_errno)?.len()
+                }
+                None => f.pos,
+            };
+            let n = file.write_at(data, pos).map_err(host_errno)?;
+            if offset.is_none() {
+                f.pos = pos + n as u64;
+            }
+            Ok(n)
+        }
+        FileKind::Device { dev, .. } => match dev {
+            Device::Full => Err(Errno::ENOSPC),
+            _ => Ok(data.len()),
+        },
+        // Writable procfs files: the content was already handled by pseudo::write
+        FileKind::Proc { .. } => Ok(data.len()),
+        // Anonymous inodes without a write operation
+        FileKind::Epoll(_)
+        | FileKind::Pidfd(_)
+        | FileKind::MessageQueue(_)
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => Err(Errno::EINVAL),
+        _ => Err(Errno::EBADF),
+    }
+}
+
+/// Which route a read or write takes. Reads and writes with an offset (pread, pwritev) on a file
+/// that cannot seek are ESPIPE: as on Linux this comes before the open-mode check (pwrite on a
+/// pipe opened read-only is also ESPIPE), except for `O_PATH`.
+fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
+    let path = io_path(f);
+    // pread and pwrite of /dev/kmsg and /proc/kmsg ignore the offset, like read and write
+    let seekable = matches!(
+        path,
+        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Kmsg | IoPath::ProcKmsg(_)
+    );
+    if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
+        return Err(Errno::ESPIPE);
+    }
+    Ok(path)
+}
+
+/// Whether the file can be read and written by position (AIO ignores the offset for files that
+/// cannot seek).
+pub(super) fn seekable(f: &OpenFile) -> bool {
+    matches!(
+        io_path(f),
+        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_)
+    )
+}
+
+fn io_path(f: &OpenFile) -> IoPath {
+    match &f.kind {
+        FileKind::Host(fd) => IoPath::Host(*fd),
+        FileKind::Pipe(end) => IoPath::Pipe(end.pipe.clone()),
+        FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), (end.master, end.born)),
+        FileKind::Socket(s) => IoPath::Socket(s.clone()),
+        FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
+        FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
+        FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
+        FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
+        FileKind::Proc {
+            node: PseudoNode::Entry(pid, _, pseudo::Entry::Pagemap),
+            ..
+        } => IoPath::Pagemap(*pid),
+        FileKind::Proc {
+            node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
+            mm,
+            ..
+        } => IoPath::Mem(mm.as_ref().and_then(std::rc::Weak::upgrade)),
+        FileKind::Device { kmsg: Some(_), .. } => IoPath::Kmsg,
+        FileKind::Proc {
+            klog: Some(log), ..
+        } => IoPath::ProcKmsg(log.clone()),
+        _ => IoPath::Local,
+    }
+}
+
+/// The host fd of a regular file: the BKL can be released while reading or writing it
+/// ([`unlocked_io`]).
+fn regular_fd(f: &OpenFile) -> Option<i32> {
+    match &f.kind {
+        FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
+        _ => None,
+    }
+}
+
+/// Reads or writes a regular file without the BKL: a host pread/pwrite of cold data waits on
+/// flash (hundreds of microseconds to milliseconds), and while the lock is held every process's
+/// syscalls would have to wait too. With `offset` None the file position is used, and an open
+/// file has only one such read or write at a time (Linux's f_pos_lock); others wait for it to
+/// finish. `io` is called with the host fd and position while the BKL is released, and must not
+/// touch any kernel object; the open file is kept alive by the caller's `file`, whose reference
+/// count and borrows are not touched while the BKL is released.
+fn unlocked_io(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    fd: i32,
+    offset: Option<u64>,
+    io: impl FnOnce(i32, u64) -> Result<usize, i32> + Send,
+) -> Result<usize, Errno> {
+    let pos = match offset {
+        Some(off) => off,
+        None => {
+            while file.borrow().pos_busy != 0 {
+                if cx.task.killed.get() {
+                    return Err(Errno::EINTR);
+                }
+                file.borrow_mut().pos_busy = 2;
+                cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+            }
+            let mut f = file.borrow_mut();
+            f.pos_busy = 1;
+            f.pos
+        }
+    };
+    let r = cx.unlocked(|| io(fd, pos));
+    if offset.is_none() {
+        let mut f = file.borrow_mut();
+        if let Ok(n) = r {
+            f.pos = pos + n as u64;
+        }
+        if std::mem::take(&mut f.pos_busy) == 2 {
+            request_wake_locks();
+        }
+    }
+    r.map_err(Errno)
+}
+
+// ---- Directories ----
+
+pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let mut f = file.borrow_mut();
+    let OpenFile { kind, pos, .. } = &mut *f;
+    let FileKind::Directory { node, entries, .. } = kind else {
+        return Err(Errno::ENOTDIR);
+    };
+    if entries.is_none() {
+        let vfs = cx.vfs()?;
+        let view = cx.view(&vfs);
+        let ino_of = |n: &Node| match n {
+            Node::Store(_, i) => *i,
+            Node::Pseudo(_, p) => pseudo::node_ino(view.k, p),
+        };
+        let parent = vfs.parent(&view, node)?;
+        let mut list = vec![
+            DirEntry {
+                name: b".".to_vec(),
+                ino: ino_of(node),
+                mode: mode::S_IFDIR,
+            },
+            DirEntry {
+                name: b"..".to_vec(),
+                ino: ino_of(&parent),
+                mode: mode::S_IFDIR,
+            },
+        ];
+        match node {
+            Node::Store(_, ino) => list.extend(vfs.store().readdir(*ino)?),
+            Node::Pseudo(id, p) => list.extend(pseudo::readdir(&view, *id, p)?),
+        }
+        *entries = Some(list);
+    }
+    let list = entries.as_ref().unwrap();
+    let mut out = Vec::new();
+    let mut next = *pos as usize;
+    while let Some(e) = list.get(next) {
+        // struct linux_dirent64: d_ino, d_off, d_reclen, d_type, d_name, aligned to 8 bytes
+        let reclen = (19 + e.name.len() + 1).next_multiple_of(8);
+        if out.len() + reclen > count {
+            break;
+        }
+        let start = out.len();
+        out.extend_from_slice(&e.ino.to_le_bytes());
+        out.extend_from_slice(&(next as u64 + 1).to_le_bytes());
+        out.extend_from_slice(&(reclen as u16).to_le_bytes());
+        out.push((e.mode >> 12) as u8 & 0xf); // DT_* is just S_IFMT >> 12
+        out.extend_from_slice(&e.name);
+        out.resize(start + reclen, 0);
+        next += 1;
+    }
+    if out.is_empty() && next < list.len() {
+        return Err(Errno::EINVAL);
+    }
+    cx.mm().write(UserSlice::new(buf, out.len()), &out)?;
+    *pos = next as u64;
+    inotify::file_event(cx.kr(), &f, inotify::IN_ACCESS);
+    Ok(out.len() as u64)
+}
+
+pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let mut f = file.borrow_mut();
+    let OpenFile { kind, pos, .. } = &mut *f;
+    let base = match kind {
+        FileKind::Host(fd) => return appine_hal::lseek(*fd, offset, whence as i32).map_err(Errno),
+        FileKind::Path(_) => return Err(Errno::EBADF),
+        FileKind::Pipe(_)
+        | FileKind::Pty(_)
+        | FileKind::Socket(_)
+        | FileKind::Epoll(_)
+        | FileKind::EventFd(_)
+        | FileKind::TimerFd(_)
+        | FileKind::SignalFd(_)
+        | FileKind::Inotify(_)
+        | FileKind::Pidfd(_)
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => return Err(Errno::ESPIPE),
+        FileKind::Proc { data, .. } => match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => *pos as i64,
+            SEEK_END => data.len() as i64,
+            _ => return Err(Errno::EINVAL),
+        },
+        FileKind::MessageQueue(q) => match whence {
+            SEEK_SET => 0,
+            SEEK_CUR => *pos as i64,
+            SEEK_END => q.borrow().status().len() as i64,
+            _ => return Err(Errno::EINVAL),
+        },
+        // /dev/kmsg seeks by record (`devkmsg_llseek`): the offset can only be 0; SEEK_SET goes
+        // to the oldest record, SEEK_DATA to the first one after syslog last cleared (after
+        // `dmesg -c`), SEEK_END to the next one; the file position is unchanged and 0 is returned
+        FileKind::Device {
+            kmsg: Some(user), ..
+        } => {
+            if offset != 0 {
+                return Err(Errno::ESPIPE);
+            }
+            let log = user.log.borrow();
+            user.seq = match whence {
+                SEEK_SET => log.first_seq(),
+                SEEK_DATA => log.clear_seq(),
+                SEEK_END => log.next_seq(),
+                _ => return Err(Errno::EINVAL),
+            };
+            return Ok(0);
+        }
+        // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
+        FileKind::Device { .. } => return Ok(0),
+        FileKind::Directory { entries, .. } => {
+            let new = match whence {
+                SEEK_SET => offset,
+                SEEK_CUR => (*pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
+                _ => return Err(Errno::EINVAL),
+            };
+            if new < 0 {
+                return Err(Errno::EINVAL);
+            }
+            if new == 0 {
+                *entries = None;
+            }
+            *pos = new as u64;
+            return Ok(new as u64);
+        }
+        FileKind::Regular { file, .. } => {
+            let size = file.metadata().map_err(host_errno)?.len() as i64;
+            match whence {
+                SEEK_SET => 0,
+                SEEK_CUR => *pos as i64,
+                SEEK_END => size,
+                SEEK_DATA if offset >= size => return Err(Errno::ENXIO),
+                SEEK_DATA => 0,
+                SEEK_HOLE if offset >= size => return Err(Errno::ENXIO),
+                SEEK_HOLE => {
+                    *pos = size as u64;
+                    return Ok(size as u64);
+                }
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+    };
+    let new = base
+        .checked_add(offset)
+        .filter(|&v| v >= 0)
+        .ok_or(Errno::EINVAL)?;
+    *pos = new as u64;
+    Ok(new as u64)
+}
+
+// ---- Cache hints and syncing ----
+
+/// posix_fadvise: affects only performance; ignored after the arguments are checked.
+pub(super) fn fadvise64(cx: &mut Cx<'_>, fd: i32, len: i64, advice: i32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    if matches!(file.borrow().kind, FileKind::Pipe(_) | FileKind::Socket(_)) {
+        return Err(Errno::ESPIPE);
+    }
+    if len < 0 || !(0..=5).contains(&advice) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// sync_file_range, readahead, syncfs: mostly argument checks (data is written straight into the
+/// host file, and reads are cached by the host too). sync_file_range with flags on a regular file
+/// is passed to the host object with the BKL released; syncfs's flush is [`sync`], called after
+/// this. `kind` tells the three apart: 0 is sync_file_range, 1 readahead, 2 syncfs.
+pub(super) fn cache_hint(
+    cx: &mut Cx<'_>,
+    fd: i32,
+    offset: i64,
+    len: i64,
+    flags: u32,
+    kind: u32,
+) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    match kind {
+        0 => {
+            if flags & !7 != 0 || offset < 0 || len < 0 || offset.checked_add(len).is_none() {
+                return Err(Errno::EINVAL);
+            }
+            match &f.kind {
+                // Handed to the host object: tools like dpkg first start writeback for a batch of
+                // files and then fsync them one by one, merged into one journal commit. The open
+                // file is kept alive by file and not touched while the BKL is released
+                FileKind::Regular { file: host, .. } if flags != 0 => {
+                    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+                    drop(f);
+                    cx.unlocked(|| appine_hal::sync_file_range(fd, offset, len, flags))
+                        .map(|()| 0)
+                        .map_err(Errno)
+                }
+                FileKind::Regular { .. } | FileKind::Directory { .. } => Ok(0),
+                FileKind::Path(_) => Err(Errno::EBADF),
+                _ => Err(Errno::ESPIPE),
+            }
+        }
+        1 => match &f.kind {
+            _ if !f.readable() => Err(Errno::EBADF),
+            FileKind::Regular { .. } if offset >= 0 => Ok(0),
+            _ => Err(Errno::EINVAL),
+        },
+        _ => Ok(0),
+    }
+}
+
+/// cachestat (Linux 6.5): the state of a file in the page cache. Files in the store look at the
+/// host file's page cache ([`appine_hal::cachestat`], only the number of pages in the cache);
+/// other files have no page cache and get all 0s.
+pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    if matches!(file.borrow().kind, FileKind::Path(_)) {
+        return Err(Errno::EBADF);
+    }
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let r: [u8; 16] = get(cx, range)?;
+    let off = u64::from_le_bytes(r[..8].try_into().unwrap());
+    let len = u64::from_le_bytes(r[8..].try_into().unwrap());
+    let stats = match &file.borrow().kind {
+        FileKind::Regular { file, .. } => {
+            appine_hal::cachestat(std::os::fd::AsRawFd::as_raw_fd(file), off, len).map_err(Errno)?
+        }
+        _ => [0; 5],
+    };
+    let mut b = [0u8; 40];
+    for (i, n) in stats.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&n.to_le_bytes());
+    }
+    put(cx, out, b).map(|()| 0)
+}
+
+/// fsync(2), fdatasync(2) (`data_only`): a regular file's data is in its host object, so the host
+/// is asked to flush it to disk; metadata (names, permissions...) is in the store's database, so
+/// the deferred write transaction is committed and then the WAL is awaited on disk
+/// ([`durable`]). The BKL is released while flushing.
+pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let host = {
+        let f = file.borrow();
+        match &f.kind {
+            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
+            // Only regular files and directories can be synced (host fds are left to the host)
+            FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
+            FileKind::Directory { .. } => None,
+            FileKind::Host(_) => return Ok(0),
+            _ => return Err(Errno::EINVAL),
+        }
+    };
+    // The open file is kept alive by file and not touched while the BKL is released
+    if let Some(fd) = host {
+        cx.unlocked(|| appine_hal::fsync(fd, data_only))
+            .map_err(Errno)?;
+    }
+    durable(cx, false)
+}
+
+/// sync(2): commits the deferred write transaction and writes the whole host filesystem holding
+/// the store to disk.
+pub(super) fn sync(cx: &mut Cx<'_>) -> SysResult {
+    durable(cx, true)
+}
+
+/// Commits the store's deferred write transaction and waits for it to reach disk
+/// ([`Store::commit`] only writes into the WAL): with `all`, syncfs the whole host filesystem
+/// together with the data of all objects, otherwise wait only for the WAL. Waits with the BKL
+/// released.
+fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
+    let Ok(vfs) = cx.vfs() else {
+        return Ok(0);
+    };
+    let store = vfs.store();
+    store.commit()?;
+    let meta = store.meta().clone();
+    drop(vfs);
+    cx.unlocked(move || {
+        if all {
+            meta.sync_all()
+        } else {
+            meta.sync_metadata()
+        }
+    })?;
+    Ok(0)
+}
+
 // ---- Metadata ----
 
 pub(super) fn faccessat(
@@ -2327,6 +3599,20 @@ pub(super) fn fchdir(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     set_cwd(cx, node)
 }
 
+/// chdir, fchdir: the target must be a searchable directory.
+fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
+    let vfs = cx.vfs()?;
+    if !vfs.is_dir(&cx.view(&vfs), &node)? {
+        return Err(Errno::ENOTDIR);
+    }
+    if let Node::Store(_, ino) = node {
+        cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
+    }
+    cx.t.fs.borrow_mut().cwd = node;
+    cx.shared.fast_changed();
+    Ok(0)
+}
+
 /// chroot: the target must be a searchable directory; requires `CAP_SYS_CHROOT`. The current
 /// directory is unchanged (it may be outside the new root, as on Linux).
 pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
@@ -2344,20 +3630,6 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::EPERM);
     }
     cx.t.fs.borrow_mut().root = node;
-    cx.shared.fast_changed();
-    Ok(0)
-}
-
-/// chdir, fchdir: the target must be a searchable directory.
-fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
-    let vfs = cx.vfs()?;
-    if !vfs.is_dir(&cx.view(&vfs), &node)? {
-        return Err(Errno::ENOTDIR);
-    }
-    if let Node::Store(_, ino) = node {
-        cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
-    }
-    cx.t.fs.borrow_mut().cwd = node;
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -2433,48 +3705,6 @@ pub(super) fn newfstatat_flags(flags: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Shared by newfstatat and statx: finds the object `*at`-style and returns its `struct stat`.
-fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
-    stat_at_kernel(cx, dirfd, path, flags).map(|st| owner_out(cx, st))
-}
-
-/// Turns the owner and group in a stat result into those in the caller's user namespace (65534
-/// when they do not map).
-fn owner_out(cx: &Cx<'_>, mut st: [u8; 128]) -> [u8; 128] {
-    let cred = cx.cred();
-    if cred.user_ns.level > 0 {
-        let word =
-            |b: &[u8; 128], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-        let (uid, gid) = (cred.uid_out(word(&st, 24)), cred.gid_out(word(&st, 28)));
-        st[24..28].copy_from_slice(&uid.to_le_bytes());
-        st[28..32].copy_from_slice(&gid.to_le_bytes());
-    }
-    st
-}
-
-/// [`stat_at`], with the owner and group as kernel IDs.
-fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
-    if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
-        file_stat(cx, &cx.fds().get(dirfd)?)
-    } else {
-        // Resolution and fetching the attributes share one read transaction (which really starts
-        // only on a cache miss)
-        let vfs = cx.vfs()?;
-        vfs.store().snapshot(|_| {
-            let cred = cx.cred();
-            let node = lookup_at_or_fd(
-                cx,
-                &cred,
-                dirfd,
-                path,
-                flags,
-                flags & AT_SYMLINK_NOFOLLOW == 0,
-            )?;
-            node_stat(cx, &node)
-        })
-    }
-}
-
 pub(super) fn statx(
     cx: &mut Cx<'_>,
     dirfd: i32,
@@ -2536,48 +3766,87 @@ pub(super) fn encode_statx(st: &[u8; 128]) -> [u8; 256] {
     b
 }
 
+/// Shared by newfstatat and statx: finds the object `*at`-style and returns its `struct stat`.
+fn stat_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
+    stat_at_kernel(cx, dirfd, path, flags).map(|st| owner_out(cx, st))
+}
+
+/// [`stat_at`], with the owner and group as kernel IDs.
+fn stat_at_kernel(cx: &Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Result<[u8; 128], Errno> {
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        file_stat(cx, &cx.fds().get(dirfd)?)
+    } else {
+        // Resolution and fetching the attributes share one read transaction (which really starts
+        // only on a cache miss)
+        let vfs = cx.vfs()?;
+        vfs.store().snapshot(|_| {
+            let cred = cx.cred();
+            let node = lookup_at_or_fd(
+                cx,
+                &cred,
+                dirfd,
+                path,
+                flags,
+                flags & AT_SYMLINK_NOFOLLOW == 0,
+            )?;
+            node_stat(cx, &node)
+        })
+    }
+}
+
 pub(super) fn fstat(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
     let st = owner_out(cx, file_stat(cx, &cx.fds().get(fd)?)?);
     put(cx, buf, st).map(|()| 0)
 }
 
-fn encode_statfs(magic: u64, s: &appine_hal::FsStats, flags: u64) -> [u8; 120] {
-    // asm-generic's struct statfs (64-bit)
-    let mut b = [0u8; 120];
-    let words = [
-        magic,
-        s.block_size,
-        s.blocks,
-        s.free,
-        s.available,
-        s.files,
-        s.files_free,
-        0, // f_fsid
-        255,
-        s.block_size,
-        statfs_flags(flags),
-    ];
-    for (i, w) in words.iter().enumerate() {
-        b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+/// Turns the owner and group in a stat result into those in the caller's user namespace (65534
+/// when they do not map).
+fn owner_out(cx: &Cx<'_>, mut st: [u8; 128]) -> [u8; 128] {
+    let cred = cx.cred();
+    if cred.user_ns.level > 0 {
+        let word =
+            |b: &[u8; 128], off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let (uid, gid) = (cred.uid_out(word(&st, 24)), cred.gid_out(word(&st, 28)));
+        st[24..28].copy_from_slice(&uid.to_le_bytes());
+        st[28..32].copy_from_slice(&gid.to_le_bytes());
     }
-    b
+    st
 }
 
-/// statfs's `f_flags` (Linux's `calculate_f_flags`): the mount's flags plus `ST_VALID`.
-fn statfs_flags(flags: u64) -> u64 {
-    const ST_VALID: u64 = 0x20;
-    const ST_RELATIME: u64 = 0x1000;
-    const ST_NOSYMFOLLOW: u64 = 0x2000;
-    // RDONLY, NOSUID, NODEV, NOEXEC, NOATIME, NODIRATIME have the same values as MS_*
-    let same = ms::RDONLY | ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::NOATIME | ms::NODIRATIME;
-    let mut f = ST_VALID | (flags & same);
-    if flags & ms::RELATIME != 0 {
-        f |= ST_RELATIME;
+pub(super) fn statfs(cx: &mut Cx<'_>, path: u64, buf: u64) -> SysResult {
+    let path = read_path(cx, path)?;
+    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
+    let b = statfs_of(cx, &node)?;
+    put(cx, buf, b).map(|()| 0)
+}
+
+pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let (pipe, node) = {
+        let f = file.borrow();
+        (matches!(f.kind, FileKind::Pipe(_)), f.node())
+    };
+    // Message queue fds are in the mqueue filesystem
+    if matches!(file.borrow().kind, FileKind::MessageQueue(_)) {
+        let empty = appine_hal::FsStats {
+            block_size: 4096,
+            ..Default::default()
+        };
+        return put(cx, buf, encode_statfs(MQUEUE_MAGIC, &empty, 0)).map(|()| 0);
     }
-    if flags & ms::NOSYMFOLLOW != 0 {
-        f |= ST_NOSYMFOLLOW;
-    }
-    f
+    let b = match (pipe, node) {
+        (true, _) => encode_statfs(
+            PIPEFS_MAGIC,
+            &appine_hal::FsStats {
+                block_size: 4096,
+                ..Default::default()
+            },
+            0,
+        ),
+        (false, Some(node)) => statfs_of(cx, &node)?,
+        (false, None) => statfs_of(cx, &Node::ROOT)?,
+    };
+    put(cx, buf, b).map(|()| 0)
 }
 
 /// statfs of the filesystem a node is in.
@@ -2622,40 +3891,239 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     })
 }
 
-pub(super) fn statfs(cx: &mut Cx<'_>, path: u64, buf: u64) -> SysResult {
-    let path = read_path(cx, path)?;
-    let node = lookup_at(cx, AT_FDCWD, &path, true)?;
-    let b = statfs_of(cx, &node)?;
-    put(cx, buf, b).map(|()| 0)
+fn encode_statfs(magic: u64, s: &appine_hal::FsStats, flags: u64) -> [u8; 120] {
+    // asm-generic's struct statfs (64-bit)
+    let mut b = [0u8; 120];
+    let words = [
+        magic,
+        s.block_size,
+        s.blocks,
+        s.free,
+        s.available,
+        s.files,
+        s.files_free,
+        0, // f_fsid
+        255,
+        s.block_size,
+        statfs_flags(flags),
+    ];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    b
 }
 
-pub(super) fn fstatfs(cx: &mut Cx<'_>, fd: i32, buf: u64) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let (pipe, node) = {
-        let f = file.borrow();
-        (matches!(f.kind, FileKind::Pipe(_)), f.node())
-    };
-    // Message queue fds are in the mqueue filesystem
-    if matches!(file.borrow().kind, FileKind::MessageQueue(_)) {
-        let empty = appine_hal::FsStats {
-            block_size: 4096,
-            ..Default::default()
-        };
-        return put(cx, buf, encode_statfs(MQUEUE_MAGIC, &empty, 0)).map(|()| 0);
+/// statfs's `f_flags` (Linux's `calculate_f_flags`): the mount's flags plus `ST_VALID`.
+fn statfs_flags(flags: u64) -> u64 {
+    const ST_VALID: u64 = 0x20;
+    const ST_RELATIME: u64 = 0x1000;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
+    // RDONLY, NOSUID, NODEV, NOEXEC, NOATIME, NODIRATIME have the same values as MS_*
+    let same = ms::RDONLY | ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::NOATIME | ms::NODIRATIME;
+    let mut f = ST_VALID | (flags & same);
+    if flags & ms::RELATIME != 0 {
+        f |= ST_RELATIME;
     }
-    let b = match (pipe, node) {
-        (true, _) => encode_statfs(
-            PIPEFS_MAGIC,
-            &appine_hal::FsStats {
-                block_size: 4096,
-                ..Default::default()
-            },
-            0,
-        ),
-        (false, Some(node)) => statfs_of(cx, &node)?,
-        (false, None) => statfs_of(cx, &Node::ROOT)?,
+    if flags & ms::NOSYMFOLLOW != 0 {
+        f |= ST_NOSYMFOLLOW;
+    }
+    f
+}
+
+// ---- stat ----
+
+/// Metadata of a filesystem node.
+fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    match node {
+        Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
+        // Namespaces are in nsfs
+        Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
+            Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
+        }
+        // The open file a magic link points at: report that file itself
+        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
+            let file = view.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+            file_stat(cx, &file)
+        }
+        // A deleted program file
+        Node::Pseudo(_, PseudoNode::OpenExe(pid)) => {
+            let exe = exe_file(cx, *pid)?;
+            let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+                return Err(Errno::ENOENT);
+            };
+            let st = vfs.store().stat_open(ino, host)?;
+            Ok(encode_stat(&st, vfs.dev_of(&Node::Store(mnt, ino))))
+        }
+        Node::Pseudo(_, p) => Ok(encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node))),
+    }
+}
+
+fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
+    let f = file.borrow();
+    let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
+        let st = Stat {
+            ino,
+            mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev,
+            size: 0,
+            atime_ns: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+        };
+        encode_stat(&st, dev)
     };
-    put(cx, buf, b).map(|()| 0)
+    match &f.kind {
+        FileKind::Host(fd) => host_stat(*fd),
+        FileKind::Pipe(end) => match end.pipe.borrow().fifo {
+            Some(ino) => {
+                let vfs = cx.vfs()?;
+                let dev = vfs.dev_of(&Node::Store(f.mnt, ino));
+                Ok(encode_stat(&vfs.store().stat(ino)?, dev))
+            }
+            None => Ok(anon(
+                end.pipe.borrow().ino,
+                mode::S_IFIFO | 0o600,
+                0,
+                PIPE_DEV,
+            )),
+        },
+        FileKind::Pty(end) if end.master => Ok(anon(2, mode::S_IFCHR | 0o666, PTMX_RDEV, ROOT_DEV)),
+        FileKind::Socket(s) => Ok(anon(
+            pseudo::socket_ino(s),
+            mode::S_IFSOCK | 0o777,
+            0,
+            SOCK_DEV,
+        )),
+        // anon_inode: no file type bits
+        FileKind::Epoll(_)
+        | FileKind::EventFd(_)
+        | FileKind::TimerFd(_)
+        | FileKind::SignalFd(_)
+        | FileKind::Inotify(_)
+        | FileKind::Pidfd(_)
+        | FileKind::SeccompNotify(_)
+        | FileKind::Bpf(_) => Ok(anon(1, 0o600, 0, ANON_DEV)),
+        // The device number is that of the mqueue filesystem of the queue's IPC namespace
+        FileKind::MessageQueue(q) => {
+            let q = q.borrow();
+            Ok(encode_stat(&q.stat(), cx.vfs()?.mq_dev(q.ns)))
+        }
+        FileKind::Pty(end) => {
+            let t = end.tty.borrow();
+            let st = Stat {
+                ino: pseudo::ino_of(&PseudoNode::Pts(t.fs, t.index)),
+                mode: mode::S_IFCHR | t.mode,
+                nlink: 1,
+                uid: t.owner.0,
+                gid: t.owner.1,
+                rdev: rdev(PTS_MAJOR, t.index),
+                atime_ns: t.atime_ns,
+                mtime_ns: t.mtime_ns,
+                ctime_ns: t.ctime_ns,
+                ..Stat::default()
+            };
+            // The device number is that of the devpts instance the terminal is in (ttyname
+            // compares it with that of /dev/pts/<n>)
+            Ok(encode_stat(&st, t.fs))
+        }
+        FileKind::Regular { ino, file } => {
+            let vfs = cx.vfs()?;
+            let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
+            Ok(encode_stat(&vfs.store().stat_open(*ino, file)?, dev))
+        }
+        _ => {
+            let node = f.node().ok_or(Errno::EBADF)?;
+            drop(f);
+            node_stat(cx, &node)
+        }
+    }
+}
+
+/// Metadata of a host fd.
+// The st_* fields have different widths on different hosts
+#[allow(clippy::unnecessary_cast)]
+fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
+    let s = appine_hal::fstat(fd).map_err(Errno)?;
+    let st = Stat {
+        ino: s.st_ino as u64,
+        mode: s.st_mode as u32,
+        nlink: s.st_nlink as u32,
+        uid: s.st_uid,
+        gid: s.st_gid,
+        rdev: s.st_rdev as u64,
+        size: s.st_size as u64,
+        atime_ns: s.st_atime as i64 * 1_000_000_000 + s.st_atime_nsec as i64,
+        mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
+        ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
+    };
+    Ok(encode_stat(&st, s.st_dev as u64))
+}
+
+/// Encodes as asm-generic's `struct stat` (128 bytes).
+pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    let mut put = |off: usize, bytes: &[u8]| b[off..off + bytes.len()].copy_from_slice(bytes);
+    let (asec, ansec) = split_ns(st.atime_ns);
+    let (msec, mnsec) = split_ns(st.mtime_ns);
+    let (csec, cnsec) = split_ns(st.ctime_ns);
+    put(0, &dev.to_le_bytes());
+    put(8, &st.ino.to_le_bytes());
+    put(16, &st.mode.to_le_bytes());
+    put(20, &st.nlink.to_le_bytes());
+    put(24, &st.uid.to_le_bytes());
+    put(28, &st.gid.to_le_bytes());
+    put(32, &st.rdev.to_le_bytes());
+    // Directories in the store have no data; report one block, following ext4's habit
+    let size = if st.is_dir() && dev == ROOT_DEV {
+        4096
+    } else {
+        st.size
+    };
+    put(48, &size.to_le_bytes());
+    put(56, &4096u32.to_le_bytes());
+    // sysfs files report a size of one page but take no blocks. Short symlinks live in the inode
+    // and take no blocks: on ext4 targets shorter than 60 bytes (`ext4_symlink`; with the
+    // trailing NUL they fit in `i_data`), on others such as tmpfs within 128 bytes
+    // (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
+    let inline = if dev == ROOT_DEV { 60 } else { 128 };
+    let blocks = if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
+        0
+    } else {
+        size.div_ceil(4096) * 8
+    };
+    put(64, &blocks.to_le_bytes());
+    put(72, &asec.to_le_bytes());
+    put(80, &ansec.to_le_bytes());
+    put(88, &msec.to_le_bytes());
+    put(96, &mnsec.to_le_bytes());
+    put(104, &csec.to_le_bytes());
+    put(112, &cnsec.to_le_bytes());
+    b
+}
+
+fn split_ns(ns: i64) -> (u64, u64) {
+    (
+        ns.div_euclid(1_000_000_000) as u64,
+        ns.rem_euclid(1_000_000_000) as u64,
+    )
+}
+
+/// The (st_dev, st_ino) fstat would report, the part known without querying the store (epoll's
+/// fdinfo). Device numbers of synthetic nodes are those of the boot instances (procfs and devpts
+/// instances mounted later have their own device numbers, [`Vfs::dev_of`]).
+pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
+    match (&f.kind, f.node()) {
+        (_, Some(Node::Store(_, ino))) => (ROOT_DEV, ino),
+        (FileKind::Pipe(end), None) => (PIPE_DEV, end.pipe.borrow().ino),
+        (FileKind::Socket(s), _) => (SOCK_DEV, pseudo::socket_ino(s)),
+        (_, Some(Node::Pseudo(_, p))) => (pseudo::fs_of(&p).dev(), pseudo::ino_of(&p)),
+        _ => (ANON_DEV, 1),
+    }
 }
 
 // ---- Changing the namespace ----
@@ -2684,6 +4152,30 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
         0,
     );
     Ok(0)
+}
+
+/// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]). The
+/// order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount EROFS, no
+/// write permission on the directory EACCES.
+fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), Errno>> {
+    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
+    Some((|| {
+        let vfs = cx.vfs()?;
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let cgroups = &cx.kr().cgroups;
+        let exists = cgroups
+            .get(id)
+            .is_some_and(|g| g.children.contains_key(name))
+            || cgroups.files(id).any(|f| f == name);
+        if name == b"." || name == b".." || exists {
+            return Err(Errno::EEXIST);
+        }
+        let cred = cx.cred();
+        cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+        cx.k().cgroups.mkdir(id, name, &cred).map(|_| ())
+    })())
 }
 
 pub(super) fn mknodat(
@@ -2728,135 +4220,6 @@ pub(super) fn mknodat(
     tmpfs_created(&vfs, tmpfs, 0);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
-}
-
-/// Deletes a queue in the mqueue filesystem (as mq_unlink does): returns Some when the parent
-/// directory is the mqueue root directory. The order follows Linux's do_unlinkat and do_rmdir:
-/// `.` and `..`, the read-only mount, not found, unlink of a name ending in `/`, write permission
-/// on the directory, the sticky bit (EPERM), rmdir's ENOTDIR.
-fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Result<(), Errno>> {
-    let start = start_dir(cx, dirfd, path).ok()?;
-    let vfs = cx.vfs().ok()?;
-    let cred = cx.cred();
-    let (dir, name) = vfs
-        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
-        .ok()?;
-    let Node::Pseudo(_, PseudoNode::MqRoot(ns)) = dir else {
-        return None;
-    };
-    let rmdir = flags & AT_REMOVEDIR != 0;
-    Some((|| {
-        match name {
-            b"." if rmdir => return Err(Errno::EINVAL),
-            b".." if rmdir => return Err(Errno::ENOTEMPTY),
-            b"." | b".." => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let ipc = cx.kr().ipc(ns);
-        if !ipc.mqueues.contains_key(name) {
-            return Err(Errno::ENOENT);
-        }
-        // unlink of a name ending in / is ENOTDIR before may_delete
-        if !rmdir && path.ends_with(b"/") {
-            return Err(Errno::ENOTDIR);
-        }
-        let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
-        cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
-        if rmdir {
-            // rmdir checks the sticky bit first (may_delete); a queue is not a directory
-            let q = ipc.mqueues[name].borrow().stat();
-            let dir_uid = ipc.mq_dir.borrow().uid;
-            if cred.fsuid != q.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&q, cap::FOWNER) {
-                return Err(Errno::EPERM);
-            }
-            return Err(Errno::ENOTDIR);
-        }
-        super::mqueue::remove_queue(cx.k().ipc_mut(ns), &cred, name)
-    })())
-}
-
-/// When the parent directory is a cgroup directory: `name` is that cgroup's id, its metadata
-/// and the last component.
-fn cgroup_parent<'p>(
-    cx: &Cx<'_>,
-    dirfd: i32,
-    path: &'p [u8],
-) -> Option<(Node, u64, Stat, &'p [u8])> {
-    let start = start_dir(cx, dirfd, path).ok()?;
-    let vfs = cx.vfs().ok()?;
-    let (dir, name) = vfs
-        .resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
-        .ok()?;
-    let Node::Pseudo(_, PseudoNode::Cgroup(id, b"")) = dir else {
-        return None;
-    };
-    let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::Cgroup(id, b"")).ok()?;
-    Some((dir, id, st, name))
-}
-
-/// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]). The
-/// order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount EROFS, no
-/// write permission on the directory EACCES.
-fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), Errno>> {
-    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
-    Some((|| {
-        let vfs = cx.vfs()?;
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let cgroups = &cx.kr().cgroups;
-        let exists = cgroups
-            .get(id)
-            .is_some_and(|g| g.children.contains_key(name))
-            || cgroups.files(id).any(|f| f == name);
-        if name == b"." || name == b".." || exists {
-            return Err(Errno::EEXIST);
-        }
-        let cred = cx.cred();
-        cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
-        cx.k().cgroups.mkdir(id, name, &cred).map(|_| ())
-    })())
-}
-
-/// unlink and rmdir in a cgroup directory: rmdir removes a child cgroup
-/// ([`crate::cgroup::rmdir`]); files cannot be deleted (EPERM, cgroup directories have no
-/// unlink).
-fn cgroup_unlink(
-    cx: &mut Cx<'_>,
-    dirfd: i32,
-    path: &[u8],
-    flags: u32,
-) -> Option<Result<(), Errno>> {
-    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
-    let rmdir = flags & AT_REMOVEDIR != 0;
-    Some((|| {
-        match name {
-            b"." if rmdir => return Err(Errno::EINVAL),
-            b".." if rmdir => return Err(Errno::ENOTEMPTY),
-            b"." | b".." => return Err(Errno::EISDIR),
-            _ => {}
-        }
-        let vfs = cx.vfs()?;
-        if vfs.readonly(&dir) {
-            return Err(Errno::EROFS);
-        }
-        let cgroups = &cx.kr().cgroups;
-        let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
-        let file = cgroups.files(id).any(|f| f == name);
-        if child.is_none() && !file {
-            return Err(Errno::ENOENT);
-        }
-        cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
-        match (rmdir, child) {
-            (true, Some(c)) => crate::cgroup::rmdir(cx.k(), c),
-            (true, None) => Err(Errno::ENOTDIR),
-            (false, Some(_)) => Err(Errno::EISDIR),
-            (false, None) => Err(Errno::EPERM),
-        }
-    })())
 }
 
 pub(super) fn unlinkat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
@@ -2932,34 +4295,109 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
     Ok(())
 }
 
-/// Before deleting or renaming: EBUSY when a mount of the caller's namespace is on `name` in
-/// directory `dir` (Linux's `is_local_mountpoint`). Returns its inode, used after the deletion
-/// to detach the mounts on it in other namespaces ([`detach_points`]).
-fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
-    match vfs.store().lookup(dir, name)? {
-        Some(ino) if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) => Err(Errno::EBUSY),
-        found => Ok(found),
-    }
+/// Deletes a queue in the mqueue filesystem (as mq_unlink does): returns Some when the parent
+/// directory is the mqueue root directory. The order follows Linux's do_unlinkat and do_rmdir:
+/// `.` and `..`, the read-only mount, not found, unlink of a name ending in `/`, write permission
+/// on the directory, the sticky bit (EPERM), rmdir's ENOTDIR.
+fn unlink_mq(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], flags: u32) -> Option<Result<(), Errno>> {
+    let start = start_dir(cx, dirfd, path).ok()?;
+    let vfs = cx.vfs().ok()?;
+    let cred = cx.cred();
+    let (dir, name) = vfs
+        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
+        .ok()?;
+    let Node::Pseudo(_, PseudoNode::MqRoot(ns)) = dir else {
+        return None;
+    };
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    Some((|| {
+        match name {
+            b"." if rmdir => return Err(Errno::EINVAL),
+            b".." if rmdir => return Err(Errno::ENOTEMPTY),
+            b"." | b".." => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let ipc = cx.kr().ipc(ns);
+        if !ipc.mqueues.contains_key(name) {
+            return Err(Errno::ENOENT);
+        }
+        // unlink of a name ending in / is ENOTDIR before may_delete
+        if !rmdir && path.ends_with(b"/") {
+            return Err(Errno::ENOTDIR);
+        }
+        let dir_st = ipc.mq_dir.borrow().stat(ipc.mqueues.len());
+        cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+        if rmdir {
+            // rmdir checks the sticky bit first (may_delete); a queue is not a directory
+            let q = ipc.mqueues[name].borrow().stat();
+            let dir_uid = ipc.mq_dir.borrow().uid;
+            if cred.fsuid != q.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&q, cap::FOWNER) {
+                return Err(Errno::EPERM);
+            }
+            return Err(Errno::ENOTDIR);
+        }
+        super::mqueue::remove_queue(cx.k().ipc_mut(ns), &cred, name)
+    })())
 }
 
-/// `name` in directory `dir` (formerly `ino`) has been deleted: the mounts on it in other
-/// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename).
-fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
-    if let Some(ino) = ino {
-        vfs.detach_store_point((ino, dir, name));
-        cx.shared.fast_changed();
-    }
+/// unlink and rmdir in a cgroup directory: rmdir removes a child cgroup
+/// ([`crate::cgroup::rmdir`]); files cannot be deleted (EPERM, cgroup directories have no
+/// unlink).
+fn cgroup_unlink(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    flags: u32,
+) -> Option<Result<(), Errno>> {
+    let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    Some((|| {
+        match name {
+            b"." if rmdir => return Err(Errno::EINVAL),
+            b".." if rmdir => return Err(Errno::ENOTEMPTY),
+            b"." | b".." => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        let vfs = cx.vfs()?;
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let cgroups = &cx.kr().cgroups;
+        let child = cgroups.get(id).and_then(|g| g.children.get(name).copied());
+        let file = cgroups.files(id).any(|f| f == name);
+        if child.is_none() && !file {
+            return Err(Errno::ENOENT);
+        }
+        cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
+        match (rmdir, child) {
+            (true, Some(c)) => crate::cgroup::rmdir(cx.k(), c),
+            (true, None) => Err(Errno::ENOTDIR),
+            (false, Some(_)) => Err(Errno::EISDIR),
+            (false, None) => Err(Errno::EPERM),
+        }
+    })())
 }
 
-/// Link `name` of file `ino` was removed (unlink, overwritten by rename): the link count changed
-/// (IN_ATTRIB), and IN_DELETE_SELF when the last link is gone too. Both events are reported only
-/// to the file itself.
-fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
-    let k = cx.kr();
-    inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
-    if store.stat(ino).map_or(0, |st| st.nlink) == 0 {
-        inotify::deleted(k, ino, dir, name);
-    }
+/// When the parent directory is a cgroup directory: `name` is that cgroup's id, its metadata
+/// and the last component.
+fn cgroup_parent<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Option<(Node, u64, Stat, &'p [u8])> {
+    let start = start_dir(cx, dirfd, path).ok()?;
+    let vfs = cx.vfs().ok()?;
+    let (dir, name) = vfs
+        .resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
+        .ok()?;
+    let Node::Pseudo(_, PseudoNode::Cgroup(id, b"")) = dir else {
+        return None;
+    };
+    let st = pseudo::stat(&cx.view(&vfs), &PseudoNode::Cgroup(id, b"")).ok()?;
+    Some((dir, id, st, name))
 }
 
 pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> SysResult {
@@ -3210,22 +4648,37 @@ fn may_rename(
     Ok(())
 }
 
-pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
-    let path = read_path(cx, path)?;
-    let target = Attrs::of(cx, &lookup_at(cx, dirfd, &path, true)?)?;
-    chmod(cx, &target, perm)?;
-    if let Attrs::Store(ino) = target {
-        attrib_at(cx, ino, dirfd, &path, true);
+/// Before deleting or renaming: EBUSY when a mount of the caller's namespace is on `name` in
+/// directory `dir` (Linux's `is_local_mountpoint`). Returns its inode, used after the deletion
+/// to detach the mounts on it in other namespaces ([`detach_points`]).
+fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Option<Ino>, Errno> {
+    match vfs.store().lookup(dir, name)? {
+        Some(ino) if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) => Err(Errno::EBUSY),
+        found => Ok(found),
     }
-    Ok(0)
 }
 
-pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
-    let target = Attrs::of_fd(cx, fd)?;
-    chmod(cx, &target, perm)?;
-    attrib_fd(cx, fd);
-    Ok(0)
+/// `name` in directory `dir` (formerly `ino`) has been deleted: the mounts on it in other
+/// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename).
+fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
+    if let Some(ino) = ino {
+        vfs.detach_store_point((ino, dir, name));
+        cx.shared.fast_changed();
+    }
 }
+
+/// Link `name` of file `ino` was removed (unlink, overwritten by rename): the link count changed
+/// (IN_ATTRIB), and IN_DELETE_SELF when the last link is gone too. Both events are reported only
+/// to the file itself.
+fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
+    let k = cx.kr();
+    inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
+    if store.stat(ino).map_or(0, |st| st.nlink) == 0 {
+        inotify::deleted(k, ino, dir, name);
+    }
+}
+
+// ---- chmod, chown and utimensat ----
 
 /// What chmod, chown and utimensat act on: a store inode, or `/dev/pts/<n>` (owner, permissions
 /// and times are kept on the terminal, as with Linux's devpts). Other nodes in synthetic
@@ -3309,24 +4762,21 @@ impl Attrs {
     }
 }
 
-/// Metadata changed by path: report IN_ATTRIB (also to the containing directory).
-pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool) {
-    if inotify::active(cx.kr()) {
-        let parent = inotify::watched_parent(cx, dirfd, path, follow);
-        let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
-        let dir = match cx.vfs().map(|v| v.store().kind(ino)) {
-            Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
-            _ => 0,
-        };
-        inotify::path_event(cx.kr(), ino, parent, inotify::IN_ATTRIB | dir);
+pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
+    let path = read_path(cx, path)?;
+    let target = Attrs::of(cx, &lookup_at(cx, dirfd, &path, true)?)?;
+    chmod(cx, &target, perm)?;
+    if let Attrs::Store(ino) = target {
+        attrib_at(cx, ino, dirfd, &path, true);
     }
+    Ok(0)
 }
 
-/// Metadata changed by fd: report IN_ATTRIB.
-pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
-    if let Ok(file) = cx.fds().get(fd) {
-        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ATTRIB);
-    }
+pub(super) fn fchmod(cx: &mut Cx<'_>, fd: i32, perm: u32) -> SysResult {
+    let target = Attrs::of_fd(cx, fd)?;
+    chmod(cx, &target, perm)?;
+    attrib_fd(cx, fd);
+    Ok(0)
 }
 
 /// Only the owner (or a holder of `CAP_FOWNER`) can change permission bits; a caller not in the
@@ -3358,10 +4808,6 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
         }
     }
     Ok(0)
-}
-
-fn owner_arg(id: u32) -> Option<u32> {
-    (id != u32::MAX).then_some(id)
 }
 
 pub(super) fn fchownat(
@@ -3444,6 +4890,10 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
         }
     }
     Ok(0)
+}
+
+fn owner_arg(id: u32) -> Option<u32> {
+    (id != u32::MAX).then_some(id)
 }
 
 pub(super) fn utimensat(
@@ -3565,6 +5015,28 @@ pub(super) fn utimensat(
     Ok(0)
 }
 
+/// Metadata changed by path: report IN_ATTRIB (also to the containing directory).
+pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool) {
+    if inotify::active(cx.kr()) {
+        let parent = inotify::watched_parent(cx, dirfd, path, follow);
+        let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
+        let dir = match cx.vfs().map(|v| v.store().kind(ino)) {
+            Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
+            _ => 0,
+        };
+        inotify::path_event(cx.kr(), ino, parent, inotify::IN_ATTRIB | dir);
+    }
+}
+
+/// Metadata changed by fd: report IN_ATTRIB.
+pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
+    if let Ok(file) = cx.fds().get(fd) {
+        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ATTRIB);
+    }
+}
+
+// ---- truncate and fallocate ----
+
 pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let len = u64::try_from(len).map_err(|_| Errno::EINVAL)?;
     let path = read_path(cx, path)?;
@@ -3622,50 +5094,6 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
         }
         FileKind::Path(_) => Err(Errno::EBADF),
         _ => Err(Errno::EINVAL),
-    }
-}
-
-/// Whether some address space maps this open file with a writable shared mapping.
-fn writably_mapped(cx: &Cx<'_>, f: &OpenFile) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let FileKind::Regular { file, .. } = &f.kind else {
-        return false;
-    };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    cx.kr().tasks.values().any(|t| {
-        t.res
-            .borrow()
-            .mm
-            .borrow()
-            .writably_maps(meta.dev(), meta.ino())
-    })
-}
-
-/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
-/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
-/// address space syncs at the end of the syscall; other processes' sync here.
-fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = host.metadata() else {
-        return;
-    };
-    let sync = cx.task.sync.clone();
-    let mut seen = Vec::new();
-    for t in cx.kr().tasks.values() {
-        let mm = t.res.borrow().mm.clone();
-        if seen.contains(&Rc::as_ptr(&mm)) {
-            continue;
-        }
-        seen.push(Rc::as_ptr(&mm));
-        let Ok(mut m) = mm.try_borrow_mut() else {
-            crate::debug::log(format_args!("truncate: an address space is busy"));
-            continue;
-        };
-        if m.file_truncated(meta.dev(), meta.ino(), meta.len()) && !Rc::ptr_eq(&mm, &cx.t.mm) {
-            m.sync(&sync);
-        }
     }
 }
 
@@ -3739,1212 +5167,277 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     Ok(0)
 }
 
-pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
-    const LOCK_SH: u32 = 1;
-    const LOCK_EX: u32 = 2;
-    const LOCK_NB: u32 = 4;
-    const LOCK_UN: u32 = 8;
-    let file = cx.fds().get(fd)?;
-    // Files not in the store (pipes, sockets) have no lock to share: always succeeds
-    let Some(ino) = file.borrow().ino() else {
-        return Ok(0);
-    };
-    let me = Rc::downgrade(&file);
-    let exclusive = match op & !LOCK_NB {
-        LOCK_SH => false,
-        LOCK_EX => true,
-        LOCK_UN => {
-            if let Some(locks) = cx.k().flocks.get_mut(&ino) {
-                locks.retain(|(f, _)| !f.ptr_eq(&me));
-            }
-            request_wake_locks();
-            return Ok(0);
-        }
-        _ => return Err(Errno::EINVAL),
-    };
-    loop {
-        let locks = cx.k().flocks.entry(ino).or_default();
-        locks.retain(|(f, _)| f.strong_count() > 0);
-        // Locking the same open file again converts the lock type
-        let conflict = locks
-            .iter()
-            .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
-        if !conflict {
-            // When converting the lock type, release the old one first (as on Linux): when an
-            // exclusive lock becomes shared, those waiting for a shared lock can take it
-            let before = locks.len();
-            locks.retain(|(f, _)| !f.ptr_eq(&me));
-            if locks.len() != before {
-                request_wake_locks();
-            }
-            locks.push((me, exclusive));
-            file.borrow_mut().holds_locks = true;
-            return Ok(0);
-        }
-        if op & LOCK_NB != 0 {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        // The file holding the lock requests a wakeup when it unlocks, converts or closes
-        // (OpenFile's destructor)
-        cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
-    }
-}
-
-/// sync_file_range, readahead, syncfs: mostly argument checks (data is written straight into the
-/// host file, and reads are cached by the host too). sync_file_range with flags on a regular file
-/// is passed to the host object with the BKL released; syncfs's flush is [`sync`], called after
-/// this. `kind` tells the three apart: 0 is sync_file_range, 1 readahead, 2 syncfs.
-pub(super) fn cache_hint(
-    cx: &mut Cx<'_>,
-    fd: i32,
-    offset: i64,
-    len: i64,
-    flags: u32,
-    kind: u32,
-) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    match kind {
-        0 => {
-            if flags & !7 != 0 || offset < 0 || len < 0 || offset.checked_add(len).is_none() {
-                return Err(Errno::EINVAL);
-            }
-            match &f.kind {
-                // Handed to the host object: tools like dpkg first start writeback for a batch of
-                // files and then fsync them one by one, merged into one journal commit. The open
-                // file is kept alive by file and not touched while the BKL is released
-                FileKind::Regular { file: host, .. } if flags != 0 => {
-                    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
-                    drop(f);
-                    cx.unlocked(|| appine_hal::sync_file_range(fd, offset, len, flags))
-                        .map(|()| 0)
-                        .map_err(Errno)
-                }
-                FileKind::Regular { .. } | FileKind::Directory { .. } => Ok(0),
-                FileKind::Path(_) => Err(Errno::EBADF),
-                _ => Err(Errno::ESPIPE),
-            }
-        }
-        1 => match &f.kind {
-            _ if !f.readable() => Err(Errno::EBADF),
-            FileKind::Regular { .. } if offset >= 0 => Ok(0),
-            _ => Err(Errno::EINVAL),
-        },
-        _ => Ok(0),
-    }
-}
-
-/// cachestat (Linux 6.5): the state of a file in the page cache. Files in the store look at the
-/// host file's page cache ([`appine_hal::cachestat`], only the number of pages in the cache);
-/// other files have no page cache and get all 0s.
-pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u32) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    if matches!(file.borrow().kind, FileKind::Path(_)) {
-        return Err(Errno::EBADF);
-    }
-    if flags != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let r: [u8; 16] = get(cx, range)?;
-    let off = u64::from_le_bytes(r[..8].try_into().unwrap());
-    let len = u64::from_le_bytes(r[8..].try_into().unwrap());
-    let stats = match &file.borrow().kind {
-        FileKind::Regular { file, .. } => {
-            appine_hal::cachestat(std::os::fd::AsRawFd::as_raw_fd(file), off, len).map_err(Errno)?
-        }
-        _ => [0; 5],
-    };
-    let mut b = [0u8; 40];
-    for (i, n) in stats.iter().enumerate() {
-        b[i * 8..i * 8 + 8].copy_from_slice(&n.to_le_bytes());
-    }
-    put(cx, out, b).map(|()| 0)
-}
-
-/// fsync(2), fdatasync(2) (`data_only`): a regular file's data is in its host object, so the host
-/// is asked to flush it to disk; metadata (names, permissions...) is in the store's database, so
-/// the deferred write transaction is committed and then the WAL is awaited on disk
-/// ([`durable`]). The BKL is released while flushing.
-pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let host = {
-        let f = file.borrow();
-        match &f.kind {
-            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
-            // Only regular files and directories can be synced (host fds are left to the host)
-            FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
-            FileKind::Directory { .. } => None,
-            FileKind::Host(_) => return Ok(0),
-            _ => return Err(Errno::EINVAL),
-        }
-    };
-    // The open file is kept alive by file and not touched while the BKL is released
-    if let Some(fd) = host {
-        cx.unlocked(|| appine_hal::fsync(fd, data_only))
-            .map_err(Errno)?;
-    }
-    durable(cx, false)
-}
-
-/// sync(2): commits the deferred write transaction and writes the whole host filesystem holding
-/// the store to disk.
-pub(super) fn sync(cx: &mut Cx<'_>) -> SysResult {
-    durable(cx, true)
-}
-
-/// Commits the store's deferred write transaction and waits for it to reach disk
-/// ([`Store::commit`] only writes into the WAL): with `all`, syncfs the whole host filesystem
-/// together with the data of all objects, otherwise wait only for the WAL. Waits with the BKL
-/// released.
-fn durable(cx: &mut Cx<'_>, all: bool) -> SysResult {
-    let Ok(vfs) = cx.vfs() else {
-        return Ok(0);
-    };
-    let store = vfs.store();
-    store.commit()?;
-    let meta = store.meta().clone();
-    drop(vfs);
-    cx.unlocked(move || {
-        if all {
-            meta.sync_all()
-        } else {
-            meta.sync_metadata()
-        }
-    })?;
-    Ok(0)
-}
-
-// ---- Directories ----
-
-pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let mut f = file.borrow_mut();
-    let OpenFile { kind, pos, .. } = &mut *f;
-    let FileKind::Directory { node, entries, .. } = kind else {
-        return Err(Errno::ENOTDIR);
-    };
-    if entries.is_none() {
-        let vfs = cx.vfs()?;
-        let view = cx.view(&vfs);
-        let ino_of = |n: &Node| match n {
-            Node::Store(_, i) => *i,
-            Node::Pseudo(_, p) => pseudo::node_ino(view.k, p),
-        };
-        let parent = vfs.parent(&view, node)?;
-        let mut list = vec![
-            DirEntry {
-                name: b".".to_vec(),
-                ino: ino_of(node),
-                mode: mode::S_IFDIR,
-            },
-            DirEntry {
-                name: b"..".to_vec(),
-                ino: ino_of(&parent),
-                mode: mode::S_IFDIR,
-            },
-        ];
-        match node {
-            Node::Store(_, ino) => list.extend(vfs.store().readdir(*ino)?),
-            Node::Pseudo(id, p) => list.extend(pseudo::readdir(&view, *id, p)?),
-        }
-        *entries = Some(list);
-    }
-    let list = entries.as_ref().unwrap();
-    let mut out = Vec::new();
-    let mut next = *pos as usize;
-    while let Some(e) = list.get(next) {
-        // struct linux_dirent64: d_ino, d_off, d_reclen, d_type, d_name, aligned to 8 bytes
-        let reclen = (19 + e.name.len() + 1).next_multiple_of(8);
-        if out.len() + reclen > count {
-            break;
-        }
-        let start = out.len();
-        out.extend_from_slice(&e.ino.to_le_bytes());
-        out.extend_from_slice(&(next as u64 + 1).to_le_bytes());
-        out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push((e.mode >> 12) as u8 & 0xf); // DT_* is just S_IFMT >> 12
-        out.extend_from_slice(&e.name);
-        out.resize(start + reclen, 0);
-        next += 1;
-    }
-    if out.is_empty() && next < list.len() {
-        return Err(Errno::EINVAL);
-    }
-    cx.mm().write(UserSlice::new(buf, out.len()), &out)?;
-    *pos = next as u64;
-    inotify::file_event(cx.kr(), &f, inotify::IN_ACCESS);
-    Ok(out.len() as u64)
-}
-
-pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let mut f = file.borrow_mut();
-    let OpenFile { kind, pos, .. } = &mut *f;
-    let base = match kind {
-        FileKind::Host(fd) => return appine_hal::lseek(*fd, offset, whence as i32).map_err(Errno),
-        FileKind::Path(_) => return Err(Errno::EBADF),
-        FileKind::Pipe(_)
-        | FileKind::Pty(_)
-        | FileKind::Socket(_)
-        | FileKind::Epoll(_)
-        | FileKind::EventFd(_)
-        | FileKind::TimerFd(_)
-        | FileKind::SignalFd(_)
-        | FileKind::Inotify(_)
-        | FileKind::Pidfd(_)
-        | FileKind::SeccompNotify(_)
-        | FileKind::Bpf(_) => return Err(Errno::ESPIPE),
-        FileKind::Proc { data, .. } => match whence {
-            SEEK_SET => 0,
-            SEEK_CUR => *pos as i64,
-            SEEK_END => data.len() as i64,
-            _ => return Err(Errno::EINVAL),
-        },
-        FileKind::MessageQueue(q) => match whence {
-            SEEK_SET => 0,
-            SEEK_CUR => *pos as i64,
-            SEEK_END => q.borrow().status().len() as i64,
-            _ => return Err(Errno::EINVAL),
-        },
-        // /dev/kmsg seeks by record (`devkmsg_llseek`): the offset can only be 0; SEEK_SET goes
-        // to the oldest record, SEEK_DATA to the first one after syslog last cleared (after
-        // `dmesg -c`), SEEK_END to the next one; the file position is unchanged and 0 is returned
-        FileKind::Device {
-            kmsg: Some(user), ..
-        } => {
-            if offset != 0 {
-                return Err(Errno::ESPIPE);
-            }
-            let log = user.log.borrow();
-            user.seq = match whence {
-                SEEK_SET => log.first_seq(),
-                SEEK_DATA => log.clear_seq(),
-                SEEK_END => log.next_seq(),
-                _ => return Err(Errno::EINVAL),
-            };
-            return Ok(0);
-        }
-        // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
-        FileKind::Device { .. } => return Ok(0),
-        FileKind::Directory { entries, .. } => {
-            let new = match whence {
-                SEEK_SET => offset,
-                SEEK_CUR => (*pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
-                _ => return Err(Errno::EINVAL),
-            };
-            if new < 0 {
-                return Err(Errno::EINVAL);
-            }
-            if new == 0 {
-                *entries = None;
-            }
-            *pos = new as u64;
-            return Ok(new as u64);
-        }
-        FileKind::Regular { file, .. } => {
-            let size = file.metadata().map_err(host_errno)?.len() as i64;
-            match whence {
-                SEEK_SET => 0,
-                SEEK_CUR => *pos as i64,
-                SEEK_END => size,
-                SEEK_DATA if offset >= size => return Err(Errno::ENXIO),
-                SEEK_DATA => 0,
-                SEEK_HOLE if offset >= size => return Err(Errno::ENXIO),
-                SEEK_HOLE => {
-                    *pos = size as u64;
-                    return Ok(size as u64);
-                }
-                _ => return Err(Errno::EINVAL),
-            }
-        }
-    };
-    let new = base
-        .checked_add(offset)
-        .filter(|&v| v >= 0)
-        .ok_or(Errno::EINVAL)?;
-    *pos = new as u64;
-    Ok(new as u64)
-}
-
-// ---- Reading and writing ----
-
-/// The route one read or write takes, carried out without holding a borrow of the open file.
-enum IoPath {
-    Host(i32),
-    Pipe(Rc<RefCell<Pipe>>),
-    /// A terminal, whether the open file is the master, and how many hangups it had seen when
-    /// opened ([`crate::tty::PtyEnd::born`]).
-    Pty(Rc<RefCell<Tty>>, (bool, u32)),
-    Socket(SocketRef),
-    EventFd(Rc<RefCell<EventFd>>),
-    TimerFd(Rc<RefCell<TimerFd>>),
-    SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
-    Inotify(Rc<RefCell<super::Inotify>>),
-    /// `/proc/<pid>/pagemap`: computed on the fly from the read position.
-    Pagemap(Tid),
-    /// `/proc/<pid>/mem`: the position is the address.
-    /// The address space of `/proc/<pid>/mem` at open, None when it has been released.
-    Mem(Option<Rc<RefCell<crate::mm::Mm>>>),
-    /// `/dev/kmsg`: read and written by record, with the read position in the open file
-    /// ([`crate::klog::KmsgFile`]).
-    Kmsg,
-    /// `/proc/kmsg`: syslog's read.
-    ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
-    /// Everything else (files in the store, devices, other synthetic files, and files with no
-    /// read or write operation): never waits for data. Regular files are read and written with
-    /// the BKL released ([`unlocked_io`]), except `O_APPEND` writes; the rest is done directly
-    /// while holding the borrow.
-    Local,
-}
-
-fn io_path(f: &OpenFile) -> IoPath {
-    match &f.kind {
-        FileKind::Host(fd) => IoPath::Host(*fd),
-        FileKind::Pipe(end) => IoPath::Pipe(end.pipe.clone()),
-        FileKind::Pty(end) => IoPath::Pty(end.tty.clone(), (end.master, end.born)),
-        FileKind::Socket(s) => IoPath::Socket(s.clone()),
-        FileKind::EventFd(e) => IoPath::EventFd(e.clone()),
-        FileKind::TimerFd(t) => IoPath::TimerFd(t.clone()),
-        FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
-        FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
-        FileKind::Proc {
-            node: PseudoNode::Entry(pid, _, pseudo::Entry::Pagemap),
-            ..
-        } => IoPath::Pagemap(*pid),
-        FileKind::Proc {
-            node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
-            mm,
-            ..
-        } => IoPath::Mem(mm.as_ref().and_then(std::rc::Weak::upgrade)),
-        FileKind::Device { kmsg: Some(_), .. } => IoPath::Kmsg,
-        FileKind::Proc {
-            klog: Some(log), ..
-        } => IoPath::ProcKmsg(log.clone()),
-        _ => IoPath::Local,
-    }
-}
-
-/// Whether the file can be read and written by position (AIO ignores the offset for files that
-/// cannot seek).
-pub(super) fn seekable(f: &OpenFile) -> bool {
-    matches!(
-        io_path(f),
-        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_)
-    )
-}
-
-/// Which route a read or write takes. Reads and writes with an offset (pread, pwritev) on a file
-/// that cannot seek are ESPIPE: as on Linux this comes before the open-mode check (pwrite on a
-/// pipe opened read-only is also ESPIPE), except for `O_PATH`.
-fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
-    let path = io_path(f);
-    // pread and pwrite of /dev/kmsg and /proc/kmsg ignore the offset, like read and write
-    let seekable = matches!(
-        path,
-        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Kmsg | IoPath::ProcKmsg(_)
-    );
-    if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
-        return Err(Errno::ESPIPE);
-    }
-    Ok(path)
-}
-
-/// Waits until a host fd (the host stdio `appine-run` gives the guest) is readable or writable;
-/// does not wait when nonblocking. Waits only on the host fd itself and registers no object:
-/// nothing in the process can make it ready, and previously every pipe or PTY read or write in
-/// the system woke the threads blocked on host stdin once.
-fn wait_host(cx: &mut Cx<'_>, fd: i32, events: i16, nonblock: bool) -> Result<(), Errno> {
-    let mut pfd = [(fd, events, 0)];
-    loop {
-        appine_hal::poll(&mut pfd, Some(Duration::ZERO)).map_err(Errno)?;
-        if pfd[0].2 != 0 {
-            return Ok(());
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_objects(None, &mut pfd, crate::kernel::wake::FILE, &[])?;
-        if pfd[0].2 != 0 {
-            return Ok(());
-        }
-    }
-}
-
-fn pipe_read(
-    cx: &mut Cx<'_>,
-    pipe: &Rc<RefCell<Pipe>>,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    loop {
-        {
-            let mut p = pipe.borrow_mut();
-            if !p.buf.is_empty() || buf.is_empty() {
-                let n = buf.len().min(p.buf.len());
-                let before = p.space();
-                for (d, s) in buf.iter_mut().zip(p.buf.drain(..n)) {
-                    *d = s;
-                }
-                if p.drained(before) {
-                    request_wake_object(crate::pipe::object(pipe));
-                }
-                return Ok(n);
-            }
-            if p.writers == 0 {
-                return Ok(0);
-            }
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_object(crate::pipe::object(pipe))?;
-    }
-}
-
-/// Waits for data in the pipe: returns false when all write ends are closed (EOF).
-fn pipe_wait_data(
-    cx: &mut Cx<'_>,
-    pipe: &Rc<RefCell<Pipe>>,
-    nonblock: bool,
-) -> Result<bool, Errno> {
-    loop {
-        {
-            let p = pipe.borrow();
-            if !p.buf.is_empty() {
-                return Ok(true);
-            }
-            if p.writers == 0 {
-                return Ok(false);
-            }
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_object(crate::pipe::object(pipe))?;
-    }
-}
-
-/// When the open file is a pipe, returns the pipe and whether it is the read end.
-fn pipe_of(file: &FileRef) -> Option<(Rc<RefCell<Pipe>>, bool)> {
-    match &file.borrow().kind {
-        FileKind::Pipe(end) => Some((end.pipe.clone(), end.read)),
-        _ => None,
-    }
-}
-
-const SPLICE_F_NONBLOCK: u32 = 2;
-
-/// splice: moves data between a pipe and another file (or two pipes). Copies through a host
-/// buffer, not zero-copy; data taken from a pipe is copied first and removed from the pipe only
-/// after the write succeeds, so a failed write loses no data.
-pub(super) fn splice(
-    cx: &mut Cx<'_>,
-    fd_in: i32,
-    off_in: u64,
-    fd_out: i32,
-    off_out: u64,
-    len: usize,
-    flags: u32,
-) -> SysResult {
-    let input = cx.fds().get(fd_in)?;
-    let output = cx.fds().get(fd_out)?;
-    if !input.borrow().readable() || !output.borrow().writable() {
-        return Err(Errno::EBADF);
-    }
-    let (in_pipe, out_pipe) = (pipe_of(&input), pipe_of(&output));
-    // Objects such as directories, eventfd and epoll do not support splice (Linux's splice_read,
-    // splice_write)
-    let splices = |f: &FileRef| {
-        matches!(
-            f.borrow().kind,
-            FileKind::Regular { .. }
-                | FileKind::Pipe(_)
-                | FileKind::Socket(_)
-                | FileKind::Device { kmsg: None, .. }
-                | FileKind::Pty(_)
-                | FileKind::Proc { .. }
-                | FileKind::Host(_)
-        )
-    };
-    if in_pipe.is_none() && out_pipe.is_none()
-        || output.borrow().flags & oflags::O_APPEND != 0
-        || !splices(&input)
-        || !splices(&output)
-    {
-        return Err(Errno::EINVAL);
-    }
-    if in_pipe.is_some() && off_in != 0 || out_pipe.is_some() && off_out != 0 {
-        return Err(Errno::ESPIPE);
-    }
-    let read_off = |cx: &Cx<'_>, addr: u64| -> Result<Option<u64>, Errno> {
-        match addr {
-            0 => Ok(None),
-            a => Ok(Some(
-                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
-            )),
-        }
-    };
-    let (src, dst) = (read_off(cx, off_in)?, read_off(cx, off_out)?);
-    if len == 0 {
-        return Ok(0);
-    }
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-    let wrote = if let Some((pipe, _)) = in_pipe {
-        if !pipe_wait_data(cx, &pipe, nonblock || input.borrow().nonblocking())? {
-            return Ok(0);
-        }
-        let data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
-        let n = write_bytes(cx, &output, &data, dst)?;
-        let mut p = pipe.borrow_mut();
-        let before = p.space();
-        p.buf.drain(..n);
-        if p.drained(before) {
-            request_wake_object(crate::pipe::object(&pipe));
-        }
-        n
-    } else {
-        let mut buf = vec![0u8; len.min(crate::pipe::PIPE_CAPACITY)];
-        // As on Linux, an unconnected socket cannot splice out data: EINVAL
-        let got = match read_bytes(cx, &input, &mut buf, src) {
-            Err(e) if e == Errno::ENOTCONN => return Err(Errno::EINVAL),
-            r => r?,
-        };
-        let n = write_bytes(cx, &output, &buf[..got], None)?;
-        // The unwritten part goes back to the input file
-        if src.is_none() && n < got {
-            input.borrow_mut().pos -= (got - n) as u64;
-        }
-        n
-    };
-    if let Some(s) = src {
-        put(cx, off_in, (s + wrote as u64).to_le_bytes())?;
-    }
-    if let Some(d) = dst {
-        put(cx, off_out, (d + wrote as u64).to_le_bytes())?;
-    }
-    Ok(wrote as u64)
-}
-
-/// tee: copies the data in one pipe to another without taking it from the source pipe.
-pub(super) fn tee(cx: &mut Cx<'_>, fd_in: i32, fd_out: i32, len: usize, flags: u32) -> SysResult {
-    let input = cx.fds().get(fd_in)?;
-    let output = cx.fds().get(fd_out)?;
-    if !input.borrow().readable() || !output.borrow().writable() {
-        return Err(Errno::EBADF);
-    }
-    let (Some((src, _)), Some((dst, _))) = (pipe_of(&input), pipe_of(&output)) else {
-        return Err(Errno::EINVAL);
-    };
-    if Rc::ptr_eq(&src, &dst) {
-        return Err(Errno::EINVAL);
-    }
-    if len == 0 {
-        return Ok(0);
-    }
-    if !pipe_wait_data(cx, &src, flags & SPLICE_F_NONBLOCK != 0)? {
-        return Ok(0);
-    }
-    let data: Vec<u8> = src.borrow().buf.iter().take(len).copied().collect();
-    write_bytes(cx, &output, &data, None).map(|n| n as u64)
-}
-
-/// vmsplice: on a pipe's read end it is like readv; on the write end it waits for space, then
-/// writes the part that fits and returns (as on Linux, without waiting for everything to be
-/// written).
-pub(super) fn vmsplice(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize, flags: u32) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let Some((pipe, read)) = pipe_of(&file) else {
-        return Err(Errno::EBADF);
-    };
-    if read {
-        return vectored(cx, fd, iov, count, None, false);
-    }
-    let iovecs = iovecs(cx, iov, count)?;
-    let nonblock = flags & SPLICE_F_NONBLOCK != 0 || file.borrow().nonblocking();
-    let space = loop {
-        {
-            let p = pipe.borrow();
-            if p.readers == 0 {
-                return Err(broken_pipe(cx));
-            }
-            if p.space() > 0 {
-                break p.space();
-            }
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        pipe.borrow_mut().want_space(1);
-        cx.wait_object(crate::pipe::object(&pipe))?;
-    };
-    let mut data = Vec::new();
-    for (base, len) in iovecs {
-        let n = len.min(space - data.len());
-        let start = data.len();
-        data.resize(start + n, 0);
-        cx.mm().read(UserSlice::new(base, n), &mut data[start..])?;
-        if data.len() == space {
-            break;
-        }
-    }
-    {
-        let mut p = pipe.borrow_mut();
-        p.buf.extend(&data);
-        p.writes += 1;
-    }
-    request_wake_object(crate::pipe::object(&pipe));
-    Ok(data.len() as u64)
-}
-
-/// The write end has no readers left: EPIPE, and SIGPIPE to the current thread.
-fn broken_pipe(cx: &mut Cx<'_>) -> Errno {
-    let task = cx.task.clone();
-    signal::send_to_task(cx.kr(), &task, Signal::PIPE, SigInfo::kernel());
-    Errno::EPIPE
-}
-
-fn pipe_write(
-    cx: &mut Cx<'_>,
-    pipe: &Rc<RefCell<Pipe>>,
-    nonblock: bool,
-    data: &[u8],
-) -> Result<usize, Errno> {
-    let mut done = 0;
-    loop {
-        let progress = {
-            let mut p = pipe.borrow_mut();
-            if p.readers == 0 {
-                drop(p);
-                let e = broken_pipe(cx);
-                return if done > 0 { Ok(done) } else { Err(e) };
-            }
-            let want = data.len() - done;
-            // Writes up to PIPE_BUF must complete at once and not interleave with other writes
-            let space = p.space();
-            if (data.len() <= PIPE_BUF && space >= want) || (data.len() > PIPE_BUF && space > 0) {
-                let n = want.min(space);
-                // Readers wait only while the pipe is empty, and poll reports it unreadable only
-                // while empty; when it is not empty only edge-triggered epoll needs to know that
-                // more data came
-                if p.buf.is_empty() {
-                    request_wake_object(crate::pipe::object(pipe));
-                } else {
-                    super::poll::arrived(cx);
-                }
-                p.buf.extend(&data[done..done + n]);
-                p.writes += 1;
-                done += n;
-                true
-            } else {
-                // Wait for the reader to make room: a small write needs room for all of it at
-                // once; a large write waits until at least a page fits, so it is not woken every
-                // time the reader reads a little
-                p.want_space(if data.len() <= PIPE_BUF {
-                    want
-                } else {
-                    want.min(PIPE_BUF)
-                });
-                false
-            }
-        };
-        if done == data.len() {
-            return Ok(done);
-        }
-        if progress {
-            continue;
-        }
-        if nonblock || cx.interrupted() {
-            let e = if nonblock {
-                Errno::EAGAIN
-            } else {
-                Errno::ERESTARTSYS
-            };
-            return if done > 0 { Ok(done) } else { Err(e) };
-        }
-        cx.wait_object(crate::pipe::object(pipe))?;
-    }
-}
-
-/// Read of `/dev/kmsg` (`devkmsg_read`): reads one record at a time
-/// ([`crate::klog::Klog::ext_text`]), waiting when there is no new record (EAGAIN when
-/// nonblocking). When the record to read has been pushed out it is EPIPE and the position jumps
-/// to the oldest record; a buffer too small for the record is EINVAL and the record counts as
-/// read, as on Linux.
-fn kmsg_read(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    loop {
-        let object = {
-            let mut f = file.borrow_mut();
-            let FileKind::Device {
-                kmsg: Some(user), ..
-            } = &mut f.kind
-            else {
-                return Err(Errno::EBADF);
-            };
-            let log = user.log.clone();
-            let l = log.borrow();
-            if let Some(r) = l.ext_text(user.seq) {
-                if r.seq != user.seq {
-                    user.seq = r.seq;
-                    return Err(Errno::EPIPE);
-                }
-                user.seq = r.seq + 1;
-                if r.text.len() > buf.len() {
-                    return Err(Errno::EINVAL);
-                }
-                buf[..r.text.len()].copy_from_slice(&r.text);
-                return Ok(r.text.len());
-            }
-            wake::of(&*log)
-        };
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_object(object)?;
-    }
-}
-
-/// Write of `/dev/kmsg` (`devkmsg_write`): one write is one record
-/// ([`crate::klog::KmsgFile::write`]), and more than `LOG_LINE_MAX` is EINVAL; without a prefix
-/// the level is the default message level of `/proc/sys/kernel/printk`.
-fn kmsg_write(cx: &mut Cx<'_>, file: &FileRef, data: &[u8]) -> Result<usize, Errno> {
-    if data.len() > crate::klog::LOG_LINE_MAX {
-        return Err(Errno::EINVAL);
-    }
-    let level = cx.kr().printk[1];
-    if let FileKind::Device {
-        kmsg: Some(user), ..
-    } = &mut file.borrow_mut().kind
-    {
-        user.write(data, level);
-    }
-    Ok(data.len())
-}
-
-/// Read of `/proc/kmsg` (`kmsg_read`): syslog's read, sharing the read position with syslog(2);
-/// what is read is gone. Nonblocking with no unread record is EAGAIN.
-fn proc_kmsg_read(
-    cx: &mut Cx<'_>,
-    log: &Rc<RefCell<crate::klog::Klog>>,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    if nonblock && log.borrow_mut().size_unread(true) == 0 {
-        return Err(Errno::EAGAIN);
-    }
-    if buf.is_empty() {
-        return Ok(0);
-    }
-    while !log.borrow().syslog_readable() {
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_object(wake::of(&**log))?;
-    }
-    let text = log.borrow_mut().syslog_read(buf.len());
-    buf[..text.len()].copy_from_slice(&text);
-    Ok(text.len())
-}
-
-/// The host fd of a regular file: the BKL can be released while reading or writing it
-/// ([`unlocked_io`]).
-fn regular_fd(f: &OpenFile) -> Option<i32> {
-    match &f.kind {
-        FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
-        _ => None,
-    }
-}
-
-/// Reads or writes a regular file without the BKL: a host pread/pwrite of cold data waits on
-/// flash (hundreds of microseconds to milliseconds), and while the lock is held every process's
-/// syscalls would have to wait too. With `offset` None the file position is used, and an open
-/// file has only one such read or write at a time (Linux's f_pos_lock); others wait for it to
-/// finish. `io` is called with the host fd and position while the BKL is released, and must not
-/// touch any kernel object; the open file is kept alive by the caller's `file`, whose reference
-/// count and borrows are not touched while the BKL is released.
-fn unlocked_io(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    fd: i32,
-    offset: Option<u64>,
-    io: impl FnOnce(i32, u64) -> Result<usize, i32> + Send,
-) -> Result<usize, Errno> {
-    let pos = match offset {
-        Some(off) => off,
-        None => {
-            while file.borrow().pos_busy != 0 {
-                if cx.task.killed.get() {
-                    return Err(Errno::EINTR);
-                }
-                file.borrow_mut().pos_busy = 2;
-                cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
-            }
-            let mut f = file.borrow_mut();
-            f.pos_busy = 1;
-            f.pos
-        }
-    };
-    let r = cx.unlocked(|| io(fd, pos));
-    if offset.is_none() {
-        let mut f = file.borrow_mut();
-        if let Ok(n) = r {
-            f.pos = pos + n as u64;
-        }
-        if std::mem::take(&mut f.pos_busy) == 2 {
-            request_wake_locks();
-        }
-    }
-    r.map_err(Errno)
-}
-
-/// As with Linux's seq_file (`seq_read_iter` starts over at offset 0), reading a procfs, sysfs or
-/// cgroup2 file from offset 0 regenerates the content: programs that keep it open and seek back
-/// to 0 to read again (procps; runc writes `cgroup.freeze` and reads it back to confirm) read the
-/// current content. Content just generated at open and not yet read or written is not
-/// regenerated.
-fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<(), Errno> {
-    let (mnt, node) = {
-        let mut f = file.borrow_mut();
-        let pos = offset.unwrap_or(f.pos);
-        match &mut f.kind {
-            FileKind::Proc {
-                mnt,
-                node,
-                fresh,
-                ns: None,
-                klog: None,
-                ..
-            } if pos == 0 && !pseudo::unreadable(node) => {
-                if std::mem::take(fresh) {
-                    return Ok(());
-                }
-                (*mnt, node.clone())
-            }
-            _ => return Ok(()),
-        }
-    };
-    let vfs = cx.vfs()?;
-    let content = pseudo::content(&cx.view(&vfs), mnt, &node)?;
-    if let FileKind::Proc { data, .. } = &mut file.borrow_mut().kind {
-        *data = content;
+/// The length after truncation or reserving space must not exceed `RLIMIT_FSIZE`.
+fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
+    if len > cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0 {
+        return Err(file_too_big(cx));
     }
     Ok(())
 }
 
-fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<usize, Errno> {
-    let pos = offset.unwrap_or(f.pos);
-    let n = match &f.kind {
-        FileKind::Regular { file, .. } => file.read_at(buf, pos).map_err(host_errno)?,
-        FileKind::Device { dev, .. } => match dev {
-            Device::Null => 0,
-            Device::Zero | Device::Full => {
-                buf.fill(0);
-                buf.len()
-            }
-            Device::Random => {
-                appine_hal::fill_random(buf).map_err(Errno)?;
-                buf.len()
-            }
-            Device::Kmsg => return Err(Errno::EBADF),
-        },
-        // Namespaces (nsfs) cannot be read
-        FileKind::Proc {
-            node: PseudoNode::NsFile(..),
-            ..
-        } => return Err(Errno::EINVAL),
-        FileKind::Proc { node, .. } if pseudo::unreadable(node) => return Err(Errno::EINVAL),
-        FileKind::Proc { data, .. } => {
-            let start = (pos as usize).min(data.len());
-            let n = buf.len().min(data.len() - start);
-            buf[..n].copy_from_slice(&data[start..start + n]);
-            n
-        }
-        // A message queue reads as its status line
-        FileKind::MessageQueue(q) => {
-            let data = q.borrow().status();
-            let start = (pos as usize).min(data.len());
-            let n = buf.len().min(data.len() - start);
-            buf[..n].copy_from_slice(&data[start..start + n]);
-            n
-        }
-        FileKind::Directory { .. } => return Err(Errno::EISDIR),
-        FileKind::Epoll(_) | FileKind::Pidfd(_) | FileKind::SeccompNotify(_) | FileKind::Bpf(_) => {
-            return Err(Errno::EINVAL);
-        }
-        _ => return Err(Errno::EBADF),
-    };
-    let positioned = matches!(
-        f.kind,
-        FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
-    );
-    if offset.is_none() && positioned {
-        f.pos = pos + n as u64;
-    }
-    Ok(n)
+/// Over `RLIMIT_FSIZE`: sends SIGXFSZ and returns EFBIG.
+fn file_too_big(cx: &Cx<'_>) -> Errno {
+    signal::send_to_task(cx.kr(), cx.task, Signal::XFSZ, SigInfo::kernel());
+    Errno::EFBIG
 }
 
-fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usize, Errno> {
-    match &f.kind {
-        FileKind::Regular { file, .. } => {
-            let pos = match offset {
-                Some(off) => off,
-                None if f.flags & oflags::O_APPEND != 0 => {
-                    file.metadata().map_err(host_errno)?.len()
-                }
-                None => f.pos,
-            };
-            let n = file.write_at(data, pos).map_err(host_errno)?;
-            if offset.is_none() {
-                f.pos = pos + n as u64;
-            }
-            Ok(n)
-        }
-        FileKind::Device { dev, .. } => match dev {
-            Device::Full => Err(Errno::ENOSPC),
-            _ => Ok(data.len()),
-        },
-        // Writable procfs files: the content was already handled by pseudo::write
-        FileKind::Proc { .. } => Ok(data.len()),
-        // Anonymous inodes without a write operation
-        FileKind::Epoll(_)
-        | FileKind::Pidfd(_)
-        | FileKind::MessageQueue(_)
-        | FileKind::SeccompNotify(_)
-        | FileKind::Bpf(_) => Err(Errno::EINVAL),
-        _ => Err(Errno::EBADF),
-    }
+// ---- Paths ----
+
+/// Resolves the path argument of the `*at` family.
+pub(super) fn lookup_at(cx: &Cx<'_>, dirfd: i32, path: &[u8], follow: bool) -> Result<Node, Errno> {
+    resolve_at(cx, &cx.cred(), dirfd, path, follow)
 }
 
-/// Does one read from an open file into a host buffer. With `offset` None the file position is
-/// used and advanced.
-fn read_bytes(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    buf: &mut [u8],
-    offset: Option<u64>,
-) -> Result<usize, Errno> {
-    let (path, nonblock) = {
-        let f = file.borrow();
-        let path = positional(&f, offset)?;
-        if !f.readable() {
-            return Err(Errno::EBADF);
-        }
-        (path, f.nonblocking())
-    };
-    match path {
-        IoPath::Host(fd) => {
-            wait_host(cx, fd, POLLIN, nonblock)?;
-            cx.unlocked(|| appine_hal::read(fd, buf)).map_err(Errno)
-        }
-        IoPath::Pipe(pipe) => pipe_read(cx, &pipe, nonblock, buf),
-        IoPath::Pty(t, side) => tty::read(cx, &t, side, nonblock, buf),
-        IoPath::Socket(s) => {
-            let m = super::net::recv(cx, &s, nonblock, buf.len(), 0, 0)?;
-            buf[..m.data.len()].copy_from_slice(&m.data);
-            Ok(m.data.len())
-        }
-        IoPath::EventFd(e) => super::poll::eventfd_read(cx, &e, nonblock, buf),
-        IoPath::TimerFd(t) => super::timerfd::read(cx, &t, nonblock, buf),
-        IoPath::SignalFd(s) => super::sig::signalfd_read(cx, &s, nonblock, buf),
-        IoPath::Inotify(i) => super::inotify::read(cx, &i, nonblock, buf),
-        IoPath::Pagemap(pid) => {
-            let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_pagemap(cx.kr(), pid, buf, pos)?;
-            if offset.is_none() {
-                file.borrow_mut().pos = pos + n as u64;
-            }
-            Ok(n)
-        }
-        IoPath::Kmsg => kmsg_read(cx, file, nonblock, buf),
-        IoPath::ProcKmsg(log) => proc_kmsg_read(cx, &log, nonblock, buf),
-        IoPath::Mem(mm) => {
-            let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_mem(mm, buf, pos)?;
-            if offset.is_none() {
-                file.borrow_mut().pos = pos.wrapping_add(n as u64);
-            }
-            Ok(n)
-        }
-        IoPath::Local => {
-            let regular = regular_fd(&file.borrow());
-            let n = match regular {
-                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
-                    appine_hal::pread(fd, buf, pos)
-                })?,
-                None => {
-                    refresh_pseudo(cx, file, offset)?;
-                    local_read(&mut file.borrow_mut(), buf, offset)?
-                }
-            };
-            if n > 0 {
-                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ACCESS);
-            }
-            Ok(n)
-        }
-    }
-}
-
-/// Does one write to an open file. With `offset` None the file position is used and advanced,
-/// and with `O_APPEND` it first moves to the end of the file.
-fn write_bytes(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    data: &[u8],
-    offset: Option<u64>,
-) -> Result<usize, Errno> {
-    let (path, nonblock) = {
-        let f = file.borrow();
-        let path = positional(&f, offset)?;
-        if !f.writable() {
-            return Err(Errno::EBADF);
-        }
-        (path, f.nonblocking())
-    };
-    match path {
-        IoPath::Host(fd) => match cx.unlocked(|| appine_hal::write(fd, data)) {
-            Ok(n) => Ok(n),
-            Err(e) if e == Errno::EPIPE.0 => Err(broken_pipe(cx)),
-            Err(e) => Err(Errno(e)),
-        },
-        IoPath::Pipe(pipe) => pipe_write(cx, &pipe, nonblock, data),
-        IoPath::Pty(t, side) => tty::write(cx, &t, side, nonblock, data),
-        IoPath::Socket(s) => super::net::send(cx, &s, nonblock, data, &[], &[], 0),
-        IoPath::EventFd(e) => super::poll::eventfd_write(cx, &e, nonblock, data),
-        IoPath::TimerFd(_) | IoPath::SignalFd(_) | IoPath::Inotify(_) | IoPath::Pagemap(_) => {
-            Err(Errno::EINVAL)
-        }
-        IoPath::Kmsg => kmsg_write(cx, file, data),
-        // Opened read-only (no proc_write)
-        IoPath::ProcKmsg(_) => Err(Errno::EBADF),
-        IoPath::Mem(mm) => {
-            let pos = offset.unwrap_or(file.borrow().pos);
-            let sync = cx.task.sync.clone();
-            let n = pseudo::write_mem(mm, data, pos, &sync)?;
-            if offset.is_none() {
-                file.borrow_mut().pos = pos.wrapping_add(n as u64);
-            }
-            Ok(n)
-        }
-        IoPath::Local => {
-            let data = &data[..fsize_allowed(cx, &file.borrow(), offset, data.len())?];
-            let (n, tmpfs) = tmpfs_write_room(cx, &file.borrow(), offset, data.len())?;
-            let data = &data[..n];
-            check_seals(cx, &file.borrow(), true, |size| {
-                let f = file.borrow();
-                let pos = match offset {
-                    Some(off) => off,
-                    None if f.flags & oflags::O_APPEND != 0 => size,
-                    None => f.pos,
-                };
-                size.max(pos + data.len() as u64)
-            })?;
-            let proc_node = match &file.borrow().kind {
-                FileKind::Proc { node, .. } => Some(node.clone()),
-                _ => None,
-            };
-            let mut written = data.len();
-            if let Some(node) = proc_node {
-                let cred = cx.cred();
-                let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
-                let tid = cx.tid();
-                pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
-                written = pseudo::written(&node, data.len());
-                if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
-                    *fresh = false;
-                }
-                // The cgroup memory limit changed: wake the timer thread to measure once right
-                // away
-                if let PseudoNode::Cgroup(_, b"memory.max") = node {
-                    cx.k().oom.recheck();
-                    crate::kernel::signal_later(&cx.shared.timers);
-                }
-            }
-            let ino = match file.borrow().kind {
-                FileKind::Regular { ino, .. } => Some(ino),
-                _ => None,
-            };
-            if let Some(ino) = ino.filter(|_| !data.is_empty()) {
-                remove_privs(cx, ino)?;
-            }
-            // Regular files are written without the BKL; O_APPEND ones are still written with
-            // the lock held (including writes with an offset, [`append_offset`]), so several
-            // processes appending at once do not overwrite each other
-            let regular =
-                regular_fd(&file.borrow()).filter(|_| file.borrow().flags & oflags::O_APPEND == 0);
-            let n = match regular {
-                Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
-                    appine_hal::pwrite(fd, data, pos)
-                })?,
-                None => local_write(&mut file.borrow_mut(), data, offset)?.min(written),
-            };
-            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind)
-                && let Ok(meta) = host.metadata()
-            {
-                tmpfs_resized(&*cx.vfs()?, Some(t), meta.len());
-            }
-            if n > 0 {
-                inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
-            }
-            Ok(n)
-        }
-    }
-}
-
-/// Removes the privileges of regular file `ino` before writing or truncating it
-/// ([`Store::remove_privs`]): the setuid and setgid bits are removed when the caller lacks
-/// `CAP_FSETID`, and file capabilities are always removed.
-fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
-    let keep_setid = cx.t.group.borrow().cred.capable(cap::FSETID);
-    cx.vfs()?.store().remove_privs(ino, keep_setid)
-}
-
-/// `RLIMIT_FSIZE`: a write to a regular file past the limit writes only up to the limit; when
-/// not a single byte can be written, sends SIGXFSZ to the current thread and returns EFBIG.
-/// Returns the number of bytes allowed.
-fn fsize_allowed(
+/// The common part of "an empty path acts on dirfd itself" (`AT_EMPTY_PATH`) in the `*at`
+/// family.
+fn lookup_at_or_fd(
     cx: &Cx<'_>,
-    f: &OpenFile,
-    offset: Option<u64>,
-    len: usize,
-) -> Result<usize, Errno> {
-    let FileKind::Regular { file, .. } = &f.kind else {
-        return Ok(len);
-    };
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
-    if limit == u64::MAX || len == 0 {
-        return Ok(len);
+    cred: &Cred,
+    dirfd: i32,
+    path: &[u8],
+    flags: u32,
+    follow: bool,
+) -> Result<Node, Errno> {
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd == AT_FDCWD {
+            return Ok(cx.cwd());
+        }
+        return cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF);
     }
-    let pos = match offset {
-        Some(off) => off,
-        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
-        None => f.pos,
-    };
-    if pos >= limit {
-        return Err(file_too_big(cx));
+    resolve_at(cx, cred, dirfd, path, follow)
+}
+
+/// Resolves the path argument of the `*at` family with credentials `cred`.
+fn resolve_at(
+    cx: &Cx<'_>,
+    cred: &Cred,
+    dirfd: i32,
+    path: &[u8],
+    follow: bool,
+) -> Result<Node, Errno> {
+    let start = start_dir(cx, dirfd, path)?;
+    let vfs = cx.vfs()?;
+    vfs.resolve(&cx.view(&vfs), cred, &cx.root(), &start, path, follow)
+}
+
+/// Resolves a path to create or delete: returns the mount the parent directory was reached
+/// through, the parent directory and the last component. Only directories in the store can be
+/// modified; whether the mount is read-only is checked by the caller in Linux's order.
+pub(super) fn parent_at<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Result<(MountId, Ino, &'p [u8]), Errno> {
+    let start = start_dir(cx, dirfd, path)?;
+    let vfs = cx.vfs()?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
+    let (mnt, dir) = store_dir(&vfs, &dir)?;
+    Ok((mnt, dir, name))
+}
+
+/// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
+/// filesystem an existing name is EEXIST, ahead of the error that the directory cannot be
+/// modified (Linux's `filename_create`: `mkdir -p /sys/fs/cgroup/x` relies on `mkdir /sys/fs`
+/// being EEXIST).
+pub(super) fn create_parent_at<'p>(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &'p [u8],
+) -> Result<(MountId, Ino, &'p [u8]), Errno> {
+    let start = start_dir(cx, dirfd, path)?;
+    let vfs = cx.vfs()?;
+    let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
+    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
+        return Err(Errno::EEXIST);
     }
-    Ok(len.min((limit - pos) as usize))
+    let (mnt, dir) = store_dir(&vfs, &dir)?;
+    Ok((mnt, dir, name))
+}
+
+/// Start directory of the `*at` family. An empty path is ENOENT at once (dirfd is not looked
+/// at), as on Linux.
+pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Errno> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if path.first() == Some(&b'/') {
+        return Ok(cx.root());
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(cx.cwd());
+    }
+    let file = cx.fds().get(dirfd)?;
+    let node = file.borrow().node().ok_or(Errno::ENOTDIR)?;
+    let vfs = cx.vfs()?;
+    if !vfs.is_dir(&cx.view(&vfs), &node)? {
+        return Err(Errno::ENOTDIR);
+    }
+    Ok(node)
+}
+
+/// The directory to create or delete in: one in the store. Those in synthetic filesystems cannot
+/// be modified, and are EROFS in a read-only mount. In the root directory of the mqueue filesystem
+/// only queues can be created and deleted (openat and unlinkat handle them separately); everything
+/// else (mkdir, mknod, symlink, link, rename) is EPERM as on Linux: its directory has no such
+/// operations. cgroup2 directories are EPERM too (mkdirat and unlinkat handle child cgroups
+/// before this).
+fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
+    match dir {
+        Node::Store(mnt, ino) => Ok((*mnt, *ino)),
+        Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
+        Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) => Err(Errno::EPERM),
+        Node::Pseudo(..) => Err(Errno::EACCES),
+    }
+}
+
+/// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted
+/// one is ENOENT.
+fn mq_queue(cx: &Cx<'_>, ns: u64, ino: u64) -> Result<Rc<RefCell<super::MessageQueue>>, Errno> {
+    super::mqueue::find(cx.kr().ipc(ns), ino)
+        .map(|(_, q)| q.clone())
+        .ok_or(Errno::ENOENT)
+}
+
+/// Checks before creating `name` in directory `dir` (`may_create`): [`may_create_name`], then the
+/// directory must be writable. Returns the directory's metadata.
+pub(super) fn may_create(
+    vfs: &Vfs,
+    cred: &Cred,
+    dir: (MountId, Ino),
+    name: &[u8],
+) -> Result<Stat, Errno> {
+    let st = may_create_name(vfs, cred, dir, name)?;
+    cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
+    Ok(st)
+}
+
+/// Checks on the name and the mount before creating `name` in directory `dir` (Linux's
+/// `filename_create`): the directory must be searchable and the name must not exist, and only
+/// then comes the read-only mount (EROFS). Returns the directory's metadata.
+fn may_create_name(
+    vfs: &Vfs,
+    cred: &Cred,
+    (mnt, dir): (MountId, Ino),
+    name: &[u8],
+) -> Result<Stat, Errno> {
+    let store = vfs.store();
+    let st = store.stat(dir)?;
+    cred.permission(&st, MAY_EXEC)?;
+    if store.lookup(dir, name)?.is_some() {
+        return Err(Errno::EEXIST);
+    }
+    if vfs.readonly(&Node::Store(mnt, dir)) {
+        return Err(Errno::EROFS);
+    }
+    Ok(st)
+}
+
+/// Before deleting or renaming: EROFS in a read-only mount (Linux's `mnt_want_write`, before the
+/// name is looked up).
+fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
+    if vfs.readonly(&Node::Store(mnt, dir)) {
+        return Err(Errno::EROFS);
+    }
+    Ok(())
+}
+
+/// What is being created is not a directory but its name ends in `/`: EEXIST when it exists,
+/// otherwise ENOENT (as in Linux's `filename_create`).
+fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> Result<(), Errno> {
+    if !path.ends_with(b"/") {
+        return Ok(());
+    }
+    Err(match store.lookup(dir, name)? {
+        Some(_) => Errno::EEXIST,
+        None => Errno::ENOENT,
+    })
+}
+
+/// Checks before deleting `name` in directory `dir` or moving it away (`may_delete`); returns its
+/// metadata.
+fn may_delete(store: &Store, cred: &Cred, dir: Ino, name: &[u8]) -> Result<Stat, Errno> {
+    let dir_st = store.stat(dir)?;
+    cred.permission(&dir_st, MAY_EXEC)?;
+    let victim = store.stat(store.lookup(dir, name)?.ok_or(Errno::ENOENT)?)?;
+    cred.may_delete(&dir_st, &victim)?;
+    Ok(victim)
+}
+
+/// The store inode of the open file that fchmod, fchown and the like act on: not for files
+/// opened with `O_PATH`, and EROFS in a read-only mount (Linux's `mnt_want_write_file`).
+fn file_ino(cx: &Cx<'_>, fd: i32) -> Result<Ino, Errno> {
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    if f.flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    let node = f.node().ok_or(Errno::EBADF)?;
+    let ino = node.ino().ok_or(Errno::EBADF)?;
+    if cx.vfs()?.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    Ok(ino)
+}
+
+/// The store inode to modify: EROFS in a read-only mount; nodes in synthetic filesystems cannot
+/// be modified (EACCES).
+fn store_ino(cx: &Cx<'_>, node: &Node) -> Result<Ino, Errno> {
+    if cx.vfs()?.readonly(node) {
+        return Err(Errno::EROFS);
+    }
+    node.ino().ok_or(Errno::EACCES)
+}
+
+/// The absolute path recorded at open (`/proc/<pid>/fd/<n>`, maps): as with Linux's `d_path`,
+/// symlinks are fully resolved, and it is computed from the directory and name `found` where the
+/// file was last found. valgrind reopens Debian's `/lib/ld-linux-aarch64.so.1` (whose last
+/// component is a link) by its name in `/proc/self/fd`, with `O_NOFOLLOW`. A file reached through
+/// a link like `/proc/<pid>/fd/<n>`, whose name is unknown, gets the lexically normalized path.
+fn display_path(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    start: &Node,
+    path: &[u8],
+    node: &Node,
+    found: Option<&Dentry>,
+) -> Option<Rc<[u8]>> {
+    if let Ok(p) = vfs.found_path(&cx.view(vfs), &cx.root(), node, found) {
+        return Some(Rc::from(p));
+    }
+    let full = if path.first() == Some(&b'/') {
+        path.to_vec()
+    } else {
+        let mut p = vfs.path_of(&cx.view(vfs), &cx.root(), start).ok()?;
+        p.push(b'/');
+        p.extend_from_slice(path);
+        p
+    };
+    Some(Rc::from(normalize(&full)))
+}
+
+// ---- tmpfs accounting ----
+
+/// Before creating a name (a new inode, or a hard link) in directory `dir` (the mount reached
+/// through and the inode): in tmpfs, checks whether it fits, ENOSPC when it does not (Linux's
+/// `shmem_reserve_inode`; `pages` is the page a long symlink needs). Returns the instance's
+/// device number, handed to [`tmpfs_created`] once created.
+pub(super) fn tmpfs_reserve(
+    vfs: &Vfs,
+    (mnt, dir): (MountId, Ino),
+    pages: u64,
+) -> Result<Option<u64>, Errno> {
+    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
+        return Ok(None);
+    };
+    vfs.tmpfs_check(dev, pages, 1)?;
+    Ok(Some(dev))
+}
+
+/// A name [`tmpfs_reserve`] found room for has been created: accounts it.
+pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
+    if let Some(dev) = dev {
+        vfs.tmpfs_charge(dev, pages as i64, 1);
+    }
 }
 
 /// Writing a regular file in tmpfs: writes until the instance is full (Linux's
@@ -5003,29 +5496,6 @@ fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, size: u64) {
     }
 }
 
-/// Before creating a name (a new inode, or a hard link) in directory `dir` (the mount reached
-/// through and the inode): in tmpfs, checks whether it fits, ENOSPC when it does not (Linux's
-/// `shmem_reserve_inode`; `pages` is the page a long symlink needs). Returns the instance's
-/// device number, handed to [`tmpfs_created`] once created.
-pub(super) fn tmpfs_reserve(
-    vfs: &Vfs,
-    (mnt, dir): (MountId, Ino),
-    pages: u64,
-) -> Result<Option<u64>, Errno> {
-    let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, dir)) else {
-        return Ok(None);
-    };
-    vfs.tmpfs_check(dev, pages, 1)?;
-    Ok(Some(dev))
-}
-
-/// A name [`tmpfs_reserve`] found room for has been created: accounts it.
-pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
-    if let Some(dev) = dev {
-        vfs.tmpfs_charge(dev, pages as i64, 1);
-    }
-}
-
 /// Before deleting `name` in directory `dir` (unlink, rmdir, overwritten by rename): in tmpfs,
 /// records what it takes: one inode for the name, plus its pages when the last link is deleted
 /// (Linux frees them only at the last close; here they are freed at deletion). Handed to
@@ -5057,553 +5527,93 @@ fn tmpfs_removed(vfs: &Vfs, victim: Option<(u64, u64)>) {
     }
 }
 
-/// Over `RLIMIT_FSIZE`: sends SIGXFSZ and returns EFBIG.
-fn file_too_big(cx: &Cx<'_>) -> Errno {
-    signal::send_to_task(cx.kr(), cx.task, Signal::XFSZ, SigInfo::kernel());
-    Errno::EFBIG
+// ---- Shared helpers ----
+
+/// The program file process `pid` is executing (`/proc/<pid>/exe`).
+pub(super) fn exe_file(cx: &Cx<'_>, pid: i32) -> Result<Rc<crate::process::ExeFile>, Errno> {
+    let group = pseudo::group_of(cx.kr(), pid)
+        .cloned()
+        .ok_or(Errno::ENOENT)?;
+    group.borrow().exe.clone().ok_or(Errno::ENOENT)
 }
 
-/// The length after truncation or reserving space must not exceed `RLIMIT_FSIZE`.
-fn check_fsize(cx: &Cx<'_>, len: u64) -> Result<(), Errno> {
-    if len > cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0 {
-        return Err(file_too_big(cx));
+/// Whether some process is executing the program `ino` in the store (opening it for write is
+/// ETXTBSY).
+pub(super) fn executing(cx: &Cx<'_>, ino: Ino) -> bool {
+    cx.kr()
+        .tasks
+        .values()
+        .any(|t| t.res.borrow().mm.borrow().exe == Some(ino))
+}
+
+/// Whether `ino` is open for write (executing it is ETXTBSY).
+/// fds from memfd_create do not count ([`OpenFile::pseudo`]).
+pub(super) fn open_for_write(cx: &Cx<'_>, ino: Ino) -> bool {
+    cx.kr().open_files().iter().any(|f| {
+        let f = f.borrow();
+        f.writable() && !f.pseudo && matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino)
+    })
+}
+
+/// Writes (write, pwrite) and length changes (ftruncate) forbidden by seals return EPERM.
+/// `grow_to` is the length after the write or truncation.
+fn check_seals(
+    cx: &Cx<'_>,
+    f: &OpenFile,
+    write: bool,
+    grow_to: impl FnOnce(u64) -> u64,
+) -> Result<(), Errno> {
+    let FileKind::Regular { ino, file } = &f.kind else {
+        return Ok(());
+    };
+    let Some(&seals) = cx.kr().seals.get(ino) else {
+        return Ok(());
+    };
+    if write && seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        return Err(Errno::EPERM);
+    }
+    let size = file.metadata().map_err(host_errno)?.len();
+    let new = grow_to(size);
+    if (new > size && seals & F_SEAL_GROW != 0) || (new < size && seals & F_SEAL_SHRINK != 0) {
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
 
-/// Reads from an open file into a guest buffer (read, pread, readv).
-pub(super) fn read_file(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    buf: u64,
-    len: usize,
-    offset: Option<u64>,
-) -> SysResult {
-    // Each read of a terminal or pipe returns only data already ready and must not block again
-    // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
-    // (`dd bs=256M` reads whole blocks)
-    let fill = matches!(
-        file.borrow().kind,
-        FileKind::Regular { .. }
-            | FileKind::Proc { klog: None, .. }
-            | FileKind::Device {
-                dev: Device::Zero | Device::Full | Device::Random,
-                ..
-            }
-    );
-    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(IO_CHUNK);
-        let k = match read_bytes(cx, file, &mut chunk[..n], offset.map(|o| o + done as u64)) {
-            Ok(k) => k,
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
+/// Removes the privileges of regular file `ino` before writing or truncating it
+/// ([`Store::remove_privs`]): the setuid and setgid bits are removed when the caller lacks
+/// `CAP_FSETID`, and file capabilities are always removed.
+fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
+    let keep_setid = cx.t.group.borrow().cred.capable(cap::FSETID);
+    cx.vfs()?.store().remove_privs(ino, keep_setid)
+}
+
+/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
+/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
+/// address space syncs at the end of the syscall; other processes' sync here.
+fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = host.metadata() else {
+        return;
+    };
+    let sync = cx.task.sync.clone();
+    let mut seen = Vec::new();
+    for t in cx.kr().tasks.values() {
+        let mm = t.res.borrow().mm.clone();
+        if seen.contains(&Rc::as_ptr(&mm)) {
+            continue;
+        }
+        seen.push(Rc::as_ptr(&mm));
+        let Ok(mut m) = mm.try_borrow_mut() else {
+            crate::debug::log(format_args!("truncate: an address space is busy"));
+            continue;
         };
-        if k > 0 {
-            file.borrow_mut().reads += 1;
-            // Signal-driven I/O is checked by the timer thread (check_fasync): just wake it
-            if file.borrow().flags & oflags::O_ASYNC != 0 {
-                crate::kernel::signal_later(&cx.shared.timers);
-            }
-        }
-        if let Err(e) = cx.mm().write(
-            UserSlice::new(buf.wrapping_add(done as u64), k),
-            &chunk[..k],
-        ) {
-            // The data has already been consumed: as on Linux, return the partial length when
-            // part of it was copied
-            if done == 0 {
-                return Err(e);
-            }
-            break;
-        }
-        done += k;
-        if k < n || !fill {
-            break;
-        }
-    }
-    Ok(done as u64)
-}
-
-/// Writes a guest buffer into an open file (write, pwrite, writev).
-pub(super) fn write_file(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    buf: u64,
-    len: usize,
-    offset: Option<u64>,
-) -> SysResult {
-    // ESPIPE and EBADF are reported before an unreadable buffer
-    positional(&file.borrow(), offset)?;
-    if !file.borrow().writable() {
-        return Err(Errno::EBADF);
-    }
-    // write(2) does not skip zero-length writes: /dev/kmsg therefore logs an empty record
-    if len == 0 && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
-        return kmsg_write(cx, file, &[]).map(|n| n as u64);
-    }
-    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(IO_CHUNK);
-        let copied = cx.mm().read(
-            UserSlice::new(buf.wrapping_add(done as u64), n),
-            &mut chunk[..n],
-        );
-        let step = copied
-            .and_then(|()| write_bytes(cx, file, &chunk[..n], offset.map(|o| o + done as u64)));
-        match step {
-            Ok(k) => {
-                done += k;
-                if k < n {
-                    break;
-                }
-            }
-            // When part was already written, return the bytes written, as Linux does
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
-        }
-    }
-    if done > 0 {
-        write_sync(cx, file, 0)?;
-    }
-    Ok(done as u64)
-}
-
-/// Regular files opened with `O_DSYNC` or `O_SYNC`, or pwritev2 with `RWF_DSYNC` or `RWF_SYNC`
-/// (`rwf`): after the write, wait for it to reach disk as fdatasync and fsync do (Linux's
-/// generic_write_sync). Data, length and times are all in the host object, so the host flushes
-/// them, waited for with the BKL released; names are not among them, and on Linux the directory
-/// also needs a separate fsync.
-fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
-    use oflags::{O_DSYNC, O_SYNC_BIT};
-    const RWF_DSYNC: u32 = 2;
-    const RWF_SYNC: u32 = 4;
-    let (fd, data_only) = {
-        let f = file.borrow();
-        let FileKind::Regular { file: host, .. } = &f.kind else {
-            return Ok(());
-        };
-        if f.flags & O_DSYNC == 0 && rwf & (RWF_DSYNC | RWF_SYNC) == 0 {
-            return Ok(());
-        }
-        let full = f.flags & O_SYNC_BIT != 0 || rwf & RWF_SYNC != 0;
-        (std::os::fd::AsRawFd::as_raw_fd(host), !full)
-    };
-    // The open file is kept alive by file and not touched while the BKL is released
-    cx.unlocked(|| appine_hal::fsync(fd, data_only))
-        .map_err(Errno)
-}
-
-pub(super) fn sendfile(
-    cx: &mut Cx<'_>,
-    out_fd: i32,
-    in_fd: i32,
-    offset: u64,
-    count: usize,
-) -> SysResult {
-    let input = cx.fds().get(in_fd)?;
-    let output = cx.fds().get(out_fd)?;
-    if !input.borrow().readable() || !output.borrow().writable() {
-        return Err(Errno::EBADF);
-    }
-    if !matches!(
-        input.borrow().kind,
-        FileKind::Regular { .. } | FileKind::Device { .. }
-    ) {
-        return Err(Errno::EINVAL);
-    }
-    let mut off = match offset {
-        0 => None,
-        addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),
-    };
-    if let Some(r) = copy_regular(cx, &input, off, &output, None, count) {
-        let n = r?;
-        if let Some(o) = off {
-            put(cx, offset, (o + n as u64).to_le_bytes())?;
-        }
-        return Ok(n as u64);
-    }
-    let mut chunk = vec![0u8; count.min(IO_CHUNK)];
-    let mut done = 0;
-    while done < count {
-        let n = (count - done).min(IO_CHUNK);
-        let got = match read_bytes(cx, &input, &mut chunk[..n], off) {
-            Ok(0) => break,
-            Ok(k) => k,
-            Err(_) if done > 0 => break,
-            Err(e) => return Err(e),
-        };
-        let wrote = match write_bytes(cx, &output, &chunk[..got], None) {
-            Ok(k) => k,
-            Err(_) if done > 0 => 0,
-            Err(e) => {
-                if off.is_none() {
-                    input.borrow_mut().pos -= got as u64;
-                }
-                return Err(e);
-            }
-        };
-        // The part not written out goes back to the input
-        match &mut off {
-            Some(o) => *o += wrote as u64,
-            None => input.borrow_mut().pos -= (got - wrote) as u64,
-        }
-        done += wrote;
-        if wrote < got || got < n {
-            break;
-        }
-    }
-    if let Some(o) = off {
-        put(cx, offset, o.to_le_bytes())?;
-    }
-    Ok(done as u64)
-}
-
-/// When sendfile and copy_file_range copy between two regular files, the copy is left to the
-/// host kernel ([`appine_hal::copy_file`]): the data does not pass through the kernel layer, and
-/// it takes only one host call, without the BKL. With `src`/`dst` None the file positions are
-/// used and advanced; the output fd's host position is also used, so the output's position is
-/// always taken as [`unlocked_io`] does, and while waiting neither is taken, so copies in the
-/// two directions do not wait for each other. When it does not apply (not two different regular
-/// files, appending writes, seals, unsupported by the host) returns None, and the caller reads
-/// and writes block by block.
-fn copy_regular(
-    cx: &mut Cx<'_>,
-    input: &FileRef,
-    src: Option<u64>,
-    output: &FileRef,
-    dst: Option<u64>,
-    len: usize,
-) -> Option<Result<usize, Errno>> {
-    let (fd_in, fd_out, ino) = {
-        let (i, o) = (input.borrow(), output.borrow());
-        if o.flags & oflags::O_APPEND != 0 || i.ino() == o.ino() {
-            return None;
-        }
-        (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
-    };
-    // Seals must be checked block by block; tmpfs must be accounted block by block and stop when
-    // full (write_bytes)
-    let in_tmpfs = cx.vfs().is_ok_and(|v| {
-        v.tmpfs_dev(&Node::Store(output.borrow().mnt, ino))
-            .is_some()
-    });
-    if cx.kr().seals.contains_key(&ino) || in_tmpfs {
-        return None;
-    }
-    let len = match fsize_allowed(cx, &output.borrow(), dst, len.min(MAX_COPY)) {
-        Ok(n) => n,
-        Err(e) => return Some(Err(e)),
-    };
-    if len > 0
-        && let Err(e) = remove_privs(cx, ino)
-    {
-        return Some(Err(e));
-    }
-    let busy = |f: &FileRef, used: bool| used && f.borrow().pos_busy != 0;
-    while busy(input, src.is_none()) || busy(output, true) {
-        if cx.task.killed.get() {
-            return Some(Err(Errno::EINTR));
-        }
-        for (f, used) in [(input, src.is_none()), (output, true)] {
-            if busy(f, used) {
-                f.borrow_mut().pos_busy = 2;
-            }
-        }
-        if let Err(e) = cx.wait_on(None, &mut [], crate::kernel::wake::LOCK) {
-            return Some(Err(e));
-        }
-    }
-    let from = src.unwrap_or_else(|| input.borrow().pos);
-    let to = dst.unwrap_or_else(|| output.borrow().pos);
-    if src.is_none() {
-        input.borrow_mut().pos_busy = 1;
-    }
-    output.borrow_mut().pos_busy = 1;
-    let r = cx.unlocked(|| appine_hal::copy_file(fd_in, from, fd_out, to, len));
-    let mut wake = false;
-    for (f, used, dst, at) in [(input, src.is_none(), src, from), (output, true, dst, to)] {
-        if used {
-            let mut f = f.borrow_mut();
-            if let (Ok(n), None) = (r, dst) {
-                f.pos = at + n as u64;
-            }
-            wake |= std::mem::take(&mut f.pos_busy) == 2;
-        }
-    }
-    if wake {
-        request_wake_locks();
-    }
-    match r.map_err(Errno) {
-        // The host does not support this pair of files: the caller reads and writes block by
-        // block
-        Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP | Errno::EXDEV) => None,
-        Err(e) => Some(Err(e)),
-        Ok(n) => {
-            if n > 0 {
-                inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
-                inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
-            }
-            Some(Ok(n))
+        if m.file_truncated(meta.dev(), meta.ino(), meta.len()) && !Rc::ptr_eq(&mm, &cx.t.mm) {
+            m.sync(&sync);
         }
     }
 }
 
-/// copy_file_range: copies between two regular files without passing through guest memory. A
-/// null offset pointer uses and advances the file position; otherwise the offset it points at
-/// is used and updated.
-pub(super) fn copy_file_range(
-    cx: &mut Cx<'_>,
-    fd_in: i32,
-    off_in: u64,
-    fd_out: i32,
-    off_out: u64,
-    len: usize,
-    flags: u32,
-) -> SysResult {
-    if flags != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let input = cx.fds().get(fd_in)?;
-    let output = cx.fds().get(fd_out)?;
-    {
-        let (i, o) = (input.borrow(), output.borrow());
-        if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
-            return Err(Errno::EBADF);
-        }
-        for f in [&i, &o] {
-            match f.kind {
-                FileKind::Regular { .. } => {}
-                FileKind::Directory { .. } => return Err(Errno::EISDIR),
-                _ => return Err(Errno::EINVAL),
-            }
-        }
-    }
-    let read_off = |addr: u64| -> Result<Option<u64>, Errno> {
-        match addr {
-            0 => Ok(None),
-            a => Ok(Some(
-                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
-            )),
-        }
-    };
-    let (mut src, mut dst) = (read_off(off_in)?, read_off(off_out)?);
-    let same = input.borrow().ino() == output.borrow().ino();
-    if same {
-        // Two ranges in the same file must not overlap
-        let s = src.unwrap_or(input.borrow().pos);
-        let d = dst.unwrap_or(output.borrow().pos);
-        if s < d + len as u64 && d < s + len as u64 {
-            return Err(Errno::EINVAL);
-        }
-    }
-    if let Some(r) = copy_regular(cx, &input, src, &output, dst, len) {
-        let n = r? as u64;
-        if let Some(s) = src {
-            put(cx, off_in, (s + n).to_le_bytes())?;
-        }
-        if let Some(d) = dst {
-            put(cx, off_out, (d + n).to_le_bytes())?;
-        }
-        return Ok(n);
-    }
-    let mut chunk = vec![0u8; len.min(IO_CHUNK)];
-    let mut done = 0;
-    while done < len {
-        let n = (len - done).min(IO_CHUNK);
-        let got = read_bytes(cx, &input, &mut chunk[..n], src)?;
-        if got == 0 {
-            break;
-        }
-        let wrote = write_bytes(cx, &output, &chunk[..got], dst)?;
-        if let Some(s) = &mut src {
-            *s += wrote as u64;
-        } else {
-            input.borrow_mut().pos -= (got - wrote) as u64;
-        }
-        if let Some(d) = &mut dst {
-            *d += wrote as u64;
-        }
-        done += wrote;
-        if wrote < got {
-            break;
-        }
-    }
-    if let Some(s) = src {
-        put(cx, off_in, s.to_le_bytes())?;
-    }
-    if let Some(d) = dst {
-        put(cx, off_out, d.to_le_bytes())?;
-    }
-    Ok(done as u64)
-}
-
-/// posix_fadvise: affects only performance; ignored after the arguments are checked.
-pub(super) fn fadvise64(cx: &mut Cx<'_>, fd: i32, len: i64, advice: i32) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    if matches!(file.borrow().kind, FileKind::Pipe(_) | FileKind::Socket(_)) {
-        return Err(Errno::ESPIPE);
-    }
-    if len < 0 || !(0..=5).contains(&advice) {
-        return Err(Errno::EINVAL);
-    }
-    Ok(0)
-}
-
-pub(super) fn read(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    read_file(cx, &file, buf, len, None)
-}
-
-pub(super) fn write(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    write_file(cx, &file, buf, len, None)
-}
-
-fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
-    u64::try_from(offset).map(Some).map_err(|_| Errno::EINVAL)
-}
-
-pub(super) fn pread(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    read_file(cx, &file, buf, len, checked_offset(offset)?)
-}
-
-pub(super) fn pwrite(cx: &mut Cx<'_>, fd: i32, buf: u64, len: usize, offset: i64) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let offset = append_offset(&file, checked_offset(offset)?)?;
-    write_file(cx, &file, buf, len, offset)
-}
-
-/// A write with an offset on an `O_APPEND` regular file still writes at the end, leaving the
-/// file position unchanged (Linux's generic_write_checks, the BUGS section of pwrite(2)); only
-/// pwritev2's `RWF_NOAPPEND` writes at the given offset. Such writes are done with the BKL held
-/// ([`write_bytes`]), so they never write at the same place as other appends.
-fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
-    let f = file.borrow();
-    match &f.kind {
-        FileKind::Regular { file, .. } if offset.is_some() && f.flags & oflags::O_APPEND != 0 => {
-            Ok(Some(file.metadata().map_err(host_errno)?.len()))
-        }
-        _ => Ok(offset),
-    }
-}
-
-/// Reads an iovec array.
-fn iovecs(cx: &Cx<'_>, iov: u64, count: usize) -> Result<Vec<(u64, usize)>, Errno> {
-    if count > UIO_MAXIOV {
-        return Err(Errno::EINVAL);
-    }
-    let mut out = Vec::with_capacity(count);
-    let mut total: usize = 0;
-    for i in 0..count as u64 {
-        let raw: [u8; 16] = get(cx, iov.wrapping_add(i * 16))?;
-        let base = u64::from_le_bytes(raw[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(raw[8..].try_into().unwrap()) as usize;
-        total = total
-            .checked_add(len)
-            .filter(|&t| t <= isize::MAX as usize)
-            .ok_or(Errno::EINVAL)?;
-        out.push((base, len));
-    }
-    Ok(out)
-}
-
-/// readv, writev and their positional variants: handle each iovec in order, stopping at an
-/// incomplete one. With `offset` None the file position is used and advanced.
-pub(super) fn vectored(
-    cx: &mut Cx<'_>,
-    fd: i32,
-    iov: u64,
-    count: usize,
-    offset: Option<u64>,
-    write: bool,
-) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    // /dev/kmsg's write_iter: the whole writev is one record (systemd logs this way)
-    if write && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
-        let vecs = iovecs(cx, iov, count)?;
-        let total: usize = vecs.iter().map(|&(_, len)| len).sum();
-        if !file.borrow().writable() {
-            return Err(Errno::EBADF);
-        }
-        // A writev with total length 0 does not call the file's write (do_iter_write)
-        if total == 0 {
-            return Ok(0);
-        }
-        if total > crate::klog::LOG_LINE_MAX {
-            return Err(Errno::EINVAL);
-        }
-        let mut data = Vec::new();
-        for (base, len) in vecs {
-            let start = data.len();
-            data.resize(start + len, 0);
-            cx.mm()
-                .read(UserSlice::new(base, len), &mut data[start..])?;
-        }
-        return kmsg_write(cx, &file, &data).map(|n| n as u64);
-    }
-    let mut total = 0;
-    for (base, len) in iovecs(cx, iov, count)? {
-        let at = offset.map(|o| o + total);
-        let r = if write {
-            write_file(cx, &file, base, len, at)
-        } else {
-            read_file(cx, &file, base, len, at)
-        };
-        match r {
-            Ok(n) => {
-                total += n;
-                if (n as usize) < len {
-                    break;
-                }
-            }
-            Err(_) if total > 0 => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
-}
-
-pub(super) fn readv(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
-    vectored(cx, fd, iov, count, None, false)
-}
-
-pub(super) fn writev(cx: &mut Cx<'_>, fd: i32, iov: u64, count: usize) -> SysResult {
-    vectored(cx, fd, iov, count, None, true)
-}
-
-/// preadv, pwritev; with `flags` not None, preadv2 and pwritev2, where an offset of -1 means the
-/// file position.
-pub(super) fn pvectored(
-    cx: &mut Cx<'_>,
-    fd: i32,
-    iov: u64,
-    count: usize,
-    offset: i64,
-    flags: Option<u32>,
-    write: bool,
-) -> SysResult {
-    // RWF_HIPRI does not affect the result; RWF_DSYNC and RWF_SYNC wait for the write to reach
-    // disk ([`write_sync`]); RWF_NOAPPEND (since Linux 6.9, used by musl's pwrite) makes a write
-    // with an offset on an O_APPEND file also write at the given offset; RWF_NOWAIT and
-    // RWF_APPEND are not supported, and as on Linux every unknown flag is EOPNOTSUPP
-    const RWF_NOAPPEND: u32 = 0x20;
-    const RWF_SUPPORTED: u32 = 0x7 | RWF_NOAPPEND;
-    let mut offset = match flags {
-        Some(f) if f & !RWF_SUPPORTED != 0 => return Err(Errno::EOPNOTSUPP),
-        Some(_) if offset == -1 => None,
-        _ => checked_offset(offset)?,
-    };
-    if write && flags.is_none_or(|f| f & RWF_NOAPPEND == 0) {
-        offset = append_offset(&cx.fds().get(fd)?, offset)?;
-    }
-    let n = vectored(cx, fd, iov, count, offset, write)?;
-    if let Some(rwf) = flags.filter(|_| write && n > 0) {
-        let file = cx.fds().get(fd)?;
-        write_sync(cx, &file, rwf)?;
-    }
-    Ok(n)
+fn host_errno(e: std::io::Error) -> Errno {
+    Errno(e.raw_os_error().unwrap_or(Errno::EIO.0))
 }

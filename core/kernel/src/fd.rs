@@ -327,20 +327,6 @@ pub struct SignalFd {
 }
 
 impl SignalFd {
-    /// The calling thread and its thread group; off a guest thread, the thread group that created
-    /// it.
-    fn pending(
-        &self,
-    ) -> (
-        Option<Rc<crate::task::Task>>,
-        Option<Rc<RefCell<crate::process::ThreadGroup>>>,
-    ) {
-        match crate::task::current() {
-            Some((task, group)) => (Some(task), Some(group)),
-            None => (None, self.group.upgrade()),
-        }
-    }
-
     /// How many signals have become pending in total for the calling thread and its thread group
     /// (`syscall::poll`'s data generation).
     pub fn arrivals(&self) -> u64 {
@@ -355,6 +341,20 @@ impl SignalFd {
         let group = group.map_or(0, |g| g.borrow().pending.set());
         let task = task.map_or(0, |t| t.pending.borrow().set());
         (group | task) & self.mask != 0
+    }
+
+    /// The calling thread and its thread group; off a guest thread, the thread group that created
+    /// it.
+    fn pending(
+        &self,
+    ) -> (
+        Option<Rc<crate::task::Task>>,
+        Option<Rc<RefCell<crate::process::ThreadGroup>>>,
+    ) {
+        match crate::task::current() {
+            Some((task, group)) => (Some(task), Some(group)),
+            None => (None, self.group.upgrade()),
+        }
     }
 }
 
@@ -525,28 +525,6 @@ pub struct FdTable {
     pub holds_locks: bool,
 }
 
-impl Default for FdTable {
-    fn default() -> Self {
-        FdTable {
-            slots: Vec::new(),
-            limit: DEFAULT_NOFILE.0,
-            holds_locks: false,
-        }
-    }
-}
-
-impl Clone for FdTable {
-    /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
-    /// and are not copied with it.
-    fn clone(&self) -> Self {
-        FdTable {
-            slots: self.slots.clone(),
-            limit: self.limit,
-            holds_locks: false,
-        }
-    }
-}
-
 impl FdTable {
     /// An empty table.
     pub fn new() -> Self {
@@ -569,14 +547,11 @@ impl FdTable {
         t
     }
 
-    /// Gets the open file for an fd.
-    pub fn get(&self, fd: i32) -> Result<FileRef, Errno> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .and_then(Option::as_ref)
-            .map(|s| s.file.clone())
-            .ok_or(Errno::EBADF)
+    /// Installs at the lowest free fd not below `min`.
+    pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
+        let fd = self.free_slot(min)?;
+        self.install_at(fd, file, cloexec)?;
+        Ok(fd)
     }
 
     /// The lowest free fd not below `min`.
@@ -585,13 +560,6 @@ impl FdTable {
             .find(|&i| self.slots.get(i).is_none_or(Option::is_none))
             .map(|i| i as i32)
             .ok_or(Errno::EMFILE)
-    }
-
-    /// Installs at the lowest free fd not below `min`.
-    pub fn install(&mut self, file: FileRef, cloexec: bool, min: usize) -> Result<i32, Errno> {
-        let fd = self.free_slot(min)?;
-        self.install_at(fd, file, cloexec)?;
-        Ok(fd)
     }
 
     /// Installs at the given fd, returning the file it replaced (dup2/dup3).
@@ -612,6 +580,41 @@ impl FdTable {
         Ok(old.map(|s| s.file))
     }
 
+    /// Gets the open file for an fd.
+    pub fn get(&self, fd: i32) -> Result<FileRef, Errno> {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|i| self.slots.get(i))
+            .and_then(Option::as_ref)
+            .map(|s| s.file.clone())
+            .ok_or(Errno::EBADF)
+    }
+
+    /// Reads the close-on-exec flag.
+    pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
+        self.slot(fd).map(|s| s.cloexec)
+    }
+
+    fn slot(&self, fd: i32) -> Result<&Slot, Errno> {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|i| self.slots.get(i))
+            .and_then(Option::as_ref)
+            .ok_or(Errno::EBADF)
+    }
+
+    /// Sets the close-on-exec flag.
+    pub fn set_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), Errno> {
+        let i = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let slot = self
+            .slots
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .ok_or(Errno::EBADF)?;
+        slot.cloexec = cloexec;
+        Ok(())
+    }
+
     /// Closes an fd, returning the closed file.
     pub fn close(&mut self, fd: i32) -> Result<FileRef, Errno> {
         let slot = usize::try_from(fd)
@@ -619,16 +622,6 @@ impl FdTable {
             .and_then(|i| self.slots.get_mut(i))
             .ok_or(Errno::EBADF)?;
         slot.take().map(|s| s.file).ok_or(Errno::EBADF)
-    }
-
-    /// All open fds, in increasing order.
-    pub fn open_fds(&self) -> Vec<i32> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.is_some())
-            .map(|(i, _)| i as i32)
-            .collect()
     }
 
     /// execve: closes every fd with the close-on-exec flag, returning the closed files.
@@ -656,29 +649,36 @@ impl FdTable {
         closed
     }
 
-    /// Reads the close-on-exec flag.
-    pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
-        self.slot(fd).map(|s| s.cloexec)
+    /// All open fds, in increasing order.
+    pub fn open_fds(&self) -> Vec<i32> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_some())
+            .map(|(i, _)| i as i32)
+            .collect()
     }
+}
 
-    /// Sets the close-on-exec flag.
-    pub fn set_cloexec(&mut self, fd: i32, cloexec: bool) -> Result<(), Errno> {
-        let i = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
-        let slot = self
-            .slots
-            .get_mut(i)
-            .and_then(Option::as_mut)
-            .ok_or(Errno::EBADF)?;
-        slot.cloexec = cloexec;
-        Ok(())
+impl Default for FdTable {
+    fn default() -> Self {
+        FdTable {
+            slots: Vec::new(),
+            limit: DEFAULT_NOFILE.0,
+            holds_locks: false,
+        }
     }
+}
 
-    fn slot(&self, fd: i32) -> Result<&Slot, Errno> {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .and_then(Option::as_ref)
-            .ok_or(Errno::EBADF)
+impl Clone for FdTable {
+    /// fork, clone without `CLONE_FILES`, unshare: POSIX locks belong to the original fd table
+    /// and are not copied with it.
+    fn clone(&self) -> Self {
+        FdTable {
+            slots: self.slots.clone(),
+            limit: self.limit,
+            holds_locks: false,
+        }
     }
 }
 

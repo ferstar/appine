@@ -56,33 +56,6 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
         .map(|fd| fd as u64)
 }
 
-fn timer_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<TimerFd>>, Errno> {
-    match &cx.fds().get(fd)?.borrow().kind {
-        FileKind::TimerFd(t) => Ok(t.clone()),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-/// Reads a `struct timespec` (`super::timespec`): EINVAL if the seconds are negative or the
-/// nanoseconds out of range.
-fn timespec(b: &[u8]) -> Result<Duration, Errno> {
-    let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
-    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
-    super::timespec(sec, nsec).ok_or(Errno::EINVAL)
-}
-
-/// `struct itimerspec`: the interval and how long until the next expiration (both 0 when not
-/// armed).
-fn current(t: &mut TimerFd) -> [u8; 32] {
-    let left = t.remaining(Instant::now());
-    let mut b = [0u8; 32];
-    for (o, d) in [(0, t.interval), (16, left)] {
-        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
-        b[o + 8..o + 16].copy_from_slice(&(d.subsec_nanos() as i64).to_le_bytes());
-    }
-    b
-}
-
 pub(super) fn timerfd_settime(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -122,10 +95,37 @@ pub(super) fn timerfd_settime(
     Ok(0)
 }
 
+/// Reads a `struct timespec` (`super::timespec`): EINVAL if the seconds are negative or the
+/// nanoseconds out of range.
+fn timespec(b: &[u8]) -> Result<Duration, Errno> {
+    let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    super::timespec(sec, nsec).ok_or(Errno::EINVAL)
+}
+
 pub(super) fn timerfd_gettime(cx: &mut Cx<'_>, fd: i32, cur: u64) -> SysResult {
     let timer = timer_of(cx, fd)?;
     let b = current(&mut timer.borrow_mut());
     put(cx, cur, b).map(|()| 0)
+}
+
+fn timer_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<TimerFd>>, Errno> {
+    match &cx.fds().get(fd)?.borrow().kind {
+        FileKind::TimerFd(t) => Ok(t.clone()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `struct itimerspec`: the interval and how long until the next expiration (both 0 when not
+/// armed).
+fn current(t: &mut TimerFd) -> [u8; 32] {
+    let left = t.remaining(Instant::now());
+    let mut b = [0u8; 32];
+    for (o, d) in [(0, t.interval), (16, left)] {
+        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
+        b[o + 8..o + 16].copy_from_slice(&(d.subsec_nanos() as i64).to_le_bytes());
+    }
+    b
 }
 
 /// Reads the number of expirations (8 bytes), waiting if none has happened yet.

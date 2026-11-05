@@ -47,6 +47,8 @@ const MNT_DETACH: u32 = 2;
 const MNT_EXPIRE: u32 = 4;
 const UMOUNT_NOFOLLOW: u32 = 8;
 
+// ---- mount(2) ----
+
 pub(super) fn mount(
     cx: &mut Cx<'_>,
     source: u64,
@@ -235,81 +237,6 @@ fn new_mount(
     Ok(0)
 }
 
-/// The tmpfs mount options that were given (the `shmem_options` parsed by Linux 6.1's
-/// `shmem_parse_one`). Unknown options are EINVAL.
-#[derive(Default)]
-struct TmpfsOptions {
-    perm: Option<u32>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    /// Number of pages and of inodes (0 is unlimited).
-    blocks: Option<u64>,
-    inodes: Option<u64>,
-    inode64: Option<bool>,
-}
-
-fn parse_tmpfs(data: &[u8]) -> Result<TmpfsOptions, Errno> {
-    const PAGE: u64 = crate::vfs::TMPFS_PAGE;
-    let mut o = TmpfsOptions::default();
-    for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
-        let (key, value) = match opt.iter().position(|&b| b == b'=') {
-            Some(i) => (&opt[..i], Some(&opt[i + 1..])),
-            None => (opt, None),
-        };
-        let id = |v: &[u8]| {
-            parse_num(v)
-                .and_then(|n| u32::try_from(n).ok())
-                .filter(|&n| n != u32::MAX)
-                .ok_or(Errno::EINVAL)
-        };
-        match (key, value) {
-            (b"size", Some(v)) => {
-                let (n, rest) = memparse(v)?;
-                let bytes = match rest {
-                    b"" => n,
-                    b"%" => n.saturating_mul(appine_hal::memory_info().0) / 100,
-                    _ => return Err(Errno::EINVAL),
-                };
-                o.blocks = Some(bytes.div_ceil(PAGE));
-            }
-            (b"nr_blocks", Some(v)) => match memparse(v)? {
-                (n, b"") => o.blocks = Some(n),
-                _ => return Err(Errno::EINVAL),
-            },
-            (b"nr_inodes", Some(v)) => match memparse(v)? {
-                (n, b"") => o.inodes = Some(n),
-                _ => return Err(Errno::EINVAL),
-            },
-            (b"mode", Some(v)) => {
-                let s = std::str::from_utf8(v).map_err(|_| Errno::EINVAL)?;
-                o.perm = Some(u32::from_str_radix(s, 8).map_err(|_| Errno::EINVAL)? & 0o7777);
-            }
-            (b"uid", Some(v)) => o.uid = Some(id(v)?),
-            (b"gid", Some(v)) => o.gid = Some(id(v)?),
-            (b"inode64", None) => o.inode64 = Some(true),
-            (b"inode32", None) => o.inode64 = Some(false),
-            (
-                b"huge",
-                Some(b"never" | b"always" | b"within_size" | b"advise" | b"deny" | b"force"),
-            ) => {}
-            (b"mpol", Some(_)) => {}
-            // Generic superblock flags (`vfs_parse_sb_flag`); mount(8) turns them into MS_* flags
-            // anyway
-            (
-                b"ro" | b"rw" | b"sync" | b"async" | b"dirsync" | b"mand" | b"nomand" | b"lazytime"
-                | b"nolazytime" | b"posixacl" | b"noposixacl" | b"silent" | b"loud",
-                None,
-            ) => {}
-            _ => {
-                let name = String::from_utf8_lossy(opt);
-                crate::debug::log(format_args!("tmpfs: unknown parameter {name}"));
-                return Err(Errno::EINVAL);
-            }
-        }
-    }
-    Ok(o)
-}
-
 /// The parameters of a newly mounted tmpfs: defaults for what is not given (permissions 1777,
 /// owner and group the mounting process's fsuid and fsgid, size and inode count half of physical
 /// memory, inode64).
@@ -324,73 +251,6 @@ fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, E
         inodes: o.inodes.unwrap_or(default),
         inode64: o.inode64.unwrap_or(true),
     })
-}
-
-/// Changes a tmpfs's superblock on remount (Linux 6.1's `shmem_reconfigure`): when a nonzero
-/// `size=` or `nr_inodes=` is given, an unlimited value cannot become limited and a limit cannot
-/// go below what is already used (both EINVAL); the given size and inode count (0 makes it
-/// unlimited) and inode32/64 are applied as given; `mode=`, `uid=` and `gid=` stay unchanged.
-fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
-    let o = parse_tmpfs(data)?;
-    vfs.tmpfs_reconfigure(dev, |p, pages, inodes| {
-        if let Some(b) = o.blocks.filter(|&b| b != 0)
-            && (p.blocks == 0 || b < pages)
-        {
-            return Err(Errno::EINVAL);
-        }
-        if let Some(n) = o.inodes.filter(|&n| n != 0)
-            && (p.inodes == 0 || n < inodes)
-        {
-            return Err(Errno::EINVAL);
-        }
-        p.blocks = o.blocks.unwrap_or(p.blocks);
-        p.inodes = o.inodes.unwrap_or(p.inodes);
-        p.inode64 = o.inode64.unwrap_or(p.inode64);
-        Ok(())
-    })
-}
-
-/// An unsigned number, with the same prefixes as C's `strtoull(…, 0)` (`0x` hexadecimal, `0`
-/// octal).
-fn parse_num(s: &[u8]) -> Option<u64> {
-    let (n, rest) = leading_num(s)?;
-    rest.is_empty().then_some(n)
-}
-
-/// The leading unsigned number and the rest.
-fn leading_num(s: &[u8]) -> Option<(u64, &[u8])> {
-    let (radix, digits) = match s {
-        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
-        [b'0', rest @ ..] if !rest.is_empty() => (8, rest),
-        _ => (10, s),
-    };
-    let end = digits
-        .iter()
-        .position(|&b| !(b as char).is_digit(radix))
-        .unwrap_or(digits.len());
-    let n = std::str::from_utf8(&digits[..end]).ok()?;
-    let n = if n.is_empty() && radix == 8 {
-        0
-    } else {
-        u64::from_str_radix(n, radix).ok()?
-    };
-    Some((n, &digits[end..]))
-}
-
-/// Linux's `memparse`: the number may be followed by K, M, G, T, P or E (case-insensitive).
-/// Returns the rest.
-fn memparse(s: &[u8]) -> Result<(u64, &[u8]), Errno> {
-    let (n, rest) = leading_num(s).ok_or(Errno::EINVAL)?;
-    let shift = match rest.first().map(u8::to_ascii_uppercase) {
-        Some(b'K') => 10,
-        Some(b'M') => 20,
-        Some(b'G') => 30,
-        Some(b'T') => 40,
-        Some(b'P') => 50,
-        Some(b'E') => 60,
-        _ => return Ok((n, rest)),
-    };
-    Ok((n.saturating_mul(1 << shift), &rest[1..]))
 }
 
 /// Bind mount (Linux's `do_loopback`): the new mount sees the source directory or file, with the
@@ -466,50 +326,6 @@ fn bind_ns(
     Ok(0)
 }
 
-/// Mount points that must be ENOENT (Linux's `lock_mount`): nameless open files such as deleted
-/// files and pipes reached through `/proc/<pid>/fd/<n>` or `exe`; the entries in `/proc/<pid>/fd`
-/// and `fdinfo` themselves (reached through an `O_PATH` fd pointing at them; not usable as mount
-/// points since Linux 6.12, LTP's mount08).
-fn may_mount_on(target: &Node) -> Result<(), Errno> {
-    match target {
-        Node::Pseudo(
-            _,
-            PseudoNode::OpenFd(..)
-            | PseudoNode::OpenExe(_)
-            | PseudoNode::Fd(..)
-            | PseudoNode::FdInfo(..),
-        ) => Err(Errno::ENOENT),
-        _ => Ok(()),
-    }
-}
-
-/// Mounts the mounts below `root` in the mount `root` is in (those in `snapshot`) the same way
-/// into mount `to` (Linux's `copy_tree`).
-fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, to: MountId) {
-    for c in snapshot.iter().filter(|c| c.parent() == Some(root.mnt())) {
-        let Some(point) = &c.point else {
-            continue;
-        };
-        // A mount on a file searches upwards from the directory it was mounted through
-        let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
-        if point != root && !vfs.is_under(ps, from, root) {
-            continue;
-        }
-        let at = c.at.clone().map(|(dir, name)| (dir.in_mount(to), name));
-        let id = vfs.add_mount(
-            c.fs,
-            c.root.clone(),
-            (point.clone().in_mount(to), at),
-            c.flags,
-            c.source.clone(),
-            Some(c.dev),
-        );
-        vfs.set_root_at(id, c.root_at.clone());
-        vfs.update_mount(id, |m| m.pin = c.pin.clone());
-        copy_submounts(vfs, ps, snapshot, &c.root, id);
-    }
-}
-
 /// Remount: changes the mount's flags (without `MS_BIND` Linux also changes the superblock's,
 /// which is shared between several mounts; here only this one mount changes). Without `MS_BIND`
 /// `data` holds options: tmpfs changes its superblock's size and inode count accordingly
@@ -544,6 +360,30 @@ fn remount(
     Ok(0)
 }
 
+/// Changes a tmpfs's superblock on remount (Linux 6.1's `shmem_reconfigure`): when a nonzero
+/// `size=` or `nr_inodes=` is given, an unlimited value cannot become limited and a limit cannot
+/// go below what is already used (both EINVAL); the given size and inode count (0 makes it
+/// unlimited) and inode32/64 are applied as given; `mode=`, `uid=` and `gid=` stay unchanged.
+fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
+    let o = parse_tmpfs(data)?;
+    vfs.tmpfs_reconfigure(dev, |p, pages, inodes| {
+        if let Some(b) = o.blocks.filter(|&b| b != 0)
+            && (p.blocks == 0 || b < pages)
+        {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(n) = o.inodes.filter(|&n| n != 0)
+            && (p.inodes == 0 || n < inodes)
+        {
+            return Err(Errno::EINVAL);
+        }
+        p.blocks = o.blocks.unwrap_or(p.blocks);
+        p.inodes = o.inodes.unwrap_or(p.inodes);
+        p.inode64 = o.inode64.unwrap_or(p.inode64);
+        Ok(())
+    })
+}
+
 /// Changes the propagation type (Linux's `do_change_type`): only checks the arguments.
 fn change_type(cx: &mut Cx<'_>, target: &Node, flags: u64) -> SysResult {
     cx.vfs()?.mount_root(target).ok_or(Errno::EINVAL)?;
@@ -567,40 +407,122 @@ fn move_mount(
     move_tree(cx, &src, (target, at))
 }
 
-/// Moves the mount rooted at `src` onto `target` (Linux's `do_move_mount`, shared by `MS_MOVE` and
-/// move_mount): `src` must be the root of a mount attached in the caller's namespace, or the root
-/// of a tree copied by open_tree and not yet attached (it is attached, and the tree enters the
-/// caller's namespace). The target must be in the caller's namespace, must be a directory if and
-/// only if `src` is (EINVAL), and must not be inside the mount being moved (ELOOP).
-fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) -> SysResult {
-    let vfs = cx.vfs()?;
-    let view = cx.view(&vfs);
-    // The root of a mount tree is also mounted (on the invisible rootfs); when it is moved the
-    // target is always inside it, which is the ELOOP below
-    let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
-    let anon = vfs
-        .mount_ns(id)
-        .and_then(|ns| vfs.find_ns(ns))
-        .is_some_and(|ns| ns.anon)
-        && vfs.mount(id).is_some_and(|m| m.point.is_none());
-    if !anon {
-        check_mnt(cx, &vfs, id)?;
-    }
-    check_mnt(cx, &vfs, target.mnt())?;
-    if vfs.is_dir(&view, src)? != vfs.is_dir(&view, &target)? {
-        return Err(Errno::EINVAL);
-    }
-    may_mount_on(&target)?;
-    if anon {
-        vfs.attach_tree(id, (target, at), cx.mnt_ns());
-    } else {
-        if vfs.is_under(&view, &target, src) {
-            return Err(Errno::ELOOP);
+/// The tmpfs mount options that were given (the `shmem_options` parsed by Linux 6.1's
+/// `shmem_parse_one`). Unknown options are EINVAL.
+#[derive(Default)]
+struct TmpfsOptions {
+    perm: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    /// Number of pages and of inodes (0 is unlimited).
+    blocks: Option<u64>,
+    inodes: Option<u64>,
+    inode64: Option<bool>,
+}
+
+fn parse_tmpfs(data: &[u8]) -> Result<TmpfsOptions, Errno> {
+    const PAGE: u64 = crate::vfs::TMPFS_PAGE;
+    let mut o = TmpfsOptions::default();
+    for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+        let (key, value) = match opt.iter().position(|&b| b == b'=') {
+            Some(i) => (&opt[..i], Some(&opt[i + 1..])),
+            None => (opt, None),
+        };
+        let id = |v: &[u8]| {
+            parse_num(v)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|&n| n != u32::MAX)
+                .ok_or(Errno::EINVAL)
+        };
+        match (key, value) {
+            (b"size", Some(v)) => {
+                let (n, rest) = memparse(v)?;
+                let bytes = match rest {
+                    b"" => n,
+                    b"%" => n.saturating_mul(appine_hal::memory_info().0) / 100,
+                    _ => return Err(Errno::EINVAL),
+                };
+                o.blocks = Some(bytes.div_ceil(PAGE));
+            }
+            (b"nr_blocks", Some(v)) => match memparse(v)? {
+                (n, b"") => o.blocks = Some(n),
+                _ => return Err(Errno::EINVAL),
+            },
+            (b"nr_inodes", Some(v)) => match memparse(v)? {
+                (n, b"") => o.inodes = Some(n),
+                _ => return Err(Errno::EINVAL),
+            },
+            (b"mode", Some(v)) => {
+                let s = std::str::from_utf8(v).map_err(|_| Errno::EINVAL)?;
+                o.perm = Some(u32::from_str_radix(s, 8).map_err(|_| Errno::EINVAL)? & 0o7777);
+            }
+            (b"uid", Some(v)) => o.uid = Some(id(v)?),
+            (b"gid", Some(v)) => o.gid = Some(id(v)?),
+            (b"inode64", None) => o.inode64 = Some(true),
+            (b"inode32", None) => o.inode64 = Some(false),
+            (
+                b"huge",
+                Some(b"never" | b"always" | b"within_size" | b"advise" | b"deny" | b"force"),
+            ) => {}
+            (b"mpol", Some(_)) => {}
+            // Generic superblock flags (`vfs_parse_sb_flag`); mount(8) turns them into MS_* flags
+            // anyway
+            (
+                b"ro" | b"rw" | b"sync" | b"async" | b"dirsync" | b"mand" | b"nomand" | b"lazytime"
+                | b"nolazytime" | b"posixacl" | b"noposixacl" | b"silent" | b"loud",
+                None,
+            ) => {}
+            _ => {
+                let name = String::from_utf8_lossy(opt);
+                crate::debug::log(format_args!("tmpfs: unknown parameter {name}"));
+                return Err(Errno::EINVAL);
+            }
         }
-        vfs.move_mount(id, Some((target, at)));
     }
-    cx.shared.fast_changed();
-    Ok(0)
+    Ok(o)
+}
+
+/// An unsigned number, with the same prefixes as C's `strtoull(…, 0)` (`0x` hexadecimal, `0`
+/// octal).
+fn parse_num(s: &[u8]) -> Option<u64> {
+    let (n, rest) = leading_num(s)?;
+    rest.is_empty().then_some(n)
+}
+
+/// Linux's `memparse`: the number may be followed by K, M, G, T, P or E (case-insensitive).
+/// Returns the rest.
+fn memparse(s: &[u8]) -> Result<(u64, &[u8]), Errno> {
+    let (n, rest) = leading_num(s).ok_or(Errno::EINVAL)?;
+    let shift = match rest.first().map(u8::to_ascii_uppercase) {
+        Some(b'K') => 10,
+        Some(b'M') => 20,
+        Some(b'G') => 30,
+        Some(b'T') => 40,
+        Some(b'P') => 50,
+        Some(b'E') => 60,
+        _ => return Ok((n, rest)),
+    };
+    Ok((n.saturating_mul(1 << shift), &rest[1..]))
+}
+
+/// The leading unsigned number and the rest.
+fn leading_num(s: &[u8]) -> Option<(u64, &[u8])> {
+    let (radix, digits) = match s {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', rest @ ..] if !rest.is_empty() => (8, rest),
+        _ => (10, s),
+    };
+    let end = digits
+        .iter()
+        .position(|&b| !(b as char).is_digit(radix))
+        .unwrap_or(digits.len());
+    let n = std::str::from_utf8(&digits[..end]).ok()?;
+    let n = if n.is_empty() && radix == 8 {
+        0
+    } else {
+        u64::from_str_radix(n, radix).ok()?
+    };
+    Some((n, &digits[end..]))
 }
 
 // ---- The new mount API (open_tree, move_mount, mount_setattr) ----
@@ -637,43 +559,6 @@ mod attr {
     pub const NOSYMFOLLOW: u64 = 0x20_0000;
     pub const VALID: u64 =
         RDONLY | NOSUID | NODEV | NOEXEC | ATIME | NODIRATIME | IDMAP | NOSYMFOLLOW;
-}
-
-/// A path argument of the new mount API: resolves `path` from `dirfd` (with `empty` it may be
-/// empty, meaning `dirfd` itself), past mount points to the topmost mount. Returns the node and
-/// the dentry it was found at.
-fn walk_at(
-    cx: &Cx<'_>,
-    (dirfd, path): (i32, u64),
-    empty: bool,
-    follow: bool,
-) -> Result<(Node, Option<Dentry>), Errno> {
-    let path = cx.mm().read_cstr(path, super::PATH_MAX - 1)?;
-    let vfs = cx.vfs()?;
-    let (node, at) = if path.is_empty() {
-        if !empty {
-            return Err(Errno::ENOENT);
-        }
-        let node = if dirfd == AT_FDCWD {
-            cx.cwd()
-        } else {
-            cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF)?
-        };
-        (node, None)
-    } else {
-        let start = start_dir(cx, dirfd, &path)?;
-        vfs.walk(
-            &cx.view(&vfs),
-            &cx.cred(),
-            &cx.root(),
-            &start,
-            &path,
-            follow,
-        )?
-    };
-    let top = vfs.mounted(node.clone());
-    let at = at.filter(|_| top == node);
-    Ok((top, at))
 }
 
 /// open_tree(2) (Linux 6.1's `open_tree`, `open_detached_copy`): without `OPEN_TREE_CLONE` it is
@@ -881,6 +766,45 @@ pub(super) fn mount_setattr(
     Ok(0)
 }
 
+/// A path argument of the new mount API: resolves `path` from `dirfd` (with `empty` it may be
+/// empty, meaning `dirfd` itself), past mount points to the topmost mount. Returns the node and
+/// the dentry it was found at.
+fn walk_at(
+    cx: &Cx<'_>,
+    (dirfd, path): (i32, u64),
+    empty: bool,
+    follow: bool,
+) -> Result<(Node, Option<Dentry>), Errno> {
+    let path = cx.mm().read_cstr(path, super::PATH_MAX - 1)?;
+    let vfs = cx.vfs()?;
+    let (node, at) = if path.is_empty() {
+        if !empty {
+            return Err(Errno::ENOENT);
+        }
+        let node = if dirfd == AT_FDCWD {
+            cx.cwd()
+        } else {
+            cx.fds().get(dirfd)?.borrow().node().ok_or(Errno::EBADF)?
+        };
+        (node, None)
+    } else {
+        let start = start_dir(cx, dirfd, &path)?;
+        vfs.walk(
+            &cx.view(&vfs),
+            &cx.cred(),
+            &cx.root(),
+            &start,
+            &path,
+            follow,
+        )?
+    };
+    let top = vfs.mounted(node.clone());
+    let at = at.filter(|_| top == node);
+    Ok((top, at))
+}
+
+// ---- pivot_root and umount2 ----
+
 /// pivot_root(2) (Linux 6.1's `pivot_root`): the mount of `new_root` takes the place of the mount
 /// the caller's root directory is in, and the old root is mounted on `put_old`; processes whose
 /// root directory or cwd was the old root directory switch to `new_root` (`chroot_fs_refs`).
@@ -990,20 +914,10 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     Ok(0)
 }
 
-/// Whether mounts may be changed (Linux's `may_mount`): `CAP_SYS_ADMIN` in the owner (a user
-/// namespace) of the mount namespace.
-fn may_mount(cx: &Cx<'_>) -> bool {
-    let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
-    cx.cred().ns_capable(&owner, cap::SYS_ADMIN)
-}
-
-/// Mount `id` is attached to the tree and in the caller's mount namespace (Linux's `check_mnt`);
-/// otherwise EINVAL.
-fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
-    match vfs.mount_ns(id) {
-        Some(ns) if ns == cx.mnt_ns() => Ok(()),
-        _ => Err(Errno::EINVAL),
-    }
+/// Mount `id` is in use: other mounts are mounted inside it, or a process's root directory, cwd
+/// or open file is in it (terminals opened through paths in devpts count too).
+fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
+    !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
 
 /// Some mount namespace is no longer used (the last process using it exited): unmount its mounts
@@ -1012,12 +926,6 @@ pub(crate) fn collect_namespaces(k: &crate::kernel::Kernel, vfs: &Vfs) {
     if vfs.has_dead_ns() {
         vfs.collect(&in_use(k));
     }
-}
-
-/// Mount `id` is in use: other mounts are mounted inside it, or a process's root directory, cwd
-/// or open file is in it (terminals opened through paths in devpts count too).
-fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
-    !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
 
 /// The mounts that processes' root directories, cwds and open files are in.
@@ -1043,4 +951,102 @@ fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
         }
     }
     used
+}
+
+// ---- Shared helpers ----
+
+/// Mounts the mounts below `root` in the mount `root` is in (those in `snapshot`) the same way
+/// into mount `to` (Linux's `copy_tree`).
+fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, to: MountId) {
+    for c in snapshot.iter().filter(|c| c.parent() == Some(root.mnt())) {
+        let Some(point) = &c.point else {
+            continue;
+        };
+        // A mount on a file searches upwards from the directory it was mounted through
+        let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
+        if point != root && !vfs.is_under(ps, from, root) {
+            continue;
+        }
+        let at = c.at.clone().map(|(dir, name)| (dir.in_mount(to), name));
+        let id = vfs.add_mount(
+            c.fs,
+            c.root.clone(),
+            (point.clone().in_mount(to), at),
+            c.flags,
+            c.source.clone(),
+            Some(c.dev),
+        );
+        vfs.set_root_at(id, c.root_at.clone());
+        vfs.update_mount(id, |m| m.pin = c.pin.clone());
+        copy_submounts(vfs, ps, snapshot, &c.root, id);
+    }
+}
+
+/// Moves the mount rooted at `src` onto `target` (Linux's `do_move_mount`, shared by `MS_MOVE` and
+/// move_mount): `src` must be the root of a mount attached in the caller's namespace, or the root
+/// of a tree copied by open_tree and not yet attached (it is attached, and the tree enters the
+/// caller's namespace). The target must be in the caller's namespace, must be a directory if and
+/// only if `src` is (EINVAL), and must not be inside the mount being moved (ELOOP).
+fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) -> SysResult {
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    // The root of a mount tree is also mounted (on the invisible rootfs); when it is moved the
+    // target is always inside it, which is the ELOOP below
+    let id = vfs.mount_root(src).ok_or(Errno::EINVAL)?;
+    let anon = vfs
+        .mount_ns(id)
+        .and_then(|ns| vfs.find_ns(ns))
+        .is_some_and(|ns| ns.anon)
+        && vfs.mount(id).is_some_and(|m| m.point.is_none());
+    if !anon {
+        check_mnt(cx, &vfs, id)?;
+    }
+    check_mnt(cx, &vfs, target.mnt())?;
+    if vfs.is_dir(&view, src)? != vfs.is_dir(&view, &target)? {
+        return Err(Errno::EINVAL);
+    }
+    may_mount_on(&target)?;
+    if anon {
+        vfs.attach_tree(id, (target, at), cx.mnt_ns());
+    } else {
+        if vfs.is_under(&view, &target, src) {
+            return Err(Errno::ELOOP);
+        }
+        vfs.move_mount(id, Some((target, at)));
+    }
+    cx.shared.fast_changed();
+    Ok(0)
+}
+
+/// Whether mounts may be changed (Linux's `may_mount`): `CAP_SYS_ADMIN` in the owner (a user
+/// namespace) of the mount namespace.
+fn may_mount(cx: &Cx<'_>) -> bool {
+    let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
+    cx.cred().ns_capable(&owner, cap::SYS_ADMIN)
+}
+
+/// Mount points that must be ENOENT (Linux's `lock_mount`): nameless open files such as deleted
+/// files and pipes reached through `/proc/<pid>/fd/<n>` or `exe`; the entries in `/proc/<pid>/fd`
+/// and `fdinfo` themselves (reached through an `O_PATH` fd pointing at them; not usable as mount
+/// points since Linux 6.12, LTP's mount08).
+fn may_mount_on(target: &Node) -> Result<(), Errno> {
+    match target {
+        Node::Pseudo(
+            _,
+            PseudoNode::OpenFd(..)
+            | PseudoNode::OpenExe(_)
+            | PseudoNode::Fd(..)
+            | PseudoNode::FdInfo(..),
+        ) => Err(Errno::ENOENT),
+        _ => Ok(()),
+    }
+}
+
+/// Mount `id` is attached to the tree and in the caller's mount namespace (Linux's `check_mnt`);
+/// otherwise EINVAL.
+fn check_mnt(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> Result<(), Errno> {
+    match vfs.mount_ns(id) {
+        Some(ns) if ns == cx.mnt_ns() => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
 }

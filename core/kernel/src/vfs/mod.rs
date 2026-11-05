@@ -72,6 +72,9 @@ impl Node {
     }
 }
 
+/// A directory and one name in it.
+pub(crate) type Dentry = (Node, Vec<u8>);
+
 /// Mount id (the first column of mountinfo, `mnt_id` in fdinfo), numbered across all mount
 /// namespaces together.
 pub(crate) type MountId = u32;
@@ -94,16 +97,6 @@ pub(crate) struct MntNs {
     /// Anonymous: the namespace of a tree copied by open_tree(`OPEN_TREE_CLONE`) and not yet
     /// attached; no process is in it, and it is held by an open file ([`Vfs::anon_ns`]).
     pub anon: bool,
-}
-
-/// Pages one inode takes in tmpfs: regular files by size, symlinks one page when the target is
-/// 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`; short ones live in the inode), others none.
-pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
-    match st.kind() {
-        mode::S_IFREG => st.size.div_ceil(TMPFS_PAGE),
-        mode::S_IFLNK => u64::from(st.size >= 128),
-        _ => 0,
-    }
 }
 
 /// Allocates a new namespace id (Linux's `proc_alloc_inum`, shared by all kinds of namespace).
@@ -301,6 +294,14 @@ pub(crate) struct Mount {
     pub pin: Option<crate::nsproxy::NsRef>,
 }
 
+impl Mount {
+    /// The mount the mount point is in (the second column of mountinfo); the root of the mount
+    /// tree and detached mounts have none.
+    pub(crate) fn parent(&self) -> Option<MountId> {
+        self.point.as_ref().map(Node::mnt)
+    }
+}
+
 /// Directory structure of a synthetic filesystem (implemented by the kernel layer, with content
 /// from kernel state).
 pub(crate) trait Pseudo {
@@ -406,6 +407,86 @@ struct Mounts {
     devpts: std::collections::HashMap<u64, crate::tty::PtsOptions>,
 }
 
+impl Mounts {
+    /// A boot mount: root `root` of filesystem `fs` (device number `dev`) mounted on `point`;
+    /// not mounted when there is no mount point.
+    fn boot(
+        &mut self,
+        id: MountId,
+        (fs, root, dev): (Fs, Node, u64),
+        point: Option<Node>,
+        flags: u64,
+        source: &[u8],
+    ) {
+        let Some(point) = point else {
+            crate::debug::log(format_args!("no mount point for {fs:?}"));
+            return;
+        };
+        self.list.push(Mount {
+            id,
+            ns: INIT_MNT_NS,
+            fs,
+            root,
+            point: Some(point),
+            at: None,
+            root_at: None,
+            flags,
+            dev,
+            source: source.to_vec(),
+            expiring: false,
+            pin: None,
+        });
+    }
+
+    /// A tmpfs mounted at boot (the same as [`Vfs::new_tmpfs`], except that the mount id is
+    /// fixed); returns its root directory.
+    fn boot_tmpfs(
+        &mut self,
+        store: &Store,
+        id: MountId,
+        point: Node,
+        flags: u64,
+        source: &[u8],
+        params: TmpfsParams,
+    ) -> Result<Ino, Errno> {
+        let root = store.create_detached_dir(params.perm, params.uid, params.gid)?;
+        let dev = self.next_dev;
+        self.next_dev += 1;
+        let fs = (Fs::Tmpfs, Node::Store(id, root), dev);
+        self.boot(id, fs, Some(point), flags, source);
+        // Usage is counted when needed ([`dev::populate`] created nodes in it)
+        let used = None;
+        self.tmpfs.insert(dev, Tmpfs { root, params, used });
+        Ok(root)
+    }
+
+    /// Mount points in the store; no-BKL resolution hands back to normal resolution when it
+    /// meets one. When the boot root filesystem is not the root of the mount tree (after
+    /// pivot_root), its root directory counts too: `..` has to leave through its mount point.
+    fn store_points(&self) -> Arc<[Ino]> {
+        let top = self
+            .list
+            .iter()
+            .any(|m| m.id == ROOT_MOUNT && m.point.is_none());
+        self.list
+            .iter()
+            .filter_map(|m| match m.point {
+                Some(Node::Store(_, ino)) => Some(ino),
+                _ => None,
+            })
+            .chain((!top).then_some(ROOT))
+            .collect()
+    }
+
+    /// The boot root filesystem is still attached and not nosymfollow: no-BKL resolution walks
+    /// only inside it.
+    fn fast_usable(&self) -> bool {
+        self.list
+            .iter()
+            .any(|m| m.id == ROOT_MOUNT && m.flags & ms::NOSYMFOLLOW == 0)
+    }
+}
+
 /// tmpfs accounts usage in pages; the page size (guest pages).
 pub(crate) const TMPFS_PAGE: u64 = 4096;
 
@@ -425,13 +506,6 @@ pub(crate) struct TmpfsParams {
 }
 
 impl TmpfsParams {
-    /// Default page and inode counts: half of physical memory (Linux's
-    /// `shmem_default_max_blocks` and `shmem_default_max_inodes`, which are equal without high
-    /// memory).
-    pub fn default_limit() -> u64 {
-        appine_hal::memory_info().0 / 2 / TMPFS_PAGE
-    }
-
     /// A tmpfs mounted at boot: the root directory has permissions `perm` and belongs to root,
     /// and the size and inode count are the defaults.
     fn boot(perm: u32) -> TmpfsParams {
@@ -469,6 +543,13 @@ impl TmpfsParams {
         }
         s += if self.inode64 { ",inode64" } else { ",inode32" };
         s
+    }
+
+    /// Default page and inode counts: half of physical memory (Linux's
+    /// `shmem_default_max_blocks` and `shmem_default_max_inodes`, which are equal without high
+    /// memory).
+    pub fn default_limit() -> u64 {
+        appine_hal::memory_info().0 / 2 / TMPFS_PAGE
     }
 }
 
@@ -811,182 +892,7 @@ impl Vfs {
         self.cached.borrow().clone()
     }
 
-    /// When something is mounted on the node, replaces it with the root of the mount on it; with
-    /// several mounts stacked, keeps going up to the topmost one (Linux's `follow_mount`).
-    pub(crate) fn mounted(&self, node: Node) -> Node {
-        let mounts = self.mounts.borrow();
-        let mut node = node;
-        while let Some(m) = mounts
-            .list
-            .iter()
-            .rev()
-            .find(|m| m.point.as_ref() == Some(&node))
-        {
-            node = m.root.clone();
-        }
-        node
-    }
-
-    /// Runs `f` on the mount with id `id` (attached or detached).
-    fn with_mount<T>(&self, id: MountId, f: impl FnOnce(&Mount) -> T) -> Option<T> {
-        let mounts = self.mounts.borrow();
-        mounts
-            .list
-            .iter()
-            .chain(&mounts.detached)
-            .find(|m| m.id == id)
-            .map(f)
-    }
-
-    /// `node` is the root of the mount it is in (attached and detached ones both count).
-    fn is_mount_root(&self, node: &Node) -> bool {
-        self.with_mount(node.mnt(), |m| m.root == *node)
-            .unwrap_or(false)
-    }
-
-    /// When `node` is the root of a mount, that mount's mount point.
-    fn point_of(&self, node: &Node) -> Option<Node> {
-        self.root_point(node).map(|(point, _)| point)
-    }
-
-    /// When `node` is the root of an attached mount with a mount point, the mount point and
-    /// [`Mount::at`].
-    fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
-        let mounts = self.mounts.borrow();
-        let m = mounts.list.iter().find(|m| m.id == node.mnt())?;
-        if m.root != *node {
-            return None;
-        }
-        Some((m.point.clone()?, m.at.clone()))
-    }
-
-    /// The node's file type bits.
-    pub(crate) fn kind(&self, ps: &dyn Pseudo, node: &Node) -> Result<u32, Errno> {
-        match node {
-            Node::Store(_, ino) => self.store.kind(*ino),
-            Node::Pseudo(_, p) => ps.kind(p),
-        }
-    }
-
-    /// Whether it is a directory.
-    pub(crate) fn is_dir(&self, ps: &dyn Pseudo, node: &Node) -> Result<bool, Errno> {
-        Ok(self.kind(ps, node)? == mode::S_IFDIR)
-    }
-
-    /// Looks up a name (not `.` or `..`) in a directory.
-    fn lookup(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> Result<Node, Errno> {
-        let child = match dir {
-            Node::Store(id, ino) => {
-                Node::Store(*id, self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?)
-            }
-            Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(*id, p, name)?),
-        };
-        Ok(self.mounted(child))
-    }
-
-    /// Directory `dir` already has `name` (`.` and `..` always exist): before creating in it,
-    /// ahead of the check whether the directory can be modified (Linux's `filename_create`).
-    pub(crate) fn has_child(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> bool {
-        name == b"." || name == b".." || self.lookup(ps, dir, name).is_ok()
-    }
-
-    /// The directory's parent; the parent of a mount's root is the mount point's parent
-    /// (getdents's `..`).
-    pub(crate) fn parent(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
-        let mut dir = dir.clone();
-        while let Some(point) = self.point_of(&dir) {
-            dir = point;
-        }
-        self.parent_in_fs(ps, &dir)
-    }
-
-    /// The parent directory within the same mount. A mount's root has no parent and is its own:
-    /// the root of the mount tree and the root of a detached mount (`MNT_DETACH`), and inside a
-    /// bind mount nothing outside the bound directory is visible.
-    fn parent_in_fs(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
-        if self.is_mount_root(dir) {
-            return Ok(dir.clone());
-        }
-        Ok(match dir {
-            Node::Store(id, ino) => Node::Store(*id, self.store.parent(*ino)?),
-            Node::Pseudo(id, p) => ps.parent(p).map_or(dir.clone(), |up| Node::Pseudo(*id, up)),
-        })
-    }
-
-    /// `..` in a path (Linux's `follow_dotdot`): stays put at the root directory; at a mount's
-    /// root it first goes back to the mount point (one level at a time through stacked mounts),
-    /// then takes the parent, and enters the mount on the parent when something is mounted there.
-    fn dotdot(&self, ps: &dyn Pseudo, root: &Node, mut dir: Node) -> Result<Node, Errno> {
-        loop {
-            if dir == *root {
-                return Ok(dir);
-            }
-            match self.point_of(&dir) {
-                Some(point) => dir = point,
-                None => break,
-            }
-        }
-        let up = self.parent_in_fs(ps, &dir)?;
-        Ok(self.mounted(up))
-    }
-
-    /// `node` is `top` or below it: searched upwards through mount points (Linux's
-    /// `is_path_reachable`). Mounts on files go through the directory recorded at mount time.
-    pub(crate) fn is_under(&self, ps: &dyn Pseudo, node: &Node, top: &Node) -> bool {
-        let mut cur = node.clone();
-        loop {
-            if cur == *top {
-                return true;
-            }
-            if let Some((point, at)) = self.root_point(&cur) {
-                cur = match at {
-                    Some((dir, _)) if point != *top => dir,
-                    _ => point,
-                };
-                continue;
-            }
-            match self.parent_in_fs(ps, &cur) {
-                Ok(up) if up != cur => cur = up,
-                _ => return false,
-            }
-        }
-    }
-
-    /// Contents of a symlink.
-    pub(crate) fn readlink(&self, ps: &dyn Pseudo, node: &Node) -> Result<Vec<u8>, Errno> {
-        match node {
-            Node::Store(_, ino) => self.store.readlink(*ino),
-            Node::Pseudo(id, p) => ps.readlink(*id, p),
-        }
-    }
-
-    /// Whether, with `fs.protected_symlinks` on, symlink `link` in directory `dir` may be
-    /// followed (Linux's `may_follow_link`): someone else's link in a sticky, world-writable
-    /// directory (/tmp) is followed only when the link's owner is the directory's owner, for root
-    /// too; otherwise EACCES.
-    fn may_follow_link(&self, cred: &Cred, dir: Ino, link: Ino) -> Result<(), Errno> {
-        let link = self.store.stat(link)?;
-        if link.uid == cred.fsuid {
-            return Ok(());
-        }
-        let dir = self.store.stat(dir)?;
-        let sticky_shared = mode::S_ISVTX | 0o002;
-        if dir.mode & sticky_shared != sticky_shared || dir.uid == link.uid {
-            return Ok(());
-        }
-        Err(Errno::EACCES)
-    }
-
-    /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
-    /// synthetic filesystems always can.
-    fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
-        match dir {
-            Node::Store(_, ino) if !cred.searches_all() => {
-                cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
-            }
-            _ => Ok(()),
-        }
-    }
+    // ---- Path resolution ----
 
     /// Resolves a path with credentials `cred` and root directory `root`. With `follow` false a
     /// symlink in the last component is not followed (lstat, readlink and so on).
@@ -1001,46 +907,6 @@ impl Vfs {
     ) -> Result<Node, Errno> {
         self.walk(ps, cred, root, cwd, path, follow)
             .map(|(node, _)| node)
-    }
-
-    /// The absolute path of the file a path points at, with all symlinks resolved
-    /// ([`found_path`](Self::found_path)).
-    #[cfg(test)]
-    pub(crate) fn real_path(
-        &self,
-        ps: &dyn Pseudo,
-        cred: &Cred,
-        root: &Node,
-        cwd: &Node,
-        path: &[u8],
-    ) -> Result<Vec<u8>, Errno> {
-        let (node, found) = self.walk(ps, cred, root, cwd, path, true)?;
-        self.found_path(ps, root, &node, found.as_ref())
-    }
-
-    /// The absolute path of the `node` [`walk`](Self::walk) found, computed from the directory
-    /// and name `found` where it was last found, with all symlinks resolved (`/proc/<pid>/exe`,
-    /// as with Linux's `d_path`). A file reached through `/proc/<pid>/fd/<n>`, whose name is
-    /// unknown, reports ENOENT.
-    pub(crate) fn found_path(
-        &self,
-        ps: &dyn Pseudo,
-        root: &Node,
-        node: &Node,
-        found: Option<&Dentry>,
-    ) -> Result<Vec<u8>, Errno> {
-        match found {
-            Some((dir, name)) => {
-                let mut p = self.path_of(ps, root, dir)?;
-                if p != b"/" {
-                    p.push(b'/');
-                }
-                p.extend_from_slice(name);
-                Ok(p)
-            }
-            None if self.is_dir(ps, node)? => self.path_of(ps, root, node),
-            None => Err(Errno::ENOENT),
-        }
     }
 
     /// [`resolve`](Self::resolve), also returning the directory and name where the result was
@@ -1214,6 +1080,51 @@ impl Vfs {
         Ok((dir, found))
     }
 
+    /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
+    /// synthetic filesystems always can.
+    fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
+        match dir {
+            Node::Store(_, ino) if !cred.searches_all() => {
+                cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `..` in a path (Linux's `follow_dotdot`): stays put at the root directory; at a mount's
+    /// root it first goes back to the mount point (one level at a time through stacked mounts),
+    /// then takes the parent, and enters the mount on the parent when something is mounted there.
+    fn dotdot(&self, ps: &dyn Pseudo, root: &Node, mut dir: Node) -> Result<Node, Errno> {
+        loop {
+            if dir == *root {
+                return Ok(dir);
+            }
+            match self.point_of(&dir) {
+                Some(point) => dir = point,
+                None => break,
+            }
+        }
+        let up = self.parent_in_fs(ps, &dir)?;
+        Ok(self.mounted(up))
+    }
+
+    /// Whether, with `fs.protected_symlinks` on, symlink `link` in directory `dir` may be
+    /// followed (Linux's `may_follow_link`): someone else's link in a sticky, world-writable
+    /// directory (/tmp) is followed only when the link's owner is the directory's owner, for root
+    /// too; otherwise EACCES.
+    fn may_follow_link(&self, cred: &Cred, dir: Ino, link: Ino) -> Result<(), Errno> {
+        let link = self.store.stat(link)?;
+        if link.uid == cred.fsuid {
+            return Ok(());
+        }
+        let dir = self.store.stat(dir)?;
+        let sticky_shared = mode::S_ISVTX | 0o002;
+        if dir.mode & sticky_shared != sticky_shared || dir.uid == link.uid {
+            return Ok(());
+        }
+        Err(Errno::EACCES)
+    }
+
     /// Resolves the parent directory of a path, returning the parent and the last component
     /// (with trailing `/` removed).
     ///
@@ -1266,6 +1177,46 @@ impl Vfs {
             return Err(Errno::ENOTDIR);
         }
         Ok((dir, name))
+    }
+
+    /// The absolute path of the file a path points at, with all symlinks resolved
+    /// ([`found_path`](Self::found_path)).
+    #[cfg(test)]
+    pub(crate) fn real_path(
+        &self,
+        ps: &dyn Pseudo,
+        cred: &Cred,
+        root: &Node,
+        cwd: &Node,
+        path: &[u8],
+    ) -> Result<Vec<u8>, Errno> {
+        let (node, found) = self.walk(ps, cred, root, cwd, path, true)?;
+        self.found_path(ps, root, &node, found.as_ref())
+    }
+
+    /// The absolute path of the `node` [`walk`](Self::walk) found, computed from the directory
+    /// and name `found` where it was last found, with all symlinks resolved (`/proc/<pid>/exe`,
+    /// as with Linux's `d_path`). A file reached through `/proc/<pid>/fd/<n>`, whose name is
+    /// unknown, reports ENOENT.
+    pub(crate) fn found_path(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        node: &Node,
+        found: Option<&Dentry>,
+    ) -> Result<Vec<u8>, Errno> {
+        match found {
+            Some((dir, name)) => {
+                let mut p = self.path_of(ps, root, dir)?;
+                if p != b"/" {
+                    p.push(b'/');
+                }
+                p.extend_from_slice(name);
+                Ok(p)
+            }
+            None if self.is_dir(ps, node)? => self.path_of(ps, root, node),
+            None => Err(Errno::ENOENT),
+        }
     }
 
     /// The absolute path of a directory relative to root `root` (Linux's `d_path`:
@@ -1353,6 +1304,127 @@ impl Vfs {
             out.extend_from_slice(name);
         }
         Ok((out, reached))
+    }
+
+    /// Whether it is a directory.
+    pub(crate) fn is_dir(&self, ps: &dyn Pseudo, node: &Node) -> Result<bool, Errno> {
+        Ok(self.kind(ps, node)? == mode::S_IFDIR)
+    }
+
+    /// The node's file type bits.
+    pub(crate) fn kind(&self, ps: &dyn Pseudo, node: &Node) -> Result<u32, Errno> {
+        match node {
+            Node::Store(_, ino) => self.store.kind(*ino),
+            Node::Pseudo(_, p) => ps.kind(p),
+        }
+    }
+
+    /// Directory `dir` already has `name` (`.` and `..` always exist): before creating in it,
+    /// ahead of the check whether the directory can be modified (Linux's `filename_create`).
+    pub(crate) fn has_child(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> bool {
+        name == b"." || name == b".." || self.lookup(ps, dir, name).is_ok()
+    }
+
+    /// Looks up a name (not `.` or `..`) in a directory.
+    fn lookup(&self, ps: &dyn Pseudo, dir: &Node, name: &[u8]) -> Result<Node, Errno> {
+        let child = match dir {
+            Node::Store(id, ino) => {
+                Node::Store(*id, self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?)
+            }
+            Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(*id, p, name)?),
+        };
+        Ok(self.mounted(child))
+    }
+
+    /// When something is mounted on the node, replaces it with the root of the mount on it; with
+    /// several mounts stacked, keeps going up to the topmost one (Linux's `follow_mount`).
+    pub(crate) fn mounted(&self, node: Node) -> Node {
+        let mounts = self.mounts.borrow();
+        let mut node = node;
+        while let Some(m) = mounts
+            .list
+            .iter()
+            .rev()
+            .find(|m| m.point.as_ref() == Some(&node))
+        {
+            node = m.root.clone();
+        }
+        node
+    }
+
+    /// Contents of a symlink.
+    pub(crate) fn readlink(&self, ps: &dyn Pseudo, node: &Node) -> Result<Vec<u8>, Errno> {
+        match node {
+            Node::Store(_, ino) => self.store.readlink(*ino),
+            Node::Pseudo(id, p) => ps.readlink(*id, p),
+        }
+    }
+
+    /// The directory's parent; the parent of a mount's root is the mount point's parent
+    /// (getdents's `..`).
+    pub(crate) fn parent(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
+        let mut dir = dir.clone();
+        while let Some(point) = self.point_of(&dir) {
+            dir = point;
+        }
+        self.parent_in_fs(ps, &dir)
+    }
+
+    /// `node` is `top` or below it: searched upwards through mount points (Linux's
+    /// `is_path_reachable`). Mounts on files go through the directory recorded at mount time.
+    pub(crate) fn is_under(&self, ps: &dyn Pseudo, node: &Node, top: &Node) -> bool {
+        let mut cur = node.clone();
+        loop {
+            if cur == *top {
+                return true;
+            }
+            if let Some((point, at)) = self.root_point(&cur) {
+                cur = match at {
+                    Some((dir, _)) if point != *top => dir,
+                    _ => point,
+                };
+                continue;
+            }
+            match self.parent_in_fs(ps, &cur) {
+                Ok(up) if up != cur => cur = up,
+                _ => return false,
+            }
+        }
+    }
+
+    /// When `node` is the root of a mount, that mount's mount point.
+    fn point_of(&self, node: &Node) -> Option<Node> {
+        self.root_point(node).map(|(point, _)| point)
+    }
+
+    /// The parent directory within the same mount. A mount's root has no parent and is its own:
+    /// the root of the mount tree and the root of a detached mount (`MNT_DETACH`), and inside a
+    /// bind mount nothing outside the bound directory is visible.
+    fn parent_in_fs(&self, ps: &dyn Pseudo, dir: &Node) -> Result<Node, Errno> {
+        if self.is_mount_root(dir) {
+            return Ok(dir.clone());
+        }
+        Ok(match dir {
+            Node::Store(id, ino) => Node::Store(*id, self.store.parent(*ino)?),
+            Node::Pseudo(id, p) => ps.parent(p).map_or(dir.clone(), |up| Node::Pseudo(*id, up)),
+        })
+    }
+
+    /// When `node` is the root of an attached mount with a mount point, the mount point and
+    /// [`Mount::at`].
+    fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
+        let mounts = self.mounts.borrow();
+        let m = mounts.list.iter().find(|m| m.id == node.mnt())?;
+        if m.root != *node {
+            return None;
+        }
+        Some((m.point.clone()?, m.at.clone()))
+    }
+
+    /// `node` is the root of the mount it is in (attached and detached ones both count).
+    fn is_mount_root(&self, node: &Node) -> bool {
+        self.with_mount(node.mnt(), |m| m.root == *node)
+            .unwrap_or(false)
     }
 
     // ---- Mount table (mount(2), umount2(2), pivot_root(2), mountinfo) ----
@@ -1567,15 +1639,6 @@ impl Vfs {
         mounts.list.iter().find(|m| m.id == id).map(|m| m.ns)
     }
 
-    /// Some mount namespace has no references left while its mounts are not yet detached:
-    /// cleanup must handle it.
-    pub(crate) fn has_dead_ns(&self) -> bool {
-        self.namespaces
-            .borrow()
-            .iter()
-            .any(|w| w.strong_count() == 0)
-    }
-
     /// The attached mount with id `id`; None for detached ones.
     pub(crate) fn mount(&self, id: MountId) -> Option<Mount> {
         self.mounts
@@ -1640,6 +1703,12 @@ impl Vfs {
             })
     }
 
+    /// When `node` is in tmpfs, that instance's device number (used by [`Vfs::tmpfs_usage`] and
+    /// others).
+    pub(crate) fn tmpfs_dev(&self, node: &Node) -> Option<u64> {
+        (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
+    }
+
     /// The kind of filesystem `node` is in.
     pub(crate) fn fs_of(&self, node: &Node) -> Fs {
         self.with_mount(node.mnt(), |m| m.fs)
@@ -1647,42 +1716,6 @@ impl Vfs {
                 Node::Store(..) => Fs::Store,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p),
             })
-    }
-
-    /// When `node` is in tmpfs, that instance's device number (used by [`Vfs::tmpfs_usage`] and
-    /// others).
-    pub(crate) fn tmpfs_dev(&self, node: &Node) -> Option<u64> {
-        (self.fs_of(node) == Fs::Tmpfs).then(|| self.dev_of(node))
-    }
-
-    /// Parameters and usage (pages, inodes) of tmpfs instance `dev`. Usage is counted as in
-    /// Linux's tmpfs: the root directory and every name take one inode each (hard links too;
-    /// Linux's `shmem_link` takes another for each link), regular files by page count (treated
-    /// as having no holes, like appine's `st_blocks`), long symlinks one page. With `fresh` it
-    /// recounts (statfs, remount: changes that bypass the accounting, such as direct changes to
-    /// the store or writes through shared mappings, are included too); otherwise it uses the
-    /// recorded usage and counts only when none is recorded.
-    pub(crate) fn tmpfs_usage(
-        &self,
-        dev: u64,
-        fresh: bool,
-    ) -> Result<(TmpfsParams, u64, u64), Errno> {
-        let (params, root, used) = {
-            let mounts = self.mounts.borrow();
-            let t = mounts.tmpfs.get(&dev).ok_or(Errno::EINVAL)?;
-            (t.params.clone(), t.root, t.used)
-        };
-        let (pages, inodes) = match used {
-            Some(u) if !fresh => u,
-            _ => {
-                let u = self.count_tmpfs(root)?;
-                if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
-                    t.used = Some(u);
-                }
-                u
-            }
-        };
-        Ok((params, pages, inodes))
     }
 
     /// Whether `pages` more pages and `inodes` more inodes fit in tmpfs instance `dev` (Linux's
@@ -1728,6 +1761,36 @@ impl Vfs {
             t.params = params;
         }
         Ok(())
+    }
+
+    /// Parameters and usage (pages, inodes) of tmpfs instance `dev`. Usage is counted as in
+    /// Linux's tmpfs: the root directory and every name take one inode each (hard links too;
+    /// Linux's `shmem_link` takes another for each link), regular files by page count (treated
+    /// as having no holes, like appine's `st_blocks`), long symlinks one page. With `fresh` it
+    /// recounts (statfs, remount: changes that bypass the accounting, such as direct changes to
+    /// the store or writes through shared mappings, are included too); otherwise it uses the
+    /// recorded usage and counts only when none is recorded.
+    pub(crate) fn tmpfs_usage(
+        &self,
+        dev: u64,
+        fresh: bool,
+    ) -> Result<(TmpfsParams, u64, u64), Errno> {
+        let (params, root, used) = {
+            let mounts = self.mounts.borrow();
+            let t = mounts.tmpfs.get(&dev).ok_or(Errno::EINVAL)?;
+            (t.params.clone(), t.root, t.used)
+        };
+        let (pages, inodes) = match used {
+            Some(u) if !fresh => u,
+            _ => {
+                let u = self.count_tmpfs(root)?;
+                if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
+                    t.used = Some(u);
+                }
+                u
+            }
+        };
+        Ok((params, pages, inodes))
     }
 
     /// Counts the usage of the tmpfs rooted at `root` (pages, inodes; see
@@ -1848,6 +1911,33 @@ impl Vfs {
             .collect()
     }
 
+    /// Mounts a new tmpfs instance (whose root directory is created here), returning the new
+    /// mount's id.
+    pub(crate) fn new_tmpfs(
+        &self,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        params: TmpfsParams,
+    ) -> Result<MountId, Errno> {
+        let root = self
+            .store
+            .create_detached_dir(params.perm, params.uid, params.gid)?;
+        let id = self.add_mount(Fs::Tmpfs, Node::Store(0, root), point, flags, source, None);
+        let mut mounts = self.mounts.borrow_mut();
+        let dev = mounts.list.iter().find(|m| m.id == id).map_or(0, |m| m.dev);
+        mounts.tmpfs.insert(
+            dev,
+            Tmpfs {
+                root,
+                params,
+                // Only the root directory
+                used: Some((0, 1)),
+            },
+        );
+        Ok(id)
+    }
+
     /// Mounts `root` in filesystem `fs` ([`Fs::root`], or a node reached through another mount)
     /// on `point`, returning the new mount's id. With `dev` None a device number is allocated
     /// ([`Fs::own_dev`]); bind mounts use the source's. When `point` is a file in the store,
@@ -1930,33 +2020,6 @@ impl Vfs {
         if let Some(dev) = mounts.list.iter().find(|m| m.id == id).map(|m| m.dev) {
             mounts.proc_ns.insert(dev, ns);
         }
-    }
-
-    /// Mounts a new tmpfs instance (whose root directory is created here), returning the new
-    /// mount's id.
-    pub(crate) fn new_tmpfs(
-        &self,
-        point: (Node, Option<Dentry>),
-        flags: u64,
-        source: Vec<u8>,
-        params: TmpfsParams,
-    ) -> Result<MountId, Errno> {
-        let root = self
-            .store
-            .create_detached_dir(params.perm, params.uid, params.gid)?;
-        let id = self.add_mount(Fs::Tmpfs, Node::Store(0, root), point, flags, source, None);
-        let mut mounts = self.mounts.borrow_mut();
-        let dev = mounts.list.iter().find(|m| m.id == id).map_or(0, |m| m.dev);
-        mounts.tmpfs.insert(
-            dev,
-            Tmpfs {
-                root,
-                params,
-                // Only the root directory
-                used: Some((0, 1)),
-            },
-        );
-        Ok(id)
     }
 
     /// Mounts mounted directly in mount `id`, in mount order.
@@ -2080,6 +2143,15 @@ impl Vfs {
         }
     }
 
+    /// Some mount namespace has no references left while its mounts are not yet detached:
+    /// cleanup must handle it.
+    pub(crate) fn has_dead_ns(&self) -> bool {
+        self.namespaces
+            .borrow()
+            .iter()
+            .any(|w| w.strong_count() == 0)
+    }
+
     /// Moves attached mount `id` onto `point` (`MS_MOVE`, pivot_root); None makes it the root
     /// of the mount tree.
     pub(crate) fn move_mount(&self, id: MountId, point: Option<(Node, Option<Dentry>)>) {
@@ -2122,6 +2194,17 @@ impl Vfs {
         self.mounts_changed();
     }
 
+    /// Runs `f` on the mount with id `id` (attached or detached).
+    fn with_mount<T>(&self, id: MountId, f: impl FnOnce(&Mount) -> T) -> Option<T> {
+        let mounts = self.mounts.borrow();
+        mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .find(|m| m.id == id)
+            .map(f)
+    }
+
     /// The mount table changed: the mount points used by no-BKL path resolution are replaced to
     /// match (the caller separately makes each thread fetch them again,
     /// [`Shared::fast_changed`](crate::kernel::Shared::fast_changed)).
@@ -2133,94 +2216,6 @@ impl Vfs {
         let mut cached = self.cached.borrow_mut();
         cached.mounts = points;
         cached.usable = usable;
-    }
-}
-
-impl Mount {
-    /// The mount the mount point is in (the second column of mountinfo); the root of the mount
-    /// tree and detached mounts have none.
-    pub(crate) fn parent(&self) -> Option<MountId> {
-        self.point.as_ref().map(Node::mnt)
-    }
-}
-
-impl Mounts {
-    /// A boot mount: root `root` of filesystem `fs` (device number `dev`) mounted on `point`;
-    /// not mounted when there is no mount point.
-    fn boot(
-        &mut self,
-        id: MountId,
-        (fs, root, dev): (Fs, Node, u64),
-        point: Option<Node>,
-        flags: u64,
-        source: &[u8],
-    ) {
-        let Some(point) = point else {
-            crate::debug::log(format_args!("no mount point for {fs:?}"));
-            return;
-        };
-        self.list.push(Mount {
-            id,
-            ns: INIT_MNT_NS,
-            fs,
-            root,
-            point: Some(point),
-            at: None,
-            root_at: None,
-            flags,
-            dev,
-            source: source.to_vec(),
-            expiring: false,
-            pin: None,
-        });
-    }
-
-    /// A tmpfs mounted at boot (the same as [`Vfs::new_tmpfs`], except that the mount id is
-    /// fixed); returns its root directory.
-    fn boot_tmpfs(
-        &mut self,
-        store: &Store,
-        id: MountId,
-        point: Node,
-        flags: u64,
-        source: &[u8],
-        params: TmpfsParams,
-    ) -> Result<Ino, Errno> {
-        let root = store.create_detached_dir(params.perm, params.uid, params.gid)?;
-        let dev = self.next_dev;
-        self.next_dev += 1;
-        let fs = (Fs::Tmpfs, Node::Store(id, root), dev);
-        self.boot(id, fs, Some(point), flags, source);
-        // Usage is counted when needed ([`dev::populate`] created nodes in it)
-        let used = None;
-        self.tmpfs.insert(dev, Tmpfs { root, params, used });
-        Ok(root)
-    }
-
-    /// Mount points in the store; no-BKL resolution hands back to normal resolution when it
-    /// meets one. When the boot root filesystem is not the root of the mount tree (after
-    /// pivot_root), its root directory counts too: `..` has to leave through its mount point.
-    fn store_points(&self) -> Arc<[Ino]> {
-        let top = self
-            .list
-            .iter()
-            .any(|m| m.id == ROOT_MOUNT && m.point.is_none());
-        self.list
-            .iter()
-            .filter_map(|m| match m.point {
-                Some(Node::Store(_, ino)) => Some(ino),
-                _ => None,
-            })
-            .chain((!top).then_some(ROOT))
-            .collect()
-    }
-
-    /// The boot root filesystem is still attached and not nosymfollow: no-BKL resolution walks
-    /// only inside it.
-    fn fast_usable(&self) -> bool {
-        self.list
-            .iter()
-            .any(|m| m.id == ROOT_MOUNT && m.flags & ms::NOSYMFOLLOW == 0)
     }
 }
 
@@ -2322,15 +2317,22 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
         .map(<[u8]>::to_vec)
 }
 
-/// A directory and one name in it.
-pub(crate) type Dentry = (Node, Vec<u8>);
-
 /// Mount `m` is mounted on `name` (inode `ino`) in store directory `dir`.
 fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
     matches!(m.point, Some(Node::Store(_, i)) if i == ino)
         && m.at
             .as_ref()
             .is_none_or(|(d, n)| d.ino() == Some(dir) && n == name)
+}
+
+/// Pages one inode takes in tmpfs: regular files by size, symlinks one page when the target is
+/// 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`; short ones live in the inode), others none.
+pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
+    match st.kind() {
+        mode::S_IFREG => st.size.div_ceil(TMPFS_PAGE),
+        mode::S_IFLNK => u64::from(st.size >= 128),
+        _ => 0,
+    }
 }
 
 /// Normalizes an absolute path lexically: drops `.` and empty components, and steps back for

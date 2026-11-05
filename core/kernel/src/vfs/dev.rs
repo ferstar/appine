@@ -25,11 +25,6 @@ pub enum Device {
     Kmsg,
 }
 
-/// Linux's device number encoding (`new_encode_dev`).
-pub const fn rdev(major: u32, minor: u32) -> u64 {
-    ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
-}
-
 impl Device {
     /// Looks up by device number; ENXIO for devices that are not implemented.
     pub fn from_rdev(rdev_value: u64) -> Result<Device, Errno> {
@@ -42,6 +37,11 @@ impl Device {
             _ => Err(Errno::ENXIO),
         }
     }
+}
+
+/// Linux's device number encoding (`new_encode_dev`).
+pub const fn rdev(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
 /// The standard nodes in `/dev`: name, device number, permissions. Terminal devices (tty,

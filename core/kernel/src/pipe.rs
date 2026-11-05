@@ -50,9 +50,24 @@ pub struct Pipe {
 }
 
 impl Pipe {
-    /// Remaining space.
-    pub fn space(&self) -> usize {
-        self.capacity.saturating_sub(self.buf.len())
+    fn new(ino: u64, fifo: Option<Ino>, capacity: usize) -> Rc<RefCell<Pipe>> {
+        Rc::new(RefCell::new(Pipe {
+            buf: VecDeque::new(),
+            capacity,
+            readers: 0,
+            writers: 0,
+            ino,
+            fifo,
+            reader_opens: 0,
+            writer_opens: 0,
+            writer_need: 0,
+            writes: 0,
+        }))
+    }
+
+    /// The pipe object of named pipe `ino`, with no ends yet.
+    pub fn fifo(ino: Ino, capacity: usize) -> Rc<RefCell<Pipe>> {
+        Pipe::new(ino, Some(ino), capacity)
     }
 
     /// A write end waits for at least `need` bytes of space.
@@ -78,24 +93,9 @@ impl Pipe {
         wake
     }
 
-    fn new(ino: u64, fifo: Option<Ino>, capacity: usize) -> Rc<RefCell<Pipe>> {
-        Rc::new(RefCell::new(Pipe {
-            buf: VecDeque::new(),
-            capacity,
-            readers: 0,
-            writers: 0,
-            ino,
-            fifo,
-            reader_opens: 0,
-            writer_opens: 0,
-            writer_need: 0,
-            writes: 0,
-        }))
-    }
-
-    /// The pipe object of named pipe `ino`, with no ends yet.
-    pub fn fifo(ino: Ino, capacity: usize) -> Rc<RefCell<Pipe>> {
-        Pipe::new(ino, Some(ino), capacity)
+    /// Remaining space.
+    pub fn space(&self) -> usize {
+        self.capacity.saturating_sub(self.buf.len())
     }
 }
 

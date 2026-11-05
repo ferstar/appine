@@ -70,6 +70,8 @@ const MAX_INSTANCES: usize = 128;
 /// The most watches per user (the default of `max_user_watches`).
 const MAX_WATCHES: usize = 1 << 20;
 
+// ---- Instances and watches ----
+
 struct Watch {
     node: Node,
     mask: u32,
@@ -131,33 +133,36 @@ impl Default for Inotify {
     }
 }
 
-impl Drop for Inotify {
-    fn drop(&mut self) {
-        let Some(registry) = self.registry.upgrade() else {
-            return;
-        };
-        let Ok(mut r) = registry.try_borrow_mut() else {
-            return;
-        };
-        let user = r.users.entry(self.uid).or_default();
-        user.0 = user.0.saturating_sub(1);
-        user.1 = user.1.saturating_sub(self.watches.len());
-        for w in self.watches.values() {
-            if let Node::Store(_, ino) = w.node
-                && let Some(list) = r.by_ino.get_mut(&ino)
-            {
-                // An instance being dropped has no strong references left, so all weak
-                // references to it are dead
-                list.retain(|(weak, _)| weak.strong_count() > 0);
-                if list.is_empty() {
-                    r.by_ino.remove(&ino);
-                }
-            }
-        }
-    }
-}
-
 impl Inotify {
+    fn push(&mut self, wd: i32, mask: u32, cookie: u32, name: &[u8]) {
+        let event = Event {
+            wd,
+            mask,
+            cookie,
+            name: name.to_vec(),
+        };
+        if self.queue.back() == Some(&event) {
+            return;
+        }
+        let event = if self.queue.len() < self.max_queued {
+            event
+        } else if self.overflowed {
+            return;
+        } else {
+            self.overflowed = true;
+            Event {
+                wd: -1,
+                mask: IN_Q_OVERFLOW,
+                cookie: 0,
+                name: Vec::new(),
+            }
+        };
+        self.bytes += event.len();
+        self.queue.push_back(event);
+        self.queued += 1;
+        request_wake_object(wake::of_value(self));
+    }
+
     /// Whether there are events to read.
     pub fn ready(&self) -> bool {
         !self.queue.is_empty()
@@ -200,36 +205,190 @@ impl Inotify {
         }
         out
     }
+}
 
-    fn push(&mut self, wd: i32, mask: u32, cookie: u32, name: &[u8]) {
-        let event = Event {
-            wd,
-            mask,
-            cookie,
-            name: name.to_vec(),
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
         };
-        if self.queue.back() == Some(&event) {
+        let Ok(mut r) = registry.try_borrow_mut() else {
             return;
-        }
-        let event = if self.queue.len() < self.max_queued {
-            event
-        } else if self.overflowed {
-            return;
-        } else {
-            self.overflowed = true;
-            Event {
-                wd: -1,
-                mask: IN_Q_OVERFLOW,
-                cookie: 0,
-                name: Vec::new(),
+        };
+        let user = r.users.entry(self.uid).or_default();
+        user.0 = user.0.saturating_sub(1);
+        user.1 = user.1.saturating_sub(self.watches.len());
+        for w in self.watches.values() {
+            if let Node::Store(_, ino) = w.node
+                && let Some(list) = r.by_ino.get_mut(&ino)
+            {
+                // An instance being dropped has no strong references left, so all weak
+                // references to it are dead
+                list.retain(|(weak, _)| weak.strong_count() > 0);
+                if list.is_empty() {
+                    r.by_ino.remove(&ino);
+                }
             }
-        };
-        self.bytes += event.len();
-        self.queue.push_back(event);
-        self.queued += 1;
-        request_wake_object(wake::of_value(self));
+        }
     }
 }
+
+pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
+    if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let uid = cx.cred().euid;
+    let registry = cx.kr().inotify.clone();
+    let mut r = registry.borrow_mut();
+    if r.users.get(&uid).map_or(0, |u| u.0) >= r.max_instances {
+        return Err(Errno::EMFILE);
+    }
+    r.users.entry(uid).or_default().0 += 1;
+    let mut inotify = Inotify::default();
+    inotify.max_queued = r.max_queued;
+    inotify.uid = uid;
+    inotify.registry = Rc::downgrade(&registry);
+    drop(r);
+    // If it does not fit in the fd table the instance is dropped here, and the counts are
+    // returned with it
+    let file = OpenFile::new(
+        FileKind::Inotify(Rc::new(RefCell::new(inotify))),
+        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
+    );
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) -> SysResult {
+    let inotify = inotify_of(cx, fd)?;
+    let path = read_path(cx, path)?;
+    if mask & IN_ALL_EVENTS == 0 || mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let node = super::fs::lookup_at(cx, super::fs::AT_FDCWD, &path, mask & IN_DONT_FOLLOW == 0)?;
+    let vfs = cx.vfs()?;
+    let view = cx.view(&vfs);
+    if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
+        return Err(Errno::ENOTDIR);
+    }
+    if let Node::Store(_, ino) = node {
+        cx.cred().permission(&vfs.store().stat(ino)?, MAY_READ)?;
+    }
+    let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
+    let mut i = inotify.borrow_mut();
+    // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
+    if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.node == node) {
+        if mask & IN_MASK_CREATE != 0 {
+            return Err(Errno::EEXIST);
+        }
+        w.mask = if mask & IN_MASK_ADD != 0 {
+            w.mask | (mask & keep)
+        } else {
+            mask & keep
+        };
+        return Ok(wd as u64);
+    }
+    let registry = cx.kr().inotify.clone();
+    let mut r = registry.borrow_mut();
+    let user = r.users.get(&i.uid).map_or(0, |u| u.1);
+    if user >= r.max_watches {
+        return Err(Errno::ENOSPC);
+    }
+    i.last_wd = i.last_wd.checked_add(1).ok_or(Errno::ENOSPC)?;
+    r.users.entry(i.uid).or_default().1 += 1;
+    let wd = i.last_wd;
+    i.watches.insert(
+        wd,
+        Watch {
+            node: node.clone(),
+            mask: mask & keep,
+        },
+    );
+    if let Node::Store(_, ino) = node {
+        r.vfs = Rc::downgrade(&vfs);
+        r.by_ino
+            .entry(ino)
+            .or_default()
+            .push((Rc::downgrade(&inotify), wd));
+    }
+    Ok(wd as u64)
+}
+
+pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
+    let inotify = inotify_of(cx, fd)?;
+    let mut i = inotify.borrow_mut();
+    let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
+    i.push(wd, IN_IGNORED, 0, b"");
+    let mut r = cx.kr().inotify.borrow_mut();
+    r.uncharge(i.uid);
+    if let Node::Store(_, ino) = w.node
+        && let Some(list) = r.by_ino.get_mut(&ino)
+    {
+        list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
+        if list.is_empty() {
+            r.by_ino.remove(&ino);
+        }
+    }
+    Ok(0)
+}
+
+fn inotify_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<Inotify>>, Errno> {
+    match &cx.fds().get(fd)?.borrow().kind {
+        FileKind::Inotify(i) => Ok(i.clone()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Reads the queued events: as many as fit, EINVAL if not even the first fits; blocks when there
+/// are none.
+pub(super) fn read(
+    cx: &mut Cx<'_>,
+    inotify: &Rc<RefCell<Inotify>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        {
+            let mut i = inotify.borrow_mut();
+            if let Some(first) = i.queue.front() {
+                if first.len() > buf.len() {
+                    return Err(Errno::EINVAL);
+                }
+                let mut n = 0;
+                while let Some(e) = i.queue.front() {
+                    let len = e.len();
+                    if n + len > buf.len() {
+                        break;
+                    }
+                    let out = &mut buf[n..n + len];
+                    out.fill(0);
+                    out[0..4].copy_from_slice(&e.wd.to_le_bytes());
+                    out[4..8].copy_from_slice(&e.mask.to_le_bytes());
+                    out[8..12].copy_from_slice(&e.cookie.to_le_bytes());
+                    out[12..16].copy_from_slice(&((len - 16) as u32).to_le_bytes());
+                    out[16..16 + e.name.len()].copy_from_slice(&e.name);
+                    if e.mask == IN_Q_OVERFLOW {
+                        i.overflowed = false;
+                    }
+                    i.bytes -= len;
+                    i.queue.pop_front();
+                    n += len;
+                }
+                return Ok(n);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(inotify)])?;
+    }
+}
+
+// ---- Reporting ----
 
 /// An instance and wd watching some inode.
 type Watcher = (Weak<RefCell<Inotify>>, i32);
@@ -269,6 +428,18 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
+    /// the name), then to its own. Each instance that got an event requests a wakeup
+    /// (`Inotify::push`).
+    fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
+        if let Some((dir, name)) = parent
+            && mask & SELF_EVENTS == 0
+        {
+            self.deliver(dir, mask, 0, name, Some(ino));
+        }
+        self.deliver(ino, mask, 0, b"", None);
+    }
+
     /// Hands an event to the watches on `ino` that want it; returns whether any event was queued
     /// (instances that queue an event request a wakeup, see `Inotify::push`). `child` is the
     /// child when a directory gets a child's own event: watches with `IN_EXCL_UNLINK` do not want
@@ -349,18 +520,6 @@ impl Registry {
             self.notify(ino, None, IN_DELETE_SELF);
         }
     }
-
-    /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
-    /// the name), then to its own. Each instance that got an event requests a wakeup
-    /// (`Inotify::push`).
-    fn notify(&mut self, ino: Ino, parent: Option<(Ino, &[u8])>, mask: u32) {
-        if let Some((dir, name)) = parent
-            && mask & SELF_EVENTS == 0
-        {
-            self.deliver(dir, mask, 0, name, Some(ino));
-        }
-        self.deliver(ino, mask, 0, b"", None);
-    }
 }
 
 /// Carried by an open store file: fd-based events are reported to its directory through it, and
@@ -385,15 +544,32 @@ impl Drop for Opened {
     }
 }
 
-/// Whether there are any watches (with none, nothing needs doing for events).
-fn idle(k: &Kernel) -> bool {
-    k.inotify.borrow().by_ino.is_empty()
-}
-
 /// There are watches: callers use this to decide whether to query the store once more to report
 /// an event.
 pub(crate) fn active(k: &Kernel) -> bool {
     !idle(k)
+}
+
+/// The directory and name of the object of a path-based operation (for the directory's watches).
+/// Not resolved when there are no watches at all.
+pub(crate) fn watched_parent(
+    cx: &Cx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    follow: bool,
+) -> Option<(Ino, Vec<u8>)> {
+    if idle(cx.kr()) || path.is_empty() {
+        return None;
+    }
+    let vfs = cx.vfs().ok()?;
+    let start = super::fs::start_dir(cx, dirfd, path).ok()?;
+    let (_, found) = vfs
+        .walk(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path, follow)
+        .ok()?;
+    match found? {
+        (Node::Store(_, dir), name) => Some((dir, name)),
+        _ => None,
+    }
 }
 
 /// An event of the object `ino` itself in a path-based operation; `parent` is its directory and
@@ -606,181 +782,9 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
     }
 }
 
-/// The directory and name of the object of a path-based operation (for the directory's watches).
-/// Not resolved when there are no watches at all.
-pub(crate) fn watched_parent(
-    cx: &Cx<'_>,
-    dirfd: i32,
-    path: &[u8],
-    follow: bool,
-) -> Option<(Ino, Vec<u8>)> {
-    if idle(cx.kr()) || path.is_empty() {
-        return None;
-    }
-    let vfs = cx.vfs().ok()?;
-    let start = super::fs::start_dir(cx, dirfd, path).ok()?;
-    let (_, found) = vfs
-        .walk(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path, follow)
-        .ok()?;
-    match found? {
-        (Node::Store(_, dir), name) => Some((dir, name)),
-        _ => None,
-    }
-}
-
-pub(super) fn inotify_init1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
-    if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let uid = cx.cred().euid;
-    let registry = cx.kr().inotify.clone();
-    let mut r = registry.borrow_mut();
-    if r.users.get(&uid).map_or(0, |u| u.0) >= r.max_instances {
-        return Err(Errno::EMFILE);
-    }
-    r.users.entry(uid).or_default().0 += 1;
-    let mut inotify = Inotify::default();
-    inotify.max_queued = r.max_queued;
-    inotify.uid = uid;
-    inotify.registry = Rc::downgrade(&registry);
-    drop(r);
-    // If it does not fit in the fd table the instance is dropped here, and the counts are
-    // returned with it
-    let file = OpenFile::new(
-        FileKind::Inotify(Rc::new(RefCell::new(inotify))),
-        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
-    );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
-        .map(|fd| fd as u64)
-}
-
-fn inotify_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<Inotify>>, Errno> {
-    match &cx.fds().get(fd)?.borrow().kind {
-        FileKind::Inotify(i) => Ok(i.clone()),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) -> SysResult {
-    let inotify = inotify_of(cx, fd)?;
-    let path = read_path(cx, path)?;
-    if mask & IN_ALL_EVENTS == 0 || mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let node = super::fs::lookup_at(cx, super::fs::AT_FDCWD, &path, mask & IN_DONT_FOLLOW == 0)?;
-    let vfs = cx.vfs()?;
-    let view = cx.view(&vfs);
-    if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
-        return Err(Errno::ENOTDIR);
-    }
-    if let Node::Store(_, ino) = node {
-        cx.cred().permission(&vfs.store().stat(ino)?, MAY_READ)?;
-    }
-    let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
-    let mut i = inotify.borrow_mut();
-    // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
-    if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.node == node) {
-        if mask & IN_MASK_CREATE != 0 {
-            return Err(Errno::EEXIST);
-        }
-        w.mask = if mask & IN_MASK_ADD != 0 {
-            w.mask | (mask & keep)
-        } else {
-            mask & keep
-        };
-        return Ok(wd as u64);
-    }
-    let registry = cx.kr().inotify.clone();
-    let mut r = registry.borrow_mut();
-    let user = r.users.get(&i.uid).map_or(0, |u| u.1);
-    if user >= r.max_watches {
-        return Err(Errno::ENOSPC);
-    }
-    i.last_wd = i.last_wd.checked_add(1).ok_or(Errno::ENOSPC)?;
-    r.users.entry(i.uid).or_default().1 += 1;
-    let wd = i.last_wd;
-    i.watches.insert(
-        wd,
-        Watch {
-            node: node.clone(),
-            mask: mask & keep,
-        },
-    );
-    if let Node::Store(_, ino) = node {
-        r.vfs = Rc::downgrade(&vfs);
-        r.by_ino
-            .entry(ino)
-            .or_default()
-            .push((Rc::downgrade(&inotify), wd));
-    }
-    Ok(wd as u64)
-}
-
-pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
-    let inotify = inotify_of(cx, fd)?;
-    let mut i = inotify.borrow_mut();
-    let w = i.watches.remove(&wd).ok_or(Errno::EINVAL)?;
-    i.push(wd, IN_IGNORED, 0, b"");
-    let mut r = cx.kr().inotify.borrow_mut();
-    r.uncharge(i.uid);
-    if let Node::Store(_, ino) = w.node
-        && let Some(list) = r.by_ino.get_mut(&ino)
-    {
-        list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
-        if list.is_empty() {
-            r.by_ino.remove(&ino);
-        }
-    }
-    Ok(0)
-}
-
-/// Reads the queued events: as many as fit, EINVAL if not even the first fits; blocks when there
-/// are none.
-pub(super) fn read(
-    cx: &mut Cx<'_>,
-    inotify: &Rc<RefCell<Inotify>>,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    loop {
-        {
-            let mut i = inotify.borrow_mut();
-            if let Some(first) = i.queue.front() {
-                if first.len() > buf.len() {
-                    return Err(Errno::EINVAL);
-                }
-                let mut n = 0;
-                while let Some(e) = i.queue.front() {
-                    let len = e.len();
-                    if n + len > buf.len() {
-                        break;
-                    }
-                    let out = &mut buf[n..n + len];
-                    out.fill(0);
-                    out[0..4].copy_from_slice(&e.wd.to_le_bytes());
-                    out[4..8].copy_from_slice(&e.mask.to_le_bytes());
-                    out[8..12].copy_from_slice(&e.cookie.to_le_bytes());
-                    out[12..16].copy_from_slice(&((len - 16) as u32).to_le_bytes());
-                    out[16..16 + e.name.len()].copy_from_slice(&e.name);
-                    if e.mask == IN_Q_OVERFLOW {
-                        i.overflowed = false;
-                    }
-                    i.bytes -= len;
-                    i.queue.pop_front();
-                    n += len;
-                }
-                return Ok(n);
-            }
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(inotify)])?;
-    }
+/// Whether there are any watches (with none, nothing needs doing for events).
+fn idle(k: &Kernel) -> bool {
+    k.inotify.borrow().by_ino.is_empty()
 }
 
 #[cfg(test)]

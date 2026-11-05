@@ -35,107 +35,6 @@ pub(super) enum Target {
     Fd(i32),
 }
 
-/// Finds the object's node; EOPNOTSUPP for files not in a filesystem.
-fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
-    match target {
-        Target::Path(path, follow) => {
-            let path = read_path(cx, path)?;
-            lookup_at(cx, AT_FDCWD, &path, follow)
-        }
-        Target::Fd(fd) => {
-            let file = cx.fds().get(fd)?;
-            let f = file.borrow();
-            if f.flags & oflags::O_PATH != 0 {
-                return Err(Errno::EBADF);
-            }
-            f.node().ok_or(Errno::EOPNOTSUPP)
-        }
-    }
-}
-
-/// The inode in the store; `pseudo` for nodes of synthetic filesystems.
-fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
-    node.ino().ok_or(pseudo)
-}
-
-/// The inode whose extended attributes are about to change: EROFS on a read-only mount (Linux's
-/// `mnt_want_write`, before the other checks).
-fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
-    if cx.vfs()?.readonly(&node) {
-        return Err(Errno::EROFS);
-    }
-    store_ino(node, Errno::EOPNOTSUPP)
-}
-
-fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
-    let name = cx.mm().read_cstr(addr, XATTR_NAME_MAX).map_err(|e| {
-        if e == Errno::ENAMETOOLONG {
-            Errno::ERANGE
-        } else {
-            e
-        }
-    })?;
-    if name.is_empty() {
-        return Err(Errno::ERANGE);
-    }
-    if !NAMESPACES.iter().any(|ns| name.starts_with(ns)) {
-        return Err(Errno::EOPNOTSUPP);
-    }
-    Ok(name)
-}
-
-/// Permission to read (`write` false) or write the extended attribute named `name`:
-///
-/// - `trusted.*` needs `CAP_SYS_ADMIN`; without it writes are EPERM and reads ENODATA (they are
-///   invisible);
-/// - `user.*` only on regular files and directories (otherwise writes are EPERM and reads
-///   ENODATA); on a sticky directory only the owner may write; reads and writes need read and
-///   write permission, respectively, on the file itself;
-/// - `security.*` writes need `CAP_SYS_ADMIN` (the caller checks `CAP_SETFCAP` for
-///   `security.capability`), reads are unrestricted; `system.*` is unrestricted.
-fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Errno> {
-    let cred = cx.cred();
-    let hidden = if write { Errno::EPERM } else { Errno::ENODATA };
-    if name.starts_with(b"trusted.") {
-        return if cred.capable(cap::SYS_ADMIN) {
-            Ok(())
-        } else {
-            Err(hidden)
-        };
-    }
-    if name.starts_with(b"user.") {
-        let dir = st.kind() == mode::S_IFDIR;
-        if !dir && st.kind() != mode::S_IFREG {
-            return Err(hidden);
-        }
-        if dir && st.mode & mode::S_ISVTX != 0 && write && !cred.owns(st) {
-            return Err(Errno::EPERM);
-        }
-        return cred.permission(st, if write { MAY_WRITE } else { MAY_READ });
-    }
-    if write
-        && name.starts_with(b"security.")
-        && name != XATTR_NAME_CAPS
-        && !cred.capable(cap::SYS_ADMIN)
-    {
-        return Err(Errno::EPERM);
-    }
-    Ok(())
-}
-
-/// Writes the result back to the guest: with `size` 0 only the length is returned, and ERANGE if
-/// the buffer is too small.
-fn reply(cx: &Cx<'_>, buf: u64, size: usize, data: &[u8]) -> SysResult {
-    if size == 0 {
-        return Ok(data.len() as u64);
-    }
-    if size < data.len() {
-        return Err(Errno::ERANGE);
-    }
-    cx.mm().write(UserSlice::new(buf, data.len()), data)?;
-    Ok(data.len() as u64)
-}
-
 pub(super) fn setxattr(
     cx: &mut Cx<'_>,
     target: Target,
@@ -176,19 +75,6 @@ pub(super) fn setxattr(
     )?;
     attrib(cx, target, ino);
     Ok(0)
-}
-
-/// An extended attribute changed: report inotify's IN_ATTRIB.
-fn attrib(cx: &Cx<'_>, target: Target, ino: Ino) {
-    match target {
-        Target::Path(path, follow) if inotify::active(cx.kr()) => {
-            if let Ok(path) = read_path(cx, path) {
-                attrib_at(cx, ino, AT_FDCWD, &path, follow);
-            }
-        }
-        Target::Path(..) => {}
-        Target::Fd(fd) => attrib_fd(cx, fd),
-    }
 }
 
 pub(super) fn getxattr(
@@ -239,4 +125,118 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     vfs.store().remove_xattr(ino, &name)?;
     attrib(cx, target, ino);
     Ok(0)
+}
+
+fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+    let name = cx.mm().read_cstr(addr, XATTR_NAME_MAX).map_err(|e| {
+        if e == Errno::ENAMETOOLONG {
+            Errno::ERANGE
+        } else {
+            e
+        }
+    })?;
+    if name.is_empty() {
+        return Err(Errno::ERANGE);
+    }
+    if !NAMESPACES.iter().any(|ns| name.starts_with(ns)) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(name)
+}
+
+/// Finds the object's node; EOPNOTSUPP for files not in a filesystem.
+fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
+    match target {
+        Target::Path(path, follow) => {
+            let path = read_path(cx, path)?;
+            lookup_at(cx, AT_FDCWD, &path, follow)
+        }
+        Target::Fd(fd) => {
+            let file = cx.fds().get(fd)?;
+            let f = file.borrow();
+            if f.flags & oflags::O_PATH != 0 {
+                return Err(Errno::EBADF);
+            }
+            f.node().ok_or(Errno::EOPNOTSUPP)
+        }
+    }
+}
+
+/// The inode whose extended attributes are about to change: EROFS on a read-only mount (Linux's
+/// `mnt_want_write`, before the other checks).
+fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
+    if cx.vfs()?.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    store_ino(node, Errno::EOPNOTSUPP)
+}
+
+/// The inode in the store; `pseudo` for nodes of synthetic filesystems.
+fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
+    node.ino().ok_or(pseudo)
+}
+
+/// Permission to read (`write` false) or write the extended attribute named `name`:
+///
+/// - `trusted.*` needs `CAP_SYS_ADMIN`; without it writes are EPERM and reads ENODATA (they are
+///   invisible);
+/// - `user.*` only on regular files and directories (otherwise writes are EPERM and reads
+///   ENODATA); on a sticky directory only the owner may write; reads and writes need read and
+///   write permission, respectively, on the file itself;
+/// - `security.*` writes need `CAP_SYS_ADMIN` (the caller checks `CAP_SETFCAP` for
+///   `security.capability`), reads are unrestricted; `system.*` is unrestricted.
+fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Errno> {
+    let cred = cx.cred();
+    let hidden = if write { Errno::EPERM } else { Errno::ENODATA };
+    if name.starts_with(b"trusted.") {
+        return if cred.capable(cap::SYS_ADMIN) {
+            Ok(())
+        } else {
+            Err(hidden)
+        };
+    }
+    if name.starts_with(b"user.") {
+        let dir = st.kind() == mode::S_IFDIR;
+        if !dir && st.kind() != mode::S_IFREG {
+            return Err(hidden);
+        }
+        if dir && st.mode & mode::S_ISVTX != 0 && write && !cred.owns(st) {
+            return Err(Errno::EPERM);
+        }
+        return cred.permission(st, if write { MAY_WRITE } else { MAY_READ });
+    }
+    if write
+        && name.starts_with(b"security.")
+        && name != XATTR_NAME_CAPS
+        && !cred.capable(cap::SYS_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// An extended attribute changed: report inotify's IN_ATTRIB.
+fn attrib(cx: &Cx<'_>, target: Target, ino: Ino) {
+    match target {
+        Target::Path(path, follow) if inotify::active(cx.kr()) => {
+            if let Ok(path) = read_path(cx, path) {
+                attrib_at(cx, ino, AT_FDCWD, &path, follow);
+            }
+        }
+        Target::Path(..) => {}
+        Target::Fd(fd) => attrib_fd(cx, fd),
+    }
+}
+
+/// Writes the result back to the guest: with `size` 0 only the length is returned, and ERANGE if
+/// the buffer is too small.
+fn reply(cx: &Cx<'_>, buf: u64, size: usize, data: &[u8]) -> SysResult {
+    if size == 0 {
+        return Ok(data.len() as u64);
+    }
+    if size < data.len() {
+        return Err(Errno::ERANGE);
+    }
+    cx.mm().write(UserSlice::new(buf, data.len()), data)?;
+    Ok(data.len() as u64)
 }

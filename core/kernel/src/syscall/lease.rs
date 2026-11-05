@@ -40,43 +40,6 @@ impl Lease {
     }
 }
 
-/// The inode of a regular file.
-fn ino_of(f: &OpenFile) -> Option<Ino> {
-    match f.kind {
-        FileKind::Regular { ino, .. } => Some(ino),
-        _ => None,
-    }
-}
-
-/// How many open files, other than `except`, have `ino` open for reading and for writing (across
-/// all processes).
-fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
-    let mut files: Vec<FileRef> = Vec::new();
-    for f in k.open_files() {
-        if !Rc::ptr_eq(&f, except) && !files.iter().any(|g| Rc::ptr_eq(g, &f)) {
-            files.push(f);
-        }
-    }
-    let mine: Vec<_> = files
-        .iter()
-        .map(|f| f.borrow())
-        .filter(|f| ino_of(f) == Some(ino))
-        .map(|f| f.writable())
-        .collect();
-    let writers = mine.iter().filter(|&&w| w).count();
-    (mine.len() - writers, writers)
-}
-
-/// Drops the leases of open files that have been closed.
-fn prune(k: &mut Kernel, ino: Ino) {
-    if let Some(list) = k.leases.get_mut(&ino) {
-        list.retain(|l| l.file.strong_count() > 0);
-        if list.is_empty() {
-            k.leases.remove(&ino);
-        }
-    }
-}
-
 /// fcntl(`F_SETLEASE`).
 pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<(), Errno> {
     let (ino, writable) = {
@@ -162,6 +125,25 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
     // As on Linux, the signal for a break goes to the process that set the lease
     file.borrow_mut().owner = (1, tgid);
     Ok(())
+}
+
+/// How many open files, other than `except`, have `ino` open for reading and for writing (across
+/// all processes).
+fn opens(k: &Kernel, ino: Ino, except: &FileRef) -> (usize, usize) {
+    let mut files: Vec<FileRef> = Vec::new();
+    for f in k.open_files() {
+        if !Rc::ptr_eq(&f, except) && !files.iter().any(|g| Rc::ptr_eq(g, &f)) {
+            files.push(f);
+        }
+    }
+    let mine: Vec<_> = files
+        .iter()
+        .map(|f| f.borrow())
+        .filter(|f| ino_of(f) == Some(ino))
+        .map(|f| f.writable())
+        .collect();
+    let writers = mine.iter().filter(|&&w| w).count();
+    (mine.len() - writers, writers)
 }
 
 /// fcntl(`F_GETLEASE`): while being broken, the type it is to be downgraded to.
@@ -280,5 +262,23 @@ pub(super) fn break_leases(
         }
         // Holders request wake::LOCK when they downgrade, give up the lease or close the file
         cx.wait_on(next, &mut [], wake::LOCK)?;
+    }
+}
+
+/// The inode of a regular file.
+fn ino_of(f: &OpenFile) -> Option<Ino> {
+    match f.kind {
+        FileKind::Regular { ino, .. } => Some(ino),
+        _ => None,
+    }
+}
+
+/// Drops the leases of open files that have been closed.
+fn prune(k: &mut Kernel, ino: Ino) {
+    if let Some(list) = k.leases.get_mut(&ino) {
+        list.retain(|l| l.file.strong_count() > 0);
+        if list.is_empty() {
+            k.leases.remove(&ino);
+        }
     }
 }
