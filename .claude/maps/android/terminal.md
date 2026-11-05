@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tab row bringing the current tab back after it rests)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tab row returning to the current tab and taking left-edge slides)
 
 ## Responsibilities
 
@@ -103,7 +103,9 @@ libghostty-vt with Zig (`android/native`).
   than a fade's width of tabs would be left beyond the padding; scrolled away from it (out of view
   or into the fade), the row brings it back the same way 3 s after coming to rest: a finger on the
   row, on a tab too, holds that off, and each later move without one (a fling, TalkBack's
-  scrolling) starts the wait again. The indicator is a rounded bar 16 dp wide and 1 dp high in the
+  scrolling) starts the wait again. With gesture navigation, a slide from the screen's left edge
+  over the tabs scrolls them instead of going back: the bar but for its buttons is excluded from
+  the system's back gesture. The indicator is a rounded bar 16 dp wide and 1 dp high in the
   primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
   draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
   the system font scale leaves them as they are (dialogs, menus and toasts follow it).

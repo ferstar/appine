@@ -8,6 +8,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.InsetDrawable
 import android.os.Build
@@ -196,6 +197,12 @@ class MainActivity : Activity(), TerminalService.Listener {
             setBackgroundColor(Color.BLACK)
             addView(strip, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(buttons, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END))
+            // With gesture navigation, a slide from the screen's left edge over the tabs scrolls
+            // them instead of going back; the buttons, which do not scroll, leave the right edge's
+            // gesture as it is
+            addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                v.systemGestureExclusionRects = listOf(Rect(0, 0, v.width - strip.paddingRight, v.height))
+            }
         }
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
