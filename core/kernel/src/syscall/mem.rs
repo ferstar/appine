@@ -298,48 +298,6 @@ pub(super) fn remap_file_pages(
     Ok(0)
 }
 
-/// msync: shared mappings are host file mappings themselves and need no write-back, so only the
-/// arguments are checked.
-pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
-    const MS_ASYNC: u32 = 1;
-    const MS_INVALIDATE: u32 = 2;
-    const MS_SYNC: u32 = 4;
-    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
-        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
-        || !addr.is_multiple_of(PAGE_SIZE)
-    {
-        return Err(Errno::EINVAL);
-    }
-    cx.mm().check_mapped(addr, len)?;
-    // Locked pages cannot be invalidated
-    if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
-        return Err(Errno::EBUSY);
-    }
-    // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC leaves the
-    // write-back to the host and waits with the BKL released. If another thread tears down the
-    // mapping meanwhile the host reports ENOMEM, which is ignored (unmapping already handed the
-    // data to the host page cache)
-    if flags & MS_SYNC != 0 {
-        let ranges = cx.mm().shared_file_ranges(addr, len);
-        if !ranges.is_empty() {
-            cx.unlocked(move || {
-                ranges
-                    .into_iter()
-                    .try_for_each(|(a, n)| match appine_hal::msync(a, n) {
-                        Err(libc::ENOMEM) => Ok(()),
-                        r => r,
-                    })
-            })
-            .map_err(Errno)?;
-        }
-    }
-    Ok(0)
-}
-
-pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
-    cx.mm_mut().munmap(addr, len).map(|()| 0)
-}
-
 pub(super) fn mprotect(cx: &mut Cx<'_>, addr: u64, len: u64, prot: u32) -> SysResult {
     if prot & !(PROT_MASK | PROT_GROWS) != 0 {
         return Err(Errno::EINVAL);
@@ -390,22 +348,6 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
             .map(|()| 0),
         _ => Ok(0),
     }
-}
-
-/// Without `CAP_IPC_LOCK`, locked memory may not exceed `RLIMIT_MEMLOCK` (nothing can be locked
-/// when it is 0). `more` is the bytes newly locked by this call.
-fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
-    if cx.cred().capable(cap::IPC_LOCK) {
-        return Ok(());
-    }
-    let limit = cx.t.group.borrow().rlimits[RLIMIT_MEMLOCK as usize].0;
-    if limit == 0 {
-        return Err(Errno::EPERM);
-    }
-    if cx.mm().locked_bytes() + more > limit {
-        return Err(Errno::ENOMEM);
-    }
-    Ok(())
 }
 
 /// mlock, munlock, mlock2: records which mappings are locked (host memory is never swapped out
@@ -460,6 +402,64 @@ pub(super) fn munlockall(cx: &mut Cx<'_>) -> SysResult {
     mm.lock_future = false;
     mm.lock_onfault = false;
     Ok(0)
+}
+
+/// Without `CAP_IPC_LOCK`, locked memory may not exceed `RLIMIT_MEMLOCK` (nothing can be locked
+/// when it is 0). `more` is the bytes newly locked by this call.
+fn check_memlock(cx: &Cx<'_>, more: u64) -> Result<(), Errno> {
+    if cx.cred().capable(cap::IPC_LOCK) {
+        return Ok(());
+    }
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_MEMLOCK as usize].0;
+    if limit == 0 {
+        return Err(Errno::EPERM);
+    }
+    if cx.mm().locked_bytes() + more > limit {
+        return Err(Errno::ENOMEM);
+    }
+    Ok(())
+}
+
+/// msync: shared mappings are host file mappings themselves and need no write-back, so only the
+/// arguments are checked.
+pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResult {
+    const MS_ASYNC: u32 = 1;
+    const MS_INVALIDATE: u32 = 2;
+    const MS_SYNC: u32 = 4;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+        || !addr.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(Errno::EINVAL);
+    }
+    cx.mm().check_mapped(addr, len)?;
+    // Locked pages cannot be invalidated
+    if flags & MS_INVALIDATE != 0 && cx.mm().locked_in(addr, len) > 0 {
+        return Err(Errno::EBUSY);
+    }
+    // A shared file mapping is the host's shared mapping of the object itself: MS_SYNC leaves the
+    // write-back to the host and waits with the BKL released. If another thread tears down the
+    // mapping meanwhile the host reports ENOMEM, which is ignored (unmapping already handed the
+    // data to the host page cache)
+    if flags & MS_SYNC != 0 {
+        let ranges = cx.mm().shared_file_ranges(addr, len);
+        if !ranges.is_empty() {
+            cx.unlocked(move || {
+                ranges
+                    .into_iter()
+                    .try_for_each(|(a, n)| match appine_hal::msync(a, n) {
+                        Err(libc::ENOMEM) => Ok(()),
+                        r => r,
+                    })
+            })
+            .map_err(Errno)?;
+        }
+    }
+    Ok(0)
+}
+
+pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
+    cx.mm_mut().munmap(addr, len).map(|()| 0)
 }
 
 /// mincore: reports whether each page is resident, by host memory.

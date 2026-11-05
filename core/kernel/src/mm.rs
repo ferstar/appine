@@ -115,424 +115,7 @@ const LEAF_SPAN: u64 = PAGE_SIZE << 9;
 /// small.
 const WINDOW_MAX: u64 = 1 << 30;
 
-/// What [`Mm::carve`] carves: each VMA's start → its piece of host memory and its host address.
-type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
-
-/// A piece of host memory held by an [`Mm`]. Shared through `Arc`: the host mappings of read-only
-/// file mappings are shared by all address spaces ([`FileMaps`]), and execve also gets them while
-/// building a new address space without the BKL.
-struct HostRegion {
-    base: NonNull<u8>,
-    len: usize,
-    /// Private anonymous memory ([`Mm::new_anonymous`], [`spare`]) and whether it is
-    /// commit-accounted: kept for reuse when returned ([`recycled`]).
-    anonymous: Option<bool>,
-    /// No host memory ([`HostRegion::reserved`]).
-    reserved: bool,
-}
-
-/// The "host address" of a reserved ([`HostRegion::reserved`]) VMA: guest offsets are counted from
-/// here only for arithmetic (splitting VMAs), never for access. Bit 55 is set, so it falls in the
-/// host kernel's half (arm64 TBI ignores only the top 8 bits), and an access by mistake is a host
-/// segmentation fault that cannot reach other memory.
-const RESERVED_HOST: usize = 0x00f0_0000_0000_0000;
-
-impl HostRegion {
-    /// A private anonymous mapping that has been `PROT_NONE` and empty since it was created takes
-    /// neither host memory nor host address space. All guest processes live in one host process,
-    /// and on devices whose host user address space is only 39 bits (512 GB; every 4K-page GKI
-    /// kernel) each Chromium process reserves tens of GB (PartitionAlloc's pools) and a renderer 1
-    /// TB more (V8's sandbox), which together do not fit. Such a VMA has no entries, so the guest
-    /// cannot reach it; it gets its own host memory only when it becomes accessible (mprotect) or
-    /// the kernel writes into it (ptrace) ([`Mm::back_reserved`]).
-    fn reserved() -> Arc<HostRegion> {
-        Arc::new(HostRegion {
-            base: NonNull::new(RESERVED_HOST as *mut u8).unwrap(),
-            len: 0,
-            anonymous: None,
-            reserved: true,
-        })
-    }
-}
-
-// SAFETY: it is only a host address range, used only when it is released (Drop)
-unsafe impl Send for HostRegion {}
-unsafe impl Sync for HostRegion {}
-
-impl Drop for HostRegion {
-    fn drop(&mut self) {
-        if self.reserved {
-            return;
-        }
-        let (base, len, anonymous) = (self.base, self.len, self.anonymous);
-        if let Some(reserve) = anonymous {
-            let deferred = UNMAPPED
-                .with_borrow_mut(|u| u.as_mut().map(|u| u.anonymous.push((base, len, reserve))));
-            if deferred.is_some() {
-                UNMAPPING.fetch_add(len, Ordering::Relaxed);
-            } else {
-                // SAFETY: this private anonymous host memory belongs to this HostRegion and is no
-                // longer used by anyone
-                unsafe { recycled::put(base, len, reserve) }
-            }
-            return;
-        }
-        let deferred =
-            UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.regions.push((base, len))));
-        if deferred.is_some() {
-            UNMAPPING.fetch_add(len, Ordering::Relaxed);
-        } else {
-            // SAFETY: this host memory belongs to this HostRegion and is no longer used by anyone
-            unsafe { appine_hal::unmap(base, len) }
-        }
-    }
-}
-
-/// Private anonymous host memory kept for reuse after it is returned ([`HostRegion::anonymous`]).
-/// All guest processes live in one host process, and every host mmap and munmap takes that one
-/// process's mmap_lock for write (natively each process has its own): musl's malloc and gcc's
-/// garbage collector map and unmap blocks of the same sizes over and over, more than a hundred
-/// thousand times when `xargs -P4` compiles Lua, each time waiting on the host mmap while holding
-/// the BKL. Returning only discards the contents (`MADV_DONTNEED`, which takes the lock only for
-/// read), and the next request of the same size and the same commit accounting takes it directly.
-mod recycled {
-    use std::collections::HashMap;
-    use std::ptr::NonNull;
-    use std::sync::Mutex;
-
-    /// The most host address space kept: the pages have gone back to the host, so it costs only
-    /// address space and a little page table.
-    const MAX_BYTES: usize = 256 << 20;
-    /// The most ranges kept per size.
-    const MAX_EACH: usize = 32;
-
-    struct Cache {
-        /// (length, commit-accounted) → starts.
-        free: HashMap<(usize, bool), Vec<usize>>,
-        bytes: usize,
-    }
-
-    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
-
-    /// Takes a kept piece of private anonymous host memory whose contents are zero.
-    pub(super) fn take(len: usize, reserve: bool) -> Option<NonNull<u8>> {
-        let mut cache = CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let c = cache.as_mut()?;
-        let base = c.free.get_mut(&(len, reserve))?.pop()?;
-        c.bytes -= len;
-        NonNull::new(base as *mut u8)
-    }
-
-    /// Returns a piece of private anonymous host memory: discards its contents and keeps it for
-    /// reuse, or returns it to the host when it cannot be kept.
-    ///
-    /// # Safety
-    ///
-    /// The host memory was allocated by [`appine_hal::map_anonymous`] and nobody uses it any more.
-    pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
-        {
-            let mut cache = CACHE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let c = cache.get_or_insert_with(|| Cache {
-                free: HashMap::new(),
-                bytes: 0,
-            });
-            let list = c.free.entry((len, reserve)).or_default();
-            if c.bytes + len <= MAX_BYTES && list.len() < MAX_EACH {
-                // SAFETY: guaranteed by the caller; after discarding it reads as zero, like a new
-                // mapping
-                if unsafe { appine_hal::discard(base, len) }.is_ok() {
-                    list.push(base.as_ptr() as usize);
-                    c.bytes += len;
-                    return;
-                }
-            }
-        }
-        // SAFETY: guaranteed by the caller
-        unsafe { appine_hal::unmap(base, len) }
-    }
-}
-
-/// Things freed while holding the BKL and returned after it is released.
-#[derive(Default)]
-struct Unmapped {
-    /// Host memory: (start, length).
-    regions: Vec<(NonNull<u8>, usize)>,
-    /// Private anonymous host memory kept for reuse ([`recycled`]): (start, length,
-    /// commit-accounted).
-    anonymous: Vec<(NonNull<u8>, usize, bool)>,
-    /// Page tables of destroyed address spaces: freeing the intermediate tables one by one takes
-    /// several microseconds.
-    mmus: Vec<Mmu>,
-}
-
-thread_local! {
-    /// Host memory freed while holding the BKL, returned to the host only after the BKL is released
-    /// ([`release_unmapped`]); None when the BKL is not held, which returns it on the spot.
-    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
-    static UNMAPPED: std::cell::RefCell<Option<Unmapped>> = const { std::cell::RefCell::new(None) };
-}
-
-/// One sample of resident memory ([`Mm::rss_plan`]).
-struct RssPlan {
-    /// 4K pages known without mincore: borrowed pages and cached file mappings.
-    fixed: u64,
-    /// Host ranges to mincore, sorted by start.
-    spans: Vec<(usize, usize)>,
-}
-
-impl RssPlan {
-    /// When the spans to measure total at most this many pages they are not measured but counted as
-    /// fully resident ([`RssPlan::estimate`]).
-    const SMALL: usize = 256;
-
-    /// Estimate used for the peak resident page count: when the spans to mincore total at most 1
-    /// MB, count them as fully resident, overcounting by at most 1 MB. A short-lived process like
-    /// `/bin/true` would measure 8 spans totalling 45 pages at exit and find 12, yet take 4 mincore
-    /// calls while holding the BKL (and wait for the host mmap_lock). Processes that allocated a
-    /// lot of memory are measured as usual.
-    fn estimate(&self) -> u64 {
-        let pages: usize = self.spans.iter().map(|&(_, len)| len.div_ceil(4096)).sum();
-        if pages <= Self::SMALL {
-            self.fixed + pages as u64
-        } else {
-            self.measure()
-        }
-    }
-
-    /// Resident 4K pages. Spans that are contiguous on the host are merged into one mincore.
-    fn measure(&self) -> u64 {
-        let mut total = self.fixed;
-        let mut rest = &self.spans[..];
-        while let Some(&(start, mut len)) = rest.first() {
-            let n = rest[1..]
-                .iter()
-                .take_while(|&&(s, l)| {
-                    let next = s == start + len;
-                    len += if next { l } else { 0 };
-                    next
-                })
-                .count();
-            total += appine_hal::resident_pages(start as *const u8, len) as u64;
-            rest = &rest[1 + n..];
-        }
-        total
-    }
-}
-
-/// Cache of the resident page counts of file mappings ([`Mm::resident_pages`]), keyed by (device,
-/// inode, file offset, length).
-struct FileResidency;
-
-impl FileResidency {
-    /// How long a cached result is used: a file's pages in the page cache change slowly.
-    const TTL: std::time::Duration = std::time::Duration::from_secs(1);
-    /// The most spans cached; the cache is cleared when it is full.
-    const MAX: usize = 1024;
-
-    fn get(
-        key: (u64, u64, u64, u64),
-        now: std::time::Instant,
-        measure: impl FnOnce() -> u64,
-    ) -> u64 {
-        type Map = HashMap<(u64, u64, u64, u64), (u64, std::time::Instant)>;
-        static CACHE: Mutex<Option<Map>> = Mutex::new(None);
-        let mut cache = CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let map = cache.get_or_insert_with(HashMap::new);
-        if let Some(&(n, at)) = map.get(&key)
-            && now.duration_since(at) < Self::TTL
-        {
-            return n;
-        }
-        if map.len() >= Self::MAX {
-            map.clear();
-        }
-        let n = measure();
-        map.insert(key, (n, now));
-        n
-    }
-}
-
-/// Several pieces of the anonymous host memory fork needs (the address space reserved for the heap
-/// and the stack, the pieces small mappings are carved from) are mapped in advance, and fork takes
-/// them directly while holding the BKL. A program forking repeatedly always wants the same few
-/// lengths, and a used piece is replaced after the BKL is released ([`refill`](spare::refill)):
-/// host mmap used to take 40% of fork's hold time, and four processes spawning at once had less
-/// total throughput than one.
-pub(crate) mod spare {
-    use std::ptr::NonNull;
-    use std::sync::{Arc, Mutex, PoisonError};
-
-    use super::HostRegion;
-    use crate::errno::Errno;
-
-    /// The most pieces kept per length.
-    const PER_LEN: usize = 2;
-    /// The most lengths remembered.
-    const LENS: usize = 8;
-
-    struct Spares {
-        /// (length, start): `MAP_NORESERVE` anonymous host memory, never touched.
-        maps: Vec<(usize, usize)>,
-        /// Lengths to replace, most recently used last.
-        wanted: Vec<usize>,
-    }
-
-    static SPARES: Mutex<Spares> = Mutex::new(Spares {
-        maps: Vec::new(),
-        wanted: Vec::new(),
-    });
-
-    /// `len` bytes of zeroed anonymous host memory, not commit-accounted (`MAP_NORESERVE`): a piece
-    /// mapped in advance if there is one, otherwise mapped on the spot.
-    pub(super) fn anonymous(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
-        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-        let found = {
-            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
-            s.wanted.retain(|&l| l != host_len);
-            s.wanted.push(host_len);
-            if s.wanted.len() > LENS {
-                let old = s.wanted.remove(0);
-                // Also return the pieces kept for a length no longer wanted
-                s.maps.retain(|&(l, base)| {
-                    if l == old {
-                        // SAFETY: host memory mapped in advance and never used
-                        unsafe { appine_hal::unmap(NonNull::new(base as *mut u8).unwrap(), l) };
-                    }
-                    l != old
-                });
-            }
-            s.maps
-                .iter()
-                .position(|&(l, _)| l == host_len)
-                .map(|i| s.maps.swap_remove(i).1)
-        };
-        let base = match found
-            .and_then(|b| NonNull::new(b as *mut u8))
-            .or_else(|| super::recycled::take(host_len, false))
-        {
-            Some(base) => base,
-            None => appine_hal::map_anonymous(host_len, false).map_err(|_| Errno::ENOMEM)?,
-        };
-        Ok((
-            Arc::new(HostRegion {
-                base,
-                len: host_len,
-                anonymous: Some(false),
-                reserved: false,
-            }),
-            base,
-        ))
-    }
-
-    /// Replaces the pieces used. Called after the BKL is released.
-    pub(crate) fn refill() {
-        loop {
-            let need = {
-                let s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
-                s.wanted
-                    .iter()
-                    .copied()
-                    .find(|&l| s.maps.iter().filter(|m| m.0 == l).count() < PER_LEN)
-            };
-            let Some(len) = need else {
-                return;
-            };
-            let Ok(base) = appine_hal::map_anonymous(len, false) else {
-                return;
-            };
-            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
-            if s.wanted.contains(&len) && s.maps.iter().filter(|m| m.0 == len).count() < PER_LEN {
-                s.maps.push((len, base.as_ptr() as usize));
-            } else {
-                drop(s);
-                // SAFETY: just mapped and never used
-                unsafe { appine_hal::unmap(base, len) };
-            }
-        }
-    }
-}
-
-/// Bytes freed but not yet returned to the host: the OOM killer waits for them to be returned
-/// before it measures.
-pub(crate) static UNMAPPING: AtomicUsize = AtomicUsize::new(0);
-
-/// Starts holding the BKL: host memory freed from now on is returned after the BKL is released
-/// ([`release_unmapped`]).
-pub(crate) fn defer_unmaps() {
-    UNMAPPED.with_borrow_mut(|u| {
-        u.get_or_insert_with(Unmapped::default);
-    });
-}
-
-/// The BKL was released: return the host memory freed while it was held. Process exit and execve
-/// free ten or twenty mappings at once, and the host takes tens of microseconds to tear down page
-/// tables and flush TLBs; threads waiting for the BKL (the shell waiting to reap it, the process
-/// at the other end of a pipe) need not wait for that too. Contiguous pieces are returned
-/// together, saving TLB flushes.
-pub(crate) fn release_unmapped() {
-    let Some(Unmapped {
-        regions: mut list,
-        anonymous,
-        mmus,
-    }) = UNMAPPED.with_borrow_mut(Option::take)
-    else {
-        return;
-    };
-    // Free the page tables first, then return the host memory they point at
-    drop(mmus);
-    let reused: usize = anonymous.iter().map(|&(_, len, _)| len).sum();
-    for (base, len, reserve) in anonymous {
-        // SAFETY: private anonymous host memory recorded when its HostRegion was dropped, and no
-        // longer used by anyone
-        unsafe { recycled::put(base, len, reserve) };
-    }
-    UNMAPPING.fetch_sub(reused, Ordering::Release);
-    if list.is_empty() {
-        return;
-    }
-    list.sort_unstable_by_key(|&(base, _)| base);
-    let total: usize = list.iter().map(|&(_, len)| len).sum();
-    let mut run = list[0];
-    for &(base, len) in &list[1..] {
-        // SAFETY: both are returned host memory; on the host the previous piece ends exactly at
-        // base (when host pages are larger than 4K the length rounds up, and pieces that do not
-        // adjoin cannot be equal by chance)
-        if unsafe { run.0.add(run.1) } == base {
-            run.1 += len;
-        } else {
-            unsafe { appine_hal::unmap(run.0, run.1) };
-            run = (base, len);
-        }
-    }
-    unsafe { appine_hal::unmap(run.0, run.1) };
-    UNMAPPING.fetch_sub(total, Ordering::Release);
-}
-
-/// Host memory that can be mapped into several address spaces (a System V shared memory segment).
-#[derive(Clone)]
-pub(crate) struct SharedMemory {
-    region: Arc<HostRegion>,
-}
-
-impl SharedMemory {
-    /// Creates zeroed memory, its length rounded up to a page.
-    pub fn new(len: u64) -> Result<SharedMemory, Errno> {
-        let len = page_up(len).ok_or(Errno::ENOMEM)?;
-        let (region, _) = Mm::new_anonymous(len, true)?;
-        Ok(SharedMemory { region })
-    }
-
-    /// Length (a multiple of the page size).
-    pub fn len(&self) -> u64 {
-        self.region.len as u64
-    }
-}
+// ---- Address space ----
 
 /// Where a mapping's contents come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,329 +208,6 @@ impl Vma {
     }
 }
 
-/// Ranges invalidated in the last few code generations.
-#[derive(Default)]
-pub struct CodeLog {
-    /// (code generation, start, length), in increasing generation order.
-    entries: VecDeque<(u64, u64, u64)>,
-}
-
-impl CodeLog {
-    /// Number of generations kept; threads further behind flush the whole translation cache. The
-    /// JVM issues `ic ivau` over a run of cache lines for every compiled method it installs, and
-    /// with only 64 kept, GC and compiler threads waking from a short sleep almost always had to
-    /// flush everything: a Maven build flushed 2400 times and used 30% more user CPU time.
-    const GENERATIONS: u64 = 4096;
-
-    fn push(&mut self, generation: u64, ranges: &[(u64, u64)]) {
-        self.entries
-            .extend(ranges.iter().map(|&(start, len)| (generation, start, len)));
-        while self
-            .entries
-            .front()
-            .is_some_and(|e| e.0 + Self::GENERATIONS <= generation)
-        {
-            self.entries.pop_front();
-        }
-    }
-
-    /// Ranges invalidated after generation `seen` up to `now`; None when the log no longer covers
-    /// them.
-    pub fn since(&self, seen: u64, now: u64) -> Option<Vec<(u64, u64)>> {
-        if self.entries.front().is_none_or(|e| e.0 > seen + 1) {
-            return None;
-        }
-        // Generations increase: binary-search the start and look only at the entries missed (the
-        // whole log has tens of thousands of entries under the JVM)
-        let first = self.entries.partition_point(|e| e.0 <= seen);
-        Some(
-            self.entries
-                .range(first..)
-                .take_while(|e| e.0 <= now)
-                .map(|e| (e.1, e.2))
-                .collect(),
-        )
-    }
-}
-
-/// Generations users check before re-entering guest code ([`Mm::sync`]).
-pub struct Generations {
-    /// TLB shootdown generation.
-    pub tlb: Arc<AtomicU64>,
-    /// Code generation: when it changes, Tier 1 translations are invalidated according to `log`.
-    pub code: Arc<AtomicU64>,
-    /// Ranges invalidated in each code generation.
-    pub log: Arc<Mutex<CodeLog>>,
-    /// The Tier 1 translations were replaced (the address space left its shared group,
-    /// [`CodeGroup`]): users switch to the new ones before re-entering guest code.
-    pub space: Arc<AtomicU64>,
-}
-
-/// An address space's Tier 1 translations, shared by the threads of that address space
-/// ([`Mm::code_space`]).
-pub struct CodeSpace {
-    pub space: Arc<appine_engine::DbtSpace>,
-    /// This address space's tag in its translation-sharing group ([`CodeGroup`]); 0 outside a
-    /// group.
-    pub tag: u16,
-    /// The code generation up to which the code-change log has been applied: the first thread to
-    /// see a new generation invalidates once for all.
-    pub seen: Mutex<u64>,
-}
-
-/// Tier 1 translations shared by several address spaces of the same program
-/// ([`Mm::code_space`]). With one set per process, four cc1 compiling in parallel took 35–40 MB of
-/// code cache each, and 20 idle python3 processes 4 MB each.
-///
-/// A translation depends only on the pc and the instruction words, so when several address spaces
-/// map the same code at the same addresses, the blocks are valid for all of them. A member's
-/// trusted executable mappings (private file mappings never written that have a version, and the
-/// vDSO) must agree with what the group has registered: one address range can only be the same
-/// piece of the same version of a file (appine has no ASLR, so processes of the same program map
-/// at the same addresses). Blocks in registered mappings are shared by all members; other
-/// executable memory (JIT output, code that was written) is private to a member: the engine keeps
-/// blocks there apart by member tag ([`appine_engine::DbtSpace::share`]), private ranges may not
-/// overlap registered ones, and registered ones may not overlap ranges private to other members
-/// ([`CodeGroup::admit`]). Each node process has its own JIT code, while V8's interpreter, its
-/// builtins and ICU, which live in the node program file, are still shared. The check runs after
-/// every syscall ([`Mm::sync`]): a member that no longer fits leaves the group and switches to
-/// translations of its own; when it is the only member left the group is closed and it keeps the
-/// existing translations. So no other member ever runs a block valid only for it. A member that
-/// unmaps its own mappings invalidates as usual, and other members only have to translate again.
-///
-/// Accessed only while holding the BKL.
-pub struct CodeGroup {
-    /// The program (the executable's inode, the same as the pool key).
-    key: u64,
-    space: Arc<appine_engine::DbtSpace>,
-    members: Cell<usize>,
-    /// Executable mappings members have mapped; one identity is registered per address range
-    /// ([`CodeGroup::extend`]).
-    ranges: RefCell<Vec<appine_engine::DbtSource>>,
-    /// Executable memory private to a member, `(tag, start, end)` ([`CodeGroup::admit`]).
-    claims: RefCell<Vec<(u16, u64, u64)>>,
-    /// No longer accepts new members.
-    closed: Cell<bool>,
-    /// Has had more than one member: blocks outside the registered ranges have been invalidated.
-    shared: Cell<bool>,
-}
-
-/// The groups ([`CodeGroup`]) that can be joined, kept in Kernel.
-pub type CodeGroups = RefCell<Vec<Weak<CodeGroup>>>;
-
-impl CodeGroup {
-    /// The most mappings registered (python's extension modules take one each).
-    const MAX_RANGES: usize = 256;
-
-    /// Registers `layout` (all of an address space's executable mappings): returns false and
-    /// changes nothing if it conflicts with what is registered or does not fit. Two overlapping
-    /// pieces agree when they are the same version of the same file with the same address minus
-    /// file offset: the dynamic linker first maps the span of the whole file and then maps the
-    /// later segments over it, so a library's executable mappings come long first, then short.
-    fn extend(&self, layout: &[appine_engine::DbtSource]) -> bool {
-        let mut ranges = self.ranges.borrow_mut();
-        let mut new = Vec::new();
-        for s in layout {
-            let mut covered = false;
-            for r in ranges.iter() {
-                if r.start < s.start + s.len && s.start < r.start + r.len {
-                    if !Self::same_file(r, s) {
-                        return false;
-                    }
-                    covered |= r.start <= s.start && s.start + s.len <= r.start + r.len;
-                }
-            }
-            if !covered {
-                new.push(*s);
-            }
-        }
-        if ranges.len() + new.len() > Self::MAX_RANGES {
-            return false;
-        }
-        ranges.extend(new);
-        true
-    }
-
-    /// Two overlapping trusted mappings are the same version of the same file with the same
-    /// address minus file offset.
-    fn same_file(r: &appine_engine::DbtSource, s: &appine_engine::DbtSource) -> bool {
-        let (ri, si) = (r.id, s.id);
-        (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
-            && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
-    }
-
-    /// The mappings in `layout` that agree with what is registered (every overlapping registration
-    /// is the same piece of file): the group's blocks there are valid for this address space.
-    fn consistent(&self, layout: &[appine_engine::DbtSource]) -> Vec<appine_engine::DbtSource> {
-        let ranges = self.ranges.borrow();
-        layout
-            .iter()
-            .filter(|s| {
-                ranges.iter().all(|r| {
-                    !(r.start < s.start + s.len && s.start < r.start + r.len)
-                        || Self::same_file(r, s)
-                })
-            })
-            .copied()
-            .collect()
-    }
-
-    /// All executable mappings of member `tag`: the trusted `layout` and the private `private`
-    /// ([`Mm::exec_split`]). layout must agree with what is registered ([`CodeGroup::extend`])
-    /// and not overlap ranges private to other members, and private must not overlap registered
-    /// ranges: if so, registers layout, installs this member's private ranges and returns true;
-    /// otherwise changes nothing.
-    fn admit(&self, tag: u16, layout: &[appine_engine::DbtSource], private: &[(u64, u64)]) -> bool {
-        let overlap = |start: u64, end: u64, s: u64, e: u64| start < e && s < end;
-        let ranges = self.ranges.borrow();
-        if private.iter().any(|&(s, e)| {
-            ranges
-                .iter()
-                .any(|r| overlap(r.start, r.start + r.len, s, e))
-        }) {
-            return false;
-        }
-        let before = ranges.len();
-        drop(ranges);
-        let mut claims = self.claims.borrow_mut();
-        if layout.iter().any(|l| {
-            claims
-                .iter()
-                .any(|&(t, s, e)| t != tag && overlap(l.start, l.start + l.len, s, e))
-        }) || !self.extend(layout)
-        {
-            return false;
-        }
-        claims.retain(|c| c.0 != tag);
-        claims.extend(private.iter().map(|&(s, e)| (tag, s, e)));
-        let ranges = self.ranges.borrow();
-        if ranges.len() != before {
-            self.space.share(&ranges);
-        }
-        true
-    }
-}
-
-/// A handle to an address space ([`Mm::into_shared`]): during copy-on-write the address spaces of
-/// one fork family find each other through it.
-type MmRef = Weak<RefCell<Mm>>;
-
-/// A lent host page.
-struct Loan {
-    /// The owner and the page's guest address there; None after the owner's address space is
-    /// destroyed (an orphan page).
-    owner: Option<(MmRef, u64)>,
-    /// The borrowers and the page's guest address in each. There is usually only one (the forked
-    /// child), stored without a separate allocation: a big process's fork makes a record for every
-    /// page.
-    first: Option<(MmRef, u64)>,
-    others: Vec<(MmRef, u64)>,
-}
-
-impl Loan {
-    fn new(owner: Option<(MmRef, u64)>, borrower: (MmRef, u64)) -> Loan {
-        Loan {
-            owner,
-            first: Some(borrower),
-            others: Vec::new(),
-        }
-    }
-
-    fn lend(&mut self, borrower: (MmRef, u64)) {
-        match self.first {
-            None => self.first = Some(borrower),
-            Some(_) => self.others.push(borrower),
-        }
-    }
-
-    /// Removes borrower `mm` (where the page is at `page`); returns whether other borrowers remain.
-    fn give_back(&mut self, mm: &MmRef, page: u64) -> bool {
-        let it = |(m, a): &(MmRef, u64)| *a == page && m.ptr_eq(mm);
-        if self.first.as_ref().is_some_and(it) {
-            self.first = self.others.pop();
-        } else {
-            self.others.retain(|b| !it(b));
-        }
-        self.first.is_some()
-    }
-
-    fn borrowers(self) -> impl Iterator<Item = (MmRef, u64)> {
-        self.first.into_iter().chain(self.others)
-    }
-
-    /// Number of address spaces mapping this page (Linux's mapcount): the owner (if still there)
-    /// and the borrowers.
-    fn users(&self) -> usize {
-        usize::from(self.owner.is_some()) + usize::from(self.first.is_some()) + self.others.len()
-    }
-}
-
-/// Hash of host page addresses: dropping the low bits of a page-aligned address and multiplying
-/// by an odd constant spreads them well enough. The default SipHash took over 10% of a big
-/// process's fork.
-#[derive(Default, Clone, Copy)]
-struct PageHasher(u64);
-
-impl std::hash::Hasher for PageHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        }
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.0 = (n as u64 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-/// The loan records shared by one fork family, keyed by host page address.
-type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageHasher>>>>;
-
-/// A contiguous run in the page table: the start of its VMA, the guest address, the host address
-/// and the length. Pages are joined into runs before their entries are changed page by page. Runs
-/// never cross VMAs: the VMAs an mprotect split off, or the host memory of two adjacent mmaps, may
-/// be contiguous while their permissions differ.
-#[derive(Default)]
-struct Runs {
-    runs: Vec<(u64, u64, usize, u64)>,
-}
-
-impl Runs {
-    fn push(&mut self, vma: u64, page: u64, host: NonNull<u8>) {
-        let host = host.as_ptr() as usize;
-        if let Some((v, g, h, len)) = self.runs.last_mut()
-            && *v == vma
-            && *g + *len == page
-            && *h + *len as usize == host
-        {
-            *len += PAGE_SIZE;
-            return;
-        }
-        self.runs.push((vma, page, host, PAGE_SIZE));
-    }
-}
-
-/// A borrowed page.
-struct Borrowed {
-    host: NonNull<u8>,
-    /// Holds that host memory, so it is not released when the owner unmaps it or is destroyed.
-    region: Arc<HostRegion>,
-}
-
-/// The copy-on-write pages of an address space (guest addresses). Only in private anonymous
-/// mappings.
-#[derive(Default)]
-struct Cow {
-    /// Lent pages: their entries have no write permission.
-    lent: BTreeSet<u64>,
-    /// Borrowed pages: their entries point at the owner's host page, without write permission.
-    borrowed: BTreeMap<u64, Borrowed>,
-}
-
 /// The address space of a guest process.
 pub struct Mm {
     // Destroy the page table before releasing the host memory it points at (Drop releases the
@@ -1025,233 +285,9 @@ pub struct Mm {
     files: FileMaps,
 }
 
-/// Host mappings of read-only private file mappings (the code segments of programs and libraries),
-/// shared by all address spaces in the kernel: mapping the same piece of the same version
-/// ([`content::version`]) of a file again reuses one directly, with its host page tables intact,
-/// so there is no re-mapping or page fault, and no teardown at exit (once each for the program's
-/// and the dynamic linker's code segments every time the shell spawns a process). VMAs using one
-/// are marked `cow`, like parent and child sharing host memory after fork, and copy their own
-/// before writing. On the host it is a read-only mapping, so a place that forgets to copy fails
-/// outright instead of silently changing someone else's code.
-#[derive(Clone, Default)]
-pub(crate) struct FileMaps(Arc<Mutex<Vec<FileMap>>>);
-
-struct FileMap {
-    /// (device, inode, file offset, length, ctime, size).
-    key: [u64; 6],
-    region: Arc<HostRegion>,
-    host: NonNull<u8>,
-    /// Sequence number of the most recent use; when full, the least recently used is dropped.
-    used: u64,
-}
-
-// SAFETY: host points into host memory that region holds
-unsafe impl Send for FileMap {}
-
-impl FileMaps {
-    /// The most pieces kept. They take only host address space; the pages are in the page cache
-    /// and can be reclaimed when host memory is short.
-    const MAX: usize = 128;
-
-    fn get(&self, key: &[u64; 6]) -> Option<(Arc<HostRegion>, NonNull<u8>)> {
-        let mut maps = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
-        let m = maps.iter_mut().find(|m| m.key == *key)?;
-        m.used = next;
-        Some((m.region.clone(), m.host))
-    }
-
-    fn insert(&self, key: [u64; 6], region: Arc<HostRegion>, host: NonNull<u8>) {
-        let mut maps = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let used = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
-        if maps.len() >= Self::MAX
-            && let Some(old) = (0..maps.len()).min_by_key(|&i| maps[i].used)
-        {
-            maps.swap_remove(old);
-        }
-        maps.push(FileMap {
-            key,
-            region,
-            host,
-            used,
-        });
-    }
-
-    /// Drops everything (when host memory is short). Mappings still in use are held by the VMAs
-    /// using them and are unaffected.
-    pub fn clear(&self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-    }
-}
-
-/// One line of `/proc/<pid>/maps`.
-pub struct Region {
-    pub start: u64,
-    pub end: u64,
-    pub prot: u32,
-    pub shared: bool,
-    pub name: Option<Rc<[u8]>>,
-    /// File mappings: the file offset of the start and the file's inode.
-    pub file: Option<(u64, u64)>,
-    /// Locked by mlock.
-    pub locked: bool,
-    /// Write permission can be granted (smaps `mw`).
-    pub may_write: bool,
-    /// Execute permission can be granted (smaps `me`).
-    pub may_exec: bool,
-    /// `MADV_DONTDUMP` (smaps `dd`).
-    pub dontdump: bool,
-    /// `MADV_WIPEONFORK` (smaps `wf`).
-    pub wipeonfork: bool,
-    /// `MADV_DONTFORK` (smaps `dc`).
-    pub dontfork: bool,
-}
-
-/// One mapping in a core dump ([`Mm::dump_regions`]).
-pub struct DumpRegion {
-    pub start: u64,
-    pub end: u64,
-    pub prot: u32,
-    /// Bytes from the start written to the core file.
-    pub size: u64,
-    /// Pages not resident in host memory were never touched (anonymous, shared memory) and are
-    /// written as holes; untouched pages of private file mappings are file contents and must be
-    /// read.
-    pub sparse: bool,
-    /// File mappings: the file offset of the start and the path (`NT_FILE`).
-    pub file: Option<(u64, Rc<[u8]>)>,
-}
-
-/// Bits of `/proc/<pid>/coredump_filter` (Linux's `MMF_DUMP_*`); the default is
-/// [`dump_filter::DEFAULT`].
-pub mod dump_filter {
-    pub const ANON_PRIVATE: u32 = 1;
-    pub const ANON_SHARED: u32 = 2;
-    pub const MAPPED_PRIVATE: u32 = 4;
-    pub const MAPPED_SHARED: u32 = 8;
-    pub const ELF_HEADERS: u32 = 16;
-    /// Private and shared anonymous mappings, ELF headers, private huge pages.
-    pub const DEFAULT: u32 = 0x33;
-}
-
-fn page_up(v: u64) -> Option<u64> {
-    v.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
-}
-
-/// The page-table permission for a guest permission: arm64 has no write-only pages, so writable
-/// implies readable.
-fn mmu_prot(p: u32) -> u32 {
-    let mut r = p & (prot::READ | prot::WRITE | prot::EXEC);
-    if r & prot::WRITE != 0 {
-        r |= prot::READ;
-    }
-    r
-}
-
-/// Bytes of the file that still have contents from `offset`, rounded up to a page, at most `len`.
-fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
-    extent(appine_hal::fstat(fd).map_or(0, |s| s.st_size), offset, len)
-}
-
-/// Bytes of a file of size `size` that still have contents from `offset` ([`file_extent`]).
-fn extent(size: i64, offset: u64, len: u64) -> u64 {
-    (size.max(0) as u64)
-        .saturating_sub(offset)
-        .next_multiple_of(PAGE_SIZE)
-        .min(len)
-}
-
-/// The version of a host file's contents ([`content::version`]), None when there is no trusted
-/// version.
-pub(crate) fn content_version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
-    content::version(st, dev, ino)
-}
-
-/// Telling whether two file mappings have the same contents ([`Mm::code_sources`]).
-mod content {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    /// Host files (device, inode) that have had a writable shared mapping: contents written through
-    /// a shared mapping do not necessarily change ctime (a page that stays dirty no longer goes
-    /// through page_mkwrite), so ctime is no longer trusted for such files.
-    static WRITABLY_SHARED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
-
-    /// File (`dev`, `ino`) got a writable shared mapping.
-    pub(super) fn writably_shared(dev: u64, ino: u64) {
-        let mut set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set.get_or_insert_with(HashSet::new).insert((dev, ino));
-    }
-
-    /// The version of a host file's contents: ctime (nanoseconds) and size. Every change to the
-    /// contents (write, truncate, fallocate…) sets ctime to the current time on the host, and
-    /// utimensat cannot set it back, so two equal versions mean no change in between. Host
-    /// timestamps come from a coarse clock, and when ctime is too close to now a change right
-    /// after may get the same ctime, so no version is given then; nor for files that have had a
-    /// writable shared mapping.
-    #[allow(clippy::unnecessary_cast)]
-    pub(super) fn version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
-        const RACY_NS: i128 = 2_000_000_000;
-        let ctime = st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as i128;
-        if ctime + RACY_NS > now {
-            return None;
-        }
-        let set = WRITABLY_SHARED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if set.as_ref().is_some_and(|s| s.contains(&(dev, ino))) {
-            return None;
-        }
-        Some((ctime as u64, st.st_size as u64))
-    }
-}
-
-/// Discards the contents of private anonymous host memory: whole pages go back to the host, and
-/// when host pages are larger than 4K the partial pages at both ends are zeroed. It used to zero
-/// everything, so the GCs of Go, the JVM and V8 touched every page they were giving back.
-///
-/// # Safety
-///
-/// `[ptr, ptr + len)` is private anonymous host memory held by an [`Mm`].
-unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
-    let page = appine_hal::page_size();
-    let addr = ptr.as_ptr() as usize;
-    let head = (addr.next_multiple_of(page) - addr).min(len);
-    let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
-    // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
-    unsafe {
-        if head < tail && appine_hal::discard(ptr.add(head), tail - head).is_ok() {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, head);
-            std::ptr::write_bytes(ptr.as_ptr().add(tail), 0, len - tail);
-        } else {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, len);
-        }
-    }
-}
-
-fn map_err(e: MapError) -> Errno {
-    match e {
-        MapError::InvalidArgument => Errno::EINVAL,
-        MapError::OutOfMemory => Errno::ENOMEM,
-    }
-}
-
 impl Mm {
+    // ---- Creation and layout ----
+
     /// Creates an empty address space.
     pub fn new() -> Self {
         Mm {
@@ -1297,17 +333,6 @@ impl Mm {
         self.files = files.clone();
     }
 
-    /// Puts it into an `Rc<RefCell<..>>` (the form `TaskState` holds) and records its own handle:
-    /// when a borrower returns the last borrow, it lets the owner restore write permission through
-    /// it.
-    pub fn into_shared(self) -> Rc<RefCell<Mm>> {
-        Rc::new_cyclic(|me| {
-            let mut mm = self;
-            mm.me = me.clone();
-            RefCell::new(mm)
-        })
-    }
-
     /// Sets the upper bound of the mmap area from the stack size limit `stack_limit` (the
     /// `RLIMIT_STACK` at execve): like Linux's `mmap_base`, it leaves a gap that large for the
     /// stack plus [`STACK_GUARD_GAP`], clamped between [`MIN_GAP`] and [`MAX_GAP`]. When the limit
@@ -1320,61 +345,100 @@ impl Mm {
         self.mmap_top = (STACK_TOP - gap) & !(PAGE_SIZE - 1);
     }
 
+    /// Creates a zeroed anonymous mapping at a fixed address (used by the loader); the range must
+    /// be free.
+    pub fn map_anonymous(&mut self, start: u64, len: u64, prot: u32) -> Result<(), Errno> {
+        if !start.is_multiple_of(PAGE_SIZE) || len == 0 || !len.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        if !self.is_free(start, len) {
+            return Err(Errno::EEXIST);
+        }
+        let (region, host) = Self::private_anonymous(len, prot, prot & prot::WRITE != 0)?;
+        self.insert(
+            start,
+            len,
+            len,
+            prot,
+            Backing::Anonymous,
+            true,
+            region,
+            host,
+        )
+    }
+
+    /// Sets the initial program break (used by the loader).
+    pub fn set_brk(&mut self, start: u64) {
+        self.brk_start = start;
+        self.brk = start;
+    }
+
+    /// Maps the main thread's initial stack `[STACK_TOP - len, STACK_TOP)` (used by the loader):
+    /// readable and writable, growing downwards. Host memory is reserved below it up to `reserve`
+    /// bytes in all (taking no memory until touched), and while the stack grows within that range
+    /// the same VMA is only lengthened in place.
+    pub fn map_stack(&mut self, len: u64, reserve: u64) -> Result<(), Errno> {
+        let start = STACK_TOP - len;
+        if !self.is_free(start, len) {
+            return Err(Errno::EEXIST);
+        }
+        let (region, base) = Self::new_anonymous(reserve.max(len), false)?;
+        // SAFETY: this host memory is at least len bytes
+        let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
+        let rw = prot::READ | prot::WRITE;
+        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)?;
+        self.vmas.get_mut(&start).unwrap().growsdown = true;
+        self.stack_low = start;
+        Ok(())
+    }
+
+    /// Records the initial stack pointer (used by the loader).
+    pub fn set_start_stack(&mut self, sp: u64) {
+        self.start_stack = sp;
+    }
+
+    /// Records the file's name and inode for file mappings starting in `[start, start + len)` (for
+    /// `/proc/<pid>/maps`). As on Linux, the anonymous mapping in between (.bss) has no name.
+    pub fn label(&mut self, start: u64, len: u64, name: Option<Rc<[u8]>>, ino: u64) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            if v.file_id.is_some() {
+                v.name = name.clone();
+                v.ino = ino;
+            }
+        }
+    }
+
+    /// Puts it into an `Rc<RefCell<..>>` (the form `TaskState` holds) and records its own handle:
+    /// when a borrower returns the last borrow, it lets the owner restore write permission through
+    /// it.
+    pub fn into_shared(self) -> Rc<RefCell<Mm>> {
+        Rc::new_cyclic(|me| {
+            let mut mm = self;
+            mm.me = me.clone();
+            RefCell::new(mm)
+        })
+    }
+
     /// This address space's software page table.
     pub fn mmu(&self) -> &Mmu {
         &self.mmu
     }
 
-    /// Ranges of shared file mappings that can be written (writable now, or can be mprotected
-    /// writable later): futexes there are keyed by file and offset ([`Mm::futex_key`]), so the
-    /// no-BKL futex keyed by host address (`syscall::fast`, which handles only writable pages)
-    /// must avoid them. Shared mappings of files opened read-only do not count: Go's toolchain
-    /// reads files through them and also maps a telemetry counter file shared and writable in
-    /// every process, hence tracking by range. Recounted after such a mapping is created or moved
-    /// ([`Mm::note_shared_files`]); torn-down ones need not be removed at once, it only means
-    /// futexes there take the locked path.
-    pub fn shared_files(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
-        self.shared_files.clone()
+    // ---- Threads, shootdown and code groups ----
+
+    /// Registers a thread that starts using this address space.
+    pub fn add_user(&mut self, user: Arc<TaskSync>) {
+        self.users.push(user);
     }
 
-    /// Recounts [`Mm::shared_files`] from the current mappings. With `moved`, only when such
-    /// mappings exist (after mremap: the ones moved or grown may be among them).
-    pub fn note_shared_files(&self, moved: bool) {
-        let mut ranges = self
-            .shared_files
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if moved && ranges.is_empty() {
-            return;
+    /// The shootdown generation, the code generation and the code-change log ([`Mm::sync`]).
+    pub fn generations(&self) -> Generations {
+        Generations {
+            tlb: self.generation.clone(),
+            code: self.code_generation.clone(),
+            log: self.code_log.clone(),
+            space: self.space_generation.clone(),
         }
-        *ranges = self
-            .vmas
-            .iter()
-            .filter(|(_, v)| v.backing == Backing::Shared && v.file_id.is_some() && v.may_write)
-            .map(|(&s, v)| (s, s + v.len))
-            .collect();
-    }
-
-    /// The key of the futex at `addr`; None when nothing is mapped there.
-    pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
-        // The key of private memory is its host address: a borrowed page is first replaced by our
-        // own, or the key would change after copy-on-write and threads waiting on the old key
-        // could never be woken; this also keeps it from matching the key on the owner's side
-        let page = addr & !(PAGE_SIZE - 1);
-        if self.cow.borrow().borrowed.contains_key(&page) {
-            self.materialize(page, true);
-        }
-        // As on Linux, the futex address must be readable
-        let host = self.translate(addr, prot::READ)?;
-        let (&start, v) = self.vmas.range(..=addr).next_back()?;
-        Some(match v.file_id {
-            Some((dev, ino, offset)) if v.backing == Backing::Shared => crate::futex::Key::File {
-                dev,
-                ino,
-                offset: offset + (addr - start),
-            },
-            _ => crate::futex::Key::Host(host.as_ptr() as usize),
-        })
     }
 
     /// This address space's Tier 1 translations, created if missing; None when the host does not
@@ -1436,6 +500,31 @@ impl Mm {
         None
     }
 
+    /// Executable mappings whose contents are determined by the file and version
+    /// ([`appine_engine::DbtSource`]): private file mappings never written that have a trusted
+    /// version ([`content::version`]). They are recorded before the translations go back to the
+    /// pool, and when the next user's mapping at the same place is the same piece of the same
+    /// version of the file, the blocks in it need no block-by-block check (which reads every
+    /// page of the program's and the dynamic linker's code segments, every time the shell spawns
+    /// a process).
+    fn code_sources(&self) -> Vec<appine_engine::DbtSource> {
+        self.vmas
+            .iter()
+            .filter(|(_, v)| {
+                v.prot & prot::EXEC != 0 && v.backing == Backing::PrivateFile && !v.written.get()
+            })
+            .filter_map(|(&start, v)| {
+                let ((dev, ino, offset), (ctime, size)) = (v.file_id?, v.content?);
+                Some(appine_engine::DbtSource {
+                    start,
+                    len: v.len,
+                    id: [dev, ino, offset, ctime, size],
+                })
+            })
+            .take(appine_engine::DbtSpace::SOURCES)
+            .collect()
+    }
+
     /// Just created its own translations: opens a group for other address spaces of the same
     /// program to join.
     fn found_group(&mut self, groups: &CodeGroups, space: &Arc<appine_engine::DbtSpace>) {
@@ -1467,47 +556,49 @@ impl Mm {
         self.code_tag = tag;
     }
 
-    /// Whether an executable mapping can share translations with other address spaces: if so,
-    /// returns its identity. Trusted are private file mappings that were never written and have a
-    /// version, and an unmodified vDSO (the same in every process).
-    fn exec_source(&self, start: u64, v: &Vma) -> Option<appine_engine::DbtSource> {
-        if start == self.vdso && v.backing == Backing::Anonymous {
-            // Read through the page table: a forked child's pages are borrowed from the parent and
-            // its own host memory is still zero
-            let image = crate::vdso::image();
-            let mut bytes = vec![0; image.len()];
-            let read = self.read(UserSlice::new(start, image.len()), &mut bytes);
-            return (read.is_ok() && bytes == image).then_some(appine_engine::DbtSource {
-                start,
-                len: v.len,
-                id: [u64::MAX; 5],
-            });
-        }
-        if v.backing != Backing::PrivateFile || v.written.get() {
-            return None;
-        }
-        let ((dev, ino, offset), (ctime, size)) = (v.file_id?, v.content?);
-        Some(appine_engine::DbtSource {
-            start,
-            len: v.len,
-            id: [dev, ino, offset, ctime, size],
-        })
+    /// The guest modified the code in `[start, start + len)` (`ic ivau`); the translations there
+    /// are invalidated at the next [`Mm::sync`].
+    pub fn invalidate_code(&mut self, start: u64, len: u64) {
+        self.code_ranges.push((start, len));
     }
 
-    /// All executable mappings: the trusted identities ([`Mm::exec_source`]) and the remaining
-    /// ranges `[start, end)` (JIT output, code that was written; adjacent ones merged).
-    fn exec_split(&self) -> (Vec<appine_engine::DbtSource>, Vec<(u64, u64)>) {
-        let (mut trusted, mut private) = (Vec::new(), Vec::<(u64, u64)>::new());
-        for (&start, v) in self.vmas.iter().filter(|(_, v)| v.prot & prot::EXEC != 0) {
-            match self.exec_source(start, v) {
-                Some(s) => trusted.push(s),
-                None => match private.last_mut() {
-                    Some(last) if last.1 == start => last.1 = start + v.len,
-                    _ => private.push((start, start + v.len)),
-                },
-            }
+    /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
+    /// unmapped host memory; when only code must be invalidated, it only records the ranges and
+    /// bumps the generation.
+    ///
+    /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
+    /// re-entering guest code.
+    pub fn sync(&mut self, current: &Arc<TaskSync>) {
+        self.check_code_group();
+        let code = std::mem::take(&mut self.code_ranges);
+        let dirty = std::mem::take(&mut self.dirty);
+        if !dirty && code.is_empty() {
+            return;
         }
-        (trusted, private)
+        // Record the ranges before bumping the generation: a user that reads the new generation
+        // is sure to find its ranges. SeqCst pairs with the user's "mark running guest code, then
+        // read the generation": either it reads the new generation, or this side sees it running
+        // and waits until it has been kicked and left
+        if !code.is_empty() {
+            let generation = self.code_generation.load(Ordering::Relaxed) + 1;
+            self.code_log.lock().unwrap().push(generation, &code);
+            self.code_generation.store(generation, Ordering::SeqCst);
+        }
+        if !dirty && self.graveyard.is_empty() {
+            // Only code changed (a JIT's ic ivau): the translations are shared by this address
+            // space's threads, and the thread that changed the code invalidates once before
+            // re-entering guest code, after which the invalidated blocks' entries jump to the
+            // forwarding stub, so other users need not be kicked. Until then they may still run
+            // the old translations, just as other cores on hardware may still run old
+            // instructions before context synchronization. Waiting is what membarrier's SYNC_CORE
+            // (which calls quiesce) is for
+            return;
+        }
+        if dirty {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.quiesce(current);
+        self.graveyard.clear();
     }
 
     /// Checks against the group's registration after the executable mappings changed
@@ -1551,99 +642,47 @@ impl Mm {
         self.dirty = true;
     }
 
-    /// Executable mappings whose contents are determined by the file and version
-    /// ([`appine_engine::DbtSource`]): private file mappings never written that have a trusted
-    /// version ([`content::version`]). They are recorded before the translations go back to the
-    /// pool, and when the next user's mapping at the same place is the same piece of the same
-    /// version of the file, the blocks in it need no block-by-block check (which reads every
-    /// page of the program's and the dynamic linker's code segments, every time the shell spawns
-    /// a process).
-    fn code_sources(&self) -> Vec<appine_engine::DbtSource> {
-        self.vmas
-            .iter()
-            .filter(|(_, v)| {
-                v.prot & prot::EXEC != 0 && v.backing == Backing::PrivateFile && !v.written.get()
-            })
-            .filter_map(|(&start, v)| {
-                let ((dev, ino, offset), (ctime, size)) = (v.file_id?, v.content?);
-                Some(appine_engine::DbtSource {
-                    start,
-                    len: v.len,
-                    id: [dev, ino, offset, ctime, size],
-                })
-            })
-            .take(appine_engine::DbtSpace::SOURCES)
-            .collect()
-    }
-
-    /// The shootdown generation, the code generation and the code-change log ([`Mm::sync`]).
-    pub fn generations(&self) -> Generations {
-        Generations {
-            tlb: self.generation.clone(),
-            code: self.code_generation.clone(),
-            log: self.code_log.clone(),
-            space: self.space_generation.clone(),
+    /// All executable mappings: the trusted identities ([`Mm::exec_source`]) and the remaining
+    /// ranges `[start, end)` (JIT output, code that was written; adjacent ones merged).
+    fn exec_split(&self) -> (Vec<appine_engine::DbtSource>, Vec<(u64, u64)>) {
+        let (mut trusted, mut private) = (Vec::new(), Vec::<(u64, u64)>::new());
+        for (&start, v) in self.vmas.iter().filter(|(_, v)| v.prot & prot::EXEC != 0) {
+            match self.exec_source(start, v) {
+                Some(s) => trusted.push(s),
+                None => match private.last_mut() {
+                    Some(last) if last.1 == start => last.1 = start + v.len,
+                    _ => private.push((start, start + v.len)),
+                },
+            }
         }
+        (trusted, private)
     }
 
-    /// The guest modified the code in `[start, start + len)` (`ic ivau`); the translations there
-    /// are invalidated at the next [`Mm::sync`].
-    pub fn invalidate_code(&mut self, start: u64, len: u64) {
-        self.code_ranges.push((start, len));
-    }
-
-    /// Registers a thread that starts using this address space.
-    pub fn add_user(&mut self, user: Arc<TaskSync>) {
-        self.users.push(user);
-    }
-
-    /// Unregisters a thread that no longer uses this address space (exit or execve).
-    pub fn remove_user(&mut self, user: &Arc<TaskSync>) {
-        self.users.retain(|u| !Arc::ptr_eq(u, user));
-    }
-
-    /// Whether other threads still use this address space.
-    pub fn shared_with_others(&self) -> bool {
-        self.users.len() > 1
-    }
-
-    /// If mappings were torn down or lost permissions, does a TLB shootdown and then releases the
-    /// unmapped host memory; when only code must be invalidated, it only records the ranges and
-    /// bumps the generation.
-    ///
-    /// The caller holds the BKL; `current` is the calling thread, which flushes by itself before
-    /// re-entering guest code.
-    pub fn sync(&mut self, current: &Arc<TaskSync>) {
-        self.check_code_group();
-        let code = std::mem::take(&mut self.code_ranges);
-        let dirty = std::mem::take(&mut self.dirty);
-        if !dirty && code.is_empty() {
-            return;
+    /// Whether an executable mapping can share translations with other address spaces: if so,
+    /// returns its identity. Trusted are private file mappings that were never written and have a
+    /// version, and an unmodified vDSO (the same in every process).
+    fn exec_source(&self, start: u64, v: &Vma) -> Option<appine_engine::DbtSource> {
+        if start == self.vdso && v.backing == Backing::Anonymous {
+            // Read through the page table: a forked child's pages are borrowed from the parent and
+            // its own host memory is still zero
+            let image = crate::vdso::image();
+            let mut bytes = vec![0; image.len()];
+            let read = self.read(UserSlice::new(start, image.len()), &mut bytes);
+            return (read.is_ok() && bytes == image).then_some(appine_engine::DbtSource {
+                start,
+                len: v.len,
+                id: [u64::MAX; 5],
+            });
         }
-        // Record the ranges before bumping the generation: a user that reads the new generation
-        // is sure to find its ranges. SeqCst pairs with the user's "mark running guest code, then
-        // read the generation": either it reads the new generation, or this side sees it running
-        // and waits until it has been kicked and left
-        if !code.is_empty() {
-            let generation = self.code_generation.load(Ordering::Relaxed) + 1;
-            self.code_log.lock().unwrap().push(generation, &code);
-            self.code_generation.store(generation, Ordering::SeqCst);
+        if v.backing != Backing::PrivateFile || v.written.get() {
+            return None;
         }
-        if !dirty && self.graveyard.is_empty() {
-            // Only code changed (a JIT's ic ivau): the translations are shared by this address
-            // space's threads, and the thread that changed the code invalidates once before
-            // re-entering guest code, after which the invalidated blocks' entries jump to the
-            // forwarding stub, so other users need not be kicked. Until then they may still run
-            // the old translations, just as other cores on hardware may still run old
-            // instructions before context synchronization. Waiting is what membarrier's SYNC_CORE
-            // (which calls quiesce) is for
-            return;
-        }
-        if dirty {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-        }
-        self.quiesce(current);
-        self.graveyard.clear();
+        let ((dev, ino, offset), (ctime, size)) = (v.file_id?, v.content?);
+        Some(appine_engine::DbtSource {
+            start,
+            len: v.len,
+            id: [dev, ino, offset, ctime, size],
+        })
     }
 
     /// Kicks the other users running guest code and waits until all have left. They next take the
@@ -1662,61 +701,17 @@ impl Mm {
         }
     }
 
-    /// Whether `[start, start + len)` is entirely free.
-    fn is_free(&self, start: u64, len: u64) -> bool {
-        // The last VMA starting before the end of the range must not reach into the range
-        self.vmas
-            .range(..start + len)
-            .next_back()
-            .is_none_or(|(&s, v)| s + v.len <= start)
+    /// Whether other threads still use this address space.
+    pub fn shared_with_others(&self) -> bool {
+        self.users.len() > 1
     }
 
-    /// Finds a free range of length `len`, top down.
-    pub fn find_free(&self, len: u64) -> Option<u64> {
-        let mut top = self.mmap_top;
-        for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
-            let end = s + v.len;
-            if end <= top && top - end >= len {
-                return Some(top - len);
-            }
-            top = top.min(s);
-        }
-        (top >= MMAP_MIN + len).then(|| top - len)
+    /// Unregisters a thread that no longer uses this address space (exit or execve).
+    pub fn remove_user(&mut self, user: &Arc<TaskSync>) {
+        self.users.retain(|u| !Arc::ptr_eq(u, user));
     }
 
-    /// Puts part of a VMA into the page table: builds entries for the VMA's own host memory
-    /// `[host, host + len)` at `[start, start + len)`, leaving existing entries alone (those
-    /// changed by copy-on-write, or kept by mprotect with permission 0). `PROT_NONE` gets none:
-    /// writing entries page by page for the large address ranges V8 and the JVM reserve takes a
-    /// lot of memory (16 MB for 8 GB), so they are added when mprotect grants permissions
-    /// ([`Mm::mprotect`]). Neither does anything over [`EAGER_MAX`], which is filled on demand at
-    /// access ([`Mm::fault_in`]), except executable mappings that are not private anonymous
-    /// (`file`: file mappings, shared anonymous memory, SysV shm), which are built anyway: when
-    /// translations are shared, guest instruction words are checked against the page table (the
-    /// DBT's recheck), and blocks without entries must be parked and restored page by page on
-    /// first execution. For a file mapping their size is bounded by the file size.
-    fn map_pages(
-        mmu: &mut Mmu,
-        start: u64,
-        host: NonNull<u8>,
-        len: u64,
-        prot: u32,
-        file: bool,
-    ) -> Result<(), Errno> {
-        if mmu_prot(prot) == 0 || len == 0 {
-            return Ok(());
-        }
-        if len > EAGER_MAX && !(file && prot & prot::EXEC != 0) {
-            return Ok(());
-        }
-        // SAFETY: the VMA holds the host memory, which lives at least as long as the mapping in
-        // the page table
-        if let Err(e) = unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) } {
-            let _ = mmu.unmap(start, len);
-            return Err(map_err(e));
-        }
-        Ok(())
-    }
+    // ---- Guest page faults ----
 
     /// On-demand filling ([`EAGER_MAX`]): called when a guest access to `addr` faults, or when the
     /// kernel layer reads or writes it. If the page has no entry yet and its VMA allows the access
@@ -1746,131 +741,6 @@ impl Mm {
         unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok()
     }
 
-    /// The ranges (guest addresses) of private anonymous VMA `start` that may have contents and may
-    /// be resident, sorted by address, each at most [`WINDOW_MAX`]: fork's lending
-    /// ([`Mm::lend`]) and resident-memory measurement look only at these, so a mapping of several
-    /// TB with only a few pages touched need not be checked page by page.
-    ///
-    /// It rests on this rule: every page of private anonymous memory with contents has an entry.
-    /// Guest accesses and kernel-layer reads and writes through the page table fill the entries
-    /// first ([`Mm::fault_in`]); the kernel layer writing host memory directly
-    /// ([`Mm::write_kernel`]) or populating it ([`Mm::populate`]) fills them too; mprotect to
-    /// `PROT_NONE` keeps the entries with permissions cleared; mremap moves the entries along
-    /// ([`Mm::move_range`]). Copy-on-write pages count as well (borrowed pages in a `PROT_NONE`
-    /// VMA have no entries). So the result is the runs of leaf tables (2 MB) that have entries.
-    fn touched_windows(&self, start: u64) -> Vec<(u64, u64)> {
-        let v = &self.vmas[&start];
-        let end = start + v.len;
-        let cow = self.cow.borrow();
-        let mut lent = cow.lent.range(start..end).copied().peekable();
-        let mut borrowed = cow.borrowed.range(start..end).map(|(&p, _)| p).peekable();
-        // The next page to look at: the earliest that has an entry or is copy-on-write
-        let mut next = |from: u64| {
-            while lent.next_if(|&p| p < from).is_some() {}
-            while borrowed.next_if(|&p| p < from).is_some() {}
-            let pte = self.mmu.next_present(from, end);
-            pte.min(lent.peek().copied().unwrap_or(end))
-                .min(borrowed.peek().copied().unwrap_or(end))
-        };
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        let mut at = start;
-        while at < end {
-            let page = next(at);
-            if page >= end {
-                break;
-            }
-            let lo = (page & !(LEAF_SPAN - 1)).max(start);
-            let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
-            match out.last_mut() {
-                Some((s, e)) if *e == lo && hi - *s <= WINDOW_MAX => *e = hi,
-                _ => out.push((lo, hi)),
-            }
-            at = hi;
-        }
-        out
-    }
-
-    /// Maps a piece of host memory at `[start, start + len)`; the caller guarantees the range is
-    /// free. For file mappings `file_len` is the number of bytes before the end of the file
-    /// ([`Vma::file_len`]), and only that part gets entries: when a small file is mapped
-    /// executable over a large range, the page table is only as large as the file.
-    #[allow(clippy::too_many_arguments)]
-    fn insert(
-        &mut self,
-        start: u64,
-        len: u64,
-        file_len: u64,
-        prot: u32,
-        backing: Backing,
-        may_write: bool,
-        region: Arc<HostRegion>,
-        host: NonNull<u8>,
-    ) -> Result<(), Errno> {
-        self.room_for(1)?;
-        let file = backing != Backing::Anonymous;
-        Self::map_pages(&mut self.mmu, start, host, file_len, prot, file)?;
-        self.exec_changed |= prot & prot::EXEC != 0;
-        self.vmas.insert(
-            start,
-            Vma {
-                len,
-                prot,
-                backing,
-                may_write,
-                may_exec: true,
-                region,
-                name: None,
-                ino: 0,
-                host,
-                file_len,
-                cow: false,
-                file_id: None,
-                content: None,
-                file: None,
-                shm: None,
-                locked: self.lock_future,
-                written: Cell::new(prot & prot::WRITE != 0),
-                growsdown: false,
-                dontdump: false,
-                wipeonfork: false,
-                dontfork: false,
-                noreserve: false,
-            },
-        );
-        Ok(())
-    }
-
-    /// Whether there is room for `more` more VMAs (`vm.max_map_count`).
-    fn room_for(&self, more: usize) -> Result<(), Errno> {
-        if self.vmas.len() + more > MAX_MAP_COUNT.load(Ordering::Relaxed) {
-            return Err(Errno::ENOMEM);
-        }
-        Ok(())
-    }
-
-    /// How many more VMAs splitting at these addresses makes.
-    fn splits(&self, addrs: &[u64]) -> usize {
-        addrs
-            .iter()
-            .filter(|&&a| {
-                self.vmas
-                    .range(..a)
-                    .next_back()
-                    .is_some_and(|(&s, v)| s + v.len > a)
-            })
-            .count()
-    }
-
-    /// Puts a whole VMA at `start`; the caller guarantees the range is free.
-    fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
-        self.room_for(1)?;
-        let file = v.backing != Backing::Anonymous;
-        Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
-        self.exec_changed |= v.prot & prot::EXEC != 0;
-        self.vmas.insert(start, v);
-        Ok(())
-    }
-
     /// Called when a guest access to `addr` faults. Returns `Some(true)` if the address is in the
     /// part of a file mapping past the end of the file, which should raise SIGBUS; if the file of
     /// a shared mapping has grown since, maps the new contents and returns `Some(false)`, and the
@@ -1893,110 +763,6 @@ impl Mm {
             }
         }
         Some(true)
-    }
-
-    /// New anonymous host memory. Host memory is always readable and writable (the page table
-    /// carries the guest permissions), so the caller decides `reserve` by Linux's commit rules:
-    /// only writable private mappings are accounted, while `MAP_NORESERVE`, read-only and
-    /// `PROT_NONE` ones are not. V8 reserves 8 GB of `PROT_NONE` for every wasm memory, which
-    /// would fail outright on hosts with little memory if it were accounted.
-    fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
-        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
-        let base = match recycled::take(host_len, reserve) {
-            Some(base) => base,
-            None => appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?,
-        };
-        Ok((
-            Arc::new(HostRegion {
-                base,
-                len: host_len,
-                anonymous: Some(reserve),
-                reserved: false,
-            }),
-            base,
-        ))
-    }
-
-    /// Host memory for a new private anonymous mapping: a `PROT_NONE` one is only a reservation
-    /// and takes no host address space ([`HostRegion::reserved`]); the rest as
-    /// [`Mm::new_anonymous`].
-    fn private_anonymous(
-        len: u64,
-        prot: u32,
-        reserve: bool,
-    ) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
-        if mmu_prot(prot) == 0 {
-            let region = HostRegion::reserved();
-            let host = region.base;
-            return Ok((region, host));
-        }
-        Self::new_anonymous(len, reserve)
-    }
-
-    /// Gives reserved VMA `start` ([`HostRegion::reserved`]) its own host memory (all zero), after
-    /// which it behaves like an ordinary private anonymous mapping. It has no entries, so the page
-    /// table needs no change. Reservations are often hundreds of GB, so the caller first splits off
-    /// the piece it needs. `reserve` is whether it is counted in the host commit
-    /// ([`Mm::new_anonymous`]).
-    fn back_reserved(&mut self, start: u64, reserve: bool) -> Result<(), Errno> {
-        let v = &self.vmas[&start];
-        if !v.reserved() {
-            return Ok(());
-        }
-        let (region, host) = Self::new_anonymous(v.len, reserve)?;
-        let v = self.vmas.get_mut(&start).unwrap();
-        v.region = region;
-        v.host = host;
-        Ok(())
-    }
-
-    /// Creates a zeroed anonymous mapping at a fixed address (used by the loader); the range must
-    /// be free.
-    pub fn map_anonymous(&mut self, start: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        if !start.is_multiple_of(PAGE_SIZE) || len == 0 || !len.is_multiple_of(PAGE_SIZE) {
-            return Err(Errno::EINVAL);
-        }
-        if !self.is_free(start, len) {
-            return Err(Errno::EEXIST);
-        }
-        let (region, host) = Self::private_anonymous(len, prot, prot & prot::WRITE != 0)?;
-        self.insert(
-            start,
-            len,
-            len,
-            prot,
-            Backing::Anonymous,
-            true,
-            region,
-            host,
-        )
-    }
-
-    /// Marks the mapping starting at `start` as growing downwards (a private anonymous mapping
-    /// with `MAP_GROWSDOWN`).
-    pub fn set_growsdown(&mut self, start: u64) {
-        if let Some(v) = self.vmas.get_mut(&start) {
-            v.growsdown = true;
-        }
-    }
-
-    /// Maps the main thread's initial stack `[STACK_TOP - len, STACK_TOP)` (used by the loader):
-    /// readable and writable, growing downwards. Host memory is reserved below it up to `reserve`
-    /// bytes in all (taking no memory until touched), and while the stack grows within that range
-    /// the same VMA is only lengthened in place.
-    pub fn map_stack(&mut self, len: u64, reserve: u64) -> Result<(), Errno> {
-        let start = STACK_TOP - len;
-        if !self.is_free(start, len) {
-            return Err(Errno::EEXIST);
-        }
-        let (region, base) = Self::new_anonymous(reserve.max(len), false)?;
-        // SAFETY: this host memory is at least len bytes
-        let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - len as usize)) };
-        let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)?;
-        self.vmas.get_mut(&start).unwrap().growsdown = true;
-        self.stack_low = start;
-        Ok(())
     }
 
     /// The current bottom of the main thread's stack; 0 while there is no stack.
@@ -2060,22 +826,6 @@ impl Mm {
         grown
     }
 
-    /// Bytes still free below the host memory of VMA `start`, by which it can be lengthened
-    /// downwards in place: parts of the same host memory taken by other VMAs (split off, or moved
-    /// away by mremap) do not count.
-    fn spare_below(&self, start: u64) -> u64 {
-        let v = &self.vmas[&start];
-        let host = v.host.as_ptr() as usize;
-        let low = self
-            .vmas
-            .values()
-            .filter(|o| Arc::ptr_eq(&o.region, &v.region))
-            .map(|o| o.host.as_ptr() as usize + o.len as usize)
-            .filter(|&end| end <= host)
-            .fold(v.region.base.as_ptr() as usize, usize::max);
-        (host - low) as u64
-    }
-
     /// Lengthens grows-down VMA `start` downwards in place by `grow` bytes, using the free part
     /// below its host memory ([`Mm::spare_below`]).
     fn extend_down(&mut self, start: u64, grow: u64) -> bool {
@@ -2129,6 +879,238 @@ impl Mm {
         v.locked = locked;
         true
     }
+
+    /// Whether a guest address falls in some mapping (telling SEGV_MAPERR from SEGV_ACCERR).
+    pub fn is_mapped(&self, addr: u64) -> bool {
+        self.vmas
+            .range(..=addr)
+            .next_back()
+            .is_some_and(|(&s, v)| addr < s + v.len)
+    }
+
+    // ---- Kernel access to guest memory ----
+
+    /// Reads from guest memory (like Linux's `copy_from_user`); every page must be readable.
+    pub fn read(&self, src: UserSlice, dst: &mut [u8]) -> Result<(), Errno> {
+        assert_eq!(src.len, dst.len());
+        self.for_each_page(src.addr, src.len, prot::READ, |host, done, chunk| unsafe {
+            std::ptr::copy_nonoverlapping(host, dst[done..].as_mut_ptr(), chunk);
+        })
+    }
+
+    /// Writes to guest memory (like Linux's `copy_to_user`); every page must be writable.
+    pub fn write(&self, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
+        assert_eq!(dst.len, data.len());
+        self.for_each_page(dst.addr, dst.len, prot::WRITE, |host, done, chunk| unsafe {
+            std::ptr::copy_nonoverlapping(data[done..].as_ptr(), host, chunk);
+        })
+    }
+
+    /// Walks `[addr, addr + len)` page by page, calling `f(host pointer, bytes done, chunk length)`
+    /// for each chunk.
+    fn for_each_page(
+        &self,
+        addr: u64,
+        len: usize,
+        required_prot: u32,
+        mut f: impl FnMut(*mut u8, usize, usize),
+    ) -> Result<(), Errno> {
+        let mut done = 0;
+        while done < len {
+            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
+            let page_left = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
+            let chunk = page_left.min(len - done);
+            let host = match self.mmu.translate(cur, required_prot) {
+                Some(host) => host,
+                // Copy-on-write pages: make them writable first (Mm::cow_break); pages without
+                // entries yet are filled on demand
+                None if required_prot & prot::WRITE != 0 && self.cow_break(cur)
+                    || self.fault_in(cur, required_prot) =>
+                {
+                    self.mmu
+                        .translate(cur, required_prot)
+                        .ok_or(Errno::EFAULT)?
+                }
+                None => return Err(Errno::EFAULT),
+            };
+            f(host.as_ptr(), done, chunk);
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// The host pointer the kernel layer finds for guest address `addr` through the page table,
+    /// requiring the permissions in `need`; if there is no entry yet it is filled on demand first
+    /// ([`Mm::fault_in`]). Does not handle copy-on-write (see [`Mm::for_each_page`]).
+    pub fn translate(&self, addr: u64, need: u32) -> Option<NonNull<u8>> {
+        self.mmu.translate(addr, need).or_else(|| {
+            self.fault_in(addr, need)
+                .then(|| self.mmu.translate(addr, need))?
+        })
+    }
+
+    /// Reads a NUL-terminated string (without the NUL), at most `max` bytes; ENAMETOOLONG if
+    /// longer.
+    pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
+        let mut out = Vec::new();
+        let mut cur = addr;
+        loop {
+            let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
+            let host = self.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
+            // SAFETY: translate guarantees this page stays valid for the duration of this call
+            let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
+            if let Some(n) = bytes.iter().position(|&b| b == 0) {
+                out.extend_from_slice(&bytes[..n]);
+                return if out.len() > max {
+                    Err(Errno::ENAMETOOLONG)
+                } else {
+                    Ok(out)
+                };
+            }
+            out.extend_from_slice(bytes);
+            if out.len() > max {
+                return Err(Errno::ENAMETOOLONG);
+            }
+            cur = cur.checked_add(chunk as u64).ok_or(Errno::EFAULT)?;
+        }
+    }
+
+    /// The kernel itself writing into guest memory, such as loading a program or building the
+    /// initial stack. Requires only that it be mapped, without checking permissions, so host
+    /// memory is found by VMA: `PROT_NONE` pages are not in the page table. The part of a file
+    /// mapping past the end of the file cannot be written.
+    pub(crate) fn write_kernel(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
+        // Write the VMA's own host memory directly: copy-on-write pages are first replaced by our
+        // own, and file mappings sharing host memory with other address spaces first copy their
+        // own
+        let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
+        self.cow_settle(addr & !(PAGE_SIZE - 1), end);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let shared: Vec<u64> = self
+            .vmas
+            .range(first..end)
+            .filter(|(_, v)| v.cow)
+            .map(|(&s, _)| s)
+            .collect();
+        for s in shared {
+            self.unshare(s)?;
+        }
+        // A reservation (PROT_NONE, a tracer forcing a write): the pages written are split off and
+        // given host memory
+        let lo = addr & !(PAGE_SIZE - 1);
+        if self
+            .vmas
+            .range(first..end)
+            .any(|(&s, v)| v.reserved() && s + v.len > lo)
+        {
+            self.split_at(lo);
+            self.split_at(end);
+            let reserved: Vec<u64> = self
+                .vmas
+                .range(lo..end)
+                .filter(|(_, v)| v.reserved())
+                .map(|(&s, _)| s)
+                .collect();
+            for s in reserved {
+                self.back_reserved(s, false)?;
+            }
+        }
+        let mut done = 0;
+        while done < data.len() {
+            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
+            let (&s, v) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.file_len)
+                .ok_or(Errno::EFAULT)?;
+            let chunk = ((s + v.file_len - cur) as usize).min(data.len() - done);
+            v.written.set(true);
+            self.exec_changed |= v.prot & prot::EXEC != 0;
+            // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
+            // the host memory
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data[done..].as_ptr(),
+                    v.host.as_ptr().add((cur - s) as usize),
+                    chunk,
+                )
+            };
+            // Pages with contents in private anonymous memory must have entries
+            // (Mm::touched_windows); PROT_NONE ones get permission 0
+            if v.backing == Backing::Anonymous {
+                let lo = cur & !(PAGE_SIZE - 1);
+                let hi = page_up(cur + chunk as u64).unwrap_or(s + v.len);
+                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
+                let host = unsafe { v.host.add((lo - s) as usize) };
+                unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) }
+                    .map_err(map_err)?;
+            }
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// A tracer forcing a write (PTRACE_POKETEXT, `/proc/<pid>/mem`, Linux's `FOLL_FORCE`):
+    /// private mappings without write permission can be written too (a program's code segment:
+    /// setting breakpoints), by copying them into our own; shared mappings without write
+    /// permission cannot. Translations of what was written are invalidated, and the threads using
+    /// this address space flush their TLBs first; `current` is the writing thread (no effect when
+    /// it is not in this address space).
+    pub(crate) fn write_force(
+        &mut self,
+        addr: u64,
+        data: &[u8],
+        current: &Arc<TaskSync>,
+    ) -> Result<(), Errno> {
+        let end = addr.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
+        let mut cur = addr;
+        while cur < end {
+            let (&s, v) = self
+                .vmas
+                .range(..=cur)
+                .next_back()
+                .filter(|&(&s, v)| cur < s + v.len)
+                .ok_or(Errno::EFAULT)?;
+            if v.backing == Backing::Shared && v.prot & prot::WRITE == 0 {
+                return Err(Errno::EFAULT);
+            }
+            cur = s + v.len;
+        }
+        self.write_kernel(addr, data)?;
+        let page = addr & !(PAGE_SIZE - 1);
+        self.invalidate_code(page, page_up(end).unwrap_or(u64::MAX) - page);
+        self.sync(current);
+        Ok(())
+    }
+
+    /// The key of the futex at `addr`; None when nothing is mapped there.
+    pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
+        // The key of private memory is its host address: a borrowed page is first replaced by our
+        // own, or the key would change after copy-on-write and threads waiting on the old key
+        // could never be woken; this also keeps it from matching the key on the owner's side
+        let page = addr & !(PAGE_SIZE - 1);
+        if self.cow.borrow().borrowed.contains_key(&page) {
+            self.materialize(page, true);
+        }
+        // As on Linux, the futex address must be readable
+        let host = self.translate(addr, prot::READ)?;
+        let (&start, v) = self.vmas.range(..=addr).next_back()?;
+        Some(match v.file_id {
+            Some((dev, ino, offset)) if v.backing == Backing::Shared => crate::futex::Key::File {
+                dev,
+                ino,
+                offset: offset + (addr - start),
+            },
+            _ => crate::futex::Key::Host(host.as_ptr() as usize),
+        })
+    }
+
+    // ---- Memory syscalls ----
 
     /// Implements mmap(2). `file` is the host fd, the file offset, and whether the file was opened
     /// for writing.
@@ -2282,6 +1264,30 @@ impl Mm {
         Ok(start)
     }
 
+    /// Marks the mapping starting at `start` as growing downwards (a private anonymous mapping
+    /// with `MAP_GROWSDOWN`).
+    pub fn set_growsdown(&mut self, start: u64) {
+        if let Some(v) = self.vmas.get_mut(&start) {
+            v.growsdown = true;
+        }
+    }
+
+    /// Mappings starting in `[start, start + len)` may never become writable (shared mappings of
+    /// /dev/zero opened read-only).
+    pub fn deny_write(&mut self, start: u64, len: u64) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            v.may_write = false;
+        }
+    }
+
+    /// Mappings starting in `[start, start + len)` may never become executable (files on a noexec
+    /// mount).
+    pub fn deny_exec(&mut self, start: u64, len: u64) {
+        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
+            v.may_exec = false;
+        }
+    }
+
     /// mremap(`MREMAP_DONTUNMAP`): the contents move to a new address (`fixed`, or a newly found
     /// range), and a mapping with the same permissions, no longer locked, stays at the old address.
     /// Like Linux since 5.13 it supports every mapping, and the old address behaves as if its page
@@ -2335,56 +1341,6 @@ impl Mm {
             self.insert_vma(start, v)?;
         }
         Ok((new, refill))
-    }
-
-    /// remap_file_pages(2): emulated with mmap as on Linux since 4.0, replacing
-    /// `[start, start + len)` with the same file's contents from `offset`. The range must lie in
-    /// contiguous shared mappings of the same file with the same permissions.
-    pub fn remap_file_pages(&mut self, start: u64, len: u64, offset: u64) -> Result<(), Errno> {
-        let end = start
-            .checked_add(len)
-            .filter(|&e| e > start)
-            .ok_or(Errno::EINVAL)?;
-        let (&s, v) = self
-            .vmas
-            .range(..=start)
-            .next_back()
-            .filter(|(s, v)| **s + v.len > start)
-            .ok_or(Errno::EINVAL)?;
-        let Some((fd, _)) = v.file.clone() else {
-            return Err(Errno::EINVAL);
-        };
-        let (prot, may_write, may_exec, name, ino, locked) = (
-            v.prot,
-            v.may_write,
-            v.may_exec,
-            v.name.clone(),
-            v.ino,
-            v.locked,
-        );
-        // The same file: compared by the host (device, inode)
-        let id = v.file_id.map(|(d, i, _)| (d, i));
-        let mut at = s + v.len;
-        while at < end {
-            let next = self
-                .vmas
-                .get(&at)
-                .filter(|n| n.file.is_some() && n.file_id.map(|(d, i, _)| (d, i)) == id)
-                .filter(|n| n.prot == prot)
-                .ok_or(Errno::EINVAL)?;
-            at += next.len;
-        }
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&*fd);
-        let flags = flags::MAP_SHARED | flags::MAP_FIXED;
-        self.mmap(start, len, prot, flags, Some((raw, offset, may_write)))?;
-        if !may_exec {
-            self.deny_exec(start, len);
-        }
-        self.label(start, len, name, ino);
-        if locked {
-            self.set_locked(start, len, true)?;
-        }
-        Ok(())
     }
 
     /// The store inode of the file mapped by the private file mapping at `addr` (None if it is not
@@ -2576,6 +1532,140 @@ impl Mm {
         Ok(())
     }
 
+    /// remap_file_pages(2): emulated with mmap as on Linux since 4.0, replacing
+    /// `[start, start + len)` with the same file's contents from `offset`. The range must lie in
+    /// contiguous shared mappings of the same file with the same permissions.
+    pub fn remap_file_pages(&mut self, start: u64, len: u64, offset: u64) -> Result<(), Errno> {
+        let end = start
+            .checked_add(len)
+            .filter(|&e| e > start)
+            .ok_or(Errno::EINVAL)?;
+        let (&s, v) = self
+            .vmas
+            .range(..=start)
+            .next_back()
+            .filter(|(s, v)| **s + v.len > start)
+            .ok_or(Errno::EINVAL)?;
+        let Some((fd, _)) = v.file.clone() else {
+            return Err(Errno::EINVAL);
+        };
+        let (prot, may_write, may_exec, name, ino, locked) = (
+            v.prot,
+            v.may_write,
+            v.may_exec,
+            v.name.clone(),
+            v.ino,
+            v.locked,
+        );
+        // The same file: compared by the host (device, inode)
+        let id = v.file_id.map(|(d, i, _)| (d, i));
+        let mut at = s + v.len;
+        while at < end {
+            let next = self
+                .vmas
+                .get(&at)
+                .filter(|n| n.file.is_some() && n.file_id.map(|(d, i, _)| (d, i)) == id)
+                .filter(|n| n.prot == prot)
+                .ok_or(Errno::EINVAL)?;
+            at += next.len;
+        }
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&*fd);
+        let flags = flags::MAP_SHARED | flags::MAP_FIXED;
+        self.mmap(start, len, prot, flags, Some((raw, offset, may_write)))?;
+        if !may_exec {
+            self.deny_exec(start, len);
+        }
+        self.label(start, len, name, ino);
+        if locked {
+            self.set_locked(start, len, true)?;
+        }
+        Ok(())
+    }
+
+    /// Implements brk(2): returns the new break, or the old one on failure.
+    pub fn brk(&mut self, new: u64) -> u64 {
+        if new < self.brk_start {
+            return self.brk;
+        }
+        let (Some(old_end), Some(new_end)) = (page_up(self.brk), page_up(new)) else {
+            return self.brk;
+        };
+        if new_end > old_end {
+            let grow = new_end - old_end;
+            if !self.is_free(old_end, grow) {
+                return self.brk;
+            }
+            let grown = self.grow_heap(old_end, grow)
+                || self.start_heap(old_end, grow)
+                || self
+                    .map_anonymous(old_end, grow, prot::READ | prot::WRITE)
+                    .is_ok();
+            if !grown {
+                return self.brk;
+            }
+        } else if new_end < old_end && self.munmap(new_end, old_end - new_end).is_err() {
+            return self.brk;
+        }
+        self.brk = new;
+        new
+    }
+
+    /// When the heap is not mapped yet, maps `len` bytes at `start` and reserves [`HEAP_RESERVE`]
+    /// of host address space.
+    fn start_heap(&mut self, start: u64, len: u64) -> bool {
+        if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
+            return false;
+        }
+        let Ok((region, host)) = Self::new_anonymous(HEAP_RESERVE, false) else {
+            return false;
+        };
+        let rw = prot::READ | prot::WRITE;
+        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)
+            .is_ok()
+    }
+
+    /// Lengthens the heap VMA ending at `end` by `grow` bytes if its host memory has room after it.
+    fn grow_heap(&mut self, end: u64, grow: u64) -> bool {
+        let Some((&s, v)) = self.vmas.range(..end).next_back() else {
+            return false;
+        };
+        let rw = prot::READ | prot::WRITE;
+        let compatible = v.backing == Backing::Anonymous
+            && v.prot == rw
+            && v.locked == self.lock_future
+            && v.name.is_none();
+        if s + v.len != end || !compatible {
+            return false;
+        }
+        let used = v.host.as_ptr() as usize - v.region.base.as_ptr() as usize + v.len as usize;
+        if used + grow as usize > v.region.len {
+            return false;
+        }
+        // No other mapping may use the host range right after it (a part of the heap moved away by
+        // mremap still belongs to the same host memory)
+        let (lo, hi) = (v.host.as_ptr() as usize + v.len as usize, grow as usize);
+        let taken = self.vmas.values().any(|o| {
+            let at = o.host.as_ptr() as usize;
+            Arc::ptr_eq(&o.region, &v.region) && at < lo + hi && lo < at + o.len as usize
+        });
+        if taken {
+            return false;
+        }
+        // SAFETY: [lo, lo + hi) is inside this private anonymous memory and no other mapping uses
+        // it
+        let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
+        // Grown again after shrinking: what was written before must read as zero again
+        unsafe { discard_host(host, hi) };
+        if Self::map_pages(&mut self.mmu, end, host, grow, rw, false).is_err() {
+            return false;
+        }
+        let v = self.vmas.get_mut(&s).unwrap();
+        v.len += grow;
+        v.file_len += grow;
+        v.written.set(true);
+        true
+    }
+
     /// shmat: maps shared memory segment `id` at `addr` (choosing a place itself when None). With
     /// `remap` it may replace existing mappings; otherwise the range must be free.
     pub fn attach_shm(
@@ -2648,370 +1738,6 @@ impl Mm {
         bases.sort_unstable();
         bases.dedup();
         bases.len()
-    }
-
-    /// Mappings starting in `[start, start + len)` may never become writable (shared mappings of
-    /// /dev/zero opened read-only).
-    pub fn deny_write(&mut self, start: u64, len: u64) {
-        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
-            v.may_write = false;
-        }
-    }
-
-    /// Mappings starting in `[start, start + len)` may never become executable (files on a noexec
-    /// mount).
-    pub fn deny_exec(&mut self, start: u64, len: u64) {
-        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
-            v.may_exec = false;
-        }
-    }
-
-    /// mlock, munlock: locks or unlocks `[addr, addr + len)` (widened to pages); the range must be
-    /// fully mapped.
-    pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) -> Result<(), Errno> {
-        let start = addr & !(PAGE_SIZE - 1);
-        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
-        self.check_mapped(start, end - start)?;
-        self.room_for(self.splits(&[start, end]))?;
-        self.split_at(start);
-        self.split_at(end);
-        for (_, v) in self.vmas.range_mut(start..end) {
-            v.locked = locked;
-        }
-        Ok(())
-    }
-
-    /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
-    /// range must be fully mapped.
-    pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.dontdump = dontdump)
-    }
-
-    /// `MADV_WIPEONFORK`, `MADV_KEEPONFORK`: whether a forked child gets `[addr, addr + len)`
-    /// zero-filled ([`Vma::wipeonfork`]); the range must be fully mapped (the caller checks that
-    /// wiping applies only to private anonymous memory).
-    pub fn set_wipeonfork(&mut self, addr: u64, len: u64, wipe: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.wipeonfork = wipe)
-    }
-
-    /// `MADV_DONTFORK`, `MADV_DOFORK`: whether a forked child gets `[addr, addr + len)` at all;
-    /// the range must be fully mapped.
-    pub fn set_dontfork(&mut self, addr: u64, len: u64, dontfork: bool) -> Result<(), Errno> {
-        self.update_range(addr, len, |v| v.dontfork = dontfork)
-    }
-
-    /// Splits the VMAs at both ends of `[addr, addr + len)` and applies `f` to each VMA inside;
-    /// the range must be fully mapped.
-    fn update_range(&mut self, addr: u64, len: u64, f: impl Fn(&mut Vma)) -> Result<(), Errno> {
-        let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
-        self.check_mapped(addr, len)?;
-        self.room_for(self.splits(&[addr, end]))?;
-        self.split_at(addr);
-        self.split_at(end);
-        for (_, v) in self.vmas.range_mut(addr..end) {
-            f(v);
-        }
-        Ok(())
-    }
-
-    /// mlockall, munlockall: locks or unlocks every mapping.
-    pub fn set_all_locked(&mut self, locked: bool) {
-        for v in self.vmas.values_mut() {
-            v.locked = locked;
-        }
-    }
-
-    /// Bytes locked (VmLck in `/proc/<pid>/status`, `RLIMIT_MEMLOCK`).
-    pub fn locked_bytes(&self) -> u64 {
-        self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
-    }
-
-    /// Bytes already locked in `[addr, addr + len)` (mlock counts only the newly locked part).
-    pub fn locked_in(&self, addr: u64, len: u64) -> u64 {
-        let end = addr.saturating_add(len);
-        self.vmas
-            .iter()
-            .filter(|&(&s, v)| v.locked && s < end && s + v.len > addr)
-            .map(|(&s, v)| (s + v.len).min(end) - s.max(addr))
-            .sum()
-    }
-
-    /// Host address ranges of the shared file mappings in `[addr, addr + len)`, aligned to host
-    /// pages (msync's `MS_SYNC`: the host maps the object itself, so the host writes it back).
-    pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
-        let end = addr.saturating_add(len);
-        let page = appine_hal::page_size();
-        self.vmas
-            .iter()
-            .filter(|&(&s, v)| {
-                v.backing == Backing::Shared && v.file_id.is_some() && s < end && s + v.len > addr
-            })
-            .map(|(&s, v)| {
-                let from = s.max(addr);
-                let host = v.host.as_ptr() as usize + (from - s) as usize;
-                let start = host & !(page - 1);
-                let stop = (host + ((s + v.len).min(end) - from) as usize).next_multiple_of(page);
-                (start, stop - start)
-            })
-            .collect()
-    }
-
-    /// The properties of a range madvise cares about: (whether it has locked pages, whether it is
-    /// all private anonymous memory). The range must be fully mapped.
-    pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
-        self.check_mapped(addr, len)?;
-        let end = addr + len;
-        // The VMA starting below `addr` counts only if it reaches into the range
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let mut locked = false;
-        let mut anon = true;
-        for (_, v) in self
-            .vmas
-            .range(first..end)
-            .filter(|&(&s, v)| s + v.len > addr)
-        {
-            locked |= v.locked;
-            anon &= v.backing == Backing::Anonymous;
-        }
-        Ok((locked, anon))
-    }
-
-    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings. For a file mapping Linux
-    /// punches a hole in the file; here the zeros are written through the host mapping, so the
-    /// file reads back zeros but its storage is not freed. As on Linux, a range with locked pages
-    /// or private anonymous mappings is EINVAL, and other private mappings or ones that cannot get
-    /// write permission are EACCES (since 6.7 what counts is whether write permission can be
-    /// granted, not whether it is held now). The range must be fully mapped.
-    pub fn remove(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
-        self.check_mapped(addr, len)?;
-        let end = addr + len;
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let overlapping = || {
-            self.vmas
-                .range(first..end)
-                .filter(move |(s, v)| *s + v.len > addr)
-        };
-        for (_, v) in overlapping() {
-            if v.locked || v.backing == Backing::Anonymous {
-                return Err(Errno::EINVAL);
-            }
-            if v.backing != Backing::Shared || !v.may_write {
-                return Err(Errno::EACCES);
-            }
-        }
-        for (&s, v) in overlapping() {
-            // The part past the end of the file must not be touched (the host would raise SIGBUS)
-            let from = addr.max(s);
-            let to = end.min(s + v.file_len);
-            if from < to {
-                // SAFETY: [from, to) is inside this VMA, which holds the host memory; for a shared
-                // mapping that can get write permission the host mapping is always writable
-                unsafe {
-                    std::ptr::write_bytes(
-                        v.host.as_ptr().add((from - s) as usize),
-                        0,
-                        (to - from) as usize,
-                    )
-                };
-            }
-        }
-        Ok(())
-    }
-
-    /// mincore: whether each page of `[addr, addr + len)` is in host memory. The range must be
-    /// fully mapped.
-    pub fn residency(&self, addr: u64, len: u64) -> Result<Vec<bool>, Errno> {
-        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
-        self.check_mapped(addr, end - addr)?;
-        let mut out = Vec::with_capacity(((end - addr) / PAGE_SIZE) as usize);
-        let mut cursor = addr;
-        while cursor < end {
-            let (&s, v) = self.vmas.range(..=cursor).next_back().unwrap();
-            let stop = end.min(s + v.len);
-            if v.reserved() {
-                out.resize(out.len() + ((stop - cursor) / PAGE_SIZE) as usize, false);
-                cursor = stop;
-                continue;
-            }
-            // SAFETY: [cursor, stop) is inside this VMA, which holds the host memory
-            let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
-            out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
-            cursor = stop;
-        }
-        // Borrowed pages are in the owner's host memory
-        for (&page, _) in self
-            .cow
-            .borrow()
-            .borrowed
-            .range(addr & !(PAGE_SIZE - 1)..end)
-        {
-            out[((page - (addr & !(PAGE_SIZE - 1))) / PAGE_SIZE) as usize] = true;
-        }
-        Ok(out)
-    }
-
-    /// The resident 4K pages in `[addr, addr + len)`, counting borrowed pages as resident (smaps,
-    /// the OOM killer's log). The same as counting [`Mm::residency`], but large on-demand
-    /// anonymous mappings are measured only over the spans that may have contents
-    /// ([`Mm::touched_windows`]), without allocating a per-page array for a mapping of several
-    /// TB.
-    pub fn resident_in(&self, addr: u64, len: u64) -> u64 {
-        let end = addr.saturating_add(len);
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let mut total = 0;
-        for (&s, v) in self.vmas.range(first..end) {
-            let (from, to) = (addr.max(s), end.min(s + v.len));
-            if from >= to || v.reserved() {
-                continue;
-            }
-            let ranges = if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
-                self.touched_windows(s)
-            } else {
-                vec![(from, to)]
-            };
-            for (lo, hi) in ranges {
-                let (lo, hi) = (lo.max(from), hi.min(to));
-                if lo < hi {
-                    let host = Self::own_page(s, v, lo);
-                    total += appine_hal::resident_pages(host.as_ptr(), (hi - lo) as usize) as u64;
-                }
-            }
-        }
-        total + self.cow.borrow().borrowed.range(addr..end).count() as u64
-    }
-
-    /// Pages in `[addr, end)` shared with other address spaces (lent or borrowed for
-    /// copy-on-write): the page count, and the bytes after dividing each page among the address
-    /// spaces sharing it. smaps counts them as shared dirty pages and Pss as only the divided
-    /// share, as Linux does by mapcount; an orphan page with only one borrower left belongs to
-    /// it alone and does not count.
-    pub fn cow_shared(&self, addr: u64, end: u64) -> (u64, u64) {
-        let c = self.cow.borrow();
-        let loans = self.loans.borrow();
-        let (mut pages, mut pss) = (0, 0);
-        let mut count = |key: usize| {
-            let users = loans.get(&key).map_or(1, Loan::users) as u64;
-            if users > 1 {
-                pages += 1;
-                pss += PAGE_SIZE / users;
-            }
-        };
-        for &page in c.lent.range(addr..end) {
-            if let Some((s, v)) = self.anon_vma(page) {
-                count(Self::own_page(s, v, page).as_ptr() as usize);
-            }
-        }
-        for b in c.borrowed.range(addr..end).map(|(_, b)| b) {
-            count(b.host.as_ptr() as usize);
-        }
-        (pages, pss)
-    }
-
-    /// The range check of msync(2): the range must be fully mapped.
-    pub fn check_mapped(&self, addr: u64, len: u64) -> Result<(), Errno> {
-        let end = page_up(len)
-            .and_then(|l| addr.checked_add(l))
-            .ok_or(Errno::ENOMEM)?;
-        let mut cursor = addr;
-        while cursor < end {
-            let (&s, v) = self
-                .vmas
-                .range(..=cursor)
-                .next_back()
-                .filter(|&(&s, v)| s + v.len > cursor)
-                .ok_or(Errno::ENOMEM)?;
-            cursor = s + v.len;
-        }
-        Ok(())
-    }
-
-    /// Splits the VMA that spans `addr` into two at `addr`.
-    fn split_at(&mut self, addr: u64) {
-        let Some((&s, v)) = self.vmas.range(..addr).next_back() else {
-            return;
-        };
-        if s + v.len <= addr {
-            return;
-        }
-        let mut tail = v.clone();
-        let head_len = addr - s;
-        tail.len -= head_len;
-        tail.file_len = v.file_len.saturating_sub(head_len);
-        if let Some(f) = &mut tail.file_id {
-            f.2 += head_len;
-        }
-        if let Some(f) = &mut tail.file {
-            f.1 += head_len;
-        }
-        // A reservation has no host memory and its address is only computed
-        // (HostRegion::reserved), so do integer arithmetic
-        tail.host = if tail.reserved() {
-            NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap()
-        } else {
-            // SAFETY: addr is inside the VMA, so the offset stays within the host mapping
-            unsafe { tail.host.add(head_len as usize) }
-        };
-        let head = self.vmas.get_mut(&s).unwrap();
-        head.len = head_len;
-        head.file_len = head.file_len.min(head_len);
-        self.vmas.insert(addr, tail);
-    }
-
-    /// Implements munmap(2).
-    pub fn munmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
-        let len = page_up(len).ok_or(Errno::EINVAL)?;
-        if !addr.is_multiple_of(PAGE_SIZE)
-            || len == 0
-            || addr.checked_add(len).is_none_or(|e| e > 1 << VA_BITS)
-        {
-            return Err(Errno::EINVAL);
-        }
-        let end = addr + len;
-        // As on Linux, max_map_count applies only when one VMA is split into three
-        let inside = |a: u64| {
-            self.vmas
-                .range(..a)
-                .next_back()
-                .filter(|(s, v)| **s + v.len > a)
-        };
-        if let (Some((s1, _)), Some((s2, _))) = (inside(addr), inside(end))
-            && s1 == s2
-        {
-            self.room_for(1)?;
-        }
-        self.split_at(addr);
-        self.split_at(end);
-        let borrowed = self.cow_unmap(addr, end);
-        // The page table unmaps page by page, so only VMAs that actually exist are handled: a guest
-        // passing a length that covers the whole address space is still fast
-        let doomed: Vec<(u64, u64)> = self
-            .vmas
-            .range(addr..end)
-            .map(|(&s, v)| (s, v.len))
-            .collect();
-        for (s, len) in doomed {
-            let vma = self.vmas.remove(&s).unwrap();
-            self.mmu.unmap(s, len).map_err(map_err)?;
-            if vma.prot & prot::EXEC != 0 {
-                self.code_ranges.push((s, len));
-            }
-            self.graveyard.push(vma.region);
-            self.dirty = true;
-        }
-        self.give_back(borrowed);
-        Ok(())
     }
 
     /// Implements mprotect(2): the range must be fully mapped.
@@ -3113,6 +1839,76 @@ impl Mm {
         Ok(())
     }
 
+    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings. For a file mapping Linux
+    /// punches a hole in the file; here the zeros are written through the host mapping, so the
+    /// file reads back zeros but its storage is not freed. As on Linux, a range with locked pages
+    /// or private anonymous mappings is EINVAL, and other private mappings or ones that cannot get
+    /// write permission are EACCES (since 6.7 what counts is whether write permission can be
+    /// granted, not whether it is held now). The range must be fully mapped.
+    pub fn remove(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        self.check_mapped(addr, len)?;
+        let end = addr + len;
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let overlapping = || {
+            self.vmas
+                .range(first..end)
+                .filter(move |(s, v)| *s + v.len > addr)
+        };
+        for (_, v) in overlapping() {
+            if v.locked || v.backing == Backing::Anonymous {
+                return Err(Errno::EINVAL);
+            }
+            if v.backing != Backing::Shared || !v.may_write {
+                return Err(Errno::EACCES);
+            }
+        }
+        for (&s, v) in overlapping() {
+            // The part past the end of the file must not be touched (the host would raise SIGBUS)
+            let from = addr.max(s);
+            let to = end.min(s + v.file_len);
+            if from < to {
+                // SAFETY: [from, to) is inside this VMA, which holds the host memory; for a shared
+                // mapping that can get write permission the host mapping is always writable
+                unsafe {
+                    std::ptr::write_bytes(
+                        v.host.as_ptr().add((from - s) as usize),
+                        0,
+                        (to - from) as usize,
+                    )
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// The properties of a range madvise cares about: (whether it has locked pages, whether it is
+    /// all private anonymous memory). The range must be fully mapped.
+    pub fn advice_range(&self, addr: u64, len: u64) -> Result<(bool, bool), Errno> {
+        self.check_mapped(addr, len)?;
+        let end = addr + len;
+        // The VMA starting below `addr` counts only if it reaches into the range
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        let mut locked = false;
+        let mut anon = true;
+        for (_, v) in self
+            .vmas
+            .range(first..end)
+            .filter(|&(&s, v)| s + v.len > addr)
+        {
+            locked |= v.locked;
+            anon &= v.backing == Backing::Anonymous;
+        }
+        Ok((locked, anon))
+    }
+
     /// madvise(MADV_DONTNEED): anonymous memory goes back to the host (reading zero afterwards);
     /// other mappings stay unchanged. The range must be fully mapped.
     pub fn discard(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
@@ -3146,6 +1942,208 @@ impl Mm {
         }
         Ok(())
     }
+
+    /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
+    /// range must be fully mapped.
+    pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.dontdump = dontdump)
+    }
+
+    /// `MADV_WIPEONFORK`, `MADV_KEEPONFORK`: whether a forked child gets `[addr, addr + len)`
+    /// zero-filled ([`Vma::wipeonfork`]); the range must be fully mapped (the caller checks that
+    /// wiping applies only to private anonymous memory).
+    pub fn set_wipeonfork(&mut self, addr: u64, len: u64, wipe: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.wipeonfork = wipe)
+    }
+
+    /// `MADV_DONTFORK`, `MADV_DOFORK`: whether a forked child gets `[addr, addr + len)` at all;
+    /// the range must be fully mapped.
+    pub fn set_dontfork(&mut self, addr: u64, len: u64, dontfork: bool) -> Result<(), Errno> {
+        self.update_range(addr, len, |v| v.dontfork = dontfork)
+    }
+
+    /// Splits the VMAs at both ends of `[addr, addr + len)` and applies `f` to each VMA inside;
+    /// the range must be fully mapped.
+    fn update_range(&mut self, addr: u64, len: u64, f: impl Fn(&mut Vma)) -> Result<(), Errno> {
+        let end = addr.checked_add(len).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(addr, len)?;
+        self.room_for(self.splits(&[addr, end]))?;
+        self.split_at(addr);
+        self.split_at(end);
+        for (_, v) in self.vmas.range_mut(addr..end) {
+            f(v);
+        }
+        Ok(())
+    }
+
+    /// Bytes already locked in `[addr, addr + len)` (mlock counts only the newly locked part).
+    pub fn locked_in(&self, addr: u64, len: u64) -> u64 {
+        let end = addr.saturating_add(len);
+        self.vmas
+            .iter()
+            .filter(|&(&s, v)| v.locked && s < end && s + v.len > addr)
+            .map(|(&s, v)| (s + v.len).min(end) - s.max(addr))
+            .sum()
+    }
+
+    /// Bytes locked (VmLck in `/proc/<pid>/status`, `RLIMIT_MEMLOCK`).
+    pub fn locked_bytes(&self) -> u64 {
+        self.vmas.values().filter(|v| v.locked).map(|v| v.len).sum()
+    }
+
+    /// mlock, munlock: locks or unlocks `[addr, addr + len)` (widened to pages); the range must be
+    /// fully mapped.
+    pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) -> Result<(), Errno> {
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(start, end - start)?;
+        self.room_for(self.splits(&[start, end]))?;
+        self.split_at(start);
+        self.split_at(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.locked = locked;
+        }
+        Ok(())
+    }
+
+    /// mlockall, munlockall: locks or unlocks every mapping.
+    pub fn set_all_locked(&mut self, locked: bool) {
+        for v in self.vmas.values_mut() {
+            v.locked = locked;
+        }
+    }
+
+    /// Brings the pages of `[addr, addr + len)` into host memory (mlock, `MAP_POPULATE`). The part
+    /// of a file mapping past the end of the file is not touched.
+    pub fn populate(&self, addr: u64, len: u64) {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        // As on Linux, mappings without any permissions are not populated
+        for (&s, v) in self.vmas.range(first..end).filter(|(_, v)| v.prot != 0) {
+            let from = addr.max(s);
+            let to = end.min(s + v.file_len);
+            if from < to {
+                // SAFETY: [from, to) is inside this VMA, which holds the host memory, and before
+                // the end of the file
+                unsafe {
+                    appine_hal::populate(
+                        v.host.as_ptr().add((from - s) as usize),
+                        (to - from) as usize,
+                    )
+                };
+                // Build the entries too (large on-demand mappings had none): populated pages must
+                // be found when measuring resident memory (Mm::touched_windows). Existing entries
+                // (copy-on-write ones) are left alone
+                let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
+                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
+                let host = unsafe { v.host.add((lo - s) as usize) };
+                let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) };
+            }
+        }
+    }
+
+    /// Host address ranges of the shared file mappings in `[addr, addr + len)`, aligned to host
+    /// pages (msync's `MS_SYNC`: the host maps the object itself, so the host writes it back).
+    pub fn shared_file_ranges(&self, addr: u64, len: u64) -> Vec<(usize, usize)> {
+        let end = addr.saturating_add(len);
+        let page = appine_hal::page_size();
+        self.vmas
+            .iter()
+            .filter(|&(&s, v)| {
+                v.backing == Backing::Shared && v.file_id.is_some() && s < end && s + v.len > addr
+            })
+            .map(|(&s, v)| {
+                let from = s.max(addr);
+                let host = v.host.as_ptr() as usize + (from - s) as usize;
+                let start = host & !(page - 1);
+                let stop = (host + ((s + v.len).min(end) - from) as usize).next_multiple_of(page);
+                (start, stop - start)
+            })
+            .collect()
+    }
+
+    /// Implements munmap(2).
+    pub fn munmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        let len = page_up(len).ok_or(Errno::EINVAL)?;
+        if !addr.is_multiple_of(PAGE_SIZE)
+            || len == 0
+            || addr.checked_add(len).is_none_or(|e| e > 1 << VA_BITS)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let end = addr + len;
+        // As on Linux, max_map_count applies only when one VMA is split into three
+        let inside = |a: u64| {
+            self.vmas
+                .range(..a)
+                .next_back()
+                .filter(|(s, v)| **s + v.len > a)
+        };
+        if let (Some((s1, _)), Some((s2, _))) = (inside(addr), inside(end))
+            && s1 == s2
+        {
+            self.room_for(1)?;
+        }
+        self.split_at(addr);
+        self.split_at(end);
+        let borrowed = self.cow_unmap(addr, end);
+        // The page table unmaps page by page, so only VMAs that actually exist are handled: a guest
+        // passing a length that covers the whole address space is still fast
+        let doomed: Vec<(u64, u64)> = self
+            .vmas
+            .range(addr..end)
+            .map(|(&s, v)| (s, v.len))
+            .collect();
+        for (s, len) in doomed {
+            let vma = self.vmas.remove(&s).unwrap();
+            self.mmu.unmap(s, len).map_err(map_err)?;
+            if vma.prot & prot::EXEC != 0 {
+                self.code_ranges.push((s, len));
+            }
+            self.graveyard.push(vma.region);
+            self.dirty = true;
+        }
+        self.give_back(borrowed);
+        Ok(())
+    }
+
+    /// mincore: whether each page of `[addr, addr + len)` is in host memory. The range must be
+    /// fully mapped.
+    pub fn residency(&self, addr: u64, len: u64) -> Result<Vec<bool>, Errno> {
+        let end = page_up(addr.checked_add(len).ok_or(Errno::ENOMEM)?).ok_or(Errno::ENOMEM)?;
+        self.check_mapped(addr, end - addr)?;
+        let mut out = Vec::with_capacity(((end - addr) / PAGE_SIZE) as usize);
+        let mut cursor = addr;
+        while cursor < end {
+            let (&s, v) = self.vmas.range(..=cursor).next_back().unwrap();
+            let stop = end.min(s + v.len);
+            if v.reserved() {
+                out.resize(out.len() + ((stop - cursor) / PAGE_SIZE) as usize, false);
+                cursor = stop;
+                continue;
+            }
+            // SAFETY: [cursor, stop) is inside this VMA, which holds the host memory
+            let host = unsafe { v.host.as_ptr().add((cursor - s) as usize) };
+            out.extend(appine_hal::page_residency(host, (stop - cursor) as usize));
+            cursor = stop;
+        }
+        // Borrowed pages are in the owner's host memory
+        for (&page, _) in self
+            .cow
+            .borrow()
+            .borrowed
+            .range(addr & !(PAGE_SIZE - 1)..end)
+        {
+            out[((page - (addr & !(PAGE_SIZE - 1))) / PAGE_SIZE) as usize] = true;
+        }
+        Ok(out)
+    }
+
+    // ---- fork ----
 
     /// fork: makes a new address space. Written private anonymous mappings are copy-on-write
     /// ([`Mm::lend`]); contents never written are all zero, so the child uses its own; writable
@@ -3387,28 +2385,52 @@ impl Mm {
         Ok(out)
     }
 
-    /// Gives a private file mapping that shares host memory with other address spaces a copy of
-    /// its own.
-    fn unshare(&mut self, start: u64) -> Result<(), Errno> {
+    /// Bytes still free below the host memory of VMA `start`, by which it can be lengthened
+    /// downwards in place: parts of the same host memory taken by other VMAs (split off, or moved
+    /// away by mremap) do not count.
+    fn spare_below(&self, start: u64) -> u64 {
         let v = &self.vmas[&start];
-        let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
-        let (region, host) = Self::new_anonymous(v.len, reserve)?;
-        // SAFETY: both pieces of host memory have at least v.len bytes and do not overlap
-        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
-        // The old entries point at the shared piece, so remove them first (map_pages leaves
-        // existing entries alone); pages past the end of the file still stay out of the page
-        // table
-        let (file_len, p) = (v.file_len, v.prot);
-        self.mmu.unmap(start, file_len).map_err(map_err)?;
-        Self::map_pages(&mut self.mmu, start, host, file_len, p, true)?;
-        let v = self.vmas.get_mut(&start).unwrap();
-        let old = std::mem::replace(&mut v.region, region);
-        v.host = host;
-        v.cow = false;
-        // Other threads' TLBs may still hold stale translations: release only after the shootdown
-        self.graveyard.push(old);
-        self.dirty = true;
-        Ok(())
+        let host = v.host.as_ptr() as usize;
+        let low = self
+            .vmas
+            .values()
+            .filter(|o| Arc::ptr_eq(&o.region, &v.region))
+            .map(|o| o.host.as_ptr() as usize + o.len as usize)
+            .filter(|&end| end <= host)
+            .fold(v.region.base.as_ptr() as usize, usize::max);
+        (host - low) as u64
+    }
+
+    // ---- Files ----
+
+    /// Ranges of shared file mappings that can be written (writable now, or can be mprotected
+    /// writable later): futexes there are keyed by file and offset ([`Mm::futex_key`]), so the
+    /// no-BKL futex keyed by host address (`syscall::fast`, which handles only writable pages)
+    /// must avoid them. Shared mappings of files opened read-only do not count: Go's toolchain
+    /// reads files through them and also maps a telemetry counter file shared and writable in
+    /// every process, hence tracking by range. Recounted after such a mapping is created or moved
+    /// ([`Mm::note_shared_files`]); torn-down ones need not be removed at once, it only means
+    /// futexes there take the locked path.
+    pub fn shared_files(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
+        self.shared_files.clone()
+    }
+
+    /// Recounts [`Mm::shared_files`] from the current mappings. With `moved`, only when such
+    /// mappings exist (after mremap: the ones moved or grown may be among them).
+    pub fn note_shared_files(&self, moved: bool) {
+        let mut ranges = self
+            .shared_files
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if moved && ranges.is_empty() {
+            return;
+        }
+        *ranges = self
+            .vmas
+            .iter()
+            .filter(|(_, v)| v.backing == Backing::Shared && v.file_id.is_some() && v.may_write)
+            .map(|(&s, v)| (s, s + v.len))
+            .collect();
     }
 
     /// Whether a shared mapping that can get write permission points at host file (`dev`, `ino`)
@@ -3451,143 +2473,7 @@ impl Mm {
         changed
     }
 
-    /// Records the file's name and inode for file mappings starting in `[start, start + len)` (for
-    /// `/proc/<pid>/maps`). As on Linux, the anonymous mapping in between (.bss) has no name.
-    pub fn label(&mut self, start: u64, len: u64, name: Option<Rc<[u8]>>, ino: u64) {
-        for (_, v) in self.vmas.range_mut(start..start.saturating_add(len)) {
-            if v.file_id.is_some() {
-                v.name = name.clone();
-                v.ino = ino;
-            }
-        }
-    }
-
-    /// Records the initial stack pointer (used by the loader).
-    pub fn set_start_stack(&mut self, sp: u64) {
-        self.start_stack = sp;
-    }
-
-    /// The range labelled `[stack]` in `/proc/<pid>/maps`: as on Linux, the mapping containing
-    /// the initial stack pointer, plus the grows-down VMAs with the same permissions directly
-    /// below it (the parts the stack grew by when host memory was not contiguous).
-    fn stack_range(&self) -> Option<(u64, u64)> {
-        let sp = self.start_stack;
-        let (&s, v) = self
-            .vmas
-            .range(..=sp)
-            .next_back()
-            .filter(|&(&s, v)| sp != 0 && sp < s + v.len)?;
-        let mut low = s;
-        for (&b, o) in self.vmas.range(..s).rev() {
-            if b + o.len != low || !o.growsdown || o.prot != v.prot {
-                break;
-            }
-            low = b;
-        }
-        Some((low, s + v.len))
-    }
-
-    /// The mappings a core dump writes (`crate::coredump`), one entry per VMA. How much is written
-    /// follows Linux's `vma_dump_size` and `coredump_filter` (`filter`, the bits of
-    /// [`dump_filter`]): the vDSO is always written whole; shared mappings depend on whether they
-    /// are anonymous (including memfd and SysV shared memory) or file-backed; written private
-    /// anonymous mappings are written whole (never-writable ones and `PROT_NONE` reservations are
-    /// not); private file mappings that have been writable are written whole (data segments),
-    /// otherwise only the first page of an ELF file, so a debugger can tell what is mapped.
-    pub fn dump_regions(&self, filter: u32) -> Vec<DumpRegion> {
-        use dump_filter::*;
-        self.vmas
-            .iter()
-            .map(|(&s, v)| {
-                let offset = v.file_id.map(|(_, _, off)| off);
-                let size = if s == self.vdso {
-                    v.len
-                } else if v.dontdump {
-                    0
-                } else {
-                    match v.backing {
-                        Backing::Shared => {
-                            let anon = offset.is_none()
-                                || v.shm.is_some()
-                                || v.name.as_deref().is_some_and(|n| {
-                                    n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")
-                                });
-                            let bit = if anon { ANON_SHARED } else { MAPPED_SHARED };
-                            if filter & bit != 0 { v.len } else { 0 }
-                        }
-                        Backing::Anonymous if filter & ANON_PRIVATE != 0 && v.written.get() => {
-                            v.len
-                        }
-                        Backing::Anonymous => 0,
-                        Backing::PrivateFile
-                            if filter & ANON_PRIVATE != 0
-                                && (v.written.get() || v.prot & prot::WRITE != 0) =>
-                        {
-                            v.len
-                        }
-                        Backing::PrivateFile if filter & MAPPED_PRIVATE != 0 => v.len,
-                        Backing::PrivateFile
-                            if filter & ELF_HEADERS != 0
-                                && offset == Some(0)
-                                && v.prot & prot::READ != 0
-                                && v.file_len >= PAGE_SIZE =>
-                        {
-                            // SAFETY: the first page lies in the file contents, and this VMA holds
-                            // the host memory
-                            let magic = unsafe { std::slice::from_raw_parts(v.host.as_ptr(), 4) };
-                            if magic == b"\x7fELF" { PAGE_SIZE } else { 0 }
-                        }
-                        Backing::PrivateFile => 0,
-                    }
-                };
-                DumpRegion {
-                    start: s,
-                    end: s + v.len,
-                    prot: v.prot,
-                    size,
-                    sparse: v.backing != Backing::PrivateFile,
-                    file: offset
-                        .map(|off| (off, v.name.clone().unwrap_or_else(|| Rc::from(&b""[..])))),
-                }
-            })
-            .collect()
-    }
-
-    /// Reads one page for a core dump (Linux's `get_dump_page`) without checking permissions:
-    /// `PROT_NONE` pages are not in the page table, so host memory is read by VMA. Pages borrowed
-    /// for copy-on-write read the owner's through the page table. Pages past the end of the file
-    /// (the host raises SIGBUS as soon as they are touched) and unreadable pages return false and
-    /// leave holes in the core file.
-    pub fn dump_page(&self, addr: u64, buf: &mut [u8]) -> bool {
-        let Some((&s, v)) = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .filter(|&(&s, v)| addr < s + v.file_len.min(v.len))
-        else {
-            return false;
-        };
-        let n = buf.len().min((s + v.file_len - addr) as usize);
-        let host = if self
-            .cow
-            .borrow()
-            .borrowed
-            .contains_key(&(addr & !(PAGE_SIZE - 1)))
-        {
-            match self.mmu.translate(addr, prot::READ) {
-                Some(host) => host.as_ptr(),
-                None => return false,
-            }
-        } else {
-            // SAFETY: addr is in the part of this VMA with file contents, and it holds the host
-            // memory
-            unsafe { v.host.as_ptr().add((addr - s) as usize) }
-        };
-        // SAFETY: [host, host + n) does not cross this page
-        unsafe { std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), n) };
-        buf[n..].fill(0);
-        true
-    }
+    // ---- Introspection ----
 
     /// All mappings, in address order; the stack, heap and vDSO are named the way Linux names
     /// them. Adjacent anonymous mappings with the same permissions (or contiguous parts of the
@@ -3646,37 +2532,85 @@ impl Mm {
         out
     }
 
-    /// Brings the pages of `[addr, addr + len)` into host memory (mlock, `MAP_POPULATE`). The part
-    /// of a file mapping past the end of the file is not touched.
-    pub fn populate(&self, addr: u64, len: u64) {
+    /// The range labelled `[stack]` in `/proc/<pid>/maps`: as on Linux, the mapping containing
+    /// the initial stack pointer, plus the grows-down VMAs with the same permissions directly
+    /// below it (the parts the stack grew by when host memory was not contiguous).
+    fn stack_range(&self) -> Option<(u64, u64)> {
+        let sp = self.start_stack;
+        let (&s, v) = self
+            .vmas
+            .range(..=sp)
+            .next_back()
+            .filter(|&(&s, v)| sp != 0 && sp < s + v.len)?;
+        let mut low = s;
+        for (&b, o) in self.vmas.range(..s).rev() {
+            if b + o.len != low || !o.growsdown || o.prot != v.prot {
+                break;
+            }
+            low = b;
+        }
+        Some((low, s + v.len))
+    }
+
+    /// The resident 4K pages in `[addr, addr + len)`, counting borrowed pages as resident (smaps,
+    /// the OOM killer's log). The same as counting [`Mm::residency`], but large on-demand
+    /// anonymous mappings are measured only over the spans that may have contents
+    /// ([`Mm::touched_windows`]), without allocating a per-page array for a mapping of several
+    /// TB.
+    pub fn resident_in(&self, addr: u64, len: u64) -> u64 {
         let end = addr.saturating_add(len);
         let first = self
             .vmas
             .range(..=addr)
             .next_back()
             .map_or(addr, |(&s, _)| s);
-        // As on Linux, mappings without any permissions are not populated
-        for (&s, v) in self.vmas.range(first..end).filter(|(_, v)| v.prot != 0) {
-            let from = addr.max(s);
-            let to = end.min(s + v.file_len);
-            if from < to {
-                // SAFETY: [from, to) is inside this VMA, which holds the host memory, and before
-                // the end of the file
-                unsafe {
-                    appine_hal::populate(
-                        v.host.as_ptr().add((from - s) as usize),
-                        (to - from) as usize,
-                    )
-                };
-                // Build the entries too (large on-demand mappings had none): populated pages must
-                // be found when measuring resident memory (Mm::touched_windows). Existing entries
-                // (copy-on-write ones) are left alone
-                let (lo, hi) = (from & !(PAGE_SIZE - 1), page_up(to).unwrap_or(to));
-                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
-                let host = unsafe { v.host.add((lo - s) as usize) };
-                let _ = unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) };
+        let mut total = 0;
+        for (&s, v) in self.vmas.range(first..end) {
+            let (from, to) = (addr.max(s), end.min(s + v.len));
+            if from >= to || v.reserved() {
+                continue;
+            }
+            let ranges = if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
+                self.touched_windows(s)
+            } else {
+                vec![(from, to)]
+            };
+            for (lo, hi) in ranges {
+                let (lo, hi) = (lo.max(from), hi.min(to));
+                if lo < hi {
+                    let host = Self::own_page(s, v, lo);
+                    total += appine_hal::resident_pages(host.as_ptr(), (hi - lo) as usize) as u64;
+                }
             }
         }
+        total + self.cow.borrow().borrowed.range(addr..end).count() as u64
+    }
+
+    /// Pages in `[addr, end)` shared with other address spaces (lent or borrowed for
+    /// copy-on-write): the page count, and the bytes after dividing each page among the address
+    /// spaces sharing it. smaps counts them as shared dirty pages and Pss as only the divided
+    /// share, as Linux does by mapcount; an orphan page with only one borrower left belongs to
+    /// it alone and does not count.
+    pub fn cow_shared(&self, addr: u64, end: u64) -> (u64, u64) {
+        let c = self.cow.borrow();
+        let loans = self.loans.borrow();
+        let (mut pages, mut pss) = (0, 0);
+        let mut count = |key: usize| {
+            let users = loans.get(&key).map_or(1, Loan::users) as u64;
+            if users > 1 {
+                pages += 1;
+                pss += PAGE_SIZE / users;
+            }
+        };
+        for &page in c.lent.range(addr..end) {
+            if let Some((s, v)) = self.anon_vma(page) {
+                count(Self::own_page(s, v, page).as_ptr() as usize);
+            }
+        }
+        for b in c.borrowed.range(addr..end).map(|(_, b)| b) {
+            count(b.host.as_ptr() as usize);
+        }
+        (pages, pss)
     }
 
     /// The `/proc/<pid>/pagemap` entries of `pages` pages from `addr`: resident (bit 63), file
@@ -3792,6 +2726,108 @@ impl Mm {
         }
     }
 
+    /// The mappings a core dump writes (`crate::coredump`), one entry per VMA. How much is written
+    /// follows Linux's `vma_dump_size` and `coredump_filter` (`filter`, the bits of
+    /// [`dump_filter`]): the vDSO is always written whole; shared mappings depend on whether they
+    /// are anonymous (including memfd and SysV shared memory) or file-backed; written private
+    /// anonymous mappings are written whole (never-writable ones and `PROT_NONE` reservations are
+    /// not); private file mappings that have been writable are written whole (data segments),
+    /// otherwise only the first page of an ELF file, so a debugger can tell what is mapped.
+    pub fn dump_regions(&self, filter: u32) -> Vec<DumpRegion> {
+        use dump_filter::*;
+        self.vmas
+            .iter()
+            .map(|(&s, v)| {
+                let offset = v.file_id.map(|(_, _, off)| off);
+                let size = if s == self.vdso {
+                    v.len
+                } else if v.dontdump {
+                    0
+                } else {
+                    match v.backing {
+                        Backing::Shared => {
+                            let anon = offset.is_none()
+                                || v.shm.is_some()
+                                || v.name.as_deref().is_some_and(|n| {
+                                    n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")
+                                });
+                            let bit = if anon { ANON_SHARED } else { MAPPED_SHARED };
+                            if filter & bit != 0 { v.len } else { 0 }
+                        }
+                        Backing::Anonymous if filter & ANON_PRIVATE != 0 && v.written.get() => {
+                            v.len
+                        }
+                        Backing::Anonymous => 0,
+                        Backing::PrivateFile
+                            if filter & ANON_PRIVATE != 0
+                                && (v.written.get() || v.prot & prot::WRITE != 0) =>
+                        {
+                            v.len
+                        }
+                        Backing::PrivateFile if filter & MAPPED_PRIVATE != 0 => v.len,
+                        Backing::PrivateFile
+                            if filter & ELF_HEADERS != 0
+                                && offset == Some(0)
+                                && v.prot & prot::READ != 0
+                                && v.file_len >= PAGE_SIZE =>
+                        {
+                            // SAFETY: the first page lies in the file contents, and this VMA holds
+                            // the host memory
+                            let magic = unsafe { std::slice::from_raw_parts(v.host.as_ptr(), 4) };
+                            if magic == b"\x7fELF" { PAGE_SIZE } else { 0 }
+                        }
+                        Backing::PrivateFile => 0,
+                    }
+                };
+                DumpRegion {
+                    start: s,
+                    end: s + v.len,
+                    prot: v.prot,
+                    size,
+                    sparse: v.backing != Backing::PrivateFile,
+                    file: offset
+                        .map(|off| (off, v.name.clone().unwrap_or_else(|| Rc::from(&b""[..])))),
+                }
+            })
+            .collect()
+    }
+
+    /// Reads one page for a core dump (Linux's `get_dump_page`) without checking permissions:
+    /// `PROT_NONE` pages are not in the page table, so host memory is read by VMA. Pages borrowed
+    /// for copy-on-write read the owner's through the page table. Pages past the end of the file
+    /// (the host raises SIGBUS as soon as they are touched) and unreadable pages return false and
+    /// leave holes in the core file.
+    pub fn dump_page(&self, addr: u64, buf: &mut [u8]) -> bool {
+        let Some((&s, v)) = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .filter(|&(&s, v)| addr < s + v.file_len.min(v.len))
+        else {
+            return false;
+        };
+        let n = buf.len().min((s + v.file_len - addr) as usize);
+        let host = if self
+            .cow
+            .borrow()
+            .borrowed
+            .contains_key(&(addr & !(PAGE_SIZE - 1)))
+        {
+            match self.mmu.translate(addr, prot::READ) {
+                Some(host) => host.as_ptr(),
+                None => return false,
+            }
+        } else {
+            // SAFETY: addr is in the part of this VMA with file contents, and it holds the host
+            // memory
+            unsafe { v.host.as_ptr().add((addr - s) as usize) }
+        };
+        // SAFETY: [host, host + n) does not cross this page
+        unsafe { std::ptr::copy_nonoverlapping(host, buf.as_mut_ptr(), n) };
+        buf[n..].fill(0);
+        true
+    }
+
     /// Test hook ([`crate::bug`]): points the page of `addr` at an inaccessible host page in the
     /// page table, so a guest access makes the engine fault on the host. That host page belongs to
     /// no VMA and is leaked on purpose.
@@ -3807,560 +2843,711 @@ impl Mm {
         .map_err(map_err)
     }
 
-    /// Whether a guest address falls in some mapping (telling SEGV_MAPERR from SEGV_ACCERR).
-    pub fn is_mapped(&self, addr: u64) -> bool {
+    // ---- VMAs, host backing and page-table population ----
+
+    /// Whether `[start, start + len)` is entirely free.
+    fn is_free(&self, start: u64, len: u64) -> bool {
+        // The last VMA starting before the end of the range must not reach into the range
         self.vmas
-            .range(..=addr)
+            .range(..start + len)
             .next_back()
-            .is_some_and(|(&s, v)| addr < s + v.len)
+            .is_none_or(|(&s, v)| s + v.len <= start)
     }
 
-    /// Sets the initial program break (used by the loader).
-    pub fn set_brk(&mut self, start: u64) {
-        self.brk_start = start;
-        self.brk = start;
-    }
-
-    /// Implements brk(2): returns the new break, or the old one on failure.
-    pub fn brk(&mut self, new: u64) -> u64 {
-        if new < self.brk_start {
-            return self.brk;
-        }
-        let (Some(old_end), Some(new_end)) = (page_up(self.brk), page_up(new)) else {
-            return self.brk;
-        };
-        if new_end > old_end {
-            let grow = new_end - old_end;
-            if !self.is_free(old_end, grow) {
-                return self.brk;
+    /// Finds a free range of length `len`, top down.
+    pub fn find_free(&self, len: u64) -> Option<u64> {
+        let mut top = self.mmap_top;
+        for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
+            let end = s + v.len;
+            if end <= top && top - end >= len {
+                return Some(top - len);
             }
-            let grown = self.grow_heap(old_end, grow)
-                || self.start_heap(old_end, grow)
-                || self
-                    .map_anonymous(old_end, grow, prot::READ | prot::WRITE)
-                    .is_ok();
-            if !grown {
-                return self.brk;
+            top = top.min(s);
+        }
+        (top >= MMAP_MIN + len).then(|| top - len)
+    }
+
+    /// Host memory for a new private anonymous mapping: a `PROT_NONE` one is only a reservation
+    /// and takes no host address space ([`HostRegion::reserved`]); the rest as
+    /// [`Mm::new_anonymous`].
+    fn private_anonymous(
+        len: u64,
+        prot: u32,
+        reserve: bool,
+    ) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        if mmu_prot(prot) == 0 {
+            let region = HostRegion::reserved();
+            let host = region.base;
+            return Ok((region, host));
+        }
+        Self::new_anonymous(len, reserve)
+    }
+
+    /// Gives reserved VMA `start` ([`HostRegion::reserved`]) its own host memory (all zero), after
+    /// which it behaves like an ordinary private anonymous mapping. It has no entries, so the page
+    /// table needs no change. Reservations are often hundreds of GB, so the caller first splits off
+    /// the piece it needs. `reserve` is whether it is counted in the host commit
+    /// ([`Mm::new_anonymous`]).
+    fn back_reserved(&mut self, start: u64, reserve: bool) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        if !v.reserved() {
+            return Ok(());
+        }
+        let (region, host) = Self::new_anonymous(v.len, reserve)?;
+        let v = self.vmas.get_mut(&start).unwrap();
+        v.region = region;
+        v.host = host;
+        Ok(())
+    }
+
+    /// Gives a private file mapping that shares host memory with other address spaces a copy of
+    /// its own.
+    fn unshare(&mut self, start: u64) -> Result<(), Errno> {
+        let v = &self.vmas[&start];
+        let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
+        let (region, host) = Self::new_anonymous(v.len, reserve)?;
+        // SAFETY: both pieces of host memory have at least v.len bytes and do not overlap
+        unsafe { copy_nonzero_pages(v.host.as_ptr(), host.as_ptr(), v.file_len as usize, None) };
+        // The old entries point at the shared piece, so remove them first (map_pages leaves
+        // existing entries alone); pages past the end of the file still stay out of the page
+        // table
+        let (file_len, p) = (v.file_len, v.prot);
+        self.mmu.unmap(start, file_len).map_err(map_err)?;
+        Self::map_pages(&mut self.mmu, start, host, file_len, p, true)?;
+        let v = self.vmas.get_mut(&start).unwrap();
+        let old = std::mem::replace(&mut v.region, region);
+        v.host = host;
+        v.cow = false;
+        // Other threads' TLBs may still hold stale translations: release only after the shootdown
+        self.graveyard.push(old);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// New anonymous host memory. Host memory is always readable and writable (the page table
+    /// carries the guest permissions), so the caller decides `reserve` by Linux's commit rules:
+    /// only writable private mappings are accounted, while `MAP_NORESERVE`, read-only and
+    /// `PROT_NONE` ones are not. V8 reserves 8 GB of `PROT_NONE` for every wasm memory, which
+    /// would fail outright on hosts with little memory if it were accounted.
+    fn new_anonymous(len: u64, reserve: bool) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+        let base = match recycled::take(host_len, reserve) {
+            Some(base) => base,
+            None => appine_hal::map_anonymous(host_len, reserve).map_err(|_| Errno::ENOMEM)?,
+        };
+        Ok((
+            Arc::new(HostRegion {
+                base,
+                len: host_len,
+                anonymous: Some(reserve),
+                reserved: false,
+            }),
+            base,
+        ))
+    }
+
+    /// Maps a piece of host memory at `[start, start + len)`; the caller guarantees the range is
+    /// free. For file mappings `file_len` is the number of bytes before the end of the file
+    /// ([`Vma::file_len`]), and only that part gets entries: when a small file is mapped
+    /// executable over a large range, the page table is only as large as the file.
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        start: u64,
+        len: u64,
+        file_len: u64,
+        prot: u32,
+        backing: Backing,
+        may_write: bool,
+        region: Arc<HostRegion>,
+        host: NonNull<u8>,
+    ) -> Result<(), Errno> {
+        self.room_for(1)?;
+        let file = backing != Backing::Anonymous;
+        Self::map_pages(&mut self.mmu, start, host, file_len, prot, file)?;
+        self.exec_changed |= prot & prot::EXEC != 0;
+        self.vmas.insert(
+            start,
+            Vma {
+                len,
+                prot,
+                backing,
+                may_write,
+                may_exec: true,
+                region,
+                name: None,
+                ino: 0,
+                host,
+                file_len,
+                cow: false,
+                file_id: None,
+                content: None,
+                file: None,
+                shm: None,
+                locked: self.lock_future,
+                written: Cell::new(prot & prot::WRITE != 0),
+                growsdown: false,
+                dontdump: false,
+                wipeonfork: false,
+                dontfork: false,
+                noreserve: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Puts a whole VMA at `start`; the caller guarantees the range is free.
+    fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
+        self.room_for(1)?;
+        let file = v.backing != Backing::Anonymous;
+        Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
+        self.exec_changed |= v.prot & prot::EXEC != 0;
+        self.vmas.insert(start, v);
+        Ok(())
+    }
+
+    /// The range check of msync(2): the range must be fully mapped.
+    pub fn check_mapped(&self, addr: u64, len: u64) -> Result<(), Errno> {
+        let end = page_up(len)
+            .and_then(|l| addr.checked_add(l))
+            .ok_or(Errno::ENOMEM)?;
+        let mut cursor = addr;
+        while cursor < end {
+            let (&s, v) = self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+                .ok_or(Errno::ENOMEM)?;
+            cursor = s + v.len;
+        }
+        Ok(())
+    }
+
+    /// How many more VMAs splitting at these addresses makes.
+    fn splits(&self, addrs: &[u64]) -> usize {
+        addrs
+            .iter()
+            .filter(|&&a| {
+                self.vmas
+                    .range(..a)
+                    .next_back()
+                    .is_some_and(|(&s, v)| s + v.len > a)
+            })
+            .count()
+    }
+
+    /// Splits the VMA that spans `addr` into two at `addr`.
+    fn split_at(&mut self, addr: u64) {
+        let Some((&s, v)) = self.vmas.range(..addr).next_back() else {
+            return;
+        };
+        if s + v.len <= addr {
+            return;
+        }
+        let mut tail = v.clone();
+        let head_len = addr - s;
+        tail.len -= head_len;
+        tail.file_len = v.file_len.saturating_sub(head_len);
+        if let Some(f) = &mut tail.file_id {
+            f.2 += head_len;
+        }
+        if let Some(f) = &mut tail.file {
+            f.1 += head_len;
+        }
+        // A reservation has no host memory and its address is only computed
+        // (HostRegion::reserved), so do integer arithmetic
+        tail.host = if tail.reserved() {
+            NonNull::new(tail.host.as_ptr().wrapping_add(head_len as usize)).unwrap()
+        } else {
+            // SAFETY: addr is inside the VMA, so the offset stays within the host mapping
+            unsafe { tail.host.add(head_len as usize) }
+        };
+        let head = self.vmas.get_mut(&s).unwrap();
+        head.len = head_len;
+        head.file_len = head.file_len.min(head_len);
+        self.vmas.insert(addr, tail);
+    }
+
+    /// Whether there is room for `more` more VMAs (`vm.max_map_count`).
+    fn room_for(&self, more: usize) -> Result<(), Errno> {
+        if self.vmas.len() + more > MAX_MAP_COUNT.load(Ordering::Relaxed) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// Puts part of a VMA into the page table: builds entries for the VMA's own host memory
+    /// `[host, host + len)` at `[start, start + len)`, leaving existing entries alone (those
+    /// changed by copy-on-write, or kept by mprotect with permission 0). `PROT_NONE` gets none:
+    /// writing entries page by page for the large address ranges V8 and the JVM reserve takes a
+    /// lot of memory (16 MB for 8 GB), so they are added when mprotect grants permissions
+    /// ([`Mm::mprotect`]). Neither does anything over [`EAGER_MAX`], which is filled on demand at
+    /// access ([`Mm::fault_in`]), except executable mappings that are not private anonymous
+    /// (`file`: file mappings, shared anonymous memory, SysV shm), which are built anyway: when
+    /// translations are shared, guest instruction words are checked against the page table (the
+    /// DBT's recheck), and blocks without entries must be parked and restored page by page on
+    /// first execution. For a file mapping their size is bounded by the file size.
+    fn map_pages(
+        mmu: &mut Mmu,
+        start: u64,
+        host: NonNull<u8>,
+        len: u64,
+        prot: u32,
+        file: bool,
+    ) -> Result<(), Errno> {
+        if mmu_prot(prot) == 0 || len == 0 {
+            return Ok(());
+        }
+        if len > EAGER_MAX && !(file && prot & prot::EXEC != 0) {
+            return Ok(());
+        }
+        // SAFETY: the VMA holds the host memory, which lives at least as long as the mapping in
+        // the page table
+        if let Err(e) = unsafe { mmu.fill_shared(start, host, len, mmu_prot(prot)) } {
+            let _ = mmu.unmap(start, len);
+            return Err(map_err(e));
+        }
+        Ok(())
+    }
+
+    /// The ranges (guest addresses) of private anonymous VMA `start` that may have contents and may
+    /// be resident, sorted by address, each at most [`WINDOW_MAX`]: fork's lending
+    /// ([`Mm::lend`]) and resident-memory measurement look only at these, so a mapping of several
+    /// TB with only a few pages touched need not be checked page by page.
+    ///
+    /// It rests on this rule: every page of private anonymous memory with contents has an entry.
+    /// Guest accesses and kernel-layer reads and writes through the page table fill the entries
+    /// first ([`Mm::fault_in`]); the kernel layer writing host memory directly
+    /// ([`Mm::write_kernel`]) or populating it ([`Mm::populate`]) fills them too; mprotect to
+    /// `PROT_NONE` keeps the entries with permissions cleared; mremap moves the entries along
+    /// ([`Mm::move_range`]). Copy-on-write pages count as well (borrowed pages in a `PROT_NONE`
+    /// VMA have no entries). So the result is the runs of leaf tables (2 MB) that have entries.
+    fn touched_windows(&self, start: u64) -> Vec<(u64, u64)> {
+        let v = &self.vmas[&start];
+        let end = start + v.len;
+        let cow = self.cow.borrow();
+        let mut lent = cow.lent.range(start..end).copied().peekable();
+        let mut borrowed = cow.borrowed.range(start..end).map(|(&p, _)| p).peekable();
+        // The next page to look at: the earliest that has an entry or is copy-on-write
+        let mut next = |from: u64| {
+            while lent.next_if(|&p| p < from).is_some() {}
+            while borrowed.next_if(|&p| p < from).is_some() {}
+            let pte = self.mmu.next_present(from, end);
+            pte.min(lent.peek().copied().unwrap_or(end))
+                .min(borrowed.peek().copied().unwrap_or(end))
+        };
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut at = start;
+        while at < end {
+            let page = next(at);
+            if page >= end {
+                break;
             }
-        } else if new_end < old_end && self.munmap(new_end, old_end - new_end).is_err() {
-            return self.brk;
+            let lo = (page & !(LEAF_SPAN - 1)).max(start);
+            let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
+            match out.last_mut() {
+                Some((s, e)) if *e == lo && hi - *s <= WINDOW_MAX => *e = hi,
+                _ => out.push((lo, hi)),
+            }
+            at = hi;
         }
-        self.brk = new;
-        new
+        out
+    }
+}
+
+impl Default for Mm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Mm {
+    fn drop(&mut self) {
+        if let Some(group) = self.code_group.take() {
+            group.members.set(group.members.get() - 1);
+            group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
+        }
+        self.release_cow();
+        // SAFETY: self.mmu is not used afterwards
+        let mmu = unsafe { ManuallyDrop::take(&mut self.mmu) };
+        // While holding the BKL, release it after the BKL is released (release_unmapped)
+        if let Some(mmu) = UNMAPPED.with_borrow_mut(|u| match u {
+            Some(u) => {
+                u.mmus.push(mmu);
+                None
+            }
+            None => Some(mmu),
+        }) {
+            drop(mmu);
+        }
+    }
+}
+
+impl Mm {
+    /// When the address space is destroyed: records the mappings the translations came from,
+    /// returns borrowed pages, and leaves lent pages with the borrowers.
+    fn release_cow(&mut self) {
+        if let Some(cs) = &self.code_space {
+            cs.space.set_sources(&self.code_sources());
+        }
+        let cow = std::mem::take(self.cow.get_mut());
+        // No thread uses this address space any more (exit, execve), so no TLB flush is needed
+        // before returning borrowed pages
+        self.return_loans(
+            cow.borrowed.into_iter().map(|(page, b)| (page, b.host)),
+            true,
+        );
+        if cow.lent.is_empty() {
+            return;
+        }
+        // Lent pages become orphans
+        {
+            let mut loans = self.loans.borrow_mut();
+            for &page in &cow.lent {
+                if let Some((s, v)) = self.anon_vma(page)
+                    && let Some(loan) =
+                        loans.get_mut(&(Self::own_page(s, v, page).as_ptr() as usize))
+                {
+                    loan.owner = None;
+                }
+            }
+        }
+        self.discard_unlent(&cow.lent);
+    }
+}
+
+// ---- Consistency and code ----
+
+/// Ranges invalidated in the last few code generations.
+#[derive(Default)]
+pub struct CodeLog {
+    /// (code generation, start, length), in increasing generation order.
+    entries: VecDeque<(u64, u64, u64)>,
+}
+
+impl CodeLog {
+    /// Number of generations kept; threads further behind flush the whole translation cache. The
+    /// JVM issues `ic ivau` over a run of cache lines for every compiled method it installs, and
+    /// with only 64 kept, GC and compiler threads waking from a short sleep almost always had to
+    /// flush everything: a Maven build flushed 2400 times and used 30% more user CPU time.
+    const GENERATIONS: u64 = 4096;
+
+    fn push(&mut self, generation: u64, ranges: &[(u64, u64)]) {
+        self.entries
+            .extend(ranges.iter().map(|&(start, len)| (generation, start, len)));
+        while self
+            .entries
+            .front()
+            .is_some_and(|e| e.0 + Self::GENERATIONS <= generation)
+        {
+            self.entries.pop_front();
+        }
     }
 
-    /// When the heap is not mapped yet, maps `len` bytes at `start` and reserves [`HEAP_RESERVE`]
-    /// of host address space.
-    fn start_heap(&mut self, start: u64, len: u64) -> bool {
-        if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
-            return false;
+    /// Ranges invalidated after generation `seen` up to `now`; None when the log no longer covers
+    /// them.
+    pub fn since(&self, seen: u64, now: u64) -> Option<Vec<(u64, u64)>> {
+        if self.entries.front().is_none_or(|e| e.0 > seen + 1) {
+            return None;
         }
-        let Ok((region, host)) = Self::new_anonymous(HEAP_RESERVE, false) else {
-            return false;
-        };
-        let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)
-            .is_ok()
+        // Generations increase: binary-search the start and look only at the entries missed (the
+        // whole log has tens of thousands of entries under the JVM)
+        let first = self.entries.partition_point(|e| e.0 <= seen);
+        Some(
+            self.entries
+                .range(first..)
+                .take_while(|e| e.0 <= now)
+                .map(|e| (e.1, e.2))
+                .collect(),
+        )
     }
+}
 
-    /// Lengthens the heap VMA ending at `end` by `grow` bytes if its host memory has room after it.
-    fn grow_heap(&mut self, end: u64, grow: u64) -> bool {
-        let Some((&s, v)) = self.vmas.range(..end).next_back() else {
-            return false;
-        };
-        let rw = prot::READ | prot::WRITE;
-        let compatible = v.backing == Backing::Anonymous
-            && v.prot == rw
-            && v.locked == self.lock_future
-            && v.name.is_none();
-        if s + v.len != end || !compatible {
+/// Generations users check before re-entering guest code ([`Mm::sync`]).
+pub struct Generations {
+    /// TLB shootdown generation.
+    pub tlb: Arc<AtomicU64>,
+    /// Code generation: when it changes, Tier 1 translations are invalidated according to `log`.
+    pub code: Arc<AtomicU64>,
+    /// Ranges invalidated in each code generation.
+    pub log: Arc<Mutex<CodeLog>>,
+    /// The Tier 1 translations were replaced (the address space left its shared group,
+    /// [`CodeGroup`]): users switch to the new ones before re-entering guest code.
+    pub space: Arc<AtomicU64>,
+}
+
+/// An address space's Tier 1 translations, shared by the threads of that address space
+/// ([`Mm::code_space`]).
+pub struct CodeSpace {
+    pub space: Arc<appine_engine::DbtSpace>,
+    /// This address space's tag in its translation-sharing group ([`CodeGroup`]); 0 outside a
+    /// group.
+    pub tag: u16,
+    /// The code generation up to which the code-change log has been applied: the first thread to
+    /// see a new generation invalidates once for all.
+    pub seen: Mutex<u64>,
+}
+
+/// Tier 1 translations shared by several address spaces of the same program
+/// ([`Mm::code_space`]). With one set per process, four cc1 compiling in parallel took 35–40 MB of
+/// code cache each, and 20 idle python3 processes 4 MB each.
+///
+/// A translation depends only on the pc and the instruction words, so when several address spaces
+/// map the same code at the same addresses, the blocks are valid for all of them. A member's
+/// trusted executable mappings (private file mappings never written that have a version, and the
+/// vDSO) must agree with what the group has registered: one address range can only be the same
+/// piece of the same version of a file (appine has no ASLR, so processes of the same program map
+/// at the same addresses). Blocks in registered mappings are shared by all members; other
+/// executable memory (JIT output, code that was written) is private to a member: the engine keeps
+/// blocks there apart by member tag ([`appine_engine::DbtSpace::share`]), private ranges may not
+/// overlap registered ones, and registered ones may not overlap ranges private to other members
+/// ([`CodeGroup::admit`]). Each node process has its own JIT code, while V8's interpreter, its
+/// builtins and ICU, which live in the node program file, are still shared. The check runs after
+/// every syscall ([`Mm::sync`]): a member that no longer fits leaves the group and switches to
+/// translations of its own; when it is the only member left the group is closed and it keeps the
+/// existing translations. So no other member ever runs a block valid only for it. A member that
+/// unmaps its own mappings invalidates as usual, and other members only have to translate again.
+///
+/// Accessed only while holding the BKL.
+pub struct CodeGroup {
+    /// The program (the executable's inode, the same as the pool key).
+    key: u64,
+    space: Arc<appine_engine::DbtSpace>,
+    members: Cell<usize>,
+    /// Executable mappings members have mapped; one identity is registered per address range
+    /// ([`CodeGroup::extend`]).
+    ranges: RefCell<Vec<appine_engine::DbtSource>>,
+    /// Executable memory private to a member, `(tag, start, end)` ([`CodeGroup::admit`]).
+    claims: RefCell<Vec<(u16, u64, u64)>>,
+    /// No longer accepts new members.
+    closed: Cell<bool>,
+    /// Has had more than one member: blocks outside the registered ranges have been invalidated.
+    shared: Cell<bool>,
+}
+
+impl CodeGroup {
+    /// The most mappings registered (python's extension modules take one each).
+    const MAX_RANGES: usize = 256;
+
+    /// All executable mappings of member `tag`: the trusted `layout` and the private `private`
+    /// ([`Mm::exec_split`]). layout must agree with what is registered ([`CodeGroup::extend`])
+    /// and not overlap ranges private to other members, and private must not overlap registered
+    /// ranges: if so, registers layout, installs this member's private ranges and returns true;
+    /// otherwise changes nothing.
+    fn admit(&self, tag: u16, layout: &[appine_engine::DbtSource], private: &[(u64, u64)]) -> bool {
+        let overlap = |start: u64, end: u64, s: u64, e: u64| start < e && s < end;
+        let ranges = self.ranges.borrow();
+        if private.iter().any(|&(s, e)| {
+            ranges
+                .iter()
+                .any(|r| overlap(r.start, r.start + r.len, s, e))
+        }) {
             return false;
         }
-        let used = v.host.as_ptr() as usize - v.region.base.as_ptr() as usize + v.len as usize;
-        if used + grow as usize > v.region.len {
+        let before = ranges.len();
+        drop(ranges);
+        let mut claims = self.claims.borrow_mut();
+        if layout.iter().any(|l| {
+            claims
+                .iter()
+                .any(|&(t, s, e)| t != tag && overlap(l.start, l.start + l.len, s, e))
+        }) || !self.extend(layout)
+        {
             return false;
         }
-        // No other mapping may use the host range right after it (a part of the heap moved away by
-        // mremap still belongs to the same host memory)
-        let (lo, hi) = (v.host.as_ptr() as usize + v.len as usize, grow as usize);
-        let taken = self.vmas.values().any(|o| {
-            let at = o.host.as_ptr() as usize;
-            Arc::ptr_eq(&o.region, &v.region) && at < lo + hi && lo < at + o.len as usize
-        });
-        if taken {
-            return false;
+        claims.retain(|c| c.0 != tag);
+        claims.extend(private.iter().map(|&(s, e)| (tag, s, e)));
+        let ranges = self.ranges.borrow();
+        if ranges.len() != before {
+            self.space.share(&ranges);
         }
-        // SAFETY: [lo, lo + hi) is inside this private anonymous memory and no other mapping uses
-        // it
-        let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
-        // Grown again after shrinking: what was written before must read as zero again
-        unsafe { discard_host(host, hi) };
-        if Self::map_pages(&mut self.mmu, end, host, grow, rw, false).is_err() {
-            return false;
-        }
-        let v = self.vmas.get_mut(&s).unwrap();
-        v.len += grow;
-        v.file_len += grow;
-        v.written.set(true);
         true
     }
 
-    /// Reads from guest memory (like Linux's `copy_from_user`); every page must be readable.
-    pub fn read(&self, src: UserSlice, dst: &mut [u8]) -> Result<(), Errno> {
-        assert_eq!(src.len, dst.len());
-        self.for_each_page(src.addr, src.len, prot::READ, |host, done, chunk| unsafe {
-            std::ptr::copy_nonoverlapping(host, dst[done..].as_mut_ptr(), chunk);
-        })
-    }
-
-    /// Writes to guest memory (like Linux's `copy_to_user`); every page must be writable.
-    pub fn write(&self, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
-        assert_eq!(dst.len, data.len());
-        self.for_each_page(dst.addr, dst.len, prot::WRITE, |host, done, chunk| unsafe {
-            std::ptr::copy_nonoverlapping(data[done..].as_ptr(), host, chunk);
-        })
-    }
-
-    /// The host pointer the kernel layer finds for guest address `addr` through the page table,
-    /// requiring the permissions in `need`; if there is no entry yet it is filled on demand first
-    /// ([`Mm::fault_in`]). Does not handle copy-on-write (see [`Mm::for_each_page`]).
-    pub fn translate(&self, addr: u64, need: u32) -> Option<NonNull<u8>> {
-        self.mmu.translate(addr, need).or_else(|| {
-            self.fault_in(addr, need)
-                .then(|| self.mmu.translate(addr, need))?
-        })
-    }
-
-    /// Reads a NUL-terminated string (without the NUL), at most `max` bytes; ENAMETOOLONG if
-    /// longer.
-    pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
-        let mut out = Vec::new();
-        let mut cur = addr;
-        loop {
-            let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
-            let host = self.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
-            // SAFETY: translate guarantees this page stays valid for the duration of this call
-            let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
-            if let Some(n) = bytes.iter().position(|&b| b == 0) {
-                out.extend_from_slice(&bytes[..n]);
-                return if out.len() > max {
-                    Err(Errno::ENAMETOOLONG)
-                } else {
-                    Ok(out)
-                };
-            }
-            out.extend_from_slice(bytes);
-            if out.len() > max {
-                return Err(Errno::ENAMETOOLONG);
-            }
-            cur = cur.checked_add(chunk as u64).ok_or(Errno::EFAULT)?;
-        }
-    }
-
-    /// The kernel itself writing into guest memory, such as loading a program or building the
-    /// initial stack. Requires only that it be mapped, without checking permissions, so host
-    /// memory is found by VMA: `PROT_NONE` pages are not in the page table. The part of a file
-    /// mapping past the end of the file cannot be written.
-    pub(crate) fn write_kernel(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        // Write the VMA's own host memory directly: copy-on-write pages are first replaced by our
-        // own, and file mappings sharing host memory with other address spaces first copy their
-        // own
-        let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
-        self.cow_settle(addr & !(PAGE_SIZE - 1), end);
-        let first = self
-            .vmas
-            .range(..=addr)
-            .next_back()
-            .map_or(addr, |(&s, _)| s);
-        let shared: Vec<u64> = self
-            .vmas
-            .range(first..end)
-            .filter(|(_, v)| v.cow)
-            .map(|(&s, _)| s)
-            .collect();
-        for s in shared {
-            self.unshare(s)?;
-        }
-        // A reservation (PROT_NONE, a tracer forcing a write): the pages written are split off and
-        // given host memory
-        let lo = addr & !(PAGE_SIZE - 1);
-        if self
-            .vmas
-            .range(first..end)
-            .any(|(&s, v)| v.reserved() && s + v.len > lo)
-        {
-            self.split_at(lo);
-            self.split_at(end);
-            let reserved: Vec<u64> = self
-                .vmas
-                .range(lo..end)
-                .filter(|(_, v)| v.reserved())
-                .map(|(&s, _)| s)
-                .collect();
-            for s in reserved {
-                self.back_reserved(s, false)?;
-            }
-        }
-        let mut done = 0;
-        while done < data.len() {
-            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
-            let (&s, v) = self
-                .vmas
-                .range(..=cur)
-                .next_back()
-                .filter(|&(&s, v)| cur < s + v.file_len)
-                .ok_or(Errno::EFAULT)?;
-            let chunk = ((s + v.file_len - cur) as usize).min(data.len() - done);
-            v.written.set(true);
-            self.exec_changed |= v.prot & prot::EXEC != 0;
-            // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
-            // the host memory
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data[done..].as_ptr(),
-                    v.host.as_ptr().add((cur - s) as usize),
-                    chunk,
-                )
-            };
-            // Pages with contents in private anonymous memory must have entries
-            // (Mm::touched_windows); PROT_NONE ones get permission 0
-            if v.backing == Backing::Anonymous {
-                let lo = cur & !(PAGE_SIZE - 1);
-                let hi = page_up(cur + chunk as u64).unwrap_or(s + v.len);
-                // SAFETY: [lo, hi) is inside this VMA, which holds the host memory
-                let host = unsafe { v.host.add((lo - s) as usize) };
-                unsafe { self.mmu.fill_shared(lo, host, hi - lo, mmu_prot(v.prot)) }
-                    .map_err(map_err)?;
-            }
-            done += chunk;
-        }
-        Ok(())
-    }
-
-    /// A tracer forcing a write (PTRACE_POKETEXT, `/proc/<pid>/mem`, Linux's `FOLL_FORCE`):
-    /// private mappings without write permission can be written too (a program's code segment:
-    /// setting breakpoints), by copying them into our own; shared mappings without write
-    /// permission cannot. Translations of what was written are invalidated, and the threads using
-    /// this address space flush their TLBs first; `current` is the writing thread (no effect when
-    /// it is not in this address space).
-    pub(crate) fn write_force(
-        &mut self,
-        addr: u64,
-        data: &[u8],
-        current: &Arc<TaskSync>,
-    ) -> Result<(), Errno> {
-        let end = addr.checked_add(data.len() as u64).ok_or(Errno::EFAULT)?;
-        let mut cur = addr;
-        while cur < end {
-            let (&s, v) = self
-                .vmas
-                .range(..=cur)
-                .next_back()
-                .filter(|&(&s, v)| cur < s + v.len)
-                .ok_or(Errno::EFAULT)?;
-            if v.backing == Backing::Shared && v.prot & prot::WRITE == 0 {
-                return Err(Errno::EFAULT);
-            }
-            cur = s + v.len;
-        }
-        self.write_kernel(addr, data)?;
-        let page = addr & !(PAGE_SIZE - 1);
-        self.invalidate_code(page, page_up(end).unwrap_or(u64::MAX) - page);
-        self.sync(current);
-        Ok(())
-    }
-
-    /// Walks `[addr, addr + len)` page by page, calling `f(host pointer, bytes done, chunk length)`
-    /// for each chunk.
-    fn for_each_page(
-        &self,
-        addr: u64,
-        len: usize,
-        required_prot: u32,
-        mut f: impl FnMut(*mut u8, usize, usize),
-    ) -> Result<(), Errno> {
-        let mut done = 0;
-        while done < len {
-            let cur = addr.checked_add(done as u64).ok_or(Errno::EFAULT)?;
-            let page_left = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
-            let chunk = page_left.min(len - done);
-            let host = match self.mmu.translate(cur, required_prot) {
-                Some(host) => host,
-                // Copy-on-write pages: make them writable first (Mm::cow_break); pages without
-                // entries yet are filled on demand
-                None if required_prot & prot::WRITE != 0 && self.cow_break(cur)
-                    || self.fault_in(cur, required_prot) =>
-                {
-                    self.mmu
-                        .translate(cur, required_prot)
-                        .ok_or(Errno::EFAULT)?
+    /// Registers `layout` (all of an address space's executable mappings): returns false and
+    /// changes nothing if it conflicts with what is registered or does not fit. Two overlapping
+    /// pieces agree when they are the same version of the same file with the same address minus
+    /// file offset: the dynamic linker first maps the span of the whole file and then maps the
+    /// later segments over it, so a library's executable mappings come long first, then short.
+    fn extend(&self, layout: &[appine_engine::DbtSource]) -> bool {
+        let mut ranges = self.ranges.borrow_mut();
+        let mut new = Vec::new();
+        for s in layout {
+            let mut covered = false;
+            for r in ranges.iter() {
+                if r.start < s.start + s.len && s.start < r.start + r.len {
+                    if !Self::same_file(r, s) {
+                        return false;
+                    }
+                    covered |= r.start <= s.start && s.start + s.len <= r.start + r.len;
                 }
-                None => return Err(Errno::EFAULT),
-            };
-            f(host.as_ptr(), done, chunk);
-            done += chunk;
+            }
+            if !covered {
+                new.push(*s);
+            }
         }
-        Ok(())
+        if ranges.len() + new.len() > Self::MAX_RANGES {
+            return false;
+        }
+        ranges.extend(new);
+        true
     }
+
+    /// The mappings in `layout` that agree with what is registered (every overlapping registration
+    /// is the same piece of file): the group's blocks there are valid for this address space.
+    fn consistent(&self, layout: &[appine_engine::DbtSource]) -> Vec<appine_engine::DbtSource> {
+        let ranges = self.ranges.borrow();
+        layout
+            .iter()
+            .filter(|s| {
+                ranges.iter().all(|r| {
+                    !(r.start < s.start + s.len && s.start < r.start + r.len)
+                        || Self::same_file(r, s)
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Two overlapping trusted mappings are the same version of the same file with the same
+    /// address minus file offset.
+    fn same_file(r: &appine_engine::DbtSource, s: &appine_engine::DbtSource) -> bool {
+        let (ri, si) = (r.id, s.id);
+        (ri[0], ri[1], ri[3], ri[4]) == (si[0], si[1], si[3], si[4])
+            && r.start.wrapping_sub(ri[2]) == s.start.wrapping_sub(si[2])
+    }
+}
+
+/// The groups ([`CodeGroup`]) that can be joined, kept in Kernel.
+pub type CodeGroups = RefCell<Vec<Weak<CodeGroup>>>;
+
+// ---- Copy-on-write ----
+
+/// A handle to an address space ([`Mm::into_shared`]): during copy-on-write the address spaces of
+/// one fork family find each other through it.
+type MmRef = Weak<RefCell<Mm>>;
+
+/// A lent host page.
+struct Loan {
+    /// The owner and the page's guest address there; None after the owner's address space is
+    /// destroyed (an orphan page).
+    owner: Option<(MmRef, u64)>,
+    /// The borrowers and the page's guest address in each. There is usually only one (the forked
+    /// child), stored without a separate allocation: a big process's fork makes a record for every
+    /// page.
+    first: Option<(MmRef, u64)>,
+    others: Vec<(MmRef, u64)>,
+}
+
+impl Loan {
+    fn new(owner: Option<(MmRef, u64)>, borrower: (MmRef, u64)) -> Loan {
+        Loan {
+            owner,
+            first: Some(borrower),
+            others: Vec::new(),
+        }
+    }
+
+    fn lend(&mut self, borrower: (MmRef, u64)) {
+        match self.first {
+            None => self.first = Some(borrower),
+            Some(_) => self.others.push(borrower),
+        }
+    }
+
+    /// Removes borrower `mm` (where the page is at `page`); returns whether other borrowers remain.
+    fn give_back(&mut self, mm: &MmRef, page: u64) -> bool {
+        let it = |(m, a): &(MmRef, u64)| *a == page && m.ptr_eq(mm);
+        if self.first.as_ref().is_some_and(it) {
+            self.first = self.others.pop();
+        } else {
+            self.others.retain(|b| !it(b));
+        }
+        self.first.is_some()
+    }
+
+    fn borrowers(self) -> impl Iterator<Item = (MmRef, u64)> {
+        self.first.into_iter().chain(self.others)
+    }
+
+    /// Number of address spaces mapping this page (Linux's mapcount): the owner (if still there)
+    /// and the borrowers.
+    fn users(&self) -> usize {
+        usize::from(self.owner.is_some()) + usize::from(self.first.is_some()) + self.others.len()
+    }
+}
+
+/// Hash of host page addresses: dropping the low bits of a page-aligned address and multiplying
+/// by an odd constant spreads them well enough. The default SipHash took over 10% of a big
+/// process's fork.
+#[derive(Default, Clone, Copy)]
+struct PageHasher(u64);
+
+impl std::hash::Hasher for PageHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64 >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The loan records shared by one fork family, keyed by host page address.
+type Loans = Rc<RefCell<HashMap<usize, Loan, std::hash::BuildHasherDefault<PageHasher>>>>;
+
+/// A contiguous run in the page table: the start of its VMA, the guest address, the host address
+/// and the length. Pages are joined into runs before their entries are changed page by page. Runs
+/// never cross VMAs: the VMAs an mprotect split off, or the host memory of two adjacent mmaps, may
+/// be contiguous while their permissions differ.
+#[derive(Default)]
+struct Runs {
+    runs: Vec<(u64, u64, usize, u64)>,
+}
+
+impl Runs {
+    fn push(&mut self, vma: u64, page: u64, host: NonNull<u8>) {
+        let host = host.as_ptr() as usize;
+        if let Some((v, g, h, len)) = self.runs.last_mut()
+            && *v == vma
+            && *g + *len == page
+            && *h + *len as usize == host
+        {
+            *len += PAGE_SIZE;
+            return;
+        }
+        self.runs.push((vma, page, host, PAGE_SIZE));
+    }
+}
+
+/// A borrowed page.
+struct Borrowed {
+    host: NonNull<u8>,
+    /// Holds that host memory, so it is not released when the owner unmaps it or is destroyed.
+    region: Arc<HostRegion>,
+}
+
+/// The copy-on-write pages of an address space (guest addresses). Only in private anonymous
+/// mappings.
+#[derive(Default)]
+struct Cow {
+    /// Lent pages: their entries have no write permission.
+    lent: BTreeSet<u64>,
+    /// Borrowed pages: their entries point at the owner's host page, without write permission.
+    borrowed: BTreeMap<u64, Borrowed>,
 }
 
 /// Copy-on-write (module docs, the kernel/mm map). Done through shared borrows: when the kernel
 /// writes into guest memory it has only `&Mm`, and an owner recalling pages must also change its
 /// borrowers' page tables.
 impl Mm {
-    /// The private anonymous VMA containing page `page`, and its start.
-    fn anon_vma(&self, page: u64) -> Option<(u64, &Vma)> {
-        let (&s, v) = self.vmas.range(..=page).next_back()?;
-        (page < s + v.len && v.backing == Backing::Anonymous).then_some((s, v))
-    }
-
-    /// The host page of page `page` in its own VMA.
-    fn own_page(s: u64, v: &Vma, page: u64) -> NonNull<u8> {
-        // SAFETY: page is inside this VMA, so the offset stays within the host mapping
-        unsafe { v.host.add((page - s) as usize) }
-    }
-
-    /// The page-table permission of a copy-on-write page: no write permission.
-    fn read_only(v: &Vma) -> u32 {
-        mmu_prot(v.prot) & !prot::WRITE
-    }
-
-    /// Called before writing to `page` (a write fault, the kernel writing guest memory): a borrowed
-    /// page is copied into our own, and borrowers of a lent page each copy theirs first. Returns
-    /// true if the entry is now writable; false if the VMA is not writable or the page is not
-    /// copy-on-write.
-    pub fn cow_break(&self, page: u64) -> bool {
-        let page = page & !(PAGE_SIZE - 1);
-        if self
-            .anon_vma(page)
-            .is_none_or(|(_, v)| v.prot & prot::WRITE == 0)
-        {
-            return false;
-        }
-        let (borrowed, lent) = {
-            let c = self.cow.borrow();
-            (c.borrowed.contains_key(&page), c.lent.contains(&page))
-        };
-        if borrowed {
-            self.materialize(page, true);
-        } else if lent {
-            self.recall(page);
-        }
-        borrowed || lent
-    }
-
-    /// Replaces borrowed page `page` with our own copy: copies it to the matching place in our own
-    /// VMA and points the entry there. With `notify`, if this returns the last borrow, the owner
-    /// gets write permission back; not needed when the owner itself is recalling.
-    fn materialize(&self, page: u64, notify: bool) {
-        let Some(b) = self.cow.borrow_mut().borrowed.remove(&page) else {
-            return;
-        };
-        if let Some((s, v)) = self.anon_vma(page) {
-            let own = Self::own_page(s, v, page);
-            // SAFETY: both sides are a whole page, and b.region holds the borrowed page
-            unsafe {
-                std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
-            };
-            // Built even for PROT_NONE (permission 0): pages with contents must have entries
-            // (Mm::touched_windows); there may be an entry with permission 0 pointing at the
-            // borrowed page, which must not stay
-            // SAFETY: the host page belongs to this VMA
-            let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
-        }
-        // Threads' TLBs may still point at the borrowed page: return it only after flushing, since
-        // the owner may write it right after
-        self.shootdown();
-        self.return_loan(b.host, page, notify);
-    }
-
-    /// Returns borrowed host page `host` (at guest address `page` here).
-    fn return_loan(&self, host: NonNull<u8>, page: u64, notify: bool) {
-        self.return_loans([(page, host)], notify);
-    }
-
-    /// Returns a batch of borrowed pages (guest addresses here, the owner's host pages). With
-    /// `notify`, pages whose last borrow is returned get write permission back at the owner,
-    /// handled together per owner.
-    fn return_loans(&self, pages: impl IntoIterator<Item = (u64, NonNull<u8>)>, notify: bool) {
-        let mut owners: Vec<(MmRef, Vec<u64>)> = Vec::new();
-        {
-            let mut loans = self.loans.borrow_mut();
-            for (page, host) in pages {
-                let key = host.as_ptr() as usize;
-                let Some(loan) = loans.get_mut(&key) else {
-                    continue;
-                };
-                if loan.give_back(&self.me, page) {
-                    continue;
-                }
-                if let Some((owner, addr)) = loans.remove(&key).and_then(|l| l.owner)
-                    && notify
-                {
-                    match owners.iter_mut().find(|(o, _)| o.ptr_eq(&owner)) {
-                        Some((_, addrs)) => addrs.push(addr),
-                        None => owners.push((owner, vec![addr])),
-                    }
-                }
-            }
-        }
-        // An owner that is currently borrowed (because of its own operation, such as a recall)
-        // can be left alone: its entries are restored at its next write fault (Mm::cow_break)
-        for (owner, addrs) in owners {
-            if let Some(owner) = owner.upgrade()
-                && let Ok(owner) = owner.try_borrow()
-            {
-                owner.repossess(&addrs);
-            }
-        }
-    }
-
-    /// These lent pages have no borrowers left: restore write permission (only adding
-    /// permissions, so no TLB flush is needed).
-    fn repossess(&self, pages: &[u64]) {
-        let mut runs = Runs::default();
-        {
-            let mut c = self.cow.borrow_mut();
-            for &page in pages {
-                if c.lent.remove(&page)
-                    && let Some((s, v)) = self.anon_vma(page)
-                {
-                    runs.push(s, page, Self::own_page(s, v, page));
-                }
-            }
-        }
-        for (s, page, _, len) in runs.runs {
-            let _ = self
-                .mmu
-                .protect_shared(page, len, mmu_prot(self.vmas[&s].prot));
-        }
-    }
-
-    /// Before the owner changes lent page `page`: every borrower copies its own, then write
-    /// permission is restored.
-    fn recall(&self, page: u64) {
-        let Some((s, v)) = self.anon_vma(page) else {
-            self.cow.borrow_mut().lent.remove(&page);
-            return;
-        };
-        let key = Self::own_page(s, v, page).as_ptr() as usize;
-        let loan = self.loans.borrow_mut().remove(&key);
-        for (b, addr) in loan.into_iter().flat_map(Loan::borrowers) {
-            if let Some(b) = b.upgrade() {
-                b.borrow().materialize(addr, false);
-            }
-        }
-        self.repossess(&[page]);
-    }
-
-    /// The immediate shootdown after a page-table entry is re-pointed: bump the generation first so
-    /// users flush their TLBs before re-entering guest code; kick those running guest code and wait
-    /// for them to leave (the approach of [`Mm::sync`], but the caller uses that page right after).
-    fn shootdown(&self) {
-        if self.users.is_empty() {
-            return;
-        }
-        // Pairs with the user's "mark, then read the generation": either it reads the new
-        // generation, or this side sees it running
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        for u in &self.users {
-            if u.in_guest.load(Ordering::SeqCst) {
-                // SAFETY: a thread unregisters from users (holding the BKL) before destroying its
-                // Cpu
-                unsafe { u.kicker.kick() };
-            }
-        }
-        for u in &self.users {
-            while u.in_guest.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-        }
-    }
-
-    /// Pages in `[start, end)` stop being copy-on-write, keeping their contents in our own host
-    /// memory: lent pages are recalled first, and borrowed ones are copied (before mremap moves,
-    /// discarding, or the kernel writing host memory directly).
-    fn cow_settle(&self, start: u64, end: u64) {
-        let (lent, borrowed): (Vec<u64>, Vec<u64>) = {
-            let c = self.cow.borrow();
-            (
-                c.lent.range(start..end).copied().collect(),
-                c.borrowed.range(start..end).map(|(&p, _)| p).collect(),
-            )
-        };
-        for page in lent {
-            self.recall(page);
-        }
-        for page in borrowed {
-            self.materialize(page, true);
-        }
-    }
-
-    /// `[start, end)` is about to be unmapped: lent pages are recalled first; borrowed ones are
-    /// taken out of the records and returned with [`Mm::give_back`] after the caller has changed
-    /// the entries and flushed the TLB (their contents are no longer wanted, so no copy).
-    fn cow_unmap(&self, start: u64, end: u64) -> Vec<(u64, Borrowed)> {
-        let lent: Vec<u64> = self.cow.borrow().lent.range(start..end).copied().collect();
-        for page in lent {
-            self.recall(page);
-        }
-        let mut c = self.cow.borrow_mut();
-        let pages: Vec<u64> = c.borrowed.range(start..end).map(|(&p, _)| p).collect();
-        pages
-            .into_iter()
-            .map(|p| (p, c.borrowed.remove(&p).unwrap()))
-            .collect()
-    }
-
-    /// Returns the pages [`Mm::cow_unmap`] took.
-    fn give_back(&self, pages: Vec<(u64, Borrowed)>) {
-        if pages.is_empty() {
-            return;
-        }
-        self.shootdown();
-        self.return_loans(pages.into_iter().map(|(page, b)| (page, b.host)), true);
-    }
-
-    /// After mprotect changed the entries of `[start, end)`: copy-on-write pages still cannot be
-    /// written, and borrowed pages still point at the owner's host pages.
-    fn cow_protect(&self, start: u64, end: u64) {
-        let c = self.cow.borrow();
-        for &page in c.lent.range(start..end) {
-            if let Some((s, v)) = self.anon_vma(page)
-                && Self::read_only(v) != 0
-            {
-                // Build the entry, not just change its permissions: a PROT_NONE mapping may have
-                // had no entry
-                // SAFETY: the host page belongs to this VMA
-                let _ = unsafe {
-                    self.mmu.map_shared(
-                        page,
-                        Self::own_page(s, v, page),
-                        PAGE_SIZE,
-                        Self::read_only(v),
-                    )
-                };
-            }
-        }
-        for (&page, b) in c.borrowed.range(start..end) {
-            if let Some((_, v)) = self.anon_vma(page)
-                && Self::read_only(v) != 0
-            {
-                // SAFETY: b.region holds the borrowed host page
-                let _ = unsafe {
-                    self.mmu
-                        .map_shared(page, b.host, PAGE_SIZE, Self::read_only(v))
-                };
-            }
-        }
-    }
-
-    /// Whether `[start, end)` has copy-on-write pages.
-    fn has_cow(&self, start: u64, end: u64) -> bool {
-        let c = self.cow.borrow();
-        c.lent.range(start..end).next().is_some() || c.borrowed.range(start..end).next().is_some()
-    }
-
     /// fork: lends the pages with contents in VMA `start` (private anonymous, written) to child
     /// `child`, whose VMA at the same address already maps its own (all-zero) host memory. Pages
     /// we borrowed ourselves are borrowed by the child from their original owner. The child's
@@ -4458,6 +3645,114 @@ impl Mm {
         lent.len() > before
     }
 
+    /// Called before writing to `page` (a write fault, the kernel writing guest memory): a borrowed
+    /// page is copied into our own, and borrowers of a lent page each copy theirs first. Returns
+    /// true if the entry is now writable; false if the VMA is not writable or the page is not
+    /// copy-on-write.
+    pub fn cow_break(&self, page: u64) -> bool {
+        let page = page & !(PAGE_SIZE - 1);
+        if self
+            .anon_vma(page)
+            .is_none_or(|(_, v)| v.prot & prot::WRITE == 0)
+        {
+            return false;
+        }
+        let (borrowed, lent) = {
+            let c = self.cow.borrow();
+            (c.borrowed.contains_key(&page), c.lent.contains(&page))
+        };
+        if borrowed {
+            self.materialize(page, true);
+        } else if lent {
+            self.recall(page);
+        }
+        borrowed || lent
+    }
+
+    /// Pages in `[start, end)` stop being copy-on-write, keeping their contents in our own host
+    /// memory: lent pages are recalled first, and borrowed ones are copied (before mremap moves,
+    /// discarding, or the kernel writing host memory directly).
+    fn cow_settle(&self, start: u64, end: u64) {
+        let (lent, borrowed): (Vec<u64>, Vec<u64>) = {
+            let c = self.cow.borrow();
+            (
+                c.lent.range(start..end).copied().collect(),
+                c.borrowed.range(start..end).map(|(&p, _)| p).collect(),
+            )
+        };
+        for page in lent {
+            self.recall(page);
+        }
+        for page in borrowed {
+            self.materialize(page, true);
+        }
+    }
+
+    /// `[start, end)` is about to be unmapped: lent pages are recalled first; borrowed ones are
+    /// taken out of the records and returned with [`Mm::give_back`] after the caller has changed
+    /// the entries and flushed the TLB (their contents are no longer wanted, so no copy).
+    fn cow_unmap(&self, start: u64, end: u64) -> Vec<(u64, Borrowed)> {
+        let lent: Vec<u64> = self.cow.borrow().lent.range(start..end).copied().collect();
+        for page in lent {
+            self.recall(page);
+        }
+        let mut c = self.cow.borrow_mut();
+        let pages: Vec<u64> = c.borrowed.range(start..end).map(|(&p, _)| p).collect();
+        pages
+            .into_iter()
+            .map(|p| (p, c.borrowed.remove(&p).unwrap()))
+            .collect()
+    }
+
+    /// Returns the pages [`Mm::cow_unmap`] took.
+    fn give_back(&self, pages: Vec<(u64, Borrowed)>) {
+        if pages.is_empty() {
+            return;
+        }
+        self.shootdown();
+        self.return_loans(pages.into_iter().map(|(page, b)| (page, b.host)), true);
+    }
+
+    /// Whether `[start, end)` has copy-on-write pages.
+    fn has_cow(&self, start: u64, end: u64) -> bool {
+        let c = self.cow.borrow();
+        c.lent.range(start..end).next().is_some() || c.borrowed.range(start..end).next().is_some()
+    }
+
+    /// After mprotect changed the entries of `[start, end)`: copy-on-write pages still cannot be
+    /// written, and borrowed pages still point at the owner's host pages.
+    fn cow_protect(&self, start: u64, end: u64) {
+        let c = self.cow.borrow();
+        for &page in c.lent.range(start..end) {
+            if let Some((s, v)) = self.anon_vma(page)
+                && Self::read_only(v) != 0
+            {
+                // Build the entry, not just change its permissions: a PROT_NONE mapping may have
+                // had no entry
+                // SAFETY: the host page belongs to this VMA
+                let _ = unsafe {
+                    self.mmu.map_shared(
+                        page,
+                        Self::own_page(s, v, page),
+                        PAGE_SIZE,
+                        Self::read_only(v),
+                    )
+                };
+            }
+        }
+        for (&page, b) in c.borrowed.range(start..end) {
+            if let Some((_, v)) = self.anon_vma(page)
+                && Self::read_only(v) != 0
+            {
+                // SAFETY: b.region holds the borrowed host page
+                let _ = unsafe {
+                    self.mmu
+                        .map_shared(page, b.host, PAGE_SIZE, Self::read_only(v))
+                };
+            }
+        }
+    }
+
     /// When the address space is destroyed: pages of private anonymous memory that are not lent go
     /// back to the host. Lent pages stay with the borrowers, which hold that host memory, and are
     /// released only when the last borrower returns them; one piece of host memory may have been
@@ -4481,66 +3776,799 @@ impl Mm {
             }
         }
     }
-}
 
-impl Drop for Mm {
-    fn drop(&mut self) {
-        if let Some(group) = self.code_group.take() {
-            group.members.set(group.members.get() - 1);
-            group.claims.borrow_mut().retain(|c| c.0 != self.code_tag);
-        }
-        self.release_cow();
-        // SAFETY: self.mmu is not used afterwards
-        let mmu = unsafe { ManuallyDrop::take(&mut self.mmu) };
-        // While holding the BKL, release it after the BKL is released (release_unmapped)
-        if let Some(mmu) = UNMAPPED.with_borrow_mut(|u| match u {
-            Some(u) => {
-                u.mmus.push(mmu);
-                None
-            }
-            None => Some(mmu),
-        }) {
-            drop(mmu);
-        }
-    }
-}
-
-impl Mm {
-    /// When the address space is destroyed: records the mappings the translations came from,
-    /// returns borrowed pages, and leaves lent pages with the borrowers.
-    fn release_cow(&mut self) {
-        if let Some(cs) = &self.code_space {
-            cs.space.set_sources(&self.code_sources());
-        }
-        let cow = std::mem::take(self.cow.get_mut());
-        // No thread uses this address space any more (exit, execve), so no TLB flush is needed
-        // before returning borrowed pages
-        self.return_loans(
-            cow.borrowed.into_iter().map(|(page, b)| (page, b.host)),
-            true,
-        );
-        if cow.lent.is_empty() {
+    /// Before the owner changes lent page `page`: every borrower copies its own, then write
+    /// permission is restored.
+    fn recall(&self, page: u64) {
+        let Some((s, v)) = self.anon_vma(page) else {
+            self.cow.borrow_mut().lent.remove(&page);
             return;
+        };
+        let key = Self::own_page(s, v, page).as_ptr() as usize;
+        let loan = self.loans.borrow_mut().remove(&key);
+        for (b, addr) in loan.into_iter().flat_map(Loan::borrowers) {
+            if let Some(b) = b.upgrade() {
+                b.borrow().materialize(addr, false);
+            }
         }
-        // Lent pages become orphans
+        self.repossess(&[page]);
+    }
+
+    /// Replaces borrowed page `page` with our own copy: copies it to the matching place in our own
+    /// VMA and points the entry there. With `notify`, if this returns the last borrow, the owner
+    /// gets write permission back; not needed when the owner itself is recalling.
+    fn materialize(&self, page: u64, notify: bool) {
+        let Some(b) = self.cow.borrow_mut().borrowed.remove(&page) else {
+            return;
+        };
+        if let Some((s, v)) = self.anon_vma(page) {
+            let own = Self::own_page(s, v, page);
+            // SAFETY: both sides are a whole page, and b.region holds the borrowed page
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.host.as_ptr(), own.as_ptr(), PAGE_SIZE as usize)
+            };
+            // Built even for PROT_NONE (permission 0): pages with contents must have entries
+            // (Mm::touched_windows); there may be an entry with permission 0 pointing at the
+            // borrowed page, which must not stay
+            // SAFETY: the host page belongs to this VMA
+            let _ = unsafe { self.mmu.map_shared(page, own, PAGE_SIZE, mmu_prot(v.prot)) };
+        }
+        // Threads' TLBs may still point at the borrowed page: return it only after flushing, since
+        // the owner may write it right after
+        self.shootdown();
+        self.return_loan(b.host, page, notify);
+    }
+
+    /// Returns borrowed host page `host` (at guest address `page` here).
+    fn return_loan(&self, host: NonNull<u8>, page: u64, notify: bool) {
+        self.return_loans([(page, host)], notify);
+    }
+
+    /// Returns a batch of borrowed pages (guest addresses here, the owner's host pages). With
+    /// `notify`, pages whose last borrow is returned get write permission back at the owner,
+    /// handled together per owner.
+    fn return_loans(&self, pages: impl IntoIterator<Item = (u64, NonNull<u8>)>, notify: bool) {
+        let mut owners: Vec<(MmRef, Vec<u64>)> = Vec::new();
         {
             let mut loans = self.loans.borrow_mut();
-            for &page in &cow.lent {
-                if let Some((s, v)) = self.anon_vma(page)
-                    && let Some(loan) =
-                        loans.get_mut(&(Self::own_page(s, v, page).as_ptr() as usize))
+            for (page, host) in pages {
+                let key = host.as_ptr() as usize;
+                let Some(loan) = loans.get_mut(&key) else {
+                    continue;
+                };
+                if loan.give_back(&self.me, page) {
+                    continue;
+                }
+                if let Some((owner, addr)) = loans.remove(&key).and_then(|l| l.owner)
+                    && notify
                 {
-                    loan.owner = None;
+                    match owners.iter_mut().find(|(o, _)| o.ptr_eq(&owner)) {
+                        Some((_, addrs)) => addrs.push(addr),
+                        None => owners.push((owner, vec![addr])),
+                    }
                 }
             }
         }
-        self.discard_unlent(&cow.lent);
+        // An owner that is currently borrowed (because of its own operation, such as a recall)
+        // can be left alone: its entries are restored at its next write fault (Mm::cow_break)
+        for (owner, addrs) in owners {
+            if let Some(owner) = owner.upgrade()
+                && let Ok(owner) = owner.try_borrow()
+            {
+                owner.repossess(&addrs);
+            }
+        }
+    }
+
+    /// These lent pages have no borrowers left: restore write permission (only adding
+    /// permissions, so no TLB flush is needed).
+    fn repossess(&self, pages: &[u64]) {
+        let mut runs = Runs::default();
+        {
+            let mut c = self.cow.borrow_mut();
+            for &page in pages {
+                if c.lent.remove(&page)
+                    && let Some((s, v)) = self.anon_vma(page)
+                {
+                    runs.push(s, page, Self::own_page(s, v, page));
+                }
+            }
+        }
+        for (s, page, _, len) in runs.runs {
+            let _ = self
+                .mmu
+                .protect_shared(page, len, mmu_prot(self.vmas[&s].prot));
+        }
+    }
+
+    /// The immediate shootdown after a page-table entry is re-pointed: bump the generation first so
+    /// users flush their TLBs before re-entering guest code; kick those running guest code and wait
+    /// for them to leave (the approach of [`Mm::sync`], but the caller uses that page right after).
+    fn shootdown(&self) {
+        if self.users.is_empty() {
+            return;
+        }
+        // Pairs with the user's "mark, then read the generation": either it reads the new
+        // generation, or this side sees it running
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for u in &self.users {
+            if u.in_guest.load(Ordering::SeqCst) {
+                // SAFETY: a thread unregisters from users (holding the BKL) before destroying its
+                // Cpu
+                unsafe { u.kicker.kick() };
+            }
+        }
+        for u in &self.users {
+            while u.in_guest.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// The private anonymous VMA containing page `page`, and its start.
+    fn anon_vma(&self, page: u64) -> Option<(u64, &Vma)> {
+        let (&s, v) = self.vmas.range(..=page).next_back()?;
+        (page < s + v.len && v.backing == Backing::Anonymous).then_some((s, v))
+    }
+
+    /// The host page of page `page` in its own VMA.
+    fn own_page(s: u64, v: &Vma, page: u64) -> NonNull<u8> {
+        // SAFETY: page is inside this VMA, so the offset stays within the host mapping
+        unsafe { v.host.add((page - s) as usize) }
+    }
+
+    /// The page-table permission of a copy-on-write page: no write permission.
+    fn read_only(v: &Vma) -> u32 {
+        mmu_prot(v.prot) & !prot::WRITE
     }
 }
 
-impl Default for Mm {
-    fn default() -> Self {
-        Self::new()
+// ---- Introspection ----
+
+/// One line of `/proc/<pid>/maps`.
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u32,
+    pub shared: bool,
+    pub name: Option<Rc<[u8]>>,
+    /// File mappings: the file offset of the start and the file's inode.
+    pub file: Option<(u64, u64)>,
+    /// Locked by mlock.
+    pub locked: bool,
+    /// Write permission can be granted (smaps `mw`).
+    pub may_write: bool,
+    /// Execute permission can be granted (smaps `me`).
+    pub may_exec: bool,
+    /// `MADV_DONTDUMP` (smaps `dd`).
+    pub dontdump: bool,
+    /// `MADV_WIPEONFORK` (smaps `wf`).
+    pub wipeonfork: bool,
+    /// `MADV_DONTFORK` (smaps `dc`).
+    pub dontfork: bool,
+}
+
+/// One sample of resident memory ([`Mm::rss_plan`]).
+struct RssPlan {
+    /// 4K pages known without mincore: borrowed pages and cached file mappings.
+    fixed: u64,
+    /// Host ranges to mincore, sorted by start.
+    spans: Vec<(usize, usize)>,
+}
+
+impl RssPlan {
+    /// When the spans to measure total at most this many pages they are not measured but counted as
+    /// fully resident ([`RssPlan::estimate`]).
+    const SMALL: usize = 256;
+
+    /// Estimate used for the peak resident page count: when the spans to mincore total at most 1
+    /// MB, count them as fully resident, overcounting by at most 1 MB. A short-lived process like
+    /// `/bin/true` would measure 8 spans totalling 45 pages at exit and find 12, yet take 4 mincore
+    /// calls while holding the BKL (and wait for the host mmap_lock). Processes that allocated a
+    /// lot of memory are measured as usual.
+    fn estimate(&self) -> u64 {
+        let pages: usize = self.spans.iter().map(|&(_, len)| len.div_ceil(4096)).sum();
+        if pages <= Self::SMALL {
+            self.fixed + pages as u64
+        } else {
+            self.measure()
+        }
+    }
+
+    /// Resident 4K pages. Spans that are contiguous on the host are merged into one mincore.
+    fn measure(&self) -> u64 {
+        let mut total = self.fixed;
+        let mut rest = &self.spans[..];
+        while let Some(&(start, mut len)) = rest.first() {
+            let n = rest[1..]
+                .iter()
+                .take_while(|&&(s, l)| {
+                    let next = s == start + len;
+                    len += if next { l } else { 0 };
+                    next
+                })
+                .count();
+            total += appine_hal::resident_pages(start as *const u8, len) as u64;
+            rest = &rest[1 + n..];
+        }
+        total
+    }
+}
+
+/// Cache of the resident page counts of file mappings ([`Mm::resident_pages`]), keyed by (device,
+/// inode, file offset, length).
+struct FileResidency;
+
+impl FileResidency {
+    /// How long a cached result is used: a file's pages in the page cache change slowly.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// The most spans cached; the cache is cleared when it is full.
+    const MAX: usize = 1024;
+
+    fn get(
+        key: (u64, u64, u64, u64),
+        now: std::time::Instant,
+        measure: impl FnOnce() -> u64,
+    ) -> u64 {
+        type Map = HashMap<(u64, u64, u64, u64), (u64, std::time::Instant)>;
+        static CACHE: Mutex<Option<Map>> = Mutex::new(None);
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = cache.get_or_insert_with(HashMap::new);
+        if let Some(&(n, at)) = map.get(&key)
+            && now.duration_since(at) < Self::TTL
+        {
+            return n;
+        }
+        if map.len() >= Self::MAX {
+            map.clear();
+        }
+        let n = measure();
+        map.insert(key, (n, now));
+        n
+    }
+}
+
+/// One mapping in a core dump ([`Mm::dump_regions`]).
+pub struct DumpRegion {
+    pub start: u64,
+    pub end: u64,
+    pub prot: u32,
+    /// Bytes from the start written to the core file.
+    pub size: u64,
+    /// Pages not resident in host memory were never touched (anonymous, shared memory) and are
+    /// written as holes; untouched pages of private file mappings are file contents and must be
+    /// read.
+    pub sparse: bool,
+    /// File mappings: the file offset of the start and the path (`NT_FILE`).
+    pub file: Option<(u64, Rc<[u8]>)>,
+}
+
+/// Bits of `/proc/<pid>/coredump_filter` (Linux's `MMF_DUMP_*`); the default is
+/// [`dump_filter::DEFAULT`].
+pub mod dump_filter {
+    pub const ANON_PRIVATE: u32 = 1;
+    pub const ANON_SHARED: u32 = 2;
+    pub const MAPPED_PRIVATE: u32 = 4;
+    pub const MAPPED_SHARED: u32 = 8;
+    pub const ELF_HEADERS: u32 = 16;
+    /// Private and shared anonymous mappings, ELF headers, private huge pages.
+    pub const DEFAULT: u32 = 0x33;
+}
+
+// ---- Host backing ----
+
+/// The "host address" of a reserved ([`HostRegion::reserved`]) VMA: guest offsets are counted from
+/// here only for arithmetic (splitting VMAs), never for access. Bit 55 is set, so it falls in the
+/// host kernel's half (arm64 TBI ignores only the top 8 bits), and an access by mistake is a host
+/// segmentation fault that cannot reach other memory.
+const RESERVED_HOST: usize = 0x00f0_0000_0000_0000;
+
+/// A piece of host memory held by an [`Mm`]. Shared through `Arc`: the host mappings of read-only
+/// file mappings are shared by all address spaces ([`FileMaps`]), and execve also gets them while
+/// building a new address space without the BKL.
+struct HostRegion {
+    base: NonNull<u8>,
+    len: usize,
+    /// Private anonymous memory ([`Mm::new_anonymous`], [`spare`]) and whether it is
+    /// commit-accounted: kept for reuse when returned ([`recycled`]).
+    anonymous: Option<bool>,
+    /// No host memory ([`HostRegion::reserved`]).
+    reserved: bool,
+}
+
+impl HostRegion {
+    /// A private anonymous mapping that has been `PROT_NONE` and empty since it was created takes
+    /// neither host memory nor host address space. All guest processes live in one host process,
+    /// and on devices whose host user address space is only 39 bits (512 GB; every 4K-page GKI
+    /// kernel) each Chromium process reserves tens of GB (PartitionAlloc's pools) and a renderer 1
+    /// TB more (V8's sandbox), which together do not fit. Such a VMA has no entries, so the guest
+    /// cannot reach it; it gets its own host memory only when it becomes accessible (mprotect) or
+    /// the kernel writes into it (ptrace) ([`Mm::back_reserved`]).
+    fn reserved() -> Arc<HostRegion> {
+        Arc::new(HostRegion {
+            base: NonNull::new(RESERVED_HOST as *mut u8).unwrap(),
+            len: 0,
+            anonymous: None,
+            reserved: true,
+        })
+    }
+}
+
+// SAFETY: it is only a host address range, used only when it is released (Drop)
+unsafe impl Send for HostRegion {}
+unsafe impl Sync for HostRegion {}
+
+impl Drop for HostRegion {
+    fn drop(&mut self) {
+        if self.reserved {
+            return;
+        }
+        let (base, len, anonymous) = (self.base, self.len, self.anonymous);
+        if let Some(reserve) = anonymous {
+            let deferred = UNMAPPED
+                .with_borrow_mut(|u| u.as_mut().map(|u| u.anonymous.push((base, len, reserve))));
+            if deferred.is_some() {
+                UNMAPPING.fetch_add(len, Ordering::Relaxed);
+            } else {
+                // SAFETY: this private anonymous host memory belongs to this HostRegion and is no
+                // longer used by anyone
+                unsafe { recycled::put(base, len, reserve) }
+            }
+            return;
+        }
+        let deferred =
+            UNMAPPED.with_borrow_mut(|u| u.as_mut().map(|u| u.regions.push((base, len))));
+        if deferred.is_some() {
+            UNMAPPING.fetch_add(len, Ordering::Relaxed);
+        } else {
+            // SAFETY: this host memory belongs to this HostRegion and is no longer used by anyone
+            unsafe { appine_hal::unmap(base, len) }
+        }
+    }
+}
+
+/// Host memory that can be mapped into several address spaces (a System V shared memory segment).
+#[derive(Clone)]
+pub(crate) struct SharedMemory {
+    region: Arc<HostRegion>,
+}
+
+impl SharedMemory {
+    /// Creates zeroed memory, its length rounded up to a page.
+    pub fn new(len: u64) -> Result<SharedMemory, Errno> {
+        let len = page_up(len).ok_or(Errno::ENOMEM)?;
+        let (region, _) = Mm::new_anonymous(len, true)?;
+        Ok(SharedMemory { region })
+    }
+
+    /// Length (a multiple of the page size).
+    pub fn len(&self) -> u64 {
+        self.region.len as u64
+    }
+}
+
+/// Host mappings of read-only private file mappings (the code segments of programs and libraries),
+/// shared by all address spaces in the kernel: mapping the same piece of the same version
+/// ([`content::version`]) of a file again reuses one directly, with its host page tables intact,
+/// so there is no re-mapping or page fault, and no teardown at exit (once each for the program's
+/// and the dynamic linker's code segments every time the shell spawns a process). VMAs using one
+/// are marked `cow`, like parent and child sharing host memory after fork, and copy their own
+/// before writing. On the host it is a read-only mapping, so a place that forgets to copy fails
+/// outright instead of silently changing someone else's code.
+#[derive(Clone, Default)]
+pub(crate) struct FileMaps(Arc<Mutex<Vec<FileMap>>>);
+
+impl FileMaps {
+    /// The most pieces kept. They take only host address space; the pages are in the page cache
+    /// and can be reclaimed when host memory is short.
+    const MAX: usize = 128;
+
+    fn get(&self, key: &[u64; 6]) -> Option<(Arc<HostRegion>, NonNull<u8>)> {
+        let mut maps = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
+        let m = maps.iter_mut().find(|m| m.key == *key)?;
+        m.used = next;
+        Some((m.region.clone(), m.host))
+    }
+
+    fn insert(&self, key: [u64; 6], region: Arc<HostRegion>, host: NonNull<u8>) {
+        let mut maps = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let used = maps.iter().map(|m| m.used).max().unwrap_or(0) + 1;
+        if maps.len() >= Self::MAX
+            && let Some(old) = (0..maps.len()).min_by_key(|&i| maps[i].used)
+        {
+            maps.swap_remove(old);
+        }
+        maps.push(FileMap {
+            key,
+            region,
+            host,
+            used,
+        });
+    }
+
+    /// Drops everything (when host memory is short). Mappings still in use are held by the VMAs
+    /// using them and are unaffected.
+    pub fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+struct FileMap {
+    /// (device, inode, file offset, length, ctime, size).
+    key: [u64; 6],
+    region: Arc<HostRegion>,
+    host: NonNull<u8>,
+    /// Sequence number of the most recent use; when full, the least recently used is dropped.
+    used: u64,
+}
+
+// SAFETY: host points into host memory that region holds
+unsafe impl Send for FileMap {}
+
+/// The version of a host file's contents ([`content::version`]), None when there is no trusted
+/// version.
+pub(crate) fn content_version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
+    content::version(st, dev, ino)
+}
+
+/// Telling whether two file mappings have the same contents ([`Mm::code_sources`]).
+mod content {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Host files (device, inode) that have had a writable shared mapping: contents written through
+    /// a shared mapping do not necessarily change ctime (a page that stays dirty no longer goes
+    /// through page_mkwrite), so ctime is no longer trusted for such files.
+    static WRITABLY_SHARED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
+
+    /// File (`dev`, `ino`) got a writable shared mapping.
+    pub(super) fn writably_shared(dev: u64, ino: u64) {
+        let mut set = WRITABLY_SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set.get_or_insert_with(HashSet::new).insert((dev, ino));
+    }
+
+    /// The version of a host file's contents: ctime (nanoseconds) and size. Every change to the
+    /// contents (write, truncate, fallocate…) sets ctime to the current time on the host, and
+    /// utimensat cannot set it back, so two equal versions mean no change in between. Host
+    /// timestamps come from a coarse clock, and when ctime is too close to now a change right
+    /// after may get the same ctime, so no version is given then; nor for files that have had a
+    /// writable shared mapping.
+    #[allow(clippy::unnecessary_cast)]
+    pub(super) fn version(st: &libc::stat, dev: u64, ino: u64) -> Option<(u64, u64)> {
+        const RACY_NS: i128 = 2_000_000_000;
+        let ctime = st.st_ctime as i128 * 1_000_000_000 + st.st_ctime_nsec as i128;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos() as i128;
+        if ctime + RACY_NS > now {
+            return None;
+        }
+        let set = WRITABLY_SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if set.as_ref().is_some_and(|s| s.contains(&(dev, ino))) {
+            return None;
+        }
+        Some((ctime as u64, st.st_size as u64))
+    }
+}
+
+/// What [`Mm::carve`] carves: each VMA's start → its piece of host memory and its host address.
+type Carved = BTreeMap<u64, (Arc<HostRegion>, NonNull<u8>)>;
+
+/// Several pieces of the anonymous host memory fork needs (the address space reserved for the heap
+/// and the stack, the pieces small mappings are carved from) are mapped in advance, and fork takes
+/// them directly while holding the BKL. A program forking repeatedly always wants the same few
+/// lengths, and a used piece is replaced after the BKL is released ([`refill`](spare::refill)):
+/// host mmap used to take 40% of fork's hold time, and four processes spawning at once had less
+/// total throughput than one.
+pub(crate) mod spare {
+    use std::ptr::NonNull;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::HostRegion;
+    use crate::errno::Errno;
+
+    /// The most pieces kept per length.
+    const PER_LEN: usize = 2;
+    /// The most lengths remembered.
+    const LENS: usize = 8;
+
+    struct Spares {
+        /// (length, start): `MAP_NORESERVE` anonymous host memory, never touched.
+        maps: Vec<(usize, usize)>,
+        /// Lengths to replace, most recently used last.
+        wanted: Vec<usize>,
+    }
+
+    static SPARES: Mutex<Spares> = Mutex::new(Spares {
+        maps: Vec::new(),
+        wanted: Vec::new(),
+    });
+
+    /// `len` bytes of zeroed anonymous host memory, not commit-accounted (`MAP_NORESERVE`): a piece
+    /// mapped in advance if there is one, otherwise mapped on the spot.
+    pub(super) fn anonymous(len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+        let found = {
+            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+            s.wanted.retain(|&l| l != host_len);
+            s.wanted.push(host_len);
+            if s.wanted.len() > LENS {
+                let old = s.wanted.remove(0);
+                // Also return the pieces kept for a length no longer wanted
+                s.maps.retain(|&(l, base)| {
+                    if l == old {
+                        // SAFETY: host memory mapped in advance and never used
+                        unsafe { appine_hal::unmap(NonNull::new(base as *mut u8).unwrap(), l) };
+                    }
+                    l != old
+                });
+            }
+            s.maps
+                .iter()
+                .position(|&(l, _)| l == host_len)
+                .map(|i| s.maps.swap_remove(i).1)
+        };
+        let base = match found
+            .and_then(|b| NonNull::new(b as *mut u8))
+            .or_else(|| super::recycled::take(host_len, false))
+        {
+            Some(base) => base,
+            None => appine_hal::map_anonymous(host_len, false).map_err(|_| Errno::ENOMEM)?,
+        };
+        Ok((
+            Arc::new(HostRegion {
+                base,
+                len: host_len,
+                anonymous: Some(false),
+                reserved: false,
+            }),
+            base,
+        ))
+    }
+
+    /// Replaces the pieces used. Called after the BKL is released.
+    pub(crate) fn refill() {
+        loop {
+            let need = {
+                let s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+                s.wanted
+                    .iter()
+                    .copied()
+                    .find(|&l| s.maps.iter().filter(|m| m.0 == l).count() < PER_LEN)
+            };
+            let Some(len) = need else {
+                return;
+            };
+            let Ok(base) = appine_hal::map_anonymous(len, false) else {
+                return;
+            };
+            let mut s = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
+            if s.wanted.contains(&len) && s.maps.iter().filter(|m| m.0 == len).count() < PER_LEN {
+                s.maps.push((len, base.as_ptr() as usize));
+            } else {
+                drop(s);
+                // SAFETY: just mapped and never used
+                unsafe { appine_hal::unmap(base, len) };
+            }
+        }
+    }
+}
+
+/// Things freed while holding the BKL and returned after it is released.
+#[derive(Default)]
+struct Unmapped {
+    /// Host memory: (start, length).
+    regions: Vec<(NonNull<u8>, usize)>,
+    /// Private anonymous host memory kept for reuse ([`recycled`]): (start, length,
+    /// commit-accounted).
+    anonymous: Vec<(NonNull<u8>, usize, bool)>,
+    /// Page tables of destroyed address spaces: freeing the intermediate tables one by one takes
+    /// several microseconds.
+    mmus: Vec<Mmu>,
+}
+
+thread_local! {
+    /// Host memory freed while holding the BKL, returned to the host only after the BKL is released
+    /// ([`release_unmapped`]); None when the BKL is not held, which returns it on the spot.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static UNMAPPED: std::cell::RefCell<Option<Unmapped>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Bytes freed but not yet returned to the host: the OOM killer waits for them to be returned
+/// before it measures.
+pub(crate) static UNMAPPING: AtomicUsize = AtomicUsize::new(0);
+
+/// Starts holding the BKL: host memory freed from now on is returned after the BKL is released
+/// ([`release_unmapped`]).
+pub(crate) fn defer_unmaps() {
+    UNMAPPED.with_borrow_mut(|u| {
+        u.get_or_insert_with(Unmapped::default);
+    });
+}
+
+/// The BKL was released: return the host memory freed while it was held. Process exit and execve
+/// free ten or twenty mappings at once, and the host takes tens of microseconds to tear down page
+/// tables and flush TLBs; threads waiting for the BKL (the shell waiting to reap it, the process
+/// at the other end of a pipe) need not wait for that too. Contiguous pieces are returned
+/// together, saving TLB flushes.
+pub(crate) fn release_unmapped() {
+    let Some(Unmapped {
+        regions: mut list,
+        anonymous,
+        mmus,
+    }) = UNMAPPED.with_borrow_mut(Option::take)
+    else {
+        return;
+    };
+    // Free the page tables first, then return the host memory they point at
+    drop(mmus);
+    let reused: usize = anonymous.iter().map(|&(_, len, _)| len).sum();
+    for (base, len, reserve) in anonymous {
+        // SAFETY: private anonymous host memory recorded when its HostRegion was dropped, and no
+        // longer used by anyone
+        unsafe { recycled::put(base, len, reserve) };
+    }
+    UNMAPPING.fetch_sub(reused, Ordering::Release);
+    if list.is_empty() {
+        return;
+    }
+    list.sort_unstable_by_key(|&(base, _)| base);
+    let total: usize = list.iter().map(|&(_, len)| len).sum();
+    let mut run = list[0];
+    for &(base, len) in &list[1..] {
+        // SAFETY: both are returned host memory; on the host the previous piece ends exactly at
+        // base (when host pages are larger than 4K the length rounds up, and pieces that do not
+        // adjoin cannot be equal by chance)
+        if unsafe { run.0.add(run.1) } == base {
+            run.1 += len;
+        } else {
+            unsafe { appine_hal::unmap(run.0, run.1) };
+            run = (base, len);
+        }
+    }
+    unsafe { appine_hal::unmap(run.0, run.1) };
+    UNMAPPING.fetch_sub(total, Ordering::Release);
+}
+
+/// Private anonymous host memory kept for reuse after it is returned ([`HostRegion::anonymous`]).
+/// All guest processes live in one host process, and every host mmap and munmap takes that one
+/// process's mmap_lock for write (natively each process has its own): musl's malloc and gcc's
+/// garbage collector map and unmap blocks of the same sizes over and over, more than a hundred
+/// thousand times when `xargs -P4` compiles Lua, each time waiting on the host mmap while holding
+/// the BKL. Returning only discards the contents (`MADV_DONTNEED`, which takes the lock only for
+/// read), and the next request of the same size and the same commit accounting takes it directly.
+mod recycled {
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
+    use std::sync::Mutex;
+
+    /// The most host address space kept: the pages have gone back to the host, so it costs only
+    /// address space and a little page table.
+    const MAX_BYTES: usize = 256 << 20;
+    /// The most ranges kept per size.
+    const MAX_EACH: usize = 32;
+
+    struct Cache {
+        /// (length, commit-accounted) → starts.
+        free: HashMap<(usize, bool), Vec<usize>>,
+        bytes: usize,
+    }
+
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+    /// Takes a kept piece of private anonymous host memory whose contents are zero.
+    pub(super) fn take(len: usize, reserve: bool) -> Option<NonNull<u8>> {
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let c = cache.as_mut()?;
+        let base = c.free.get_mut(&(len, reserve))?.pop()?;
+        c.bytes -= len;
+        NonNull::new(base as *mut u8)
+    }
+
+    /// Returns a piece of private anonymous host memory: discards its contents and keeps it for
+    /// reuse, or returns it to the host when it cannot be kept.
+    ///
+    /// # Safety
+    ///
+    /// The host memory was allocated by [`appine_hal::map_anonymous`] and nobody uses it any more.
+    pub(super) unsafe fn put(base: NonNull<u8>, len: usize, reserve: bool) {
+        {
+            let mut cache = CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = cache.get_or_insert_with(|| Cache {
+                free: HashMap::new(),
+                bytes: 0,
+            });
+            let list = c.free.entry((len, reserve)).or_default();
+            if c.bytes + len <= MAX_BYTES && list.len() < MAX_EACH {
+                // SAFETY: guaranteed by the caller; after discarding it reads as zero, like a new
+                // mapping
+                if unsafe { appine_hal::discard(base, len) }.is_ok() {
+                    list.push(base.as_ptr() as usize);
+                    c.bytes += len;
+                    return;
+                }
+            }
+        }
+        // SAFETY: guaranteed by the caller
+        unsafe { appine_hal::unmap(base, len) }
+    }
+}
+
+fn page_up(v: u64) -> Option<u64> {
+    v.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1))
+}
+
+/// The page-table permission for a guest permission: arm64 has no write-only pages, so writable
+/// implies readable.
+fn mmu_prot(p: u32) -> u32 {
+    let mut r = p & (prot::READ | prot::WRITE | prot::EXEC);
+    if r & prot::WRITE != 0 {
+        r |= prot::READ;
+    }
+    r
+}
+
+/// Bytes of the file that still have contents from `offset`, rounded up to a page, at most `len`.
+fn file_extent(fd: i32, offset: u64, len: u64) -> u64 {
+    extent(appine_hal::fstat(fd).map_or(0, |s| s.st_size), offset, len)
+}
+
+/// Bytes of a file of size `size` that still have contents from `offset` ([`file_extent`]).
+fn extent(size: i64, offset: u64, len: u64) -> u64 {
+    (size.max(0) as u64)
+        .saturating_sub(offset)
+        .next_multiple_of(PAGE_SIZE)
+        .min(len)
+}
+
+/// Discards the contents of private anonymous host memory: whole pages go back to the host, and
+/// when host pages are larger than 4K the partial pages at both ends are zeroed. It used to zero
+/// everything, so the GCs of Go, the JVM and V8 touched every page they were giving back.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` is private anonymous host memory held by an [`Mm`].
+unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
+    let page = appine_hal::page_size();
+    let addr = ptr.as_ptr() as usize;
+    let head = (addr.next_multiple_of(page) - addr).min(len);
+    let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
+    // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
+    unsafe {
+        if head < tail && appine_hal::discard(ptr.add(head), tail - head).is_ok() {
+            std::ptr::write_bytes(ptr.as_ptr(), 0, head);
+            std::ptr::write_bytes(ptr.as_ptr().add(tail), 0, len - tail);
+        } else {
+            std::ptr::write_bytes(ptr.as_ptr(), 0, len);
+        }
+    }
+}
+
+fn map_err(e: MapError) -> Errno {
+    match e {
+        MapError::InvalidArgument => Errno::EINVAL,
+        MapError::OutOfMemory => Errno::ENOMEM,
     }
 }
 

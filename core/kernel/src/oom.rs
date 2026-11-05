@@ -70,19 +70,6 @@ pub(crate) struct Oom {
     code_views: Option<Instant>,
 }
 
-/// The counts in `memory.events`: how often usage was measured over the limit and so a process
-/// had to be picked and ended (not counted while the one picked last time has not finished
-/// exiting), how many processes were ended, and how often a whole group was ended because of
-/// `memory.oom.group`. Recorded on the cgroup ([`crate::cgroup::memory_event`]); those for the
-/// app's limit are recorded on the root.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Events {
-    pub max: u64,
-    pub oom: u64,
-    pub oom_kill: u64,
-    pub oom_group_kill: u64,
-}
-
 impl Default for Oom {
     fn default() -> Oom {
         Oom {
@@ -114,64 +101,25 @@ impl Oom {
     }
 }
 
+/// The counts in `memory.events`: how often usage was measured over the limit and so a process
+/// had to be picked and ended (not counted while the one picked last time has not finished
+/// exiting), how many processes were ended, and how often a whole group was ended because of
+/// `memory.oom.group`. Recorded on the cgroup ([`crate::cgroup::memory_event`]); those for the
+/// app's limit are recorded on the root.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Events {
+    pub max: u64,
+    pub oom: u64,
+    pub oom_kill: u64,
+    pub oom_group_kill: u64,
+}
+
 /// The default limit: half of the host's physical memory.
 pub(crate) fn default_limit() -> u64 {
     match appine_hal::memory_info().0 {
         0 => u64::MAX,
         total => total / 2,
     }
-}
-
-/// The app's memory usage, item by item ([`appine_hal::memory_usage`]). Pages Tier 1's code cache
-/// has written in the writable view and that are not torn down yet ([`unmap_code_views`]) count
-/// twice in the host's RssShmem, so one count is subtracted.
-pub(crate) fn app_memory() -> Option<appine_hal::MemoryUsage> {
-    let mut u = appine_hal::memory_usage()?;
-    u.shmem = u.shmem.saturating_sub(appine_engine::written_code_bytes());
-    Some(u)
-}
-
-/// The app's memory usage (bytes): the sum of the items of [`app_memory`]. Returns None when it
-/// cannot be read.
-fn footprint() -> Option<u64> {
-    app_memory().map(|u| u.anon + u.shmem + u.swap)
-}
-
-/// All guest threads are waiting in the kernel: memory will not grow any more, and the code cache
-/// will not be written either.
-fn all_sleeping(k: &Kernel) -> bool {
-    k.tasks.values().all(|t| t.sleeping.load(Ordering::Relaxed))
-}
-
-/// Called each time the timer thread wakes up: while some guest thread is running, tears down the
-/// pages Tier 1's code cache has written in the writable view once a second, and once more after
-/// all threads are waiting, then stops ([`appine_engine::unmap_written_code`]). The code cache is
-/// mapped twice for W^X, and the host's RSS counts pages per mapping, so a page touched in both
-/// views counts twice: translations count double in the app usage measured above ([`app_memory`]
-/// subtracts the ones not torn down yet) and in the RSS the LMK looks at. Tearing down by time
-/// rather than by how much was written: JIT workloads backfill links and invalidate blocks in
-/// thousands of different pages per second, and after a teardown every write to those pages takes
-/// a page fault again. Returns when the next one is due.
-pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
-    let now = Instant::now();
-    if let Some(next) = k.oom.code_views
-        && now < next
-    {
-        return Some(next);
-    }
-    let idle = all_sleeping(k);
-    // Woken by something else after stopping: no thread ran meanwhile, so there are no newly
-    // written pages
-    if !idle || k.oom.code_views.is_some() {
-        appine_engine::unmap_written_code();
-    }
-    if idle {
-        shared.checks_idle.store(true, Ordering::Relaxed);
-        k.oom.code_views = None;
-        return None;
-    }
-    k.oom.code_views = Some(now + CODE_VIEW_INTERVAL);
-    k.oom.code_views
 }
 
 /// Called each time the timer thread wakes up: when a check is due, measures the app's memory and
@@ -242,12 +190,19 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     k.oom.next
 }
 
-/// The process picked last time has not finished exiting, and [`VICTIM_TIMEOUT`] has not passed
-/// yet.
-fn waiting_for_victim(k: &Kernel, now: Instant) -> bool {
-    matches!(&k.oom.victim, Some((victim, at))
-        if now < *at + VICTIM_TIMEOUT
-            && victim.upgrade().is_some_and(|g| !g.borrow().threads.is_empty()))
+/// The app's memory usage (bytes): the sum of the items of [`app_memory`]. Returns None when it
+/// cannot be read.
+fn footprint() -> Option<u64> {
+    app_memory().map(|u| u.anon + u.shmem + u.swap)
+}
+
+/// The app's memory usage, item by item ([`appine_hal::memory_usage`]). Pages Tier 1's code cache
+/// has written in the writable view and that are not torn down yet ([`unmap_code_views`]) count
+/// twice in the host's RssShmem, so one count is subtracted.
+pub(crate) fn app_memory() -> Option<appine_hal::MemoryUsage> {
+    let mut u = appine_hal::memory_usage()?;
+    u.shmem = u.shmem.saturating_sub(appine_engine::written_code_bytes());
+    Some(u)
 }
 
 /// Usage `used` of OOM scope `domain` (a cgroup, the root being the whole app) exceeds limit
@@ -331,30 +286,44 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
     }
 }
 
-/// The report for the app ([`crate::bug::KillReport`]): the app's limit, or which cgroup's
-/// `memory.max`.
-fn oom_reason(k: &Kernel, domain: u64, used: u64, limit: u64) -> crate::bug::KillReason {
-    crate::bug::KillReason::OutOfMemory {
-        cgroup: (domain != ROOT).then(|| k.cgroups.path(domain, ROOT)),
-        used,
-        limit,
-    }
-}
-
-/// Ends process `g` with SIGKILL and counts it in the `oom_kill` of its cgroup (one already exiting
-/// counts too, as on Linux).
-fn kill(k: &mut Kernel, g: &Rc<RefCell<ThreadGroup>>) {
-    let cgroup = g.borrow().cgroup;
-    if g.borrow().exiting.is_none() {
-        let status = ExitStatus::Signaled {
-            signal: Signal::KILL,
-            pc: None,
-            fault_addr: None,
-            core_dumped: false,
+/// Picks the process to end (skipping `skip`): the OOM scope is cgroup `domain` (the root being the
+/// whole app), and the pick is among the processes below it, by Linux's oom_badness: resident pages
+/// plus `oom_score_adj` converted into pages against the limit `limit` (for the root, the larger
+/// of physical memory and the limit; 1000 equals everything, so such a process is always picked
+/// first). Returns the process and its resident 4K page count.
+fn select(
+    k: &Kernel,
+    skip: Option<&Rc<RefCell<ThreadGroup>>>,
+    (domain, limit): (u64, u64),
+) -> Option<(Rc<RefCell<ThreadGroup>>, u64)> {
+    let total = if domain == ROOT {
+        appine_hal::memory_info().0.max(limit)
+    } else {
+        limit
+    };
+    let total = (total / PAGE_SIZE) as i64;
+    let mut best: Option<(Rc<RefCell<ThreadGroup>>, i64, u64)> = None;
+    for group in k.groups.values() {
+        if skip.is_some_and(|s| Rc::ptr_eq(s, group)) {
+            continue;
+        }
+        let g = group.borrow();
+        if g.tgid == INIT
+            || g.oom_score_adj == OOM_SCORE_ADJ_MIN
+            || !k.cgroups.is_within(g.cgroup, domain)
+        {
+            continue;
+        }
+        let Some(task) = g.threads.first().and_then(|t| k.tasks.get(t)) else {
+            continue;
         };
-        crate::signal::group_exit(k, g, status);
+        let rss = task.res.borrow().mm.borrow().resident_pages();
+        let points = (rss as i64 + g.oom_score_adj as i64 * total / 1000).max(1);
+        if best.as_ref().is_none_or(|b| points > b.1) {
+            best = Some((group.clone(), points, rss));
+        }
     }
-    crate::cgroup::memory_event(k, cgroup, |e| e.oom_kill += 1);
+    best.map(|(g, _, rss)| (g, rss))
 }
 
 /// Writes to the kernel log when ending a process ([`crate::klog`]): to the guest, the app's limit
@@ -427,42 +396,73 @@ fn log_killed(k: &Kernel, g: &ThreadGroup, task: Option<&crate::task::Task>) {
     );
 }
 
-/// Picks the process to end (skipping `skip`): the OOM scope is cgroup `domain` (the root being the
-/// whole app), and the pick is among the processes below it, by Linux's oom_badness: resident pages
-/// plus `oom_score_adj` converted into pages against the limit `limit` (for the root, the larger
-/// of physical memory and the limit; 1000 equals everything, so such a process is always picked
-/// first). Returns the process and its resident 4K page count.
-fn select(
-    k: &Kernel,
-    skip: Option<&Rc<RefCell<ThreadGroup>>>,
-    (domain, limit): (u64, u64),
-) -> Option<(Rc<RefCell<ThreadGroup>>, u64)> {
-    let total = if domain == ROOT {
-        appine_hal::memory_info().0.max(limit)
-    } else {
-        limit
-    };
-    let total = (total / PAGE_SIZE) as i64;
-    let mut best: Option<(Rc<RefCell<ThreadGroup>>, i64, u64)> = None;
-    for group in k.groups.values() {
-        if skip.is_some_and(|s| Rc::ptr_eq(s, group)) {
-            continue;
-        }
-        let g = group.borrow();
-        if g.tgid == INIT
-            || g.oom_score_adj == OOM_SCORE_ADJ_MIN
-            || !k.cgroups.is_within(g.cgroup, domain)
-        {
-            continue;
-        }
-        let Some(task) = g.threads.first().and_then(|t| k.tasks.get(t)) else {
-            continue;
-        };
-        let rss = task.res.borrow().mm.borrow().resident_pages();
-        let points = (rss as i64 + g.oom_score_adj as i64 * total / 1000).max(1);
-        if best.as_ref().is_none_or(|b| points > b.1) {
-            best = Some((group.clone(), points, rss));
-        }
+/// The report for the app ([`crate::bug::KillReport`]): the app's limit, or which cgroup's
+/// `memory.max`.
+fn oom_reason(k: &Kernel, domain: u64, used: u64, limit: u64) -> crate::bug::KillReason {
+    crate::bug::KillReason::OutOfMemory {
+        cgroup: (domain != ROOT).then(|| k.cgroups.path(domain, ROOT)),
+        used,
+        limit,
     }
-    best.map(|(g, _, rss)| (g, rss))
+}
+
+/// Ends process `g` with SIGKILL and counts it in the `oom_kill` of its cgroup (one already exiting
+/// counts too, as on Linux).
+fn kill(k: &mut Kernel, g: &Rc<RefCell<ThreadGroup>>) {
+    let cgroup = g.borrow().cgroup;
+    if g.borrow().exiting.is_none() {
+        let status = ExitStatus::Signaled {
+            signal: Signal::KILL,
+            pc: None,
+            fault_addr: None,
+            core_dumped: false,
+        };
+        crate::signal::group_exit(k, g, status);
+    }
+    crate::cgroup::memory_event(k, cgroup, |e| e.oom_kill += 1);
+}
+
+/// The process picked last time has not finished exiting, and [`VICTIM_TIMEOUT`] has not passed
+/// yet.
+fn waiting_for_victim(k: &Kernel, now: Instant) -> bool {
+    matches!(&k.oom.victim, Some((victim, at))
+        if now < *at + VICTIM_TIMEOUT
+            && victim.upgrade().is_some_and(|g| !g.borrow().threads.is_empty()))
+}
+
+/// Called each time the timer thread wakes up: while some guest thread is running, tears down the
+/// pages Tier 1's code cache has written in the writable view once a second, and once more after
+/// all threads are waiting, then stops ([`appine_engine::unmap_written_code`]). The code cache is
+/// mapped twice for W^X, and the host's RSS counts pages per mapping, so a page touched in both
+/// views counts twice: translations count double in the app usage measured above ([`app_memory`]
+/// subtracts the ones not torn down yet) and in the RSS the LMK looks at. Tearing down by time
+/// rather than by how much was written: JIT workloads backfill links and invalidate blocks in
+/// thousands of different pages per second, and after a teardown every write to those pages takes
+/// a page fault again. Returns when the next one is due.
+pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
+    let now = Instant::now();
+    if let Some(next) = k.oom.code_views
+        && now < next
+    {
+        return Some(next);
+    }
+    let idle = all_sleeping(k);
+    // Woken by something else after stopping: no thread ran meanwhile, so there are no newly
+    // written pages
+    if !idle || k.oom.code_views.is_some() {
+        appine_engine::unmap_written_code();
+    }
+    if idle {
+        shared.checks_idle.store(true, Ordering::Relaxed);
+        k.oom.code_views = None;
+        return None;
+    }
+    k.oom.code_views = Some(now + CODE_VIEW_INTERVAL);
+    k.oom.code_views
+}
+
+/// All guest threads are waiting in the kernel: memory will not grow any more, and the code cache
+/// will not be written either.
+fn all_sleeping(k: &Kernel) -> bool {
+    k.tasks.values().all(|t| t.sleeping.load(Ordering::Relaxed))
 }
