@@ -5,9 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; socket owner column found while checking them)
->
-> Maintained: 2026-11-05 (targeted verification: `/proc/<tid>` resolves any thread; removed the bug)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references)
 
 ## Responsibilities
 
@@ -31,7 +29,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 `timens_offsets`, `ns/*`, `children`, state letters and namespaces (`kernel/process`);
 `/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour
 (`kernel/tty`); network semantics behind `/proc/net` and `net.*` (`kernel/net`); the OOM killer
-(`oom.rs`), SysV IPC and message queues (not yet mapped).
+(`kernel/mm`); SysV IPC and message queues (`kernel/ipc`).
 
 ## Key types
 

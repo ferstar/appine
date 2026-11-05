@@ -5,9 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: IPv6-only binds get their own host port, so IPv4 and IPv6 can bind one port side by side; the dual-stack bug narrowed to the remaining address cases)
->
-> Maintained: 2026-11-05 (targeted verification: `DELTABLE` with family 0 or without a name and handle flushes tables, so `nft flush ruleset` works; removed the bug)
+> Maintained: 2026-11-05 (targeted verification only since the full mapping: IPv6-only binds get their own host port, so IPv4 and IPv6 bind one port side by side; `DELTABLE` without family, name or handle flushes tables, so `nft flush ruleset` works)
 
 ## Responsibilities
 

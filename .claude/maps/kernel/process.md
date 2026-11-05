@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: guest timeouts and timer values saturate at `KTIME_MAX`; removed the long-sleep panic; orphans in a dying pid namespace go to the virtual init, removed the teardown hang)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: guest timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; the timer thread sends DNS stub answers; root files and module references corrected)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@
 
 Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`, the
 `wake` module), `cell.rs`, `syscall/proc.rs`, `syscall/fast.rs`, `futex.rs`, `loader.rs`,
-`machine.rs` (timer thread, boot/shutdown, host-facing calls), `itimer.rs`, `posix_timer.rs` and
+`machine.rs` (timer thread, boot/shutdown, host-facing calls), `itimer.rs`,
 `syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `pidns.rs`, `nsproxy.rs`,
 `syscall/ns.rs`, and `UserNs` in `cred.rs`.
 
@@ -393,8 +393,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `engine`: `Cpu::new`/`run`/`step`/`reset`, `Dbt::attach`/`run`, `Kicker`, `guest_hwcap`.
 - `kernel/mm`: `fork`, `quiesce`, users, `futex_key`, `translate`, layout and mapping calls used by
   the loader, `defer_unmaps`/`release_unmapped`/`spare::refill`.
-- vfs (resolution, mount flags, store, `copy_ns`), credentials, cgroups, SysV IPC, AIO, OOM,
-  loadavg, the store's deferred commits.
+- vfs (resolution, mount flags, store, `copy_ns`), credentials, cgroups, SysV IPC
+  (`kernel/ipc`), AIO (`kernel/vfs`), the OOM killer (`kernel/mm`), loadavg, the store's deferred
+  commits.
 - `appine_hal`: `poll`, `Event`, thread CPU clocks, host thread nice/affinity/ioprio, host CPUs,
   random bytes; `std::thread`, `std::sync::Mutex`.
 

@@ -5,9 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: timeouts saturate at `KTIME_MAX`; removed the huge-timeout panic)
->
-> Maintained: 2026-11-05 (targeted verification: pselect6 clamps `nfds` to the fd table size, counts only events in the sets, reports `POLLNVAL` in all three; removed the early-return bug)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6 clamps `nfds`, counts only events in the sets and reports `POLLNVAL` in all three; module references)
 
 ## Responsibilities
 
@@ -25,8 +23,8 @@ Root: `core/kernel/src/syscall/poll.rs`.
 Outside the module: the wait mechanism, wake objects, the BKL and the timer thread (`kernel/process`);
 per-kind readiness of sockets (`kernel/net`, `kernel/unix`), terminals (`kernel/tty`), pipes,
 inotify, timerfd and eventfd objects (`kernel/vfs`), signalfd (`kernel/signal`), message queues
-and seccomp notify (not yet mapped); fcntl and ioctl entry points (`kernel/vfs`); signal delivery
-(`kernel/signal`).
+(`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl entry points (`kernel/vfs`);
+signal delivery (`kernel/signal`).
 
 ## Key types
 

@@ -5,9 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty, `TIOCNOTTY` on a master is `ENOTTY`)
->
-> Maintained: 2026-11-05 (targeted verification: `TIOCSTI` needs the controlling terminal or `CAP_SYS_ADMIN`, and on a master feeds the master's reads; removed the bug)
+> Maintained: 2026-11-05 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty and `TIOCNOTTY` there is `ENOTTY`; `TIOCSTI` needs the controlling terminal or `CAP_SYS_ADMIN`, and on a master feeds its reads)
 
 ## Responsibilities
 

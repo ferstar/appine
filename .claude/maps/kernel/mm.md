@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: `MADV_WIPEONFORK`/`MADV_DONTFORK` honoured at fork, flags kept by fork and mremap growth, madvise judges only overlapping VMAs; removed those bugs)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` honoured at fork and kept by fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer added, 5 claims checked by 1 verifier)
 
 ## Responsibilities
 
@@ -18,7 +18,9 @@ address layer), but it implements Linux mm semantics for every guest process:
 - demand population of page-table entries and the guest page-fault policy;
 - multi-thread consistency (TLB shootdown) and the code-change log that Tier 1 translations consume;
 - `fork` with page-granular copy-on-write implemented only in the soft page tables;
-- read-only views for procfs, core dumps, rusage, cgroups and the OOM killer.
+- read-only views for procfs, core dumps, rusage, cgroups and the OOM killer;
+- the OOM killer, which keeps the app under a memory limit by ending guest processes, and the
+  periodic release of Tier 1 code written through the writable view.
 
 Root:
 
@@ -31,11 +33,13 @@ Root:
   Tier 0 refill.
 - The page-fault branch of the task run loop in `core/kernel/src/task.rs`, and the stack-growth
   helpers on `Cx` in `core/kernel/src/kernel.rs`.
+- `core/kernel/src/oom.rs` — the OOM killer and the release of written code views, run from the
+  timer thread.
 
 Outside the module (dependencies only): the CPU engine and the Tier 1 translator (`dbt.c`,
-including its inline TLB fast path and refill), the OOM policy (`oom.rs`), SysV IPC (`ipc.rs`),
-futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host abstraction layer
-(`core/hal`).
+including its inline TLB fast path and refill), SysV IPC objects (`kernel/ipc`), futexes, the ELF
+loader, the timer thread (`kernel/process`), procfs and the cgroup files (`kernel/procfs`), core
+dumps and the host abstraction layer (`core/hal`).
 
 ## Key types
 
@@ -116,6 +120,16 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
   residency.
 - `DumpRegion`, `dump_filter` — core-dump segments and the `coredump_filter` bits (default `0x33`).
 
+### OOM killer
+
+- `Oom` (`Kernel::oom`) — the app-wide limit (`u64::MAX` is none), the root's peak, the next check
+  deadline (`None` while every task sleeps), the last victim and when it was picked, and the next
+  code-view release.
+- `Events` — a cgroup's `memory.events` counters (`max`, `oom`, `oom_kill`, `oom_group_kill`),
+  kept hierarchical and local.
+- Intervals: 20 ms, 5 ms above 3/4 of a limit, at least 20 times the measurement's own time; 1 s
+  victim timeout and code-view interval.
+
 ## Public entry points
 
 - **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `munmap`, `mprotect`, `mremap` (including
@@ -142,6 +156,9 @@ futexes, the ELF loader, procfs (`pseudo.rs`), core dumps, cgroups and the host 
 - **BKL hooks**: `defer_unmaps` when the BKL is taken; `release_unmapped`, then `spare::refill`
   when it is released.
 - **Machine**: `FileMaps::clear` from `Machine::trim_memory`.
+- **OOM killer**: `oom::check` and `oom::unmap_code_views` (timer thread), `out_of_memory` (also
+  from a lowered cgroup `memory.max`), `Oom::{measure, recheck}`, `default_limit`, `app_memory`;
+  `Shared::resume_checks` from the run loop.
 
 ## Data flow / lifecycle
 
@@ -381,6 +398,50 @@ signals may still be delivered).
 - `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP`; the core-dump writer leaves holes
   where `residency` reports pages absent.
 
+### OOM killer
+
+- All guest memory is host memory of the one app process, and Android's low-memory killer would end
+  the whole app, so the OOM killer keeps the app under its own limit by ending guest processes.
+  Guest accesses to host-backed pages never reach the kernel layer, so it polls.
+- The limit is set once at start from `MachineOptions.memory_limit` (the CLI's `--memory-limit`,
+  `none` for no limit; the Android host passes none, meaning half of the host's total RAM, or no
+  limit if that reads 0). The guest cannot change it (the root's `memory.max` is `EPERM`); the
+  kernel turns it off for good if the usage cannot be read or the check panics.
+- The root (whole-app) usage is the app process's host RssAnon + RssShmem + VmSwap (VmRSS and no
+  shmem on kernels without RssAnon), minus Tier 1 code written through the writable view and not
+  yet unmapped: it includes translations and kernel-layer metadata and excludes host file pages.
+  A child cgroup with a numeric `memory.max` uses the sum of its processes' `resident_pages`.
+- `check` runs under the BKL each time the timer thread wakes. With no root limit and no cgroup
+  limit it does nothing; otherwise it measures every 20 ms, every 5 ms once a scope is above 3/4 of
+  its limit, and never more often than 20 times the measurement's own time. The root is measured
+  first and cgroups stop at the first scope over its limit, so one scope is handled per round. A
+  `memory.max` write forces an immediate round.
+- When every task is sleeping, `check` sets `checks_idle` and stops; every guest thread calls
+  `resume_checks` at the top of each run-loop iteration, which signals the timer thread if the flag
+  was set.
+- An over-limit round is skipped while `UNMAPPING` is nonzero or the last victim, picked under 1 s
+  ago, still has threads; otherwise it records a `max` event and calls `out_of_memory`. Lowering a
+  child's `memory.max` below its usage calls `out_of_memory` once at once, without a `max` event.
+- `select` considers every process except tgid 1 (the built-in init), `oom_score_adj` -1000,
+  processes outside the over-limit cgroup, zombies, and the last victim while it is still recorded
+  and has outlived its second. The score is `max(1, resident_pages + adj * total / 1000)` with
+  `total` the larger of RAM and the limit for the root, the cgroup's limit otherwise; a strictly
+  greater score wins, so ties go to the lowest tgid. With no eligible process nothing is killed or
+  logged.
+- The kill records `oom` on the domain and the victim; a victim already exiting is only waited for.
+  Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and ancestors count `oom_kill`, host
+  stderr gets a line, the kernel log gets Linux's memcg lines (`memory: usage …`,
+  `oom-kill:constraint=CONSTRAINT_MEMCG,…`, `Memory cgroup out of memory: Killed process …`; the
+  app-wide limit appears as a memcg OOM), and the app gets a `KillReason::OutOfMemory` report. With
+  `memory.oom.group` on the victim's cgroup or an ancestor up to the domain, every other live
+  process of the topmost such cgroup except init and -1000 ones is killed too; the victim is logged
+  and counted twice, as Linux's `mem_cgroup_scan_tasks` does.
+- `unmap_code_views` runs on the timer thread whether or not there is a limit: at once after a
+  resume from idle, then once a second while any task runs, and once more when everything is idle,
+  it calls `appine_engine::unmap_written_code`, because translation-cache pages written through the
+  writable W^X view count twice in RssShmem. It is timed rather than continuous because each unmap
+  makes the next write to every such page fault again.
+
 ## Dependencies (inbound / outbound)
 
 ### Inbound
@@ -392,8 +453,11 @@ signals may still be delivered).
 - Loader (`loader.rs`), ptrace (`write_force`), futexes (`futex_key`, `translate`, `shared_files`
   on the fast path), membarrier (`quiesce`), SysV IPC, `syscall/fs.rs` (truncation, `ETXTBSY` via
   `exe`, seals).
-- Observers: procfs (`pseudo.rs`), core dumps, rusage, cgroups, the OOM killer.
-- `Machine` (initial `FileMaps`, `trim_memory`).
+- Observers: procfs (`pseudo.rs`), core dumps, rusage, cgroups.
+- `Machine` (initial `FileMaps`, `trim_memory`, the memory limit at start).
+- OOM killer: the timer thread (`check`, `unmap_code_views`), the run loop (`resume_checks`), the
+  cgroup files (`measure`, `limit`, peak, `app_memory`, `Events`, `out_of_memory` for a lowered
+  `memory.max`), and the write path's `recheck`.
 
 ### Outbound
 
@@ -403,6 +467,10 @@ signals may still be delivered).
   `fstat`, `msync`, `mincore`-based residency, pagemap reads (`touched_pages`), `ram_and_swap`,
   `page_size`.
 - vfs (file kinds, mount flags, seals), credentials (`CAP_IPC_LOCK`), rlimits.
+- OOM killer: `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`),
+  `appine_engine` (`written_code_bytes`, `unmap_written_code`), cgroups (`memory_limits`,
+  `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
+  and kill reports (`bug::record_kill`).
 - The Tier 1 translator depends on the page-table geometry, the PTE bit layout, the TLB entry
   layout and offsets, `tlb_used`, and the watchpoint count.
 
@@ -441,6 +509,12 @@ signals may still be delivered).
 - Host `mincore` reports pages swapped to zram as absent, which is why fork's touched-page check
   reads pagemap instead; RSS, smaps, mincore(2) and core-dump holes still use mincore.
 - Page-table memory only grows over an address space's lifetime.
+- The OOM killer uses two measures: the root counts the whole app process (translations, metadata,
+  swap, no file pages), while cgroups and victim scores count guest resident pages (file pages
+  included, swap excluded, shared pages once per process).
+- The OOM killer polls, so a process that allocates and exits within one interval is never seen,
+  and under Tier 1 a guest can touch gigabytes between polls: the limit needs headroom.
+- `failcnt` in the OOM log is the domain's hierarchical `max` count, including its descendants'.
 
 ## Confirmed bugs / technical debt
 
@@ -473,6 +547,18 @@ signals may still be delivered).
   would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
   loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
   and the guard's comment cites a path (`recall`) that never reaches it.
+- **OOM checks can stop for about a second:** `check` (like the code-view release and load-average
+  sampling) reads "every task sleeping" and sets `checks_idle` in two steps, while a thread waking
+  from a no-BKL fast-path sleep clears its flag and tests `checks_idle` without the BKL, so the
+  waker can miss the store; checks then stay off until the next code-view round (up to 1 s), the
+  next engine exit of any thread or another timer event, and the relaxed atomics leave the outage
+  unbounded in theory on weak-memory hosts. A thread touching already-mapped memory without
+  syscalls makes no engine exit.
+- **OOM victim choice differs from Linux and can stall:** scores omit swap and page tables, so a
+  mostly swapped-out process ranks low although the root counts VmSwap; negative scores clamp to 1
+  and ties go to the lowest tgid (Linux 6.1 compares raw scores and lets a later equal one win). A
+  victim that outlived its second is skipped only until another is recorded; picked again, it is
+  only waited for, so the killer stalls another second without killing.
 
 ## Open questions
 
@@ -486,6 +572,9 @@ signals may still be delivered).
 - Is the window in `mmap` between installing entries and `note_shared_files` acceptable for a
   concurrent fast-path futex on a writable shared file page?
 - `statm` reports data = rss while `status` reports VmData = VmSize; is the mismatch intentional?
+- A kill frees no Tier 1 translations kept in the translator's pool or shared through code groups,
+  and the OOM killer never trims the pool; is that acceptable when translations dominate the root
+  usage?
 
 ## To verify
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: NOPASSWD rules fail closed and are refreshed at root logins too; admins recorded only once in the group and matched literally; mirrors recorded only after writing; downloads stopped past the pinned length; four bugs removed or narrowed)
+> Maintained: 2026-11-04 (targeted verification only since the full mapping: NOPASSWD rules fail closed and are refreshed at root logins; admins recorded once and matched literally; mirrors recorded only after writing; downloads stop past the pinned length)
 
 ## Responsibilities
 

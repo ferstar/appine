@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: chown of set-id files needs the owner or `CAP_FOWNER`, and clears setgid as 6.2's `setattr_should_drop_sgid`; removed the set-id stripping bug)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; chown of set-id files as in 6.2; native AIO added, 5 claims checked by 1 verifier; module references)
 
 ## Responsibilities
 
@@ -22,17 +22,18 @@ inode store and the synthetic filesystems). It provides:
   mkdir/mknod/unlink/rename/link/symlink, getdents64, getcwd/chdir) and extended attributes;
 - in-memory pipes and FIFOs, advisory locks (`flock`, POSIX, OFD) and leases, character-device
   nodes and their in-process implementations, eventfd/timerfd objects;
-- inotify, including replaying changes made by the Android Files app.
+- inotify, including replaying changes made by the Android Files app;
+- native AIO (`io_setup` to `io_pgetevents`), with I/O done at submit and pending polls.
 
 Root: `core/kernel/src/vfs/mod.rs`, `vfs/dev.rs`, `fd.rs`, `pipe.rs`, `locks.rs`,
 `syscall/fs.rs`, `syscall/mount.rs`, `syscall/xattr.rs`, `syscall/lease.rs`,
-`syscall/inotify.rs`, `syscall/timerfd.rs`.
+`syscall/inotify.rs`, `syscall/timerfd.rs`, `syscall/aio.rs`.
 
 Outside the module: the store's own semantics (`kernel/store`), procfs/sysfs/cgroup2/devpts
-content (`kernel/procfs`), terminals (`kernel/tty`), sockets, poll/epoll and the eventfd syscalls
-(`kernel/net`), the BKL, the no-BKL fast path and the namespace mechanism
-(`kernel/process`), credentials and file capabilities at exec (credentials module, not yet
-mapped).
+content (`kernel/procfs`), terminals (`kernel/tty`), sockets (`kernel/net`, `kernel/unix`),
+poll/epoll and the eventfd syscalls (`kernel/poll`), the message queues behind the mqueue
+filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mechanism
+(`kernel/process`), credentials and file capabilities at exec (`kernel/cred`).
 
 ## Key types
 
@@ -68,6 +69,9 @@ mapped).
 - `Device` — Null, Zero, Full, Random, Kmsg (tty, ptmx and pts are routed separately).
 - `EventFd`, `TimerFd`.
 - `Inotify`, `Event`, `Registry` (one per kernel, watches keyed by store inode), `Opened`.
+- `AioContext` — one io_setup context: its capacity `nr`, completed `io_event`s, pending polls and
+  the `dead` mark set by io_destroy; held by the thread group (`ThreadGroup::aio`), keyed by its id.
+  `Kernel::aio_nr`/`aio_max_nr` back `fs.aio-nr` and `fs.aio-max-nr`.
 
 ## Public entry points
 
@@ -91,6 +95,8 @@ mapped).
 - **inotify**: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, read; hooks `active`,
   `path_event`, `file_event`, `dir_event`, `cookie`, `opened`, `renamed`, `deleted`,
   `watched_parent`; `host_change`.
+- **AIO**: `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents`;
+  `aio_released` (execve, group exit).
 - **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps),
   `FdTable::with_host_stdio` (boot).
 
@@ -393,7 +399,7 @@ mapped).
 ### eventfd and timerfd
 
 - eventfd: counter or semaphore mode; writing `u64::MAX` is `EINVAL`; overflow blocks; every
-  read/write wakes the object (the syscalls live in `kernel/net`'s poll code).
+  read/write wakes the object (the syscalls live in `kernel/poll`).
 - timerfd: realtime, monotonic, boottime and the alarm clocks; absolute times are converted once
   at settime; settime resets the expiration count; `TFD_TIMER_CANCEL_ON_SET` is accepted but never
   yields `ECANCELED`.
@@ -425,15 +431,47 @@ mapped).
 - read returns whole events (`EINVAL` if the first does not fit), blocks unless nonblocking;
   `FIONREAD`, poll readiness and fdinfo read the instance. No fanotify (`ENOSYS`), no dnotify.
 
+### Native AIO
+
+- A context's id is the guest address of a 4096-byte read-only anonymous page that io_setup maps
+  whatever `nr` is. The page never holds a ring header, so libaio's user-space ring check fails and
+  it always makes the syscall. Contexts belong to the thread group: a non-thread child (fork, vfork,
+  `CLONE_VM` without `CLONE_THREAD`) starts with none; execve and the last thread's exit release
+  them.
+- io_setup: `*ctxp` must be 0 and `nr` from 1 to `0x1000_0000 / 32` (`EINVAL`); each context
+  charges `2 * nr` to `aio-nr` against `aio-max-nr` (65536; `EAGAIN`).
+- io_submit, per iocb: `aio_reserved2` must be 0; the fd must exist (`EBADF`), and with
+  `IOCB_FLAG_RESFD` the resfd must be an eventfd; reads need a readable file and writes a writable
+  one (`EBADF`); unknown `aio_rw_flags` are `EOPNOTSUPP` and unknown opcodes `EINVAL`; a context
+  whose queued events and pending polls reach `nr` is `EAGAIN`. The first failure is returned when
+  nothing was submitted, otherwise the count so far.
+- PREAD, PWRITE, PREADV, PWRITEV, FSYNC and FDSYNC run synchronously inside io_submit through the
+  regular read, write, vectored and fsync paths (blocking pipe or socket I/O blocks io_submit), and
+  their result or negative errno is queued at once. `aio_offset` is used only for positional files;
+  `RWF_NOWAIT` and `RWF_APPEND` are set temporarily as `O_NONBLOCK`/`O_APPEND` on the shared open
+  file.
+- `IOCB_CMD_POLL` completes at once when ready; otherwise it stays pending and is checked only by
+  io_getevents and io_pgetevents on that context (one-shot, reporting every ready bit). The resfd
+  eventfd, kept as an fd number and looked up again, is signalled when an event is queued.
+- io_getevents and io_pgetevents (`min_nr <= nr`, relative timeout, optional temporary sigmask):
+  complete ready polls, then return once `max(min_nr, 1)` events are queued, `min_nr` is 0 or the
+  deadline has passed; a destroyed context returns what is queued, else `EINVAL`; a signal is
+  `EINTR`; otherwise wait for any kernel wake. Events are removed before they are copied out.
+- io_cancel can cancel only a pending poll (an event with result 0, then `EINPROGRESS`); everything
+  else has already completed (`EINVAL`). io_destroy marks the context dead, drops pending polls
+  without events, releases the charge, unmaps the page and wakes waiters, which take what is
+  queued; it does not wait for a submit still blocked in I/O.
+
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
 - The syscall dispatcher; `kernel/process` (clone/unshare/setns, execve's fd-table handling and
-  mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver); `kernel/mm` (mmap
-  `PROT_EXEC` on noexec); `kernel/procfs` (mountinfo, fd links, fdinfo, sysctls for pipes, leases,
-  inotify and `protected_*`); `kernel/net` (AF_UNIX bind creating store nodes, poll/epoll reading
-  open files, eventfd syscalls); the machine (boot, `store_changed` for inotify); core dumps.
+  mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver, AIO release at execve
+  and exit); `kernel/mm` (mmap `PROT_EXEC` on noexec); `kernel/procfs` (mountinfo, fd links,
+  fdinfo, sysctls for pipes, leases, inotify, AIO and `protected_*`); `kernel/unix` (AF_UNIX bind
+  creating store nodes); `kernel/poll` (poll/epoll reading open files, eventfd syscalls);
+  `kernel/ipc` (queue fds, `mq_dev`); the machine (boot, `store_changed` for inotify); core dumps.
 
 ### Outbound
 
@@ -443,7 +481,8 @@ mapped).
   (`permission`, `owns`, `capable_wrt`, `new_owner`, `FileCaps`); `appine_hal` (pread, pwrite,
   poll, lseek, fsync, `copy_file`, `statvfs`, `memory_info`, `fill_random`); the kernel's wake
   objects and `Cx::unlocked`; signals (`SIGPIPE`, `SIGIO`, `F_SETSIG`); `bpf::check_device`;
-  `mqueue`; `cgroup`; `pidns`/`nsproxy`.
+  `kernel/ipc` (mqueue objects); `cgroup`; `pidns`/`nsproxy`; for AIO, `kernel/poll` (`poll_once`,
+  the temporary sigmask) and `kernel/mm` (the context page).
 
 ## Invariants and gotchas
 
@@ -463,6 +502,9 @@ mapped).
   any other code that moves the position must take `pos_busy` or accept being overwritten.
 - `Node` comparisons in pivot_root's root/cwd rewrite include the mount id, so only tasks in the
   same mount namespace are moved.
+- AIO contexts belong to the thread group, not the address space, so a `CLONE_VM` child cannot use
+  its parent's contexts (Linux keeps them per mm). The capacity check runs before I/O that may
+  release the BKL, so concurrent submitters can exceed `nr`.
 
 ## Confirmed bugs / technical debt
 
@@ -502,6 +544,23 @@ mapped).
 - **Small inotify leaks and ordering:** a delayed delete-self entry is never removed if every
   watch disappears before the last close; an event identical to the last one is merged even when
   the queue is full, where Linux queues `IN_Q_OVERFLOW`.
+- **Pending AIO polls complete late or never:** a pending `IOCB_CMD_POLL` is checked only inside
+  io_getevents on its context, so its resfd eventfd is not signalled until some thread calls it
+  (the poll iocb, resfd and epoll pattern never fires); and io_getevents waits for kernel wakes
+  only, with no host fds or timerfd deadlines, so a poll on an inet socket, a host fd or a timerfd
+  is noticed only on an unrelated wake or the timeout, and without a timeout it may block forever.
+  The resfd is an fd number looked up at completion, so a closed or reused fd loses the signal or
+  sends it to another eventfd; io_cancel's event signals nothing.
+- **AIO writes ignore append and sync flags:** PWRITE and PWRITEV on a regular file write at
+  `aio_offset` even with `RWF_APPEND` or an `O_APPEND` file, `RWF_DSYNC`/`RWF_SYNC` never sync
+  (only the file's own `O_DSYNC`/`O_SYNC` do), and a negative offset is not rejected but cast and
+  failed later.
+- **AIO results leak restart codes and can be lost:** an interrupted blocking read or write inside
+  io_submit stores `-ERESTARTSYS` (-512) in `io_event.res` instead of `-EINTR`, and io_getevents
+  drops the events it took when copying them out faults (Linux leaves them in the ring).
+- **`aio-nr` counts twice `nr`:** each context charges and reports `2 * nr`, as Linux did before
+  4.12; 6.1 charges `nr`, so only half as many events fit under `aio-max-nr` and `aio-nr` reads
+  double.
 - **Fidelity gaps:** statx never reports btime, `stx_mnt_id` or attributes; no
   `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
   fallocate writes zeros); `TFD_TIMER_CANCEL_ON_SET` never cancels; `RLIMIT_NOFILE` set by prlimit
@@ -529,3 +588,7 @@ mapped).
   `/proc/<pid>/cwd` return for a deleted cwd (Linux shows ` (deleted)`).
 - inotify's per-hook ordering against every Linux fsnotify call site (only spot-checked; the
   differential test `inotify` covers the common sequences).
+- The Linux 6.1 AIO behaviour the AIO bugs compare against (completion from the poll wake-up,
+  `aio_rw_done`'s `EINTR`, the ring head on a failed copy, `IOCB_APPEND` and the sync flags, `nr`
+  charged to `aio-nr` since 4.12) comes from upstream knowledge: no Linux source is in the
+  repository.
