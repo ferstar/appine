@@ -53,8 +53,7 @@ libghostty-vt with Zig (`android/native`).
 ### The terminal
 
 - `VtSession` — a tab owned by the service: its `ConsolePty`, the terminal handle (0 until the
-  shell starts), the name the user gave it (`name`, null when none), the view showing it (`view`,
-  read on the pump thread), pending restored text and
+  shell starts), the view showing it (`view`, read on the pump thread), pending restored text and
   messages, a `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer`
   executor; `Events` (title changed, finished) go to the service.
 - `VtView` — the view: the attached `VtSession`, cell metrics, a mirror of the screen (codepoint,
@@ -282,7 +281,7 @@ libghostty-vt with Zig (`android/native`).
 ### Inbound
 
 - `TerminalService` (creates and holds the `VtSession`s: `showMessage`, `setRestored`,
-  `transcriptText`, `name`, `release`; listener callbacks); `SettingsActivity` (licenses).
+  `transcriptText`, `release`; listener callbacks); `SettingsActivity` (licenses).
 
 ### Outbound
 

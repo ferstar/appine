@@ -68,12 +68,6 @@ internal class VtSession(
     /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
     val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
 
-    /**
-     * The name the user gave the tab ([TerminalService.renameSession]), shown instead of [title];
-     * null when none. Saved and restored with the tab.
-     */
-    var name: String? = null
-
     /** True until the shell has exited (also before it starts). */
     val isRunning: Boolean get() = exit == null
 

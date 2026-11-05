@@ -579,16 +579,6 @@ class TerminalService : Service() {
         sessionsChanged()
     }
 
-    /**
-     * Names a tab ([VtSession.name]); a blank [name] clears it, so the program's title shows again.
-     * Saved with the tabs soon after.
-     */
-    internal fun renameSession(session: VtSession, name: String) {
-        if (session !in sessions) return
-        session.name = name.trim().takeIf { it.isNotEmpty() }
-        sessionsChanged()
-    }
-
     private fun sessionsChanged() {
         updateNotification()
         each { it.onSessionsChanged() }
@@ -606,7 +596,6 @@ class TerminalService : Service() {
         val notice = "\u001b[33m[appine] " + getString(R.string.restored_notice, time) + "\u001b[0m\r\n\r\n"
         for (tab in saved.tabs) {
             val session = createSession(tab.login, tab.cwd)
-            session.name = tab.name
             val body = tab.transcript.trimEnd().replace("\r\n", "\n").replace("\n", "\r\n")
             session.setRestored(((if (body.isEmpty()) "" else body + "\r\n") + notice).toByteArray())
             unshown[session] = tab
@@ -629,7 +618,7 @@ class TerminalService : Service() {
             // A restored tab not shown yet: its shell has not started, so save the original copy
             val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
             // The directory is filled in on the worker
-            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty(), s.name)
+            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty())
         }
         val index = live.indexOf(current).coerceAtLeast(0)
         runCatching {

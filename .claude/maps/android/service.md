@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: "exit all" during a start, restart or replace finished by them; wake lock over starts and transitions; downloads finishing during a restart kept; failed starts shown and the service stopped without UI; saved tabs kept until restored and transcripts named by content; ended tabs not counted; kill notification ids and visibility; eight bugs removed)
+> Maintained: 2026-11-05 (targeted verification: "exit all" during a start, restart or replace finished by them; wake lock over starts and transitions; downloads finishing during a restart kept; failed starts shown and the service stopped without UI; saved tabs kept until restored and transcripts named by content; ended tabs not counted; kill notification ids and visibility; eight bugs removed; tab names and `renameSession` removed with renaming in the terminal)
 
 ## Responsibilities
 
@@ -47,15 +47,14 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`).
 - `Tabs` — the `files/tabs/` store: `running` marker, `index.json`, transcripts named by content
   (`t-<128-bit SHA-256 prefix>.txt`; earlier versions wrote `t<i>.txt`, still read); `Tab(login,
-  cwd, transcript, name)`, `Saved(tabs, current, time)`.
+  cwd, transcript)`, `Saved(tabs, current, time)`.
 - Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s.
 
 ## Public entry points
 
 - Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
   `START_NOT_STICKY`), `onTrimMemory`, `onDestroy`.
-- Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`,
-  `renameSession`, `exitAll`,
+- Called by activities: `addListener`/`removeListener`, `createSession`/`removeSession`, `exitAll`,
   `setTier` (ignored in a release build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setMirror`/`autoMirror`, `setLogin`, `setSystemDocuments`, `setFillWide`, `takeNotice`.
 - Static settings read without the service: `login()` and `showSystemDocuments()` by `Documents`,
@@ -129,21 +128,20 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `createSession(login, cwd)` builds a `ConsolePty` and a `VtSession`; the shell starts when a
   view first knows its size. Sessions report title changes and ends, which become
-  `onSessionsChanged`. `removeSession` releases the session. `renameSession` sets the tab's name
-  (`VtSession.name`; trimmed, blank clears it) and reports it like an opened or closed tab.
-- Saving (`saveTabs`): for running sessions only, the login setting, the name and the transcript
+  `onSessionsChanged`. `removeSession` releases the session.
+- Saving (`saveTabs`): for running sessions only, the login setting and the transcript
   (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread and the foreground
   group's cwd (`consoleCwd` of the session's console) on the worker; unshown restored tabs keep
-  their saved transcript and cwd; the name is an optional key of `index.json`, absent in tabs
-  saved before tabs had names. Files are written temp-then-rename; a transcript's name is its
+  their saved transcript and cwd; a `name` key in an index from versions that could rename tabs
+  is ignored. Files are written temp-then-rename; a transcript's name is its
   content digest, so unchanged ones are not rewritten, the index is skipped when unchanged, and
   transcripts no index names any more are deleted only after the index is replaced (a kill at any
-  point leaves a consistent set). Triggers: every 60 s, 2 s after a tab opens, closes, is renamed
-  or its shell ends, when the last listener leaves, on memory trim.
+  point leaves a consistent set). Triggers: every 60 s, 2 s after a tab opens, closes or its shell
+  ends, when the last listener leaves, on memory trim.
 - The `running` marker is written after a successful start and removed (with saved tabs) on a
   normal exit; `takeKilled` loads the tabs when it is present at service creation and leaves the
   marker and files alone, so a second kill (or a failed start) before the kernel is up keeps them.
-- Restore: each saved tab reopens with its saved login setting, cwd and name, preceded by its old
+- Restore: each saved tab reopens with its saved login setting and cwd, preceded by its old
   transcript and a yellow notice with the save time; the saved current tab is focused.
 
 ### Reports and notifications

@@ -28,9 +28,9 @@ internal object Tabs {
 
     /**
      * A tab: the login account ([ConsolePty]'s `login`), the foreground process's current directory
-     * (null when unavailable), the transcript, and the name the user gave it (null when none).
+     * (null when unavailable) and the transcript.
      */
-    data class Tab(val login: String, val cwd: String?, val transcript: String, val name: String?)
+    data class Tab(val login: String, val cwd: String?, val transcript: String)
 
     /** The saved tabs, which one is current, and when they were saved (ms). */
     data class Saved(val tabs: List<Tab>, val current: Int, val time: Long)
@@ -68,13 +68,8 @@ internal object Tabs {
         val tabs = (0 until list.length()).map { i ->
             val t = list.getJSONObject(i)
             val transcript = File(dir(context), t.getString("transcript")).takeIf { it.isFile }?.readText().orEmpty()
-            Tab(
-                t.getString("login"),
-                t.optString("cwd").takeIf { it.isNotEmpty() },
-                transcript,
-                // Absent in tabs saved before tabs had names
-                t.optString("name").takeIf { it.isNotEmpty() },
-            )
+            // A "name" key, from versions that could rename tabs, is ignored
+            Tab(t.getString("login"), t.optString("cwd").takeIf { it.isNotEmpty() }, transcript)
         }
         return Saved(tabs, json.optInt("current"), json.optLong("time"))
     }
@@ -104,10 +99,7 @@ internal object Tabs {
                 // Unchanged since the last save: the file with this content is already there
                 if (name !in names && !File(dir, name).isFile) replace(File(dir, name), text)
                 names.add(name)
-                entries.put(
-                    JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name)
-                        .apply { tab.name?.let { put("name", it) } },
-                )
+                entries.put(JSONObject().put("login", tab.login).put("cwd", tab.cwd ?: "").put("transcript", name))
             }
             // The index carries the save time: not rewritten when the transcripts, the layout and
             // the current directories are all unchanged
