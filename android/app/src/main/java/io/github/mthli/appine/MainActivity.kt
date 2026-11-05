@@ -690,6 +690,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         override val ctrl: Boolean get() = keys.ctrl
         override val alt: Boolean get() = keys.alt
+        override val shift: Boolean get() = keys.shift
 
         override fun modifiersUsed() = keys.modifiersUsed()
     }

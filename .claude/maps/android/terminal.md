@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity)
+> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed)
 
 ## Responsibilities
 
@@ -39,9 +39,10 @@ libghostty-vt with Zig (`android/native`).
   `list_tab.xml`); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
-  `|`, PGUP; TAB, CTRL, ALT, ←, ↓, →, `~`, PGDN): the first seven columns in a
-  `HorizontalScrollView`, the last (PGUP, PGDN) fixed beside it; keeps CTRL and ALT (one-shot or
-  locked) and sends keys and text to a `Target`; `Press` handles the touch on one key.
+  `|`, a blank cell; TAB, CTRL, ALT, ←, ↓, →, `~`, SHIFT): the first seven columns in a
+  `HorizontalScrollView`, the last (the blank cell over SHIFT) fixed beside it; keeps CTRL, ALT
+  and SHIFT (one-shot or locked) and sends keys and text to a `Target`; `Press` handles the touch
+  on one key.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
   until started.
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
@@ -59,7 +60,7 @@ libghostty-vt with Zig (`android/native`).
   colours, attributes, grapheme clusters per cell, each row's selected columns), a backing bitmap
   of the grid, the modes and selection bounds of the last frame, the IME connection, gestures,
   selection handles and the floating menu. `Host` (the activity): `onGrid`, `onInput`, `onZoom`,
-  the extra keys' `ctrl`, `alt` and `modifiersUsed`.
+  the extra keys' `ctrl`, `alt`, `shift` and `modifiersUsed`.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
@@ -132,18 +133,17 @@ libghostty-vt with Zig (`android/native`).
   45 dp (the last one takes the pixels left over), so they all fit from 360 dp on. Narrower, the
   first seven columns of both rows scroll sideways together under the finger, while the last stays
   at the right edge; a sideways slide past the touch slop then scrolls and cancels the key it
-  started on, unless that key is already held or showing its popup. With nothing to scroll the
+  started on, unless that key is already held. With nothing to scroll the
   keys keep every touch. Lines one pixel wide in the outline variant colour at half opacity run
   above each row, below the last one and between the columns, drawn over the keys (a pressed key's
   shading does not cover them); those of the first seven columns scroll with them.
 - A key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed (the highest surface container
-  colour, as is the popup). Held past the long-press
-  timeout, the arrows, PGUP and PGDN repeat every 80 ms (no act on release
-  then); swiping up from
-  `-` shows `|` in a popup right above it, sent on release (sliding back down sends `-`). CTRL and
-  ALT: a tap turns them on for the next key (primary colour) or off; a long press locks them on
-  (primary colour, underlined) until tapped, or turns them off. Keys go to `VtView.press` and `type`, which read the
+  colour); the blank cell above SHIFT takes no touch (no shading, no haptic). Held past the
+  long-press timeout, the arrows repeat every 80 ms (no act on release then); no key has a swipe
+  or popup. CTRL,
+  ALT and SHIFT: a tap turns them on for the next key (primary colour) or off; a long press locks
+  them on (primary colour, underlined) until tapped, or turns them off. Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
   leaves locked ones on.
 - The content is edge-to-edge with the root padded by system-bar and IME insets.
@@ -212,10 +212,14 @@ libghostty-vt with Zig (`android/native`).
 - Keys: mapped keys go through `VtNative.key`, which encodes them in the terminal's current modes
   (cursor and keypad modes, Kitty keyboard protocol, including releases from `onKeyUp` and lone
   modifiers, which are sent only when the encoder emits something); unmapped keys that type a
-  character without Ctrl or Alt are sent as text. CTRL and ALT on the extra keys apply to the
-  next key or one typed character (turned back into a key event), or to every one while locked.
-  The extra keys send presses only (a held key repeats as new presses), never releases.
-  Ctrl+Shift+C and V and the dedicated copy and paste keys copy and paste.
+  character without Ctrl or Alt are sent as text. CTRL, ALT and SHIFT on the extra keys apply to
+  the next key or one typed character (turned back into a key event through the virtual keyboard's
+  key map), or to every one while locked: they are added to the key event's meta state, so with
+  SHIFT a key types its shifted character in that map (`a` → `A`, `-` → `_`, `/` → `?`) and Tab
+  is sent as back-tab. A character the key map lacks (CJK) or a commit of several characters goes
+  as text and leaves them on. The extra keys send presses only (a held key repeats as new presses),
+  never releases. Ctrl+Shift+C and V (held, or from the extra keys) and the dedicated copy and
+  paste keys copy and paste.
 - Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom,
   then goes through the host to the tab's `vt-writer` thread (`Native.write`).
 - IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
@@ -301,7 +305,7 @@ libghostty-vt with Zig (`android/native`).
   protocol sees no release without a press.
 - A `HorizontalScrollView` takes any sideways slide past the touch slop even when it has nothing
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
-  scroll, and a held key or one showing its popup asks its parents not to intercept.
+  scroll, and a held key asks its parents not to intercept.
 - The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
   and the grid inside the scroll view are measured without a width limit, so they are forced to
   measure again whenever the column width changes.
@@ -359,7 +363,7 @@ libghostty-vt with Zig (`android/native`).
 ## Open questions
 
 - Should a Nerd Font or a CJK fallback font be bundled?
-- Should PGUP and PGDN, the fixed column of the extra keys, give way to other keys, and which?
+- Which key, if any, should take the blank cell above SHIFT?
 
 ## To verify
 

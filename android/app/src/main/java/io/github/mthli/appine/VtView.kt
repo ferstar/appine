@@ -77,9 +77,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         /** Pinch zoom changed the font size (pixels), to keep for next time. */
         fun onZoom(fontPx: Int)
 
-        /** The extra keys' one-shot Ctrl and Alt, which apply to the next key or character. */
+        /** The extra keys' one-shot Ctrl, Alt and Shift, which apply to the next key or character. */
         val ctrl: Boolean
         val alt: Boolean
+        val shift: Boolean
 
         /** The next key or character took the one-shot modifiers. */
         fun modifiersUsed()
@@ -725,7 +726,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /** Text from the input method or the extra keys; one character with a one-shot modifier is a key. */
     fun type(text: String) {
-        if ((host.ctrl || host.alt) && text.codePointCount(0, text.length) == 1) {
+        if ((host.ctrl || host.alt || host.shift) && text.codePointCount(0, text.length) == 1) {
             val events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(text.toCharArray())
             val down = events?.firstOrNull { it.action == KeyEvent.ACTION_DOWN && it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT }
             if (down != null && key(down)) return
@@ -754,7 +755,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Encodes a key press for the program; false for keys it does not take (Back, volume). */
     private fun key(event: KeyEvent): Boolean {
         if (tab == 0L || event.isSystem) return false
-        if (shortcut(event)) return true
         val key = VtKeys.of(event.keyCode)
         val action = if (event.repeatCount > 0) VtKeys.ACTION_REPEAT else VtKeys.ACTION_PRESS
         if (VtKeys.isModifier(event.keyCode)) {
@@ -764,11 +764,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             send(bytes)
             return true
         }
-        var mods = VtKeys.mods(event.metaState)
-        if (host.ctrl) mods = mods or VtKeys.MOD_CTRL
-        if (host.alt) mods = mods or VtKeys.MOD_ALT
-        val plain = event.getUnicodeChar(
-            event.metaState and (KeyEvent.META_CTRL_MASK or KeyEvent.META_ALT_MASK or KeyEvent.META_META_MASK).inv(),
+        // The extra keys' one-shot modifiers, as if held on a keyboard: with Shift a key types its
+        // shifted character, and with Ctrl and Shift C and V copy and paste
+        val extra = extraMeta()
+        val e = if (extra == 0) {
+            event
+        } else {
+            KeyEvent(
+                event.downTime, event.eventTime, event.action, event.keyCode, event.repeatCount,
+                event.metaState or extra, event.deviceId, event.scanCode, event.flags, event.source,
+            )
+        }
+        if (shortcut(e)) {
+            if (extra != 0) host.modifiersUsed()
+            return true
+        }
+        val mods = VtKeys.mods(e.metaState)
+        val plain = e.getUnicodeChar(
+            e.metaState and (KeyEvent.META_CTRL_MASK or KeyEvent.META_ALT_MASK or KeyEvent.META_META_MASK).inv(),
         )
         val text = if (plain >= 0x20 && plain != 0x7f && plain and KeyCharacterMap.COMBINING_ACCENT == 0) {
             String(Character.toChars(plain))
@@ -778,19 +791,29 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (key == 0) {
             if (text == null) return false
             if (mods and (VtKeys.MOD_CTRL or VtKeys.MOD_ALT) == 0) {
+                if (extra != 0) host.modifiersUsed()
                 input(text.toByteArray())
                 return true
             }
         }
-        val unshifted = event.getUnicodeChar(0)
+        val unshifted = e.getUnicodeChar(0)
         val consumed = if (mods and VtKeys.MOD_SHIFT != 0 && text != null && plain != unshifted) VtKeys.MOD_SHIFT else 0
         val bytes = VtNative.key(tab, key, mods, consumed, action, text, unshifted) ?: return true
-        if (host.ctrl || host.alt) host.modifiersUsed()
+        if (extra != 0) host.modifiersUsed()
         input(bytes)
         return true
     }
 
-    /** Copy and paste keys of hardware keyboards: Ctrl+Shift+C and V, and the dedicated keys. */
+    /** The meta state of the extra keys' one-shot modifiers that are on, 0 for none. */
+    private fun extraMeta(): Int {
+        var m = 0
+        if (host.shift) m = m or KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+        if (host.ctrl) m = m or KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+        if (host.alt) m = m or KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON
+        return m
+    }
+
+    /** Copy and paste keys: Ctrl+Shift+C and V (held, or from the extra keys) and the dedicated keys. */
     private fun shortcut(event: KeyEvent): Boolean {
         val both = event.isCtrlPressed && event.isShiftPressed
         return when {

@@ -15,7 +15,6 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
-import android.widget.PopupWindow
 import android.widget.TextView
 import com.google.android.material.color.MaterialColors
 import kotlin.math.max
@@ -23,21 +22,21 @@ import kotlin.math.roundToInt
 
 /**
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
- * widened to eight columns.
+ * widened to eight columns, with Shift in the last and a cell left blank above it.
  *
  * ```
- * ESC  /   -  HOME  ↑  END  |  │ PGUP
- * TAB CTRL ALT  ←   ↓   →   ~  │ PGDN
+ * ESC  /   -  HOME  ↑  END  |  │
+ * TAB CTRL ALT  ←   ↓   →   ~  │ SHIFT
  * ```
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
  * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
  * sideways beside it. Faint lines one pixel wide put each key in a cell of its own.
  *
- * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
- * PGUP or PGDN repeats it; swiping up from `-` sends `|` instead. Ctrl and Alt are one-shot
- * modifiers: tapped, they apply to the next key typed, which reads them ([ctrl], [alt]) and reports
- * taking them ([modifiersUsed]); held, they stay on until tapped again. The android/terminal map.
+ * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow
+ * repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply to the next key typed,
+ * which reads them ([ctrl], [alt], [shift]) and reports taking them ([modifiersUsed]); held, they
+ * stay on until tapped again. The android/terminal map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : LinearLayout(context) {
@@ -51,7 +50,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         fun text(text: String)
     }
 
-    /** Ctrl or Alt: on for the next key after a tap, [locked] on after a long press. */
+    /** Ctrl, Alt or Shift: on for the next key after a tap, [locked] on after a long press. */
     private class Modifier {
         var on = false
         var locked = false
@@ -59,19 +58,19 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }
 
     /**
-     * One key: its label, what it sends, whether holding it repeats, the key a swipe up sends
-     * instead, or the modifier it toggles.
+     * One key: its label, what it sends, whether holding it repeats, or the modifier it toggles.
      */
     private class Key(
         val label: String,
         val repeats: Boolean = false,
-        val popup: Key? = null,
         val modifier: Modifier? = null,
         val send: () -> Unit = {},
     )
 
     private val ctrlKey = Modifier()
     private val altKey = Modifier()
+    private val shiftKey = Modifier()
+    private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
 
     /** The first seven columns of both rows, and the keys in them (sized in [onMeasure]). */
     private val grid = object : LinearLayout(context) {
@@ -116,12 +115,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
+    val shift get() = shiftKey.on
 
     private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
     // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
-    // labels, a modifier that is on, a key while pressed and the popup above one
+    // labels, a modifier that is on and a key while pressed
     private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
     private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
@@ -141,12 +141,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         row(
             special("ESC", KeyEvent.KEYCODE_ESCAPE),
             char("/"),
-            char("-", popup = char("|")),
+            char("-"),
             special("HOME", KeyEvent.KEYCODE_MOVE_HOME),
             special("↑", KeyEvent.KEYCODE_DPAD_UP, repeats = true),
             special("END", KeyEvent.KEYCODE_MOVE_END),
             char("|"),
-            special("PGUP", KeyEvent.KEYCODE_PAGE_UP, repeats = true),
+            null,
         )
         row(
             special("TAB", KeyEvent.KEYCODE_TAB),
@@ -156,7 +156,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
             special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
             char("~"),
-            special("PGDN", KeyEvent.KEYCODE_PAGE_DOWN, repeats = true),
+            Key("SHIFT", modifier = shiftKey),
         )
         addView(scroll, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
         // Its width is set in onMeasure
@@ -188,7 +188,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     /** The next key or character took the one-shot modifiers; locked ones stay on. */
     fun modifiersUsed() {
         var changed = false
-        for (m in arrayOf(ctrlKey, altKey)) {
+        for (m in modifiers) {
             if (m.on && !m.locked) {
                 m.on = false
                 changed = true
@@ -210,10 +210,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }
 
-    private fun char(text: String, popup: Key? = null) = Key(text, popup = popup) { target.text(text) }
+    private fun char(text: String) = Key(text) { target.text(text) }
 
-    /** One row of [COLUMNS] keys: all but the last in the grid, the last in the fixed column. */
-    private fun row(vararg keys: Key) {
+    /**
+     * One row of [COLUMNS] keys: all but the last in the grid, the last in the fixed column; null
+     * leaves a blank cell.
+     */
+    private fun row(vararg keys: Key?) {
         check(keys.size == COLUMNS)
         val height = (ROW_DP * density).roundToInt()
         val row = LinearLayout(context).apply { orientation = HORIZONTAL }
@@ -227,11 +230,15 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         fixed.addView(keyView(keys.last()), LayoutParams(LayoutParams.MATCH_PARENT, height))
     }
 
+    /** The key's label, or for null a blank cell that takes no touch (no shading, no haptic). */
     @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
-    private fun keyView(key: Key) = label(key.label).also { view ->
-        key.modifier?.view = view
-        view.setOnClickListener { tap(key) }
-        view.setOnTouchListener(Press(key, view))
+    private fun keyView(key: Key?): View {
+        if (key == null) return View(context)
+        return label(key.label).also { view ->
+            key.modifier?.view = view
+            view.setOnClickListener { tap(key) }
+            view.setOnTouchListener(Press(key, view))
+        }
     }
 
     private fun label(text: String) = TextView(context).apply {
@@ -252,7 +259,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         } ?: key.send()
     }
 
-    /** A long press on Ctrl or Alt: locks it on, or turns it off. */
+    /** A long press on Ctrl, Alt or Shift: locks it on, or turns it off. */
     private fun hold(m: Modifier) {
         m.on = !m.on
         m.locked = m.on
@@ -260,7 +267,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }
 
     private fun refresh() {
-        for (m in arrayOf(ctrlKey, altKey)) {
+        for (m in modifiers) {
             m.view.setTextColor(if (m.on) onColor else labelColor)
             m.view.paintFlags = if (m.locked) {
                 m.view.paintFlags or Paint.UNDERLINE_TEXT_FLAG
@@ -272,14 +279,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /**
      * The touch on one key: highlights it while pressed, taps it on release (through
-     * [View.performClick]), repeats it or locks its modifier while held, and shows its popup while
-     * the finger is above the key. A sideways slide on a key that is not yet held or showing its
-     * popup scrolls the grid, if it can scroll, and cancels the key.
+     * [View.performClick]), and repeats it or locks its modifier while held. A sideways slide on a
+     * key that is not yet held scrolls the grid, if it can scroll, and cancels the key.
      */
     private inner class Press(private val key: Key, private val view: View) : OnTouchListener, Runnable {
         private var held = 0
         private var cancelled = false
-        private var window: PopupWindow? = null
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             when (e.actionMasked) {
@@ -291,28 +296,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
                         v.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
                     }
                 }
-                MotionEvent.ACTION_MOVE -> if (!cancelled) {
-                    if (key.popup != null && e.y < 0) {
-                        if (window == null) showPopup(key.popup)
-                    } else {
-                        window?.dismiss()
-                        window = null
-                        if (outside(v, e)) cancel()
-                    }
-                }
+                MotionEvent.ACTION_MOVE -> if (!cancelled && outside(v, e)) cancel()
                 MotionEvent.ACTION_UP -> {
-                    val shown = window
                     val tapped = !cancelled && held == 0
                     cancel()
-                    when {
-                        shown != null -> {
-                            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                            key.popup!!.send()
-                        }
-                        tapped -> {
-                            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                            v.performClick()
-                        }
+                    if (tapped) {
+                        v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        v.performClick()
                     }
                 }
                 MotionEvent.ACTION_CANCEL -> cancel()
@@ -343,20 +333,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             cancelled = true
             view.removeCallbacks(this)
             view.background = null
-            window?.dismiss()
-            window = null
-        }
-
-        /** The popup key, as large as this one, right above it. */
-        private fun showPopup(popupKey: Key) {
-            view.removeCallbacks(this)
-            keepTouch()
-            val label = label(popupKey.label).apply { setBackgroundColor(pressedColor) }
-            window = PopupWindow(label, view.width, view.height).apply {
-                isTouchable = false
-                animationStyle = 0
-                showAsDropDown(view, 0, -2 * view.height)
-            }
         }
     }
 
