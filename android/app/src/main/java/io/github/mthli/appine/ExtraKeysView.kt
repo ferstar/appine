@@ -22,11 +22,16 @@ import kotlin.math.roundToInt
 
 /**
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
- * widened to eight columns, with Shift in the last and a cell left blank above it.
+ * widened to eight columns, with SYM and Shift in the last. Until it is tapped again, SYM puts
+ * symbols in place of the keys that are not, so that page has every ASCII symbol Gboard types
+ * neither directly nor from a long press on a letter.
  *
  * ```
- * ESC  /   -  HOME  ↑  END  |  │
+ * ESC  /   -  HOME  ↑  END  |  │ SYM
  * TAB CTRL ALT  ←   ↓   →   ~  │ SHIFT
+ *
+ *  `   /   -   =   ^   \   |   │ SYM
+ *  [   ]   {   }   <   >   ~   │  %
  * ```
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
@@ -36,7 +41,9 @@ import kotlin.math.roundToInt
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow
  * repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply to the next key typed,
  * which reads them ([ctrl], [alt], [shift]) and reports taking them ([modifiersUsed]); held, they
- * stay on until tapped again. The android/terminal map.
+ * stay on until tapped again. SYM is no modifier: turning the page leaves them as they are, and
+ * Ctrl and Alt apply to a symbol too, while Shift, not shown with the symbols, waits for the first
+ * page. The android/terminal map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : LinearLayout(context) {
@@ -72,32 +79,29 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val shiftKey = Modifier()
     private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
 
-    /** The first seven columns of both rows, and the keys in them (sized in [onMeasure]). */
-    private val grid = object : LinearLayout(context) {
-        // Over the keys, so a pressed key's shading does not hide them; drawn here, inside the
-        // scroll view, the lines between columns scroll with the keys
-        override fun dispatchDraw(canvas: Canvas) {
-            super.dispatchDraw(canvas)
-            for (i in 0 until childCount) {
-                val row = getChildAt(i) as ViewGroup
-                hLine(canvas, row.top, width)
-                for (j in 1 until row.childCount) vLine(canvas, row.left + row.getChildAt(j).left, row.top, row.bottom)
-            }
-            hLine(canvas, height - 1, width)
-        }
-    }.apply { orientation = VERTICAL }
+    /**
+     * A page: the [grid] of its first seven columns, and the [last] key, under SYM. Only the page
+     * shown is in the view.
+     */
+    private class Page(val grid: LinearLayout, val last: View)
+
+    /** The keys, then the symbols SYM shows. */
+    private val pages = mutableListOf<Page>()
+
+    /** The keys in the pages' grids (sized in [onMeasure]). */
     private val gridKeys = mutableListOf<View>()
 
-    /** The grid, scrolled sideways when the view is too narrow for all eight columns. */
+    /** Whether SYM shows the symbols. */
+    private var symbols = false
+    private lateinit var symView: TextView
+
+    /** The page shown, scrolled sideways when the view is too narrow for all eight columns. */
     private val scroll = object : HorizontalScrollView(context) {
         // It would take any sideways slide past the touch slop, cancelling the key under the
         // finger, even with nothing to scroll (360 dp and wider)
         override fun onInterceptTouchEvent(e: MotionEvent) =
             (canScrollHorizontally(1) || canScrollHorizontally(-1)) && super.onInterceptTouchEvent(e)
-    }.apply {
-        isHorizontalScrollBarEnabled = false
-        addView(grid)
-    }
+    }.apply { isHorizontalScrollBarEnabled = false }
 
     /** The last column, fixed at the right edge. */
     private val fixed = object : LinearLayout(context) {
@@ -115,7 +119,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
-    val shift get() = shiftKey.on
+    val shift get() = shiftKey.on && !symbols
 
     private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
@@ -135,29 +139,40 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         alpha = 128 // after color, which sets the alpha from the opaque theme colour
     }
 
+    /** The height of a row, in pixels. */
+    private val rowHeight = (ROW_DP * density).roundToInt()
+
     init {
         orientation = HORIZONTAL
         setBackgroundColor(Color.BLACK)
-        row(
-            special("ESC", KeyEvent.KEYCODE_ESCAPE),
-            char("/"),
-            char("-"),
-            special("HOME", KeyEvent.KEYCODE_MOVE_HOME),
-            special("↑", KeyEvent.KEYCODE_DPAD_UP, repeats = true),
-            special("END", KeyEvent.KEYCODE_MOVE_END),
-            char("|"),
-            null,
+        page(
+            arrayOf(
+                special("ESC", KeyEvent.KEYCODE_ESCAPE),
+                char("/"),
+                char("-"),
+                special("HOME", KeyEvent.KEYCODE_MOVE_HOME),
+                special("↑", KeyEvent.KEYCODE_DPAD_UP, repeats = true),
+                special("END", KeyEvent.KEYCODE_MOVE_END),
+                char("|"),
+            ),
+            arrayOf(
+                special("TAB", KeyEvent.KEYCODE_TAB),
+                Key("CTRL", modifier = ctrlKey),
+                Key("ALT", modifier = altKey),
+                special("←", KeyEvent.KEYCODE_DPAD_LEFT, repeats = true),
+                special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
+                special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
+                char("~"),
+            ),
+            last = Key("SHIFT", modifier = shiftKey),
         )
-        row(
-            special("TAB", KeyEvent.KEYCODE_TAB),
-            Key("CTRL", modifier = ctrlKey),
-            Key("ALT", modifier = altKey),
-            special("←", KeyEvent.KEYCODE_DPAD_LEFT, repeats = true),
-            special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
-            special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
-            char("~"),
-            Key("SHIFT", modifier = shiftKey),
-        )
+        // The ASCII symbols that Gboard's letters do not give from a long press (as they give
+        // $ & ; : and the like), and -: / - | ~ where they are on the first page, ` in the corner
+        // it has on a keyboard, - = and \ | side by side as there, and ^ in place of ↑
+        page(chars("`/-=^\\|"), chars("[]{}<>~"), last = char("%"))
+        symView = fixedView(Key("SYM") { turnPage() })
+        fixed.addView(symView)
+        show(pages[0])
         addView(scroll, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
         // Its width is set in onMeasure
         addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT))
@@ -176,20 +191,26 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         if (c != column) {
             column = c
             for (v in gridKeys) v.layoutParams.width = c
-            // The rows and the grid are measured without a width limit, which need not change
-            // with the columns, so their last measurement could be reused
-            grid.forceLayout()
-            for (i in 0 until grid.childCount) grid.getChildAt(i).forceLayout()
+            // The rows and the grids are measured without a width limit, which need not change
+            // with the columns, so their last measurement could be reused; the page not shown
+            // keeps the flag until it is shown
+            for (page in pages) {
+                page.grid.forceLayout()
+                for (i in 0 until page.grid.childCount) page.grid.getChildAt(i).forceLayout()
+            }
         }
         fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
 
-    /** The next key or character took the one-shot modifiers; locked ones stay on. */
+    /**
+     * The next key or character took the one-shot modifiers; locked ones stay on, and so does
+     * Shift while it waits with the symbols shown.
+     */
     fun modifiersUsed() {
         var changed = false
         for (m in modifiers) {
-            if (m.on && !m.locked) {
+            if (m.on && !m.locked && !(symbols && m === shiftKey)) {
                 m.on = false
                 changed = true
             }
@@ -212,33 +233,49 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     private fun char(text: String) = Key(text) { target.text(text) }
 
-    /**
-     * One row of [COLUMNS] keys: all but the last in the grid, the last in the fixed column; null
-     * leaves a blank cell.
-     */
-    private fun row(vararg keys: Key?) {
-        check(keys.size == COLUMNS)
-        val height = (ROW_DP * density).roundToInt()
-        val row = LinearLayout(context).apply { orientation = HORIZONTAL }
-        for (key in keys.dropLast(1)) {
-            val view = keyView(key)
-            gridKeys.add(view)
-            // Its width is set in onMeasure
-            row.addView(view, LayoutParams(0, LayoutParams.MATCH_PARENT))
+    /** A key for each character of [text]. */
+    private fun chars(text: String) = Array(text.length) { char(text[it].toString()) }
+
+    /** A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last]. */
+    private fun page(vararg rows: Array<Key>, last: Key) {
+        val grid = object : LinearLayout(context) {
+            // Over the keys, so a pressed key's shading does not hide them; drawn here, inside
+            // the scroll view, the lines between columns scroll with the keys
+            override fun dispatchDraw(canvas: Canvas) {
+                super.dispatchDraw(canvas)
+                for (i in 0 until childCount) {
+                    val row = getChildAt(i) as ViewGroup
+                    hLine(canvas, row.top, width)
+                    for (j in 1 until row.childCount) {
+                        vLine(canvas, row.left + row.getChildAt(j).left, row.top, row.bottom)
+                    }
+                }
+                hLine(canvas, height - 1, width)
+            }
+        }.apply { orientation = VERTICAL }
+        for (keys in rows) {
+            check(keys.size == COLUMNS - 1)
+            val row = LinearLayout(context).apply { orientation = HORIZONTAL }
+            for (key in keys) {
+                val view = keyView(key)
+                gridKeys.add(view)
+                // Its width is set in onMeasure
+                row.addView(view, LayoutParams(0, LayoutParams.MATCH_PARENT))
+            }
+            grid.addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
         }
-        grid.addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, height))
-        fixed.addView(keyView(keys.last()), LayoutParams(LayoutParams.MATCH_PARENT, height))
+        pages.add(Page(grid, fixedView(last)))
     }
 
-    /** The key's label, or for null a blank cell that takes no touch (no shading, no haptic). */
+    /** A key for the fixed column, laid out to fill a cell of it. */
+    private fun fixedView(key: Key) =
+        keyView(key).apply { layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
+
     @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
-    private fun keyView(key: Key?): View {
-        if (key == null) return View(context)
-        return label(key.label).also { view ->
-            key.modifier?.view = view
-            view.setOnClickListener { tap(key) }
-            view.setOnTouchListener(Press(key, view))
-        }
+    private fun keyView(key: Key) = label(key.label).also { view ->
+        key.modifier?.view = view
+        view.setOnClickListener { tap(key) }
+        view.setOnTouchListener(Press(key, view))
     }
 
     private fun label(text: String) = TextView(context).apply {
@@ -266,7 +303,26 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         refresh()
     }
 
+    /** SYM: shows the symbols in place of the first page, or the first page again. */
+    private fun turnPage() {
+        symbols = !symbols
+        show(pages[if (symbols) 1 else 0])
+        refresh()
+    }
+
+    /**
+     * Puts [page] in the view in place of the other one. Removing a key's view cancels its touch,
+     * so a key still held on the page going away stops repeating.
+     */
+    private fun show(page: Page) {
+        scroll.removeAllViews()
+        scroll.addView(page.grid)
+        if (fixed.childCount > 1) fixed.removeViewAt(1)
+        fixed.addView(page.last)
+    }
+
     private fun refresh() {
+        symView.setTextColor(if (symbols) onColor else labelColor)
         for (m in modifiers) {
             m.view.setTextColor(if (m.on) onColor else labelColor)
             m.view.paintFlags = if (m.locked) {
