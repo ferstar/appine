@@ -55,6 +55,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         /** Plain characters; the one-shot modifiers are still to be read. */
         fun text(text: String)
+
+        /** A short message about the keys, such as which modifier a long press locked. */
+        fun notice(text: String)
     }
 
     /** Ctrl, Alt or Shift: on for the next key after a tap, [locked] on after a long press. */
@@ -319,11 +322,15 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         } ?: key.send()
     }
 
-    /** A long press on Ctrl, Alt or Shift: locks it on, or turns it off. */
+    /**
+     * A long press on Ctrl, Alt or Shift: locks it on, also when a tap had turned it on for the
+     * next key, saying which one it locked, or turns it off when locked.
+     */
     private fun hold(m: Modifier) {
-        m.on = !m.on
-        m.locked = m.on
+        m.locked = !m.locked
+        m.on = m.locked
         refresh()
+        if (m.locked) target.notice(context.getString(R.string.modifier_locked, m.view.text))
     }
 
     /** SYM: shows the symbols in place of the first page, or the first page again. */

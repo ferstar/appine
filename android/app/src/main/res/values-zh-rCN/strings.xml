@@ -31,6 +31,7 @@
     <string name="shortcuts_tabs">标签页</string>
     <string name="tab_ended">%1$s（已结束）</string>
     <string name="tab_description">标签页 %1$d：%2$s</string>
+    <string name="modifier_locked">%1$s 已锁定</string>
     <string name="menu_settings">设置</string>
     <string name="settings">设置</string>
     <string name="navigate_up">返回</string>

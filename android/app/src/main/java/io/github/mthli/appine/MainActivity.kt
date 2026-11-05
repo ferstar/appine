@@ -65,7 +65,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     private var currentIndex = 0
     private var fontSize = 0
 
-    /** The last tab title shown by a long press, cancelled by the next. */
+    /** The last toast ([showToast]), cancelled by the next. */
     private var toast: Toast? = null
 
     /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
@@ -322,8 +322,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         foreground = touchFeedback()
         setOnClickListener { show(session) }
         setOnLongClickListener {
-            toast?.cancel()
-            toast = Toast.makeText(this@MainActivity, title(session), Toast.LENGTH_SHORT).apply { show() }
+            showToast(title(session))
             true
         }
     }
@@ -332,6 +331,15 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun title(session: VtSession): String {
         val text = session.title?.takeIf { it.isNotBlank() } ?: "sh"
         return if (session.isRunning) text else getString(R.string.tab_ended, text)
+    }
+
+    /**
+     * A tab's title or a notice from the extra keys, in place of the last one, so that quick long
+     * presses do not queue toasts.
+     */
+    private fun showToast(text: String) {
+        toast?.cancel()
+        toast = Toast.makeText(this, text, Toast.LENGTH_SHORT).apply { show() }
     }
 
     /** A button in the bar: a square as tall as the bar ([barItem]) with its label centred. */
@@ -504,6 +512,8 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun key(keyCode: Int) = screen.press(keyCode)
 
         override fun text(text: String) = screen.type(text)
+
+        override fun notice(text: String) = showToast(text)
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

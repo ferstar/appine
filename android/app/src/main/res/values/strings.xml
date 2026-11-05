@@ -33,6 +33,7 @@
     <string name="shortcuts_tabs">Tabs</string>
     <string name="tab_ended">%1$s (ended)</string>
     <string name="tab_description">Tab %1$d: %2$s</string>
+    <string name="modifier_locked">%1$s locked</string>
     <string name="menu_settings">Settings</string>
     <string name="settings">Settings</string>
     <string name="navigate_up">Back</string>
