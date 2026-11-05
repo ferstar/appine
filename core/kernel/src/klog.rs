@@ -92,12 +92,6 @@ impl Record {
         (8 + self.text.len()).div_ceil(8) * 8
     }
 
-    /// Number of lines: newlines in the text plus one (the trailing newline was removed when
-    /// stored).
-    fn lines(&self) -> usize {
-        self.text.iter().filter(|&&b| b == b'\n').count() + 1
-    }
-
     /// The prefix of each line in syslog format (`info_print_prefix`).
     fn prefix(&self, syslog: bool, time: bool) -> String {
         let mut s = String::new();
@@ -110,6 +104,19 @@ impl Record {
         }
         s
     }
+
+    /// Number of lines: newlines in the text plus one (the trailing newline was removed when
+    /// stored).
+    fn lines(&self) -> usize {
+        self.text.iter().filter(|&&b| b == b'\n').count() + 1
+    }
+}
+
+/// A record read out (copied, and written to the guest after the borrow is released).
+pub(crate) struct Read {
+    /// The record's sequence number; larger than the one asked for means that one was pushed out.
+    pub seq: u64,
+    pub text: Vec<u8>,
 }
 
 /// The kernel log.
@@ -153,13 +160,6 @@ impl Default for Klog {
     }
 }
 
-/// A record read out (copied, and written to the guest after the borrow is released).
-pub(crate) struct Read {
-    /// The record's sequence number; larger than the one asked for means that one was pushed out.
-    pub seq: u64,
-    pub text: Vec<u8>,
-}
-
 impl Klog {
     /// Stores a record (`vprintk_store`): the text up to the first NUL (`%s`), at most
     /// `LOG_LINE_MAX - 1` bytes, with one trailing newline removed and recorded as a flag. Does
@@ -191,84 +191,6 @@ impl Klog {
         }
     }
 
-    /// Sequence number of the oldest record (`prb_first_valid_seq`); with no records, that of the
-    /// next one.
-    pub fn first_seq(&self) -> u64 {
-        self.records.front().map_or(self.next_seq, |r| r.seq)
-    }
-
-    /// The number of readable records: when the newest one has no trailing newline it is not yet
-    /// finalized (`desc_make_final` waits for the next record) and does not count.
-    fn visible(&self) -> usize {
-        let open = self
-            .records
-            .back()
-            .is_some_and(|r| r.flags & LOG_NEWLINE == 0);
-        self.records.len() - open as usize
-    }
-
-    /// Readable records with sequence numbers not below `seq`.
-    fn readable_from(&self, seq: u64) -> impl Iterator<Item = &Record> {
-        self.records
-            .iter()
-            .take(self.visible())
-            .filter(move |r| r.seq >= seq)
-    }
-
-    /// Sequence number of the next record to be logged (whether or not the newest one is
-    /// finalized).
-    pub fn upcoming_seq(&self) -> u64 {
-        self.next_seq
-    }
-
-    /// Readable records with sequence numbers not below `seq`, one entry per line as `dmesg` shows
-    /// them, prefixed with `[sec.usec] ` (always with time, regardless of `printk_time`, and
-    /// whether or not syslog was cleared). Control characters are escaped as `\xNN` and non-UTF-8
-    /// bytes replaced with U+FFFD. Kernel bug reports carry them to the app ([`crate::bug`]).
-    pub fn lines_from(&self, seq: u64) -> Vec<String> {
-        let mut out = Vec::new();
-        for r in self.readable_from(seq) {
-            let prefix = r.prefix(false, true);
-            for line in r.text.split(|&b| b == b'\n') {
-                let mut s = prefix.clone();
-                for c in String::from_utf8_lossy(line).chars() {
-                    if c.is_control() {
-                        write!(s, "\\x{:02x}", c as u32).unwrap();
-                    } else {
-                        s.push(c);
-                    }
-                }
-                out.push(s);
-            }
-        }
-        out
-    }
-
-    /// The first record after syslog's last clear (`SEEK_DATA` on `/dev/kmsg`).
-    pub fn clear_seq(&self) -> u64 {
-        self.clear_seq
-    }
-
-    /// The sequence number after the last readable record (`prb_next_seq`): also how many records
-    /// have ever been readable; poll's data generation uses it.
-    pub fn next_seq(&self) -> u64 {
-        self.first_seq() + self.visible() as u64
-    }
-
-    /// The first readable record with a sequence number not below `seq` (`prb_read_valid`).
-    fn record(&self, seq: u64) -> Option<&Record> {
-        let index: usize = seq
-            .saturating_sub(self.first_seq())
-            .try_into()
-            .unwrap_or(usize::MAX);
-        self.records.get(index).filter(|_| index < self.visible())
-    }
-
-    /// Whether a record with a sequence number not below `seq` exists: what readers wait for.
-    pub fn readable(&self, seq: u64) -> bool {
-        self.record(seq).is_some()
-    }
-
     /// The format read from `/dev/kmsg` (`info_print_ext_header`, `msg_print_ext_body`): the first
     /// record with a sequence number not below `seq`.
     pub fn ext_text(&self, seq: u64) -> Option<Read> {
@@ -290,46 +212,6 @@ impl Klog {
         }
         text.push(b'\n');
         Some(Read { seq: r.seq, text })
-    }
-
-    /// One record in syslog format (`record_print_text`, with a `CONSOLE_LOG_MAX` buffer): each
-    /// line gets the prefix and a trailing newline is added; lines that do not fit with the prefix
-    /// are dropped from the end, and a first line that does not fit is truncated.
-    fn syslog_text(r: &Record, time: bool) -> Vec<u8> {
-        let prefix = r.prefix(true, time);
-        let prefix = prefix.as_bytes();
-        let mut out = Vec::new();
-        let mut text: &[u8] = &r.text;
-        let mut truncated = false;
-        loop {
-            let next = text.iter().position(|&b| b == b'\n');
-            if next.is_none() && truncated {
-                break;
-            }
-            let line_len = next.unwrap_or(text.len());
-            let mut text_len = text.len();
-            if out.len() + prefix.len() + text_len + 2 > CONSOLE_LOG_MAX {
-                if out.len() + prefix.len() + line_len + 2 > CONSOLE_LOG_MAX {
-                    break;
-                }
-                text_len = CONSOLE_LOG_MAX - out.len() - prefix.len() - 2;
-                truncated = true;
-            }
-            out.extend_from_slice(prefix);
-            out.extend_from_slice(&text[..line_len.min(text_len)]);
-            out.push(b'\n');
-            if text_len == line_len {
-                break;
-            }
-            text = &text[line_len + 1..text_len];
-        }
-        out
-    }
-
-    /// The length of [`Klog::syslog_text`] when nothing is truncated
-    /// (`get_record_print_text_size`).
-    fn syslog_size(r: &Record, time: bool) -> usize {
-        r.prefix(true, time).len() * r.lines() + r.text.len() + 1
     }
 
     /// syslog's read-all (`syslog_print_all`): from the records since the clear, takes the newest
@@ -438,6 +320,124 @@ impl Klog {
             time = self.printk_time;
         }
         (n - self.syslog_partial) as u64
+    }
+
+    /// Readable records with sequence numbers not below `seq`, one entry per line as `dmesg` shows
+    /// them, prefixed with `[sec.usec] ` (always with time, regardless of `printk_time`, and
+    /// whether or not syslog was cleared). Control characters are escaped as `\xNN` and non-UTF-8
+    /// bytes replaced with U+FFFD. Kernel bug reports carry them to the app ([`crate::bug`]).
+    pub fn lines_from(&self, seq: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in self.readable_from(seq) {
+            let prefix = r.prefix(false, true);
+            for line in r.text.split(|&b| b == b'\n') {
+                let mut s = prefix.clone();
+                for c in String::from_utf8_lossy(line).chars() {
+                    if c.is_control() {
+                        write!(s, "\\x{:02x}", c as u32).unwrap();
+                    } else {
+                        s.push(c);
+                    }
+                }
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// One record in syslog format (`record_print_text`, with a `CONSOLE_LOG_MAX` buffer): each
+    /// line gets the prefix and a trailing newline is added; lines that do not fit with the prefix
+    /// are dropped from the end, and a first line that does not fit is truncated.
+    fn syslog_text(r: &Record, time: bool) -> Vec<u8> {
+        let prefix = r.prefix(true, time);
+        let prefix = prefix.as_bytes();
+        let mut out = Vec::new();
+        let mut text: &[u8] = &r.text;
+        let mut truncated = false;
+        loop {
+            let next = text.iter().position(|&b| b == b'\n');
+            if next.is_none() && truncated {
+                break;
+            }
+            let line_len = next.unwrap_or(text.len());
+            let mut text_len = text.len();
+            if out.len() + prefix.len() + text_len + 2 > CONSOLE_LOG_MAX {
+                if out.len() + prefix.len() + line_len + 2 > CONSOLE_LOG_MAX {
+                    break;
+                }
+                text_len = CONSOLE_LOG_MAX - out.len() - prefix.len() - 2;
+                truncated = true;
+            }
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(&text[..line_len.min(text_len)]);
+            out.push(b'\n');
+            if text_len == line_len {
+                break;
+            }
+            text = &text[line_len + 1..text_len];
+        }
+        out
+    }
+
+    /// The length of [`Klog::syslog_text`] when nothing is truncated
+    /// (`get_record_print_text_size`).
+    fn syslog_size(r: &Record, time: bool) -> usize {
+        r.prefix(true, time).len() * r.lines() + r.text.len() + 1
+    }
+
+    /// Whether a record with a sequence number not below `seq` exists: what readers wait for.
+    pub fn readable(&self, seq: u64) -> bool {
+        self.record(seq).is_some()
+    }
+
+    /// The first readable record with a sequence number not below `seq` (`prb_read_valid`).
+    fn record(&self, seq: u64) -> Option<&Record> {
+        let index: usize = seq
+            .saturating_sub(self.first_seq())
+            .try_into()
+            .unwrap_or(usize::MAX);
+        self.records.get(index).filter(|_| index < self.visible())
+    }
+
+    /// Readable records with sequence numbers not below `seq`.
+    fn readable_from(&self, seq: u64) -> impl Iterator<Item = &Record> {
+        self.records
+            .iter()
+            .take(self.visible())
+            .filter(move |r| r.seq >= seq)
+    }
+
+    /// The number of readable records: when the newest one has no trailing newline it is not yet
+    /// finalized (`desc_make_final` waits for the next record) and does not count.
+    fn visible(&self) -> usize {
+        let open = self
+            .records
+            .back()
+            .is_some_and(|r| r.flags & LOG_NEWLINE == 0);
+        self.records.len() - open as usize
+    }
+
+    /// Sequence number of the oldest record (`prb_first_valid_seq`); with no records, that of the
+    /// next one.
+    pub fn first_seq(&self) -> u64 {
+        self.records.front().map_or(self.next_seq, |r| r.seq)
+    }
+
+    /// The sequence number after the last readable record (`prb_next_seq`): also how many records
+    /// have ever been readable; poll's data generation uses it.
+    pub fn next_seq(&self) -> u64 {
+        self.first_seq() + self.visible() as u64
+    }
+
+    /// Sequence number of the next record to be logged (whether or not the newest one is
+    /// finalized).
+    pub fn upcoming_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// The first record after syslog's last clear (`SEEK_DATA` on `/dev/kmsg`).
+    pub fn clear_seq(&self) -> u64 {
+        self.clear_seq
     }
 }
 

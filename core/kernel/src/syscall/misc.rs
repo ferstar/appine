@@ -69,53 +69,6 @@ const GRND_INSECURE: u32 = 4;
 /// The kernel version `uname -r` reports, that is, the ABI contract (the kernel/signal map).
 const RELEASE: &[u8] = b"6.1.0-appine";
 
-/// Converts an absolute time on `clock` into a wait deadline. A time already past becomes an
-/// instant in the past: periodic timers count missed periods from it. A time too early for the
-/// monotonic clock to represent becomes now.
-pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
-    let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
-    let now = Duration::new(sec.max(0) as u64, nsec as u32);
-    let base = Instant::now();
-    Ok(match abs.checked_sub(now) {
-        Some(ahead) => base + ahead,
-        None => base.checked_sub(now - abs).unwrap_or(base),
-    })
-}
-
-/// Converts the absolute time `abs` on clock `clock` in the time namespace into a wait deadline:
-/// first subtracts the offset (Linux's `timens_ktime_to_host`; times before the offset count as
-/// already past), then computes on the host's clock.
-pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Instant, Errno> {
-    deadline_from_clock(clock, to_host_clock(cx.time_offset(clock), abs))
-}
-
-/// What time `abs`, which includes offset `offset`, is on the host clock: the offset subtracted,
-/// not before 0.
-pub(super) fn to_host_clock(offset: i64, abs: Duration) -> Duration {
-    let ns = abs.as_nanos() as i128 - offset as i128;
-    Duration::from_nanos(ns.clamp(0, u64::MAX as i128) as u64)
-}
-
-/// A host clock reading (sec, nsec) plus the time namespace offset `offset` (in nanoseconds).
-pub(super) fn add_offset((sec, nsec): (i64, i64), offset: i64) -> (i64, i64) {
-    if offset == 0 {
-        return (sec, nsec);
-    }
-    let ns = sec as i128 * 1_000_000_000 + nsec as i128 + offset as i128;
-    (
-        ns.div_euclid(1_000_000_000) as i64,
-        ns.rem_euclid(1_000_000_000) as i64,
-    )
-}
-
-/// The futex key: the translated host address.
-fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
-    if !uaddr.is_multiple_of(4) {
-        return Err(Errno::EINVAL);
-    }
-    cx.mm().futex_key(uaddr).ok_or(Errno::EFAULT)
-}
-
 pub(super) fn futex(
     cx: &mut Cx<'_>,
     uaddr: u64,
@@ -322,160 +275,18 @@ pub(super) fn futex_waitv(
     }
 }
 
-/// Sleeps until `deadline`; returns the remaining time when interrupted by a signal.
-fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(());
-        }
-        if cx.interrupted() || cx.wait(Some(deadline), &mut []).is_err() {
-            return Err(deadline - now);
-        }
+/// The futex key: the translated host address.
+fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
+    if !uaddr.is_multiple_of(4) {
+        return Err(Errno::EINVAL);
     }
+    cx.mm().futex_key(uaddr).ok_or(Errno::EFAULT)
 }
 
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
     let early = cx.t.fast_sleep.take();
     let t = read_timespec(cx, req)?;
     sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem)
-}
-
-/// Sleeps until `deadline`. When interrupted by a signal, writes the remaining time to `rem` (if
-/// not 0) and records the deadline: when no handler interrupts (for example a stop followed by a
-/// continue), restart_syscall goes on sleeping instead of sleeping the original duration again.
-fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
-    match sleep_until(cx, deadline) {
-        Ok(()) => Ok(0),
-        Err(left) => {
-            if rem != 0 {
-                write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
-            }
-            cx.t.restart = Some(Restart::Sleep { deadline, rem });
-            Err(Errno::ERESTART_RESTARTBLOCK)
-        }
-    }
-}
-
-/// What restart_syscall continues after an interruption without a handler (Linux's
-/// `restart_block`).
-pub(crate) enum Restart {
-    /// nanosleep, clock_nanosleep: the deadline and the address of `rem`.
-    Sleep { deadline: Instant, rem: u64 },
-    /// A futex wait with a timeout (`futex_wait_restart`): goes on waiting with the original
-    /// arguments until the original deadline.
-    Futex {
-        uaddr: u64,
-        val: u32,
-        bitset: u32,
-        deadline: Instant,
-    },
-}
-
-/// restart_syscall: continues an interrupted nanosleep or futex wait. As on Linux, returns EINTR
-/// when there is nothing to continue.
-pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
-    match cx.t.restart.take() {
-        Some(Restart::Sleep { deadline, rem }) => sleep_rest(cx, deadline, rem),
-        Some(Restart::Futex {
-            uaddr,
-            val,
-            bitset,
-            deadline,
-        }) => futex_wait(cx, (uaddr, val, bitset), Some(deadline)),
-        None => Err(Errno::EINTR),
-    }
-}
-
-/// Reads a `struct itimerval`: (interval, time until the first expiry).
-fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno> {
-    let b: [u8; 32] = get(cx, addr)?;
-    let tv = |o: usize| {
-        let sec = i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-        let usec = i64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap());
-        if !(0..1_000_000).contains(&usec) {
-            return Err(Errno::EINVAL);
-        }
-        super::timespec(sec, usec * 1000).ok_or(Errno::EINVAL)
-    };
-    Ok((tv(0)?, tv(16)?))
-}
-
-/// Writes a `struct itimerval`: the interval and the time left until the next expiry.
-fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<(Duration, Duration)>) -> Result<(), Errno> {
-    let (interval, left) = match t {
-        // As on Linux, a timer that has not expired yet reports at least 1 microsecond
-        Some((interval, left)) => (interval, left.max(Duration::from_micros(1))),
-        None => (Duration::ZERO, Duration::ZERO),
-    };
-    let mut b = [0u8; 32];
-    for (o, d) in [(0, interval), (16, left)] {
-        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
-        b[o + 8..o + 16].copy_from_slice(&(d.subsec_micros() as i64).to_le_bytes());
-    }
-    put(cx, addr, b)
-}
-
-const ITIMER_VIRTUAL: i32 = 1;
-const ITIMER_PROF: i32 = 2;
-
-/// The timer's current value: (interval, time left until the next expiry), or None when it is not
-/// armed.
-fn itimer_value(cx: &Cx<'_>, which: i32) -> Option<(Duration, Duration)> {
-    let g = cx.t.group.borrow();
-    if which == ITIMER_REAL {
-        let t = g.itimer?;
-        return Some((
-            t.interval,
-            t.deadline.saturating_duration_since(Instant::now()),
-        ));
-    }
-    let t = g.cpu_itimers[(which - 1) as usize]?;
-    let left = t.deadline.saturating_sub(g.cpu_ns(cx.kr()));
-    Some((Duration::from_nanos(t.interval), Duration::from_nanos(left)))
-}
-
-fn check_itimer(which: i32) -> Result<(), Errno> {
-    match which {
-        ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => Ok(()),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-pub(super) fn getitimer(cx: &mut Cx<'_>, which: i32, curr: u64) -> SysResult {
-    check_itimer(which)?;
-    let t = itimer_value(cx, which);
-    write_itimerval(cx, curr, t).map(|()| 0)
-}
-
-pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysResult {
-    check_itimer(which)?;
-    // As on Linux, a null new value means disarm
-    let (interval, value) = if new == 0 {
-        (Duration::ZERO, Duration::ZERO)
-    } else {
-        read_itimerval(cx, new)?
-    };
-    if old != 0 {
-        let prev = itimer_value(cx, which);
-        write_itimerval(cx, old, prev)?;
-    }
-    if which == ITIMER_REAL {
-        cx.t.group.borrow_mut().itimer = (!value.is_zero()).then(|| ITimer {
-            deadline: Instant::now() + value,
-            interval,
-        });
-    } else {
-        let now = cx.t.group.borrow().cpu_ns(cx.kr());
-        cx.t.group.borrow_mut().cpu_itimers[(which - 1) as usize] =
-            (!value.is_zero()).then(|| CpuTimer {
-                deadline: now + value.as_nanos() as u64,
-                interval: interval.as_nanos() as u64,
-            });
-    }
-    // Make the timer thread recompute its wait. Wake only it: this used to wake all waiters
-    crate::kernel::signal_later(&cx.shared.timers);
-    Ok(0)
 }
 
 pub(super) fn clock_nanosleep(
@@ -519,8 +330,184 @@ pub(super) fn clock_nanosleep(
     }
 }
 
+/// Sleeps until `deadline`. When interrupted by a signal, writes the remaining time to `rem` (if
+/// not 0) and records the deadline: when no handler interrupts (for example a stop followed by a
+/// continue), restart_syscall goes on sleeping instead of sleeping the original duration again.
+fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
+    match sleep_until(cx, deadline) {
+        Ok(()) => Ok(0),
+        Err(left) => {
+            if rem != 0 {
+                write_pair(cx, rem, left.as_secs() as i64, left.subsec_nanos() as i64)?;
+            }
+            cx.t.restart = Some(Restart::Sleep { deadline, rem });
+            Err(Errno::ERESTART_RESTARTBLOCK)
+        }
+    }
+}
+
+/// Sleeps until `deadline`; returns the remaining time when interrupted by a signal.
+fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        if cx.interrupted() || cx.wait(Some(deadline), &mut []).is_err() {
+            return Err(deadline - now);
+        }
+    }
+}
+
+/// What restart_syscall continues after an interruption without a handler (Linux's
+/// `restart_block`).
+pub(crate) enum Restart {
+    /// nanosleep, clock_nanosleep: the deadline and the address of `rem`.
+    Sleep { deadline: Instant, rem: u64 },
+    /// A futex wait with a timeout (`futex_wait_restart`): goes on waiting with the original
+    /// arguments until the original deadline.
+    Futex {
+        uaddr: u64,
+        val: u32,
+        bitset: u32,
+        deadline: Instant,
+    },
+}
+
+/// restart_syscall: continues an interrupted nanosleep or futex wait. As on Linux, returns EINTR
+/// when there is nothing to continue.
+pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
+    match cx.t.restart.take() {
+        Some(Restart::Sleep { deadline, rem }) => sleep_rest(cx, deadline, rem),
+        Some(Restart::Futex {
+            uaddr,
+            val,
+            bitset,
+            deadline,
+        }) => futex_wait(cx, (uaddr, val, bitset), Some(deadline)),
+        None => Err(Errno::EINTR),
+    }
+}
+
+const ITIMER_VIRTUAL: i32 = 1;
+const ITIMER_PROF: i32 = 2;
+
+pub(super) fn getitimer(cx: &mut Cx<'_>, which: i32, curr: u64) -> SysResult {
+    check_itimer(which)?;
+    let t = itimer_value(cx, which);
+    write_itimerval(cx, curr, t).map(|()| 0)
+}
+
+pub(super) fn setitimer(cx: &mut Cx<'_>, which: i32, new: u64, old: u64) -> SysResult {
+    check_itimer(which)?;
+    // As on Linux, a null new value means disarm
+    let (interval, value) = if new == 0 {
+        (Duration::ZERO, Duration::ZERO)
+    } else {
+        read_itimerval(cx, new)?
+    };
+    if old != 0 {
+        let prev = itimer_value(cx, which);
+        write_itimerval(cx, old, prev)?;
+    }
+    if which == ITIMER_REAL {
+        cx.t.group.borrow_mut().itimer = (!value.is_zero()).then(|| ITimer {
+            deadline: Instant::now() + value,
+            interval,
+        });
+    } else {
+        let now = cx.t.group.borrow().cpu_ns(cx.kr());
+        cx.t.group.borrow_mut().cpu_itimers[(which - 1) as usize] =
+            (!value.is_zero()).then(|| CpuTimer {
+                deadline: now + value.as_nanos() as u64,
+                interval: interval.as_nanos() as u64,
+            });
+    }
+    // Make the timer thread recompute its wait. Wake only it: this used to wake all waiters
+    crate::kernel::signal_later(&cx.shared.timers);
+    Ok(0)
+}
+
+fn check_itimer(which: i32) -> Result<(), Errno> {
+    match which {
+        ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Reads a `struct itimerval`: (interval, time until the first expiry).
+fn read_itimerval(cx: &Cx<'_>, addr: u64) -> Result<(Duration, Duration), Errno> {
+    let b: [u8; 32] = get(cx, addr)?;
+    let tv = |o: usize| {
+        let sec = i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let usec = i64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap());
+        if !(0..1_000_000).contains(&usec) {
+            return Err(Errno::EINVAL);
+        }
+        super::timespec(sec, usec * 1000).ok_or(Errno::EINVAL)
+    };
+    Ok((tv(0)?, tv(16)?))
+}
+
+/// The timer's current value: (interval, time left until the next expiry), or None when it is not
+/// armed.
+fn itimer_value(cx: &Cx<'_>, which: i32) -> Option<(Duration, Duration)> {
+    let g = cx.t.group.borrow();
+    if which == ITIMER_REAL {
+        let t = g.itimer?;
+        return Some((
+            t.interval,
+            t.deadline.saturating_duration_since(Instant::now()),
+        ));
+    }
+    let t = g.cpu_itimers[(which - 1) as usize]?;
+    let left = t.deadline.saturating_sub(g.cpu_ns(cx.kr()));
+    Some((Duration::from_nanos(t.interval), Duration::from_nanos(left)))
+}
+
+/// Writes a `struct itimerval`: the interval and the time left until the next expiry.
+fn write_itimerval(cx: &Cx<'_>, addr: u64, t: Option<(Duration, Duration)>) -> Result<(), Errno> {
+    let (interval, left) = match t {
+        // As on Linux, a timer that has not expired yet reports at least 1 microsecond
+        Some((interval, left)) => (interval, left.max(Duration::from_micros(1))),
+        None => (Duration::ZERO, Duration::ZERO),
+    };
+    let mut b = [0u8; 32];
+    for (o, d) in [(0, interval), (16, left)] {
+        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
+        b[o + 8..o + 16].copy_from_slice(&(d.subsec_micros() as i64).to_le_bytes());
+    }
+    put(cx, addr, b)
+}
+
 const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+pub(super) fn clock_gettime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
+    let (sec, nsec) = match cpu_clock(cx, clock) {
+        Some(ns) => {
+            let ns = ns?;
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        // Monotonic and boottime clocks get the time namespace offset added
+        None => add_offset(
+            appine_hal::clock_gettime(clock).map_err(Errno)?,
+            cx.time_offset(clock),
+        ),
+    };
+    write_pair(cx, tp, sec, nsec).map(|()| 0)
+}
+
+pub(super) fn clock_getres(cx: &mut Cx<'_>, clock: i32, res: u64) -> SysResult {
+    let (sec, nsec) = match cpu_clock(cx, clock) {
+        Some(ns) => ns.map(|_| (0, 1))?,
+        None => appine_hal::clock_getres(clock).map_err(Errno)?,
+    };
+    if res != 0 {
+        write_pair(cx, res, sec, nsec)?;
+    }
+    Ok(0)
+}
 
 /// Nanoseconds used on the CPU clock of a guest process or thread; None when `clock` is not a CPU
 /// clock. Negative clock ids are encoded by `clock_getcpuclockid`/`pthread_getcpuclockid`
@@ -551,32 +538,6 @@ fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
         };
         group.map(|g| g.borrow().cpu_ns(k)).ok_or(Errno::EINVAL)
     })
-}
-
-pub(super) fn clock_gettime(cx: &mut Cx<'_>, clock: i32, tp: u64) -> SysResult {
-    let (sec, nsec) = match cpu_clock(cx, clock) {
-        Some(ns) => {
-            let ns = ns?;
-            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
-        }
-        // Monotonic and boottime clocks get the time namespace offset added
-        None => add_offset(
-            appine_hal::clock_gettime(clock).map_err(Errno)?,
-            cx.time_offset(clock),
-        ),
-    };
-    write_pair(cx, tp, sec, nsec).map(|()| 0)
-}
-
-pub(super) fn clock_getres(cx: &mut Cx<'_>, clock: i32, res: u64) -> SysResult {
-    let (sec, nsec) = match cpu_clock(cx, clock) {
-        Some(ns) => ns.map(|_| (0, 1))?,
-        None => appine_hal::clock_getres(clock).map_err(Errno)?,
-    };
-    if res != 0 {
-        write_pair(cx, res, sec, nsec)?;
-    }
-    Ok(0)
 }
 
 /// clock_settime: the guest cannot change the host's time. The settable clock (`CLOCK_REALTIME`)
@@ -657,11 +618,6 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
     result
 }
 
-/// syslog(2) (klogctl); for the contents see [`crate::klog`].
-pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResult {
-    do_syslog(cx, kind, buf, len, false)
-}
-
 pub(crate) mod syslog_action {
     pub const CLOSE: i32 = 0;
     pub const OPEN: i32 = 1;
@@ -673,41 +629,9 @@ pub(crate) mod syslog_action {
     pub const SIZE_BUFFER: i32 = 10;
 }
 
-/// Permissions (`check_syslog_permissions`), checked before the arguments: with `dmesg_restrict`
-/// 0 anyone may read all and ask for the buffer size; other actions (and every action with
-/// `dmesg_restrict` 1) need `CAP_SYSLOG` in the boot namespace; `CAP_SYS_ADMIN` alone also works,
-/// but the first time a warning is logged. `/proc/kmsg` was checked when opened, so later reads
-/// are not checked again (`from_proc`). Opening `/dev/kmsg` for reading is checked as read-all.
-pub(crate) fn check_syslog_permissions(cx: &Cx<'_>, kind: i32, from_proc: bool) -> SysResult {
-    use syslog_action::*;
-    if from_proc && kind != OPEN {
-        return Ok(0);
-    }
-    let restricted = cx.kr().dmesg_restrict || (kind != READ_ALL && kind != SIZE_BUFFER);
-    if !restricted {
-        return Ok(0);
-    }
-    let cred = cx.cred();
-    if cred.capable(cap::SYSLOG) {
-        return Ok(0);
-    }
-    if !cred.capable(cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
-    let log = cx.kr().klog.clone();
-    if !std::mem::replace(&mut log.borrow_mut().sys_admin_warned, true) {
-        let comm = crate::pseudo::comm_str(Some(cx.task), cx.tgid());
-        klog::printk(
-            &log,
-            klog::level::WARNING,
-            format_args!(
-                "printk: {comm} ({}): Attempt to access syslog with CAP_SYS_ADMIN but no \
-                 CAP_SYSLOG (deprecated).",
-                cx.tid()
-            ),
-        );
-    }
-    Ok(0)
+/// syslog(2) (klogctl); for the contents see [`crate::klog`].
+pub(super) fn syslog(cx: &mut Cx<'_>, kind: i32, buf: u64, len: i32) -> SysResult {
+    do_syslog(cx, kind, buf, len, false)
 }
 
 /// The actions of syslog(2) and `/proc/kmsg` (`from_proc`) (`do_syslog`): read (2) waits until
@@ -800,6 +724,43 @@ pub(crate) fn do_syslog(
         SIZE_BUFFER => Ok(klog::LOG_BUF_LEN as u64),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Permissions (`check_syslog_permissions`), checked before the arguments: with `dmesg_restrict`
+/// 0 anyone may read all and ask for the buffer size; other actions (and every action with
+/// `dmesg_restrict` 1) need `CAP_SYSLOG` in the boot namespace; `CAP_SYS_ADMIN` alone also works,
+/// but the first time a warning is logged. `/proc/kmsg` was checked when opened, so later reads
+/// are not checked again (`from_proc`). Opening `/dev/kmsg` for reading is checked as read-all.
+pub(crate) fn check_syslog_permissions(cx: &Cx<'_>, kind: i32, from_proc: bool) -> SysResult {
+    use syslog_action::*;
+    if from_proc && kind != OPEN {
+        return Ok(0);
+    }
+    let restricted = cx.kr().dmesg_restrict || (kind != READ_ALL && kind != SIZE_BUFFER);
+    if !restricted {
+        return Ok(0);
+    }
+    let cred = cx.cred();
+    if cred.capable(cap::SYSLOG) {
+        return Ok(0);
+    }
+    if !cred.capable(cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let log = cx.kr().klog.clone();
+    if !std::mem::replace(&mut log.borrow_mut().sys_admin_warned, true) {
+        let comm = crate::pseudo::comm_str(Some(cx.task), cx.tgid());
+        klog::printk(
+            &log,
+            klog::level::WARNING,
+            format_args!(
+                "printk: {comm} ({}): Attempt to access syslog with CAP_SYS_ADMIN but no \
+                 CAP_SYSLOG (deprecated).",
+                cx.tid()
+            ),
+        );
+    }
+    Ok(0)
 }
 
 pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
@@ -1302,6 +1263,47 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
         done += n;
     }
     Ok(done as u64)
+}
+
+// ---- Time namespace offsets ----
+
+/// Converts the absolute time `abs` on clock `clock` in the time namespace into a wait deadline:
+/// first subtracts the offset (Linux's `timens_ktime_to_host`; times before the offset count as
+/// already past), then computes on the host's clock.
+pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Instant, Errno> {
+    deadline_from_clock(clock, to_host_clock(cx.time_offset(clock), abs))
+}
+
+/// What time `abs`, which includes offset `offset`, is on the host clock: the offset subtracted,
+/// not before 0.
+pub(super) fn to_host_clock(offset: i64, abs: Duration) -> Duration {
+    let ns = abs.as_nanos() as i128 - offset as i128;
+    Duration::from_nanos(ns.clamp(0, u64::MAX as i128) as u64)
+}
+
+/// Converts an absolute time on `clock` into a wait deadline. A time already past becomes an
+/// instant in the past: periodic timers count missed periods from it. A time too early for the
+/// monotonic clock to represent becomes now.
+pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
+    let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
+    let now = Duration::new(sec.max(0) as u64, nsec as u32);
+    let base = Instant::now();
+    Ok(match abs.checked_sub(now) {
+        Some(ahead) => base + ahead,
+        None => base.checked_sub(now - abs).unwrap_or(base),
+    })
+}
+
+/// A host clock reading (sec, nsec) plus the time namespace offset `offset` (in nanoseconds).
+pub(super) fn add_offset((sec, nsec): (i64, i64), offset: i64) -> (i64, i64) {
+    if offset == 0 {
+        return (sec, nsec);
+    }
+    let ns = sec as i128 * 1_000_000_000 + nsec as i128 + offset as i128;
+    (
+        ns.div_euclid(1_000_000_000) as i64,
+        ns.rem_euclid(1_000_000_000) as i64,
+    )
 }
 
 #[cfg(test)]

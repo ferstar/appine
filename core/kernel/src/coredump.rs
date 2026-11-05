@@ -284,6 +284,156 @@ const NT_ARM_HW_BREAK: u32 = 0x402;
 const NT_ARM_HW_WATCH: u32 = 0x403;
 const NT_ARM_SYSTEM_CALL: u32 = 0x404;
 
+/// All notes, in the order of Linux's `write_note_info`: for each thread `NT_PRSTATUS` first;
+/// after the first thread (the one that raised the signal) come the process's `NT_PRPSINFO`,
+/// `NT_SIGINFO`, `NT_AUXV` and `NT_FILE`, then that thread's other register sets.
+fn notes(
+    cx: &Cx<'_>,
+    mm: &Mm,
+    regions: &[DumpRegion],
+    threads: &[ThreadCore],
+    sig: Signal,
+    info: &SigInfo,
+) -> Vec<u8> {
+    let g = cx.t.group.borrow();
+    // The process's CPU time: exited threads are already added to g.cpu, the thread that raised
+    // the signal is not yet
+    let process_cpu = g.cpu + threads[0].cpu;
+    let mut out = Vec::new();
+    for (i, t) in threads.iter().enumerate() {
+        note(
+            &mut out,
+            "CORE",
+            NT_PRSTATUS,
+            &prstatus(&g, t, sig, process_cpu),
+        );
+        if i == 0 {
+            note(&mut out, "CORE", NT_PRPSINFO, &prpsinfo(cx, &g, mm));
+            note(&mut out, "CORE", NT_SIGINFO, &info.encode(sig));
+            let auxv: Vec<u8> = mm.auxv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            note(&mut out, "CORE", NT_AUXV, &auxv);
+            note(&mut out, "CORE", NT_FILE, &files(regions));
+        }
+        // The other register sets are the same as PTRACE_GETREGSET reads; not in a syscall, so
+        // the number is -1
+        for (name, nt) in [
+            ("CORE", NT_PRFPREG),
+            ("LINUX", NT_ARM_TLS),
+            ("LINUX", NT_ARM_HW_BREAK),
+            ("LINUX", NT_ARM_HW_WATCH),
+            ("LINUX", NT_ARM_SYSTEM_CALL),
+        ] {
+            let desc = crate::syscall::encode_regset(u64::from(nt), &t.regs, -1, &t.hw);
+            note(&mut out, name, nt, &desc);
+        }
+    }
+    out
+}
+
+/// One note: the name and the contents are each aligned to 4 bytes.
+fn note(out: &mut Vec<u8>, name: &str, ty: u32, desc: &[u8]) {
+    out.extend_from_slice(&(name.len() as u32 + 1).to_le_bytes());
+    out.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ty.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out.extend_from_slice(desc);
+    out.resize(out.len().next_multiple_of(4), 0);
+}
+
+/// `struct elf_prstatus` (arm64, 392 bytes). As on Linux, the thread group's main thread reports
+/// the whole process's CPU time (`process_cpu`), other threads their own.
+fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) -> Vec<u8> {
+    let mut b = vec![0u8; 392];
+    b[..4].copy_from_slice(&sig.number().to_le_bytes());
+    b[12..14].copy_from_slice(&(sig.number() as u16).to_le_bytes());
+    b[16..24].copy_from_slice(&t.pending.to_le_bytes());
+    b[24..32].copy_from_slice(&t.blocked.to_le_bytes());
+    // pids are the ids in the process's own pid namespace (Linux's fill_prstatus uses
+    // task_pid_vnr)
+    for (i, &v) in [t.tid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+        let v = g.pid_ns.vnr(v).unwrap_or(0);
+        b[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let cpu = if t.tid == g.tgid { process_cpu } else { t.cpu };
+    b[48..64].copy_from_slice(&timeval(cpu.user_ns()));
+    b[64..80].copy_from_slice(&timeval(cpu.sys_ns));
+    b[80..96].copy_from_slice(&timeval(g.child_cpu.user_ns()));
+    b[96..112].copy_from_slice(&timeval(g.child_cpu.sys_ns));
+    let r = &t.regs;
+    // user_pt_regs: x0–x30, sp, pc, pstate
+    for (i, v) in r.x.iter().chain(&[r.sp, r.pc, r.pstate]).enumerate() {
+        b[112 + i * 8..120 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b[384..388].copy_from_slice(&1i32.to_le_bytes()); // pr_fpvalid
+    b
+}
+
+fn timeval(ns: u64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    b[8..].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+    b
+}
+
+/// `struct elf_prpsinfo` (arm64, 136 bytes): state, credentials, pids, comm and the first 79
+/// bytes of the command line (NULs between arguments replaced by spaces).
+fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
+    const PF_FORKNOEXEC: u64 = 0x40;
+    const PF_DUMPCORE: u64 = 0x200;
+    const PF_SIGNALED: u64 = 0x400;
+    let mut b = vec![0u8; 136];
+    b[1] = b'R';
+    b[3] = cx.task.nice.get() as i8 as u8;
+    let flags = PF_DUMPCORE | PF_SIGNALED | if g.execed { 0 } else { PF_FORKNOEXEC };
+    b[8..16].copy_from_slice(&flags.to_le_bytes());
+    // The real user and group IDs as seen in the process's own user namespace (Linux's
+    // fill_psinfo)
+    b[16..20].copy_from_slice(&g.cred.uid_out(g.cred.ruid).to_le_bytes());
+    b[20..24].copy_from_slice(&g.cred.gid_out(g.cred.rgid).to_le_bytes());
+    for (i, &v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
+        let v = g.pid_ns.vnr(v).unwrap_or(0);
+        b[24 + i * 4..28 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b[40..56].copy_from_slice(&cx.task.comm.get());
+    let (start, end) = mm.args;
+    let len = end.saturating_sub(start).min(79) as usize;
+    let mut args = vec![0u8; len];
+    if mm
+        .read(crate::uaccess::UserSlice::new(start, len), &mut args)
+        .is_ok()
+    {
+        let used = args.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+        for (i, &c) in args[..used].iter().enumerate() {
+            b[56 + i] = if c == 0 { b' ' } else { c };
+        }
+    }
+    b
+}
+
+/// `NT_FILE`: the number of file mappings, the page size, (start, end, file offset in pages) for
+/// each, then their paths.
+fn files(regions: &[DumpRegion]) -> Vec<u8> {
+    let mapped: Vec<_> = regions
+        .iter()
+        .filter_map(|r| r.file.as_ref().map(|f| (r, f)))
+        .collect();
+    let mut b = Vec::new();
+    b.extend_from_slice(&(mapped.len() as u64).to_le_bytes());
+    b.extend_from_slice(&PAGE_SIZE.to_le_bytes());
+    for (r, (offset, _)) in &mapped {
+        for v in [r.start, r.end, offset / PAGE_SIZE] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for (_, (_, path)) in &mapped {
+        b.extend_from_slice(path);
+        b.push(0);
+    }
+    b
+}
+
 /// The ELF header and program headers, and the file position of the first mapping's contents
 /// (page-aligned, Linux's `dataoff`).
 fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
@@ -365,156 +515,6 @@ fn elf_header(regions: &[DumpRegion], notes: &[u8]) -> (Vec<u8>, u64) {
         b.extend_from_slice(&sh);
     }
     (b, data_offset)
-}
-
-/// One note: the name and the contents are each aligned to 4 bytes.
-fn note(out: &mut Vec<u8>, name: &str, ty: u32, desc: &[u8]) {
-    out.extend_from_slice(&(name.len() as u32 + 1).to_le_bytes());
-    out.extend_from_slice(&(desc.len() as u32).to_le_bytes());
-    out.extend_from_slice(&ty.to_le_bytes());
-    out.extend_from_slice(name.as_bytes());
-    out.push(0);
-    out.resize(out.len().next_multiple_of(4), 0);
-    out.extend_from_slice(desc);
-    out.resize(out.len().next_multiple_of(4), 0);
-}
-
-/// All notes, in the order of Linux's `write_note_info`: for each thread `NT_PRSTATUS` first;
-/// after the first thread (the one that raised the signal) come the process's `NT_PRPSINFO`,
-/// `NT_SIGINFO`, `NT_AUXV` and `NT_FILE`, then that thread's other register sets.
-fn notes(
-    cx: &Cx<'_>,
-    mm: &Mm,
-    regions: &[DumpRegion],
-    threads: &[ThreadCore],
-    sig: Signal,
-    info: &SigInfo,
-) -> Vec<u8> {
-    let g = cx.t.group.borrow();
-    // The process's CPU time: exited threads are already added to g.cpu, the thread that raised
-    // the signal is not yet
-    let process_cpu = g.cpu + threads[0].cpu;
-    let mut out = Vec::new();
-    for (i, t) in threads.iter().enumerate() {
-        note(
-            &mut out,
-            "CORE",
-            NT_PRSTATUS,
-            &prstatus(&g, t, sig, process_cpu),
-        );
-        if i == 0 {
-            note(&mut out, "CORE", NT_PRPSINFO, &prpsinfo(cx, &g, mm));
-            note(&mut out, "CORE", NT_SIGINFO, &info.encode(sig));
-            let auxv: Vec<u8> = mm.auxv.iter().flat_map(|w| w.to_le_bytes()).collect();
-            note(&mut out, "CORE", NT_AUXV, &auxv);
-            note(&mut out, "CORE", NT_FILE, &files(regions));
-        }
-        // The other register sets are the same as PTRACE_GETREGSET reads; not in a syscall, so
-        // the number is -1
-        for (name, nt) in [
-            ("CORE", NT_PRFPREG),
-            ("LINUX", NT_ARM_TLS),
-            ("LINUX", NT_ARM_HW_BREAK),
-            ("LINUX", NT_ARM_HW_WATCH),
-            ("LINUX", NT_ARM_SYSTEM_CALL),
-        ] {
-            let desc = crate::syscall::encode_regset(u64::from(nt), &t.regs, -1, &t.hw);
-            note(&mut out, name, nt, &desc);
-        }
-    }
-    out
-}
-
-fn timeval(ns: u64) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
-    b[8..].copy_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
-    b
-}
-
-/// `struct elf_prstatus` (arm64, 392 bytes). As on Linux, the thread group's main thread reports
-/// the whole process's CPU time (`process_cpu`), other threads their own.
-fn prstatus(g: &ThreadGroup, t: &ThreadCore, sig: Signal, process_cpu: CpuTime) -> Vec<u8> {
-    let mut b = vec![0u8; 392];
-    b[..4].copy_from_slice(&sig.number().to_le_bytes());
-    b[12..14].copy_from_slice(&(sig.number() as u16).to_le_bytes());
-    b[16..24].copy_from_slice(&t.pending.to_le_bytes());
-    b[24..32].copy_from_slice(&t.blocked.to_le_bytes());
-    // pids are the ids in the process's own pid namespace (Linux's fill_prstatus uses
-    // task_pid_vnr)
-    for (i, &v) in [t.tid, g.ppid, g.pgid, g.sid].iter().enumerate() {
-        let v = g.pid_ns.vnr(v).unwrap_or(0);
-        b[32 + i * 4..36 + i * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    let cpu = if t.tid == g.tgid { process_cpu } else { t.cpu };
-    b[48..64].copy_from_slice(&timeval(cpu.user_ns()));
-    b[64..80].copy_from_slice(&timeval(cpu.sys_ns));
-    b[80..96].copy_from_slice(&timeval(g.child_cpu.user_ns()));
-    b[96..112].copy_from_slice(&timeval(g.child_cpu.sys_ns));
-    let r = &t.regs;
-    // user_pt_regs: x0–x30, sp, pc, pstate
-    for (i, v) in r.x.iter().chain(&[r.sp, r.pc, r.pstate]).enumerate() {
-        b[112 + i * 8..120 + i * 8].copy_from_slice(&v.to_le_bytes());
-    }
-    b[384..388].copy_from_slice(&1i32.to_le_bytes()); // pr_fpvalid
-    b
-}
-
-/// `struct elf_prpsinfo` (arm64, 136 bytes): state, credentials, pids, comm and the first 79
-/// bytes of the command line (NULs between arguments replaced by spaces).
-fn prpsinfo(cx: &Cx<'_>, g: &ThreadGroup, mm: &Mm) -> Vec<u8> {
-    const PF_FORKNOEXEC: u64 = 0x40;
-    const PF_DUMPCORE: u64 = 0x200;
-    const PF_SIGNALED: u64 = 0x400;
-    let mut b = vec![0u8; 136];
-    b[1] = b'R';
-    b[3] = cx.task.nice.get() as i8 as u8;
-    let flags = PF_DUMPCORE | PF_SIGNALED | if g.execed { 0 } else { PF_FORKNOEXEC };
-    b[8..16].copy_from_slice(&flags.to_le_bytes());
-    // The real user and group IDs as seen in the process's own user namespace (Linux's
-    // fill_psinfo)
-    b[16..20].copy_from_slice(&g.cred.uid_out(g.cred.ruid).to_le_bytes());
-    b[20..24].copy_from_slice(&g.cred.gid_out(g.cred.rgid).to_le_bytes());
-    for (i, &v) in [g.tgid, g.ppid, g.pgid, g.sid].iter().enumerate() {
-        let v = g.pid_ns.vnr(v).unwrap_or(0);
-        b[24 + i * 4..28 + i * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    b[40..56].copy_from_slice(&cx.task.comm.get());
-    let (start, end) = mm.args;
-    let len = end.saturating_sub(start).min(79) as usize;
-    let mut args = vec![0u8; len];
-    if mm
-        .read(crate::uaccess::UserSlice::new(start, len), &mut args)
-        .is_ok()
-    {
-        let used = args.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
-        for (i, &c) in args[..used].iter().enumerate() {
-            b[56 + i] = if c == 0 { b' ' } else { c };
-        }
-    }
-    b
-}
-
-/// `NT_FILE`: the number of file mappings, the page size, (start, end, file offset in pages) for
-/// each, then their paths.
-fn files(regions: &[DumpRegion]) -> Vec<u8> {
-    let mapped: Vec<_> = regions
-        .iter()
-        .filter_map(|r| r.file.as_ref().map(|f| (r, f)))
-        .collect();
-    let mut b = Vec::new();
-    b.extend_from_slice(&(mapped.len() as u64).to_le_bytes());
-    b.extend_from_slice(&PAGE_SIZE.to_le_bytes());
-    for (r, (offset, _)) in &mapped {
-        for v in [r.start, r.end, offset / PAGE_SIZE] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    for (_, (_, path)) in &mapped {
-        b.extend_from_slice(path);
-        b.push(0);
-    }
-    b
 }
 
 #[cfg(test)]

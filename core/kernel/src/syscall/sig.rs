@@ -20,14 +20,6 @@ const SIG_SETMASK: u32 = 2;
 /// Size of the guest's sigset_t in the kernel ABI (64 signals).
 const SIGSET_SIZE: usize = 8;
 
-/// A signal number argument: 0 only checks that the target exists.
-fn signal_arg(sig: i32) -> Result<Option<Signal>, Errno> {
-    if sig == 0 {
-        return Ok(None);
-    }
-    Signal::new(sig).map(Some).ok_or(Errno::EINVAL)
-}
-
 pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     let sig = signal_arg(sig)?;
     let me = cx.tgid();
@@ -94,16 +86,6 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
     Ok(0)
 }
 
-/// Whether process `tgid` may be sent signal `sig` (`check_kill_permission`): the credentials
-/// allow it, or it is the same process, or it is SIGCONT sent within the same session.
-fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, tgid: Tid, sig: Option<Signal>) -> bool {
-    let Some(target) = cx.kr().groups.get(&tgid) else {
-        return false;
-    };
-    let t = target.borrow();
-    t.tgid == cx.tgid() || cred.may_signal(&t.cred) || (sig == Some(Signal::CONT) && t.sid == sid)
-}
-
 pub(super) fn tkill(cx: &mut Cx<'_>, tid: i32, sig: i32) -> SysResult {
     kill_thread(cx, None, tid, sig)
 }
@@ -144,20 +126,6 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
         signal::send_to_task(cx.kr(), &task, sig, info);
     }
     Ok(0)
-}
-
-/// The siginfo given by the caller (rt_sigqueueinfo, pidfd_send_signal).
-fn queue_info(b: &[u8; 128]) -> SigInfo {
-    let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-    SigInfo {
-        code: word(8),
-        fields: signal::InfoFields::Queue {
-            pid: word(16),
-            uid: word(20) as u32,
-            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
-        },
-        ..SigInfo::default()
-    }
 }
 
 /// pidfd_send_signal: the pidfd may also be an open `/proc/<pid>` directory. With `uinfo` null it
@@ -304,133 +272,36 @@ pub(super) fn sigqueueinfo(
     Ok(0)
 }
 
-/// signalfd4: creates a new one when `fd` is -1, otherwise changes the mask of an existing
-/// signalfd.
-pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags: u32) -> SysResult {
-    use crate::fd::{FileKind, OpenFile, SignalFd, oflags};
-    if size != SIGSET_SIZE || flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
-        return Err(Errno::EINVAL);
+/// A signal number argument: 0 only checks that the target exists.
+fn signal_arg(sig: i32) -> Result<Option<Signal>, Errno> {
+    if sig == 0 {
+        return Ok(None);
     }
-    let set = u64::from_le_bytes(get(cx, mask)?) & !UNBLOCKABLE;
-    if fd != -1 {
-        let file = cx.fds().get(fd)?;
-        let FileKind::SignalFd(s) = &file.borrow().kind else {
-            return Err(Errno::EINVAL);
-        };
-        s.borrow_mut().mask = set;
-        // Threads waiting on this signalfd recheck with the new mask (poll registered it)
-        crate::kernel::request_wake_object(crate::kernel::wake::of(s));
-        return Ok(fd as u64);
+    Signal::new(sig).map(Some).ok_or(Errno::EINVAL)
+}
+
+/// The siginfo given by the caller (rt_sigqueueinfo, pidfd_send_signal).
+fn queue_info(b: &[u8; 128]) -> SigInfo {
+    let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    SigInfo {
+        code: word(8),
+        fields: signal::InfoFields::Queue {
+            pid: word(16),
+            uid: word(20) as u32,
+            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        },
+        ..SigInfo::default()
     }
-    let s = SignalFd {
-        mask: set,
-        group: std::rc::Rc::downgrade(&cx.t.group),
+}
+
+/// Whether process `tgid` may be sent signal `sig` (`check_kill_permission`): the credentials
+/// allow it, or it is the same process, or it is SIGCONT sent within the same session.
+fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, tgid: Tid, sig: Option<Signal>) -> bool {
+    let Some(target) = cx.kr().groups.get(&tgid) else {
+        return false;
     };
-    let file = OpenFile::new(
-        FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
-        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
-    );
-    cx.fds_mut()
-        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
-        .map(|fd| fd as u64)
-}
-
-/// Reads a signalfd: takes the caller's pending signals that are in the mask, each encoded as a
-/// 128-byte `struct signalfd_siginfo`. Blocks when there are none (EAGAIN when nonblocking).
-pub(super) fn signalfd_read(
-    cx: &mut Cx<'_>,
-    s: &std::rc::Rc<crate::cell::RefCell<crate::fd::SignalFd>>,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    if buf.len() < 128 {
-        return Err(Errno::EINVAL);
-    }
-    let mut n = 0;
-    loop {
-        let mask = s.borrow().mask;
-        while n + 128 <= buf.len() {
-            let Some((sig, info)) = signal::take(cx, mask) else {
-                break;
-            };
-            buf[n..n + 128].copy_from_slice(&encode_signalfd_siginfo(sig, &info));
-            n += 128;
-        }
-        if n > 0 {
-            return Ok(n);
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        // A blocked signal becoming pending requests wake::SIGNAL; changing the mask requests
-        // this signalfd
-        cx.wait_objects(None, &mut [], wake::FILE | wake::SIGNAL, &[wake::of(s)])?;
-    }
-}
-
-/// `struct signalfd_siginfo` (128 bytes).
-fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
-    use signal::InfoFields;
-    let mut b = [0u8; 128];
-    let mut put32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    put32(0, sig.number() as u32);
-    put32(8, info.code as u32);
-    let mut value = None;
-    match info.fields {
-        InfoFields::None => {}
-        InfoFields::Kill { pid, uid } => {
-            put32(12, pid as u32);
-            put32(16, uid);
-        }
-        InfoFields::Child { pid, uid, status } => {
-            put32(12, pid as u32);
-            put32(16, uid);
-            put32(40, status as u32);
-        }
-        InfoFields::Queue { pid, uid, value: v } => {
-            put32(12, pid as u32);
-            put32(16, uid);
-            value = Some(v);
-        }
-        InfoFields::Timer {
-            id,
-            overrun,
-            value: v,
-        } => {
-            put32(24, id as u32);
-            put32(32, overrun);
-            value = Some(v);
-        }
-        InfoFields::Fault { addr } => b[72..80].copy_from_slice(&addr.to_le_bytes()),
-        InfoFields::Poll { band, fd } => {
-            put32(20, fd as u32);
-            put32(28, band as u32);
-        }
-        InfoFields::Sys {
-            errno,
-            call_addr,
-            syscall,
-            arch,
-        } => {
-            put32(4, errno as u32);
-            put32(84, syscall as u32);
-            put32(96, arch);
-            b[88..96].copy_from_slice(&call_addr.to_le_bytes());
-        }
-        // Given by a tracer: most si_codes start with the sender's pid and uid
-        InfoFields::Raw(rest) => {
-            put32(12, u32::from_le_bytes(rest[..4].try_into().unwrap()));
-            put32(16, u32::from_le_bytes(rest[4..8].try_into().unwrap()));
-        }
-    }
-    if let Some(v) = value {
-        b[44..48].copy_from_slice(&(v as u32).to_le_bytes());
-        b[48..56].copy_from_slice(&v.to_le_bytes());
-    }
-    b
+    let t = target.borrow();
+    t.tgid == cx.tgid() || cred.may_signal(&t.cred) || (sig == Some(Signal::CONT) && t.sid == sid)
 }
 
 pub(super) fn rt_sigaction(
@@ -597,6 +468,135 @@ pub(super) fn rt_sigtimedwait(
         // thread directly
         cx.wait_on(deadline, &mut [], wake::SIGNAL)?;
     }
+}
+
+/// signalfd4: creates a new one when `fd` is -1, otherwise changes the mask of an existing
+/// signalfd.
+pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags: u32) -> SysResult {
+    use crate::fd::{FileKind, OpenFile, SignalFd, oflags};
+    if size != SIGSET_SIZE || flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let set = u64::from_le_bytes(get(cx, mask)?) & !UNBLOCKABLE;
+    if fd != -1 {
+        let file = cx.fds().get(fd)?;
+        let FileKind::SignalFd(s) = &file.borrow().kind else {
+            return Err(Errno::EINVAL);
+        };
+        s.borrow_mut().mask = set;
+        // Threads waiting on this signalfd recheck with the new mask (poll registered it)
+        crate::kernel::request_wake_object(crate::kernel::wake::of(s));
+        return Ok(fd as u64);
+    }
+    let s = SignalFd {
+        mask: set,
+        group: std::rc::Rc::downgrade(&cx.t.group),
+    };
+    let file = OpenFile::new(
+        FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
+        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
+    );
+    cx.fds_mut()
+        .install(file, flags & oflags::O_CLOEXEC != 0, 0)
+        .map(|fd| fd as u64)
+}
+
+/// Reads a signalfd: takes the caller's pending signals that are in the mask, each encoded as a
+/// 128-byte `struct signalfd_siginfo`. Blocks when there are none (EAGAIN when nonblocking).
+pub(super) fn signalfd_read(
+    cx: &mut Cx<'_>,
+    s: &std::rc::Rc<crate::cell::RefCell<crate::fd::SignalFd>>,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    if buf.len() < 128 {
+        return Err(Errno::EINVAL);
+    }
+    let mut n = 0;
+    loop {
+        let mask = s.borrow().mask;
+        while n + 128 <= buf.len() {
+            let Some((sig, info)) = signal::take(cx, mask) else {
+                break;
+            };
+            buf[n..n + 128].copy_from_slice(&encode_signalfd_siginfo(sig, &info));
+            n += 128;
+        }
+        if n > 0 {
+            return Ok(n);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        // A blocked signal becoming pending requests wake::SIGNAL; changing the mask requests
+        // this signalfd
+        cx.wait_objects(None, &mut [], wake::FILE | wake::SIGNAL, &[wake::of(s)])?;
+    }
+}
+
+/// `struct signalfd_siginfo` (128 bytes).
+fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
+    use signal::InfoFields;
+    let mut b = [0u8; 128];
+    let mut put32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put32(0, sig.number() as u32);
+    put32(8, info.code as u32);
+    let mut value = None;
+    match info.fields {
+        InfoFields::None => {}
+        InfoFields::Kill { pid, uid } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+        }
+        InfoFields::Child { pid, uid, status } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+            put32(40, status as u32);
+        }
+        InfoFields::Queue { pid, uid, value: v } => {
+            put32(12, pid as u32);
+            put32(16, uid);
+            value = Some(v);
+        }
+        InfoFields::Timer {
+            id,
+            overrun,
+            value: v,
+        } => {
+            put32(24, id as u32);
+            put32(32, overrun);
+            value = Some(v);
+        }
+        InfoFields::Fault { addr } => b[72..80].copy_from_slice(&addr.to_le_bytes()),
+        InfoFields::Poll { band, fd } => {
+            put32(20, fd as u32);
+            put32(28, band as u32);
+        }
+        InfoFields::Sys {
+            errno,
+            call_addr,
+            syscall,
+            arch,
+        } => {
+            put32(4, errno as u32);
+            put32(84, syscall as u32);
+            put32(96, arch);
+            b[88..96].copy_from_slice(&call_addr.to_le_bytes());
+        }
+        // Given by a tracer: most si_codes start with the sender's pid and uid
+        InfoFields::Raw(rest) => {
+            put32(12, u32::from_le_bytes(rest[..4].try_into().unwrap()));
+            put32(16, u32::from_le_bytes(rest[4..8].try_into().unwrap()));
+        }
+    }
+    if let Some(v) = value {
+        b[44..48].copy_from_slice(&(v as u32).to_le_bytes());
+        b[48..56].copy_from_slice(&v.to_le_bytes());
+    }
+    b
 }
 
 pub(super) fn sigaltstack(cx: &mut Cx<'_>, sp: u64, uss: u64, uoss: u64) -> SysResult {

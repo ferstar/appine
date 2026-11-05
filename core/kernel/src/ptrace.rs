@@ -56,10 +56,6 @@ pub(crate) mod opt {
     pub const MASK: u32 = 0xff | EXITKILL | SUSPEND_SECCOMP;
 }
 
-/// The values of PTRACE_GETEVENTMSG at syscall entry and exit stops.
-pub(crate) const EVENTMSG_SYSCALL_ENTRY: u64 = 1;
-pub(crate) const EVENTMSG_SYSCALL_EXIT: u64 = 2;
-
 /// Why the thread stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stop {
@@ -142,19 +138,19 @@ pub(crate) fn pstate_of(s: &CpuState) -> u64 {
     (s.nzcv & PSTATE_NZCV) | (u64::from(s.dit) << 24)
 }
 
+/// Restores NZCV and DIT from a pstate ([`user_pstate`]).
+pub(crate) fn set_pstate(s: &mut CpuState, pstate: u64) {
+    let p = user_pstate(pstate);
+    s.nzcv = p & PSTATE_NZCV;
+    s.dit = u32::from(p & PSTATE_DIT != 0);
+}
+
 /// The bits of a pstate from a signal frame or from the tracer that the guest may change: NZCV,
 /// plus DIT when DIT is advertised (Linux's `valid_native_regs` only clears the RES0 bits and
 /// restores DIT as given; on hardware without DIT the bit has no effect).
 pub(crate) fn user_pstate(pstate: u64) -> u64 {
     let dit = appine_engine::guest_hwcap() & appine_engine::hwcap::DIT != 0;
     pstate & (PSTATE_NZCV | if dit { PSTATE_DIT } else { 0 })
-}
-
-/// Restores NZCV and DIT from a pstate ([`user_pstate`]).
-pub(crate) fn set_pstate(s: &mut CpuState, pstate: u64) {
-    let p = user_pstate(pstate);
-    s.nzcv = p & PSTATE_NZCV;
-    s.dit = u32::from(p & PSTATE_DIT != 0);
 }
 
 /// A thread's ptrace state ([`Task::trace`]), accessed only while holding the BKL.
@@ -205,6 +201,35 @@ pub(crate) struct Trace {
     pub hw_changed: bool,
 }
 
+impl Trace {
+    /// The status reported to the tracer on a stop (Linux's `exit_code`): the wait4 status word is
+    /// it shifted left by 8 and ORed with 0x7f, and waitid's `si_status` is it.
+    pub fn exit_code(&self) -> Option<i32> {
+        let trap = Signal::TRAP.number();
+        Some(match self.stop? {
+            Stop::Signal(s) | Stop::Group(s) => s.number(),
+            Stop::Syscall(_) if self.options & opt::TRACESYSGOOD != 0 => trap | 0x80,
+            Stop::Syscall(_) => trap,
+            Stop::Event(e, s) => s.number() | (e as i32) << 8,
+        })
+    }
+
+    /// The tracer has enabled event `e`.
+    pub fn enabled(&self, e: u32) -> bool {
+        self.tracer.is_some() && self.options & (1 << e) != 0
+    }
+
+    /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
+    pub fn stopped(&self) -> bool {
+        self.stop.is_some() && !self.listening
+    }
+}
+
+/// The thread is traced.
+pub(crate) fn traced(task: &Task) -> bool {
+    task.trace.borrow().tracer.is_some()
+}
+
 /// Number of hardware breakpoint and watchpoint slots, the same as common Cortex-A cores (BRPs
 /// and WRPs of `ID_AA64DFR0_EL1`).
 pub(crate) const BRK_SLOTS: usize = 6;
@@ -253,40 +278,358 @@ impl HwDebug {
     }
 }
 
-impl Trace {
-    /// The status reported to the tracer on a stop (Linux's `exit_code`): the wait4 status word is
-    /// it shifted left by 8 and ORed with 0x7f, and waitid's `si_status` is it.
-    pub fn exit_code(&self) -> Option<i32> {
-        let trap = Signal::TRAP.number();
-        Some(match self.stop? {
-            Stop::Signal(s) | Stop::Group(s) => s.number(),
-            Stop::Syscall(_) if self.options & opt::TRACESYSGOOD != 0 => trap | 0x80,
-            Stop::Syscall(_) => trap,
-            Stop::Event(e, s) => s.number() | (e as i32) << 8,
-        })
-    }
+// ---- Signal-delivery stops and group-stops ----
 
-    /// The tracer has enabled event `e`.
-    pub fn enabled(&self, e: u32) -> bool {
-        self.tracer.is_some() && self.options & (1 << e) != 0
-    }
+/// Joins a group-stop (the thread group was stopped by a stop signal): stops in a ptrace-stop and
+/// reports to the tracer. Does nothing when there is no group-stop to join. Returns false when
+/// the thread is killed.
+pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+    let (sig, seized) = {
+        let mut t = cx.task.trace.borrow_mut();
+        match t.group_stop.take() {
+            Some(sig) if t.tracer.is_some() => (sig, t.seized),
+            _ => return true,
+        }
+    };
+    let (why, info) = if seized {
+        let si_code = sig.number() | (event::STOP as i32) << 8;
+        let info = notify_info(
+            sig,
+            si_code,
+            cx.pid_out(cx.tid()),
+            cx.cred().uid_out(cx.cred().ruid),
+        );
+        (Stop::Event(event::STOP, sig), Some(info))
+    } else {
+        (Stop::Group(sig), None)
+    };
+    stop(cx, cpu, why, info, 0).is_some()
+}
 
-    /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
-    pub fn stopped(&self) -> bool {
-        self.stop.is_some() && !self.listening
+/// PTRACE_INTERRUPT, or a new thread auto-attached under SEIZE: stops once at
+/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due. Returns false when the thread is
+/// killed.
+pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+    {
+        let mut t = cx.task.trace.borrow_mut();
+        if !std::mem::take(&mut t.trap) || t.tracer.is_none() {
+            return true;
+        }
+    }
+    let sig = Signal::TRAP;
+    let si_code = sig.number() | (event::STOP as i32) << 8;
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
+    stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
+}
+
+/// Before signal `sig` is delivered (signal-delivery stop). Returns the signal the tracer lets
+/// through and its siginfo, `Ok(None)` when the tracer suppresses delivery, and `Err(())` when the
+/// thread is killed.
+pub(crate) fn signal_stop(
+    cx: &mut Cx<'_>,
+    cpu: &mut Cpu,
+    sig: Signal,
+    info: SigInfo,
+) -> Result<Option<(Signal, SigInfo)>, ()> {
+    if !traced(cx.task) {
+        return Ok(Some((sig, info)));
+    }
+    let raw = info.encode(sig);
+    let data = stop(cx, cpu, Stop::Signal(sig), Some(raw), 0).ok_or(())?;
+    let Some(new) = Signal::new(data) else {
+        return Ok(None);
+    };
+    // The siginfo as changed by PTRACE_SETSIGINFO (Linux's ptrace_signal)
+    let now = cx.task.trace.borrow_mut().siginfo.take().unwrap_or(raw);
+    let signo = i32::from_le_bytes(now[..4].try_into().unwrap());
+    let info = if new.number() != signo {
+        // The signal was replaced without a siginfo: treat it as sent by the tracer with kill
+        let tracer = cx.task.trace.borrow().tracer.unwrap_or(0);
+        let uid = cx
+            .kr()
+            .groups
+            .get(&tracer)
+            .map_or(0, |g| g.borrow().cred.ruid);
+        // Linux's ptrace_signal: the tracer's real user ID as seen in the tracee's namespace
+        SigInfo::kill(code::SI_USER, cx.pid_out(tracer), cx.cred().uid_out(uid))
+    } else if now == raw {
+        info
+    } else {
+        SigInfo::from_raw(&now)
+    };
+    // The replacement signal is blocked: queue it again, to be delivered once unblocked
+    if cx.task.sigmask.get() & new.bit() != 0 {
+        signal::send_to_task(cx.kr(), cx.task, new, info);
+        return Ok(None);
+    }
+    Ok(Some((new, info)))
+}
+
+/// While single-stepping, a signal handler has just been set up (its first instruction not yet
+/// executed): stops once, as Linux's `ptrace_notify(SIGTRAP)` does; the tracer sees a siginfo of
+/// SIGTRAP whose `si_code` is also SIGTRAP and whose sender is the thread itself. The signal of
+/// this stop is not delivered. Returns false when the thread is killed.
+pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+    if !traced(cx.task) {
+        return true;
+    }
+    let sig = Signal::TRAP;
+    let info = notify_info(
+        sig,
+        sig.number(),
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
+    stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
+}
+
+// ---- Single-step ----
+
+/// PTRACE_SINGLESTEP made the thread execute one instruction (not an svc): as with arm64 Linux's
+/// single-step exception, delivers SIGTRAP (`TRAP_TRACE`, with the address of the next
+/// instruction) and reports to the tracer in a signal-delivery stop.
+pub(crate) fn step_done(cx: &mut Cx<'_>, cpu: &Cpu) {
+    let info = SigInfo::fault(code::TRAP_TRACE, cpu.state().pc, 0);
+    signal::force(cx, Signal::TRAP, info);
+}
+
+/// The single-stepped instruction was an svc: reports after the syscall completes. As on arm64
+/// Linux, this SIGTRAP is `SI_USER` with no sender; the hardware single-step state is still
+/// pending, so the next PTRACE_SINGLESTEP executes no instruction and reports `TRAP_TRACE` again
+/// in place (`Task::step_again`).
+pub(crate) fn syscall_stepped(cx: &mut Cx<'_>) {
+    if cx.task.stepping.load(Ordering::Relaxed) {
+        signal::force(cx, Signal::TRAP, SigInfo::kill(code::SI_USER, 0, 0));
+        cx.task.step_again.store(true, Ordering::Relaxed);
     }
 }
 
-/// The thread is traced.
-pub(crate) fn traced(task: &Task) -> bool {
-    task.trace.borrow().tracer.is_some()
+// ---- Syscall stops ----
+
+/// The values of PTRACE_GETEVENTMSG at syscall entry and exit stops.
+pub(crate) const EVENTMSG_SYSCALL_ENTRY: u64 = 1;
+pub(crate) const EVENTMSG_SYSCALL_EXIT: u64 = 2;
+
+/// The entry of a syscall (number `nr`). Returns None when there is no tracer, or when it is a
+/// vDSO clock stub (on Linux these do not enter the kernel, so tracers do not see them).
+/// Otherwise records the number, as Linux's `regs->syscallno` does: when resumed other than by
+/// PTRACE_SYSCALL, event stops along the way (`PTRACE_EVENT_FORK` and so on), exit stops after a
+/// later switch to PTRACE_SYSCALL, and `NT_ARM_SYSTEM_CALL` also read this syscall's number;
+/// returns whether PTRACE_SYSCALL stops at the entry. Whether to stop at the exit is decided
+/// again by [`syscall_exit`] from the state at that time.
+pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
+    if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
+        return None;
+    }
+    let mut t = cx.task.trace.borrow_mut();
+    t.syscallno = nr as i32;
+    Some(t.mode == Mode::Syscall)
 }
 
-/// The siginfo sent by the tracer: carries a sender as a kill would (what Linux's
-/// `ptrace_do_notify` fills in is the tracee thread itself).
-fn notify_info(signo: Signal, si_code: i32, pid: Tid, uid: u32) -> [u8; 128] {
-    SigInfo::kill(si_code, pid, uid).encode(signo)
+/// Stops at syscall entry (the number was recorded by [`syscall_start`]). Returns the number as
+/// changed by the tracer (-1 skips this syscall); None when the thread is killed.
+pub(crate) fn syscall_entry(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Option<u64> {
+    syscall_stop(cx, cpu, true).then(|| cx.task.trace.borrow().syscallno as i64 as u64)
 }
+
+/// A seccomp filter returned TRACE (with data `data`): stops once at `PTRACE_EVENT_SECCOMP`, and
+/// the tracer may change the number (`NT_ARM_SYSTEM_CALL`, -1 skips) and the registers. Returns
+/// the resulting number; None when the thread is killed.
+pub(crate) fn seccomp_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64, data: u32) -> Option<u64> {
+    cx.task.trace.borrow_mut().syscallno = nr as i32;
+    event(cx, cpu, event::SECCOMP, u64::from(data))
+        .then(|| cx.task.trace.borrow().syscallno as i64 as u64)
+}
+
+/// Stops at syscall exit (if the thread has by then been resumed with PTRACE_SYSCALL; rechecked
+/// as arm64 Linux's `syscall_trace_exit` does, whether or not it stopped at entry). Returns false
+/// when the thread is killed.
+pub(crate) fn syscall_exit(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
+    let nr = cx.task.trace.borrow().syscallno as i64 as u64;
+    !syscall_traced(cx, cpu, nr) || syscall_stop(cx, cpu, false)
+}
+
+/// Whether this syscall (number `nr`) stops at entry and exit after PTRACE_SYSCALL resumed the
+/// thread. vDSO clock stubs do not count: on Linux they do not enter the kernel, so tracers do
+/// not see them.
+pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
+    {
+        let t = cx.task.trace.borrow();
+        if t.tracer.is_none() || t.mode != Mode::Syscall {
+            return false;
+        }
+    }
+    !crate::vdso::clock_stub(cx, cpu.state().pc, nr)
+}
+
+/// A syscall stop: as on arm64 Linux, x7 is 0 (entry) or 1 (exit) during the stop, and the tracer
+/// can neither see nor change its original value. Returns false when the thread is killed.
+fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
+    let options = cx.task.trace.borrow().options;
+    let sig = Signal::TRAP;
+    let si_code = sig.number()
+        | if options & opt::TRACESYSGOOD != 0 {
+            0x80
+        } else {
+            0
+        };
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
+    let message = if entry {
+        EVENTMSG_SYSCALL_ENTRY
+    } else {
+        EVENTMSG_SYSCALL_EXIT
+    };
+    let saved = std::mem::replace(&mut cpu.state_mut().x[7], u64::from(!entry));
+    let data = stop(cx, cpu, Stop::Syscall(entry), Some(info), message);
+    cpu.state_mut().x[7] = saved;
+    match data {
+        Some(data) => {
+            inject(cx, data);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A signal the tracer injects at a syscall stop: treated, as on Linux, as a new signal the
+/// kernel sends to the thread itself.
+fn inject(cx: &Cx<'_>, data: i32) {
+    if let Some(sig) = Signal::new(data) {
+        signal::send_to_task(cx.kr(), cx.task, sig, SigInfo::kernel());
+    }
+}
+
+// ---- Event stops ----
+
+/// Whether a thread `child` created by clone (`flags` and `exit_signal` are clone's arguments) is
+/// traced: when the parent thread is traced, the matching event is enabled (or `CLONE_PTRACE` was
+/// used) and there is no `CLONE_UNTRACED`, the new thread is traced by the same tracer and stops
+/// before executing its first instruction (with a pending SIGSTOP when not under SEIZE). Returns
+/// the event the parent thread reports.
+pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -> Option<u32> {
+    const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_PTRACE: u64 = 0x2000;
+    const CLONE_UNTRACED: u64 = 0x0080_0000;
+    let p = parent.trace.borrow();
+    if p.tracer.is_none() || flags & CLONE_UNTRACED != 0 {
+        return None;
+    }
+    let e = if flags & CLONE_VFORK != 0 {
+        event::VFORK
+    } else if exit_signal != Signal::CHLD.number() {
+        event::CLONE
+    } else {
+        event::FORK
+    };
+    let report = p.enabled(e).then_some(e);
+    if report.is_none() && flags & CLONE_PTRACE == 0 {
+        return None;
+    }
+    {
+        let mut c = child.trace.borrow_mut();
+        c.tracer = p.tracer;
+        c.privileged = p.privileged;
+        c.seized = p.seized;
+        c.options = p.options;
+        if p.seized {
+            c.trap = true;
+        } else {
+            let stop = SigInfo::default();
+            child.pending.borrow_mut().add(Signal::STOP, stop, false);
+        }
+    }
+    // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
+    unsafe { child.sync.kicker.kick() };
+    report
+}
+
+/// execve: clears hardware breakpoints and watchpoints, as Linux's `flush_ptrace_hw_breakpoint`
+/// does.
+pub(crate) fn exec_hw_flush(cx: &Cx<'_>, cpu: &mut Cpu) {
+    let mut t = cx.task.trace.borrow_mut();
+    if t.hw != HwDebug::default() {
+        t.hw = HwDebug::default();
+        t.hw_changed = false;
+        cpu.state_mut().set_hw_debug(&[], &[]);
+    }
+}
+
+/// After a successful execve: `PTRACE_EVENT_EXEC` (the message is the tid before the execve); if
+/// the event is not enabled and the tracee is not under SEIZE, sends itself SIGTRAP. Returns false
+/// when the thread is killed.
+pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
+    let (traced, seized, enabled) = {
+        let t = cx.task.trace.borrow();
+        (t.tracer.is_some(), t.seized, t.enabled(event::EXEC))
+    };
+    if enabled {
+        let old = tracer_pid_of(cx, old_tid);
+        return event(cx, cpu, event::EXEC, old as u64);
+    }
+    if traced && !seized {
+        let cred = cx.cred();
+        let info = SigInfo::kill(
+            code::SI_USER,
+            cx.pid_out(cx.tgid()),
+            cred.uid_out(cred.ruid),
+        );
+        signal::send_to_task(cx.kr(), cx.task, Signal::TRAP, info);
+    }
+    true
+}
+
+/// The id of thread `tid` as seen by the process tracing it (`ptrace_event_pid`), or as seen by
+/// itself when there is no tracer.
+pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
+    match cx.task.trace.borrow().tracer {
+        Some(tracer) => cx.kr().pid_seen_by(tracer, tid),
+        None => cx.pid_out(tid),
+    }
+}
+
+/// The thread is about to exit (exit, exit_group, a fatal signal's default action):
+/// `PTRACE_EVENT_EXIT`, with the wait status word as the message. exit_group has already asked
+/// every thread to exit, including the caller; the caller still stops and reports, and stops
+/// waiting if killed by SIGKILL during the stop.
+pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
+    cx.task.begin_exit(cx.kr(), &cx.t.group, status);
+    if !cx.task.trace.borrow().enabled(event::EXIT) {
+        return;
+    }
+    let killed = cx.task.killed.replace(false);
+    if event(cx, cpu, event::EXIT, status.wait_status() as u64) {
+        cx.task.killed.set(killed);
+    }
+}
+
+/// Stops at a `PTRACE_EVENT_*` (when the tracer has enabled the event). Returns false when the
+/// thread is killed.
+pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> bool {
+    if !cx.task.trace.borrow().enabled(e) {
+        return true;
+    }
+    let sig = Signal::TRAP;
+    let si_code = sig.number() | (e as i32) << 8;
+    let info = notify_info(
+        sig,
+        si_code,
+        cx.pid_out(cx.tid()),
+        cx.cred().uid_out(cx.cred().ruid),
+    );
+    stop(cx, cpu, Stop::Event(e, sig), Some(info), message).is_some()
+}
+
+// ---- Stopping and notifying the tracer ----
 
 /// Stops in a ptrace-stop: notifies the tracer and waits for it to resume the thread. Returns the
 /// signal the tracer injects (0 means none); None when the thread is killed (SIGKILL). `info` is
@@ -374,17 +717,6 @@ pub(crate) fn stop(
     resumed
 }
 
-/// execve: clears hardware breakpoints and watchpoints, as Linux's `flush_ptrace_hw_breakpoint`
-/// does.
-pub(crate) fn exec_hw_flush(cx: &Cx<'_>, cpu: &mut Cpu) {
-    let mut t = cx.task.trace.borrow_mut();
-    if t.hw != HwDebug::default() {
-        t.hw = HwDebug::default();
-        t.hw_changed = false;
-        cpu.state_mut().set_hw_debug(&[], &[]);
-    }
-}
-
 /// Notifies the tracer that the thread stopped: wakes its wait, and sends SIGCHLD (`CLD_TRAPPED`,
 /// or `CLD_STOPPED` for a group-stop) unless it ignores SIGCHLD or has set SA_NOCLDSTOP.
 fn notify(k: &Kernel, task: &Task) {
@@ -417,333 +749,13 @@ fn notify(k: &Kernel, task: &Task) {
     signal::send_to_group(k, tracer, Signal::CHLD, info);
 }
 
-/// Before signal `sig` is delivered (signal-delivery stop). Returns the signal the tracer lets
-/// through and its siginfo, `Ok(None)` when the tracer suppresses delivery, and `Err(())` when the
-/// thread is killed.
-pub(crate) fn signal_stop(
-    cx: &mut Cx<'_>,
-    cpu: &mut Cpu,
-    sig: Signal,
-    info: SigInfo,
-) -> Result<Option<(Signal, SigInfo)>, ()> {
-    if !traced(cx.task) {
-        return Ok(Some((sig, info)));
-    }
-    let raw = info.encode(sig);
-    let data = stop(cx, cpu, Stop::Signal(sig), Some(raw), 0).ok_or(())?;
-    let Some(new) = Signal::new(data) else {
-        return Ok(None);
-    };
-    // The siginfo as changed by PTRACE_SETSIGINFO (Linux's ptrace_signal)
-    let now = cx.task.trace.borrow_mut().siginfo.take().unwrap_or(raw);
-    let signo = i32::from_le_bytes(now[..4].try_into().unwrap());
-    let info = if new.number() != signo {
-        // The signal was replaced without a siginfo: treat it as sent by the tracer with kill
-        let tracer = cx.task.trace.borrow().tracer.unwrap_or(0);
-        let uid = cx
-            .kr()
-            .groups
-            .get(&tracer)
-            .map_or(0, |g| g.borrow().cred.ruid);
-        // Linux's ptrace_signal: the tracer's real user ID as seen in the tracee's namespace
-        SigInfo::kill(code::SI_USER, cx.pid_out(tracer), cx.cred().uid_out(uid))
-    } else if now == raw {
-        info
-    } else {
-        SigInfo::from_raw(&now)
-    };
-    // The replacement signal is blocked: queue it again, to be delivered once unblocked
-    if cx.task.sigmask.get() & new.bit() != 0 {
-        signal::send_to_task(cx.kr(), cx.task, new, info);
-        return Ok(None);
-    }
-    Ok(Some((new, info)))
+/// The siginfo sent by the tracer: carries a sender as a kill would (what Linux's
+/// `ptrace_do_notify` fills in is the tracee thread itself).
+fn notify_info(signo: Signal, si_code: i32, pid: Tid, uid: u32) -> [u8; 128] {
+    SigInfo::kill(si_code, pid, uid).encode(signo)
 }
 
-/// Joins a group-stop (the thread group was stopped by a stop signal): stops in a ptrace-stop and
-/// reports to the tracer. Does nothing when there is no group-stop to join. Returns false when
-/// the thread is killed.
-pub(crate) fn group_stop(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
-    let (sig, seized) = {
-        let mut t = cx.task.trace.borrow_mut();
-        match t.group_stop.take() {
-            Some(sig) if t.tracer.is_some() => (sig, t.seized),
-            _ => return true,
-        }
-    };
-    let (why, info) = if seized {
-        let si_code = sig.number() | (event::STOP as i32) << 8;
-        let info = notify_info(
-            sig,
-            si_code,
-            cx.pid_out(cx.tid()),
-            cx.cred().uid_out(cx.cred().ruid),
-        );
-        (Stop::Event(event::STOP, sig), Some(info))
-    } else {
-        (Stop::Group(sig), None)
-    };
-    stop(cx, cpu, why, info, 0).is_some()
-}
-
-/// PTRACE_INTERRUPT, or a new thread auto-attached under SEIZE: stops once at
-/// `PTRACE_EVENT_STOP`. Does nothing when no stop is due. Returns false when the thread is
-/// killed.
-pub(crate) fn trap(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
-    {
-        let mut t = cx.task.trace.borrow_mut();
-        if !std::mem::take(&mut t.trap) || t.tracer.is_none() {
-            return true;
-        }
-    }
-    let sig = Signal::TRAP;
-    let si_code = sig.number() | (event::STOP as i32) << 8;
-    let info = notify_info(
-        sig,
-        si_code,
-        cx.pid_out(cx.tid()),
-        cx.cred().uid_out(cx.cred().ruid),
-    );
-    stop(cx, cpu, Stop::Event(event::STOP, sig), Some(info), 0).is_some()
-}
-
-/// While single-stepping, a signal handler has just been set up (its first instruction not yet
-/// executed): stops once, as Linux's `ptrace_notify(SIGTRAP)` does; the tracer sees a siginfo of
-/// SIGTRAP whose `si_code` is also SIGTRAP and whose sender is the thread itself. The signal of
-/// this stop is not delivered. Returns false when the thread is killed.
-pub(crate) fn handler_entered(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
-    if !traced(cx.task) {
-        return true;
-    }
-    let sig = Signal::TRAP;
-    let info = notify_info(
-        sig,
-        sig.number(),
-        cx.pid_out(cx.tid()),
-        cx.cred().uid_out(cx.cred().ruid),
-    );
-    stop(cx, cpu, Stop::Event(0, sig), Some(info), 0).is_some()
-}
-
-/// PTRACE_SINGLESTEP made the thread execute one instruction (not an svc): as with arm64 Linux's
-/// single-step exception, delivers SIGTRAP (`TRAP_TRACE`, with the address of the next
-/// instruction) and reports to the tracer in a signal-delivery stop.
-pub(crate) fn step_done(cx: &mut Cx<'_>, cpu: &Cpu) {
-    let info = SigInfo::fault(code::TRAP_TRACE, cpu.state().pc, 0);
-    signal::force(cx, Signal::TRAP, info);
-}
-
-/// The single-stepped instruction was an svc: reports after the syscall completes. As on arm64
-/// Linux, this SIGTRAP is `SI_USER` with no sender; the hardware single-step state is still
-/// pending, so the next PTRACE_SINGLESTEP executes no instruction and reports `TRAP_TRACE` again
-/// in place (`Task::step_again`).
-pub(crate) fn syscall_stepped(cx: &mut Cx<'_>) {
-    if cx.task.stepping.load(Ordering::Relaxed) {
-        signal::force(cx, Signal::TRAP, SigInfo::kill(code::SI_USER, 0, 0));
-        cx.task.step_again.store(true, Ordering::Relaxed);
-    }
-}
-
-/// A signal the tracer injects at a syscall stop: treated, as on Linux, as a new signal the
-/// kernel sends to the thread itself.
-fn inject(cx: &Cx<'_>, data: i32) {
-    if let Some(sig) = Signal::new(data) {
-        signal::send_to_task(cx.kr(), cx.task, sig, SigInfo::kernel());
-    }
-}
-
-/// The entry of a syscall (number `nr`). Returns None when there is no tracer, or when it is a
-/// vDSO clock stub (on Linux these do not enter the kernel, so tracers do not see them).
-/// Otherwise records the number, as Linux's `regs->syscallno` does: when resumed other than by
-/// PTRACE_SYSCALL, event stops along the way (`PTRACE_EVENT_FORK` and so on), exit stops after a
-/// later switch to PTRACE_SYSCALL, and `NT_ARM_SYSTEM_CALL` also read this syscall's number;
-/// returns whether PTRACE_SYSCALL stops at the entry. Whether to stop at the exit is decided
-/// again by [`syscall_exit`] from the state at that time.
-pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
-    if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
-        return None;
-    }
-    let mut t = cx.task.trace.borrow_mut();
-    t.syscallno = nr as i32;
-    Some(t.mode == Mode::Syscall)
-}
-
-/// Whether this syscall (number `nr`) stops at entry and exit after PTRACE_SYSCALL resumed the
-/// thread. vDSO clock stubs do not count: on Linux they do not enter the kernel, so tracers do
-/// not see them.
-pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
-    {
-        let t = cx.task.trace.borrow();
-        if t.tracer.is_none() || t.mode != Mode::Syscall {
-            return false;
-        }
-    }
-    !crate::vdso::clock_stub(cx, cpu.state().pc, nr)
-}
-
-/// A syscall stop: as on arm64 Linux, x7 is 0 (entry) or 1 (exit) during the stop, and the tracer
-/// can neither see nor change its original value. Returns false when the thread is killed.
-fn syscall_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, entry: bool) -> bool {
-    let options = cx.task.trace.borrow().options;
-    let sig = Signal::TRAP;
-    let si_code = sig.number()
-        | if options & opt::TRACESYSGOOD != 0 {
-            0x80
-        } else {
-            0
-        };
-    let info = notify_info(
-        sig,
-        si_code,
-        cx.pid_out(cx.tid()),
-        cx.cred().uid_out(cx.cred().ruid),
-    );
-    let message = if entry {
-        EVENTMSG_SYSCALL_ENTRY
-    } else {
-        EVENTMSG_SYSCALL_EXIT
-    };
-    let saved = std::mem::replace(&mut cpu.state_mut().x[7], u64::from(!entry));
-    let data = stop(cx, cpu, Stop::Syscall(entry), Some(info), message);
-    cpu.state_mut().x[7] = saved;
-    match data {
-        Some(data) => {
-            inject(cx, data);
-            true
-        }
-        None => false,
-    }
-}
-
-/// Stops at syscall entry (the number was recorded by [`syscall_start`]). Returns the number as
-/// changed by the tracer (-1 skips this syscall); None when the thread is killed.
-pub(crate) fn syscall_entry(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Option<u64> {
-    syscall_stop(cx, cpu, true).then(|| cx.task.trace.borrow().syscallno as i64 as u64)
-}
-
-/// Stops at syscall exit (if the thread has by then been resumed with PTRACE_SYSCALL; rechecked
-/// as arm64 Linux's `syscall_trace_exit` does, whether or not it stopped at entry). Returns false
-/// when the thread is killed.
-pub(crate) fn syscall_exit(cx: &mut Cx<'_>, cpu: &mut Cpu) -> bool {
-    let nr = cx.task.trace.borrow().syscallno as i64 as u64;
-    !syscall_traced(cx, cpu, nr) || syscall_stop(cx, cpu, false)
-}
-
-/// A seccomp filter returned TRACE (with data `data`): stops once at `PTRACE_EVENT_SECCOMP`, and
-/// the tracer may change the number (`NT_ARM_SYSTEM_CALL`, -1 skips) and the registers. Returns
-/// the resulting number; None when the thread is killed.
-pub(crate) fn seccomp_stop(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64, data: u32) -> Option<u64> {
-    cx.task.trace.borrow_mut().syscallno = nr as i32;
-    event(cx, cpu, event::SECCOMP, u64::from(data))
-        .then(|| cx.task.trace.borrow().syscallno as i64 as u64)
-}
-
-/// Stops at a `PTRACE_EVENT_*` (when the tracer has enabled the event). Returns false when the
-/// thread is killed.
-pub(crate) fn event(cx: &mut Cx<'_>, cpu: &mut Cpu, e: u32, message: u64) -> bool {
-    if !cx.task.trace.borrow().enabled(e) {
-        return true;
-    }
-    let sig = Signal::TRAP;
-    let si_code = sig.number() | (e as i32) << 8;
-    let info = notify_info(
-        sig,
-        si_code,
-        cx.pid_out(cx.tid()),
-        cx.cred().uid_out(cx.cred().ruid),
-    );
-    stop(cx, cpu, Stop::Event(e, sig), Some(info), message).is_some()
-}
-
-/// The id of thread `tid` as seen by the process tracing it (`ptrace_event_pid`), or as seen by
-/// itself when there is no tracer.
-pub(crate) fn tracer_pid_of(cx: &Cx<'_>, tid: Tid) -> Tid {
-    match cx.task.trace.borrow().tracer {
-        Some(tracer) => cx.kr().pid_seen_by(tracer, tid),
-        None => cx.pid_out(tid),
-    }
-}
-
-/// After a successful execve: `PTRACE_EVENT_EXEC` (the message is the tid before the execve); if
-/// the event is not enabled and the tracee is not under SEIZE, sends itself SIGTRAP. Returns false
-/// when the thread is killed.
-pub(crate) fn exec(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: Tid) -> bool {
-    let (traced, seized, enabled) = {
-        let t = cx.task.trace.borrow();
-        (t.tracer.is_some(), t.seized, t.enabled(event::EXEC))
-    };
-    if enabled {
-        let old = tracer_pid_of(cx, old_tid);
-        return event(cx, cpu, event::EXEC, old as u64);
-    }
-    if traced && !seized {
-        let cred = cx.cred();
-        let info = SigInfo::kill(
-            code::SI_USER,
-            cx.pid_out(cx.tgid()),
-            cred.uid_out(cred.ruid),
-        );
-        signal::send_to_task(cx.kr(), cx.task, Signal::TRAP, info);
-    }
-    true
-}
-
-/// The thread is about to exit (exit, exit_group, a fatal signal's default action):
-/// `PTRACE_EVENT_EXIT`, with the wait status word as the message. exit_group has already asked
-/// every thread to exit, including the caller; the caller still stops and reports, and stops
-/// waiting if killed by SIGKILL during the stop.
-pub(crate) fn exit(cx: &mut Cx<'_>, cpu: &mut Cpu, status: ExitStatus) {
-    cx.task.begin_exit(cx.kr(), &cx.t.group, status);
-    if !cx.task.trace.borrow().enabled(event::EXIT) {
-        return;
-    }
-    let killed = cx.task.killed.replace(false);
-    if event(cx, cpu, event::EXIT, status.wait_status() as u64) {
-        cx.task.killed.set(killed);
-    }
-}
-
-/// Whether a thread `child` created by clone (`flags` and `exit_signal` are clone's arguments) is
-/// traced: when the parent thread is traced, the matching event is enabled (or `CLONE_PTRACE` was
-/// used) and there is no `CLONE_UNTRACED`, the new thread is traced by the same tracer and stops
-/// before executing its first instruction (with a pending SIGSTOP when not under SEIZE). Returns
-/// the event the parent thread reports.
-pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -> Option<u32> {
-    const CLONE_VFORK: u64 = 0x4000;
-    const CLONE_PTRACE: u64 = 0x2000;
-    const CLONE_UNTRACED: u64 = 0x0080_0000;
-    let p = parent.trace.borrow();
-    if p.tracer.is_none() || flags & CLONE_UNTRACED != 0 {
-        return None;
-    }
-    let e = if flags & CLONE_VFORK != 0 {
-        event::VFORK
-    } else if exit_signal != Signal::CHLD.number() {
-        event::CLONE
-    } else {
-        event::FORK
-    };
-    let report = p.enabled(e).then_some(e);
-    if report.is_none() && flags & CLONE_PTRACE == 0 {
-        return None;
-    }
-    {
-        let mut c = child.trace.borrow_mut();
-        c.tracer = p.tracer;
-        c.privileged = p.privileged;
-        c.seized = p.seized;
-        c.options = p.options;
-        if p.seized {
-            c.trap = true;
-        } else {
-            let stop = SigInfo::default();
-            child.pending.borrow_mut().add(Signal::STOP, stop, false);
-        }
-    }
-    // SAFETY: the new thread's Cpu still exists, and the caller holds the BKL
-    unsafe { child.sync.kicker.kick() };
-    report
-}
+// ---- Detaching ----
 
 /// The tracer stops tracing `task` (PTRACE_DETACH, tracer exit): a stopped thread is resumed, and
 /// the registers the tracer changed are written back. `sig` is the signal PTRACE_DETACH delivers;
@@ -800,6 +812,8 @@ pub(crate) fn tracer_exited(k: &mut Kernel, tgid: Tid) {
         }
     }
 }
+
+// ---- Exits of traced threads ----
 
 /// A traced thread has exited, waiting for the tracer's wait to take it ([`Kernel::trace_exits`]).
 pub(crate) struct TraceExit {
@@ -882,19 +896,6 @@ pub(crate) fn group_finished(
     true
 }
 
-/// The tracer has taken the end `e` of a traced thread (or exited without taking it): the end of
-/// the whole process is handed to the parent.
-pub(crate) fn released(k: &mut Kernel, e: &TraceExit) {
-    if !e.process {
-        return;
-    }
-    if let Some(group) = k.groups.get(&e.pid).cloned()
-        && group.borrow().exit_tracer == Some(e.tracer)
-    {
-        crate::process::tracer_released(k, &group);
-    }
-}
-
 fn report_exit(k: &mut Kernel, mut exit: TraceExit) {
     if !k.groups.contains_key(&exit.tracer) {
         return;
@@ -910,6 +911,19 @@ fn report_exit(k: &mut Kernel, mut exit: TraceExit) {
     k.trace_exits.push(exit);
     request_wake_on(wake::CHILD);
     signal::send_to_group(k, tracer, Signal::CHLD, info);
+}
+
+/// The tracer has taken the end `e` of a traced thread (or exited without taking it): the end of
+/// the whole process is handed to the parent.
+pub(crate) fn released(k: &mut Kernel, e: &TraceExit) {
+    if !e.process {
+        return;
+    }
+    if let Some(group) = k.groups.get(&e.pid).cloned()
+        && group.borrow().exit_tracer == Some(e.tracer)
+    {
+        crate::process::tracer_released(k, &group);
+    }
 }
 
 #[cfg(test)]

@@ -35,34 +35,19 @@ const fn mov_x8(nr: u32) -> u32 {
     0xd280_0008 | (nr << 5)
 }
 
-/// The System V ABI ELF hash.
-fn elf_hash(name: &[u8]) -> u32 {
-    let mut h: u32 = 0;
-    for &c in name {
-        h = (h << 4).wrapping_add(c as u32);
-        let g = h & 0xf000_0000;
-        if g != 0 {
-            h ^= g >> 24;
-        }
-        h &= !g;
-    }
-    h
+/// The vDSO image (at most one page).
+pub fn image() -> &'static [u8] {
+    &get().bytes
 }
 
-fn put16(b: &mut Vec<u8>, v: u16) {
-    b.extend_from_slice(&v.to_le_bytes());
+/// Offset of `__kernel_rt_sigreturn` from the start of the vDSO.
+pub fn sigreturn_offset() -> u64 {
+    get().sigreturn
 }
 
-fn put32(b: &mut Vec<u8>, v: u32) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-
-fn put64(b: &mut Vec<u8>, v: u64) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-
-fn align(b: &mut Vec<u8>, to: usize) {
-    b.resize(b.len().next_multiple_of(to), 0);
+fn get() -> &'static Image {
+    static IMAGE: OnceLock<Image> = OnceLock::new();
+    IMAGE.get_or_init(build)
 }
 
 fn build() -> Image {
@@ -222,19 +207,34 @@ fn build() -> Image {
     }
 }
 
-fn get() -> &'static Image {
-    static IMAGE: OnceLock<Image> = OnceLock::new();
-    IMAGE.get_or_init(build)
+/// The System V ABI ELF hash.
+fn elf_hash(name: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &c in name {
+        h = (h << 4).wrapping_add(c as u32);
+        let g = h & 0xf000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
 }
 
-/// The vDSO image (at most one page).
-pub fn image() -> &'static [u8] {
-    &get().bytes
+fn put16(b: &mut Vec<u8>, v: u16) {
+    b.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Offset of `__kernel_rt_sigreturn` from the start of the vDSO.
-pub fn sigreturn_offset() -> u64 {
-    get().sigreturn
+fn put32(b: &mut Vec<u8>, v: u32) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put64(b: &mut Vec<u8>, v: u64) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn align(b: &mut Vec<u8>, to: usize) {
+    b.resize(b.len().next_multiple_of(to), 0);
 }
 
 /// Whether the syscall with number `nr`, whose pc after the svc is `pc`, comes from a vDSO clock

@@ -193,24 +193,6 @@ fn traceme(cx: &mut Cx<'_>) -> SysResult {
     Ok(0)
 }
 
-/// `PTRACE_O_SUSPEND_SECCOMP` (for checkpoint/restore): requires `CAP_SYS_ADMIN`, and that the
-/// tracer itself has no seccomp and is not traced this way (Linux's `check_ptrace_options`).
-fn check_options(cx: &Cx<'_>, options: u32) -> Result<(), Errno> {
-    if options & opt::SUSPEND_SECCOMP != 0 {
-        let suspended = {
-            let t = cx.task.trace.borrow();
-            t.tracer.is_some() && t.options & opt::SUSPEND_SECCOMP != 0
-        };
-        if !cx.cred().capable(crate::cred::cap::SYS_ADMIN)
-            || cx.task.seccomp.borrow().mode != crate::seccomp::mode::DISABLED
-            || suspended
-        {
-            return Err(Errno::EPERM);
-        }
-    }
-    Ok(())
-}
-
 /// PTRACE_ATTACH and PTRACE_SEIZE (`options` in `data`). ATTACH sends the thread a SIGSTOP, SEIZE
 /// leaves it undisturbed.
 fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysResult {
@@ -265,6 +247,24 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
     Ok(0)
 }
 
+/// `PTRACE_O_SUSPEND_SECCOMP` (for checkpoint/restore): requires `CAP_SYS_ADMIN`, and that the
+/// tracer itself has no seccomp and is not traced this way (Linux's `check_ptrace_options`).
+fn check_options(cx: &Cx<'_>, options: u32) -> Result<(), Errno> {
+    if options & opt::SUSPEND_SECCOMP != 0 {
+        let suspended = {
+            let t = cx.task.trace.borrow();
+            t.tracer.is_some() && t.options & opt::SUSPEND_SECCOMP != 0
+        };
+        if !cx.cred().capable(crate::cred::cap::SYS_ADMIN)
+            || cx.task.seccomp.borrow().mode != crate::seccomp::mode::DISABLED
+            || suspended
+        {
+            return Err(Errno::EPERM);
+        }
+    }
+    Ok(())
+}
+
 /// PTRACE_CONT, PTRACE_SYSCALL, PTRACE_SINGLESTEP: resume a stopped thread, with `data` as the
 /// signal to inject.
 fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
@@ -295,6 +295,40 @@ fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
         .read(UserSlice::new(addr, 8), &mut word)
         .map_err(|_| Errno::EIO)?;
     put(cx, data, word).map(|()| 0)
+}
+
+/// PTRACE_GETREGSET, PTRACE_SETREGSET: `data` points at an iovec whose length may be shorter than
+/// the regset (only the front part is read or written); the amount read or written is written
+/// back as the iovec's length.
+fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResult {
+    let b: [u8; 16] = get(cx, iov)?;
+    let base = u64::from_le_bytes(b[..8].try_into().unwrap());
+    let len = u64::from_le_bytes(b[8..].try_into().unwrap());
+    let (size, n) = regset_shape(nt)?;
+    if !len.is_multiple_of(size as u64) {
+        return Err(Errno::EINVAL);
+    }
+    let len = len.min((size * n) as u64) as usize;
+    {
+        let mut t = task.trace.borrow_mut();
+        let Trace {
+            regs,
+            syscallno,
+            hw,
+            hw_changed,
+            ..
+        } = &mut *t;
+        let regs = regs.as_mut().ok_or(Errno::ESRCH)?;
+        let mut bytes = encode_regset(nt, regs, *syscallno, hw);
+        if set {
+            cx.mm().read(UserSlice::new(base, len), &mut bytes[..len])?;
+            decode_regset(nt, &bytes, regs, syscallno, hw)?;
+            *hw_changed |= nt == NT_ARM_HW_BREAK || nt == NT_ARM_HW_WATCH;
+        } else {
+            cx.mm().write(UserSlice::new(base, len), &bytes[..len])?;
+        }
+    }
+    put(cx, iov + 8, (len as u64).to_le_bytes()).map(|()| 0)
 }
 
 /// A regset's (element size, element count).
@@ -447,40 +481,6 @@ fn hw_slot(watch: bool, addr: u64, ctrl: u32) -> Result<(u64, u32), Errno> {
     }
 }
 
-/// PTRACE_GETREGSET, PTRACE_SETREGSET: `data` points at an iovec whose length may be shorter than
-/// the regset (only the front part is read or written); the amount read or written is written
-/// back as the iovec's length.
-fn regset(cx: &mut Cx<'_>, task: &Task, set: bool, nt: u64, iov: u64) -> SysResult {
-    let b: [u8; 16] = get(cx, iov)?;
-    let base = u64::from_le_bytes(b[..8].try_into().unwrap());
-    let len = u64::from_le_bytes(b[8..].try_into().unwrap());
-    let (size, n) = regset_shape(nt)?;
-    if !len.is_multiple_of(size as u64) {
-        return Err(Errno::EINVAL);
-    }
-    let len = len.min((size * n) as u64) as usize;
-    {
-        let mut t = task.trace.borrow_mut();
-        let Trace {
-            regs,
-            syscallno,
-            hw,
-            hw_changed,
-            ..
-        } = &mut *t;
-        let regs = regs.as_mut().ok_or(Errno::ESRCH)?;
-        let mut bytes = encode_regset(nt, regs, *syscallno, hw);
-        if set {
-            cx.mm().read(UserSlice::new(base, len), &mut bytes[..len])?;
-            decode_regset(nt, &bytes, regs, syscallno, hw)?;
-            *hw_changed |= nt == NT_ARM_HW_BREAK || nt == NT_ARM_HW_WATCH;
-        } else {
-            cx.mm().write(UserSlice::new(base, len), &bytes[..len])?;
-        }
-    }
-    put(cx, iov + 8, (len as u64).to_le_bytes()).map(|()| 0)
-}
-
 /// PTRACE_GET_SYSCALL_INFO: `size` is the buffer length. Syscall entry and exit (which need
 /// `PTRACE_O_TRACESYSGOOD`) give the number and arguments, or the return value; other stops only
 /// the common part at the front. Returns the full length.
@@ -533,24 +533,6 @@ fn syscall_info(cx: &mut Cx<'_>, task: &Task, size: u64, data: u64) -> SysResult
     let n = size.min(actual) as usize;
     cx.mm().write(UserSlice::new(data, n), &b[..n])?;
     Ok(actual)
-}
-
-/// Reads `count` iovecs.
-fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
-    let mut b = vec![0u8; count as usize * 16];
-    cx.mm().read(UserSlice::new(addr, b.len()), &mut b)?;
-    let mut total = 0u64;
-    let mut out = Vec::with_capacity(count as usize);
-    for c in b.chunks_exact(16) {
-        let base = u64::from_le_bytes(c[..8].try_into().unwrap());
-        let len = u64::from_le_bytes(c[8..].try_into().unwrap());
-        total = total
-            .checked_add(len)
-            .filter(|&t| t <= i64::MAX as u64)
-            .ok_or(Errno::EINVAL)?;
-        out.push((base, len));
-    }
-    Ok(out)
 }
 
 /// process_vm_readv (process_vm_writev with `write`): copies between our own `local` and the
@@ -625,6 +607,24 @@ pub(super) fn process_vm(
         return Err(Errno::EFAULT);
     }
     Ok(total)
+}
+
+/// Reads `count` iovecs.
+fn iovecs(cx: &Cx<'_>, addr: u64, count: u64) -> Result<Vec<(u64, u64)>, Errno> {
+    let mut b = vec![0u8; count as usize * 16];
+    cx.mm().read(UserSlice::new(addr, b.len()), &mut b)?;
+    let mut total = 0u64;
+    let mut out = Vec::with_capacity(count as usize);
+    for c in b.chunks_exact(16) {
+        let base = u64::from_le_bytes(c[..8].try_into().unwrap());
+        let len = u64::from_le_bytes(c[8..].try_into().unwrap());
+        total = total
+            .checked_add(len)
+            .filter(|&t| t <= i64::MAX as u64)
+            .ok_or(Errno::EINVAL)?;
+        out.push((base, len));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
