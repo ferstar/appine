@@ -7,56 +7,7 @@ use crate::cred::{Cred, NGROUPS_MAX};
 use crate::errno::Errno;
 use crate::kernel::Cx;
 
-/// Versions for capget and capset: v1 has only the low 32 bits, v2 and v3 have two 32-bit sets.
-const CAPABILITY_VERSION_1: u32 = 0x1998_0330;
-const CAPABILITY_VERSION_2: u32 = 0x2007_1026;
-const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
-/// An ID argument meaning "unchanged" (-1) is `None`.
-fn id_arg(id: u64) -> Option<u32> {
-    (id as u32 != u32::MAX).then_some(id as u32)
-}
-
-/// Converts a user ID argument to a kernel ID: -1 is `None`, unmapped is EINVAL (`uid_valid`
-/// after `make_kuid`).
-fn uid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
-    id_arg(id)
-        .map(|id| cx.cred().uid_in(id).ok_or(Errno::EINVAL))
-        .transpose()
-}
-
-/// Converts a group ID argument to a kernel ID, with the same rules as [`uid_arg`].
-fn gid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
-    id_arg(id)
-        .map(|id| cx.cred().gid_in(id).ok_or(Errno::EINVAL))
-        .transpose()
-}
-
-/// Modifies the current process's credentials: if `f` fails, the credentials stay unchanged. As
-/// with Linux's `commit_creds`, when the effective or filesystem user or group changes, or new
-/// capabilities are gained, the process is no longer dumpable (the files in `/proc/<pid>` then
-/// belong to root), and it no longer gets a signal when its parent exits.
-fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Result<T, Errno> {
-    let mut cred = cx.cred();
-    let old = cred.clone();
-    let r = f(&mut cred)?;
-    let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
-    let mut g = cx.t.group.borrow_mut();
-    if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
-        g.dumpable = false;
-        // Credentials are kept per process, so all threads changed together: on Linux libc has
-        // each thread commit_creds separately, clearing each one's pdeath_signal
-        for t in &g.threads {
-            if let Some(t) = cx.kr().tasks.get(t) {
-                t.pdeathsig.set(0);
-            }
-        }
-    }
-    g.cred = cred;
-    drop(g);
-    cx.shared.fast_changed();
-    Ok(r)
-}
+// ---- Id syscalls ----
 
 pub(super) fn getuid(cx: &mut Cx<'_>, effective: bool) -> SysResult {
     let c = cx.cred();
@@ -159,21 +110,32 @@ pub(super) fn setgroups(cx: &mut Cx<'_>, size: i32, list: u64) -> SysResult {
     update(cx, |c| c.setgroups(groups)).map(|()| 0)
 }
 
-/// Header of capget and capset: checks the version (when unknown, writes back the kernel's
-/// version and returns EINVAL), and returns the number of data sets and the pid.
-fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
-    let h: [u8; 8] = get(cx, hdr)?;
-    let version = u32::from_le_bytes(h[..4].try_into().unwrap());
-    let pid = i32::from_le_bytes(h[4..].try_into().unwrap());
-    match version {
-        CAPABILITY_VERSION_1 => Ok((1, pid)),
-        CAPABILITY_VERSION_2 | CAPABILITY_VERSION_3 => Ok((2, pid)),
-        _ => {
-            put(cx, hdr, CAPABILITY_VERSION_3.to_le_bytes())?;
-            Err(Errno::EINVAL)
-        }
-    }
+/// Converts a user ID argument to a kernel ID: -1 is `None`, unmapped is EINVAL (`uid_valid`
+/// after `make_kuid`).
+fn uid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
+    id_arg(id)
+        .map(|id| cx.cred().uid_in(id).ok_or(Errno::EINVAL))
+        .transpose()
 }
+
+/// Converts a group ID argument to a kernel ID, with the same rules as [`uid_arg`].
+fn gid_arg(cx: &Cx<'_>, id: u64) -> Result<Option<u32>, Errno> {
+    id_arg(id)
+        .map(|id| cx.cred().gid_in(id).ok_or(Errno::EINVAL))
+        .transpose()
+}
+
+/// An ID argument meaning "unchanged" (-1) is `None`.
+fn id_arg(id: u64) -> Option<u32> {
+    (id as u32 != u32::MAX).then_some(id as u32)
+}
+
+// ---- Capabilities ----
+
+/// Versions for capget and capset: v1 has only the low 32 bits, v2 and v3 have two 32-bit sets.
+const CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
 pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     let header = cap_header(cx, hdr);
@@ -227,4 +189,48 @@ pub(super) fn capset(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     }
     let [effective, permitted, inheritable] = sets;
     update(cx, |c| c.capset(effective, permitted, inheritable)).map(|()| 0)
+}
+
+/// Header of capget and capset: checks the version (when unknown, writes back the kernel's
+/// version and returns EINVAL), and returns the number of data sets and the pid.
+fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
+    let h: [u8; 8] = get(cx, hdr)?;
+    let version = u32::from_le_bytes(h[..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(h[4..].try_into().unwrap());
+    match version {
+        CAPABILITY_VERSION_1 => Ok((1, pid)),
+        CAPABILITY_VERSION_2 | CAPABILITY_VERSION_3 => Ok((2, pid)),
+        _ => {
+            put(cx, hdr, CAPABILITY_VERSION_3.to_le_bytes())?;
+            Err(Errno::EINVAL)
+        }
+    }
+}
+
+// ---- Committing credentials ----
+
+/// Modifies the current process's credentials: if `f` fails, the credentials stay unchanged. As
+/// with Linux's `commit_creds`, when the effective or filesystem user or group changes, or new
+/// capabilities are gained, the process is no longer dumpable (the files in `/proc/<pid>` then
+/// belong to root), and it no longer gets a signal when its parent exits.
+fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Result<T, Errno> {
+    let mut cred = cx.cred();
+    let old = cred.clone();
+    let r = f(&mut cred)?;
+    let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
+    let mut g = cx.t.group.borrow_mut();
+    if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
+        g.dumpable = false;
+        // Credentials are kept per process, so all threads changed together: on Linux libc has
+        // each thread commit_creds separately, clearing each one's pdeath_signal
+        for t in &g.threads {
+            if let Some(t) = cx.kr().tasks.get(t) {
+                t.pdeathsig.set(0);
+            }
+        }
+    }
+    g.cred = cred;
+    drop(g);
+    cx.shared.fast_changed();
+    Ok(r)
 }

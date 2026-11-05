@@ -109,163 +109,7 @@ pub(crate) const MAX_USER_NS_LEVEL: u32 = 32;
 /// The most extents one ID map may have (Linux's `UID_GID_MAP_MAX_EXTENTS`).
 const MAX_EXTENTS: usize = 340;
 
-/// An ID map (uid_map, gid_map): each extent is (first ID in the namespace, first kernel ID,
-/// count).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct IdMap(Vec<(u32, u32, u32)>);
-
-impl IdMap {
-    /// The boot-time namespace: every ID maps to itself (Linux's `0 0 4294967295`).
-    fn identity() -> IdMap {
-        IdMap(vec![(0, 0, u32::MAX)])
-    }
-
-    /// The kernel ID for `id` in the namespace (`make_kuid`).
-    pub fn down(&self, id: u32) -> Option<u32> {
-        self.0
-            .iter()
-            .find(|&&(first, _, count)| id >= first && id - first < count)
-            .map(|&(first, lower, _)| lower + (id - first))
-    }
-
-    /// The ID in the namespace of kernel ID `k` (`from_kuid`).
-    pub fn up(&self, k: u32) -> Option<u32> {
-        self.0
-            .iter()
-            .find(|&&(_, lower, count)| k >= lower && k - lower < count)
-            .map(|&(first, lower, _)| first + (k - lower))
-    }
-
-    /// The extents.
-    pub fn extents(&self) -> &[(u32, u32, u32)] {
-        &self.0
-    }
-
-    /// Parses what is written to uid_map or gid_map (the parsing part of Linux's `map_write`):
-    /// each line is "first ID in the namespace, first ID in the parent, count"; the count cannot
-    /// be 0, extents cannot overflow or overlap, and there are at most 340 of them. The second
-    /// column is still an ID in the parent namespace; the caller converts it to a kernel ID.
-    pub fn parse(data: &[u8]) -> Result<IdMap, Errno> {
-        let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-        let mut extents: Vec<(u32, u32, u32)> = Vec::new();
-        for line in text.split('\n').filter(|l| !l.is_empty()) {
-            let nums: Vec<u32> = line
-                .split_ascii_whitespace()
-                .map(|n| n.parse().map_err(|_| Errno::EINVAL))
-                .collect::<Result<_, _>>()?;
-            let &[first, lower, count] = nums.as_slice() else {
-                return Err(Errno::EINVAL);
-            };
-            let fits = |start: u32| {
-                count > 0 && start.checked_add(count - 1).is_some_and(|e| e != u32::MAX)
-            };
-            if !fits(first) || !fits(lower) {
-                return Err(Errno::EINVAL);
-            }
-            let overlaps = |&(f, l, c): &(u32, u32, u32)| {
-                first < f + c && f < first + count || lower < l + c && l < lower + count
-            };
-            if extents.iter().any(overlaps) || extents.len() == MAX_EXTENTS {
-                return Err(Errno::EINVAL);
-            }
-            extents.push((first, lower, count));
-        }
-        if extents.is_empty() {
-            return Err(Errno::EINVAL);
-        }
-        Ok(IdMap(extents))
-    }
-
-    /// Converts each extent's second column from an ID in the parent namespace (whose map is
-    /// `parent`) to a kernel ID; any unmapped one is EPERM. One extent may correspond to several
-    /// in the parent, and is split along the parent's extents.
-    pub fn lower_to_kernel(&self, parent: &IdMap) -> Result<IdMap, Errno> {
-        let mut out = Vec::new();
-        for &(first, lower, count) in &self.0 {
-            let mut done = 0;
-            while done < count {
-                let id = lower + done;
-                let &(pf, pl, pc) = parent
-                    .0
-                    .iter()
-                    .find(|&&(f, _, c)| id >= f && id - f < c)
-                    .ok_or(Errno::EPERM)?;
-                let n = (count - done).min(pc - (id - pf));
-                out.push((first + done, pl + (id - pf), n));
-                done += n;
-            }
-        }
-        Ok(IdMap(out))
-    }
-}
-
-/// A user namespace (user_namespaces(7)). In the boot-time one every ID maps to itself; a new one
-/// starts with no mappings, which `/proc/<pid>/uid_map` and `gid_map` write once.
-#[derive(Debug)]
-pub(crate) struct UserNs {
-    /// The id (the inode number in `/proc/<pid>/ns/user`).
-    pub id: u64,
-    pub parent: Option<Rc<UserNs>>,
-    /// Nesting level, 0 for the boot-time namespace.
-    pub level: u32,
-    /// The creator's effective user ID (a kernel ID): it has every capability over this namespace
-    /// in the parent namespace.
-    pub owner: u32,
-    pub uid_map: RefCell<IdMap>,
-    pub gid_map: RefCell<IdMap>,
-    /// `/proc/<pid>/setgroups` is "allow": after it is written as "deny", setgroups is not allowed
-    /// in this namespace.
-    pub setgroups: Cell<bool>,
-}
-
-impl PartialEq for UserNs {
-    fn eq(&self, other: &UserNs) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for UserNs {}
-
-impl UserNs {
-    /// The boot-time user namespace (a new copy each time, compared by id).
-    pub fn init() -> Rc<UserNs> {
-        Rc::new(UserNs {
-            id: INIT_USER_NS,
-            parent: None,
-            level: 0,
-            owner: 0,
-            uid_map: RefCell::new(IdMap::identity()),
-            gid_map: RefCell::new(IdMap::identity()),
-            setgroups: Cell::new(true),
-        })
-    }
-
-    /// A new namespace under `parent` whose creator's effective user ID is `owner`. The setgroups
-    /// state is inherited from the parent.
-    pub fn child(parent: &Rc<UserNs>, owner: u32) -> Rc<UserNs> {
-        Rc::new(UserNs {
-            id: crate::vfs::new_ns_id(),
-            parent: Some(parent.clone()),
-            level: parent.level + 1,
-            owner,
-            uid_map: RefCell::new(IdMap::default()),
-            gid_map: RefCell::new(IdMap::default()),
-            setgroups: Cell::new(parent.setgroups.get()),
-        })
-    }
-
-    /// `self` is `other` or one of its ancestors (Linux's `in_userns(self, other)`).
-    pub fn is_ancestor_of(&self, other: &UserNs) -> bool {
-        let mut ns = other;
-        while ns.level > self.level {
-            match &ns.parent {
-                Some(p) => ns = p,
-                None => return false,
-            }
-        }
-        ns.id == self.id
-    }
-}
+// ---- Credentials ----
 
 /// A process's credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,226 +174,6 @@ impl Cred {
         self.user_ns = ns;
     }
 
-    /// The user ID of kernel ID `k` in our own namespace, 65534 when unmapped
-    /// (`from_kuid_munged`).
-    pub fn uid_out(&self, k: u32) -> u32 {
-        self.user_ns.uid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
-    }
-
-    /// The group ID of kernel ID `k` in our own namespace, 65534 when unmapped.
-    pub fn gid_out(&self, k: u32) -> u32 {
-        self.user_ns.gid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
-    }
-
-    /// The kernel ID for user ID `id` in our own namespace (`make_kuid`); None when unmapped.
-    pub fn uid_in(&self, id: u32) -> Option<u32> {
-        self.user_ns.uid_map.borrow().down(id)
-    }
-
-    /// The kernel ID for group ID `id` in our own namespace; None when unmapped.
-    pub fn gid_in(&self, id: u32) -> Option<u32> {
-        self.user_ns.gid_map.borrow().down(id)
-    }
-
-    /// The kernel ID of root (user ID 0) in our own namespace; None when unmapped.
-    fn root_uid(&self) -> Option<u32> {
-        self.uid_in(0)
-    }
-
-    /// `SECBIT_KEEP_CAPS`.
-    pub fn keep_caps(&self) -> bool {
-        self.securebits & secbit::KEEP_CAPS != 0
-    }
-
-    /// Whether there is capability `c` in the boot-time user namespace (Linux's `capable()`):
-    /// processes in other namespaces never have it.
-    pub fn capable(&self, c: u32) -> bool {
-        self.user_ns.level == 0 && self.capable_here(c)
-    }
-
-    /// Whether there is capability `c` in our own user namespace (whether it is in the effective
-    /// set, `ns_capable(current_user_ns(), c)`).
-    pub fn capable_here(&self, c: u32) -> bool {
-        self.cap_effective & (1 << c) != 0
-    }
-
-    /// Whether there is capability `c` in user namespace `ns` (Linux's `cap_capable`): when `ns`
-    /// is our own namespace, the effective set decides; when it is a descendant of our own
-    /// namespace, a process that created it (or one of its ancestors) and whose effective user ID
-    /// equals its owner has every capability; otherwise there is none.
-    pub fn ns_capable(&self, ns: &UserNs, c: u32) -> bool {
-        let mut ns = ns;
-        loop {
-            if ns.id == self.user_ns.id {
-                return self.capable_here(c);
-            }
-            if ns.level <= self.user_ns.level {
-                return false;
-            }
-            let Some(parent) = &ns.parent else {
-                return false;
-            };
-            if parent.id == self.user_ns.id && ns.owner == self.euid {
-                return true;
-            }
-            ns = parent;
-        }
-    }
-
-    /// Whether there is capability `c` over a file whose owner and group are `st`'s (Linux's
-    /// `capable_wrt_inode_uidgid`): it is held in our own namespace, and the owner and group are
-    /// both mapped in it.
-    pub fn capable_wrt(&self, st: &Stat, c: u32) -> bool {
-        self.capable_here(c)
-            && self.user_ns.uid_map.borrow().up(st.uid).is_some()
-            && self.user_ns.gid_map.borrow().up(st.gid).is_some()
-    }
-
-    /// Whether `gid` is the fsgid or among the supplementary groups.
-    pub fn in_group(&self, gid: u32) -> bool {
-        self.fsgid == gid || self.groups.binary_search(&gid).is_ok()
-    }
-
-    /// Is the file's owner, or has `CAP_FOWNER` (chmod, setting timestamps and so on).
-    pub fn owns(&self, st: &Stat) -> bool {
-        self.fsuid == st.uid || self.capable_wrt(st, cap::FOWNER)
-    }
-
-    /// Permission check for file access (`generic_permission`): `mask` is a combination of
-    /// `MAY_*`.
-    pub fn permission(&self, st: &Stat, mask: u32) -> Result<(), Errno> {
-        let class = if self.fsuid == st.uid {
-            st.mode >> 6
-        } else if self.in_group(st.gid) {
-            st.mode >> 3
-        } else {
-            st.mode
-        };
-        if mask & !class & 7 == 0 {
-            return Ok(());
-        }
-        if st.kind() == mode::S_IFDIR {
-            // Directory permissions can always be overridden by capabilities
-            if mask & MAY_WRITE == 0 && self.capable_wrt(st, cap::DAC_READ_SEARCH)
-                || self.capable_wrt(st, cap::DAC_OVERRIDE)
-            {
-                return Ok(());
-            }
-        } else {
-            if mask == MAY_READ && self.capable_wrt(st, cap::DAC_READ_SEARCH) {
-                return Ok(());
-            }
-            // Execute permission can only be overridden when at least one x bit is set
-            if (mask & MAY_EXEC == 0 || st.mode & 0o111 != 0)
-                && self.capable_wrt(st, cap::DAC_OVERRIDE)
-            {
-                return Ok(());
-            }
-        }
-        Err(Errno::EACCES)
-    }
-
-    /// Whether the search permission checks of every directory can be bypassed (the
-    /// path-resolution fast path). In other user namespaces only directories whose owner and group
-    /// are mapped can be bypassed, so that does not count.
-    pub fn searches_all(&self) -> bool {
-        self.capable(cap::DAC_READ_SEARCH) || self.capable(cap::DAC_OVERRIDE)
-    }
-
-    /// Deleting or renaming `victim` in directory `dir`: the directory must be writable and
-    /// searchable, and the sticky bit is honoured.
-    pub fn may_delete(&self, dir: &Stat, victim: &Stat) -> Result<(), Errno> {
-        self.permission(dir, MAY_WRITE | MAY_EXEC)?;
-        if dir.mode & mode::S_ISVTX != 0
-            && self.fsuid != victim.uid
-            && self.fsuid != dir.uid
-            && !self.capable_wrt(victim, cap::FOWNER)
-        {
-            return Err(Errno::EPERM);
-        }
-        Ok(())
-    }
-
-    /// The credentials access(2) uses: checks with the real user and group IDs, and capabilities
-    /// depend on whether the real user ID is root (in our own namespace).
-    pub fn for_access(&self) -> Cred {
-        let mut c = self.clone();
-        c.fsuid = self.ruid;
-        c.fsgid = self.rgid;
-        c.cap_effective = if Some(self.ruid) == self.root_uid() {
-            self.cap_permitted
-        } else {
-            0
-        };
-        c
-    }
-
-    /// The owner and group of a new file: in a setgid directory the group is inherited from the
-    /// directory. Returns (uid, gid, adjusted permission bits): a directory created in a setgid
-    /// directory inherits the setgid bit, and a caller not in the group cannot create a setgid
-    /// executable.
-    pub fn new_owner(&self, dir: &Stat, perm: u32, is_dir: bool) -> (u32, u32, u32) {
-        let mut perm = perm;
-        let gid = if dir.mode & mode::S_ISGID != 0 {
-            if is_dir {
-                perm |= mode::S_ISGID;
-            }
-            dir.gid
-        } else {
-            self.fsgid
-        };
-        if !is_dir
-            && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
-            && !self.in_group(gid)
-            && !self.capable_wrt(dir, cap::FSETID)
-        {
-            perm &= !mode::S_ISGID;
-        }
-        (self.fsuid, gid, perm)
-    }
-
-    /// Adjusts capabilities by Linux's rules after user IDs change (`cap_emulate_setxuid`), with
-    /// root meaning root in our own namespace; no adjustment with `SECBIT_NO_SETUID_FIXUP`.
-    fn fix_caps(&mut self, old: &Cred) {
-        if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
-            return;
-        }
-        let root = old.root_uid();
-        let is_root = |id: u32| Some(id) == root;
-        let had_root = is_root(old.ruid) || is_root(old.euid) || is_root(old.suid);
-        let has_root = is_root(self.ruid) || is_root(self.euid) || is_root(self.suid);
-        if had_root && !has_root {
-            if !self.keep_caps() {
-                self.cap_permitted = 0;
-                self.cap_effective = 0;
-            }
-            // Legacy programs have no capabilities left after setresuid to non-root and execve;
-            // ambient capabilities must not defeat that
-            self.cap_ambient = 0;
-        }
-        if is_root(old.euid) && !is_root(self.euid) {
-            self.cap_effective = 0;
-        }
-        if !is_root(old.euid) && is_root(self.euid) {
-            self.cap_effective = self.cap_permitted;
-        }
-    }
-
-    /// Adjusts the filesystem capabilities after fsuid changes; no adjustment with
-    /// `SECBIT_NO_SETUID_FIXUP`.
-    fn fix_fs_caps(&mut self, old_fsuid: u32) {
-        if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
-            return;
-        }
-        let root = self.root_uid();
-        if Some(old_fsuid) == root && Some(self.fsuid) != root {
-            self.cap_effective &= !CAP_FS_MASK;
-        }
-        if Some(old_fsuid) != root && Some(self.fsuid) == root {
-            self.cap_effective |= self.cap_permitted & CAP_FS_MASK;
-        }
-    }
-
     /// setuid(2).
     pub fn setuid(&mut self, uid: u32) -> Result<(), Errno> {
         let old = self.clone();
@@ -604,6 +228,33 @@ impl Cred {
         Ok(())
     }
 
+    /// Adjusts capabilities by Linux's rules after user IDs change (`cap_emulate_setxuid`), with
+    /// root meaning root in our own namespace; no adjustment with `SECBIT_NO_SETUID_FIXUP`.
+    fn fix_caps(&mut self, old: &Cred) {
+        if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
+            return;
+        }
+        let root = old.root_uid();
+        let is_root = |id: u32| Some(id) == root;
+        let had_root = is_root(old.ruid) || is_root(old.euid) || is_root(old.suid);
+        let has_root = is_root(self.ruid) || is_root(self.euid) || is_root(self.suid);
+        if had_root && !has_root {
+            if !self.keep_caps() {
+                self.cap_permitted = 0;
+                self.cap_effective = 0;
+            }
+            // Legacy programs have no capabilities left after setresuid to non-root and execve;
+            // ambient capabilities must not defeat that
+            self.cap_ambient = 0;
+        }
+        if is_root(old.euid) && !is_root(self.euid) {
+            self.cap_effective = 0;
+        }
+        if !is_root(old.euid) && is_root(self.euid) {
+            self.cap_effective = self.cap_permitted;
+        }
+    }
+
     /// setfsuid(2): returns the old fsuid; disallowed changes are silently ignored.
     pub fn setfsuid(&mut self, uid: Option<u32>) -> u32 {
         let old = self.fsuid;
@@ -618,6 +269,21 @@ impl Cred {
             self.fix_fs_caps(old);
         }
         old
+    }
+
+    /// Adjusts the filesystem capabilities after fsuid changes; no adjustment with
+    /// `SECBIT_NO_SETUID_FIXUP`.
+    fn fix_fs_caps(&mut self, old_fsuid: u32) {
+        if self.securebits & secbit::NO_SETUID_FIXUP != 0 {
+            return;
+        }
+        let root = self.root_uid();
+        if Some(old_fsuid) == root && Some(self.fsuid) != root {
+            self.cap_effective &= !CAP_FS_MASK;
+        }
+        if Some(old_fsuid) != root && Some(self.fsuid) == root {
+            self.cap_effective |= self.cap_permitted & CAP_FS_MASK;
+        }
     }
 
     /// setgid(2).
@@ -843,6 +509,109 @@ impl Cred {
         Ok(secure)
     }
 
+    /// Is the file's owner, or has `CAP_FOWNER` (chmod, setting timestamps and so on).
+    pub fn owns(&self, st: &Stat) -> bool {
+        self.fsuid == st.uid || self.capable_wrt(st, cap::FOWNER)
+    }
+
+    /// Permission check for file access (`generic_permission`): `mask` is a combination of
+    /// `MAY_*`.
+    pub fn permission(&self, st: &Stat, mask: u32) -> Result<(), Errno> {
+        let class = if self.fsuid == st.uid {
+            st.mode >> 6
+        } else if self.in_group(st.gid) {
+            st.mode >> 3
+        } else {
+            st.mode
+        };
+        if mask & !class & 7 == 0 {
+            return Ok(());
+        }
+        if st.kind() == mode::S_IFDIR {
+            // Directory permissions can always be overridden by capabilities
+            if mask & MAY_WRITE == 0 && self.capable_wrt(st, cap::DAC_READ_SEARCH)
+                || self.capable_wrt(st, cap::DAC_OVERRIDE)
+            {
+                return Ok(());
+            }
+        } else {
+            if mask == MAY_READ && self.capable_wrt(st, cap::DAC_READ_SEARCH) {
+                return Ok(());
+            }
+            // Execute permission can only be overridden when at least one x bit is set
+            if (mask & MAY_EXEC == 0 || st.mode & 0o111 != 0)
+                && self.capable_wrt(st, cap::DAC_OVERRIDE)
+            {
+                return Ok(());
+            }
+        }
+        Err(Errno::EACCES)
+    }
+
+    /// Whether the search permission checks of every directory can be bypassed (the
+    /// path-resolution fast path). In other user namespaces only directories whose owner and group
+    /// are mapped can be bypassed, so that does not count.
+    pub fn searches_all(&self) -> bool {
+        self.capable(cap::DAC_READ_SEARCH) || self.capable(cap::DAC_OVERRIDE)
+    }
+
+    /// Deleting or renaming `victim` in directory `dir`: the directory must be writable and
+    /// searchable, and the sticky bit is honoured.
+    pub fn may_delete(&self, dir: &Stat, victim: &Stat) -> Result<(), Errno> {
+        self.permission(dir, MAY_WRITE | MAY_EXEC)?;
+        if dir.mode & mode::S_ISVTX != 0
+            && self.fsuid != victim.uid
+            && self.fsuid != dir.uid
+            && !self.capable_wrt(victim, cap::FOWNER)
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    /// The credentials access(2) uses: checks with the real user and group IDs, and capabilities
+    /// depend on whether the real user ID is root (in our own namespace).
+    pub fn for_access(&self) -> Cred {
+        let mut c = self.clone();
+        c.fsuid = self.ruid;
+        c.fsgid = self.rgid;
+        c.cap_effective = if Some(self.ruid) == self.root_uid() {
+            self.cap_permitted
+        } else {
+            0
+        };
+        c
+    }
+
+    /// The owner and group of a new file: in a setgid directory the group is inherited from the
+    /// directory. Returns (uid, gid, adjusted permission bits): a directory created in a setgid
+    /// directory inherits the setgid bit, and a caller not in the group cannot create a setgid
+    /// executable.
+    pub fn new_owner(&self, dir: &Stat, perm: u32, is_dir: bool) -> (u32, u32, u32) {
+        let mut perm = perm;
+        let gid = if dir.mode & mode::S_ISGID != 0 {
+            if is_dir {
+                perm |= mode::S_ISGID;
+            }
+            dir.gid
+        } else {
+            self.fsgid
+        };
+        if !is_dir
+            && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
+            && !self.in_group(gid)
+            && !self.capable_wrt(dir, cap::FSETID)
+        {
+            perm &= !mode::S_ISGID;
+        }
+        (self.fsuid, gid, perm)
+    }
+
+    /// Whether `gid` is the fsgid or among the supplementary groups.
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.fsgid == gid || self.groups.binary_search(&gid).is_ok()
+    }
+
     /// Whether another process with credentials `target` may be accessed the way ptrace does
     /// (Linux's `__ptrace_may_access` plus `cap_ptrace_access_check`): the real user and group
     /// (the filesystem ones with `fscreds`) equal all of the target's users and groups and the
@@ -876,6 +645,81 @@ impl Cred {
             .any(|&u| u == target.suid || u == target.ruid)
             || self.ns_capable(&target.user_ns, cap::KILL)
     }
+
+    /// The user ID of kernel ID `k` in our own namespace, 65534 when unmapped
+    /// (`from_kuid_munged`).
+    pub fn uid_out(&self, k: u32) -> u32 {
+        self.user_ns.uid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
+    }
+
+    /// The group ID of kernel ID `k` in our own namespace, 65534 when unmapped.
+    pub fn gid_out(&self, k: u32) -> u32 {
+        self.user_ns.gid_map.borrow().up(k).unwrap_or(OVERFLOW_ID)
+    }
+
+    /// The kernel ID for user ID `id` in our own namespace (`make_kuid`); None when unmapped.
+    pub fn uid_in(&self, id: u32) -> Option<u32> {
+        self.user_ns.uid_map.borrow().down(id)
+    }
+
+    /// The kernel ID for group ID `id` in our own namespace; None when unmapped.
+    pub fn gid_in(&self, id: u32) -> Option<u32> {
+        self.user_ns.gid_map.borrow().down(id)
+    }
+
+    /// The kernel ID of root (user ID 0) in our own namespace; None when unmapped.
+    fn root_uid(&self) -> Option<u32> {
+        self.uid_in(0)
+    }
+
+    /// `SECBIT_KEEP_CAPS`.
+    pub fn keep_caps(&self) -> bool {
+        self.securebits & secbit::KEEP_CAPS != 0
+    }
+
+    /// Whether there is capability `c` in the boot-time user namespace (Linux's `capable()`):
+    /// processes in other namespaces never have it.
+    pub fn capable(&self, c: u32) -> bool {
+        self.user_ns.level == 0 && self.capable_here(c)
+    }
+
+    /// Whether there is capability `c` in our own user namespace (whether it is in the effective
+    /// set, `ns_capable(current_user_ns(), c)`).
+    pub fn capable_here(&self, c: u32) -> bool {
+        self.cap_effective & (1 << c) != 0
+    }
+
+    /// Whether there is capability `c` in user namespace `ns` (Linux's `cap_capable`): when `ns`
+    /// is our own namespace, the effective set decides; when it is a descendant of our own
+    /// namespace, a process that created it (or one of its ancestors) and whose effective user ID
+    /// equals its owner has every capability; otherwise there is none.
+    pub fn ns_capable(&self, ns: &UserNs, c: u32) -> bool {
+        let mut ns = ns;
+        loop {
+            if ns.id == self.user_ns.id {
+                return self.capable_here(c);
+            }
+            if ns.level <= self.user_ns.level {
+                return false;
+            }
+            let Some(parent) = &ns.parent else {
+                return false;
+            };
+            if parent.id == self.user_ns.id && ns.owner == self.euid {
+                return true;
+            }
+            ns = parent;
+        }
+    }
+
+    /// Whether there is capability `c` over a file whose owner and group are `st`'s (Linux's
+    /// `capable_wrt_inode_uidgid`): it is held in our own namespace, and the owner and group are
+    /// both mapped in it.
+    pub fn capable_wrt(&self, st: &Stat, c: u32) -> bool {
+        self.capable_here(c)
+            && self.user_ns.uid_map.borrow().up(st.uid).is_some()
+            && self.user_ns.gid_map.borrow().up(st.gid).is_some()
+    }
 }
 
 /// The new real and effective IDs for setreuid and setregid: without privilege the real ID can
@@ -893,6 +737,8 @@ fn re_ids(
     }
     Ok((r.unwrap_or(real), e.unwrap_or(eff)))
 }
+
+// ---- File capabilities ----
 
 /// The extended attribute name of program file capabilities.
 pub(crate) const XATTR_NAME_CAPS: &[u8] = b"security.capability";
@@ -915,10 +761,6 @@ pub(crate) struct FileCaps {
     pub inheritable: u64,
     /// The effective bit: after execve the effective set equals the permitted set.
     pub effective: bool,
-}
-
-fn le32(v: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(v[at..at + 4].try_into().unwrap())
 }
 
 impl FileCaps {
@@ -981,6 +823,170 @@ impl FileCaps {
         }
     }
 }
+
+fn le32(v: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(v[at..at + 4].try_into().unwrap())
+}
+
+// ---- User namespaces ----
+
+/// An ID map (uid_map, gid_map): each extent is (first ID in the namespace, first kernel ID,
+/// count).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdMap(Vec<(u32, u32, u32)>);
+
+impl IdMap {
+    /// The boot-time namespace: every ID maps to itself (Linux's `0 0 4294967295`).
+    fn identity() -> IdMap {
+        IdMap(vec![(0, 0, u32::MAX)])
+    }
+
+    /// Parses what is written to uid_map or gid_map (the parsing part of Linux's `map_write`):
+    /// each line is "first ID in the namespace, first ID in the parent, count"; the count cannot
+    /// be 0, extents cannot overflow or overlap, and there are at most 340 of them. The second
+    /// column is still an ID in the parent namespace; the caller converts it to a kernel ID.
+    pub fn parse(data: &[u8]) -> Result<IdMap, Errno> {
+        let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let mut extents: Vec<(u32, u32, u32)> = Vec::new();
+        for line in text.split('\n').filter(|l| !l.is_empty()) {
+            let nums: Vec<u32> = line
+                .split_ascii_whitespace()
+                .map(|n| n.parse().map_err(|_| Errno::EINVAL))
+                .collect::<Result<_, _>>()?;
+            let &[first, lower, count] = nums.as_slice() else {
+                return Err(Errno::EINVAL);
+            };
+            let fits = |start: u32| {
+                count > 0 && start.checked_add(count - 1).is_some_and(|e| e != u32::MAX)
+            };
+            if !fits(first) || !fits(lower) {
+                return Err(Errno::EINVAL);
+            }
+            let overlaps = |&(f, l, c): &(u32, u32, u32)| {
+                first < f + c && f < first + count || lower < l + c && l < lower + count
+            };
+            if extents.iter().any(overlaps) || extents.len() == MAX_EXTENTS {
+                return Err(Errno::EINVAL);
+            }
+            extents.push((first, lower, count));
+        }
+        if extents.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(IdMap(extents))
+    }
+
+    /// Converts each extent's second column from an ID in the parent namespace (whose map is
+    /// `parent`) to a kernel ID; any unmapped one is EPERM. One extent may correspond to several
+    /// in the parent, and is split along the parent's extents.
+    pub fn lower_to_kernel(&self, parent: &IdMap) -> Result<IdMap, Errno> {
+        let mut out = Vec::new();
+        for &(first, lower, count) in &self.0 {
+            let mut done = 0;
+            while done < count {
+                let id = lower + done;
+                let &(pf, pl, pc) = parent
+                    .0
+                    .iter()
+                    .find(|&&(f, _, c)| id >= f && id - f < c)
+                    .ok_or(Errno::EPERM)?;
+                let n = (count - done).min(pc - (id - pf));
+                out.push((first + done, pl + (id - pf), n));
+                done += n;
+            }
+        }
+        Ok(IdMap(out))
+    }
+
+    /// The kernel ID for `id` in the namespace (`make_kuid`).
+    pub fn down(&self, id: u32) -> Option<u32> {
+        self.0
+            .iter()
+            .find(|&&(first, _, count)| id >= first && id - first < count)
+            .map(|&(first, lower, _)| lower + (id - first))
+    }
+
+    /// The ID in the namespace of kernel ID `k` (`from_kuid`).
+    pub fn up(&self, k: u32) -> Option<u32> {
+        self.0
+            .iter()
+            .find(|&&(_, lower, count)| k >= lower && k - lower < count)
+            .map(|&(first, lower, _)| first + (k - lower))
+    }
+
+    /// The extents.
+    pub fn extents(&self) -> &[(u32, u32, u32)] {
+        &self.0
+    }
+}
+
+/// A user namespace (user_namespaces(7)). In the boot-time one every ID maps to itself; a new one
+/// starts with no mappings, which `/proc/<pid>/uid_map` and `gid_map` write once.
+#[derive(Debug)]
+pub(crate) struct UserNs {
+    /// The id (the inode number in `/proc/<pid>/ns/user`).
+    pub id: u64,
+    pub parent: Option<Rc<UserNs>>,
+    /// Nesting level, 0 for the boot-time namespace.
+    pub level: u32,
+    /// The creator's effective user ID (a kernel ID): it has every capability over this namespace
+    /// in the parent namespace.
+    pub owner: u32,
+    pub uid_map: RefCell<IdMap>,
+    pub gid_map: RefCell<IdMap>,
+    /// `/proc/<pid>/setgroups` is "allow": after it is written as "deny", setgroups is not allowed
+    /// in this namespace.
+    pub setgroups: Cell<bool>,
+}
+
+impl UserNs {
+    /// The boot-time user namespace (a new copy each time, compared by id).
+    pub fn init() -> Rc<UserNs> {
+        Rc::new(UserNs {
+            id: INIT_USER_NS,
+            parent: None,
+            level: 0,
+            owner: 0,
+            uid_map: RefCell::new(IdMap::identity()),
+            gid_map: RefCell::new(IdMap::identity()),
+            setgroups: Cell::new(true),
+        })
+    }
+
+    /// A new namespace under `parent` whose creator's effective user ID is `owner`. The setgroups
+    /// state is inherited from the parent.
+    pub fn child(parent: &Rc<UserNs>, owner: u32) -> Rc<UserNs> {
+        Rc::new(UserNs {
+            id: crate::vfs::new_ns_id(),
+            parent: Some(parent.clone()),
+            level: parent.level + 1,
+            owner,
+            uid_map: RefCell::new(IdMap::default()),
+            gid_map: RefCell::new(IdMap::default()),
+            setgroups: Cell::new(parent.setgroups.get()),
+        })
+    }
+
+    /// `self` is `other` or one of its ancestors (Linux's `in_userns(self, other)`).
+    pub fn is_ancestor_of(&self, other: &UserNs) -> bool {
+        let mut ns = other;
+        while ns.level > self.level {
+            match &ns.parent {
+                Some(p) => ns = p,
+                None => return false,
+            }
+        }
+        ns.id == self.id
+    }
+}
+
+impl PartialEq for UserNs {
+    fn eq(&self, other: &UserNs) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for UserNs {}
 
 #[cfg(test)]
 mod tests {

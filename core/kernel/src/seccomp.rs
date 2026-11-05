@@ -85,12 +85,6 @@ mod flag {
         TSYNC | LOG | SPEC_ALLOW | NEW_LISTENER | TSYNC_ESRCH | WAIT_KILLABLE_RECV;
 }
 
-/// seccomp(2) operations.
-const SET_MODE_STRICT: u32 = 0;
-const SET_MODE_FILTER: u32 = 1;
-const GET_ACTION_AVAIL: u32 = 2;
-const GET_NOTIF_SIZES: u32 = 3;
-
 /// `seccomp_data.arch` and SIGSYS's `si_arch`.
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 /// The most instructions one program may have (`BPF_MAXINSNS`).
@@ -113,381 +107,6 @@ const MAX_ERRNO: u32 = 4095;
 const STRICT_ALLOWED: [u64; 4] = [63, 64, 93, 139];
 /// `seccomp_notif_resp.flags`: let the syscall run as usual.
 const USER_NOTIF_FLAG_CONTINUE: u32 = 1;
-
-/// ioctls of the notification fd.
-const IOCTL_NOTIF_RECV: u32 = 0xc050_2100;
-const IOCTL_NOTIF_SEND: u32 = 0xc018_2101;
-const IOCTL_NOTIF_ID_VALID: u32 = 0x4008_2102;
-/// ID_VALID as first defined, with the wrong direction; Linux still accepts it.
-const IOCTL_NOTIF_ID_VALID_WRONG_DIR: u32 = 0x8008_2102;
-/// ADDFD's size can vary (the struct may grow later), so the direction and size are masked off
-/// when comparing.
-const IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
-const IOC_DIR_SIZE_MASK: u32 = 0xc000_0000 | 0x3fff_0000;
-/// The original size of `struct seccomp_notif_addfd`.
-const ADDFD_SIZE_VER0: usize = 24;
-const ADDFD_FLAG_SETFD: u32 = 1;
-const ADDFD_FLAG_SEND: u32 = 2;
-
-/// cBPF opcodes.
-mod bpf {
-    pub const LD: u16 = 0x00;
-    pub const LDX: u16 = 0x01;
-    pub const ST: u16 = 0x02;
-    pub const STX: u16 = 0x03;
-    pub const ALU: u16 = 0x04;
-    pub const JMP: u16 = 0x05;
-    pub const RET: u16 = 0x06;
-    pub const MISC: u16 = 0x07;
-
-    pub const W: u16 = 0x00;
-    pub const H: u16 = 0x08;
-    pub const B: u16 = 0x10;
-
-    pub const IMM: u16 = 0x00;
-    pub const ABS: u16 = 0x20;
-    pub const IND: u16 = 0x40;
-    pub const MEM: u16 = 0x60;
-    pub const LEN: u16 = 0x80;
-    pub const MSH: u16 = 0xa0;
-
-    pub const ADD: u16 = 0x00;
-    pub const SUB: u16 = 0x10;
-    pub const MUL: u16 = 0x20;
-    pub const DIV: u16 = 0x30;
-    pub const OR: u16 = 0x40;
-    pub const AND: u16 = 0x50;
-    pub const LSH: u16 = 0x60;
-    pub const RSH: u16 = 0x70;
-    pub const NEG: u16 = 0x80;
-    pub const MOD: u16 = 0x90;
-    pub const XOR: u16 = 0xa0;
-
-    pub const JA: u16 = 0x00;
-    pub const JEQ: u16 = 0x10;
-    pub const JGT: u16 = 0x20;
-    pub const JGE: u16 = 0x30;
-    pub const JSET: u16 = 0x40;
-
-    pub const K: u16 = 0x00;
-    pub const X: u16 = 0x08;
-    /// `BPF_RET | BPF_A`.
-    pub const A: u16 = 0x10;
-
-    pub const TAX: u16 = 0x00;
-    pub const TXA: u16 = 0x80;
-
-    /// Number of scratch memory slots.
-    pub const MEMWORDS: u32 = 16;
-
-    /// The opcode seccomp rewrites `LD | W | ABS` reads of `seccomp_data` into (Linux borrows it
-    /// the same way).
-    pub const LOAD_DATA: u16 = LDX | W | ABS;
-}
-
-/// One cBPF instruction (`struct sock_filter`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Insn {
-    code: u16,
-    jt: u8,
-    jf: u8,
-    k: u32,
-}
-
-impl Insn {
-    fn decode(b: &[u8]) -> Insn {
-        Insn {
-            code: u16::from_le_bytes([b[0], b[1]]),
-            jt: b[2],
-            jf: b[3],
-            k: u32::from_le_bytes(b[4..8].try_into().unwrap()),
-        }
-    }
-}
-
-/// Opcodes cBPF recognizes (Linux's `chk_code_allowed`).
-fn classic_code(code: u16) -> bool {
-    use bpf::*;
-    matches!(
-        code,
-        0x04 | 0x0c // ADD
-            | 0x14 | 0x1c // SUB
-            | 0x24 | 0x2c // MUL
-            | 0x34 | 0x3c // DIV
-            | 0x94 | 0x9c // MOD
-            | 0x54 | 0x5c // AND
-            | 0x44 | 0x4c // OR
-            | 0xa4 | 0xac // XOR
-            | 0x64 | 0x6c // LSH
-            | 0x74 | 0x7c // RSH
-            | 0x84 // NEG
-    ) || [
-        LD | W | ABS,
-        LD | H | ABS,
-        LD | B | ABS,
-        LD | W | LEN,
-        LD | W | IND,
-        LD | H | IND,
-        LD | B | IND,
-        LD | IMM,
-        LD | MEM,
-        LDX | W | LEN,
-        LDX | B | MSH,
-        LDX | IMM,
-        LDX | MEM,
-        ST,
-        STX,
-        MISC | TAX,
-        MISC | TXA,
-        RET | K,
-        RET | A,
-        JMP | JA,
-    ]
-    .contains(&code)
-        || conditional(code)
-}
-
-/// Conditional jumps.
-fn conditional(code: u16) -> bool {
-    use bpf::*;
-    code & 0x07 == JMP && code & 0xf0 != JA && code & 0xf0 <= JSET
-}
-
-/// Checks a program by the cBPF rules (Linux's `bpf_check_classic`): opcodes are recognized;
-/// division by constant 0, shifts beyond 31, out-of-bounds scratch memory and jumps out of the
-/// program are refused; the last instruction is a return; scratch memory is written before read.
-fn check_classic(prog: &[Insn]) -> Result<(), Errno> {
-    use bpf::*;
-    let n = prog.len();
-    for (pc, i) in prog.iter().enumerate() {
-        if !classic_code(i.code) {
-            return Err(Errno::EINVAL);
-        }
-        let bad = match i.code {
-            c if c == ALU | DIV | K || c == ALU | MOD | K => i.k == 0,
-            c if c == ALU | LSH | K || c == ALU | RSH | K => i.k >= 32,
-            c if c == LD | MEM || c == LDX | MEM || c == ST || c == STX => i.k >= MEMWORDS,
-            c if c == JMP | JA => i.k as u64 >= (n - pc - 1) as u64,
-            c if conditional(c) => pc + i.jt as usize + 1 >= n || pc + i.jf as usize + 1 >= n,
-            _ => false,
-        };
-        if bad {
-            return Err(Errno::EINVAL);
-        }
-    }
-    if !matches!(prog[n - 1].code, c if c == RET | K || c == RET | A) {
-        return Err(Errno::EINVAL);
-    }
-    check_load_and_stores(prog)
-}
-
-/// Scratch memory is written before it is read on every path (Linux's `check_load_and_stores`):
-/// a jump passes the slots already written on arrival to its target, and the instruction after a
-/// jump can only be reached by jumping from elsewhere.
-fn check_load_and_stores(prog: &[Insn]) -> Result<(), Errno> {
-    use bpf::*;
-    let mut masks = vec![u16::MAX; prog.len()];
-    let mut valid = 0u16;
-    for (pc, i) in prog.iter().enumerate() {
-        valid &= masks[pc];
-        match i.code {
-            c if c == ST || c == STX => valid |= 1 << i.k,
-            c if c == LD | MEM || c == LDX | MEM => {
-                if valid & 1 << i.k == 0 {
-                    return Err(Errno::EINVAL);
-                }
-            }
-            c if c == JMP | JA => {
-                masks[pc + 1 + i.k as usize] &= valid;
-                valid = u16::MAX;
-            }
-            c if conditional(c) => {
-                masks[pc + 1 + i.jt as usize] &= valid;
-                masks[pc + 1 + i.jf as usize] &= valid;
-                valid = u16::MAX;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-/// Checks and rewrites a program by seccomp's rules (Linux's `seccomp_check_filter`): data reads
-/// may only read 4-byte-aligned words of `seccomp_data`, length reads become the constant 64, and
-/// other packet-reading instructions and modulo are refused.
-fn check_seccomp(prog: &mut [Insn]) -> Result<(), Errno> {
-    use bpf::*;
-    for i in prog {
-        match i.code {
-            c if c == LD | W | ABS => {
-                if i.k as usize >= DATA_SIZE || i.k & 3 != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                i.code = LOAD_DATA;
-            }
-            c if c == LD | W | LEN => {
-                i.code = LD | IMM;
-                i.k = DATA_SIZE as u32;
-            }
-            c if c == LDX | W | LEN => {
-                i.code = LDX | IMM;
-                i.k = DATA_SIZE as u32;
-            }
-            0x06 | 0x16 // RET K, RET A
-            | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c // ADD, SUB, MUL, DIV
-            | 0x54 | 0x5c | 0x44 | 0x4c | 0xa4 | 0xac // AND, OR, XOR
-            | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 // LSH, RSH, NEG
-            | 0x00 | 0x01 // LD IMM, LDX IMM
-            | 0x07 | 0x87 // TAX, TXA
-            | 0x60 | 0x61 | 0x02 | 0x03 // LD MEM, LDX MEM, ST, STX
-            | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d | 0x25 | 0x2d | 0x45 | 0x4d => {} // jumps
-            _ => return Err(Errno::EINVAL),
-        }
-    }
-    Ok(())
-}
-
-/// The length after Linux's `bpf_convert_filter`, used for the filter chain's capacity check.
-/// cBPF is still interpreted here, and only the converted length is counted; seccomp has already
-/// excluded packet access and modulo instructions.
-fn converted_len(prog: &[Insn]) -> usize {
-    use bpf::*;
-    // Clear A and X and save the context pointer.
-    3 + prog
-        .iter()
-        .map(|i| match i.code {
-            c if c == RET | K => 2,
-            c if c == ALU | DIV | X => 5,
-            c if conditional(c) => {
-                let immediate = usize::from(c & X == 0 && i.k > i32::MAX as u32);
-                let extra_jump = usize::from(i.jf != 0 && (i.jt != 0 || c & 0xf0 == JSET));
-                1 + immediate + extra_jump
-            }
-            _ => 1,
-        })
-        .sum::<usize>()
-}
-
-/// Runs a checked program on `data` (a `struct seccomp_data`) and returns its return value.
-fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
-    use bpf::*;
-    let (mut a, mut x) = (0u32, 0u32);
-    let mut mem = [0u32; MEMWORDS as usize];
-    let mut pc = 0;
-    loop {
-        let i = prog[pc];
-        pc += 1;
-        let src = if i.code & X != 0 { x } else { i.k };
-        match i.code {
-            LOAD_DATA => {
-                let k = i.k as usize;
-                a = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
-            }
-            c if c == LD | IMM => a = i.k,
-            c if c == LDX | IMM => x = i.k,
-            c if c == LD | MEM => a = mem[i.k as usize],
-            c if c == LDX | MEM => x = mem[i.k as usize],
-            c if c == ST => mem[i.k as usize] = a,
-            c if c == STX => mem[i.k as usize] = x,
-            c if c == MISC | TAX => x = a,
-            c if c == MISC | TXA => a = x,
-            c if c == RET | K => return i.k,
-            c if c == RET | A => return a,
-            c if c == JMP | JA => pc += i.k as usize,
-            c if c & 0x07 == ALU => match c & 0xf0 {
-                ADD => a = a.wrapping_add(src),
-                SUB => a = a.wrapping_sub(src),
-                MUL => a = a.wrapping_mul(src),
-                // On division by 0 (only possible with X) a cBPF program returns 0
-                DIV if src == 0 => return 0,
-                DIV => a /= src,
-                OR => a |= src,
-                AND => a &= src,
-                XOR => a ^= src,
-                LSH => a = a.wrapping_shl(src),
-                RSH => a = a.wrapping_shr(src),
-                NEG => a = a.wrapping_neg(),
-                _ => unreachable!("modulo cannot pass the checks"),
-            },
-            c => {
-                let taken = match c & 0xf0 {
-                    JEQ => a == src,
-                    JGT => a > src,
-                    JGE => a >= src,
-                    _ => a & src != 0,
-                };
-                pc += if taken { i.jt } else { i.jf } as usize;
-            }
-        }
-    }
-}
-
-/// Whether the program always returns ALLOW when only the number `nr` and the architecture are
-/// known (Linux's `seccomp_is_const_allow`): it may read only the number and the architecture and
-/// use only jumps comparing with constants, unconditional jumps and ANDs with constants. Reading
-/// other data or using other instructions does not count, and the return value must be exactly
-/// ALLOW (with data it does not count).
-fn const_allow(prog: &[Insn], nr: u32) -> bool {
-    use bpf::*;
-    let mut a = 0u32;
-    let mut pc = 0;
-    while let Some(i) = prog.get(pc) {
-        pc += 1;
-        match i.code {
-            LOAD_DATA => match i.k {
-                0 => a = nr,
-                4 => a = AUDIT_ARCH_AARCH64,
-                _ => return false,
-            },
-            c if c == RET | K => return i.k == ret::ALLOW,
-            c if c == JMP | JA => pc += i.k as usize,
-            c if conditional(c) && c & X == 0 => {
-                let taken = match c & 0xf0 {
-                    JEQ => a == i.k,
-                    JGT => a > i.k,
-                    JGE => a >= i.k,
-                    _ => a & i.k != 0,
-                };
-                pc += if taken { i.jt } else { i.jf } as usize;
-            }
-            c if c == ALU | AND | K => a &= i.k,
-            _ => return false,
-        }
-    }
-    false
-}
-
-/// The bitmap of a new filter (Linux's `seccomp_cache_prepare_bitmap`): the numbers in the
-/// previous filter's bitmap (every number when there is none) that this program also always
-/// returns ALLOW for.
-fn cache(prog: &[Insn], prev: Option<&[u64; CACHE_WORDS]>) -> [u64; CACHE_WORDS] {
-    let mut allow = prev.copied().unwrap_or([u64::MAX; CACHE_WORDS]);
-    for nr in 0..CACHED_NRS {
-        let bit = 1 << (nr % 64);
-        if allow[nr / 64] & bit != 0 && !const_allow(prog, nr as u32) {
-            allow[nr / 64] &= !bit;
-        }
-    }
-    allow
-}
-
-/// Whether number `nr` is in the bitmap (each word given by `word`).
-fn cached(word: impl Fn(usize) -> u64, nr: u64) -> bool {
-    nr < CACHED_NRS as u64 && word(nr as usize / 64) >> (nr % 64) & 1 != 0
-}
-
-/// `struct seccomp_data`: the number, the architecture, the pc after svc and the six arguments
-/// (the first is the original x0).
-fn seccomp_data(nr: i32, pc: u64, args: [u64; 6]) -> [u8; DATA_SIZE] {
-    let mut d = [0u8; DATA_SIZE];
-    d[..4].copy_from_slice(&nr.to_le_bytes());
-    d[4..8].copy_from_slice(&AUDIT_ARCH_AARCH64.to_le_bytes());
-    d[8..16].copy_from_slice(&pc.to_le_bytes());
-    for (i, a) in args.iter().enumerate() {
-        d[16 + i * 8..24 + i * 8].copy_from_slice(&a.to_le_bytes());
-    }
-    d
-}
 
 /// An installed filter (Linux's `struct seccomp_filter`), unchanged once installed (except for the
 /// notification fd's end and the user count).
@@ -654,23 +273,6 @@ impl Listener {
     }
 }
 
-impl Drop for Listener {
-    fn drop(&mut self) {
-        let Some(n) = self.0.notif.borrow_mut().take() else {
-            return;
-        };
-        for k in n.list {
-            let mut k = k.borrow_mut();
-            if k.state != State::Replied {
-                k.state = State::Replied;
-                k.error = -(Errno::ENOSYS.0);
-                k.val = 0;
-                signal_later(&k.event);
-            }
-        }
-    }
-}
-
 impl Listener {
     /// Ready events: readable when a notification is waiting to be received, writable when one
     /// received is waiting for an answer, POLLHUP when no users are left.
@@ -712,339 +314,30 @@ impl Listener {
     }
 }
 
-/// The result of the check at syscall entry.
-pub(crate) enum Verdict {
-    /// Run the syscall with this number as usual (the tracer may have changed the number).
-    Run(u64),
-    /// Do not run it; x0 already holds the return value (or SIGSYS is already pending).
-    Skip,
-    /// The thread has exited.
-    Exit,
-}
-
-/// Syscall entry (after the PTRACE_SYSCALL entry stop): checks syscall number `nr` against the
-/// thread's seccomp mode.
-pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
-    let (mode, top) = {
-        let s = cx.task.seccomp.borrow();
-        (s.mode, s.chain.as_ref().map(|c| c.filter().clone()))
-    };
-    // PTRACE_O_SUSPEND_SECCOMP (used by checkpoint/restore); the clock-reading stubs in the vDSO
-    // do not enter the kernel on Linux
-    let suspended = {
-        let t = cx.task.trace.borrow();
-        t.tracer.is_some() && t.options & crate::ptrace::opt::SUSPEND_SECCOMP != 0
-    };
-    if mode == mode::DISABLED || suspended || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
-        return Verdict::Run(nr);
-    }
-    match (mode, top) {
-        (mode::FILTER, Some(top)) => filter(cx, cpu, &top, nr, false),
-        (mode::STRICT, _) if STRICT_ALLOWED.contains(&nr) => Verdict::Run(nr),
-        (mode::STRICT, _) => {
-            log(cx, nr, Signal::KILL.number(), ret::KILL_THREAD, true);
-            cx.task.seccomp.borrow_mut().mode = mode::DEAD;
-            publish(cx.task);
-            exit_thread(cx, cpu, Signal::KILL)
-        }
-        // A thread already told to die entered the kernel again (Linux should not get here
-        // either)
-        _ => exit_thread(cx, cpu, Signal::KILL),
-    }
-}
-
-/// Ends only this thread, as if terminated by signal `sig` (Linux's `do_exit(sig)`).
-fn exit_thread(cx: &mut Cx<'_>, cpu: &mut Cpu, sig: Signal) -> Verdict {
-    let status = ExitStatus::Signaled {
-        signal: sig,
-        pc: None,
-        fault_addr: None,
-        core_dumped: false,
-    };
-    cx.task.exit_status.set(status);
-    if cx.tid() == cx.tgid() {
-        cx.t.group.borrow_mut().leader_status = status;
-    }
-    crate::ptrace::exit(cx, cpu, status);
-    Verdict::Exit
-}
-
-/// SIGSYS's siginfo: `si_errno` is the data the filter gave, `si_call_addr` the pc after svc.
-fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
-    SigInfo {
-        code: SYS_SECCOMP,
-        fields: InfoFields::Sys {
-            errno: data as i32,
-            call_addr: cpu.state().pc,
-            syscall: nr as i32,
-            arch: AUDIT_ARCH_AARCH64,
-        },
-        ..SigInfo::default()
-    }
-}
-
-/// Filter mode: runs the filters on the chain and carries out the resulting action (Linux's
-/// `__seccomp_filter`). `recheck` is the re-check after the tracer has handled TRACE: this time
-/// TRACE counts as allow.
-fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bool) -> Verdict {
-    // Numbers the cache says are always ALLOW do not run the programs (Linux's
-    // seccomp_cache_check_allow)
-    if top.always_allows(nr) {
-        return Verdict::Run(nr);
-    }
-    let data = {
-        let s = cpu.state();
-        let args = [s.orig_x0, s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
-        seccomp_data(nr as i32, s.pc, args)
-    };
-    let (r, matched) = run_filters(top, &data);
-    let (action, value) = (r & ret::ACTION_FULL, r & ret::DATA);
-    // The syscall is not run: logged only when the filter set SECCOMP_FILTER_FLAG_LOG
-    let requested = matched.as_ref().is_some_and(|m| m.log);
-    let skip = |cx: &Cx<'_>| {
-        log(cx, nr, 0, action, requested);
-        Verdict::Skip
-    };
-    match action {
-        ret::ERRNO => {
-            cpu.state_mut().x[0] = (-i64::from(value.min(MAX_ERRNO))) as u64;
-            skip(cx)
-        }
-        ret::TRAP => {
-            // The handler sees the original registers
-            cpu.state_mut().x[0] = cpu.state().orig_x0;
-            signal::force(cx, Signal::SYS, sigsys(cpu, nr, value));
-            skip(cx)
-        }
-        ret::TRACE if recheck => Verdict::Run(nr),
-        ret::TRACE => {
-            if !cx
-                .task
-                .trace
-                .borrow()
-                .enabled(crate::ptrace::event::SECCOMP)
-            {
-                cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
-                return skip(cx);
-            }
-            // The tracer may change the number (-1 skips) and the arguments; check again after
-            let Some(nr) = crate::ptrace::seccomp_stop(cx, cpu, nr, value) else {
-                return Verdict::Exit;
-            };
-            if nr as i64 >= 0 {
-                filter(cx, cpu, top, nr, true)
-            } else {
-                skip(cx)
-            }
-        }
-        ret::USER_NOTIF => match matched {
-            Some(m) => notify(cx, cpu, &m, data, nr),
-            None => Verdict::Run(nr),
-        },
-        ret::LOG => {
-            log(cx, nr, 0, action, true);
-            Verdict::Run(nr)
-        }
-        ret::ALLOW => Verdict::Run(nr),
-        // KILL_PROCESS, KILL_THREAD and unknown actions: terminate. With only this thread left it
-        // is the same as killing the process: deliver a SIGSYS that cannot be handled or stopped
-        // by a tracer, and write a core
-        _ => {
-            log(cx, nr, Signal::SYS.number(), action, true);
-            cx.task.seccomp.borrow_mut().mode = mode::DEAD;
-            publish(cx.task);
-            if action != ret::KILL_THREAD || cx.t.group.borrow().threads.len() == 1 {
-                cpu.state_mut().x[0] = cpu.state().orig_x0;
-                signal::force_fatal(cx, Signal::SYS, sigsys(cpu, nr, value));
-                Verdict::Skip
-            } else {
-                exit_thread(cx, cpu, Signal::SYS)
-            }
-        }
-    }
-}
-
-/// Runs every filter on the chain and takes the result with the strictest action (the smallest
-/// as a signed number, the newest among equally strict ones), along with the filter that gave it
-/// (Linux's `seccomp_run_filters`).
-fn run_filters(top: &Rc<Filter>, data: &[u8; DATA_SIZE]) -> (u32, Option<Rc<Filter>>) {
-    let action = |r: u32| (r & ret::ACTION_FULL) as i32;
-    let mut best = (ret::ALLOW, None);
-    let mut f = Some(top);
-    while let Some(cur) = f {
-        let r = run(&cur.prog, data);
-        if action(r) < action(best.0) {
-            best = (r, Some(cur.clone()));
-        }
-        f = cur.prev.as_ref();
-    }
-    best
-}
-
-/// USER_NOTIF: sends a notification to the notification fd's end and waits for its answer
-/// (Linux's `seccomp_do_user_notification`). Returns ENOSYS without a notification fd. Returns
-/// ERESTARTSYS when interrupted by a signal, and sends a new notification when restarted; with
-/// `WAIT_KILLABLE_RECV`, once the notification is received only fatal signals interrupt.
-fn notify(
-    cx: &mut Cx<'_>,
-    cpu: &mut Cpu,
-    filter: &Rc<Filter>,
-    data: [u8; DATA_SIZE],
-    nr: u64,
-) -> Verdict {
-    let knotif = {
-        let mut slot = filter.notif.borrow_mut();
-        let Some(n) = slot.as_mut() else {
-            cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
-            return Verdict::Skip;
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let Some(n) = self.0.notif.borrow_mut().take() else {
+            return;
         };
-        let k = Rc::new(RefCell::new(Knotif {
-            id: n.next_id,
-            tid: cx.tid(),
-            event: cx.task.event.clone(),
-            state: State::Init,
-            data,
-            error: 0,
-            val: 0,
-            flags: 0,
-        }));
-        n.next_id = n.next_id.wrapping_add(1);
-        n.list.push(k.clone());
-        n.requests += 1;
-        n.arrivals[0] += 1;
-        k
-    };
-    request_wake_object(filter.object());
-    let outcome = loop {
-        let state = knotif.borrow().state;
-        if state == State::Replied {
-            break Ok(());
-        }
-        if cx.task.killed.get() {
-            break Err(None);
-        }
-        let killable = filter.wait_killable_recv && state == State::Sent;
-        if !killable && cx.interrupted() {
-            break Err(Some(Errno::ERESTARTSYS));
-        }
-        let _ = cx.wait_alone(None);
-    };
-    if let Some(n) = filter.notif.borrow_mut().as_mut() {
-        n.list.retain(|k| !Rc::ptr_eq(k, &knotif));
-    }
-    let k = knotif.borrow();
-    match outcome {
-        Err(None) => Verdict::Exit,
-        Err(Some(e)) => {
-            cpu.state_mut().x[0] = e.to_syscall_return();
-            Verdict::Skip
-        }
-        Ok(()) if k.flags & USER_NOTIF_FLAG_CONTINUE != 0 => Verdict::Run(nr),
-        Ok(()) => {
-            let v = if k.error != 0 {
-                i64::from(k.error)
-            } else {
-                k.val
-            };
-            cpu.state_mut().x[0] = v as u64;
-            Verdict::Skip
+        for k in n.list {
+            let mut k = k.borrow_mut();
+            if k.state != State::Replied {
+                k.state = State::Replied;
+                k.error = -(Errno::ENOSYS.0);
+                k.val = 0;
+                signal_later(&k.event);
+            }
         }
     }
 }
 
-/// Logs (Linux emits an audit record, here the debug log is written): kills and LOG are always
-/// logged, TRAP, ERRNO, TRACE and USER_NOTIF only when the filter set `SECCOMP_FILTER_FLAG_LOG`,
-/// and all of them must be in `actions_logged`.
-fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
-    let (bit, always) = match action {
-        ret::ALLOW => return,
-        ret::TRAP => (logged::TRAP, false),
-        ret::ERRNO => (logged::ERRNO, false),
-        ret::TRACE => (logged::TRACE, false),
-        ret::USER_NOTIF => (logged::USER_NOTIF, false),
-        ret::LOG => (logged::LOG, true),
-        ret::KILL_THREAD => (logged::KILL_THREAD, true),
-        _ => (logged::KILL_PROCESS, true),
-    };
-    if (always || requested) && cx.kr().seccomp_logged & bit != 0 {
-        crate::debug::log(format_args!(
-            "seccomp: pid {} tid {} syscall {nr} sig {sig} action {action:#x}",
-            cx.tgid(),
-            cx.tid(),
-        ));
-    }
-}
+// ---- Installing filters ----
 
-/// Bits of `/proc/sys/kernel/seccomp/actions_logged` (Linux's `SECCOMP_LOG_*`).
-pub(crate) mod logged {
-    pub const KILL_PROCESS: u32 = 1;
-    pub const KILL_THREAD: u32 = 2;
-    pub const TRAP: u32 = 4;
-    pub const ERRNO: u32 = 8;
-    pub const TRACE: u32 = 16;
-    pub const LOG: u32 = 32;
-    pub const ALLOW: u32 = 64;
-    pub const USER_NOTIF: u32 = 128;
-    /// By default every action except ALLOW is logged.
-    pub const DEFAULT: u32 = KILL_PROCESS | KILL_THREAD | TRAP | ERRNO | USER_NOTIF | TRACE | LOG;
-}
-
-/// Action names, in `actions_avail` order.
-const NAMES: [(&str, u32); 8] = [
-    ("kill_process", logged::KILL_PROCESS),
-    ("kill_thread", logged::KILL_THREAD),
-    ("trap", logged::TRAP),
-    ("errno", logged::ERRNO),
-    ("user_notif", logged::USER_NOTIF),
-    ("trace", logged::TRACE),
-    ("log", logged::LOG),
-    ("allow", logged::ALLOW),
-];
-
-/// `/proc/sys/kernel/seccomp/actions_avail`.
-pub(crate) fn actions_avail() -> String {
-    let names: Vec<_> = NAMES.iter().map(|(n, _)| *n).collect();
-    format!("{}\n", names.join(" "))
-}
-
-/// `/proc/sys/kernel/seccomp/actions_logged`.
-pub(crate) fn actions_logged(k: &Kernel) -> String {
-    let names: Vec<_> = NAMES
-        .iter()
-        .filter(|(_, bit)| k.seccomp_logged & bit != 0)
-        .map(|(n, _)| *n)
-        .collect();
-    format!("{}\n", names.join(" "))
-}
-
-/// Writes `actions_logged`: space-separated names (up to a newline or an empty name), allow is
-/// not permitted, and `CAP_SYS_ADMIN` is required (Linux's `write_actions_logged`).
-pub(crate) fn set_actions_logged(
-    k: &mut Kernel,
-    cred: &crate::cred::Cred,
-    data: &[u8],
-) -> Result<(), Errno> {
-    if !cred.capable(crate::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
-    let line = data.split(|&c| c == b'\n' || c == 0).next().unwrap_or(&[]);
-    let mut bits = 0;
-    for name in line.split(|&c| c == b' ') {
-        if name.is_empty() {
-            break;
-        }
-        let (_, bit) = NAMES
-            .iter()
-            .find(|(n, _)| n.as_bytes() == name)
-            .ok_or(Errno::EINVAL)?;
-        bits |= bit;
-    }
-    if bits & logged::ALLOW != 0 {
-        return Err(Errno::EINVAL);
-    }
-    k.seccomp_logged = bits;
-    Ok(())
-}
+/// seccomp(2) operations.
+const SET_MODE_STRICT: u32 = 0;
+const SET_MODE_FILTER: u32 = 1;
+const GET_ACTION_AVAIL: u32 = 2;
+const GET_NOTIF_SIZES: u32 = 3;
 
 /// seccomp(2).
 pub(crate) fn seccomp(cx: &mut Cx<'_>, op: u32, flags: u32, args: u64) -> Result<u64, Errno> {
@@ -1088,12 +381,6 @@ pub(crate) fn prctl_set(cx: &mut Cx<'_>, mode: u64, filter: u64) -> Result<u64, 
         2 => set_filter(cx, 0, filter),
         _ => Err(Errno::EINVAL),
     }
-}
-
-fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
-    let mut b = [0u8; N];
-    cx.mm().read(UserSlice::new(addr, N), &mut b)?;
-    Ok(b)
 }
 
 /// Enters strict mode. A thread already in filter mode cannot switch.
@@ -1262,30 +549,6 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     }
 }
 
-/// A thread's seccomp changed (a filter installed, TSYNC, clone, being killed): updates
-/// [`Task::seccomp_on`] and the allow bitmap [`Task::seccomp_allow`], which are read without the
-/// BKL. Only filter mode has a bitmap.
-pub(crate) fn publish(task: &Task) {
-    let s = task.seccomp.borrow();
-    let allow = match (s.mode, &s.chain) {
-        (mode::FILTER, Some(c)) => c.filter().allow,
-        _ => [0; CACHE_WORDS],
-    };
-    for (w, bits) in task.seccomp_allow.iter().zip(allow) {
-        w.store(bits, Ordering::Relaxed);
-    }
-    task.seccomp_on
-        .store(s.mode != mode::DISABLED, Ordering::Relaxed);
-}
-
-/// Without the BKL: the thread's filters always return ALLOW for number `nr` (the bitmap from
-/// [`publish`]). Another thread doing TSYNC may be changing it; a stale bit read belongs to the
-/// chain before the sync (the new chain can only be stricter), as if this syscall happened before
-/// the sync.
-pub(crate) fn always_allowed(task: &Task, nr: u64) -> bool {
-    cached(|i| task.seccomp_allow[i].load(Ordering::Relaxed), nr)
-}
-
 /// Notification ids start from a random number (as on Linux, so supervisors cannot guess other
 /// notifications).
 fn random_id() -> u64 {
@@ -1293,6 +556,374 @@ fn random_id() -> u64 {
     let _ = appine_hal::fill_random(&mut b);
     u64::from_le_bytes(b)
 }
+
+// ---- Syscall entry ----
+
+/// The result of the check at syscall entry.
+pub(crate) enum Verdict {
+    /// Run the syscall with this number as usual (the tracer may have changed the number).
+    Run(u64),
+    /// Do not run it; x0 already holds the return value (or SIGSYS is already pending).
+    Skip,
+    /// The thread has exited.
+    Exit,
+}
+
+/// Syscall entry (after the PTRACE_SYSCALL entry stop): checks syscall number `nr` against the
+/// thread's seccomp mode.
+pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
+    let (mode, top) = {
+        let s = cx.task.seccomp.borrow();
+        (s.mode, s.chain.as_ref().map(|c| c.filter().clone()))
+    };
+    // PTRACE_O_SUSPEND_SECCOMP (used by checkpoint/restore); the clock-reading stubs in the vDSO
+    // do not enter the kernel on Linux
+    let suspended = {
+        let t = cx.task.trace.borrow();
+        t.tracer.is_some() && t.options & crate::ptrace::opt::SUSPEND_SECCOMP != 0
+    };
+    if mode == mode::DISABLED || suspended || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
+        return Verdict::Run(nr);
+    }
+    match (mode, top) {
+        (mode::FILTER, Some(top)) => filter(cx, cpu, &top, nr, false),
+        (mode::STRICT, _) if STRICT_ALLOWED.contains(&nr) => Verdict::Run(nr),
+        (mode::STRICT, _) => {
+            log(cx, nr, Signal::KILL.number(), ret::KILL_THREAD, true);
+            cx.task.seccomp.borrow_mut().mode = mode::DEAD;
+            publish(cx.task);
+            exit_thread(cx, cpu, Signal::KILL)
+        }
+        // A thread already told to die entered the kernel again (Linux should not get here
+        // either)
+        _ => exit_thread(cx, cpu, Signal::KILL),
+    }
+}
+
+/// Filter mode: runs the filters on the chain and carries out the resulting action (Linux's
+/// `__seccomp_filter`). `recheck` is the re-check after the tracer has handled TRACE: this time
+/// TRACE counts as allow.
+fn filter(cx: &mut Cx<'_>, cpu: &mut Cpu, top: &Rc<Filter>, nr: u64, recheck: bool) -> Verdict {
+    // Numbers the cache says are always ALLOW do not run the programs (Linux's
+    // seccomp_cache_check_allow)
+    if top.always_allows(nr) {
+        return Verdict::Run(nr);
+    }
+    let data = {
+        let s = cpu.state();
+        let args = [s.orig_x0, s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
+        seccomp_data(nr as i32, s.pc, args)
+    };
+    let (r, matched) = run_filters(top, &data);
+    let (action, value) = (r & ret::ACTION_FULL, r & ret::DATA);
+    // The syscall is not run: logged only when the filter set SECCOMP_FILTER_FLAG_LOG
+    let requested = matched.as_ref().is_some_and(|m| m.log);
+    let skip = |cx: &Cx<'_>| {
+        log(cx, nr, 0, action, requested);
+        Verdict::Skip
+    };
+    match action {
+        ret::ERRNO => {
+            cpu.state_mut().x[0] = (-i64::from(value.min(MAX_ERRNO))) as u64;
+            skip(cx)
+        }
+        ret::TRAP => {
+            // The handler sees the original registers
+            cpu.state_mut().x[0] = cpu.state().orig_x0;
+            signal::force(cx, Signal::SYS, sigsys(cpu, nr, value));
+            skip(cx)
+        }
+        ret::TRACE if recheck => Verdict::Run(nr),
+        ret::TRACE => {
+            if !cx
+                .task
+                .trace
+                .borrow()
+                .enabled(crate::ptrace::event::SECCOMP)
+            {
+                cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
+                return skip(cx);
+            }
+            // The tracer may change the number (-1 skips) and the arguments; check again after
+            let Some(nr) = crate::ptrace::seccomp_stop(cx, cpu, nr, value) else {
+                return Verdict::Exit;
+            };
+            if nr as i64 >= 0 {
+                filter(cx, cpu, top, nr, true)
+            } else {
+                skip(cx)
+            }
+        }
+        ret::USER_NOTIF => match matched {
+            Some(m) => notify(cx, cpu, &m, data, nr),
+            None => Verdict::Run(nr),
+        },
+        ret::LOG => {
+            log(cx, nr, 0, action, true);
+            Verdict::Run(nr)
+        }
+        ret::ALLOW => Verdict::Run(nr),
+        // KILL_PROCESS, KILL_THREAD and unknown actions: terminate. With only this thread left it
+        // is the same as killing the process: deliver a SIGSYS that cannot be handled or stopped
+        // by a tracer, and write a core
+        _ => {
+            log(cx, nr, Signal::SYS.number(), action, true);
+            cx.task.seccomp.borrow_mut().mode = mode::DEAD;
+            publish(cx.task);
+            if action != ret::KILL_THREAD || cx.t.group.borrow().threads.len() == 1 {
+                cpu.state_mut().x[0] = cpu.state().orig_x0;
+                signal::force_fatal(cx, Signal::SYS, sigsys(cpu, nr, value));
+                Verdict::Skip
+            } else {
+                exit_thread(cx, cpu, Signal::SYS)
+            }
+        }
+    }
+}
+
+/// `struct seccomp_data`: the number, the architecture, the pc after svc and the six arguments
+/// (the first is the original x0).
+fn seccomp_data(nr: i32, pc: u64, args: [u64; 6]) -> [u8; DATA_SIZE] {
+    let mut d = [0u8; DATA_SIZE];
+    d[..4].copy_from_slice(&nr.to_le_bytes());
+    d[4..8].copy_from_slice(&AUDIT_ARCH_AARCH64.to_le_bytes());
+    d[8..16].copy_from_slice(&pc.to_le_bytes());
+    for (i, a) in args.iter().enumerate() {
+        d[16 + i * 8..24 + i * 8].copy_from_slice(&a.to_le_bytes());
+    }
+    d
+}
+
+/// Runs every filter on the chain and takes the result with the strictest action (the smallest
+/// as a signed number, the newest among equally strict ones), along with the filter that gave it
+/// (Linux's `seccomp_run_filters`).
+fn run_filters(top: &Rc<Filter>, data: &[u8; DATA_SIZE]) -> (u32, Option<Rc<Filter>>) {
+    let action = |r: u32| (r & ret::ACTION_FULL) as i32;
+    let mut best = (ret::ALLOW, None);
+    let mut f = Some(top);
+    while let Some(cur) = f {
+        let r = run(&cur.prog, data);
+        if action(r) < action(best.0) {
+            best = (r, Some(cur.clone()));
+        }
+        f = cur.prev.as_ref();
+    }
+    best
+}
+
+/// SIGSYS's siginfo: `si_errno` is the data the filter gave, `si_call_addr` the pc after svc.
+fn sigsys(cpu: &Cpu, nr: u64, data: u32) -> SigInfo {
+    SigInfo {
+        code: SYS_SECCOMP,
+        fields: InfoFields::Sys {
+            errno: data as i32,
+            call_addr: cpu.state().pc,
+            syscall: nr as i32,
+            arch: AUDIT_ARCH_AARCH64,
+        },
+        ..SigInfo::default()
+    }
+}
+
+/// USER_NOTIF: sends a notification to the notification fd's end and waits for its answer
+/// (Linux's `seccomp_do_user_notification`). Returns ENOSYS without a notification fd. Returns
+/// ERESTARTSYS when interrupted by a signal, and sends a new notification when restarted; with
+/// `WAIT_KILLABLE_RECV`, once the notification is received only fatal signals interrupt.
+fn notify(
+    cx: &mut Cx<'_>,
+    cpu: &mut Cpu,
+    filter: &Rc<Filter>,
+    data: [u8; DATA_SIZE],
+    nr: u64,
+) -> Verdict {
+    let knotif = {
+        let mut slot = filter.notif.borrow_mut();
+        let Some(n) = slot.as_mut() else {
+            cpu.state_mut().x[0] = Errno::ENOSYS.to_syscall_return();
+            return Verdict::Skip;
+        };
+        let k = Rc::new(RefCell::new(Knotif {
+            id: n.next_id,
+            tid: cx.tid(),
+            event: cx.task.event.clone(),
+            state: State::Init,
+            data,
+            error: 0,
+            val: 0,
+            flags: 0,
+        }));
+        n.next_id = n.next_id.wrapping_add(1);
+        n.list.push(k.clone());
+        n.requests += 1;
+        n.arrivals[0] += 1;
+        k
+    };
+    request_wake_object(filter.object());
+    let outcome = loop {
+        let state = knotif.borrow().state;
+        if state == State::Replied {
+            break Ok(());
+        }
+        if cx.task.killed.get() {
+            break Err(None);
+        }
+        let killable = filter.wait_killable_recv && state == State::Sent;
+        if !killable && cx.interrupted() {
+            break Err(Some(Errno::ERESTARTSYS));
+        }
+        let _ = cx.wait_alone(None);
+    };
+    if let Some(n) = filter.notif.borrow_mut().as_mut() {
+        n.list.retain(|k| !Rc::ptr_eq(k, &knotif));
+    }
+    let k = knotif.borrow();
+    match outcome {
+        Err(None) => Verdict::Exit,
+        Err(Some(e)) => {
+            cpu.state_mut().x[0] = e.to_syscall_return();
+            Verdict::Skip
+        }
+        Ok(()) if k.flags & USER_NOTIF_FLAG_CONTINUE != 0 => Verdict::Run(nr),
+        Ok(()) => {
+            let v = if k.error != 0 {
+                i64::from(k.error)
+            } else {
+                k.val
+            };
+            cpu.state_mut().x[0] = v as u64;
+            Verdict::Skip
+        }
+    }
+}
+
+/// Logs (Linux emits an audit record, here the debug log is written): kills and LOG are always
+/// logged, TRAP, ERRNO, TRACE and USER_NOTIF only when the filter set `SECCOMP_FILTER_FLAG_LOG`,
+/// and all of them must be in `actions_logged`.
+fn log(cx: &Cx<'_>, nr: u64, sig: i32, action: u32, requested: bool) {
+    let (bit, always) = match action {
+        ret::ALLOW => return,
+        ret::TRAP => (logged::TRAP, false),
+        ret::ERRNO => (logged::ERRNO, false),
+        ret::TRACE => (logged::TRACE, false),
+        ret::USER_NOTIF => (logged::USER_NOTIF, false),
+        ret::LOG => (logged::LOG, true),
+        ret::KILL_THREAD => (logged::KILL_THREAD, true),
+        _ => (logged::KILL_PROCESS, true),
+    };
+    if (always || requested) && cx.kr().seccomp_logged & bit != 0 {
+        crate::debug::log(format_args!(
+            "seccomp: pid {} tid {} syscall {nr} sig {sig} action {action:#x}",
+            cx.tgid(),
+            cx.tid(),
+        ));
+    }
+}
+
+/// Ends only this thread, as if terminated by signal `sig` (Linux's `do_exit(sig)`).
+fn exit_thread(cx: &mut Cx<'_>, cpu: &mut Cpu, sig: Signal) -> Verdict {
+    let status = ExitStatus::Signaled {
+        signal: sig,
+        pc: None,
+        fault_addr: None,
+        core_dumped: false,
+    };
+    cx.task.exit_status.set(status);
+    if cx.tid() == cx.tgid() {
+        cx.t.group.borrow_mut().leader_status = status;
+    }
+    crate::ptrace::exit(cx, cpu, status);
+    Verdict::Exit
+}
+
+// ---- actions_avail and actions_logged sysctls ----
+
+/// Bits of `/proc/sys/kernel/seccomp/actions_logged` (Linux's `SECCOMP_LOG_*`).
+pub(crate) mod logged {
+    pub const KILL_PROCESS: u32 = 1;
+    pub const KILL_THREAD: u32 = 2;
+    pub const TRAP: u32 = 4;
+    pub const ERRNO: u32 = 8;
+    pub const TRACE: u32 = 16;
+    pub const LOG: u32 = 32;
+    pub const ALLOW: u32 = 64;
+    pub const USER_NOTIF: u32 = 128;
+    /// By default every action except ALLOW is logged.
+    pub const DEFAULT: u32 = KILL_PROCESS | KILL_THREAD | TRAP | ERRNO | USER_NOTIF | TRACE | LOG;
+}
+
+/// Action names, in `actions_avail` order.
+const NAMES: [(&str, u32); 8] = [
+    ("kill_process", logged::KILL_PROCESS),
+    ("kill_thread", logged::KILL_THREAD),
+    ("trap", logged::TRAP),
+    ("errno", logged::ERRNO),
+    ("user_notif", logged::USER_NOTIF),
+    ("trace", logged::TRACE),
+    ("log", logged::LOG),
+    ("allow", logged::ALLOW),
+];
+
+/// `/proc/sys/kernel/seccomp/actions_avail`.
+pub(crate) fn actions_avail() -> String {
+    let names: Vec<_> = NAMES.iter().map(|(n, _)| *n).collect();
+    format!("{}\n", names.join(" "))
+}
+
+/// `/proc/sys/kernel/seccomp/actions_logged`.
+pub(crate) fn actions_logged(k: &Kernel) -> String {
+    let names: Vec<_> = NAMES
+        .iter()
+        .filter(|(_, bit)| k.seccomp_logged & bit != 0)
+        .map(|(n, _)| *n)
+        .collect();
+    format!("{}\n", names.join(" "))
+}
+
+/// Writes `actions_logged`: space-separated names (up to a newline or an empty name), allow is
+/// not permitted, and `CAP_SYS_ADMIN` is required (Linux's `write_actions_logged`).
+pub(crate) fn set_actions_logged(
+    k: &mut Kernel,
+    cred: &crate::cred::Cred,
+    data: &[u8],
+) -> Result<(), Errno> {
+    if !cred.capable(crate::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let line = data.split(|&c| c == b'\n' || c == 0).next().unwrap_or(&[]);
+    let mut bits = 0;
+    for name in line.split(|&c| c == b' ') {
+        if name.is_empty() {
+            break;
+        }
+        let (_, bit) = NAMES
+            .iter()
+            .find(|(n, _)| n.as_bytes() == name)
+            .ok_or(Errno::EINVAL)?;
+        bits |= bit;
+    }
+    if bits & logged::ALLOW != 0 {
+        return Err(Errno::EINVAL);
+    }
+    k.seccomp_logged = bits;
+    Ok(())
+}
+
+// ---- User notifications ----
+
+/// ioctls of the notification fd.
+const IOCTL_NOTIF_RECV: u32 = 0xc050_2100;
+const IOCTL_NOTIF_SEND: u32 = 0xc018_2101;
+const IOCTL_NOTIF_ID_VALID: u32 = 0x4008_2102;
+/// ID_VALID as first defined, with the wrong direction; Linux still accepts it.
+const IOCTL_NOTIF_ID_VALID_WRONG_DIR: u32 = 0x8008_2102;
+/// ADDFD's size can vary (the struct may grow later), so the direction and size are masked off
+/// when comparing.
+const IOCTL_NOTIF_ADDFD: u32 = 0x4018_2103;
+const IOC_DIR_SIZE_MASK: u32 = 0xc000_0000 | 0x3fff_0000;
+/// The original size of `struct seccomp_notif_addfd`.
+const ADDFD_SIZE_VER0: usize = 24;
+const ADDFD_FLAG_SETFD: u32 = 1;
+const ADDFD_FLAG_SEND: u32 = 2;
 
 /// ioctls of the notification fd.
 pub(crate) fn ioctl(cx: &mut Cx<'_>, f: &Filter, request: u32, arg: u64) -> Result<u64, Errno> {
@@ -1311,15 +942,6 @@ pub(crate) fn ioctl(cx: &mut Cx<'_>, f: &Filter, request: u32, arg: u64) -> Resu
         }
         _ => Err(Errno::EINVAL),
     }
-}
-
-fn find(f: &Filter, id: u64) -> Option<Rc<RefCell<Knotif>>> {
-    let n = f.notif.borrow();
-    n.as_ref()?
-        .list
-        .iter()
-        .find(|k| k.borrow().id == id)
-        .cloned()
 }
 
 /// SECCOMP_IOCTL_NOTIF_RECV: waits for a notification not yet received and takes it (`struct
@@ -1477,6 +1099,17 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
     Ok(fd as u64)
 }
 
+fn find(f: &Filter, id: u64) -> Option<Rc<RefCell<Knotif>>> {
+    let n = f.notif.borrow();
+    n.as_ref()?
+        .list
+        .iter()
+        .find(|k| k.borrow().id == id)
+        .cloned()
+}
+
+// ---- ptrace ----
+
 /// PTRACE_SECCOMP_GET_FILTER: the original program of the tracee's filter number `index` (0 is
 /// the first installed), written to `data` (when it is 0, only the instruction count is
 /// returned). The tracer needs `CAP_SYS_ADMIN` and must have no seccomp itself.
@@ -1508,15 +1141,6 @@ pub(crate) fn get_metadata(cx: &Cx<'_>, task: &Task, size: u64, data: u64) -> Re
     Ok(size as u64)
 }
 
-fn privileged_tracer(cx: &Cx<'_>) -> Result<(), Errno> {
-    if !cx.cred().capable(crate::cred::cap::SYS_ADMIN)
-        || cx.task.seccomp.borrow().mode != mode::DISABLED
-    {
-        return Err(Errno::EACCES);
-    }
-    Ok(())
-}
-
 fn nth_filter(cx: &Cx<'_>, task: &Task, index: u64) -> Result<Rc<Filter>, Errno> {
     privileged_tracer(cx)?;
     let s = task.seccomp.borrow();
@@ -1538,6 +1162,17 @@ fn nth_filter(cx: &Cx<'_>, task: &Task, index: u64) -> Result<Rc<Filter>, Errno>
     Ok(f)
 }
 
+fn privileged_tracer(cx: &Cx<'_>) -> Result<(), Errno> {
+    if !cx.cred().capable(crate::cred::cap::SYS_ADMIN)
+        || cx.task.seccomp.borrow().mode != mode::DISABLED
+    {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+// ---- Thread exit ----
+
 /// A thread has exited: a non-main thread drops its filter chain at once; the main thread's is
 /// handed to the thread group and dropped only when the process is reaped (Linux drops it in
 /// `release_task`; a zombie is still a user, and the notification fd reports POLLHUP only then).
@@ -1546,6 +1181,389 @@ pub(crate) fn exited(task: &Task, group: &mut crate::process::ThreadGroup) {
     if task.tid.get() == group.tgid {
         group.leader_seccomp = chain;
     }
+}
+
+// ---- The always-allow cache ----
+
+/// The bitmap of a new filter (Linux's `seccomp_cache_prepare_bitmap`): the numbers in the
+/// previous filter's bitmap (every number when there is none) that this program also always
+/// returns ALLOW for.
+fn cache(prog: &[Insn], prev: Option<&[u64; CACHE_WORDS]>) -> [u64; CACHE_WORDS] {
+    let mut allow = prev.copied().unwrap_or([u64::MAX; CACHE_WORDS]);
+    for nr in 0..CACHED_NRS {
+        let bit = 1 << (nr % 64);
+        if allow[nr / 64] & bit != 0 && !const_allow(prog, nr as u32) {
+            allow[nr / 64] &= !bit;
+        }
+    }
+    allow
+}
+
+/// Whether the program always returns ALLOW when only the number `nr` and the architecture are
+/// known (Linux's `seccomp_is_const_allow`): it may read only the number and the architecture and
+/// use only jumps comparing with constants, unconditional jumps and ANDs with constants. Reading
+/// other data or using other instructions does not count, and the return value must be exactly
+/// ALLOW (with data it does not count).
+fn const_allow(prog: &[Insn], nr: u32) -> bool {
+    use bpf::*;
+    let mut a = 0u32;
+    let mut pc = 0;
+    while let Some(i) = prog.get(pc) {
+        pc += 1;
+        match i.code {
+            LOAD_DATA => match i.k {
+                0 => a = nr,
+                4 => a = AUDIT_ARCH_AARCH64,
+                _ => return false,
+            },
+            c if c == RET | K => return i.k == ret::ALLOW,
+            c if c == JMP | JA => pc += i.k as usize,
+            c if conditional(c) && c & X == 0 => {
+                let taken = match c & 0xf0 {
+                    JEQ => a == i.k,
+                    JGT => a > i.k,
+                    JGE => a >= i.k,
+                    _ => a & i.k != 0,
+                };
+                pc += if taken { i.jt } else { i.jf } as usize;
+            }
+            c if c == ALU | AND | K => a &= i.k,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A thread's seccomp changed (a filter installed, TSYNC, clone, being killed): updates
+/// [`Task::seccomp_on`] and the allow bitmap [`Task::seccomp_allow`], which are read without the
+/// BKL. Only filter mode has a bitmap.
+pub(crate) fn publish(task: &Task) {
+    let s = task.seccomp.borrow();
+    let allow = match (s.mode, &s.chain) {
+        (mode::FILTER, Some(c)) => c.filter().allow,
+        _ => [0; CACHE_WORDS],
+    };
+    for (w, bits) in task.seccomp_allow.iter().zip(allow) {
+        w.store(bits, Ordering::Relaxed);
+    }
+    task.seccomp_on
+        .store(s.mode != mode::DISABLED, Ordering::Relaxed);
+}
+
+/// Without the BKL: the thread's filters always return ALLOW for number `nr` (the bitmap from
+/// [`publish`]). Another thread doing TSYNC may be changing it; a stale bit read belongs to the
+/// chain before the sync (the new chain can only be stricter), as if this syscall happened before
+/// the sync.
+pub(crate) fn always_allowed(task: &Task, nr: u64) -> bool {
+    cached(|i| task.seccomp_allow[i].load(Ordering::Relaxed), nr)
+}
+
+/// Whether number `nr` is in the bitmap (each word given by `word`).
+fn cached(word: impl Fn(usize) -> u64, nr: u64) -> bool {
+    nr < CACHED_NRS as u64 && word(nr as usize / 64) >> (nr % 64) & 1 != 0
+}
+
+// ---- cBPF programs ----
+
+/// cBPF opcodes.
+mod bpf {
+    pub const LD: u16 = 0x00;
+    pub const LDX: u16 = 0x01;
+    pub const ST: u16 = 0x02;
+    pub const STX: u16 = 0x03;
+    pub const ALU: u16 = 0x04;
+    pub const JMP: u16 = 0x05;
+    pub const RET: u16 = 0x06;
+    pub const MISC: u16 = 0x07;
+
+    pub const W: u16 = 0x00;
+    pub const H: u16 = 0x08;
+    pub const B: u16 = 0x10;
+
+    pub const IMM: u16 = 0x00;
+    pub const ABS: u16 = 0x20;
+    pub const IND: u16 = 0x40;
+    pub const MEM: u16 = 0x60;
+    pub const LEN: u16 = 0x80;
+    pub const MSH: u16 = 0xa0;
+
+    pub const ADD: u16 = 0x00;
+    pub const SUB: u16 = 0x10;
+    pub const MUL: u16 = 0x20;
+    pub const DIV: u16 = 0x30;
+    pub const OR: u16 = 0x40;
+    pub const AND: u16 = 0x50;
+    pub const LSH: u16 = 0x60;
+    pub const RSH: u16 = 0x70;
+    pub const NEG: u16 = 0x80;
+    pub const MOD: u16 = 0x90;
+    pub const XOR: u16 = 0xa0;
+
+    pub const JA: u16 = 0x00;
+    pub const JEQ: u16 = 0x10;
+    pub const JGT: u16 = 0x20;
+    pub const JGE: u16 = 0x30;
+    pub const JSET: u16 = 0x40;
+
+    pub const K: u16 = 0x00;
+    pub const X: u16 = 0x08;
+    /// `BPF_RET | BPF_A`.
+    pub const A: u16 = 0x10;
+
+    pub const TAX: u16 = 0x00;
+    pub const TXA: u16 = 0x80;
+
+    /// Number of scratch memory slots.
+    pub const MEMWORDS: u32 = 16;
+
+    /// The opcode seccomp rewrites `LD | W | ABS` reads of `seccomp_data` into (Linux borrows it
+    /// the same way).
+    pub const LOAD_DATA: u16 = LDX | W | ABS;
+}
+
+/// One cBPF instruction (`struct sock_filter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Insn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+impl Insn {
+    fn decode(b: &[u8]) -> Insn {
+        Insn {
+            code: u16::from_le_bytes([b[0], b[1]]),
+            jt: b[2],
+            jf: b[3],
+            k: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+        }
+    }
+}
+
+/// Checks a program by the cBPF rules (Linux's `bpf_check_classic`): opcodes are recognized;
+/// division by constant 0, shifts beyond 31, out-of-bounds scratch memory and jumps out of the
+/// program are refused; the last instruction is a return; scratch memory is written before read.
+fn check_classic(prog: &[Insn]) -> Result<(), Errno> {
+    use bpf::*;
+    let n = prog.len();
+    for (pc, i) in prog.iter().enumerate() {
+        if !classic_code(i.code) {
+            return Err(Errno::EINVAL);
+        }
+        let bad = match i.code {
+            c if c == ALU | DIV | K || c == ALU | MOD | K => i.k == 0,
+            c if c == ALU | LSH | K || c == ALU | RSH | K => i.k >= 32,
+            c if c == LD | MEM || c == LDX | MEM || c == ST || c == STX => i.k >= MEMWORDS,
+            c if c == JMP | JA => i.k as u64 >= (n - pc - 1) as u64,
+            c if conditional(c) => pc + i.jt as usize + 1 >= n || pc + i.jf as usize + 1 >= n,
+            _ => false,
+        };
+        if bad {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if !matches!(prog[n - 1].code, c if c == RET | K || c == RET | A) {
+        return Err(Errno::EINVAL);
+    }
+    check_load_and_stores(prog)
+}
+
+/// Opcodes cBPF recognizes (Linux's `chk_code_allowed`).
+fn classic_code(code: u16) -> bool {
+    use bpf::*;
+    matches!(
+        code,
+        0x04 | 0x0c // ADD
+            | 0x14 | 0x1c // SUB
+            | 0x24 | 0x2c // MUL
+            | 0x34 | 0x3c // DIV
+            | 0x94 | 0x9c // MOD
+            | 0x54 | 0x5c // AND
+            | 0x44 | 0x4c // OR
+            | 0xa4 | 0xac // XOR
+            | 0x64 | 0x6c // LSH
+            | 0x74 | 0x7c // RSH
+            | 0x84 // NEG
+    ) || [
+        LD | W | ABS,
+        LD | H | ABS,
+        LD | B | ABS,
+        LD | W | LEN,
+        LD | W | IND,
+        LD | H | IND,
+        LD | B | IND,
+        LD | IMM,
+        LD | MEM,
+        LDX | W | LEN,
+        LDX | B | MSH,
+        LDX | IMM,
+        LDX | MEM,
+        ST,
+        STX,
+        MISC | TAX,
+        MISC | TXA,
+        RET | K,
+        RET | A,
+        JMP | JA,
+    ]
+    .contains(&code)
+        || conditional(code)
+}
+
+/// Scratch memory is written before it is read on every path (Linux's `check_load_and_stores`):
+/// a jump passes the slots already written on arrival to its target, and the instruction after a
+/// jump can only be reached by jumping from elsewhere.
+fn check_load_and_stores(prog: &[Insn]) -> Result<(), Errno> {
+    use bpf::*;
+    let mut masks = vec![u16::MAX; prog.len()];
+    let mut valid = 0u16;
+    for (pc, i) in prog.iter().enumerate() {
+        valid &= masks[pc];
+        match i.code {
+            c if c == ST || c == STX => valid |= 1 << i.k,
+            c if c == LD | MEM || c == LDX | MEM => {
+                if valid & 1 << i.k == 0 {
+                    return Err(Errno::EINVAL);
+                }
+            }
+            c if c == JMP | JA => {
+                masks[pc + 1 + i.k as usize] &= valid;
+                valid = u16::MAX;
+            }
+            c if conditional(c) => {
+                masks[pc + 1 + i.jt as usize] &= valid;
+                masks[pc + 1 + i.jf as usize] &= valid;
+                valid = u16::MAX;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Checks and rewrites a program by seccomp's rules (Linux's `seccomp_check_filter`): data reads
+/// may only read 4-byte-aligned words of `seccomp_data`, length reads become the constant 64, and
+/// other packet-reading instructions and modulo are refused.
+fn check_seccomp(prog: &mut [Insn]) -> Result<(), Errno> {
+    use bpf::*;
+    for i in prog {
+        match i.code {
+            c if c == LD | W | ABS => {
+                if i.k as usize >= DATA_SIZE || i.k & 3 != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                i.code = LOAD_DATA;
+            }
+            c if c == LD | W | LEN => {
+                i.code = LD | IMM;
+                i.k = DATA_SIZE as u32;
+            }
+            c if c == LDX | W | LEN => {
+                i.code = LDX | IMM;
+                i.k = DATA_SIZE as u32;
+            }
+            0x06 | 0x16 // RET K, RET A
+            | 0x04 | 0x0c | 0x14 | 0x1c | 0x24 | 0x2c | 0x34 | 0x3c // ADD, SUB, MUL, DIV
+            | 0x54 | 0x5c | 0x44 | 0x4c | 0xa4 | 0xac // AND, OR, XOR
+            | 0x64 | 0x6c | 0x74 | 0x7c | 0x84 // LSH, RSH, NEG
+            | 0x00 | 0x01 // LD IMM, LDX IMM
+            | 0x07 | 0x87 // TAX, TXA
+            | 0x60 | 0x61 | 0x02 | 0x03 // LD MEM, LDX MEM, ST, STX
+            | 0x05 | 0x15 | 0x1d | 0x35 | 0x3d | 0x25 | 0x2d | 0x45 | 0x4d => {} // jumps
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    Ok(())
+}
+
+/// The length after Linux's `bpf_convert_filter`, used for the filter chain's capacity check.
+/// cBPF is still interpreted here, and only the converted length is counted; seccomp has already
+/// excluded packet access and modulo instructions.
+fn converted_len(prog: &[Insn]) -> usize {
+    use bpf::*;
+    // Clear A and X and save the context pointer.
+    3 + prog
+        .iter()
+        .map(|i| match i.code {
+            c if c == RET | K => 2,
+            c if c == ALU | DIV | X => 5,
+            c if conditional(c) => {
+                let immediate = usize::from(c & X == 0 && i.k > i32::MAX as u32);
+                let extra_jump = usize::from(i.jf != 0 && (i.jt != 0 || c & 0xf0 == JSET));
+                1 + immediate + extra_jump
+            }
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
+/// Conditional jumps.
+fn conditional(code: u16) -> bool {
+    use bpf::*;
+    code & 0x07 == JMP && code & 0xf0 != JA && code & 0xf0 <= JSET
+}
+
+/// Runs a checked program on `data` (a `struct seccomp_data`) and returns its return value.
+fn run(prog: &[Insn], data: &[u8; DATA_SIZE]) -> u32 {
+    use bpf::*;
+    let (mut a, mut x) = (0u32, 0u32);
+    let mut mem = [0u32; MEMWORDS as usize];
+    let mut pc = 0;
+    loop {
+        let i = prog[pc];
+        pc += 1;
+        let src = if i.code & X != 0 { x } else { i.k };
+        match i.code {
+            LOAD_DATA => {
+                let k = i.k as usize;
+                a = u32::from_le_bytes(data[k..k + 4].try_into().unwrap());
+            }
+            c if c == LD | IMM => a = i.k,
+            c if c == LDX | IMM => x = i.k,
+            c if c == LD | MEM => a = mem[i.k as usize],
+            c if c == LDX | MEM => x = mem[i.k as usize],
+            c if c == ST => mem[i.k as usize] = a,
+            c if c == STX => mem[i.k as usize] = x,
+            c if c == MISC | TAX => x = a,
+            c if c == MISC | TXA => a = x,
+            c if c == RET | K => return i.k,
+            c if c == RET | A => return a,
+            c if c == JMP | JA => pc += i.k as usize,
+            c if c & 0x07 == ALU => match c & 0xf0 {
+                ADD => a = a.wrapping_add(src),
+                SUB => a = a.wrapping_sub(src),
+                MUL => a = a.wrapping_mul(src),
+                // On division by 0 (only possible with X) a cBPF program returns 0
+                DIV if src == 0 => return 0,
+                DIV => a /= src,
+                OR => a |= src,
+                AND => a &= src,
+                XOR => a ^= src,
+                LSH => a = a.wrapping_shl(src),
+                RSH => a = a.wrapping_shr(src),
+                NEG => a = a.wrapping_neg(),
+                _ => unreachable!("modulo cannot pass the checks"),
+            },
+            c => {
+                let taken = match c & 0xf0 {
+                    JEQ => a == src,
+                    JGT => a > src,
+                    JGE => a >= src,
+                    _ => a & src != 0,
+                };
+                pc += if taken { i.jt } else { i.jf } as usize;
+            }
+        }
+    }
+}
+
+// ---- Shared helpers ----
+
+fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
+    let mut b = [0u8; N];
+    cx.mm().read(UserSlice::new(addr, N), &mut b)?;
+    Ok(b)
 }
 
 #[cfg(test)]
