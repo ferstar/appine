@@ -264,17 +264,6 @@ pub(crate) struct Addr6 {
     pub metric: u32,
 }
 
-/// Address scope (`ipv6_addr_scope`): link for link-local, host for ::1, universe otherwise.
-fn scope6(a: &[u8; 16]) -> u8 {
-    if a[0] == 0xfe && a[1] & 0xc0 == 0x80 {
-        RT_SCOPE_LINK
-    } else if *a == std::net::Ipv6Addr::LOCALHOST.octets() {
-        RT_SCOPE_HOST
-    } else {
-        RT_SCOPE_UNIVERSE
-    }
-}
-
 /// One virtual device.
 #[derive(Debug)]
 pub(crate) struct Dev {
@@ -444,1067 +433,11 @@ impl Devices {
     }
 }
 
-/// The device table of namespace `ns`, after first clearing veths whose peer is gone.
-fn devs(ns: &NetNs) -> crate::cell::RefMut<'_, Devices> {
-    let mut d = ns.devs.borrow_mut();
-    d.prune();
-    d
-}
-
-/// The interfaces in a namespace that are not virtual devices: the host's in the initial
-/// namespace, lo in a new one.
-pub(crate) fn base(ns: &NetNs) -> Vec<Interface> {
-    if ns.host_net.is_none() {
-        appine_hal::net::interfaces()
-    } else {
-        vec![crate::netns::lo_interface(ns)]
-    }
-}
-
-fn random_mac() -> [u8; 6] {
-    let mut m = [0u8; 6];
-    let _ = appine_hal::fill_random(&mut m);
-    // A unicast, locally administered address (eth_random_addr)
-    m[0] = (m[0] & 0xfe) | 0x02;
-    m
-}
-
-fn valid_mac(m: &[u8]) -> bool {
-    m.len() == 6 && m[0] & 1 == 0 && m.iter().any(|&b| b != 0)
-}
-
-/// Whether an interface name is valid (`dev_valid_name`).
-fn valid_name(name: &[u8]) -> bool {
-    !name.is_empty()
-        && name.len() < IFNAMSIZ
-        && name != b"."
-        && name != b".."
-        && !name
-            .iter()
-            .any(|&c| c == b'/' || c == b':' || c.is_ascii_whitespace())
-}
-
-fn name_in_use(ns: &NetNs, d: &Devices, name: &[u8]) -> bool {
-    d.by_name(name).is_some() || base(ns).iter().any(|i| i.name.as_bytes() == name)
-}
-
-/// Chooses a name (`dev_get_valid_name`): one with `%d` takes the lowest unused number; others
-/// must be valid and unused (otherwise EINVAL, EEXIST).
-fn choose_name(ns: &NetNs, d: &Devices, pattern: &[u8]) -> Result<Vec<u8>, Errno> {
-    if !valid_name(pattern) {
-        return Err(Errno::EINVAL);
-    }
-    let Some(at) = pattern.windows(2).position(|w| w == b"%d") else {
-        if pattern.contains(&b'%') {
-            return Err(Errno::EINVAL);
-        }
-        if name_in_use(ns, d, pattern) {
-            return Err(Errno::EEXIST);
-        }
-        return Ok(pattern.to_vec());
-    };
-    if pattern[at + 2..].contains(&b'%') || pattern[..at].contains(&b'%') {
-        return Err(Errno::EINVAL);
-    }
-    for n in 0..32768 {
-        let mut name = pattern[..at].to_vec();
-        name.extend_from_slice(n.to_string().as_bytes());
-        name.extend_from_slice(&pattern[at + 2..]);
-        if name.len() >= IFNAMSIZ {
-            return Err(Errno::EINVAL);
-        }
-        if !name_in_use(ns, d, &name) {
-            return Ok(name);
-        }
-    }
-    Err(Errno::ENFILE)
-}
-
-/// Allocates an interface index (`dev_new_index`): in the initial namespace, after the host's
-/// largest.
-fn alloc_index(ns: &NetNs, d: &mut Devices) -> u32 {
-    let host = base(ns);
-    if ns.host_net.is_none() {
-        let top = host.iter().map(|i| i.index).max().unwrap_or(0);
-        d.ifindex = d.ifindex.max(top);
-    }
-    loop {
-        d.ifindex = d.ifindex.wrapping_add(1).max(1);
-        let i = d.ifindex;
-        if d.by_index(i).is_none() && !host.iter().any(|h| h.index == i) {
-            return i;
-        }
-    }
-}
-
-fn index_in_use(ns: &NetNs, d: &Devices, index: u32) -> bool {
-    d.by_index(index).is_some() || base(ns).iter().any(|h| h.index == index)
-}
-
-// ---- Carrier and state ----
-
-/// Whether the device has carrier (`netif_carrier_ok`). `devs` is the device table of its
-/// namespace (to find a bridge's ports).
-fn carrier(me: &DevRef, devs: &Devices) -> bool {
-    let d = me.borrow();
-    match d.kind {
-        Kind::Dummy => true,
-        Kind::Veth => d.up && d.peer.upgrade().is_some_and(|p| p.borrow().up),
-        Kind::Bridge if !d.selected => true,
-        Kind::Bridge => {
-            d.up && devs
-                .ports(me)
-                .iter()
-                .any(|p| p.borrow().up && carrier(p, devs))
-        }
-    }
-}
-
-/// A port's state (`BR_STATE_*`): forwarding when the bridge and the port are both up and the
-/// port has carrier (STP off), disabled otherwise.
-fn port_state(port: &DevRef, devs: &Devices) -> Option<u8> {
-    let br = port.borrow().master.upgrade()?;
-    let on = br.borrow().up && port.borrow().up && carrier(port, devs);
-    Some(if on { 3 } else { 0 })
-}
-
-/// A snapshot of a device (for netlink answers, procfs and sysfs).
-#[derive(Debug, Clone)]
-pub(crate) struct View {
-    pub index: u32,
-    pub name: Vec<u8>,
-    pub kind: Kind,
-    /// Reported flags (`dev_get_flags`: including RUNNING and LOWER_UP).
-    pub flags: u32,
-    pub carrier: bool,
-    pub operstate: u8,
-    pub mtu: u32,
-    pub mac: [u8; 6],
-    pub txqlen: u32,
-    pub group: u32,
-    pub alias: Option<Vec<u8>>,
-    /// `IFLA_LINK`: the index of the veth's peer (with its namespace when it is not in the same
-    /// one).
-    pub link: Option<(u32, Option<Rc<NetNs>>)>,
-    pub master: Option<u32>,
-    pub port_state: Option<u8>,
-    pub carrier_changes: u32,
-    pub v4: Vec<Addr4>,
-    pub v6: Vec<Addr6>,
-    /// The MAC used for the bridge id (`bridge_id`).
-    pub bridge_mac: [u8; 6],
-    /// Has been up (the qdisc is noqueue).
-    pub ever_up: bool,
-}
-
-impl View {
-    /// Viewed as an interface, the way `ip` and procfs use it.
-    pub fn interface(&self) -> Interface {
-        let mut addrs: Vec<(i32, Vec<u8>, u8)> = self
-            .v4
-            .iter()
-            .map(|a| (AF_INET, a.local.to_vec(), a.prefix))
-            .collect();
-        addrs.extend(
-            self.v6
-                .iter()
-                .map(|a| (AF_INET6, a.addr.to_vec(), a.prefix)),
-        );
-        Interface {
-            name: String::from_utf8_lossy(&self.name).into_owned(),
-            index: self.index,
-            flags: self.flags,
-            mtu: self.mtu,
-            mac: Some(self.mac),
-            addrs,
-        }
-    }
-}
-
-fn view(me: &DevRef, devs: &Devices, my_ns: &NetNs) -> View {
-    let c = carrier(me, devs);
-    let port = port_state(me, devs);
-    let d = me.borrow();
-    let link = match d.kind {
-        Kind::Veth => Some(match d.peer.upgrade() {
-            Some(p) => {
-                let p = p.borrow();
-                let other =
-                    p.ns.upgrade()
-                        .filter(|n| !std::ptr::eq(Rc::as_ptr(n), my_ns));
-                (p.index, other)
-            }
-            None => (0, None),
-        }),
-        _ => None,
-    };
-    let iflink = link.as_ref().map_or(d.index, |l| l.0);
-    let operstate = if !d.up {
-        IF_OPER_DOWN
-    } else if !c {
-        if iflink != d.index {
-            IF_OPER_LOWERLAYERDOWN
-        } else {
-            IF_OPER_DOWN
-        }
-    } else if d.kind == Kind::Dummy || (d.kind == Kind::Bridge && !d.selected) {
-        IF_OPER_UNKNOWN
-    } else {
-        IF_OPER_UP
-    };
-    let mut flags = d.flags;
-    if d.up {
-        flags |= IFF_UP;
-        if matches!(operstate, IF_OPER_UP | IF_OPER_UNKNOWN) {
-            flags |= IFF_RUNNING;
-        }
-        if c {
-            flags |= IFF_LOWER_UP;
-        }
-    }
-    View {
-        index: d.index,
-        name: d.name.clone(),
-        kind: d.kind,
-        flags,
-        carrier: c,
-        operstate,
-        mtu: d.mtu,
-        mac: d.mac,
-        txqlen: d.txqlen,
-        group: d.group,
-        alias: d.alias.clone(),
-        link,
-        master: d.master.upgrade().map(|m| m.borrow().index),
-        port_state: port,
-        carrier_changes: d.carrier_changes,
-        v4: d.v4.clone(),
-        v6: d.v6.clone(),
-        bridge_mac: d.mac,
-        ever_up: d.ever_up,
-    }
-}
-
-/// The virtual devices in namespace `ns`, by index.
-pub(crate) fn views(ns: &NetNs) -> Vec<View> {
-    let d = devs(ns);
-    let mut v: Vec<View> = d.list.iter().map(|x| view(x, &d, ns)).collect();
-    v.sort_by_key(|x| x.index);
-    v
-}
-
-/// The IPv4 addresses and prefix lengths on virtual devices in namespace `ns` (for address
-/// mapping, [`crate::netns`]).
-pub(crate) fn local_v4(ns: &NetNs) -> Vec<([u8; 4], u8)> {
-    let d = devs(ns);
-    let mut v = Vec::new();
-    for x in &d.list {
-        v.extend(x.borrow().v4.iter().map(|a| (a.local, a.prefix)));
-    }
-    v
-}
-
-/// The route in namespace `ns` through virtual devices to IPv4 address `ip` (the longest prefix
-/// in the main table; among equal lengths, the lowest metric).
-pub(crate) fn route_v4(ns: &NetNs, ip: [u8; 4]) -> Option<Entry> {
-    entries(ns)
-        .into_iter()
-        .filter(|e| {
-            e.family == AF_INET
-                && e.table == RT_TABLE_MAIN
-                && crate::route::network(&ip, e.prefix) == e.dst
-        })
-        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
-}
-
-/// Whether namespace `ns` has an IPv6 route to `ip` through virtual devices.
-pub(crate) fn routes_v6(ns: &NetNs, ip: &[u8; 16]) -> bool {
-    entries(ns).iter().any(|e| {
-        e.family == AF_INET6
-            && e.table == RT_TABLE_MAIN
-            && crate::route::network(ip, e.prefix) == e.dst
-    })
-}
-
-/// The first primary IPv4 address on the virtual device with index `index` in namespace `ns`.
-pub(crate) fn first_v4(ns: &NetNs, index: u32) -> Option<[u8; 4]> {
-    let d = devs(ns);
-    let x = d.by_index(index)?;
-    let x = x.borrow();
-    x.v4.iter()
-        .find(|a| a.flags & IFA_F_SECONDARY == 0)
-        .map(|a| a.local)
-}
-
-/// All interfaces in namespace `ns` (the host's or lo, plus virtual devices), by index.
-pub(crate) fn interfaces(ns: &NetNs) -> Vec<Interface> {
-    let mut all = base(ns);
-    all.extend(views(ns).iter().map(View::interface));
-    all.sort_by_key(|i| i.index);
-    all
-}
-
-/// Routes on virtual devices ([`Entry`] with `host` false), in the order added.
-pub(crate) fn entries(ns: &NetNs) -> Vec<Entry> {
-    let d = devs(ns);
-    d.routes
-        .iter()
-        .filter_map(|r| {
-            let dev = r.dev.upgrade()?;
-            let linkdown = r.ty != RTN_LOCAL && !carrier(&dev, &d);
-            let x = dev.borrow();
-            Some(Entry {
-                family: r.family,
-                table: r.table,
-                ty: r.ty,
-                proto: r.proto,
-                scope: r.scope,
-                dst: r.dst.clone(),
-                prefix: r.prefix,
-                prefsrc: r.prefsrc.clone(),
-                gateway: r.gateway.clone(),
-                iface: String::from_utf8_lossy(&x.name).into_owned(),
-                index: x.index,
-                metric: r.metric,
-                flags: if linkdown { RTNH_F_LINKDOWN } else { 0 },
-                host: false,
-            })
-        })
-        .collect()
-}
-
-/// The two tables of namespace `ns` (the host's or lo's, plus those on virtual devices).
-/// `host_routes` are the routes in the host's main table (the initial namespace,
-/// [`crate::route::host_routes`]).
-pub(crate) fn tables(ns: &NetNs, host_routes: Option<Vec<appine_hal::net::Route>>) -> Vec<Entry> {
-    let base_ifaces = base(ns);
-    let host = if ns.host_net.is_none() {
-        crate::route::tables(&base_ifaces, host_routes)
-    } else {
-        // A new namespace: lo's local routes (there is no host main table)
-        crate::route::tables(&base_ifaces, Some(Vec::new()))
-            .into_iter()
-            .map(|mut e| {
-                e.host = false;
-                e
-            })
-            .collect()
-    };
-    crate::route::merge(host, entries(ns))
-}
-
-// ---- Namespace ids ----
-
-/// The id `ns` gives `peer`, allocating one if there is none (`peernet2id_alloc`: the lowest
-/// unused from 0).
-pub(crate) fn nsid_alloc(ns: &NetNs, peer: &Rc<NetNs>) -> i32 {
-    let mut d = ns.devs.borrow_mut();
-    d.nsids.retain(|(w, _)| w.strong_count() > 0);
-    if let Some((_, id)) = d
-        .nsids
-        .iter()
-        .find(|(w, _)| Weak::ptr_eq(w, &Rc::downgrade(peer)))
-    {
-        return *id;
-    }
-    let id = (0..)
-        .find(|i| !d.nsids.iter().any(|(_, x)| x == i))
-        .unwrap();
-    d.nsids.push((Rc::downgrade(peer), id));
-    id
-}
-
-/// The id `ns` gives `peer`; None when none is allocated.
-pub(crate) fn nsid(ns: &NetNs, peer: &Rc<NetNs>) -> Option<i32> {
-    let d = ns.devs.borrow();
-    d.nsids
-        .iter()
-        .find(|(w, _)| w.strong_count() > 0 && Weak::ptr_eq(w, &Rc::downgrade(peer)))
-        .map(|(_, id)| *id)
-}
-
-// ---- Adding and removing routes (added per address) ----
-
-fn add_route(d: &mut Devices, r: Rt) {
-    if !d.routes.iter().any(|x| x.same(&r)) {
-        d.routes.push(r);
-    }
-}
-
-/// A route added per address (by `fib_magic` or addrconf).
-#[allow(clippy::too_many_arguments)]
-fn kernel_route(
-    family: i32,
-    table: u8,
-    ty: u8,
-    scope: u8,
-    dst: Vec<u8>,
-    prefix: u8,
-    prefsrc: Option<Vec<u8>>,
-    dev: &DevRef,
-    metric: u32,
-    owner: Vec<u8>,
-) -> Rt {
-    Rt {
-        family,
-        table,
-        ty,
-        proto: RTPROT_KERNEL,
-        scope,
-        tos: 0,
-        dst,
-        prefix,
-        prefsrc,
-        gateway: None,
-        dev: Rc::downgrade(dev),
-        metric,
-        owner: Some(owner),
-    }
-}
-
-/// The routes of IPv4 address `a` (`fib_add_ifaddr`): the local route is always added; an
-/// explicit broadcast address, the subnet and the subnet broadcast only while the interface is
-/// up; a secondary's preferred source is the primary in the same subnet.
-fn add_ifaddr4(d: &mut Devices, dev: &DevRef, a: &Addr4) {
-    let (up, prim) = {
-        let x = dev.borrow();
-        let prim = if a.flags & IFA_F_SECONDARY != 0 {
-            x.v4.iter()
-                .find(|p| {
-                    p.flags & IFA_F_SECONDARY == 0 && p.prefix == a.prefix && p.contains(a.local)
-                })
-                .map_or(a.local, |p| p.local)
-        } else {
-            a.local
-        };
-        (x.up, prim)
-    };
-    let src = Some(prim.to_vec());
-    let own = a.local.to_vec();
-    let host = |ty, scope, dst: [u8; 4]| {
-        kernel_route(
-            AF_INET,
-            RT_TABLE_LOCAL,
-            ty,
-            scope,
-            dst.to_vec(),
-            32,
-            src.clone(),
-            dev,
-            0,
-            own.clone(),
-        )
-    };
-    add_route(d, host(RTN_LOCAL, RT_SCOPE_HOST, a.local));
-    if !up {
-        return;
-    }
-    if a.broadcast != [0; 4] && a.broadcast != [0xff; 4] {
-        add_route(d, host(RTN_BROADCAST, RT_SCOPE_LINK, a.broadcast));
-    }
-    let prefix = a.subnet();
-    if prefix != 0
-        && a.flags & IFA_F_SECONDARY == 0
-        && (prefix != u32::from_be_bytes(a.local) || a.prefix < 32)
-    {
-        if a.flags & IFA_F_NOPREFIXROUTE == 0 {
-            add_route(
-                d,
-                kernel_route(
-                    AF_INET,
-                    RT_TABLE_MAIN,
-                    RTN_UNICAST,
-                    RT_SCOPE_LINK,
-                    prefix.to_be_bytes().to_vec(),
-                    a.prefix,
-                    src.clone(),
-                    dev,
-                    a.metric,
-                    own.clone(),
-                ),
-            );
-        }
-        if a.prefix < 31 {
-            add_route(
-                d,
-                host(
-                    RTN_BROADCAST,
-                    RT_SCOPE_LINK,
-                    (prefix | !a.mask()).to_be_bytes(),
-                ),
-            );
-        }
-    }
-}
-
-/// The routes of an IPv6 address: the subnet (none with `IFA_F_NOPREFIXROUTE`, nor for /128) and
-/// the local route (while the interface is up).
-fn add_ifaddr6(d: &mut Devices, dev: &DevRef, a: &Addr6) {
-    let up = dev.borrow().up;
-    let own = a.addr.to_vec();
-    if a.flags & IFA_F_NOPREFIXROUTE == 0 && a.prefix < 128 {
-        add_route(
-            d,
-            kernel_route(
-                AF_INET6,
-                RT_TABLE_MAIN,
-                RTN_UNICAST,
-                RT_SCOPE_UNIVERSE,
-                crate::route::network(&a.addr, a.prefix),
-                a.prefix,
-                None,
-                dev,
-                if a.metric != 0 {
-                    a.metric
-                } else {
-                    IP6_PRIO_ADDRCONF
-                },
-                own.clone(),
-            ),
-        );
-    }
-    if up {
-        add_route(
-            d,
-            kernel_route(
-                AF_INET6,
-                RT_TABLE_LOCAL,
-                RTN_LOCAL,
-                RT_SCOPE_UNIVERSE,
-                own.clone(),
-                128,
-                None,
-                dev,
-                0,
-                own,
-            ),
-        );
-    }
-}
-
-/// Removes the routes through `dev`: with `keep_local`, IPv4 local routes stay (when the
-/// interface goes down).
-fn drop_routes(d: &mut Devices, dev: &DevRef, family: Option<i32>, keep_local: bool) {
-    d.routes.retain(|r| {
-        !(r.on(dev)
-            && family.is_none_or(|f| r.family == f)
-            && !(keep_local && r.family == AF_INET && r.ty == RTN_LOCAL))
-    });
-}
-
-/// Rebuilds the routes added per address after IPv4 addresses change: removes those of `gone`
-/// (including those whose preferred source it is, `fib_sync_down_addr`), then adds them back for
-/// the remaining addresses (`fib_del_ifaddr` keeps shared ones).
-fn redo_ifaddr4(d: &mut Devices, dev: &DevRef, gone: &[[u8; 4]]) {
-    d.routes.retain(|r| {
-        !(r.family == AF_INET
-            && gone.iter().any(|g| {
-                r.owner.as_deref() == Some(&g[..]) || r.prefsrc.as_deref() == Some(&g[..])
-            }))
-    });
-    let addrs = dev.borrow().v4.clone();
-    for a in &addrs {
-        add_ifaddr4(d, dev, a);
-    }
-}
-
-/// Whether the interface has IPv6 off: its own `disable_ipv6`, or an MTU below 1280.
-fn v6_disabled(x: &Dev) -> bool {
-    x.conf6.get(true, "disable_ipv6") != 0 || i64::from(x.mtu) < crate::netconf::IPV6_MIN_MTU
-}
-
-/// The link-local address generated from the MAC (EUI-64).
-fn link_local(mac: [u8; 6]) -> [u8; 16] {
-    let mut a = [0u8; 16];
-    a[0] = 0xfe;
-    a[1] = 0x80;
-    a[8] = mac[0] ^ 0x02;
-    a[9] = mac[1];
-    a[10] = mac[2];
-    a[11] = 0xff;
-    a[12] = 0xfe;
-    a[13] = mac[3];
-    a[14] = mac[4];
-    a[15] = mac[5];
-    a
-}
-
-/// Configures an interface's IPv6 (addrconf's `addrconf_dev_config`): routes for ff00::/8 and
-/// fe80::/64, a generated link-local address (none when `addr_gen_mode` is 1), and routes for
-/// existing addresses.
-fn v6_config(d: &mut Devices, dev: &DevRef) {
-    let (mac, mode) = {
-        let mut x = dev.borrow_mut();
-        x.v6_ready = true;
-        (x.mac, x.conf6.get(true, "addr_gen_mode"))
-    };
-    let r = |table, ty, dst: Vec<u8>, prefix| {
-        kernel_route(
-            AF_INET6,
-            table,
-            ty,
-            RT_SCOPE_UNIVERSE,
-            dst,
-            prefix,
-            None,
-            dev,
-            IP6_PRIO_ADDRCONF,
-            Vec::new(),
-        )
-    };
-    let mut mc = vec![0u8; 16];
-    mc[0] = 0xff;
-    add_route(d, r(RT_TABLE_LOCAL, RTN_MULTICAST, mc, 8));
-    let mut ll = vec![0u8; 16];
-    ll[..2].copy_from_slice(&[0xfe, 0x80]);
-    add_route(d, r(RT_TABLE_MAIN, RTN_UNICAST, ll, 64));
-    if mode != 1 {
-        let a = Addr6 {
-            addr: link_local(mac),
-            prefix: 64,
-            flags: IFA_F_PERMANENT,
-            proto: IFAPROT_KERNEL_LL,
-            metric: 0,
-        };
-        let mut x = dev.borrow_mut();
-        if !x.v6.iter().any(|b| b.addr == a.addr) {
-            x.v6.push(a);
-        }
-    }
-    let addrs = dev.borrow().v6.clone();
-    for a in &addrs {
-        add_ifaddr6(d, dev, a);
-    }
-}
-
-/// Removes an interface's IPv6 (when going down, disabling IPv6 or moving away,
-/// `addrconf_ifdown`): addresses and routes are all removed.
-fn v6_down(d: &mut Devices, dev: &DevRef) {
-    {
-        let mut x = dev.borrow_mut();
-        x.v6.clear();
-        x.v6_ready = false;
-    }
-    drop_routes(d, dev, Some(AF_INET6), false);
-}
-
-/// Advances after a state change: counts carrier changes, and configures IPv6 on interfaces that
-/// are up with carrier and IPv6 not disabled. Those in `first` are handled first (Linux goes by
-/// the order of events: the changed one, its peer, the bridge it is attached to).
-fn settle(ns: &NetNs, first: &[DevRef]) {
-    let mut d = devs(ns);
-    let mut order: Vec<DevRef> = Vec::new();
-    for x in first.iter().chain(d.list.clone().iter()) {
-        let mine = x
-            .borrow()
-            .ns
-            .upgrade()
-            .is_some_and(|n| std::ptr::eq(Rc::as_ptr(&n), ns));
-        if mine && !order.iter().any(|o| Rc::ptr_eq(o, x)) {
-            order.push(x.clone());
-        }
-    }
-    for x in &order {
-        let c = carrier(x, &d);
-        let ready = {
-            let mut y = x.borrow_mut();
-            if c != y.carrier_was {
-                y.carrier_was = c;
-                y.carrier_changes += 1;
-            }
-            y.up && c && !y.v6_ready && !v6_disabled(&y)
-        };
-        if ready {
-            v6_config(&mut d, x);
-        }
-    }
-}
-
-/// `dev` and those connected to it: its peer and the bridge it is attached to (the order for
-/// [`settle`]).
-fn related(dev: &DevRef) -> Vec<DevRef> {
-    let x = dev.borrow();
-    let mut v = vec![dev.clone()];
-    v.extend(x.peer.upgrade());
-    v.extend(x.master.upgrade());
-    v
-}
-
-/// Advances the namespaces of `dev` and of its peer.
-fn settle_around(dev: &DevRef) {
-    let first = related(dev);
-    let mut nss: Vec<Rc<NetNs>> = Vec::new();
-    for x in &first {
-        if let Some(n) = x.borrow().ns.upgrade()
-            && !nss.iter().any(|m| Rc::ptr_eq(m, &n))
-        {
-            nss.push(n);
-        }
-    }
-    for n in &nss {
-        settle(n, &first);
-    }
-}
-
-// ---- Device changes ----
-
-/// Brings a device up or down (`__dev_open`, `__dev_close`).
-fn set_up(ns: &NetNs, dev: &DevRef, up: bool) {
-    if dev.borrow().up == up {
-        return;
-    }
-    {
-        let mut x = dev.borrow_mut();
-        x.up = up;
-        x.ever_up |= up;
-    }
-    let mut d = devs(ns);
-    if up {
-        // NETDEV_UP: re-add the routes per address
-        let addrs = dev.borrow().v4.clone();
-        for a in &addrs {
-            add_ifaddr4(&mut d, dev, a);
-        }
-    } else {
-        drop_routes(&mut d, dev, Some(AF_INET), true);
-        let keep = {
-            let x = dev.borrow();
-            x.conf6.get(true, "keep_addr_on_down") > 0
-                || d.conf.all6.get(true, "keep_addr_on_down") > 0
-        };
-        if keep {
-            dev.borrow_mut().v6_ready = false;
-            drop_routes(&mut d, dev, Some(AF_INET6), false);
-        } else {
-            v6_down(&mut d, dev);
-        }
-    }
-}
-
-/// Changes flags (`dev_change_flags`): `flags` are the wanted flags after combining.
-fn change_flags(ns: &NetNs, dev: &DevRef, flags: u32) {
-    {
-        let mut x = dev.borrow_mut();
-        x.flags = (flags & CHANGEABLE) | (x.flags & !CHANGEABLE);
-    }
-    set_up(ns, dev, flags & IFF_UP != 0);
-}
-
-/// Reported flags (`dev_get_flags`).
-fn reported_flags(ns: &NetNs, dev: &DevRef) -> u32 {
-    let d = devs(ns);
-    view(dev, &d, ns).flags
-}
-
-/// MTU check (`dev_validate_mtu`).
-fn validate_mtu(kind: Kind, mtu: u32) -> Result<(), Fail> {
-    let (min, max) = kind.mtu_range();
-    if (mtu as i32) < 0 || mtu < min {
-        return Err(fail(Errno::EINVAL, "mtu less than device minimum"));
-    }
-    if max > 0 && mtu > max {
-        return Err(fail(Errno::EINVAL, "mtu greater than device maximum"));
-    }
-    Ok(())
-}
-
-/// Changes the MTU (`dev_set_mtu_ext`): a bridge records that the user set it, and when a port
-/// changes, its bridge adjusts; IPv6's `mtu` follows the interface's.
-fn set_mtu(ns: &NetNs, dev: &DevRef, mtu: u32) -> Result<(), Fail> {
-    let kind = dev.borrow().kind;
-    validate_mtu(kind, mtu)?;
-    {
-        let mut x = dev.borrow_mut();
-        x.mtu = mtu;
-        x.conf6.mtu6 = None;
-        if kind == Kind::Bridge {
-            x.mtu_set = true;
-        }
-    }
-    let br = dev.borrow().master.upgrade();
-    if let Some(br) = br {
-        bridge_adjust(ns, &br);
-    }
-    // IPv6 is turned off when the MTU is below 1280 (NETDEV_CHANGEMTU)
-    if i64::from(mtu) < crate::netconf::IPV6_MIN_MTU {
-        let mut d = devs(ns);
-        v6_down(&mut d, dev);
-    }
-    Ok(())
-}
-
-/// A bridge's MTU and MAC follow its ports (`br_mtu_auto_adjust`,
-/// `br_stp_recalculate_bridge_id`): unless set by the user, the MTU is the smallest of its ports'
-/// (1500 with no ports), and the MAC the smallest of its ports' (all zeros with no ports).
-fn bridge_adjust(ns: &NetNs, br: &DevRef) {
-    let ports = devs(ns).ports(br);
-    let mut b = br.borrow_mut();
-    b.selected = true;
-    if !b.mtu_set {
-        b.mtu = ports
-            .iter()
-            .map(|p| p.borrow().mtu)
-            .min()
-            .unwrap_or(ETH_DATA_LEN);
-    }
-    if !b.mac_set {
-        b.mac = ports.iter().map(|p| p.borrow().mac).min().unwrap_or([0; 6]);
-    }
-}
-
-/// Changes the MAC (`dev_set_mac_address_user`): it must be a valid unicast address
-/// (EADDRNOTAVAIL).
-fn set_mac(ns: &NetNs, dev: &DevRef, mac: &[u8]) -> Result<(), Fail> {
-    if mac.len() < 6 {
-        return Err(Errno::EINVAL.into());
-    }
-    if !valid_mac(&mac[..6]) {
-        return Err(Errno::EADDRNOTAVAIL.into());
-    }
-    {
-        let mut x = dev.borrow_mut();
-        x.mac.copy_from_slice(&mac[..6]);
-        x.mac_set = true;
-        // A bridge changing its MAC recomputes its state from its ports (br_set_mac_address →
-        // br_stp_change_bridge_id)
-        if x.kind == Kind::Bridge {
-            x.selected = true;
-        }
-    }
-    let br = dev.borrow().master.upgrade();
-    if let Some(br) = br {
-        bridge_adjust(ns, &br);
-    }
-    Ok(())
-}
-
-/// Renames (`dev_change_name`): in 6.1 an interface that is up cannot be renamed (EBUSY).
-fn rename(ns: &NetNs, dev: &DevRef, name: &[u8]) -> Result<(), Fail> {
-    if dev.borrow().name == name {
-        return Ok(());
-    }
-    if dev.borrow().up {
-        return Err(Errno::EBUSY.into());
-    }
-    let new = {
-        let d = devs(ns);
-        choose_name(ns, &d, name)?
-    };
-    let mut x = dev.borrow_mut();
-    // Address labels are renamed along with it (`inetdev_changename`)
-    let old = std::mem::replace(&mut x.name, new.clone());
-    for a in &mut x.v4 {
-        if a.label.starts_with(&old) {
-            let mut l = new.clone();
-            l.extend_from_slice(&a.label[old.len()..]);
-            a.label = l;
-        }
-    }
-    Ok(())
-}
-
-/// Attaches to or detaches from a bridge (`do_set_master`, `br_add_if`, `br_del_if`). `index` 0
-/// detaches.
-fn set_master(ns: &NetNs, dev: &DevRef, index: u32) -> Result<(), Fail> {
-    let cur = dev.borrow().master.upgrade();
-    if let Some(cur) = &cur {
-        if cur.borrow().index == index {
-            return Ok(());
-        }
-        dev.borrow_mut().master = Weak::new();
-        bridge_adjust(ns, cur);
-    }
-    if index == 0 {
-        return Ok(());
-    }
-    let br = devs(ns).by_index(index);
-    let Some(br) = br else {
-        // Host interfaces and lo cannot be masters (no ndo_add_slave); a nonexistent one is
-        // EINVAL
-        return Err(if index_in_use(ns, &devs(ns), index) {
-            Errno::EOPNOTSUPP
-        } else {
-            Errno::EINVAL
-        }
-        .into());
-    };
-    if br.borrow().kind != Kind::Bridge {
-        return Err(Errno::EOPNOTSUPP.into());
-    }
-    if dev.borrow().kind == Kind::Bridge {
-        return Err(fail(Errno::ELOOP, "Can not enslave a bridge to a bridge"));
-    }
-    dev.borrow_mut().master = Rc::downgrade(&br);
-    bridge_adjust(ns, &br);
-    Ok(())
-}
-
-/// Removes a device from the namespace's table (on deletion or moving away): detaches its ports
-/// and removes the routes through it.
-fn unlink(ns: &NetNs, dev: &DevRef) {
-    let ports = {
-        let mut d = devs(ns);
-        d.list.retain(|x| !Rc::ptr_eq(x, dev));
-        d.routes.retain(|r| !r.on(dev) && r.dev.strong_count() > 0);
-        d.ports(dev)
-    };
-    for p in &ports {
-        p.borrow_mut().master = Weak::new();
-    }
-    let br = dev.borrow().master.upgrade();
-    dev.borrow_mut().master = Weak::new();
-    if let Some(br) = br {
-        bridge_adjust(ns, &br);
-    }
-}
-
-/// Deletes (`rtnl_dellink`): a veth together with its peer.
-fn delete(ns: &NetNs, dev: &DevRef) {
-    let peer = dev.borrow().peer.upgrade();
-    unlink(ns, dev);
-    dev.borrow_mut().ns = Weak::new();
-    let mut touched = Vec::new();
-    if let Some(p) = peer {
-        if let Some(pns) = p.borrow().ns.upgrade() {
-            touched.push(pns);
-        }
-        if let Some(pns) = touched.last() {
-            unlink(pns, &p);
-        }
-        p.borrow_mut().ns = Weak::new();
-    }
-    for n in &touched {
-        settle(n, &[]);
-    }
-    settle(ns, &[]);
-}
-
-/// Moves to namespace `to` (`__dev_change_net_namespace`): first brought down and detached, with
-/// addresses and routes all removed, and sysctls start over from that namespace's `default`; the
-/// index is reallocated if it is taken there. If the name is taken, it is renamed by `pat`, and
-/// EEXIST when none is given.
-fn move_to(ns: &NetNs, dev: &DevRef, to: &Rc<NetNs>, pat: Option<&[u8]>) -> Result<(), Fail> {
-    if !dev.borrow().kind.movable() {
-        return Err(Errno::EINVAL.into());
-    }
-    if std::ptr::eq(ns, Rc::as_ptr(to)) {
-        return Ok(());
-    }
-    let name = dev.borrow().name.clone();
-    let new_name = {
-        let d = devs(to);
-        if name_in_use(to, &d, &name) {
-            match pat {
-                Some(p) => choose_name(to, &d, p)?,
-                None => return Err(Errno::EEXIST.into()),
-            }
-        } else {
-            name.clone()
-        }
-    };
-    set_up(ns, dev, false);
-    unlink(ns, dev);
-    {
-        let mut x = dev.borrow_mut();
-        x.v4.clear();
-        x.v6.clear();
-        x.v6_ready = false;
-        x.name = new_name;
-    }
-    {
-        let mut d = devs(to);
-        let index = dev.borrow().index;
-        let index = if index_in_use(to, &d, index) {
-            alloc_index(to, &mut d)
-        } else {
-            index
-        };
-        let (c4, c6) = (d.conf.dflt4.inherit(), d.conf.dflt6.inherit());
-        {
-            let mut x = dev.borrow_mut();
-            x.index = index;
-            x.ns = Rc::downgrade(to);
-            x.conf4 = c4;
-            x.conf6 = c6;
-        }
-        d.list.push(dev.clone());
-    }
-    settle_around(dev);
-    settle(ns, &[]);
-    Ok(())
-}
-
 // ---- netlink change requests ----
 
 /// Finds the network namespace that `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD` refers to (ESRCH when
 /// the process is gone, EINVAL when the fd is not a network namespace).
 pub(crate) type Resolve<'a> = &'a dyn Fn(u16, u32) -> Result<Rc<NetNs>, Errno>;
-
-fn get<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
-    attrs.iter().find(|(t, _)| *t == ty).map(|(_, d)| *d)
-}
-
-fn get_u32(attrs: &[(u16, &[u8])], ty: u16) -> Option<u32> {
-    get(attrs, ty)
-        .and_then(|d| d.get(..4))
-        .map(|d| u32::from_le_bytes(d.try_into().unwrap()))
-}
-
-/// `IFLA_IFNAME` (without the terminating NUL): ERANGE from the policy check when longer than 15
-/// bytes.
-fn ifname<'a>(attrs: &[(u16, &'a [u8])]) -> Result<Option<&'a [u8]>, Fail> {
-    let Some(d) = get(attrs, IFLA_IFNAME) else {
-        return Ok(None);
-    };
-    let n = d.split(|&c| c == 0).next().unwrap_or_default();
-    if n.len() >= IFNAMSIZ {
-        return Err(fail(Errno::ERANGE, "Attribute failed policy validation"));
-    }
-    Ok(Some(n))
-}
-
-/// The kind and arguments in `IFLA_LINKINFO`.
-#[derive(Default)]
-struct LinkInfo<'a> {
-    kind: Option<&'a [u8]>,
-    data: Option<&'a [u8]>,
-    slave_data: Option<&'a [u8]>,
-}
-
-fn linkinfo<'a>(attrs: &[(u16, &'a [u8])]) -> LinkInfo<'a> {
-    let Some(li) = get(attrs, IFLA_LINKINFO) else {
-        return LinkInfo::default();
-    };
-    let inner = crate::route::attrs(li);
-    LinkInfo {
-        kind: get(&inner, IFLA_INFO_KIND).map(|k| k.split(|&c| c == 0).next().unwrap_or_default()),
-        data: get(&inner, IFLA_INFO_DATA),
-        slave_data: get(&inner, IFLA_INFO_SLAVE_DATA),
-    }
-}
-
-/// The namespace named in the request (`rtnl_link_get_net_capable`): needs `CAP_NET_ADMIN` in
-/// its owner.
-fn target_ns(
-    attrs: &[(u16, &[u8])],
-    cred: &Cred,
-    resolve: Resolve<'_>,
-) -> Result<Option<Rc<NetNs>>, Fail> {
-    let ns = if let Some(pid) = get_u32(attrs, IFLA_NET_NS_PID) {
-        resolve(IFLA_NET_NS_PID, pid)?
-    } else if let Some(fd) = get_u32(attrs, IFLA_NET_NS_FD) {
-        resolve(IFLA_NET_NS_FD, fd)?
-    } else if get(attrs, IFLA_TARGET_NETNSID).is_some() {
-        // Naming a namespace by id is not implemented
-        return Err(Errno::EOPNOTSUPP.into());
-    } else {
-        return Ok(None);
-    };
-    if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
-        return Err(Errno::EPERM.into());
-    }
-    Ok(Some(ns))
-}
 
 /// A netlink request changing interfaces, addresses or routes (a whole message): `RTM_NEWLINK`,
 /// `RTM_SETLINK`, `RTM_DELLINK`, `RTM_NEWADDR`, `RTM_DELADDR`, `RTM_NEWROUTE`, `RTM_DELROUTE`.
@@ -1538,25 +471,6 @@ pub(crate) fn request(
         RTM_NEWADDR | RTM_DELADDR => addr_request(ns, cred, req),
         _ => route_request(ns, req),
     })
-}
-
-/// ifinfomsg's index, flags and flags to change.
-fn ifinfo(m: &[u8]) -> (i32, u32, u32) {
-    (
-        i32::from_le_bytes(m[4..8].try_into().unwrap()),
-        u32::from_le_bytes(m[8..12].try_into().unwrap()),
-        u32::from_le_bytes(m[12..16].try_into().unwrap()),
-    )
-}
-
-/// Combined flags (`rtnl_dev_combine_flags`): when `change` is 0, all of `flags` counts as
-/// wanted.
-fn combine(cur: u32, flags: u32, change: u32) -> u32 {
-    if change != 0 {
-        (flags & change) | (cur & !change)
-    } else {
-        flags
-    }
 }
 
 fn link_request(ns: &Rc<NetNs>, cred: &Cred, req: &[u8], resolve: Resolve<'_>) -> Result<(), Fail> {
@@ -1635,52 +549,6 @@ fn link_request(ns: &Rc<NetNs>, cred: &Cred, req: &[u8], resolve: Resolve<'_>) -
     create(ns, cred, index, ifi_flags, change, &attrs, resolve)
 }
 
-/// lo in a new namespace: can only be brought up or down and have its MTU changed; attaching it
-/// to a bridge is EINVAL (a loopback interface), moving it to another namespace is EINVAL
-/// (`NETIF_F_NETNS_LOCAL`), and renaming is not supported.
-fn lo_link(
-    ns: &Rc<NetNs>,
-    cred: &Cred,
-    ifi_flags: u32,
-    change: u32,
-    attrs: &[(u16, &[u8])],
-    resolve: Resolve<'_>,
-) -> Result<(), Fail> {
-    // Moving to any namespace (including the one it is in) is EINVAL: Linux checks
-    // NETIF_F_NETNS_LOCAL first
-    if target_ns(attrs, cred, resolve)?.is_some() {
-        return Err(Errno::EINVAL.into());
-    }
-    if let Some(m) = get_u32(attrs, IFLA_MTU) {
-        if m < ETH_MIN_MTU {
-            return Err(fail(Errno::EINVAL, "mtu less than device minimum"));
-        }
-        ns.lo.borrow_mut().mtu = Some(m);
-    }
-    // Finding lo by index and giving another name is a rename, which is not supported
-    if ifname(attrs)?.is_some_and(|n| n != b"lo") {
-        return Err(Errno::EOPNOTSUPP.into());
-    }
-    if ifi_flags != 0 || change != 0 {
-        let cur = crate::netns::lo_interface(ns).flags;
-        crate::netns::set_up(
-            &mut ns.lo.borrow_mut(),
-            combine(cur, ifi_flags, change) & IFF_UP != 0,
-        );
-    }
-    if let Some(m) = get_u32(attrs, IFLA_MASTER)
-        && m != 0
-    {
-        let target = devs(ns).by_index(m);
-        return Err(match target {
-            Some(t) if t.borrow().kind != Kind::Bridge => Errno::EOPNOTSUPP,
-            _ => Errno::EINVAL,
-        }
-        .into());
-    }
-    Ok(())
-}
-
 /// Changes a virtual device (`do_setlink`): in order, moving to another namespace, MAC, MTU,
 /// group, rename (when found by index), alias, flags, master, transmit queue length; earlier
 /// changes stay when a later one fails.
@@ -1733,6 +601,125 @@ fn setlink(
     if let Some(q) = get_u32(attrs, IFLA_TXQLEN) {
         dev.borrow_mut().txqlen = q;
     }
+    Ok(())
+}
+
+/// lo in a new namespace: can only be brought up or down and have its MTU changed; attaching it
+/// to a bridge is EINVAL (a loopback interface), moving it to another namespace is EINVAL
+/// (`NETIF_F_NETNS_LOCAL`), and renaming is not supported.
+fn lo_link(
+    ns: &Rc<NetNs>,
+    cred: &Cred,
+    ifi_flags: u32,
+    change: u32,
+    attrs: &[(u16, &[u8])],
+    resolve: Resolve<'_>,
+) -> Result<(), Fail> {
+    // Moving to any namespace (including the one it is in) is EINVAL: Linux checks
+    // NETIF_F_NETNS_LOCAL first
+    if target_ns(attrs, cred, resolve)?.is_some() {
+        return Err(Errno::EINVAL.into());
+    }
+    if let Some(m) = get_u32(attrs, IFLA_MTU) {
+        if m < ETH_MIN_MTU {
+            return Err(fail(Errno::EINVAL, "mtu less than device minimum"));
+        }
+        ns.lo.borrow_mut().mtu = Some(m);
+    }
+    // Finding lo by index and giving another name is a rename, which is not supported
+    if ifname(attrs)?.is_some_and(|n| n != b"lo") {
+        return Err(Errno::EOPNOTSUPP.into());
+    }
+    if ifi_flags != 0 || change != 0 {
+        let cur = crate::netns::lo_interface(ns).flags;
+        crate::netns::set_up(
+            &mut ns.lo.borrow_mut(),
+            combine(cur, ifi_flags, change) & IFF_UP != 0,
+        );
+    }
+    if let Some(m) = get_u32(attrs, IFLA_MASTER)
+        && m != 0
+    {
+        let target = devs(ns).by_index(m);
+        return Err(match target {
+            Some(t) if t.borrow().kind != Kind::Bridge => Errno::EOPNOTSUPP,
+            _ => Errno::EINVAL,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Creates a device (`rtnl_newlink_create`): a veth registers its peer first (in the namespace
+/// given in `VETH_INFO_PEER`, or the requesting one when none is given), then itself; then flags
+/// are changed per the ifinfomsg, and finally it is attached to its master (the new device is
+/// deleted on failure).
+fn create(
+    ns: &Rc<NetNs>,
+    cred: &Cred,
+    index: i32,
+    ifi_flags: u32,
+    change: u32,
+    attrs: &[(u16, &[u8])],
+    resolve: Resolve<'_>,
+) -> Result<(), Fail> {
+    let info = linkinfo(attrs);
+    let Some(kind) = info.kind.and_then(Kind::parse) else {
+        return Err(fail(Errno::EOPNOTSUPP, "Unknown device type"));
+    };
+    validate(kind, attrs)?;
+    let dest = target_ns(attrs, cred, resolve)?.unwrap_or_else(|| ns.clone());
+    let default_name: &[u8] = match kind {
+        Kind::Bridge => b"bridge%d",
+        Kind::Veth => b"veth%d",
+        Kind::Dummy => b"dummy%d",
+    };
+    let pat = ifname(attrs)?.unwrap_or(default_name);
+    let dev = if kind == Kind::Veth {
+        let peer = info
+            .data
+            .map(crate::route::attrs)
+            .and_then(|a| get(&a, VETH_INFO_PEER));
+        let (pm, pattrs) = match peer {
+            Some(p) if p.len() >= 16 => (p[..16].to_vec(), crate::route::attrs(&p[16..])),
+            Some(_) => return Err(Errno::EINVAL.into()),
+            None => (vec![0u8; 16], Vec::new()),
+        };
+        validate(kind, &pattrs)?;
+        let peer_ns = target_ns(&pattrs, cred, resolve)?.unwrap_or_else(|| ns.clone());
+        let ppat = ifname(&pattrs)?.unwrap_or(b"veth%d");
+        let (pindex, pflags, pchange) = ifinfo(&pm);
+        let p = new_dev(&peer_ns, kind, ppat, pindex, &pattrs)?;
+        let dev = match new_dev(&dest, kind, pat, index, attrs) {
+            Ok(d) => d,
+            Err(e) => {
+                unlink(&peer_ns, &p);
+                return Err(e);
+            }
+        };
+        p.borrow_mut().peer = Rc::downgrade(&dev);
+        p.borrow_mut().paired = true;
+        dev.borrow_mut().peer = Rc::downgrade(&p);
+        dev.borrow_mut().paired = true;
+        if pflags != 0 || pchange != 0 {
+            let cur = reported_flags(&peer_ns, &p);
+            change_flags(&peer_ns, &p, combine(cur, pflags, pchange));
+        }
+        dev
+    } else {
+        new_dev(&dest, kind, pat, index, attrs)?
+    };
+    if ifi_flags != 0 || change != 0 {
+        let cur = reported_flags(&dest, &dev);
+        change_flags(&dest, &dev, combine(cur, ifi_flags, change));
+    }
+    if let Some(m) = get_u32(attrs, IFLA_MASTER)
+        && let Err(e) = set_master(&dest, &dev, m)
+    {
+        delete(&dest, &dev);
+        return Err(e);
+    }
+    settle_around(&dev);
     Ok(())
 }
 
@@ -1811,77 +798,12 @@ fn new_dev(
     Ok(dev)
 }
 
-/// Creates a device (`rtnl_newlink_create`): a veth registers its peer first (in the namespace
-/// given in `VETH_INFO_PEER`, or the requesting one when none is given), then itself; then flags
-/// are changed per the ifinfomsg, and finally it is attached to its master (the new device is
-/// deleted on failure).
-fn create(
-    ns: &Rc<NetNs>,
-    cred: &Cred,
-    index: i32,
-    ifi_flags: u32,
-    change: u32,
-    attrs: &[(u16, &[u8])],
-    resolve: Resolve<'_>,
-) -> Result<(), Fail> {
-    let info = linkinfo(attrs);
-    let Some(kind) = info.kind.and_then(Kind::parse) else {
-        return Err(fail(Errno::EOPNOTSUPP, "Unknown device type"));
-    };
-    validate(kind, attrs)?;
-    let dest = target_ns(attrs, cred, resolve)?.unwrap_or_else(|| ns.clone());
-    let default_name: &[u8] = match kind {
-        Kind::Bridge => b"bridge%d",
-        Kind::Veth => b"veth%d",
-        Kind::Dummy => b"dummy%d",
-    };
-    let pat = ifname(attrs)?.unwrap_or(default_name);
-    let dev = if kind == Kind::Veth {
-        let peer = info
-            .data
-            .map(crate::route::attrs)
-            .and_then(|a| get(&a, VETH_INFO_PEER));
-        let (pm, pattrs) = match peer {
-            Some(p) if p.len() >= 16 => (p[..16].to_vec(), crate::route::attrs(&p[16..])),
-            Some(_) => return Err(Errno::EINVAL.into()),
-            None => (vec![0u8; 16], Vec::new()),
-        };
-        validate(kind, &pattrs)?;
-        let peer_ns = target_ns(&pattrs, cred, resolve)?.unwrap_or_else(|| ns.clone());
-        let ppat = ifname(&pattrs)?.unwrap_or(b"veth%d");
-        let (pindex, pflags, pchange) = ifinfo(&pm);
-        let p = new_dev(&peer_ns, kind, ppat, pindex, &pattrs)?;
-        let dev = match new_dev(&dest, kind, pat, index, attrs) {
-            Ok(d) => d,
-            Err(e) => {
-                unlink(&peer_ns, &p);
-                return Err(e);
-            }
-        };
-        p.borrow_mut().peer = Rc::downgrade(&dev);
-        p.borrow_mut().paired = true;
-        dev.borrow_mut().peer = Rc::downgrade(&p);
-        dev.borrow_mut().paired = true;
-        if pflags != 0 || pchange != 0 {
-            let cur = reported_flags(&peer_ns, &p);
-            change_flags(&peer_ns, &p, combine(cur, pflags, pchange));
-        }
-        dev
-    } else {
-        new_dev(&dest, kind, pat, index, attrs)?
-    };
-    if ifi_flags != 0 || change != 0 {
-        let cur = reported_flags(&dest, &dev);
-        change_flags(&dest, &dev, combine(cur, ifi_flags, change));
-    }
-    if let Some(m) = get_u32(attrs, IFLA_MASTER)
-        && let Err(e) = set_master(&dest, &dev, m)
-    {
-        delete(&dest, &dev);
-        return Err(e);
-    }
-    settle_around(&dev);
-    Ok(())
+fn random_mac() -> [u8; 6] {
+    let mut m = [0u8; 6];
+    let _ = appine_hal::fill_random(&mut m);
+    // A unicast, locally administered address (eth_random_addr)
+    m[0] = (m[0] & 0xfe) | 0x02;
+    m
 }
 
 fn del_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
@@ -1918,6 +840,443 @@ fn del_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
         Errno::ENODEV
     }
     .into())
+}
+
+/// ifinfomsg's index, flags and flags to change.
+fn ifinfo(m: &[u8]) -> (i32, u32, u32) {
+    (
+        i32::from_le_bytes(m[4..8].try_into().unwrap()),
+        u32::from_le_bytes(m[8..12].try_into().unwrap()),
+        u32::from_le_bytes(m[12..16].try_into().unwrap()),
+    )
+}
+
+/// `IFLA_IFNAME` (without the terminating NUL): ERANGE from the policy check when longer than 15
+/// bytes.
+fn ifname<'a>(attrs: &[(u16, &'a [u8])]) -> Result<Option<&'a [u8]>, Fail> {
+    let Some(d) = get(attrs, IFLA_IFNAME) else {
+        return Ok(None);
+    };
+    let n = d.split(|&c| c == 0).next().unwrap_or_default();
+    if n.len() >= IFNAMSIZ {
+        return Err(fail(Errno::ERANGE, "Attribute failed policy validation"));
+    }
+    Ok(Some(n))
+}
+
+/// The kind and arguments in `IFLA_LINKINFO`.
+#[derive(Default)]
+struct LinkInfo<'a> {
+    kind: Option<&'a [u8]>,
+    data: Option<&'a [u8]>,
+    slave_data: Option<&'a [u8]>,
+}
+
+fn linkinfo<'a>(attrs: &[(u16, &'a [u8])]) -> LinkInfo<'a> {
+    let Some(li) = get(attrs, IFLA_LINKINFO) else {
+        return LinkInfo::default();
+    };
+    let inner = crate::route::attrs(li);
+    LinkInfo {
+        kind: get(&inner, IFLA_INFO_KIND).map(|k| k.split(|&c| c == 0).next().unwrap_or_default()),
+        data: get(&inner, IFLA_INFO_DATA),
+        slave_data: get(&inner, IFLA_INFO_SLAVE_DATA),
+    }
+}
+
+/// The namespace named in the request (`rtnl_link_get_net_capable`): needs `CAP_NET_ADMIN` in
+/// its owner.
+fn target_ns(
+    attrs: &[(u16, &[u8])],
+    cred: &Cred,
+    resolve: Resolve<'_>,
+) -> Result<Option<Rc<NetNs>>, Fail> {
+    let ns = if let Some(pid) = get_u32(attrs, IFLA_NET_NS_PID) {
+        resolve(IFLA_NET_NS_PID, pid)?
+    } else if let Some(fd) = get_u32(attrs, IFLA_NET_NS_FD) {
+        resolve(IFLA_NET_NS_FD, fd)?
+    } else if get(attrs, IFLA_TARGET_NETNSID).is_some() {
+        // Naming a namespace by id is not implemented
+        return Err(Errno::EOPNOTSUPP.into());
+    } else {
+        return Ok(None);
+    };
+    if !cred.ns_capable(&ns.owner, cap::NET_ADMIN) {
+        return Err(Errno::EPERM.into());
+    }
+    Ok(Some(ns))
+}
+
+/// Combined flags (`rtnl_dev_combine_flags`): when `change` is 0, all of `flags` counts as
+/// wanted.
+fn combine(cur: u32, flags: u32, change: u32) -> u32 {
+    if change != 0 {
+        (flags & change) | (cur & !change)
+    } else {
+        flags
+    }
+}
+
+// ---- Device changes ----
+
+/// Moves to namespace `to` (`__dev_change_net_namespace`): first brought down and detached, with
+/// addresses and routes all removed, and sysctls start over from that namespace's `default`; the
+/// index is reallocated if it is taken there. If the name is taken, it is renamed by `pat`, and
+/// EEXIST when none is given.
+fn move_to(ns: &NetNs, dev: &DevRef, to: &Rc<NetNs>, pat: Option<&[u8]>) -> Result<(), Fail> {
+    if !dev.borrow().kind.movable() {
+        return Err(Errno::EINVAL.into());
+    }
+    if std::ptr::eq(ns, Rc::as_ptr(to)) {
+        return Ok(());
+    }
+    let name = dev.borrow().name.clone();
+    let new_name = {
+        let d = devs(to);
+        if name_in_use(to, &d, &name) {
+            match pat {
+                Some(p) => choose_name(to, &d, p)?,
+                None => return Err(Errno::EEXIST.into()),
+            }
+        } else {
+            name.clone()
+        }
+    };
+    set_up(ns, dev, false);
+    unlink(ns, dev);
+    {
+        let mut x = dev.borrow_mut();
+        x.v4.clear();
+        x.v6.clear();
+        x.v6_ready = false;
+        x.name = new_name;
+    }
+    {
+        let mut d = devs(to);
+        let index = dev.borrow().index;
+        let index = if index_in_use(to, &d, index) {
+            alloc_index(to, &mut d)
+        } else {
+            index
+        };
+        let (c4, c6) = (d.conf.dflt4.inherit(), d.conf.dflt6.inherit());
+        {
+            let mut x = dev.borrow_mut();
+            x.index = index;
+            x.ns = Rc::downgrade(to);
+            x.conf4 = c4;
+            x.conf6 = c6;
+        }
+        d.list.push(dev.clone());
+    }
+    settle_around(dev);
+    settle(ns, &[]);
+    Ok(())
+}
+
+/// Changes the MAC (`dev_set_mac_address_user`): it must be a valid unicast address
+/// (EADDRNOTAVAIL).
+fn set_mac(ns: &NetNs, dev: &DevRef, mac: &[u8]) -> Result<(), Fail> {
+    if mac.len() < 6 {
+        return Err(Errno::EINVAL.into());
+    }
+    if !valid_mac(&mac[..6]) {
+        return Err(Errno::EADDRNOTAVAIL.into());
+    }
+    {
+        let mut x = dev.borrow_mut();
+        x.mac.copy_from_slice(&mac[..6]);
+        x.mac_set = true;
+        // A bridge changing its MAC recomputes its state from its ports (br_set_mac_address →
+        // br_stp_change_bridge_id)
+        if x.kind == Kind::Bridge {
+            x.selected = true;
+        }
+    }
+    let br = dev.borrow().master.upgrade();
+    if let Some(br) = br {
+        bridge_adjust(ns, &br);
+    }
+    Ok(())
+}
+
+fn valid_mac(m: &[u8]) -> bool {
+    m.len() == 6 && m[0] & 1 == 0 && m.iter().any(|&b| b != 0)
+}
+
+/// Changes the MTU (`dev_set_mtu_ext`): a bridge records that the user set it, and when a port
+/// changes, its bridge adjusts; IPv6's `mtu` follows the interface's.
+fn set_mtu(ns: &NetNs, dev: &DevRef, mtu: u32) -> Result<(), Fail> {
+    let kind = dev.borrow().kind;
+    validate_mtu(kind, mtu)?;
+    {
+        let mut x = dev.borrow_mut();
+        x.mtu = mtu;
+        x.conf6.mtu6 = None;
+        if kind == Kind::Bridge {
+            x.mtu_set = true;
+        }
+    }
+    let br = dev.borrow().master.upgrade();
+    if let Some(br) = br {
+        bridge_adjust(ns, &br);
+    }
+    // IPv6 is turned off when the MTU is below 1280 (NETDEV_CHANGEMTU)
+    if i64::from(mtu) < crate::netconf::IPV6_MIN_MTU {
+        let mut d = devs(ns);
+        v6_down(&mut d, dev);
+    }
+    Ok(())
+}
+
+/// MTU check (`dev_validate_mtu`).
+fn validate_mtu(kind: Kind, mtu: u32) -> Result<(), Fail> {
+    let (min, max) = kind.mtu_range();
+    if (mtu as i32) < 0 || mtu < min {
+        return Err(fail(Errno::EINVAL, "mtu less than device minimum"));
+    }
+    if max > 0 && mtu > max {
+        return Err(fail(Errno::EINVAL, "mtu greater than device maximum"));
+    }
+    Ok(())
+}
+
+/// Renames (`dev_change_name`): in 6.1 an interface that is up cannot be renamed (EBUSY).
+fn rename(ns: &NetNs, dev: &DevRef, name: &[u8]) -> Result<(), Fail> {
+    if dev.borrow().name == name {
+        return Ok(());
+    }
+    if dev.borrow().up {
+        return Err(Errno::EBUSY.into());
+    }
+    let new = {
+        let d = devs(ns);
+        choose_name(ns, &d, name)?
+    };
+    let mut x = dev.borrow_mut();
+    // Address labels are renamed along with it (`inetdev_changename`)
+    let old = std::mem::replace(&mut x.name, new.clone());
+    for a in &mut x.v4 {
+        if a.label.starts_with(&old) {
+            let mut l = new.clone();
+            l.extend_from_slice(&a.label[old.len()..]);
+            a.label = l;
+        }
+    }
+    Ok(())
+}
+
+/// Reported flags (`dev_get_flags`).
+fn reported_flags(ns: &NetNs, dev: &DevRef) -> u32 {
+    let d = devs(ns);
+    view(dev, &d, ns).flags
+}
+
+/// Changes flags (`dev_change_flags`): `flags` are the wanted flags after combining.
+fn change_flags(ns: &NetNs, dev: &DevRef, flags: u32) {
+    {
+        let mut x = dev.borrow_mut();
+        x.flags = (flags & CHANGEABLE) | (x.flags & !CHANGEABLE);
+    }
+    set_up(ns, dev, flags & IFF_UP != 0);
+}
+
+/// Brings a device up or down (`__dev_open`, `__dev_close`).
+fn set_up(ns: &NetNs, dev: &DevRef, up: bool) {
+    if dev.borrow().up == up {
+        return;
+    }
+    {
+        let mut x = dev.borrow_mut();
+        x.up = up;
+        x.ever_up |= up;
+    }
+    let mut d = devs(ns);
+    if up {
+        // NETDEV_UP: re-add the routes per address
+        let addrs = dev.borrow().v4.clone();
+        for a in &addrs {
+            add_ifaddr4(&mut d, dev, a);
+        }
+    } else {
+        drop_routes(&mut d, dev, Some(AF_INET), true);
+        let keep = {
+            let x = dev.borrow();
+            x.conf6.get(true, "keep_addr_on_down") > 0
+                || d.conf.all6.get(true, "keep_addr_on_down") > 0
+        };
+        if keep {
+            dev.borrow_mut().v6_ready = false;
+            drop_routes(&mut d, dev, Some(AF_INET6), false);
+        } else {
+            v6_down(&mut d, dev);
+        }
+    }
+}
+
+/// Attaches to or detaches from a bridge (`do_set_master`, `br_add_if`, `br_del_if`). `index` 0
+/// detaches.
+fn set_master(ns: &NetNs, dev: &DevRef, index: u32) -> Result<(), Fail> {
+    let cur = dev.borrow().master.upgrade();
+    if let Some(cur) = &cur {
+        if cur.borrow().index == index {
+            return Ok(());
+        }
+        dev.borrow_mut().master = Weak::new();
+        bridge_adjust(ns, cur);
+    }
+    if index == 0 {
+        return Ok(());
+    }
+    let br = devs(ns).by_index(index);
+    let Some(br) = br else {
+        // Host interfaces and lo cannot be masters (no ndo_add_slave); a nonexistent one is
+        // EINVAL
+        return Err(if index_in_use(ns, &devs(ns), index) {
+            Errno::EOPNOTSUPP
+        } else {
+            Errno::EINVAL
+        }
+        .into());
+    };
+    if br.borrow().kind != Kind::Bridge {
+        return Err(Errno::EOPNOTSUPP.into());
+    }
+    if dev.borrow().kind == Kind::Bridge {
+        return Err(fail(Errno::ELOOP, "Can not enslave a bridge to a bridge"));
+    }
+    dev.borrow_mut().master = Rc::downgrade(&br);
+    bridge_adjust(ns, &br);
+    Ok(())
+}
+
+/// Deletes (`rtnl_dellink`): a veth together with its peer.
+fn delete(ns: &NetNs, dev: &DevRef) {
+    let peer = dev.borrow().peer.upgrade();
+    unlink(ns, dev);
+    dev.borrow_mut().ns = Weak::new();
+    let mut touched = Vec::new();
+    if let Some(p) = peer {
+        if let Some(pns) = p.borrow().ns.upgrade() {
+            touched.push(pns);
+        }
+        if let Some(pns) = touched.last() {
+            unlink(pns, &p);
+        }
+        p.borrow_mut().ns = Weak::new();
+    }
+    for n in &touched {
+        settle(n, &[]);
+    }
+    settle(ns, &[]);
+}
+
+/// Removes a device from the namespace's table (on deletion or moving away): detaches its ports
+/// and removes the routes through it.
+fn unlink(ns: &NetNs, dev: &DevRef) {
+    let ports = {
+        let mut d = devs(ns);
+        d.list.retain(|x| !Rc::ptr_eq(x, dev));
+        d.routes.retain(|r| !r.on(dev) && r.dev.strong_count() > 0);
+        d.ports(dev)
+    };
+    for p in &ports {
+        p.borrow_mut().master = Weak::new();
+    }
+    let br = dev.borrow().master.upgrade();
+    dev.borrow_mut().master = Weak::new();
+    if let Some(br) = br {
+        bridge_adjust(ns, &br);
+    }
+}
+
+/// A bridge's MTU and MAC follow its ports (`br_mtu_auto_adjust`,
+/// `br_stp_recalculate_bridge_id`): unless set by the user, the MTU is the smallest of its ports'
+/// (1500 with no ports), and the MAC the smallest of its ports' (all zeros with no ports).
+fn bridge_adjust(ns: &NetNs, br: &DevRef) {
+    let ports = devs(ns).ports(br);
+    let mut b = br.borrow_mut();
+    b.selected = true;
+    if !b.mtu_set {
+        b.mtu = ports
+            .iter()
+            .map(|p| p.borrow().mtu)
+            .min()
+            .unwrap_or(ETH_DATA_LEN);
+    }
+    if !b.mac_set {
+        b.mac = ports.iter().map(|p| p.borrow().mac).min().unwrap_or([0; 6]);
+    }
+}
+
+// ---- Names and indexes ----
+
+/// Chooses a name (`dev_get_valid_name`): one with `%d` takes the lowest unused number; others
+/// must be valid and unused (otherwise EINVAL, EEXIST).
+fn choose_name(ns: &NetNs, d: &Devices, pattern: &[u8]) -> Result<Vec<u8>, Errno> {
+    if !valid_name(pattern) {
+        return Err(Errno::EINVAL);
+    }
+    let Some(at) = pattern.windows(2).position(|w| w == b"%d") else {
+        if pattern.contains(&b'%') {
+            return Err(Errno::EINVAL);
+        }
+        if name_in_use(ns, d, pattern) {
+            return Err(Errno::EEXIST);
+        }
+        return Ok(pattern.to_vec());
+    };
+    if pattern[at + 2..].contains(&b'%') || pattern[..at].contains(&b'%') {
+        return Err(Errno::EINVAL);
+    }
+    for n in 0..32768 {
+        let mut name = pattern[..at].to_vec();
+        name.extend_from_slice(n.to_string().as_bytes());
+        name.extend_from_slice(&pattern[at + 2..]);
+        if name.len() >= IFNAMSIZ {
+            return Err(Errno::EINVAL);
+        }
+        if !name_in_use(ns, d, &name) {
+            return Ok(name);
+        }
+    }
+    Err(Errno::ENFILE)
+}
+
+/// Whether an interface name is valid (`dev_valid_name`).
+fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() < IFNAMSIZ
+        && name != b"."
+        && name != b".."
+        && !name
+            .iter()
+            .any(|&c| c == b'/' || c == b':' || c.is_ascii_whitespace())
+}
+
+fn name_in_use(ns: &NetNs, d: &Devices, name: &[u8]) -> bool {
+    d.by_name(name).is_some() || base(ns).iter().any(|i| i.name.as_bytes() == name)
+}
+
+/// Allocates an interface index (`dev_new_index`): in the initial namespace, after the host's
+/// largest.
+fn alloc_index(ns: &NetNs, d: &mut Devices) -> u32 {
+    let host = base(ns);
+    if ns.host_net.is_none() {
+        let top = host.iter().map(|i| i.index).max().unwrap_or(0);
+        d.ifindex = d.ifindex.max(top);
+    }
+    loop {
+        d.ifindex = d.ifindex.wrapping_add(1).max(1);
+        let i = d.ifindex;
+        if d.by_index(i).is_none() && !host.iter().any(|h| h.index == i) {
+            return i;
+        }
+    }
+}
+
+fn index_in_use(ns: &NetNs, d: &Devices, index: u32) -> bool {
+    d.by_index(index).is_some() || base(ns).iter().any(|h| h.index == index)
 }
 
 // ---- Addresses ----
@@ -1963,14 +1322,6 @@ fn addr_request(ns: &Rc<NetNs>, cred: &Cred, req: &[u8]) -> Result<(), Fail> {
     };
     settle_around(&dev);
     r
-}
-
-fn ip4(attrs: &[(u16, &[u8])], ty: u16) -> Option<[u8; 4]> {
-    get(attrs, ty).and_then(|d| d.try_into().ok())
-}
-
-fn ip6(attrs: &[(u16, &[u8])], ty: u16) -> Option<[u8; 16]> {
-    get(attrs, ty).and_then(|d| d.try_into().ok())
 }
 
 /// Adds an IPv4 address (`inet_rtm_newaddr`, `__inet_insert_ifa`).
@@ -2075,18 +1426,8 @@ fn del_addr4(ns: &Rc<NetNs>, dev: &DevRef, prefix: u8, attrs: &[(u16, &[u8])]) -
     Ok(())
 }
 
-/// The scope of an IPv6 address for list ordering (`ipv6_addr_src_scope`): global 14, site 5,
-/// link 2, loopback 1.
-fn src_scope6(a: &[u8; 16]) -> u8 {
-    if a[0] == 0xfe && a[1] & 0xc0 == 0x80 {
-        2
-    } else if a[0] == 0xfe && a[1] & 0xc0 == 0xc0 {
-        5
-    } else if *a == std::net::Ipv6Addr::LOCALHOST.octets() {
-        1
-    } else {
-        14
-    }
+fn ip4(attrs: &[(u16, &[u8])], ty: u16) -> Option<[u8; 4]> {
+    get(attrs, ty).and_then(|d| d.try_into().ok())
 }
 
 /// Adds an IPv6 address (`inet6_rtm_newaddr`, `inet6_addr_add`): EACCES when the interface has
@@ -2142,6 +1483,20 @@ fn add_addr6(
     Ok(())
 }
 
+/// The scope of an IPv6 address for list ordering (`ipv6_addr_src_scope`): global 14, site 5,
+/// link 2, loopback 1.
+fn src_scope6(a: &[u8; 16]) -> u8 {
+    if a[0] == 0xfe && a[1] & 0xc0 == 0x80 {
+        2
+    } else if a[0] == 0xfe && a[1] & 0xc0 == 0xc0 {
+        5
+    } else if *a == std::net::Ipv6Addr::LOCALHOST.octets() {
+        1
+    } else {
+        14
+    }
+}
+
 fn del_addr6(ns: &Rc<NetNs>, dev: &DevRef, prefix: u8, attrs: &[(u16, &[u8])]) -> Result<(), Fail> {
     let addr = ip6(attrs, IFA_LOCAL)
         .or_else(|| ip6(attrs, IFA_ADDRESS))
@@ -2159,86 +1514,11 @@ fn del_addr6(ns: &Rc<NetNs>, dev: &DevRef, prefix: u8, attrs: &[(u16, &[u8])]) -
     Ok(())
 }
 
-// ---- Routes ----
-
-/// A next hop (`fib_check_nh`, `fib6_nh_init`): the interface must be a virtual device (host
-/// interfaces and lo are EOPNOTSUPP) and up. With a gateway, the subnet it is in is looked up in
-/// this namespace's routes.
-fn nexthop(
-    ns: &Rc<NetNs>,
-    family: i32,
-    gw: Option<&[u8]>,
-    oif: Option<u32>,
-    scope: u8,
-) -> Result<DevRef, Fail> {
-    let v4 = family == AF_INET;
-    let not_up = if v4 {
-        "Device for nexthop is not up"
-    } else {
-        "Nexthop device is not up"
-    };
-    let oif = oif.filter(|&i| i != 0);
-    let Some(gw) = gw else {
-        let i = oif.ok_or(Errno::ENODEV)?;
-        let dev = devs(ns).by_index(i);
-        let Some(dev) = dev else {
-            return Err(if base(ns).iter().any(|b| b.index == i) {
-                Errno::EOPNOTSUPP
-            } else {
-                Errno::ENODEV
-            }
-            .into());
-        };
-        if !dev.borrow().up {
-            return Err(fail(Errno::ENETDOWN, not_up));
-        }
-        return Ok(dev);
-    };
-    // The gateway's subnet: the longest prefix in the local and main tables through oif (when
-    // given) with a scope not less than link
-    let want = if v4 {
-        scope.saturating_add(1).max(RT_SCOPE_LINK)
-    } else {
-        0
-    };
-    let found = entries(ns)
-        .into_iter()
-        .filter(|e| {
-            e.family == family
-                && (e.table == RT_TABLE_LOCAL || e.table == RT_TABLE_MAIN)
-                && e.scope >= want
-                && oif.is_none_or(|o| e.index == o)
-                && crate::route::network(gw, e.prefix) == e.dst
-        })
-        .max_by_key(|e| e.prefix);
-    let Some(e) = found else {
-        let host = base(ns).iter().any(|i| {
-            i.addrs.iter().any(|(f, a, p)| {
-                *f == family && crate::route::network(a, *p) == crate::route::network(gw, *p)
-            })
-        });
-        if host && ns.host_net.is_none() {
-            return Err(Errno::EOPNOTSUPP.into());
-        }
-        return Err(if v4 {
-            fail(Errno::ENETUNREACH, "Nexthop has invalid gateway")
-        } else {
-            Errno::ENETUNREACH.into()
-        });
-    };
-    if e.ty != RTN_UNICAST && e.ty != RTN_LOCAL {
-        return Err(fail(Errno::EINVAL, "Nexthop has invalid gateway"));
-    }
-    let dev = devs(ns).by_index(e.index).ok_or(Errno::ENODEV)?;
-    if !dev.borrow().up {
-        return Err(if v4 {
-            Errno::ENETDOWN.into()
-        } else {
-            fail(Errno::ENETDOWN, not_up)
-        });
-    }
-    Ok(dev)
+fn ip6(attrs: &[(u16, &[u8])], ty: u16) -> Option<[u8; 16]> {
+    get(attrs, ty).and_then(|d| d.try_into().ok())
 }
+
+// ---- Routes ----
 
 /// `RTM_NEWROUTE` and `RTM_DELROUTE` (`fib_table_insert`, `fib_table_delete`; for IPv6
 /// `ip6_route_add`, `ip6_route_del`): unicast routes only; the table number must be at most 255.
@@ -2400,6 +1680,97 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
     Ok(())
 }
 
+/// A next hop (`fib_check_nh`, `fib6_nh_init`): the interface must be a virtual device (host
+/// interfaces and lo are EOPNOTSUPP) and up. With a gateway, the subnet it is in is looked up in
+/// this namespace's routes.
+fn nexthop(
+    ns: &Rc<NetNs>,
+    family: i32,
+    gw: Option<&[u8]>,
+    oif: Option<u32>,
+    scope: u8,
+) -> Result<DevRef, Fail> {
+    let v4 = family == AF_INET;
+    let not_up = if v4 {
+        "Device for nexthop is not up"
+    } else {
+        "Nexthop device is not up"
+    };
+    let oif = oif.filter(|&i| i != 0);
+    let Some(gw) = gw else {
+        let i = oif.ok_or(Errno::ENODEV)?;
+        let dev = devs(ns).by_index(i);
+        let Some(dev) = dev else {
+            return Err(if base(ns).iter().any(|b| b.index == i) {
+                Errno::EOPNOTSUPP
+            } else {
+                Errno::ENODEV
+            }
+            .into());
+        };
+        if !dev.borrow().up {
+            return Err(fail(Errno::ENETDOWN, not_up));
+        }
+        return Ok(dev);
+    };
+    // The gateway's subnet: the longest prefix in the local and main tables through oif (when
+    // given) with a scope not less than link
+    let want = if v4 {
+        scope.saturating_add(1).max(RT_SCOPE_LINK)
+    } else {
+        0
+    };
+    let found = entries(ns)
+        .into_iter()
+        .filter(|e| {
+            e.family == family
+                && (e.table == RT_TABLE_LOCAL || e.table == RT_TABLE_MAIN)
+                && e.scope >= want
+                && oif.is_none_or(|o| e.index == o)
+                && crate::route::network(gw, e.prefix) == e.dst
+        })
+        .max_by_key(|e| e.prefix);
+    let Some(e) = found else {
+        let host = base(ns).iter().any(|i| {
+            i.addrs.iter().any(|(f, a, p)| {
+                *f == family && crate::route::network(a, *p) == crate::route::network(gw, *p)
+            })
+        });
+        if host && ns.host_net.is_none() {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        return Err(if v4 {
+            fail(Errno::ENETUNREACH, "Nexthop has invalid gateway")
+        } else {
+            Errno::ENETUNREACH.into()
+        });
+    };
+    if e.ty != RTN_UNICAST && e.ty != RTN_LOCAL {
+        return Err(fail(Errno::EINVAL, "Nexthop has invalid gateway"));
+    }
+    let dev = devs(ns).by_index(e.index).ok_or(Errno::ENODEV)?;
+    if !dev.borrow().up {
+        return Err(if v4 {
+            Errno::ENETDOWN.into()
+        } else {
+            fail(Errno::ENETDOWN, not_up)
+        });
+    }
+    Ok(dev)
+}
+
+// ---- netlink attributes ----
+
+fn get<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
+    attrs.iter().find(|(t, _)| *t == ty).map(|(_, d)| *d)
+}
+
+fn get_u32(attrs: &[(u16, &[u8])], ty: u16) -> Option<u32> {
+    get(attrs, ty)
+        .and_then(|d| d.get(..4))
+        .map(|d| u32::from_le_bytes(d.try_into().unwrap()))
+}
+
 // ---- netlink answers ----
 
 /// `RTM_NEWLINK` for one virtual device (`rtnl_fill_ifinfo`, with the same attribute order).
@@ -2559,6 +1930,47 @@ pub(crate) fn addr_messages(v: &View, family: i32) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Address scope (`ipv6_addr_scope`): link for link-local, host for ::1, universe otherwise.
+fn scope6(a: &[u8; 16]) -> u8 {
+    if a[0] == 0xfe && a[1] & 0xc0 == 0x80 {
+        RT_SCOPE_LINK
+    } else if *a == std::net::Ipv6Addr::LOCALHOST.octets() {
+        RT_SCOPE_HOST
+    } else {
+        RT_SCOPE_UNIVERSE
+    }
+}
+
+// ---- Namespace ids ----
+
+/// The id `ns` gives `peer`, allocating one if there is none (`peernet2id_alloc`: the lowest
+/// unused from 0).
+pub(crate) fn nsid_alloc(ns: &NetNs, peer: &Rc<NetNs>) -> i32 {
+    let mut d = ns.devs.borrow_mut();
+    d.nsids.retain(|(w, _)| w.strong_count() > 0);
+    if let Some((_, id)) = d
+        .nsids
+        .iter()
+        .find(|(w, _)| Weak::ptr_eq(w, &Rc::downgrade(peer)))
+    {
+        return *id;
+    }
+    let id = (0..)
+        .find(|i| !d.nsids.iter().any(|(_, x)| x == i))
+        .unwrap();
+    d.nsids.push((Rc::downgrade(peer), id));
+    id
+}
+
+/// The id `ns` gives `peer`; None when none is allocated.
+pub(crate) fn nsid(ns: &NetNs, peer: &Rc<NetNs>) -> Option<i32> {
+    let d = ns.devs.borrow();
+    d.nsids
+        .iter()
+        .find(|(w, _)| w.strong_count() > 0 && Weak::ptr_eq(w, &Rc::downgrade(peer)))
+        .map(|(_, id)| *id)
 }
 
 // ---- ioctl ----
@@ -2768,29 +2180,6 @@ pub(crate) fn conf_dir_name(ns: &NetNs, dir: ConfDir) -> Option<Vec<u8>> {
         .map(|(n, _)| n)
 }
 
-/// A set of settings and the interface's MTU (for IPv6's `mtu`).
-fn conf_of(ns: &NetNs, v6: bool, dir: ConfDir) -> Result<(Conf, Option<u32>), Errno> {
-    let mut d = devs(ns);
-    let pick = |c4: &Conf, c6: &Conf| if v6 { c6.clone() } else { c4.clone() };
-    Ok(match dir {
-        ConfDir::All => (pick(&d.conf.all4, &d.conf.all6), None),
-        ConfDir::Default => (pick(&d.conf.dflt4, &d.conf.dflt6), None),
-        ConfDir::Dev(i) => {
-            if let Some(x) = d.by_index(i) {
-                let x = x.borrow();
-                (pick(&x.conf4, &x.conf6), Some(x.mtu))
-            } else {
-                let b = base(ns)
-                    .into_iter()
-                    .find(|b| b.index == i)
-                    .ok_or(Errno::ENODEV)?;
-                let (c4, c6) = d.conf.other_mut(i).clone();
-                (pick(&c4, &c6), Some(b.mtu))
-            }
-        }
-    })
-}
-
 /// Reads one interface setting.
 pub(crate) fn conf_read(ns: &NetNs, v6: bool, dir: ConfDir, name: &[u8]) -> Result<String, Errno> {
     let i = crate::netconf::position(v6, name).ok_or(Errno::ENOENT)?;
@@ -2866,6 +2255,29 @@ pub(crate) fn conf_write(
         ipv6_switch(ns);
     }
     Ok(())
+}
+
+/// A set of settings and the interface's MTU (for IPv6's `mtu`).
+fn conf_of(ns: &NetNs, v6: bool, dir: ConfDir) -> Result<(Conf, Option<u32>), Errno> {
+    let mut d = devs(ns);
+    let pick = |c4: &Conf, c6: &Conf| if v6 { c6.clone() } else { c4.clone() };
+    Ok(match dir {
+        ConfDir::All => (pick(&d.conf.all4, &d.conf.all6), None),
+        ConfDir::Default => (pick(&d.conf.dflt4, &d.conf.dflt6), None),
+        ConfDir::Dev(i) => {
+            if let Some(x) = d.by_index(i) {
+                let x = x.borrow();
+                (pick(&x.conf4, &x.conf6), Some(x.mtu))
+            } else {
+                let b = base(ns)
+                    .into_iter()
+                    .find(|b| b.index == i)
+                    .ok_or(Errno::ENODEV)?;
+                let (c4, c6) = d.conf.other_mut(i).clone();
+                (pick(&c4, &c6), Some(b.mtu))
+            }
+        }
+    })
 }
 
 /// Changes one set of settings.
@@ -2994,6 +2406,602 @@ pub(crate) fn test_dev(ns: &Rc<NetNs>, name: &str, addr: [u8; 4], prefix: u8, gw
         ];
         attr(&mut r, RTA_GATEWAY, &g);
         send(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, r);
+    }
+}
+
+// ---- Carrier changes and IPv6 configuration ----
+
+/// Advances the namespaces of `dev` and of its peer.
+fn settle_around(dev: &DevRef) {
+    let first = related(dev);
+    let mut nss: Vec<Rc<NetNs>> = Vec::new();
+    for x in &first {
+        if let Some(n) = x.borrow().ns.upgrade()
+            && !nss.iter().any(|m| Rc::ptr_eq(m, &n))
+        {
+            nss.push(n);
+        }
+    }
+    for n in &nss {
+        settle(n, &first);
+    }
+}
+
+/// `dev` and those connected to it: its peer and the bridge it is attached to (the order for
+/// [`settle`]).
+fn related(dev: &DevRef) -> Vec<DevRef> {
+    let x = dev.borrow();
+    let mut v = vec![dev.clone()];
+    v.extend(x.peer.upgrade());
+    v.extend(x.master.upgrade());
+    v
+}
+
+/// Advances after a state change: counts carrier changes, and configures IPv6 on interfaces that
+/// are up with carrier and IPv6 not disabled. Those in `first` are handled first (Linux goes by
+/// the order of events: the changed one, its peer, the bridge it is attached to).
+fn settle(ns: &NetNs, first: &[DevRef]) {
+    let mut d = devs(ns);
+    let mut order: Vec<DevRef> = Vec::new();
+    for x in first.iter().chain(d.list.clone().iter()) {
+        let mine = x
+            .borrow()
+            .ns
+            .upgrade()
+            .is_some_and(|n| std::ptr::eq(Rc::as_ptr(&n), ns));
+        if mine && !order.iter().any(|o| Rc::ptr_eq(o, x)) {
+            order.push(x.clone());
+        }
+    }
+    for x in &order {
+        let c = carrier(x, &d);
+        let ready = {
+            let mut y = x.borrow_mut();
+            if c != y.carrier_was {
+                y.carrier_was = c;
+                y.carrier_changes += 1;
+            }
+            y.up && c && !y.v6_ready && !v6_disabled(&y)
+        };
+        if ready {
+            v6_config(&mut d, x);
+        }
+    }
+}
+
+/// Whether the interface has IPv6 off: its own `disable_ipv6`, or an MTU below 1280.
+fn v6_disabled(x: &Dev) -> bool {
+    x.conf6.get(true, "disable_ipv6") != 0 || i64::from(x.mtu) < crate::netconf::IPV6_MIN_MTU
+}
+
+/// Configures an interface's IPv6 (addrconf's `addrconf_dev_config`): routes for ff00::/8 and
+/// fe80::/64, a generated link-local address (none when `addr_gen_mode` is 1), and routes for
+/// existing addresses.
+fn v6_config(d: &mut Devices, dev: &DevRef) {
+    let (mac, mode) = {
+        let mut x = dev.borrow_mut();
+        x.v6_ready = true;
+        (x.mac, x.conf6.get(true, "addr_gen_mode"))
+    };
+    let r = |table, ty, dst: Vec<u8>, prefix| {
+        kernel_route(
+            AF_INET6,
+            table,
+            ty,
+            RT_SCOPE_UNIVERSE,
+            dst,
+            prefix,
+            None,
+            dev,
+            IP6_PRIO_ADDRCONF,
+            Vec::new(),
+        )
+    };
+    let mut mc = vec![0u8; 16];
+    mc[0] = 0xff;
+    add_route(d, r(RT_TABLE_LOCAL, RTN_MULTICAST, mc, 8));
+    let mut ll = vec![0u8; 16];
+    ll[..2].copy_from_slice(&[0xfe, 0x80]);
+    add_route(d, r(RT_TABLE_MAIN, RTN_UNICAST, ll, 64));
+    if mode != 1 {
+        let a = Addr6 {
+            addr: link_local(mac),
+            prefix: 64,
+            flags: IFA_F_PERMANENT,
+            proto: IFAPROT_KERNEL_LL,
+            metric: 0,
+        };
+        let mut x = dev.borrow_mut();
+        if !x.v6.iter().any(|b| b.addr == a.addr) {
+            x.v6.push(a);
+        }
+    }
+    let addrs = dev.borrow().v6.clone();
+    for a in &addrs {
+        add_ifaddr6(d, dev, a);
+    }
+}
+
+/// The link-local address generated from the MAC (EUI-64).
+fn link_local(mac: [u8; 6]) -> [u8; 16] {
+    let mut a = [0u8; 16];
+    a[0] = 0xfe;
+    a[1] = 0x80;
+    a[8] = mac[0] ^ 0x02;
+    a[9] = mac[1];
+    a[10] = mac[2];
+    a[11] = 0xff;
+    a[12] = 0xfe;
+    a[13] = mac[3];
+    a[14] = mac[4];
+    a[15] = mac[5];
+    a
+}
+
+/// Removes an interface's IPv6 (when going down, disabling IPv6 or moving away,
+/// `addrconf_ifdown`): addresses and routes are all removed.
+fn v6_down(d: &mut Devices, dev: &DevRef) {
+    {
+        let mut x = dev.borrow_mut();
+        x.v6.clear();
+        x.v6_ready = false;
+    }
+    drop_routes(d, dev, Some(AF_INET6), false);
+}
+
+// ---- Adding and removing routes (added per address) ----
+
+/// Rebuilds the routes added per address after IPv4 addresses change: removes those of `gone`
+/// (including those whose preferred source it is, `fib_sync_down_addr`), then adds them back for
+/// the remaining addresses (`fib_del_ifaddr` keeps shared ones).
+fn redo_ifaddr4(d: &mut Devices, dev: &DevRef, gone: &[[u8; 4]]) {
+    d.routes.retain(|r| {
+        !(r.family == AF_INET
+            && gone.iter().any(|g| {
+                r.owner.as_deref() == Some(&g[..]) || r.prefsrc.as_deref() == Some(&g[..])
+            }))
+    });
+    let addrs = dev.borrow().v4.clone();
+    for a in &addrs {
+        add_ifaddr4(d, dev, a);
+    }
+}
+
+/// The routes of IPv4 address `a` (`fib_add_ifaddr`): the local route is always added; an
+/// explicit broadcast address, the subnet and the subnet broadcast only while the interface is
+/// up; a secondary's preferred source is the primary in the same subnet.
+fn add_ifaddr4(d: &mut Devices, dev: &DevRef, a: &Addr4) {
+    let (up, prim) = {
+        let x = dev.borrow();
+        let prim = if a.flags & IFA_F_SECONDARY != 0 {
+            x.v4.iter()
+                .find(|p| {
+                    p.flags & IFA_F_SECONDARY == 0 && p.prefix == a.prefix && p.contains(a.local)
+                })
+                .map_or(a.local, |p| p.local)
+        } else {
+            a.local
+        };
+        (x.up, prim)
+    };
+    let src = Some(prim.to_vec());
+    let own = a.local.to_vec();
+    let host = |ty, scope, dst: [u8; 4]| {
+        kernel_route(
+            AF_INET,
+            RT_TABLE_LOCAL,
+            ty,
+            scope,
+            dst.to_vec(),
+            32,
+            src.clone(),
+            dev,
+            0,
+            own.clone(),
+        )
+    };
+    add_route(d, host(RTN_LOCAL, RT_SCOPE_HOST, a.local));
+    if !up {
+        return;
+    }
+    if a.broadcast != [0; 4] && a.broadcast != [0xff; 4] {
+        add_route(d, host(RTN_BROADCAST, RT_SCOPE_LINK, a.broadcast));
+    }
+    let prefix = a.subnet();
+    if prefix != 0
+        && a.flags & IFA_F_SECONDARY == 0
+        && (prefix != u32::from_be_bytes(a.local) || a.prefix < 32)
+    {
+        if a.flags & IFA_F_NOPREFIXROUTE == 0 {
+            add_route(
+                d,
+                kernel_route(
+                    AF_INET,
+                    RT_TABLE_MAIN,
+                    RTN_UNICAST,
+                    RT_SCOPE_LINK,
+                    prefix.to_be_bytes().to_vec(),
+                    a.prefix,
+                    src.clone(),
+                    dev,
+                    a.metric,
+                    own.clone(),
+                ),
+            );
+        }
+        if a.prefix < 31 {
+            add_route(
+                d,
+                host(
+                    RTN_BROADCAST,
+                    RT_SCOPE_LINK,
+                    (prefix | !a.mask()).to_be_bytes(),
+                ),
+            );
+        }
+    }
+}
+
+/// The routes of an IPv6 address: the subnet (none with `IFA_F_NOPREFIXROUTE`, nor for /128) and
+/// the local route (while the interface is up).
+fn add_ifaddr6(d: &mut Devices, dev: &DevRef, a: &Addr6) {
+    let up = dev.borrow().up;
+    let own = a.addr.to_vec();
+    if a.flags & IFA_F_NOPREFIXROUTE == 0 && a.prefix < 128 {
+        add_route(
+            d,
+            kernel_route(
+                AF_INET6,
+                RT_TABLE_MAIN,
+                RTN_UNICAST,
+                RT_SCOPE_UNIVERSE,
+                crate::route::network(&a.addr, a.prefix),
+                a.prefix,
+                None,
+                dev,
+                if a.metric != 0 {
+                    a.metric
+                } else {
+                    IP6_PRIO_ADDRCONF
+                },
+                own.clone(),
+            ),
+        );
+    }
+    if up {
+        add_route(
+            d,
+            kernel_route(
+                AF_INET6,
+                RT_TABLE_LOCAL,
+                RTN_LOCAL,
+                RT_SCOPE_UNIVERSE,
+                own.clone(),
+                128,
+                None,
+                dev,
+                0,
+                own,
+            ),
+        );
+    }
+}
+
+fn add_route(d: &mut Devices, r: Rt) {
+    if !d.routes.iter().any(|x| x.same(&r)) {
+        d.routes.push(r);
+    }
+}
+
+/// A route added per address (by `fib_magic` or addrconf).
+#[allow(clippy::too_many_arguments)]
+fn kernel_route(
+    family: i32,
+    table: u8,
+    ty: u8,
+    scope: u8,
+    dst: Vec<u8>,
+    prefix: u8,
+    prefsrc: Option<Vec<u8>>,
+    dev: &DevRef,
+    metric: u32,
+    owner: Vec<u8>,
+) -> Rt {
+    Rt {
+        family,
+        table,
+        ty,
+        proto: RTPROT_KERNEL,
+        scope,
+        tos: 0,
+        dst,
+        prefix,
+        prefsrc,
+        gateway: None,
+        dev: Rc::downgrade(dev),
+        metric,
+        owner: Some(owner),
+    }
+}
+
+/// Removes the routes through `dev`: with `keep_local`, IPv4 local routes stay (when the
+/// interface goes down).
+fn drop_routes(d: &mut Devices, dev: &DevRef, family: Option<i32>, keep_local: bool) {
+    d.routes.retain(|r| {
+        !(r.on(dev)
+            && family.is_none_or(|f| r.family == f)
+            && !(keep_local && r.family == AF_INET && r.ty == RTN_LOCAL))
+    });
+}
+
+// ---- Carrier and state ----
+
+/// A snapshot of a device (for netlink answers, procfs and sysfs).
+#[derive(Debug, Clone)]
+pub(crate) struct View {
+    pub index: u32,
+    pub name: Vec<u8>,
+    pub kind: Kind,
+    /// Reported flags (`dev_get_flags`: including RUNNING and LOWER_UP).
+    pub flags: u32,
+    pub carrier: bool,
+    pub operstate: u8,
+    pub mtu: u32,
+    pub mac: [u8; 6],
+    pub txqlen: u32,
+    pub group: u32,
+    pub alias: Option<Vec<u8>>,
+    /// `IFLA_LINK`: the index of the veth's peer (with its namespace when it is not in the same
+    /// one).
+    pub link: Option<(u32, Option<Rc<NetNs>>)>,
+    pub master: Option<u32>,
+    pub port_state: Option<u8>,
+    pub carrier_changes: u32,
+    pub v4: Vec<Addr4>,
+    pub v6: Vec<Addr6>,
+    /// The MAC used for the bridge id (`bridge_id`).
+    pub bridge_mac: [u8; 6],
+    /// Has been up (the qdisc is noqueue).
+    pub ever_up: bool,
+}
+
+impl View {
+    /// Viewed as an interface, the way `ip` and procfs use it.
+    pub fn interface(&self) -> Interface {
+        let mut addrs: Vec<(i32, Vec<u8>, u8)> = self
+            .v4
+            .iter()
+            .map(|a| (AF_INET, a.local.to_vec(), a.prefix))
+            .collect();
+        addrs.extend(
+            self.v6
+                .iter()
+                .map(|a| (AF_INET6, a.addr.to_vec(), a.prefix)),
+        );
+        Interface {
+            name: String::from_utf8_lossy(&self.name).into_owned(),
+            index: self.index,
+            flags: self.flags,
+            mtu: self.mtu,
+            mac: Some(self.mac),
+            addrs,
+        }
+    }
+}
+
+/// The virtual devices in namespace `ns`, by index.
+pub(crate) fn views(ns: &NetNs) -> Vec<View> {
+    let d = devs(ns);
+    let mut v: Vec<View> = d.list.iter().map(|x| view(x, &d, ns)).collect();
+    v.sort_by_key(|x| x.index);
+    v
+}
+
+fn view(me: &DevRef, devs: &Devices, my_ns: &NetNs) -> View {
+    let c = carrier(me, devs);
+    let port = port_state(me, devs);
+    let d = me.borrow();
+    let link = match d.kind {
+        Kind::Veth => Some(match d.peer.upgrade() {
+            Some(p) => {
+                let p = p.borrow();
+                let other =
+                    p.ns.upgrade()
+                        .filter(|n| !std::ptr::eq(Rc::as_ptr(n), my_ns));
+                (p.index, other)
+            }
+            None => (0, None),
+        }),
+        _ => None,
+    };
+    let iflink = link.as_ref().map_or(d.index, |l| l.0);
+    let operstate = if !d.up {
+        IF_OPER_DOWN
+    } else if !c {
+        if iflink != d.index {
+            IF_OPER_LOWERLAYERDOWN
+        } else {
+            IF_OPER_DOWN
+        }
+    } else if d.kind == Kind::Dummy || (d.kind == Kind::Bridge && !d.selected) {
+        IF_OPER_UNKNOWN
+    } else {
+        IF_OPER_UP
+    };
+    let mut flags = d.flags;
+    if d.up {
+        flags |= IFF_UP;
+        if matches!(operstate, IF_OPER_UP | IF_OPER_UNKNOWN) {
+            flags |= IFF_RUNNING;
+        }
+        if c {
+            flags |= IFF_LOWER_UP;
+        }
+    }
+    View {
+        index: d.index,
+        name: d.name.clone(),
+        kind: d.kind,
+        flags,
+        carrier: c,
+        operstate,
+        mtu: d.mtu,
+        mac: d.mac,
+        txqlen: d.txqlen,
+        group: d.group,
+        alias: d.alias.clone(),
+        link,
+        master: d.master.upgrade().map(|m| m.borrow().index),
+        port_state: port,
+        carrier_changes: d.carrier_changes,
+        v4: d.v4.clone(),
+        v6: d.v6.clone(),
+        bridge_mac: d.mac,
+        ever_up: d.ever_up,
+    }
+}
+
+/// A port's state (`BR_STATE_*`): forwarding when the bridge and the port are both up and the
+/// port has carrier (STP off), disabled otherwise.
+fn port_state(port: &DevRef, devs: &Devices) -> Option<u8> {
+    let br = port.borrow().master.upgrade()?;
+    let on = br.borrow().up && port.borrow().up && carrier(port, devs);
+    Some(if on { 3 } else { 0 })
+}
+
+/// The IPv4 addresses and prefix lengths on virtual devices in namespace `ns` (for address
+/// mapping, [`crate::netns`]).
+pub(crate) fn local_v4(ns: &NetNs) -> Vec<([u8; 4], u8)> {
+    let d = devs(ns);
+    let mut v = Vec::new();
+    for x in &d.list {
+        v.extend(x.borrow().v4.iter().map(|a| (a.local, a.prefix)));
+    }
+    v
+}
+
+/// The route in namespace `ns` through virtual devices to IPv4 address `ip` (the longest prefix
+/// in the main table; among equal lengths, the lowest metric).
+pub(crate) fn route_v4(ns: &NetNs, ip: [u8; 4]) -> Option<Entry> {
+    entries(ns)
+        .into_iter()
+        .filter(|e| {
+            e.family == AF_INET
+                && e.table == RT_TABLE_MAIN
+                && crate::route::network(&ip, e.prefix) == e.dst
+        })
+        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
+}
+
+/// Whether namespace `ns` has an IPv6 route to `ip` through virtual devices.
+pub(crate) fn routes_v6(ns: &NetNs, ip: &[u8; 16]) -> bool {
+    entries(ns).iter().any(|e| {
+        e.family == AF_INET6
+            && e.table == RT_TABLE_MAIN
+            && crate::route::network(ip, e.prefix) == e.dst
+    })
+}
+
+/// The first primary IPv4 address on the virtual device with index `index` in namespace `ns`.
+pub(crate) fn first_v4(ns: &NetNs, index: u32) -> Option<[u8; 4]> {
+    let d = devs(ns);
+    let x = d.by_index(index)?;
+    let x = x.borrow();
+    x.v4.iter()
+        .find(|a| a.flags & IFA_F_SECONDARY == 0)
+        .map(|a| a.local)
+}
+
+/// All interfaces in namespace `ns` (the host's or lo, plus virtual devices), by index.
+pub(crate) fn interfaces(ns: &NetNs) -> Vec<Interface> {
+    let mut all = base(ns);
+    all.extend(views(ns).iter().map(View::interface));
+    all.sort_by_key(|i| i.index);
+    all
+}
+
+/// The two tables of namespace `ns` (the host's or lo's, plus those on virtual devices).
+/// `host_routes` are the routes in the host's main table (the initial namespace,
+/// [`crate::route::host_routes`]).
+pub(crate) fn tables(ns: &NetNs, host_routes: Option<Vec<appine_hal::net::Route>>) -> Vec<Entry> {
+    let base_ifaces = base(ns);
+    let host = if ns.host_net.is_none() {
+        crate::route::tables(&base_ifaces, host_routes)
+    } else {
+        // A new namespace: lo's local routes (there is no host main table)
+        crate::route::tables(&base_ifaces, Some(Vec::new()))
+            .into_iter()
+            .map(|mut e| {
+                e.host = false;
+                e
+            })
+            .collect()
+    };
+    crate::route::merge(host, entries(ns))
+}
+
+/// Routes on virtual devices ([`Entry`] with `host` false), in the order added.
+pub(crate) fn entries(ns: &NetNs) -> Vec<Entry> {
+    let d = devs(ns);
+    d.routes
+        .iter()
+        .filter_map(|r| {
+            let dev = r.dev.upgrade()?;
+            let linkdown = r.ty != RTN_LOCAL && !carrier(&dev, &d);
+            let x = dev.borrow();
+            Some(Entry {
+                family: r.family,
+                table: r.table,
+                ty: r.ty,
+                proto: r.proto,
+                scope: r.scope,
+                dst: r.dst.clone(),
+                prefix: r.prefix,
+                prefsrc: r.prefsrc.clone(),
+                gateway: r.gateway.clone(),
+                iface: String::from_utf8_lossy(&x.name).into_owned(),
+                index: x.index,
+                metric: r.metric,
+                flags: if linkdown { RTNH_F_LINKDOWN } else { 0 },
+                host: false,
+            })
+        })
+        .collect()
+}
+
+/// Whether the device has carrier (`netif_carrier_ok`). `devs` is the device table of its
+/// namespace (to find a bridge's ports).
+fn carrier(me: &DevRef, devs: &Devices) -> bool {
+    let d = me.borrow();
+    match d.kind {
+        Kind::Dummy => true,
+        Kind::Veth => d.up && d.peer.upgrade().is_some_and(|p| p.borrow().up),
+        Kind::Bridge if !d.selected => true,
+        Kind::Bridge => {
+            d.up && devs
+                .ports(me)
+                .iter()
+                .any(|p| p.borrow().up && carrier(p, devs))
+        }
+    }
+}
+
+// ---- Device table ----
+
+/// The device table of namespace `ns`, after first clearing veths whose peer is gone.
+fn devs(ns: &NetNs) -> crate::cell::RefMut<'_, Devices> {
+    let mut d = ns.devs.borrow_mut();
+    d.prune();
+    d
+}
+
+/// The interfaces in a namespace that are not virtual devices: the host's in the initial
+/// namespace, lo in a new one.
+pub(crate) fn base(ns: &NetNs) -> Vec<Interface> {
+    if ns.host_net.is_none() {
+        appine_hal::net::interfaces()
+    } else {
+        vec![crate::netns::lo_interface(ns)]
     }
 }
 

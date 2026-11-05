@@ -129,21 +129,6 @@ pub(crate) const V6: [Item; 58] = [
 /// The minimum IPv6 MTU.
 pub(crate) const IPV6_MIN_MTU: i64 = 1280;
 
-/// The table of one family.
-pub(crate) fn table(v6: bool) -> &'static [Item] {
-    if v6 { &V6 } else { &V4 }
-}
-
-/// Position of entry `name` in the table.
-pub(crate) fn position(v6: bool, name: &[u8]) -> Option<usize> {
-    table(v6).iter().position(|(n, ..)| n.as_bytes() == name)
-}
-
-/// Read-only entries (`mc_forwarding`).
-pub(crate) fn read_only(name: &[u8]) -> bool {
-    name == b"mc_forwarding"
-}
-
 /// One set of interface settings (of one family): the value of every entry, and which were set
 /// individually (IPv4 `default` only changes those not set).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,19 +230,19 @@ impl NetConf {
     }
 }
 
-/// Parses a written integer as `proc_dointvec` does: leading whitespace and a sign are allowed,
-/// and whitespace (a newline) may follow.
-pub(crate) fn parse_int(data: &[u8]) -> Result<i64, Errno> {
-    let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-    let s = s.trim_start();
-    let end = s
-        .char_indices()
-        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-        .map_or(s.len(), |(i, _)| i);
-    if !s[end..].trim().is_empty() {
-        return Err(Errno::EINVAL);
-    }
-    s[..end].parse().map_err(|_| Errno::EINVAL)
+/// Position of entry `name` in the table.
+pub(crate) fn position(v6: bool, name: &[u8]) -> Option<usize> {
+    table(v6).iter().position(|(n, ..)| n.as_bytes() == name)
+}
+
+/// The table of one family.
+pub(crate) fn table(v6: bool) -> &'static [Item] {
+    if v6 { &V6 } else { &V4 }
+}
+
+/// Read-only entries (`mc_forwarding`).
+pub(crate) fn read_only(name: &[u8]) -> bool {
+    name == b"mc_forwarding"
 }
 
 /// The values an entry may take: mostly any int; a few have ranges (those Linux handles with
@@ -296,16 +281,6 @@ pub(crate) fn parse_secret(data: &[u8]) -> Result<[u8; 16], Errno> {
         .map_err(|_| Errno::EINVAL)
 }
 
-/// Two integers (writes of `ip_local_port_range` and `ping_group_range`).
-fn parse_pair(data: &[u8]) -> Result<(i64, i64), Errno> {
-    let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-    let mut it = s.split_ascii_whitespace().map(|w| w.parse::<i64>());
-    let (Some(Ok(a)), Some(Ok(b)), None) = (it.next(), it.next(), it.next()) else {
-        return Err(Errno::EINVAL);
-    };
-    Ok((a, b))
-}
-
 /// Writes `ipv4/ip_local_port_range`: two numbers, both between 1 and 65535, the first not
 /// greater than the second, and not below `ip_unprivileged_port_start` (`prot_sock`); otherwise
 /// EINVAL (Linux 6.1's `ipv4_local_port_range`).
@@ -336,6 +311,31 @@ pub(crate) fn parse_ping_group(data: &[u8]) -> Result<(i64, i64), Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(if hi < lo { (1, 0) } else { (lo, hi) })
+}
+
+/// Parses a written integer as `proc_dointvec` does: leading whitespace and a sign are allowed,
+/// and whitespace (a newline) may follow.
+pub(crate) fn parse_int(data: &[u8]) -> Result<i64, Errno> {
+    let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    let s = s.trim_start();
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+        .map_or(s.len(), |(i, _)| i);
+    if !s[end..].trim().is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    s[..end].parse().map_err(|_| Errno::EINVAL)
+}
+
+/// Two integers (writes of `ip_local_port_range` and `ping_group_range`).
+fn parse_pair(data: &[u8]) -> Result<(i64, i64), Errno> {
+    let s = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    let mut it = s.split_ascii_whitespace().map(|w| w.parse::<i64>());
+    let (Some(Ok(a)), Some(Ok(b)), None) = (it.next(), it.next(), it.next()) else {
+        return Err(Errno::EINVAL);
+    };
+    Ok((a, b))
 }
 
 /// Other sysctls under `/proc/sys/net` (docs/rounds/177-net-sysctls.md): the path (under `core/`,

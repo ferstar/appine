@@ -41,74 +41,7 @@ const BUFFER: usize = 64 * 1024;
 /// How long a UDP forwarding socket may stay idle before it is closed (docker-proxy: 90 seconds).
 const UDP_IDLE: Duration = Duration::from_secs(120);
 
-/// 127.254.0.0/16 on the host is kept for connections forwarded in from outside (blocks of new
-/// network namespaces never take it).
-pub(crate) const OUTSIDE_BLOCK: u8 = 254;
-
-/// Host address bound by a connection forwarded in from outside → (client address, client port,
-/// bound host port). One per process: addresses come from a process-wide counter, so they never
-/// repeat.
-static OUTSIDE: Mutex<Option<Outside>> = Mutex::new(None);
-
-#[derive(Default)]
-struct Outside {
-    next: u16,
-    peers: HashMap<[u8; 4], ([u8; 4], u16, u16)>,
-}
-
-/// The client's real address and port, when host address `host` (127.254.x.y) and port `port`
-/// belong to a connection forwarded in from outside.
-pub(crate) fn outside_peer(host: [u8; 4], port: u16) -> Option<([u8; 4], u16)> {
-    let g = OUTSIDE.lock().unwrap();
-    let &(ip, cport, hport) = g.as_ref()?.peers.get(&host)?;
-    (hport == port).then_some((ip, cport))
-}
-
-/// Gives a connection from outside a 127.254.x.y address (skipping .0.0).
-fn take_outside() -> [u8; 4] {
-    let mut g = OUTSIDE.lock().unwrap();
-    let o = g.get_or_insert_with(Default::default);
-    loop {
-        o.next = o.next.wrapping_add(1);
-        let [a, b] = o.next.to_be_bytes();
-        let addr = [127, OUTSIDE_BLOCK, a, b];
-        if o.next != 0 && !o.peers.contains_key(&addr) {
-            return addr;
-        }
-    }
-}
-
-fn record_outside(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
-    let mut g = OUTSIDE.lock().unwrap();
-    g.get_or_insert_with(Default::default)
-        .peers
-        .insert(host, (client, cport, hport));
-}
-
-/// Records a connection forwarded in from outside, in tests ([`outside_peer`]).
-#[cfg(test)]
-pub(crate) fn record_outside_for_test(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
-    record_outside(host, client, cport, hport);
-}
-
-fn forget_outside(host: [u8; 4]) {
-    if let Some(o) = OUTSIDE.lock().unwrap().as_mut() {
-        o.peers.remove(&host);
-    }
-}
-
-/// The IPv4 address and port in an accepted client address: for an IPv4-mapped IPv6 address, the
-/// IPv4 part; None for loopback addresses and pure IPv6.
-fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
-    const MAPPED: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-    let port = u16::from_be_bytes([*addr.get(2)?, *addr.get(3)?]);
-    let ip: [u8; 4] = match family(addr) {
-        2 => addr.get(4..8)?.try_into().ok()?,
-        10 if addr.get(8..20)? == MAPPED => addr.get(20..24)?.try_into().ok()?,
-        _ => return None,
-    };
-    (ip[0] != 127).then_some((ip, port))
-}
+// ---- Forwarding thread ----
 
 /// A port to forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,64 +58,6 @@ pub(crate) struct Target {
 #[derive(Default)]
 pub(crate) struct Forwarder {
     shared: Arc<Shared>,
-}
-
-#[derive(Default)]
-struct Shared {
-    state: Mutex<State>,
-    event: std::sync::OnceLock<appine_hal::Event>,
-}
-
-#[derive(Default)]
-struct State {
-    next: u64,
-    /// Ports to forward: the duplicated listening fd and the destination.
-    ports: HashMap<u64, (i32, Target)>,
-    /// Duplicated fds of ports no longer forwarded: the thread closes them (it may be polling
-    /// them).
-    closing: Vec<i32>,
-    running: bool,
-    /// The kernel is gone ([`Forwarder`] was dropped): the thread closes the fds it holds and
-    /// exits.
-    stop: bool,
-}
-
-impl Drop for Forwarder {
-    fn drop(&mut self) {
-        self.shared.state.lock().unwrap().stop = true;
-        if let Some(e) = self.shared.event.get() {
-            e.signal();
-        }
-    }
-}
-
-/// One forwarded port: forwarding stops when it is dropped.
-pub(crate) struct Handle {
-    shared: Arc<Shared>,
-    id: u64,
-    pub target: Target,
-}
-
-impl std::fmt::Debug for Handle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Handle")
-            .field("id", &self.id)
-            .field("target", &self.target)
-            .finish()
-    }
-}
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        let mut st = self.shared.state.lock().unwrap();
-        if let Some((fd, _)) = st.ports.remove(&self.id) {
-            st.closing.push(fd);
-        }
-        drop(st);
-        if let Some(e) = self.shared.event.get() {
-            e.signal();
-        }
-    }
 }
 
 impl Forwarder {
@@ -224,6 +99,64 @@ impl Forwarder {
     }
 }
 
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.shared.state.lock().unwrap().stop = true;
+        if let Some(e) = self.shared.event.get() {
+            e.signal();
+        }
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    state: Mutex<State>,
+    event: std::sync::OnceLock<appine_hal::Event>,
+}
+
+#[derive(Default)]
+struct State {
+    next: u64,
+    /// Ports to forward: the duplicated listening fd and the destination.
+    ports: HashMap<u64, (i32, Target)>,
+    /// Duplicated fds of ports no longer forwarded: the thread closes them (it may be polling
+    /// them).
+    closing: Vec<i32>,
+    running: bool,
+    /// The kernel is gone ([`Forwarder`] was dropped): the thread closes the fds it holds and
+    /// exits.
+    stop: bool,
+}
+
+/// One forwarded port: forwarding stops when it is dropped.
+pub(crate) struct Handle {
+    shared: Arc<Shared>,
+    id: u64,
+    pub target: Target,
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handle")
+            .field("id", &self.id)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let mut st = self.shared.state.lock().unwrap();
+        if let Some((fd, _)) = st.ports.remove(&self.id) {
+            st.closing.push(fd);
+        }
+        drop(st);
+        if let Some(e) = self.shared.event.get() {
+            e.signal();
+        }
+    }
+}
+
 /// One forwarded TCP connection.
 struct Conn {
     client: i32,
@@ -261,86 +194,6 @@ struct Relay {
     port: u64,
     client: Vec<u8>,
     last: Instant,
-}
-
-fn family(addr: &[u8]) -> i32 {
-    i32::from(u16::from_le_bytes([addr[0], addr[1]]))
-}
-
-/// Creates a host socket connecting to `t` (nonblocking; the connection may still be in
-/// progress) and returns (fd, connected, bound 127.254.x.y). When `client` is an outside client's
-/// IPv4 address and port, first binds a 127.254.x.y address and that port (letting the host choose
-/// if the port cannot be bound) and records it; otherwise binds `t.source`.
-fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option<[u8; 4]>), i32> {
-    let fd = appine_hal::net::socket(
-        family(&t.addr),
-        if t.udp { SOCK_DGRAM } else { SOCK_STREAM },
-        0,
-    )?;
-    let mut outside = None;
-    let bound = match client.filter(|_| family(&t.addr) == 2) {
-        Some((ip, port)) => {
-            let host = take_outside();
-            let at = |p: u16| appine_hal::net::sockaddr(std::net::SocketAddr::from((host, p)));
-            let r =
-                appine_hal::net::bind(fd, &at(port)).or_else(|_| appine_hal::net::bind(fd, &at(0)));
-            if r.is_ok() {
-                let hport = appine_hal::net::sockname(fd, false)
-                    .ok()
-                    .map_or(0, |a| u16::from_be_bytes([a[2], a[3]]));
-                record_outside(host, ip, port, hport);
-                outside = Some(host);
-            }
-            r
-        }
-        None => t
-            .source
-            .as_ref()
-            .map_or(Ok(()), |src| appine_hal::net::bind(fd, src)),
-    };
-    if let Err(e) = bound {
-        appine_hal::net::close(fd);
-        return Err(e);
-    }
-    match appine_hal::net::connect(fd, &t.addr) {
-        Ok(()) => Ok((fd, true, outside)),
-        Err(EINPROGRESS) => Ok((fd, false, outside)),
-        Err(e) => {
-            appine_hal::net::close(fd);
-            if let Some(a) = outside {
-                forget_outside(a);
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Reads from `fd` into `buf` (up to [`BUFFER`]): end of file is Ok(false).
-fn fill(fd: i32, buf: &mut Vec<u8>) -> Result<bool, i32> {
-    let mut chunk = vec![0u8; BUFFER - buf.len()];
-    match appine_hal::read(fd, &mut chunk) {
-        Ok(0) => Ok(false),
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            Ok(true)
-        }
-        Err(EAGAIN) => Ok(true),
-        Err(e) => Err(e),
-    }
-}
-
-/// Writes `buf` to `fd` (whatever cannot be written stays).
-fn drain(fd: i32, buf: &mut Vec<u8>) -> Result<(), i32> {
-    while !buf.is_empty() {
-        match appine_hal::net::sendmsg(fd, buf, &[], &[], 0) {
-            Ok(n) => {
-                buf.drain(..n);
-            }
-            Err(EAGAIN) => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 /// The forwarding thread.
@@ -528,6 +381,34 @@ fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
     Ok(())
 }
 
+/// Reads from `fd` into `buf` (up to [`BUFFER`]): end of file is Ok(false).
+fn fill(fd: i32, buf: &mut Vec<u8>) -> Result<bool, i32> {
+    let mut chunk = vec![0u8; BUFFER - buf.len()];
+    match appine_hal::read(fd, &mut chunk) {
+        Ok(0) => Ok(false),
+        Ok(n) => {
+            buf.extend_from_slice(&chunk[..n]);
+            Ok(true)
+        }
+        Err(EAGAIN) => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes `buf` to `fd` (whatever cannot be written stays).
+fn drain(fd: i32, buf: &mut Vec<u8>) -> Result<(), i32> {
+    while !buf.is_empty() {
+        match appine_hal::net::sendmsg(fd, buf, &[], &[], 0) {
+            Ok(n) => {
+                buf.drain(..n);
+            }
+            Err(EAGAIN) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Datagrams received on a UDP port: finds (or opens) the forwarding socket of the source and
 /// sends them to the destination.
 fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
@@ -561,6 +442,129 @@ fn datagrams(id: u64, fd: i32, target: &Target, relays: &mut Vec<Relay>) {
         r.last = Instant::now();
         let _ = appine_hal::net::sendmsg(r.fd, data, &[], &[], 0);
     }
+}
+
+/// Creates a host socket connecting to `t` (nonblocking; the connection may still be in
+/// progress) and returns (fd, connected, bound 127.254.x.y). When `client` is an outside client's
+/// IPv4 address and port, first binds a 127.254.x.y address and that port (letting the host choose
+/// if the port cannot be bound) and records it; otherwise binds `t.source`.
+fn open(t: &Target, client: Option<([u8; 4], u16)>) -> Result<(i32, bool, Option<[u8; 4]>), i32> {
+    let fd = appine_hal::net::socket(
+        family(&t.addr),
+        if t.udp { SOCK_DGRAM } else { SOCK_STREAM },
+        0,
+    )?;
+    let mut outside = None;
+    let bound = match client.filter(|_| family(&t.addr) == 2) {
+        Some((ip, port)) => {
+            let host = take_outside();
+            let at = |p: u16| appine_hal::net::sockaddr(std::net::SocketAddr::from((host, p)));
+            let r =
+                appine_hal::net::bind(fd, &at(port)).or_else(|_| appine_hal::net::bind(fd, &at(0)));
+            if r.is_ok() {
+                let hport = appine_hal::net::sockname(fd, false)
+                    .ok()
+                    .map_or(0, |a| u16::from_be_bytes([a[2], a[3]]));
+                record_outside(host, ip, port, hport);
+                outside = Some(host);
+            }
+            r
+        }
+        None => t
+            .source
+            .as_ref()
+            .map_or(Ok(()), |src| appine_hal::net::bind(fd, src)),
+    };
+    if let Err(e) = bound {
+        appine_hal::net::close(fd);
+        return Err(e);
+    }
+    match appine_hal::net::connect(fd, &t.addr) {
+        Ok(()) => Ok((fd, true, outside)),
+        Err(EINPROGRESS) => Ok((fd, false, outside)),
+        Err(e) => {
+            appine_hal::net::close(fd);
+            if let Some(a) = outside {
+                forget_outside(a);
+            }
+            Err(e)
+        }
+    }
+}
+
+// ---- Real client address ----
+
+/// 127.254.0.0/16 on the host is kept for connections forwarded in from outside (blocks of new
+/// network namespaces never take it).
+pub(crate) const OUTSIDE_BLOCK: u8 = 254;
+
+/// Host address bound by a connection forwarded in from outside → (client address, client port,
+/// bound host port). One per process: addresses come from a process-wide counter, so they never
+/// repeat.
+static OUTSIDE: Mutex<Option<Outside>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Outside {
+    next: u16,
+    peers: HashMap<[u8; 4], ([u8; 4], u16, u16)>,
+}
+
+/// The IPv4 address and port in an accepted client address: for an IPv4-mapped IPv6 address, the
+/// IPv4 part; None for loopback addresses and pure IPv6.
+fn outside_client(addr: &[u8]) -> Option<([u8; 4], u16)> {
+    const MAPPED: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+    let port = u16::from_be_bytes([*addr.get(2)?, *addr.get(3)?]);
+    let ip: [u8; 4] = match family(addr) {
+        2 => addr.get(4..8)?.try_into().ok()?,
+        10 if addr.get(8..20)? == MAPPED => addr.get(20..24)?.try_into().ok()?,
+        _ => return None,
+    };
+    (ip[0] != 127).then_some((ip, port))
+}
+
+/// Gives a connection from outside a 127.254.x.y address (skipping .0.0).
+fn take_outside() -> [u8; 4] {
+    let mut g = OUTSIDE.lock().unwrap();
+    let o = g.get_or_insert_with(Default::default);
+    loop {
+        o.next = o.next.wrapping_add(1);
+        let [a, b] = o.next.to_be_bytes();
+        let addr = [127, OUTSIDE_BLOCK, a, b];
+        if o.next != 0 && !o.peers.contains_key(&addr) {
+            return addr;
+        }
+    }
+}
+
+fn record_outside(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
+    let mut g = OUTSIDE.lock().unwrap();
+    g.get_or_insert_with(Default::default)
+        .peers
+        .insert(host, (client, cport, hport));
+}
+
+/// Records a connection forwarded in from outside, in tests ([`outside_peer`]).
+#[cfg(test)]
+pub(crate) fn record_outside_for_test(host: [u8; 4], client: [u8; 4], cport: u16, hport: u16) {
+    record_outside(host, client, cport, hport);
+}
+
+/// The client's real address and port, when host address `host` (127.254.x.y) and port `port`
+/// belong to a connection forwarded in from outside.
+pub(crate) fn outside_peer(host: [u8; 4], port: u16) -> Option<([u8; 4], u16)> {
+    let g = OUTSIDE.lock().unwrap();
+    let &(ip, cport, hport) = g.as_ref()?.peers.get(&host)?;
+    (hport == port).then_some((ip, cport))
+}
+
+fn forget_outside(host: [u8; 4]) {
+    if let Some(o) = OUTSIDE.lock().unwrap().as_mut() {
+        o.peers.remove(&host);
+    }
+}
+
+fn family(addr: &[u8]) -> i32 {
+    i32::from(u16::from_le_bytes([addr[0], addr[1]]))
 }
 
 #[cfg(test)]

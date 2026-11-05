@@ -158,107 +158,6 @@ const NFT_GOTO: i32 = -4;
 /// Maximum length of a name (`NFT_NAME_MAXLEN`, including the terminating NUL).
 const NAME_MAX: usize = 256;
 
-/// Known expressions (those `nft_expr_type_get` finds, the ones commonly built into 6.1): others
-/// are ENOENT.
-const EXPRS: [&str; 39] = [
-    "bitwise",
-    "byteorder",
-    "cmp",
-    "connlimit",
-    "counter",
-    "ct",
-    "dup",
-    "dynset",
-    "exthdr",
-    "fib",
-    "flow_offload",
-    "fwd",
-    "hash",
-    "immediate",
-    "last",
-    "limit",
-    "log",
-    "lookup",
-    "masq",
-    "match",
-    "meta",
-    "nat",
-    "notrack",
-    "numgen",
-    "objref",
-    "osf",
-    "payload",
-    "queue",
-    "quota",
-    "range",
-    "redir",
-    "reject",
-    "rt",
-    "socket",
-    "synproxy",
-    "target",
-    "tproxy",
-    "tunnel",
-    "xfrm",
-];
-
-/// xt extensions (`NFNL_MSG_COMPAT_GET` of `nft_compat`): name, whether it is a target, highest
-/// revision.
-const XT: [(&str, bool, u32); 52] = [
-    ("DNAT", true, 2),
-    ("SNAT", true, 2),
-    ("MASQUERADE", true, 0),
-    ("REDIRECT", true, 0),
-    ("REJECT", true, 0),
-    ("LOG", true, 0),
-    ("NFLOG", true, 0),
-    ("MARK", true, 2),
-    ("CONNMARK", true, 2),
-    ("CT", true, 2),
-    ("NOTRACK", true, 0),
-    ("TCPMSS", true, 0),
-    ("CHECKSUM", true, 0),
-    ("NFQUEUE", true, 3),
-    ("TPROXY", true, 1),
-    ("NETMAP", true, 0),
-    ("TEE", true, 1),
-    ("CLASSIFY", true, 0),
-    ("DSCP", true, 0),
-    ("TOS", true, 0),
-    ("TRACE", true, 0),
-    ("SET", true, 3),
-    ("TTL", true, 0),
-    ("HL", true, 0),
-    ("udp", false, 0),
-    ("tcp", false, 0),
-    ("icmp", false, 0),
-    ("icmp6", false, 0),
-    ("conntrack", false, 3),
-    ("state", false, 0),
-    ("comment", false, 0),
-    ("addrtype", false, 1),
-    ("mark", false, 1),
-    ("connmark", false, 1),
-    ("multiport", false, 1),
-    ("set", false, 4),
-    ("physdev", false, 0),
-    ("mac", false, 0),
-    ("limit", false, 0),
-    ("iprange", false, 1),
-    ("owner", false, 1),
-    ("pkttype", false, 0),
-    ("statistic", false, 0),
-    ("string", false, 1),
-    ("length", false, 0),
-    ("hashlimit", false, 3),
-    ("recent", false, 1),
-    ("socket", false, 3),
-    ("policy", false, 0),
-    ("devgroup", false, 0),
-    ("cgroup", false, 2),
-    ("u32", false, 0),
-];
-
 /// The ruleset of one network namespace.
 #[derive(Debug, Clone)]
 pub(crate) struct Nft {
@@ -337,54 +236,7 @@ struct Set {
     elems: Vec<Vec<u8>>,
 }
 
-// ---- Encoding ----
-
-fn be32(v: u32) -> [u8; 4] {
-    v.to_be_bytes()
-}
-
-fn be64(v: u64) -> [u8; 8] {
-    v.to_be_bytes()
-}
-
-fn get<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
-    attrs.iter().find(|(t, _)| *t == ty).map(|(_, d)| *d)
-}
-
-fn get_be32(attrs: &[(u16, &[u8])], ty: u16) -> Option<u32> {
-    get(attrs, ty)
-        .and_then(|d| d.get(..4))
-        .map(|d| u32::from_be_bytes(d.try_into().unwrap()))
-}
-
-fn get_be64(attrs: &[(u16, &[u8])], ty: u16) -> Option<u64> {
-    get(attrs, ty)
-        .and_then(|d| d.get(..8))
-        .map(|d| u64::from_be_bytes(d.try_into().unwrap()))
-}
-
-/// A string attribute (without the terminating NUL).
-fn get_str<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
-    get(attrs, ty).map(|d| d.split(|&c| c == 0).next().unwrap_or_default())
-}
-
-fn cstr(s: &[u8]) -> Vec<u8> {
-    let mut v = s.to_vec();
-    v.push(0);
-    v
-}
-
-/// One nfnetlink message: nfgenmsg (address family, version, `res_id`) plus attributes.
-fn nfmsg(ty: u16, flags: u16, seq: u32, pid: u32, family: u8, res: u16, attrs: &[u8]) -> Vec<u8> {
-    let mut p = vec![family, 0];
-    p.extend_from_slice(&res.to_be_bytes());
-    p.extend_from_slice(attrs);
-    message(ty, flags, seq, pid, &p)
-}
-
-fn nft_type(msg: u8) -> u16 {
-    (NFNL_SUBSYS_NFTABLES << 8) | u16::from(msg)
-}
+// ---- Requests ----
 
 /// A failed request: the error code, and the offending attribute (extack's
 /// `NLMSGERR_ATTR_OFFS`: nft uses it to mark the offending word in the command).
@@ -436,64 +288,6 @@ pub(crate) struct Peer<'a> {
     pub comm: &'a [u8],
 }
 
-/// The messages in one datagram.
-fn split(data: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut off = 0;
-    while off + 16 <= data.len() {
-        let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
-        if len < 16 || off + len > data.len() {
-            break;
-        }
-        out.push(&data[off..off + len]);
-        off += len.next_multiple_of(4);
-    }
-    out
-}
-
-fn parse(m: &[u8]) -> Req<'_> {
-    let ty = u16::from_le_bytes([m[4], m[5]]);
-    Req {
-        msg: ty as u8,
-        flags: u16::from_le_bytes([m[6], m[7]]),
-        seq: u32::from_le_bytes(m[8..12].try_into().unwrap()),
-        family: m.get(16).copied().unwrap_or(0),
-        attrs: crate::route::attrs(m.get(20..).unwrap_or_default()),
-    }
-}
-
-/// The acknowledgement or error for request `req` (a whole message, `netlink_ack`): when the
-/// offending attribute is in the request and `NETLINK_EXT_ACK` is set, its offset is attached
-/// (counted from the message header, `NLMSGERR_ATTR_OFFS`).
-fn ack(req: &[u8], r: Result<(), Fail>, peer: &Peer<'_>) -> Vec<u8> {
-    const NLM_F_CAPPED: u16 = 0x100;
-    const NLM_F_ACK_TLVS: u16 = 0x200;
-    const NLMSGERR_ATTR_OFFS: u16 = 2;
-    let (errno, at) = match r {
-        Ok(()) => (0, None),
-        Err(f) => (f.errno, f.at),
-    };
-    let base = req.as_ptr() as usize;
-    let offs = at
-        .filter(|&a| peer.ext_ack && a >= base + 4 && a <= base + req.len())
-        .map(|a| (a - 4 - base) as u32);
-    let mut p = (-errno).to_le_bytes().to_vec();
-    let mut flags = 0;
-    if errno == 0 || peer.cap_ack {
-        p.extend_from_slice(&req[..16]);
-        flags |= NLM_F_CAPPED;
-    } else {
-        p.extend_from_slice(req);
-    }
-    if let Some(o) = offs {
-        p.resize(p.len().next_multiple_of(4), 0);
-        attr(&mut p, NLMSGERR_ATTR_OFFS, &o.to_ne_bytes());
-        flags |= NLM_F_ACK_TLVS;
-    }
-    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
-    message(NLMSG_ERROR, flags, seq, peer.pid, &p)
-}
-
 /// Handles one datagram the guest sent on `NETLINK_NETFILTER`, returning the datagrams of the
 /// answers.
 pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
@@ -525,6 +319,21 @@ pub(crate) fn handle(ns: &NetNs, cred: &Cred, data: &[u8], peer: &Peer<'_>) -> V
         }
         out.extend(single(ns, m, peer));
         i += 1;
+    }
+    out
+}
+
+/// The messages in one datagram.
+fn split(data: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 16 <= data.len() {
+        let len = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        if len < 16 || off + len > data.len() {
+            break;
+        }
+        out.push(&data[off..off + len]);
+        off += len.next_multiple_of(4);
     }
     out
 }
@@ -620,86 +429,96 @@ fn single(ns: &NetNs, m: &[u8], peer: &Peer<'_>) -> Vec<Vec<u8>> {
     }
 }
 
-/// `NFNL_MSG_COMPAT_GET`: whether an xt extension exists, and its highest revision.
-fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
-    let (Some(name), Some(rev), Some(ty)) = (
-        get_str(&r.attrs, COMPAT_NAME),
-        get_be32(&r.attrs, COMPAT_REV),
-        get_be32(&r.attrs, COMPAT_TYPE),
-    ) else {
-        return Err(fail(Errno::EINVAL));
-    };
-    let target = ty == 1;
-    let (_, _, max) = XT
-        .iter()
-        .find(|(n, t, _)| n.as_bytes() == name && *t == target)
-        .ok_or_else(|| fail(Errno::ENOENT))?;
-    let mut p = Vec::new();
-    attr(&mut p, COMPAT_NAME, &cstr(name));
-    attr(&mut p, COMPAT_REV, &be32(rev.min(*max)));
-    attr(&mut p, COMPAT_TYPE, &be32(ty));
-    let t = NFNL_SUBSYS_NFT_COMPAT << 8;
-    Ok(vec![nfmsg(
-        t,
-        NLM_F_MULTI,
-        r.seq,
-        peer.pid,
-        r.family,
-        0,
-        &p,
-    )])
-}
-
-/// Valid address families (`NFPROTO_*`): inet, ip, arp, netdev, bridge, ip6.
-fn valid_family(f: u8) -> bool {
-    matches!(f, 1 | 2 | 3 | 5 | 7 | 10)
-}
-
-fn valid_name(n: &[u8]) -> Result<(), Fail> {
-    if n.is_empty() || n.len() >= NAME_MAX {
-        return Err(fail(Errno::EINVAL));
+fn parse(m: &[u8]) -> Req<'_> {
+    let ty = u16::from_le_bytes([m[4], m[5]]);
+    Req {
+        msg: ty as u8,
+        flags: u16::from_le_bytes([m[6], m[7]]),
+        seq: u32::from_le_bytes(m[8..12].try_into().unwrap()),
+        family: m.get(16).copied().unwrap_or(0),
+        attrs: crate::route::attrs(m.get(20..).unwrap_or_default()),
     }
-    Ok(())
 }
+
+/// The acknowledgement or error for request `req` (a whole message, `netlink_ack`): when the
+/// offending attribute is in the request and `NETLINK_EXT_ACK` is set, its offset is attached
+/// (counted from the message header, `NLMSGERR_ATTR_OFFS`).
+fn ack(req: &[u8], r: Result<(), Fail>, peer: &Peer<'_>) -> Vec<u8> {
+    const NLM_F_CAPPED: u16 = 0x100;
+    const NLM_F_ACK_TLVS: u16 = 0x200;
+    const NLMSGERR_ATTR_OFFS: u16 = 2;
+    let (errno, at) = match r {
+        Ok(()) => (0, None),
+        Err(f) => (f.errno, f.at),
+    };
+    let base = req.as_ptr() as usize;
+    let offs = at
+        .filter(|&a| peer.ext_ack && a >= base + 4 && a <= base + req.len())
+        .map(|a| (a - 4 - base) as u32);
+    let mut p = (-errno).to_le_bytes().to_vec();
+    let mut flags = 0;
+    if errno == 0 || peer.cap_ack {
+        p.extend_from_slice(&req[..16]);
+        flags |= NLM_F_CAPPED;
+    } else {
+        p.extend_from_slice(req);
+    }
+    if let Some(o) = offs {
+        p.resize(p.len().next_multiple_of(4), 0);
+        attr(&mut p, NLMSGERR_ATTR_OFFS, &o.to_ne_bytes());
+        flags |= NLM_F_ACK_TLVS;
+    }
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    message(NLMSG_ERROR, flags, seq, peer.pid, &p)
+}
+
+// ---- Changes ----
+
+/// Known expressions (those `nft_expr_type_get` finds, the ones commonly built into 6.1): others
+/// are ENOENT.
+const EXPRS: [&str; 39] = [
+    "bitwise",
+    "byteorder",
+    "cmp",
+    "connlimit",
+    "counter",
+    "ct",
+    "dup",
+    "dynset",
+    "exthdr",
+    "fib",
+    "flow_offload",
+    "fwd",
+    "hash",
+    "immediate",
+    "last",
+    "limit",
+    "log",
+    "lookup",
+    "masq",
+    "match",
+    "meta",
+    "nat",
+    "notrack",
+    "numgen",
+    "objref",
+    "osf",
+    "payload",
+    "queue",
+    "quota",
+    "range",
+    "redir",
+    "reject",
+    "rt",
+    "socket",
+    "synproxy",
+    "target",
+    "tproxy",
+    "tunnel",
+    "xfrm",
+];
 
 impl Nft {
-    /// There are no tables.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.tables.is_empty()
-    }
-
-    fn table(&self, family: u8, name: &[u8]) -> Option<usize> {
-        self.tables
-            .iter()
-            .position(|t| t.family == family && t.name == name)
-    }
-
-    /// The table in the request (by name, or by handle when there is no name): ENOENT when not
-    /// found, with that attribute as the offending one.
-    fn table_of(
-        &self,
-        r: &Req<'_>,
-        name_attr: u16,
-        handle_attr: Option<u16>,
-    ) -> Result<usize, Fail> {
-        if let Some(n) = get_str(&r.attrs, name_attr) {
-            return self
-                .table(r.family, n)
-                .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, name_attr)));
-        }
-        if let Some(a) = handle_attr
-            && let Some(h) = get_be64(&r.attrs, a)
-        {
-            return self
-                .tables
-                .iter()
-                .position(|t| t.family == r.family && t.handle == h)
-                .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, a)));
-        }
-        Err(fail(Errno::EINVAL))
-    }
-
     /// One change in a batch (`nf_tables_newtable` and so on).
     fn apply(&mut self, r: &Req<'_>) -> Result<(), Fail> {
         // nf_tables_deltable: family NFPROTO_UNSPEC, or neither a name nor a handle, flushes
@@ -1147,26 +966,55 @@ impl Nft {
         }
         Ok(())
     }
+
+    /// The table in the request (by name, or by handle when there is no name): ENOENT when not
+    /// found, with that attribute as the offending one.
+    fn table_of(
+        &self,
+        r: &Req<'_>,
+        name_attr: u16,
+        handle_attr: Option<u16>,
+    ) -> Result<usize, Fail> {
+        if let Some(n) = get_str(&r.attrs, name_attr) {
+            return self
+                .table(r.family, n)
+                .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, name_attr)));
+        }
+        if let Some(a) = handle_attr
+            && let Some(h) = get_be64(&r.attrs, a)
+        {
+            return self
+                .tables
+                .iter()
+                .position(|t| t.family == r.family && t.handle == h)
+                .ok_or_else(|| bad(Errno::ENOENT, get(&r.attrs, a)));
+        }
+        Err(fail(Errno::EINVAL))
+    }
+
+    fn table(&self, family: u8, name: &[u8]) -> Option<usize> {
+        self.tables
+            .iter()
+            .position(|t| t.family == family && t.name == name)
+    }
+
+    /// There are no tables.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
 }
 
-/// An element's key (the value in `NFTA_SET_ELEM_KEY`).
-fn elem_key(e: &[u8]) -> Option<Vec<u8>> {
-    let a = crate::route::attrs(e);
-    data_value(get(&a, SET_ELEM_KEY)?)
+/// Valid address families (`NFPROTO_*`): inet, ip, arp, netdev, bridge, ip6.
+fn valid_family(f: u8) -> bool {
+    matches!(f, 1 | 2 | 3 | 5 | 7 | 10)
 }
 
-fn elem_key_end(e: &[u8]) -> Option<Vec<u8>> {
-    let a = crate::route::attrs(e);
-    data_value(get(&a, SET_ELEM_KEY_END)?)
-}
-
-fn elem_flags(e: &[u8]) -> u32 {
-    get_be32(&crate::route::attrs(e), SET_ELEM_FLAGS).unwrap_or(0)
-}
-
-/// The value in `NFTA_DATA_VALUE`.
-fn data_value(d: &[u8]) -> Option<Vec<u8>> {
-    get(&crate::route::attrs(d), DATA_VALUE).map(<[u8]>::to_vec)
+fn valid_name(n: &[u8]) -> Result<(), Fail> {
+    if n.is_empty() || n.len() >= NAME_MAX {
+        return Err(fail(Errno::EINVAL));
+    }
+    Ok(())
 }
 
 impl Table {
@@ -1184,35 +1032,6 @@ impl Table {
             .sum()
     }
 
-    /// Whether chain `goal` can be reached from chain `start` through jumps (including itself).
-    fn reaches(&self, start: &[u8], goal: &[u8], depth: usize) -> bool {
-        if start == goal {
-            return true;
-        }
-        if depth > JUMP_STACK {
-            return false;
-        }
-        let Some(c) = self.chains.iter().find(|c| c.name == start) else {
-            return false;
-        };
-        c.rules.iter().any(|r| {
-            exprs(&r.exprs).iter().any(|(n, d)| {
-                n == b"immediate"
-                    && verdict_chain(d).is_some_and(|t| self.reaches(&t, goal, depth + 1))
-            })
-        })
-    }
-
-    /// Whether some rule uses set `name` (lookup, dynset).
-    fn uses_set(&self, name: &[u8]) -> bool {
-        self.chains.iter().flat_map(|c| &c.rules).any(|r| {
-            exprs(&r.exprs).iter().any(|(n, d)| {
-                (n == b"lookup" || n == b"dynset")
-                    && get_str(&crate::route::attrs(d), LOOKUP_SET) == Some(name)
-            })
-        })
-    }
-
     /// Removes the anonymous sets no rule uses any more (they go away with the rules when those
     /// are deleted).
     fn drop_unused_anonymous(&mut self) {
@@ -1223,6 +1042,16 @@ impl Table {
             .map(|s| s.name.clone())
             .collect();
         self.sets.retain(|s| !unused.contains(&s.name));
+    }
+
+    /// Whether some rule uses set `name` (lookup, dynset).
+    fn uses_set(&self, name: &[u8]) -> bool {
+        self.chains.iter().flat_map(|c| &c.rules).any(|r| {
+            exprs(&r.exprs).iter().any(|(n, d)| {
+                (n == b"lookup" || n == b"dynset")
+                    && get_str(&crate::route::attrs(d), LOOKUP_SET) == Some(name)
+            })
+        })
     }
 
     /// Checks a rule's expressions (`nf_tables_newrule`): names must be known (ENOENT), jump
@@ -1306,6 +1135,25 @@ impl Table {
         Ok(out)
     }
 
+    /// Whether chain `goal` can be reached from chain `start` through jumps (including itself).
+    fn reaches(&self, start: &[u8], goal: &[u8], depth: usize) -> bool {
+        if start == goal {
+            return true;
+        }
+        if depth > JUMP_STACK {
+            return false;
+        }
+        let Some(c) = self.chains.iter().find(|c| c.name == start) else {
+            return false;
+        };
+        c.rules.iter().any(|r| {
+            exprs(&r.exprs).iter().any(|(n, d)| {
+                n == b"immediate"
+                    && verdict_chain(d).is_some_and(|t| self.reaches(&t, goal, depth + 1))
+            })
+        })
+    }
+
     /// The set referred to by lookup or dynset: found by id (an anonymous set just created in the
     /// same batch) or by name; the name is recorded and put first (the kernel orders it that way
     /// in dumps).
@@ -1334,20 +1182,6 @@ impl Table {
     }
 }
 
-/// A rule's expressions: (name, arguments).
-fn exprs(e: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    crate::route::attrs(e)
-        .into_iter()
-        .map(|(_, x)| {
-            let a = crate::route::attrs(x);
-            (
-                get_str(&a, EXPR_NAME).unwrap_or_default().to_vec(),
-                get(&a, EXPR_DATA).unwrap_or_default().to_vec(),
-            )
-        })
-        .collect()
-}
-
 /// The chain jumped to in immediate's arguments.
 fn verdict_chain(data: &[u8]) -> Option<Vec<u8>> {
     let d = get(&crate::route::attrs(data), IMMEDIATE_DATA)?;
@@ -1357,160 +1191,62 @@ fn verdict_chain(data: &[u8]) -> Option<Vec<u8>> {
 
 // ---- Queries ----
 
-fn done(seq: u32, pid: u32) -> Vec<u8> {
-    message(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
-}
-
-/// Removes `NLA_F_NESTED` from nested attributes (user space sets it; 6.1 kernels leave it out of
-/// dumps).
-fn unflag(mut b: &[u8]) -> Vec<u8> {
-    const NLA_F_NESTED: u16 = 0x8000;
-    let mut out = Vec::new();
-    while b.len() >= 4 {
-        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
-        if len < 4 || len > b.len() {
-            break;
-        }
-        let ty = u16::from_le_bytes([b[2], b[3]]);
-        if ty & NLA_F_NESTED != 0 {
-            attr(&mut out, ty & 0x3fff, &unflag(&b[4..len]));
-        } else {
-            attr(&mut out, ty & 0x3fff, &b[4..len]);
-        }
-        b = &b[len.next_multiple_of(4).min(b.len())..];
-    }
-    out
-}
-
-/// Packs dumped messages into datagrams (each at most 8 KiB), ending with `NLMSG_DONE`.
-fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<Vec<u8>> {
-    const CHUNK: usize = 8192;
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut cur = Vec::new();
-    for m in msgs {
-        if !cur.is_empty() && cur.len() + m.len() > CHUNK {
-            out.push(std::mem::take(&mut cur));
-        }
-        cur.extend(m);
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out.push(done(seq, pid));
-    out
-}
-
-impl Table {
-    fn table_attrs(&self) -> Vec<u8> {
-        let mut p = Vec::new();
-        attr(&mut p, TABLE_NAME, &cstr(&self.name));
-        attr(
-            &mut p,
-            TABLE_USE,
-            &be32((self.chains.len() + self.sets.len()) as u32),
-        );
-        attr(&mut p, TABLE_HANDLE, &be64(self.handle));
-        attr(&mut p, TABLE_FLAGS, &be32(self.flags));
-        if let Some(u) = &self.userdata {
-            attr(&mut p, TABLE_USERDATA, u);
-        }
-        p
-    }
-
-    fn chain_attrs(&self, c: &Chain) -> Vec<u8> {
-        let mut p = Vec::new();
-        attr(&mut p, CHAIN_TABLE, &cstr(&self.name));
-        attr(&mut p, CHAIN_NAME, &cstr(&c.name));
-        attr(&mut p, CHAIN_HANDLE, &be64(c.handle));
-        if let Some(b) = &c.base {
-            let mut h = Vec::new();
-            attr(&mut h, HOOK_HOOKNUM, &be32(b.hooknum));
-            attr(&mut h, HOOK_PRIORITY, &be32(b.priority as u32));
-            attr(&mut p, CHAIN_HOOK, &h);
-            attr(&mut p, CHAIN_POLICY, &be32(b.policy));
-            attr(&mut p, CHAIN_TYPE, &cstr(&b.ty));
-            if b.counters {
-                let mut n = Vec::new();
-                attr(&mut n, 1, &be64(0));
-                attr(&mut n, 2, &be64(0));
-                attr(&mut p, CHAIN_COUNTERS, &n);
-            }
-            attr(&mut p, CHAIN_FLAGS, &be32(NFT_CHAIN_BASE));
-        }
-        let used = c.rules.len() + self.jumps_to(&c.name);
-        attr(&mut p, CHAIN_USE, &be32(used as u32));
-        if let Some(u) = &c.userdata {
-            attr(&mut p, CHAIN_USERDATA, u);
-        }
-        p
-    }
-
-    /// A rule; `prev` means including the previous rule's handle, as dumps do
-    /// (`NFTA_RULE_POSITION`).
-    fn rule_attrs(&self, c: &Chain, i: usize, prev: bool) -> Vec<u8> {
-        let r = &c.rules[i];
-        let mut p = Vec::new();
-        attr(&mut p, RULE_TABLE, &cstr(&self.name));
-        attr(&mut p, RULE_CHAIN, &cstr(&c.name));
-        attr(&mut p, RULE_HANDLE, &be64(r.handle));
-        if prev && i > 0 {
-            attr(&mut p, RULE_POSITION, &be64(c.rules[i - 1].handle));
-        }
-        attr(&mut p, RULE_EXPRESSIONS, &r.exprs);
-        if let Some(u) = &r.userdata {
-            attr(&mut p, RULE_USERDATA, u);
-        }
-        p
-    }
-
-    fn set_attrs(&self, s: &Set) -> Vec<u8> {
-        let mut p = Vec::new();
-        attr(&mut p, SET_TABLE, &cstr(&self.name));
-        attr(&mut p, SET_NAME, &cstr(&s.name));
-        attr(&mut p, SET_HANDLE, &be64(s.handle));
-        attr(&mut p, SET_FLAGS, &be32(s.flags));
-        let other = |t: u16| s.other.iter().find(|(x, _)| *x == t).map(|(_, d)| &d[..]);
-        attr(&mut p, SET_KEY_TYPE, other(SET_KEY_TYPE).unwrap_or(&[0; 4]));
-        attr(&mut p, SET_KEY_LEN, &be32(s.key_len));
-        // The order of nf_tables_fill_set
-        for t in [
-            SET_DATA_TYPE,
-            SET_DATA_LEN,
-            SET_OBJ_TYPE,
-            SET_TIMEOUT,
-            SET_GC_INTERVAL,
-            SET_POLICY,
-            SET_USERDATA,
-        ] {
-            if let Some(d) = other(t) {
-                attr(&mut p, t, d);
-            }
-        }
-        attr(
-            &mut p,
-            SET_DESC,
-            &other(SET_DESC).map(unflag).unwrap_or_default(),
-        );
-        for t in [SET_EXPR, SET_EXPRESSIONS] {
-            if let Some(d) = other(t) {
-                attr(&mut p, t, &unflag(d));
-            }
-        }
-        p
-    }
-
-    fn elems_attrs(&self, s: &Set, elems: &[Vec<u8>]) -> Vec<u8> {
-        let mut p = Vec::new();
-        attr(&mut p, SET_ELEM_LIST_TABLE, &cstr(&self.name));
-        attr(&mut p, SET_ELEM_LIST_SET, &cstr(&s.name));
-        let mut l = Vec::new();
-        for e in elems {
-            attr(&mut l, LIST_ELEM, e);
-        }
-        attr(&mut p, SET_ELEM_LIST_ELEMENTS, &l);
-        p
-    }
-}
+/// xt extensions (`NFNL_MSG_COMPAT_GET` of `nft_compat`): name, whether it is a target, highest
+/// revision.
+const XT: [(&str, bool, u32); 52] = [
+    ("DNAT", true, 2),
+    ("SNAT", true, 2),
+    ("MASQUERADE", true, 0),
+    ("REDIRECT", true, 0),
+    ("REJECT", true, 0),
+    ("LOG", true, 0),
+    ("NFLOG", true, 0),
+    ("MARK", true, 2),
+    ("CONNMARK", true, 2),
+    ("CT", true, 2),
+    ("NOTRACK", true, 0),
+    ("TCPMSS", true, 0),
+    ("CHECKSUM", true, 0),
+    ("NFQUEUE", true, 3),
+    ("TPROXY", true, 1),
+    ("NETMAP", true, 0),
+    ("TEE", true, 1),
+    ("CLASSIFY", true, 0),
+    ("DSCP", true, 0),
+    ("TOS", true, 0),
+    ("TRACE", true, 0),
+    ("SET", true, 3),
+    ("TTL", true, 0),
+    ("HL", true, 0),
+    ("udp", false, 0),
+    ("tcp", false, 0),
+    ("icmp", false, 0),
+    ("icmp6", false, 0),
+    ("conntrack", false, 3),
+    ("state", false, 0),
+    ("comment", false, 0),
+    ("addrtype", false, 1),
+    ("mark", false, 1),
+    ("connmark", false, 1),
+    ("multiport", false, 1),
+    ("set", false, 4),
+    ("physdev", false, 0),
+    ("mac", false, 0),
+    ("limit", false, 0),
+    ("iprange", false, 1),
+    ("owner", false, 1),
+    ("pkttype", false, 0),
+    ("statistic", false, 0),
+    ("string", false, 1),
+    ("length", false, 0),
+    ("hashlimit", false, 3),
+    ("recent", false, 1),
+    ("socket", false, 3),
+    ("policy", false, 0),
+    ("devgroup", false, 0),
+    ("cgroup", false, 2),
+    ("u32", false, 0),
+];
 
 impl Nft {
     /// nftables messages outside batches: `NFT_MSG_GET*`.
@@ -1659,6 +1395,166 @@ impl Nft {
     }
 }
 
+impl Table {
+    fn table_attrs(&self) -> Vec<u8> {
+        let mut p = Vec::new();
+        attr(&mut p, TABLE_NAME, &cstr(&self.name));
+        attr(
+            &mut p,
+            TABLE_USE,
+            &be32((self.chains.len() + self.sets.len()) as u32),
+        );
+        attr(&mut p, TABLE_HANDLE, &be64(self.handle));
+        attr(&mut p, TABLE_FLAGS, &be32(self.flags));
+        if let Some(u) = &self.userdata {
+            attr(&mut p, TABLE_USERDATA, u);
+        }
+        p
+    }
+
+    fn chain_attrs(&self, c: &Chain) -> Vec<u8> {
+        let mut p = Vec::new();
+        attr(&mut p, CHAIN_TABLE, &cstr(&self.name));
+        attr(&mut p, CHAIN_NAME, &cstr(&c.name));
+        attr(&mut p, CHAIN_HANDLE, &be64(c.handle));
+        if let Some(b) = &c.base {
+            let mut h = Vec::new();
+            attr(&mut h, HOOK_HOOKNUM, &be32(b.hooknum));
+            attr(&mut h, HOOK_PRIORITY, &be32(b.priority as u32));
+            attr(&mut p, CHAIN_HOOK, &h);
+            attr(&mut p, CHAIN_POLICY, &be32(b.policy));
+            attr(&mut p, CHAIN_TYPE, &cstr(&b.ty));
+            if b.counters {
+                let mut n = Vec::new();
+                attr(&mut n, 1, &be64(0));
+                attr(&mut n, 2, &be64(0));
+                attr(&mut p, CHAIN_COUNTERS, &n);
+            }
+            attr(&mut p, CHAIN_FLAGS, &be32(NFT_CHAIN_BASE));
+        }
+        let used = c.rules.len() + self.jumps_to(&c.name);
+        attr(&mut p, CHAIN_USE, &be32(used as u32));
+        if let Some(u) = &c.userdata {
+            attr(&mut p, CHAIN_USERDATA, u);
+        }
+        p
+    }
+
+    /// A rule; `prev` means including the previous rule's handle, as dumps do
+    /// (`NFTA_RULE_POSITION`).
+    fn rule_attrs(&self, c: &Chain, i: usize, prev: bool) -> Vec<u8> {
+        let r = &c.rules[i];
+        let mut p = Vec::new();
+        attr(&mut p, RULE_TABLE, &cstr(&self.name));
+        attr(&mut p, RULE_CHAIN, &cstr(&c.name));
+        attr(&mut p, RULE_HANDLE, &be64(r.handle));
+        if prev && i > 0 {
+            attr(&mut p, RULE_POSITION, &be64(c.rules[i - 1].handle));
+        }
+        attr(&mut p, RULE_EXPRESSIONS, &r.exprs);
+        if let Some(u) = &r.userdata {
+            attr(&mut p, RULE_USERDATA, u);
+        }
+        p
+    }
+
+    fn set_attrs(&self, s: &Set) -> Vec<u8> {
+        let mut p = Vec::new();
+        attr(&mut p, SET_TABLE, &cstr(&self.name));
+        attr(&mut p, SET_NAME, &cstr(&s.name));
+        attr(&mut p, SET_HANDLE, &be64(s.handle));
+        attr(&mut p, SET_FLAGS, &be32(s.flags));
+        let other = |t: u16| s.other.iter().find(|(x, _)| *x == t).map(|(_, d)| &d[..]);
+        attr(&mut p, SET_KEY_TYPE, other(SET_KEY_TYPE).unwrap_or(&[0; 4]));
+        attr(&mut p, SET_KEY_LEN, &be32(s.key_len));
+        // The order of nf_tables_fill_set
+        for t in [
+            SET_DATA_TYPE,
+            SET_DATA_LEN,
+            SET_OBJ_TYPE,
+            SET_TIMEOUT,
+            SET_GC_INTERVAL,
+            SET_POLICY,
+            SET_USERDATA,
+        ] {
+            if let Some(d) = other(t) {
+                attr(&mut p, t, d);
+            }
+        }
+        attr(
+            &mut p,
+            SET_DESC,
+            &other(SET_DESC).map(unflag).unwrap_or_default(),
+        );
+        for t in [SET_EXPR, SET_EXPRESSIONS] {
+            if let Some(d) = other(t) {
+                attr(&mut p, t, &unflag(d));
+            }
+        }
+        p
+    }
+
+    fn elems_attrs(&self, s: &Set, elems: &[Vec<u8>]) -> Vec<u8> {
+        let mut p = Vec::new();
+        attr(&mut p, SET_ELEM_LIST_TABLE, &cstr(&self.name));
+        attr(&mut p, SET_ELEM_LIST_SET, &cstr(&s.name));
+        let mut l = Vec::new();
+        for e in elems {
+            attr(&mut l, LIST_ELEM, e);
+        }
+        attr(&mut p, SET_ELEM_LIST_ELEMENTS, &l);
+        p
+    }
+}
+
+/// Packs dumped messages into datagrams (each at most 8 KiB), ending with `NLMSG_DONE`.
+fn dump_reply(msgs: Vec<Vec<u8>>, seq: u32, pid: u32) -> Vec<Vec<u8>> {
+    const CHUNK: usize = 8192;
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut cur = Vec::new();
+    for m in msgs {
+        if !cur.is_empty() && cur.len() + m.len() > CHUNK {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.extend(m);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out.push(done(seq, pid));
+    out
+}
+
+/// `NFNL_MSG_COMPAT_GET`: whether an xt extension exists, and its highest revision.
+fn compat(r: &Req<'_>, peer: &Peer<'_>) -> Result<Vec<Vec<u8>>, Fail> {
+    let (Some(name), Some(rev), Some(ty)) = (
+        get_str(&r.attrs, COMPAT_NAME),
+        get_be32(&r.attrs, COMPAT_REV),
+        get_be32(&r.attrs, COMPAT_TYPE),
+    ) else {
+        return Err(fail(Errno::EINVAL));
+    };
+    let target = ty == 1;
+    let (_, _, max) = XT
+        .iter()
+        .find(|(n, t, _)| n.as_bytes() == name && *t == target)
+        .ok_or_else(|| fail(Errno::ENOENT))?;
+    let mut p = Vec::new();
+    attr(&mut p, COMPAT_NAME, &cstr(name));
+    attr(&mut p, COMPAT_REV, &be32(rev.min(*max)));
+    attr(&mut p, COMPAT_TYPE, &be32(ty));
+    let t = NFNL_SUBSYS_NFT_COMPAT << 8;
+    Ok(vec![nfmsg(
+        t,
+        NLM_F_MULTI,
+        r.seq,
+        peer.pid,
+        r.family,
+        0,
+        &p,
+    )])
+}
+
 // ---- Execution ----
 
 const NF_DROP: i32 = 0;
@@ -1742,31 +1638,165 @@ pub(crate) fn addr_type(a: &[u8], local: impl Fn(&[u8]) -> bool) -> u32 {
     }
 }
 
-/// The state of a rule while it runs (`struct nft_regs` and the packet).
-struct Eval<'a> {
-    p: &'a Packet<'a>,
-    /// Network- and transport-layer headers (synthesized from the [`Packet`]: TCP is a SYN).
-    nh: Vec<u8>,
-    th: Vec<u8>,
-    /// Registers (20 of 32 bits; the first 4 are for the verdict).
-    regs: [u8; 80],
-    verdict: i32,
-    chain: Option<Vec<u8>>,
-    mark: u32,
-    dnat: Option<(Vec<u8>, Option<u16>)>,
-    /// The reject error code (the verdict is NF_DROP at the same time).
-    reject: Option<i32>,
-}
+impl Nft {
+    /// Whether hook `hook` has a nat-type base chain (if not, no packet needs to be synthesized).
+    pub(crate) fn has_nat(&self, hook: u32) -> bool {
+        self.has(hook, true)
+    }
 
-/// Position of a register in [`Eval::regs`] (`nft_parse_register`): NFT_REG_1..4 are 16 bytes,
-/// and NFT_REG32_00..15 are 4 bytes, overlapping the former.
-fn reg(r: u32, len: usize) -> Option<std::ops::Range<usize>> {
-    let at = match r {
-        1..=4 => r as usize * 16,
-        8..=23 => (r as usize - 4) * 4,
-        _ => return None,
-    };
-    (at + len <= 80).then_some(at..at + len)
+    /// Whether hook `hook` has a filter- or route-type base chain.
+    pub(crate) fn has_filter(&self, hook: u32) -> bool {
+        self.has(hook, false)
+    }
+
+    fn has(&self, hook: u32, nat: bool) -> bool {
+        self.tables.iter().any(|t| {
+            t.flags & 1 == 0
+                && t.chains.iter().any(|c| {
+                    c.base
+                        .as_ref()
+                        .is_some_and(|b| b.hooknum == hook && (b.ty == b"nat") == nat)
+                })
+        })
+    }
+
+    /// Runs the nat chains on hook `p.hook` (`nf_nat_inet_fn`): one by one by priority, stopping
+    /// at the first that DNATs or drops. Address families: IPv4 packets look at ip and inet
+    /// tables, IPv6 ones at ip6 and inet tables.
+    pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
+        let fam = if p.dst.len() == 4 { 2 } else { 10 };
+        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
+        for t in &self.tables {
+            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
+                continue;
+            }
+            for c in &t.chains {
+                if let Some(b) = &c.base
+                    && b.hooknum == p.hook
+                    && b.ty == b"nat"
+                {
+                    chains.push((t, c, b.priority));
+                }
+            }
+        }
+        if chains.is_empty() {
+            return Outcome::Accept;
+        }
+        chains.sort_by_key(|(_, _, prio)| *prio);
+        let (nh, th) = headers(p);
+        let mut mark = p.mark;
+        for (t, c, _) in chains {
+            let mut e = Eval {
+                p,
+                nh: nh.clone(),
+                th: th.clone(),
+                regs: [0; 80],
+                verdict: NFT_CONTINUE,
+                chain: None,
+                mark,
+                dnat: None,
+                reject: None,
+            };
+            let v = run_chain(&mut e, t, c);
+            mark = e.mark;
+            if v == NF_DROP {
+                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
+            }
+            if let Some((a, port)) = e.dnat {
+                return Outcome::Dnat(a, port);
+            }
+        }
+        Outcome::Accept
+    }
+
+    /// Runs the filter- and route-type chains on hook `p.hook`: one by one by priority, stopping
+    /// at the first drop (reject), and running the next one after an accept (each base chain gives
+    /// its own verdict).
+    pub(crate) fn filter(&self, p: &Packet<'_>) -> Outcome {
+        let fam = if p.dst.len() == 4 { 2 } else { 10 };
+        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
+        for t in &self.tables {
+            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
+                continue;
+            }
+            for c in &t.chains {
+                if let Some(b) = &c.base
+                    && b.hooknum == p.hook
+                    && b.ty != b"nat"
+                {
+                    chains.push((t, c, b.priority));
+                }
+            }
+        }
+        chains.sort_by_key(|(_, _, prio)| *prio);
+        let (nh, th) = headers(p);
+        let mut mark = p.mark;
+        for (t, c, _) in chains {
+            let mut e = Eval {
+                p,
+                nh: nh.clone(),
+                th: th.clone(),
+                regs: [0; 80],
+                verdict: NFT_CONTINUE,
+                chain: None,
+                mark,
+                dnat: None,
+                reject: None,
+            };
+            let v = run_chain(&mut e, t, c);
+            mark = e.mark;
+            if v == NF_DROP {
+                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
+            }
+        }
+        Outcome::Accept
+    }
+
+    /// Whether IPv4 (with `v6`, IPv6) packets in this namespace go through connection tracking:
+    /// Linux attaches the conntrack hooks only when the ruleset has expressions that use it
+    /// (`nf_ct_netns_get`, called when an expression is initialized, dormant tables included); ip
+    /// and ip6 tables each cover their own family, and inet tables cover both. An empty nat chain
+    /// does not count (checked against native). `SO_ORIGINAL_DST` answers by it for connections
+    /// that were not NATed ([`crate::origdst`]).
+    pub(crate) fn tracks(&self, v6: bool) -> bool {
+        /// Expressions, xt targets and matches that call `nf_ct_netns_get` when initialized.
+        const EXPRS: [&[u8]; 7] = [
+            b"ct",
+            b"nat",
+            b"masq",
+            b"redir",
+            b"connlimit",
+            b"flow_offload",
+            b"synproxy",
+        ];
+        const XT: [&[u8]; 10] = [
+            b"DNAT",
+            b"SNAT",
+            b"MASQUERADE",
+            b"REDIRECT",
+            b"NETMAP",
+            b"CONNMARK",
+            b"CT",
+            b"conntrack",
+            b"state",
+            b"connmark",
+        ];
+        let fam = if v6 { 10 } else { 2 };
+        self.tables
+            .iter()
+            .filter(|t| t.family == fam || t.family == 1)
+            .flat_map(|t| &t.chains)
+            .flat_map(|c| &c.rules)
+            .any(|r| {
+                exprs(&r.exprs).iter().any(|(name, data)| match &name[..] {
+                    b"target" | b"match" => {
+                        let a = crate::route::attrs(data);
+                        get_str(&a, COMPAT_NAME).is_some_and(|n| XT.contains(&n))
+                    }
+                    n => EXPRS.contains(&n),
+                })
+            })
+    }
 }
 
 fn headers(p: &Packet<'_>) -> (Vec<u8>, Vec<u8>) {
@@ -1812,26 +1842,88 @@ fn headers(p: &Packet<'_>) -> (Vec<u8>, Vec<u8>) {
     (nh, th)
 }
 
+/// Runs from base chain `base` (`nft_do_chain`), returning the final verdict.
+fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
+    let mut stack: Vec<(&Chain, usize)> = Vec::new();
+    let (mut chain, mut next) = (base, 0usize);
+    // Guards against accidental loops (Table::check_verdict already rejects jumps that loop when
+    // a rule is added, as Linux does)
+    let mut budget = 100_000;
+    loop {
+        if next >= chain.rules.len() {
+            match stack.pop() {
+                Some((c, i)) => {
+                    chain = c;
+                    next = i;
+                    continue;
+                }
+                None => return base.base.as_ref().map_or(NF_ACCEPT, |b| b.policy as i32),
+            }
+        }
+        budget -= 1;
+        if budget == 0 {
+            return NF_ACCEPT;
+        }
+        let rule = &chain.rules[next];
+        next += 1;
+        e.verdict = NFT_CONTINUE;
+        e.chain = None;
+        for (name, data) in exprs(&rule.exprs) {
+            e.expr(t, &name, &data);
+            if e.verdict != NFT_CONTINUE {
+                break;
+            }
+        }
+        match e.verdict {
+            NFT_CONTINUE | NFT_BREAK => {}
+            NFT_JUMP | NFT_GOTO => {
+                let Some(target) = e
+                    .chain
+                    .as_ref()
+                    .and_then(|n| t.chains.iter().find(|c| &c.name == n))
+                else {
+                    return NF_DROP;
+                };
+                if e.verdict == NFT_JUMP {
+                    if stack.len() >= JUMP_STACK {
+                        return NF_DROP;
+                    }
+                    stack.push((chain, next));
+                }
+                chain = target;
+                next = 0;
+            }
+            NFT_RETURN => match stack.pop() {
+                Some((c, i)) => {
+                    chain = c;
+                    next = i;
+                }
+                None => return base.base.as_ref().map_or(NF_ACCEPT, |b| b.policy as i32),
+            },
+            v => return v,
+        }
+    }
+}
+
+// ---- Expressions ----
+
+/// The state of a rule while it runs (`struct nft_regs` and the packet).
+struct Eval<'a> {
+    p: &'a Packet<'a>,
+    /// Network- and transport-layer headers (synthesized from the [`Packet`]: TCP is a SYN).
+    nh: Vec<u8>,
+    th: Vec<u8>,
+    /// Registers (20 of 32 bits; the first 4 are for the verdict).
+    regs: [u8; 80],
+    verdict: i32,
+    chain: Option<Vec<u8>>,
+    mark: u32,
+    dnat: Option<(Vec<u8>, Option<u16>)>,
+    /// The reject error code (the verdict is NF_DROP at the same time).
+    reject: Option<i32>,
+}
+
 impl Eval<'_> {
-    fn load(&self, r: u32, len: usize) -> Option<&[u8]> {
-        Some(&self.regs[reg(r, len)?])
-    }
-
-    /// Writes a register, zero-padding the part short of 4 bytes (as `nft_reg_store*` and payload
-    /// writes do).
-    fn store(&mut self, r: u32, data: &[u8]) -> bool {
-        let Some(at) = reg(r, data.len().next_multiple_of(4)) else {
-            return false;
-        };
-        self.regs[at.clone()].fill(0);
-        self.regs[at.start..at.start + data.len()].copy_from_slice(data);
-        true
-    }
-
-    fn store_u32(&mut self, r: u32, v: u32) -> bool {
-        self.store(r, &v.to_ne_bytes())
-    }
-
     /// One expression; unknown ones and those that cannot be evaluated here count as the rule not
     /// matching (NFT_BREAK).
     fn expr(&mut self, table: &Table, name: &[u8], data: &[u8]) {
@@ -2129,13 +2221,6 @@ impl Eval<'_> {
         }
     }
 
-    fn set_dnat(&mut self, addr: Option<Vec<u8>>, port: Option<u16>) -> bool {
-        let addr = addr.unwrap_or_else(|| self.p.dst.to_vec());
-        self.dnat = Some((addr, port));
-        self.verdict = NF_ACCEPT;
-        true
-    }
-
     /// nftables' own nat (`dnat to`): the address and port are in registers.
     fn nat(&mut self, a: &[(u16, &[u8])]) -> bool {
         // NFT_NAT_DNAT; there is no SNAT on OUTPUT
@@ -2175,17 +2260,6 @@ impl Eval<'_> {
         };
         let to = self.redirect_addr();
         self.set_dnat(Some(to), port)
-    }
-
-    /// The address redirect rewrites to: the loopback address on OUTPUT, the input interface's
-    /// address on PREROUTING (`nf_nat_redirect_ipv4`; unchanged when there is no address).
-    fn redirect_addr(&self) -> Vec<u8> {
-        match &self.p.iif {
-            Some(i) if i.addr.len() == self.p.dst.len() => i.addr.clone(),
-            Some(_) => self.p.dst.to_vec(),
-            None if self.p.dst.len() == 4 => vec![127, 0, 0, 1],
-            None => std::net::Ipv6Addr::LOCALHOST.octets().to_vec(),
-        }
     }
 
     /// xt targets (iptables-nft's `-j DNAT`, `-j REDIRECT`). Other targets do not change the
@@ -2401,6 +2475,66 @@ impl Eval<'_> {
             _ => false,
         }
     }
+
+    /// The address redirect rewrites to: the loopback address on OUTPUT, the input interface's
+    /// address on PREROUTING (`nf_nat_redirect_ipv4`; unchanged when there is no address).
+    fn redirect_addr(&self) -> Vec<u8> {
+        match &self.p.iif {
+            Some(i) if i.addr.len() == self.p.dst.len() => i.addr.clone(),
+            Some(_) => self.p.dst.to_vec(),
+            None if self.p.dst.len() == 4 => vec![127, 0, 0, 1],
+            None => std::net::Ipv6Addr::LOCALHOST.octets().to_vec(),
+        }
+    }
+
+    fn set_dnat(&mut self, addr: Option<Vec<u8>>, port: Option<u16>) -> bool {
+        let addr = addr.unwrap_or_else(|| self.p.dst.to_vec());
+        self.dnat = Some((addr, port));
+        self.verdict = NF_ACCEPT;
+        true
+    }
+
+    fn load(&self, r: u32, len: usize) -> Option<&[u8]> {
+        Some(&self.regs[reg(r, len)?])
+    }
+
+    fn store_u32(&mut self, r: u32, v: u32) -> bool {
+        self.store(r, &v.to_ne_bytes())
+    }
+
+    /// Writes a register, zero-padding the part short of 4 bytes (as `nft_reg_store*` and payload
+    /// writes do).
+    fn store(&mut self, r: u32, data: &[u8]) -> bool {
+        let Some(at) = reg(r, data.len().next_multiple_of(4)) else {
+            return false;
+        };
+        self.regs[at.clone()].fill(0);
+        self.regs[at.start..at.start + data.len()].copy_from_slice(data);
+        true
+    }
+}
+
+/// The error code the initiator gets from a reject expression (`NFTA_REJECT_TYPE`,
+/// `NFTA_REJECT_ICMP_CODE`; `icmp_err_convert`, `icmpv6_err_convert`): TCP RST is ECONNREFUSED;
+/// the ICMPX codes no route, port unreachable, host unreachable and administratively prohibited;
+/// ICMP and ICMPv6 by their own codes.
+fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
+    let e = match (ty, code, v6) {
+        (1, _, _) => Errno::ECONNREFUSED,
+        (2, 0, _) => Errno::ENETUNREACH,
+        (2, 1, _) => Errno::ECONNREFUSED,
+        (2, 2 | 3, _) => Errno::EHOSTUNREACH,
+        (0, 0 | 6 | 9 | 11, false) => Errno::ENETUNREACH,
+        (0, 2, false) => Errno::ENOPROTOOPT,
+        (0, 3, false) => Errno::ECONNREFUSED,
+        (0, _, false) => Errno::EHOSTUNREACH,
+        (0, 0, true) => Errno::ENETUNREACH,
+        (0, 1, true) => Errno::EACCES,
+        (0, 4, true) => Errno::ECONNREFUSED,
+        (0, _, true) => Errno::EHOSTUNREACH,
+        _ => Errno::ECONNREFUSED,
+    };
+    e.0
 }
 
 /// The element of the set with key `key`: interval sets are searched by interval (those with
@@ -2440,251 +2574,123 @@ fn set_find(set: &Set, key: &[u8]) -> Option<Vec<u8>> {
         .map(|(_, e)| e.clone())
 }
 
-impl Nft {
-    /// Whether hook `hook` has a nat-type base chain (if not, no packet needs to be synthesized).
-    pub(crate) fn has_nat(&self, hook: u32) -> bool {
-        self.has(hook, true)
-    }
-
-    /// Whether hook `hook` has a filter- or route-type base chain.
-    pub(crate) fn has_filter(&self, hook: u32) -> bool {
-        self.has(hook, false)
-    }
-
-    /// Whether IPv4 (with `v6`, IPv6) packets in this namespace go through connection tracking:
-    /// Linux attaches the conntrack hooks only when the ruleset has expressions that use it
-    /// (`nf_ct_netns_get`, called when an expression is initialized, dormant tables included); ip
-    /// and ip6 tables each cover their own family, and inet tables cover both. An empty nat chain
-    /// does not count (checked against native). `SO_ORIGINAL_DST` answers by it for connections
-    /// that were not NATed ([`crate::origdst`]).
-    pub(crate) fn tracks(&self, v6: bool) -> bool {
-        /// Expressions, xt targets and matches that call `nf_ct_netns_get` when initialized.
-        const EXPRS: [&[u8]; 7] = [
-            b"ct",
-            b"nat",
-            b"masq",
-            b"redir",
-            b"connlimit",
-            b"flow_offload",
-            b"synproxy",
-        ];
-        const XT: [&[u8]; 10] = [
-            b"DNAT",
-            b"SNAT",
-            b"MASQUERADE",
-            b"REDIRECT",
-            b"NETMAP",
-            b"CONNMARK",
-            b"CT",
-            b"conntrack",
-            b"state",
-            b"connmark",
-        ];
-        let fam = if v6 { 10 } else { 2 };
-        self.tables
-            .iter()
-            .filter(|t| t.family == fam || t.family == 1)
-            .flat_map(|t| &t.chains)
-            .flat_map(|c| &c.rules)
-            .any(|r| {
-                exprs(&r.exprs).iter().any(|(name, data)| match &name[..] {
-                    b"target" | b"match" => {
-                        let a = crate::route::attrs(data);
-                        get_str(&a, COMPAT_NAME).is_some_and(|n| XT.contains(&n))
-                    }
-                    n => EXPRS.contains(&n),
-                })
-            })
-    }
-
-    fn has(&self, hook: u32, nat: bool) -> bool {
-        self.tables.iter().any(|t| {
-            t.flags & 1 == 0
-                && t.chains.iter().any(|c| {
-                    c.base
-                        .as_ref()
-                        .is_some_and(|b| b.hooknum == hook && (b.ty == b"nat") == nat)
-                })
-        })
-    }
-
-    /// Runs the filter- and route-type chains on hook `p.hook`: one by one by priority, stopping
-    /// at the first drop (reject), and running the next one after an accept (each base chain gives
-    /// its own verdict).
-    pub(crate) fn filter(&self, p: &Packet<'_>) -> Outcome {
-        let fam = if p.dst.len() == 4 { 2 } else { 10 };
-        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
-        for t in &self.tables {
-            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
-                continue;
-            }
-            for c in &t.chains {
-                if let Some(b) = &c.base
-                    && b.hooknum == p.hook
-                    && b.ty != b"nat"
-                {
-                    chains.push((t, c, b.priority));
-                }
-            }
-        }
-        chains.sort_by_key(|(_, _, prio)| *prio);
-        let (nh, th) = headers(p);
-        let mut mark = p.mark;
-        for (t, c, _) in chains {
-            let mut e = Eval {
-                p,
-                nh: nh.clone(),
-                th: th.clone(),
-                regs: [0; 80],
-                verdict: NFT_CONTINUE,
-                chain: None,
-                mark,
-                dnat: None,
-                reject: None,
-            };
-            let v = run_chain(&mut e, t, c);
-            mark = e.mark;
-            if v == NF_DROP {
-                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
-            }
-        }
-        Outcome::Accept
-    }
-
-    /// Runs the nat chains on hook `p.hook` (`nf_nat_inet_fn`): one by one by priority, stopping
-    /// at the first that DNATs or drops. Address families: IPv4 packets look at ip and inet
-    /// tables, IPv6 ones at ip6 and inet tables.
-    pub(crate) fn nat(&self, p: &Packet<'_>) -> Outcome {
-        let fam = if p.dst.len() == 4 { 2 } else { 10 };
-        let mut chains: Vec<(&Table, &Chain, i32)> = Vec::new();
-        for t in &self.tables {
-            if (t.family != fam && t.family != 1) || t.flags & 1 != 0 {
-                continue;
-            }
-            for c in &t.chains {
-                if let Some(b) = &c.base
-                    && b.hooknum == p.hook
-                    && b.ty == b"nat"
-                {
-                    chains.push((t, c, b.priority));
-                }
-            }
-        }
-        if chains.is_empty() {
-            return Outcome::Accept;
-        }
-        chains.sort_by_key(|(_, _, prio)| *prio);
-        let (nh, th) = headers(p);
-        let mut mark = p.mark;
-        for (t, c, _) in chains {
-            let mut e = Eval {
-                p,
-                nh: nh.clone(),
-                th: th.clone(),
-                regs: [0; 80],
-                verdict: NFT_CONTINUE,
-                chain: None,
-                mark,
-                dnat: None,
-                reject: None,
-            };
-            let v = run_chain(&mut e, t, c);
-            mark = e.mark;
-            if v == NF_DROP {
-                return e.reject.map_or(Outcome::Drop, Outcome::Reject);
-            }
-            if let Some((a, port)) = e.dnat {
-                return Outcome::Dnat(a, port);
-            }
-        }
-        Outcome::Accept
-    }
-}
-
-/// The error code the initiator gets from a reject expression (`NFTA_REJECT_TYPE`,
-/// `NFTA_REJECT_ICMP_CODE`; `icmp_err_convert`, `icmpv6_err_convert`): TCP RST is ECONNREFUSED;
-/// the ICMPX codes no route, port unreachable, host unreachable and administratively prohibited;
-/// ICMP and ICMPv6 by their own codes.
-fn reject_errno(ty: u32, code: u8, v6: bool) -> i32 {
-    let e = match (ty, code, v6) {
-        (1, _, _) => Errno::ECONNREFUSED,
-        (2, 0, _) => Errno::ENETUNREACH,
-        (2, 1, _) => Errno::ECONNREFUSED,
-        (2, 2 | 3, _) => Errno::EHOSTUNREACH,
-        (0, 0 | 6 | 9 | 11, false) => Errno::ENETUNREACH,
-        (0, 2, false) => Errno::ENOPROTOOPT,
-        (0, 3, false) => Errno::ECONNREFUSED,
-        (0, _, false) => Errno::EHOSTUNREACH,
-        (0, 0, true) => Errno::ENETUNREACH,
-        (0, 1, true) => Errno::EACCES,
-        (0, 4, true) => Errno::ECONNREFUSED,
-        (0, _, true) => Errno::EHOSTUNREACH,
-        _ => Errno::ECONNREFUSED,
+/// Position of a register in [`Eval::regs`] (`nft_parse_register`): NFT_REG_1..4 are 16 bytes,
+/// and NFT_REG32_00..15 are 4 bytes, overlapping the former.
+fn reg(r: u32, len: usize) -> Option<std::ops::Range<usize>> {
+    let at = match r {
+        1..=4 => r as usize * 16,
+        8..=23 => (r as usize - 4) * 4,
+        _ => return None,
     };
-    e.0
+    (at + len <= 80).then_some(at..at + len)
 }
 
-/// Runs from base chain `base` (`nft_do_chain`), returning the final verdict.
-fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
-    let mut stack: Vec<(&Chain, usize)> = Vec::new();
-    let (mut chain, mut next) = (base, 0usize);
-    // Guards against accidental loops (Table::check_verdict already rejects jumps that loop when
-    // a rule is added, as Linux does)
-    let mut budget = 100_000;
-    loop {
-        if next >= chain.rules.len() {
-            match stack.pop() {
-                Some((c, i)) => {
-                    chain = c;
-                    next = i;
-                    continue;
-                }
-                None => return base.base.as_ref().map_or(NF_ACCEPT, |b| b.policy as i32),
-            }
+// ---- Encoding ----
+
+fn be32(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+
+fn be64(v: u64) -> [u8; 8] {
+    v.to_be_bytes()
+}
+
+fn get<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
+    attrs.iter().find(|(t, _)| *t == ty).map(|(_, d)| *d)
+}
+
+fn get_be32(attrs: &[(u16, &[u8])], ty: u16) -> Option<u32> {
+    get(attrs, ty)
+        .and_then(|d| d.get(..4))
+        .map(|d| u32::from_be_bytes(d.try_into().unwrap()))
+}
+
+fn get_be64(attrs: &[(u16, &[u8])], ty: u16) -> Option<u64> {
+    get(attrs, ty)
+        .and_then(|d| d.get(..8))
+        .map(|d| u64::from_be_bytes(d.try_into().unwrap()))
+}
+
+/// A string attribute (without the terminating NUL).
+fn get_str<'a>(attrs: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
+    get(attrs, ty).map(|d| d.split(|&c| c == 0).next().unwrap_or_default())
+}
+
+fn cstr(s: &[u8]) -> Vec<u8> {
+    let mut v = s.to_vec();
+    v.push(0);
+    v
+}
+
+/// One nfnetlink message: nfgenmsg (address family, version, `res_id`) plus attributes.
+fn nfmsg(ty: u16, flags: u16, seq: u32, pid: u32, family: u8, res: u16, attrs: &[u8]) -> Vec<u8> {
+    let mut p = vec![family, 0];
+    p.extend_from_slice(&res.to_be_bytes());
+    p.extend_from_slice(attrs);
+    message(ty, flags, seq, pid, &p)
+}
+
+fn nft_type(msg: u8) -> u16 {
+    (NFNL_SUBSYS_NFTABLES << 8) | u16::from(msg)
+}
+
+fn done(seq: u32, pid: u32) -> Vec<u8> {
+    message(NLMSG_DONE, NLM_F_MULTI, seq, pid, &0i32.to_le_bytes())
+}
+
+/// Removes `NLA_F_NESTED` from nested attributes (user space sets it; 6.1 kernels leave it out of
+/// dumps).
+fn unflag(mut b: &[u8]) -> Vec<u8> {
+    const NLA_F_NESTED: u16 = 0x8000;
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            break;
         }
-        budget -= 1;
-        if budget == 0 {
-            return NF_ACCEPT;
+        let ty = u16::from_le_bytes([b[2], b[3]]);
+        if ty & NLA_F_NESTED != 0 {
+            attr(&mut out, ty & 0x3fff, &unflag(&b[4..len]));
+        } else {
+            attr(&mut out, ty & 0x3fff, &b[4..len]);
         }
-        let rule = &chain.rules[next];
-        next += 1;
-        e.verdict = NFT_CONTINUE;
-        e.chain = None;
-        for (name, data) in exprs(&rule.exprs) {
-            e.expr(t, &name, &data);
-            if e.verdict != NFT_CONTINUE {
-                break;
-            }
-        }
-        match e.verdict {
-            NFT_CONTINUE | NFT_BREAK => {}
-            NFT_JUMP | NFT_GOTO => {
-                let Some(target) = e
-                    .chain
-                    .as_ref()
-                    .and_then(|n| t.chains.iter().find(|c| &c.name == n))
-                else {
-                    return NF_DROP;
-                };
-                if e.verdict == NFT_JUMP {
-                    if stack.len() >= JUMP_STACK {
-                        return NF_DROP;
-                    }
-                    stack.push((chain, next));
-                }
-                chain = target;
-                next = 0;
-            }
-            NFT_RETURN => match stack.pop() {
-                Some((c, i)) => {
-                    chain = c;
-                    next = i;
-                }
-                None => return base.base.as_ref().map_or(NF_ACCEPT, |b| b.policy as i32),
-            },
-            v => return v,
-        }
+        b = &b[len.next_multiple_of(4).min(b.len())..];
     }
+    out
+}
+
+/// A rule's expressions: (name, arguments).
+fn exprs(e: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    crate::route::attrs(e)
+        .into_iter()
+        .map(|(_, x)| {
+            let a = crate::route::attrs(x);
+            (
+                get_str(&a, EXPR_NAME).unwrap_or_default().to_vec(),
+                get(&a, EXPR_DATA).unwrap_or_default().to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// An element's key (the value in `NFTA_SET_ELEM_KEY`).
+fn elem_key(e: &[u8]) -> Option<Vec<u8>> {
+    let a = crate::route::attrs(e);
+    data_value(get(&a, SET_ELEM_KEY)?)
+}
+
+fn elem_key_end(e: &[u8]) -> Option<Vec<u8>> {
+    let a = crate::route::attrs(e);
+    data_value(get(&a, SET_ELEM_KEY_END)?)
+}
+
+fn elem_flags(e: &[u8]) -> u32 {
+    get_be32(&crate::route::attrs(e), SET_ELEM_FLAGS).unwrap_or(0)
+}
+
+/// The value in `NFTA_DATA_VALUE`.
+fn data_value(d: &[u8]) -> Option<Vec<u8>> {
+    get(&crate::route::attrs(d), DATA_VALUE).map(<[u8]>::to_vec)
 }
 
 #[cfg(test)]

@@ -31,40 +31,6 @@ const IFF_LOWER_UP: u32 = 0x10000;
 pub(crate) const LO_INDEX: u32 = 1;
 const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
-/// What a guest address is used for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Use {
-    /// bind: must be a local address (EADDRNOTAVAIL otherwise); the wildcard address also works.
-    Bind,
-    /// connect, sendto: must be reachable (ENETUNREACH otherwise).
-    Reach,
-}
-
-impl Loopback {
-    /// Whether IPv4 loopback address `ip` may be used this way: as seen on Linux, 127.0.0.0/8 can
-    /// always be bound (even while lo is down or has no address), and is reachable only when lo
-    /// is up and the address's subnet is configured on it.
-    fn has_v4(&self, ip: [u8; 4], usage: Use) -> bool {
-        let covered = |&(a, len): &([u8; 4], u8)| {
-            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
-            u32::from_be_bytes(a) & mask == u32::from_be_bytes(ip) & mask
-        };
-        match usage {
-            Use::Bind => true,
-            Use::Reach => self.up && self.v4.iter().any(covered),
-        }
-    }
-}
-
-fn family(addr: &[u8]) -> Option<i32> {
-    addr.get(..2)
-        .map(|b| i32::from(u16::from_le_bytes([b[0], b[1]])))
-}
-
-fn mapped(ip: &[u8]) -> Option<[u8; 4]> {
-    (ip[..10] == [0; 10] && ip[10..12] == [0xff, 0xff]).then(|| ip[12..16].try_into().unwrap())
-}
-
 /// All network namespaces (address translation looks at virtual addresses in other
 /// namespaces): the first is the initial one.
 pub(crate) struct World {
@@ -107,95 +73,15 @@ impl World {
     }
 }
 
-/// The directly connected subnets in `me` (routes on virtual devices with no gateway, not /32).
-fn connected(me: &NetNs) -> Vec<([u8; 4], u8)> {
-    crate::netdev::entries(me)
-        .into_iter()
-        .filter(|e| e.family == AF_INET && e.table == 254 && e.gateway.is_none() && e.prefix < 32)
-        .filter_map(|e| Some((<[u8; 4]>::try_from(&e.dst[..]).ok()?, e.prefix)))
-        .collect()
-}
+// ---- Translation to the host ----
 
-fn covers(net: [u8; 4], prefix: u8, ip: [u8; 4]) -> bool {
-    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
-    u32::from_be_bytes(net) & mask == u32::from_be_bytes(ip) & mask
-}
-
-/// The host loopback address (127.255.x.y) of virtual address `v` in the initial namespace,
-/// allocated if there is none.
-pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> [u8; 4] {
-    let mut d = init.devs.borrow_mut();
-    if let Some((_, h)) = d.hostmap.iter().find(|(g, _)| *g == v) {
-        return *h;
-    }
-    let n = (1..0xffffu16)
-        .find(|n| {
-            let h = [127, INIT_BLOCK, (n >> 8) as u8, *n as u8];
-            !d.hostmap.iter().any(|(_, x)| *x == h)
-        })
-        .unwrap_or(1);
-    let h = [127, INIT_BLOCK, (n >> 8) as u8, n as u8];
-    d.hostmap.push((v, h));
-    h
-}
-
-/// Which virtual address in the initial namespace the host's 127.255.x.y stands for.
-fn init_guest(init: &NetNs, h: [u8; 4]) -> Option<[u8; 4]> {
-    init.devs
-        .borrow()
-        .hostmap
-        .iter()
-        .find(|(_, x)| *x == h)
-        .map(|(g, _)| *g)
-}
-
-/// The virtual address of `m` that faces `me`: one in a subnet `me` has a directly connected
-/// route to, otherwise the first.
-fn facing(m: &NetNs, me: &NetNs) -> Option<[u8; 4]> {
-    let mine = crate::netdev::local_v4(m);
-    let direct = connected(me);
-    mine.iter()
-        .find(|(a, _)| direct.iter().any(|&(net, p)| covers(net, p, *a)))
-        .or(mine.first())
-        .map(|(a, _)| *a)
-}
-
-/// The source address when `me` sends to `ip` (`inet_select_addr`): the route's preferred
-/// source, otherwise an address on the outgoing interface, otherwise `me`'s first virtual
-/// address.
-fn source(me: &NetNs, ip: [u8; 4]) -> Option<[u8; 4]> {
-    let r = crate::netdev::route_v4(me, ip);
-    r.as_ref()
-        .and_then(|r| r.prefsrc.as_deref())
-        .and_then(|p| p.try_into().ok())
-        .or_else(|| r.and_then(|r| crate::netdev::first_v4(me, r.index)))
-        .or_else(|| crate::netdev::local_v4(me).first().map(|(a, _)| *a))
-}
-
-/// The IPv4 address in a sockaddr (for an IPv4-mapped IPv6 address, the IPv4 part).
-fn ipv4_of(addr: &[u8]) -> Option<[u8; 4]> {
-    match family(addr) {
-        Some(AF_INET) if addr.len() >= 8 => addr[4..8].try_into().ok(),
-        Some(AF_INET6) if addr.len() >= 24 => mapped(&addr[8..24]),
-        _ => None,
-    }
-}
-
-/// Replaces the IPv4 address in a sockaddr with `ip` (written IPv4-mapped for AF_INET6, with the
-/// scope id cleared).
-fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
-    let mut out = addr.to_vec();
-    if family(addr) == Some(AF_INET) {
-        out[4..8].copy_from_slice(&ip);
-    } else {
-        out[8..18].fill(0);
-        out[18..20].copy_from_slice(&[0xff, 0xff]);
-        out[20..24].copy_from_slice(&ip);
-        if let Some(s) = out.get_mut(24..28) {
-            s.fill(0);
-        }
-    }
-    out
+/// What a guest address is used for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Use {
+    /// bind: must be a local address (EADDRNOTAVAIL otherwise); the wildcard address also works.
+    Bind,
+    /// connect, sendto: must be reachable (ENETUNREACH otherwise).
+    Reach,
 }
 
 /// A guest address translated to the host's, the result of [`to_host`].
@@ -352,15 +238,6 @@ pub(crate) fn to_host(
     }
 }
 
-/// The host address of virtual address `ip` in another namespace `m`: 127.c.d.1 for a new
-/// namespace, 127.255.x.y for the initial one.
-fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> [u8; 4] {
-    match m.host_net {
-        Some([c, d]) => [127, c, d, 1],
-        None => init_host(w.init(), ip),
-    }
-}
-
 /// [`to_host`] in the initial namespace.
 fn init_to_host(w: &World, me: &Rc<NetNs>, addr: &[u8], usage: Use) -> Result<Mapped, Errno> {
     let Some(ip) = ipv4_of(addr).filter(|ip| ip[0] != 127 && *ip != [0; 4]) else {
@@ -409,6 +286,73 @@ pub(crate) fn any_like(addr: &[u8]) -> Vec<u8> {
     s[..2].copy_from_slice(&addr[..2]);
     s
 }
+
+/// The host address (port 0) an unbound socket is bound to first.
+pub(crate) fn implicit_bind(ns: &NetNs, family: i32, icmp6: bool) -> Option<Vec<u8>> {
+    let [a, b] = ns.host_net?;
+    Some(if icmp6 {
+        let mut s = vec![0u8; 28];
+        s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        s[8..24].copy_from_slice(&LOOPBACK6);
+        s
+    } else if family == AF_INET6 {
+        let mut s = vec![0u8; 28];
+        s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+        s[18..20].copy_from_slice(&[0xff, 0xff]);
+        s[20..24].copy_from_slice(&[127, a, b, 1]);
+        s
+    } else {
+        let mut s = vec![0u8; 16];
+        s[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        s[4..8].copy_from_slice(&[127, a, b, 1]);
+        s
+    })
+}
+
+impl Loopback {
+    /// Whether IPv4 loopback address `ip` may be used this way: as seen on Linux, 127.0.0.0/8 can
+    /// always be bound (even while lo is down or has no address), and is reachable only when lo
+    /// is up and the address's subnet is configured on it.
+    fn has_v4(&self, ip: [u8; 4], usage: Use) -> bool {
+        let covered = |&(a, len): &([u8; 4], u8)| {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            u32::from_be_bytes(a) & mask == u32::from_be_bytes(ip) & mask
+        };
+        match usage {
+            Use::Bind => true,
+            Use::Reach => self.up && self.v4.iter().any(covered),
+        }
+    }
+}
+
+/// The host address of virtual address `ip` in another namespace `m`: 127.c.d.1 for a new
+/// namespace, 127.255.x.y for the initial one.
+fn host_of(w: &World, m: &NetNs, ip: [u8; 4]) -> [u8; 4] {
+    match m.host_net {
+        Some([c, d]) => [127, c, d, 1],
+        None => init_host(w.init(), ip),
+    }
+}
+
+/// The host loopback address (127.255.x.y) of virtual address `v` in the initial namespace,
+/// allocated if there is none.
+pub(crate) fn init_host(init: &NetNs, v: [u8; 4]) -> [u8; 4] {
+    let mut d = init.devs.borrow_mut();
+    if let Some((_, h)) = d.hostmap.iter().find(|(g, _)| *g == v) {
+        return *h;
+    }
+    let n = (1..0xffffu16)
+        .find(|n| {
+            let h = [127, INIT_BLOCK, (n >> 8) as u8, *n as u8];
+            !d.hostmap.iter().any(|(_, x)| *x == h)
+        })
+        .unwrap_or(1);
+    let h = [127, INIT_BLOCK, (n >> 8) as u8, n as u8];
+    d.hostmap.push((v, h));
+    h
+}
+
+// ---- Translation back to the guest ----
 
 /// The role of a host address ([`from_host`]).
 pub(crate) enum Role<'a> {
@@ -533,29 +477,49 @@ pub(crate) fn from_host(
     }
 }
 
-/// Whether a TCP socket (with `udp`, a bound UDP socket; [`crate::nsproxy::Listener`]) in new
-/// network namespace `t` is listening on guest address `dst` (a sockaddr, as seen in `t`): a
-/// wildcard listener accepts IPv4 and IPv6 (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set
-/// only IPv6), and one bound to an address accepts only what is sent to it.
-pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
-    let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
-        return true;
-    };
-    let ip: Vec<u8> = match (family(dst), ipv4_of(dst)) {
-        (_, Some(v4)) => v4.to_vec(),
-        (Some(AF_INET6), None) if dst.len() >= 24 => dst[8..24].to_vec(),
-        _ => return true,
-    };
-    t.listeners.borrow().iter().any(|l| {
-        l.port == port
-            && l.udp == udp
-            && match &l.addr {
-                None if ip.len() == 4 => !l.v6 || !l.v6only,
-                None => l.v6,
-                Some(a) => *a == ip,
-            }
-    })
+/// The virtual address seen in `me` for another namespace's loopback address on the host
+/// (127.c.d.1, 127.255.x.y).
+fn remote_guest(w: &World, me: &NetNs, x: [u8; 4]) -> Option<[u8; 4]> {
+    if x[0] != 127 {
+        return None;
+    }
+    if x[1] == INIT_BLOCK {
+        return init_guest(w.init(), x);
+    }
+    let m = w.by_block(x[1], x[2]).filter(|_| x[3] == 1)?;
+    facing(m, me)
 }
+
+/// Which virtual address in the initial namespace the host's 127.255.x.y stands for.
+fn init_guest(init: &NetNs, h: [u8; 4]) -> Option<[u8; 4]> {
+    init.devs
+        .borrow()
+        .hostmap
+        .iter()
+        .find(|(_, x)| *x == h)
+        .map(|(g, _)| *g)
+}
+
+/// The virtual address of `m` that faces `me`: one in a subnet `me` has a directly connected
+/// route to, otherwise the first.
+fn facing(m: &NetNs, me: &NetNs) -> Option<[u8; 4]> {
+    let mine = crate::netdev::local_v4(m);
+    let direct = connected(me);
+    mine.iter()
+        .find(|(a, _)| direct.iter().any(|&(net, p)| covers(net, p, *a)))
+        .or(mine.first())
+        .map(|(a, _)| *a)
+}
+
+/// The local end in `me` when sending to guest address `peer`: `local` (the local end on the
+/// host, whose port is kept) with the source address used toward the peer.
+pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<u8>> {
+    let ip = ipv4_of(peer)?;
+    let src = source(me, ip)?;
+    Some(with_ipv4(local, src))
+}
+
+// ---- Listeners ----
 
 /// What [`add_listener`] records: the guest port, whether the wildcard address is bound, the
 /// virtual address bound, the local end on the host, the address family and `IPV6_V6ONLY`, and
@@ -614,6 +578,32 @@ pub(crate) fn add_listener(me: &NetNs, l: &ListenAt<'_>) -> std::num::NonZeroU64
     std::num::NonZeroU64::new(id).expect("starts at 1")
 }
 
+/// Whether a TCP socket (with `udp`, a bound UDP socket; [`crate::nsproxy::Listener`]) in new
+/// network namespace `t` is listening on guest address `dst` (a sockaddr, as seen in `t`): a
+/// wildcard listener accepts IPv4 and IPv6 (an AF_INET one only IPv4, one with `IPV6_V6ONLY` set
+/// only IPv6), and one bound to an address accepts only what is sent to it.
+pub(crate) fn listening(t: &NetNs, dst: &[u8], udp: bool) -> bool {
+    let Some(port) = dst.get(2..4).map(|p| u16::from_be_bytes([p[0], p[1]])) else {
+        return true;
+    };
+    let ip: Vec<u8> = match (family(dst), ipv4_of(dst)) {
+        (_, Some(v4)) => v4.to_vec(),
+        (Some(AF_INET6), None) if dst.len() >= 24 => dst[8..24].to_vec(),
+        _ => return true,
+    };
+    t.listeners.borrow().iter().any(|l| {
+        l.port == port
+            && l.udp == udp
+            && match &l.addr {
+                None if ip.len() == 4 => !l.v6 || !l.v6only,
+                None => l.v6,
+                Some(a) => *a == ip,
+            }
+    })
+}
+
+// ---- Sending to its own virtual address ----
+
 /// Whether host address `host` is `me`'s 127.a.b.254 (the source bound when sending to its own
 /// virtual address).
 pub(crate) fn is_self_source(me: &NetNs, host: &[u8]) -> bool {
@@ -649,13 +639,7 @@ pub(crate) fn from_self(me: &NetNs, host: &[u8]) -> Option<Vec<u8>> {
     Some(with_ipv4(host, v))
 }
 
-/// The local end in `me` when sending to guest address `peer`: `local` (the local end on the
-/// host, whose port is kept) with the source address used toward the peer.
-pub(crate) fn local_toward(me: &NetNs, local: &[u8], peer: &[u8]) -> Option<Vec<u8>> {
-    let ip = ipv4_of(peer)?;
-    let src = source(me, ip)?;
-    Some(with_ipv4(local, src))
-}
+// ---- OUTPUT and PREROUTING nat ----
 
 /// nftables OUTPUT nat ([`crate::nft::Nft::nat`]): a connection or datagram in `me` with protocol
 /// `proto` (TCP, UDP) to guest address `dst` (a sockaddr). Returns the new destination when
@@ -730,13 +714,6 @@ pub(crate) fn entering(w: &World, me: &Rc<NetNs>, m: &Mapped, dst: &[u8]) -> Opt
     }
 }
 
-/// Local addresses in the initial namespace `init` (on host interfaces, lo and virtual devices).
-fn init_local(init: &NetNs, ip: [u8; 4]) -> bool {
-    crate::netdev::interfaces(init)
-        .iter()
-        .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
-}
-
 /// A connection or datagram entering `t` from another namespace `from` (to an address of `t`,
 /// guest sockaddr `dst`; virtual addresses are the same for everyone) passes `t`'s PREROUTING nat:
 /// returns the new destination as seen in `t` when DNATed. The source address is the one `from`
@@ -781,259 +758,7 @@ pub(crate) fn prerouting_nat(
     hook_nat(t, &packet, dst)
 }
 
-/// The PREROUTING nat result for a connection from outside the host (another device, another app
-/// on the phone) to `dst` listening in the initial namespace `init` (a guest sockaddr, with the
-/// wildcard address replaced by one of the host's addresses): the source is taken to be 192.0.2.1
-/// (TEST-NET-1), and the input interface is the host's first non-loopback interface with an IPv4
-/// address.
-pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8>> {
-    if !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
-        return None;
-    }
-    let outer = outer_iface(init);
-    let mut dst = dst.to_vec();
-    if ipv4_of(&dst) == Some([0; 4]) {
-        dst = with_ipv4(&dst, outer.as_ref().map_or([127, 0, 0, 1], |(_, a)| *a));
-    }
-    let packet = NatPacket {
-        hook: crate::nft::HOOK_PRE_ROUTING,
-        proto,
-        src: EXTERNAL.to_vec(),
-        sport: 40000,
-        uid: 0,
-        gid: 0,
-        iif: Some(outer.map(|(i, _)| i).unwrap_or_default()),
-        ct_state: crate::nft::CT_NEW,
-        mark: 0,
-    };
-    hook_nat(init, &packet, &dst).ok().flatten()
-}
-
-/// Source address of packets from outside (TEST-NET-1).
-const EXTERNAL: [u8; 4] = [192, 0, 2, 1];
-
-/// Forwarding from outside the host through the initial namespace `init` to the DNAT
-/// destination `there` (a guest address in namespace `t`): passes `init`'s FORWARD (entering on
-/// the host's interface) and the filter chains on `t`'s PREROUTING and INPUT; what is dropped or
-/// rejected is not forwarded.
-pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there: &[u8]) -> bool {
-    use crate::nft::{HOOK_PRE_ROUTING, Outcome};
-    const HOOK_LOCAL_IN: u32 = 1;
-    const HOOK_FORWARD: u32 = 2;
-    let Some((ip, true)) = nat_ip(there) else {
-        return true;
-    };
-    let ip: [u8; 4] = ip[..].try_into().unwrap();
-    let packet = |hook: u32, iif: crate::nft::Iif| NatPacket {
-        hook,
-        proto,
-        src: EXTERNAL.to_vec(),
-        sport: 40000,
-        uid: 0,
-        gid: 0,
-        iif: Some(iif),
-        ct_state: crate::nft::CT_NEW,
-        mark: 0,
-    };
-    let pass = |o: Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
-    let outer = outer_iface(init).map(|(i, _)| i).unwrap_or_default();
-    if let Some(t) = t.filter(|t| !std::ptr::eq(*t, init)) {
-        if init.nft.borrow().has_filter(HOOK_FORWARD) {
-            let oif = iif_facing(init, ip).name;
-            if !pass(hook_eval(
-                init,
-                &packet(HOOK_FORWARD, outer.clone()),
-                there,
-                Some(oif),
-                true,
-            )) {
-                return false;
-            }
-        }
-        let iif = iif_facing(t, EXTERNAL);
-        for hook in [HOOK_PRE_ROUTING, HOOK_LOCAL_IN] {
-            if t.nft.borrow().has_filter(hook)
-                && !pass(hook_eval(t, &packet(hook, iif.clone()), there, None, true))
-            {
-                return false;
-            }
-        }
-    } else if init.nft.borrow().has_filter(HOOK_LOCAL_IN)
-        && !pass(hook_eval(
-            init,
-            &packet(HOOK_LOCAL_IN, outer),
-            there,
-            None,
-            true,
-        ))
-    {
-        return false;
-    }
-    true
-}
-
-/// The parts of a synthetic packet besides the socket ([`hook_nat`]).
-struct NatPacket {
-    hook: u32,
-    proto: u8,
-    src: Vec<u8>,
-    sport: u16,
-    uid: u32,
-    gid: u32,
-    iif: Option<crate::nft::Iif>,
-    ct_state: u32,
-    /// The packet's initial mark ([`crate::nft::Packet::mark`]).
-    mark: u32,
-}
-
-/// Which kind of packet a sockaddr is judged as: (address, is IPv4). IPv4-mapped IPv6 addresses
-/// count as IPv4 packets.
-fn nat_ip(dst: &[u8]) -> Option<(Vec<u8>, bool)> {
-    match (family(dst), ipv4_of(dst)) {
-        (Some(AF_INET | AF_INET6), Some(x)) => Some((x.to_vec(), true)),
-        (Some(AF_INET6), None) if dst.len() >= 24 => Some((dst[8..24].to_vec(), false)),
-        _ => None,
-    }
-}
-
-fn is_loopback(a: &[u8]) -> bool {
-    (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets()
-}
-
-/// nat on hook `p.hook` of `ns` ([`crate::nft::Nft::nat`]): for a packet to guest address `dst`,
-/// returns the new destination when DNATed (keeping the port when it is not changed), and EPERM
-/// when a rule drops it.
-fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
-    let Some((_, v4)) = nat_ip(dst) else {
-        return Ok(None);
-    };
-    match hook_eval(ns, p, dst, None, false) {
-        crate::nft::Outcome::Accept => Ok(None),
-        crate::nft::Outcome::Drop | crate::nft::Outcome::Reject(_) => Err(Errno::EPERM),
-        crate::nft::Outcome::Dnat(a, port) => {
-            let mut out = if v4 {
-                with_ipv4(dst, a[..4].try_into().map_err(|_| Errno::EINVAL)?)
-            } else {
-                let mut o = dst.to_vec();
-                o[8..24].copy_from_slice(&a);
-                o
-            };
-            if let Some(port) = port {
-                out[2..4].copy_from_slice(&port.to_be_bytes());
-            }
-            Ok(Some(out))
-        }
-    }
-}
-
-/// Builds a packet to `dst` from `p` and runs the filter chains (`filter`) or the nat chains on
-/// hook `p.hook` of `ns`. `oif` is the name of a given output interface (on FORWARD); with None,
-/// it is chosen by route.
-fn hook_eval(
-    ns: &NetNs,
-    p: &NatPacket,
-    dst: &[u8],
-    oif: Option<Vec<u8>>,
-    filter: bool,
-) -> crate::nft::Outcome {
-    let Some((ip, v4)) = nat_ip(dst) else {
-        return crate::nft::Outcome::Accept;
-    };
-    let local = |a: &[u8]| {
-        is_loopback(a)
-            || crate::netdev::interfaces(ns)
-                .iter()
-                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
-    };
-    let src = if p.src.len() == ip.len() {
-        p.src.clone()
-    } else {
-        vec![0; ip.len()]
-    };
-    let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
-    // Index and name of the output interface: by name when one is given (on FORWARD), lo for
-    // local addresses, otherwise by route
-    let oif = || -> (u32, Vec<u8>) {
-        let found = |f: &dyn Fn(&appine_hal::net::Interface) -> bool| {
-            crate::netdev::interfaces(ns)
-                .into_iter()
-                .find(|i| f(i))
-                .map(|i| (i.index, i.name.into_bytes()))
-        };
-        if let Some(o) = &oif {
-            return found(&|i| i.name.as_bytes() == &o[..]).unwrap_or((0, o.clone()));
-        }
-        if local(&ip) {
-            return found(&|i| i.name == "lo").unwrap_or((1, b"lo".to_vec()));
-        }
-        let index = v4
-            .then(|| crate::netdev::route_v4(ns, ip[..4].try_into().unwrap()))
-            .flatten()
-            .map(|e| e.index);
-        found(&|i| Some(i.index) == index).unwrap_or_default()
-    };
-    let packet = crate::nft::Packet {
-        src: &src,
-        dst: &ip,
-        proto: p.proto,
-        sport: p.sport,
-        dport: u16::from_be_bytes([dst[2], dst[3]]),
-        uid: p.uid,
-        gid: p.gid,
-        addr_type: &addr_type,
-        oif: &oif,
-        hook: p.hook,
-        iif: p.iif.clone(),
-        ct_state: p.ct_state,
-        mark: p.mark,
-    };
-    let nft = ns.nft.borrow();
-    if filter {
-        nft.filter(&packet)
-    } else {
-        nft.nat(&packet)
-    }
-}
-
-/// The interface in `t` facing IPv4 address `src` (the one packets from `src` come in on): the
-/// one with the directly connected subnet, otherwise the default route's output interface.
-fn iif_facing(t: &NetNs, src: [u8; 4]) -> crate::nft::Iif {
-    let Some(e) = crate::netdev::route_v4(t, src) else {
-        return Default::default();
-    };
-    let name = crate::netdev::interfaces(t)
-        .into_iter()
-        .find(|i| i.index == e.index)
-        .map(|i| i.name.into_bytes())
-        .unwrap_or_default();
-    crate::nft::Iif {
-        index: e.index,
-        name,
-        addr: crate::netdev::first_v4(t, e.index)
-            .map(|a| a.to_vec())
-            .unwrap_or_default(),
-    }
-}
-
-/// The host's first non-loopback interface with an IPv4 address: the input interface of packets
-/// from outside and the output interface of packets going outside.
-fn outer_iface(init: &NetNs) -> Option<(crate::nft::Iif, [u8; 4])> {
-    crate::netdev::interfaces(init).into_iter().find_map(|i| {
-        let a = i
-            .addrs
-            .iter()
-            .find(|(f, a, _)| *f == AF_INET && a.len() == 4 && a[0] != 127)?;
-        let addr: [u8; 4] = a.1[..].try_into().ok()?;
-        Some((
-            crate::nft::Iif {
-                index: i.index,
-                name: i.name.clone().into_bytes(),
-                addr: addr.to_vec(),
-            },
-            addr,
-        ))
-    })
-}
+// ---- Filter chains along the path ----
 
 /// One namespace a packet enters in turn in [`path_filter`]: the hook, the input interface and
 /// the output interface (on FORWARD).
@@ -1200,18 +925,272 @@ pub(crate) fn path_filter(
     (Outcome::Accept, false)
 }
 
-/// The virtual address seen in `me` for another namespace's loopback address on the host
-/// (127.c.d.1, 127.255.x.y).
-fn remote_guest(w: &World, me: &NetNs, x: [u8; 4]) -> Option<[u8; 4]> {
-    if x[0] != 127 {
+/// Local addresses in the initial namespace `init` (on host interfaces, lo and virtual devices).
+fn init_local(init: &NetNs, ip: [u8; 4]) -> bool {
+    crate::netdev::interfaces(init)
+        .iter()
+        .any(|i| i.addrs.iter().any(|(_, a, _)| a[..] == ip[..]))
+}
+
+// ---- Forwarding from outside ----
+
+/// Source address of packets from outside (TEST-NET-1).
+const EXTERNAL: [u8; 4] = [192, 0, 2, 1];
+
+/// The PREROUTING nat result for a connection from outside the host (another device, another app
+/// on the phone) to `dst` listening in the initial namespace `init` (a guest sockaddr, with the
+/// wildcard address replaced by one of the host's addresses): the source is taken to be 192.0.2.1
+/// (TEST-NET-1), and the input interface is the host's first non-loopback interface with an IPv4
+/// address.
+pub(crate) fn external_nat(init: &NetNs, proto: u8, dst: &[u8]) -> Option<Vec<u8>> {
+    if !init.nft.borrow().has_nat(crate::nft::HOOK_PRE_ROUTING) {
         return None;
     }
-    if x[1] == INIT_BLOCK {
-        return init_guest(w.init(), x);
+    let outer = outer_iface(init);
+    let mut dst = dst.to_vec();
+    if ipv4_of(&dst) == Some([0; 4]) {
+        dst = with_ipv4(&dst, outer.as_ref().map_or([127, 0, 0, 1], |(_, a)| *a));
     }
-    let m = w.by_block(x[1], x[2]).filter(|_| x[3] == 1)?;
-    facing(m, me)
+    let packet = NatPacket {
+        hook: crate::nft::HOOK_PRE_ROUTING,
+        proto,
+        src: EXTERNAL.to_vec(),
+        sport: 40000,
+        uid: 0,
+        gid: 0,
+        iif: Some(outer.map(|(i, _)| i).unwrap_or_default()),
+        ct_state: crate::nft::CT_NEW,
+        mark: 0,
+    };
+    hook_nat(init, &packet, &dst).ok().flatten()
 }
+
+/// Forwarding from outside the host through the initial namespace `init` to the DNAT
+/// destination `there` (a guest address in namespace `t`): passes `init`'s FORWARD (entering on
+/// the host's interface) and the filter chains on `t`'s PREROUTING and INPUT; what is dropped or
+/// rejected is not forwarded.
+pub(crate) fn external_filter(init: &NetNs, t: Option<&NetNs>, proto: u8, there: &[u8]) -> bool {
+    use crate::nft::{HOOK_PRE_ROUTING, Outcome};
+    const HOOK_LOCAL_IN: u32 = 1;
+    const HOOK_FORWARD: u32 = 2;
+    let Some((ip, true)) = nat_ip(there) else {
+        return true;
+    };
+    let ip: [u8; 4] = ip[..].try_into().unwrap();
+    let packet = |hook: u32, iif: crate::nft::Iif| NatPacket {
+        hook,
+        proto,
+        src: EXTERNAL.to_vec(),
+        sport: 40000,
+        uid: 0,
+        gid: 0,
+        iif: Some(iif),
+        ct_state: crate::nft::CT_NEW,
+        mark: 0,
+    };
+    let pass = |o: Outcome| matches!(o, Outcome::Accept | Outcome::Dnat(..));
+    let outer = outer_iface(init).map(|(i, _)| i).unwrap_or_default();
+    if let Some(t) = t.filter(|t| !std::ptr::eq(*t, init)) {
+        if init.nft.borrow().has_filter(HOOK_FORWARD) {
+            let oif = iif_facing(init, ip).name;
+            if !pass(hook_eval(
+                init,
+                &packet(HOOK_FORWARD, outer.clone()),
+                there,
+                Some(oif),
+                true,
+            )) {
+                return false;
+            }
+        }
+        let iif = iif_facing(t, EXTERNAL);
+        for hook in [HOOK_PRE_ROUTING, HOOK_LOCAL_IN] {
+            if t.nft.borrow().has_filter(hook)
+                && !pass(hook_eval(t, &packet(hook, iif.clone()), there, None, true))
+            {
+                return false;
+            }
+        }
+    } else if init.nft.borrow().has_filter(HOOK_LOCAL_IN)
+        && !pass(hook_eval(
+            init,
+            &packet(HOOK_LOCAL_IN, outer),
+            there,
+            None,
+            true,
+        ))
+    {
+        return false;
+    }
+    true
+}
+
+// ---- Synthetic packets ----
+
+/// The parts of a synthetic packet besides the socket ([`hook_nat`]).
+struct NatPacket {
+    hook: u32,
+    proto: u8,
+    src: Vec<u8>,
+    sport: u16,
+    uid: u32,
+    gid: u32,
+    iif: Option<crate::nft::Iif>,
+    ct_state: u32,
+    /// The packet's initial mark ([`crate::nft::Packet::mark`]).
+    mark: u32,
+}
+
+/// nat on hook `p.hook` of `ns` ([`crate::nft::Nft::nat`]): for a packet to guest address `dst`,
+/// returns the new destination when DNATed (keeping the port when it is not changed), and EPERM
+/// when a rule drops it.
+fn hook_nat(ns: &NetNs, p: &NatPacket, dst: &[u8]) -> Result<Option<Vec<u8>>, Errno> {
+    let Some((_, v4)) = nat_ip(dst) else {
+        return Ok(None);
+    };
+    match hook_eval(ns, p, dst, None, false) {
+        crate::nft::Outcome::Accept => Ok(None),
+        crate::nft::Outcome::Drop | crate::nft::Outcome::Reject(_) => Err(Errno::EPERM),
+        crate::nft::Outcome::Dnat(a, port) => {
+            let mut out = if v4 {
+                with_ipv4(dst, a[..4].try_into().map_err(|_| Errno::EINVAL)?)
+            } else {
+                let mut o = dst.to_vec();
+                o[8..24].copy_from_slice(&a);
+                o
+            };
+            if let Some(port) = port {
+                out[2..4].copy_from_slice(&port.to_be_bytes());
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
+/// Builds a packet to `dst` from `p` and runs the filter chains (`filter`) or the nat chains on
+/// hook `p.hook` of `ns`. `oif` is the name of a given output interface (on FORWARD); with None,
+/// it is chosen by route.
+fn hook_eval(
+    ns: &NetNs,
+    p: &NatPacket,
+    dst: &[u8],
+    oif: Option<Vec<u8>>,
+    filter: bool,
+) -> crate::nft::Outcome {
+    let Some((ip, v4)) = nat_ip(dst) else {
+        return crate::nft::Outcome::Accept;
+    };
+    let local = |a: &[u8]| {
+        is_loopback(a)
+            || crate::netdev::interfaces(ns)
+                .iter()
+                .any(|i| i.addrs.iter().any(|(_, x, _)| x == a))
+    };
+    let src = if p.src.len() == ip.len() {
+        p.src.clone()
+    } else {
+        vec![0; ip.len()]
+    };
+    let addr_type = |a: &[u8]| crate::nft::addr_type(a, local);
+    // Index and name of the output interface: by name when one is given (on FORWARD), lo for
+    // local addresses, otherwise by route
+    let oif = || -> (u32, Vec<u8>) {
+        let found = |f: &dyn Fn(&appine_hal::net::Interface) -> bool| {
+            crate::netdev::interfaces(ns)
+                .into_iter()
+                .find(|i| f(i))
+                .map(|i| (i.index, i.name.into_bytes()))
+        };
+        if let Some(o) = &oif {
+            return found(&|i| i.name.as_bytes() == &o[..]).unwrap_or((0, o.clone()));
+        }
+        if local(&ip) {
+            return found(&|i| i.name == "lo").unwrap_or((1, b"lo".to_vec()));
+        }
+        let index = v4
+            .then(|| crate::netdev::route_v4(ns, ip[..4].try_into().unwrap()))
+            .flatten()
+            .map(|e| e.index);
+        found(&|i| Some(i.index) == index).unwrap_or_default()
+    };
+    let packet = crate::nft::Packet {
+        src: &src,
+        dst: &ip,
+        proto: p.proto,
+        sport: p.sport,
+        dport: u16::from_be_bytes([dst[2], dst[3]]),
+        uid: p.uid,
+        gid: p.gid,
+        addr_type: &addr_type,
+        oif: &oif,
+        hook: p.hook,
+        iif: p.iif.clone(),
+        ct_state: p.ct_state,
+        mark: p.mark,
+    };
+    let nft = ns.nft.borrow();
+    if filter {
+        nft.filter(&packet)
+    } else {
+        nft.nat(&packet)
+    }
+}
+
+/// Which kind of packet a sockaddr is judged as: (address, is IPv4). IPv4-mapped IPv6 addresses
+/// count as IPv4 packets.
+fn nat_ip(dst: &[u8]) -> Option<(Vec<u8>, bool)> {
+    match (family(dst), ipv4_of(dst)) {
+        (Some(AF_INET | AF_INET6), Some(x)) => Some((x.to_vec(), true)),
+        (Some(AF_INET6), None) if dst.len() >= 24 => Some((dst[8..24].to_vec(), false)),
+        _ => None,
+    }
+}
+
+fn is_loopback(a: &[u8]) -> bool {
+    (a.len() == 4 && a[0] == 127) || a == std::net::Ipv6Addr::LOCALHOST.octets()
+}
+
+/// The interface in `t` facing IPv4 address `src` (the one packets from `src` come in on): the
+/// one with the directly connected subnet, otherwise the default route's output interface.
+fn iif_facing(t: &NetNs, src: [u8; 4]) -> crate::nft::Iif {
+    let Some(e) = crate::netdev::route_v4(t, src) else {
+        return Default::default();
+    };
+    let name = crate::netdev::interfaces(t)
+        .into_iter()
+        .find(|i| i.index == e.index)
+        .map(|i| i.name.into_bytes())
+        .unwrap_or_default();
+    crate::nft::Iif {
+        index: e.index,
+        name,
+        addr: crate::netdev::first_v4(t, e.index)
+            .map(|a| a.to_vec())
+            .unwrap_or_default(),
+    }
+}
+
+/// The host's first non-loopback interface with an IPv4 address: the input interface of packets
+/// from outside and the output interface of packets going outside.
+fn outer_iface(init: &NetNs) -> Option<(crate::nft::Iif, [u8; 4])> {
+    crate::netdev::interfaces(init).into_iter().find_map(|i| {
+        let a = i
+            .addrs
+            .iter()
+            .find(|(f, a, _)| *f == AF_INET && a.len() == 4 && a[0] != 127)?;
+        let addr: [u8; 4] = a.1[..].try_into().ok()?;
+        Some((
+            crate::nft::Iif {
+                index: i.index,
+                name: i.name.clone().into_bytes(),
+                addr: addr.to_vec(),
+            },
+            addr,
+        ))
+    })
+}
+
+// ---- Address helpers ----
 
 /// The namespace a host address belongs to (the low-port mapping registry goes by it,
 /// [`crate::portmap`]): another namespace's block gives that namespace, 127.255.x.y the initial
@@ -1240,67 +1219,68 @@ pub(crate) fn is_any(addr: &[u8]) -> bool {
     }
 }
 
-/// The host address (port 0) an unbound socket is bound to first.
-pub(crate) fn implicit_bind(ns: &NetNs, family: i32, icmp6: bool) -> Option<Vec<u8>> {
-    let [a, b] = ns.host_net?;
-    Some(if icmp6 {
-        let mut s = vec![0u8; 28];
-        s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
-        s[8..24].copy_from_slice(&LOOPBACK6);
-        s
-    } else if family == AF_INET6 {
-        let mut s = vec![0u8; 28];
-        s[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
-        s[18..20].copy_from_slice(&[0xff, 0xff]);
-        s[20..24].copy_from_slice(&[127, a, b, 1]);
-        s
+/// The source address when `me` sends to `ip` (`inet_select_addr`): the route's preferred
+/// source, otherwise an address on the outgoing interface, otherwise `me`'s first virtual
+/// address.
+fn source(me: &NetNs, ip: [u8; 4]) -> Option<[u8; 4]> {
+    let r = crate::netdev::route_v4(me, ip);
+    r.as_ref()
+        .and_then(|r| r.prefsrc.as_deref())
+        .and_then(|p| p.try_into().ok())
+        .or_else(|| r.and_then(|r| crate::netdev::first_v4(me, r.index)))
+        .or_else(|| crate::netdev::local_v4(me).first().map(|(a, _)| *a))
+}
+
+/// The directly connected subnets in `me` (routes on virtual devices with no gateway, not /32).
+fn connected(me: &NetNs) -> Vec<([u8; 4], u8)> {
+    crate::netdev::entries(me)
+        .into_iter()
+        .filter(|e| e.family == AF_INET && e.table == 254 && e.gateway.is_none() && e.prefix < 32)
+        .filter_map(|e| Some((<[u8; 4]>::try_from(&e.dst[..]).ok()?, e.prefix)))
+        .collect()
+}
+
+fn covers(net: [u8; 4], prefix: u8, ip: [u8; 4]) -> bool {
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    u32::from_be_bytes(net) & mask == u32::from_be_bytes(ip) & mask
+}
+
+/// The IPv4 address in a sockaddr (for an IPv4-mapped IPv6 address, the IPv4 part).
+fn ipv4_of(addr: &[u8]) -> Option<[u8; 4]> {
+    match family(addr) {
+        Some(AF_INET) if addr.len() >= 8 => addr[4..8].try_into().ok(),
+        Some(AF_INET6) if addr.len() >= 24 => mapped(&addr[8..24]),
+        _ => None,
+    }
+}
+
+/// Replaces the IPv4 address in a sockaddr with `ip` (written IPv4-mapped for AF_INET6, with the
+/// scope id cleared).
+fn with_ipv4(addr: &[u8], ip: [u8; 4]) -> Vec<u8> {
+    let mut out = addr.to_vec();
+    if family(addr) == Some(AF_INET) {
+        out[4..8].copy_from_slice(&ip);
     } else {
-        let mut s = vec![0u8; 16];
-        s[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
-        s[4..8].copy_from_slice(&[127, a, b, 1]);
-        s
-    })
-}
-
-/// The lo interface (for netlink and procfs answers).
-pub(crate) fn lo_interface(ns: &NetNs) -> Interface {
-    let lo = ns.lo.borrow();
-    let mut addrs: Vec<(i32, Vec<u8>, u8)> = lo
-        .v4
-        .iter()
-        .map(|(a, len)| (AF_INET, a.to_vec(), *len))
-        .collect();
-    if lo.v6 {
-        addrs.push((AF_INET6, LOOPBACK6.to_vec(), 128));
-    }
-    Interface {
-        name: "lo".into(),
-        index: LO_INDEX,
-        flags: if lo.up {
-            IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
-        } else {
-            IFF_LOOPBACK
-        },
-        mtu: lo.mtu.unwrap_or(65536),
-        mac: None,
-        addrs,
-    }
-}
-
-/// Brings lo up or down (`RTM_NEWLINK`, `SIOCSIFFLAGS`): bringing it up adds 127.0.0.1/8 when
-/// it has no IPv4 address (Linux's `inetdev_event`), and adds ::1 (addrconf); bringing it down
-/// removes ::1 with it.
-pub(crate) fn set_up(lo: &mut Loopback, up: bool) {
-    if up && !lo.up {
-        if lo.v4.is_empty() {
-            lo.v4.push(([127, 0, 0, 1], 8));
+        out[8..18].fill(0);
+        out[18..20].copy_from_slice(&[0xff, 0xff]);
+        out[20..24].copy_from_slice(&ip);
+        if let Some(s) = out.get_mut(24..28) {
+            s.fill(0);
         }
-        lo.v6 = true;
-    } else if !up {
-        lo.v6 = false;
     }
-    lo.up = up;
+    out
 }
+
+fn family(addr: &[u8]) -> Option<i32> {
+    addr.get(..2)
+        .map(|b| i32::from(u16::from_le_bytes([b[0], b[1]])))
+}
+
+fn mapped(ip: &[u8]) -> Option<[u8; 4]> {
+    (ip[..10] == [0; 10] && ip[10..12] == [0xff, 0xff]).then(|| ip[12..16].try_into().unwrap())
+}
+
+// ---- lo configuration ----
 
 /// A netlink request that modifies lo (the whole message): `RTM_NEWADDR`, `RTM_DELADDR`,
 /// `RTM_NEWLINK` (`RTM_SETLINK`). None means it is none of these; Some holds the error code (0 is
@@ -1492,6 +1472,46 @@ pub(crate) fn interface_ioctl(
         _ => data[..4].copy_from_slice(&1000i32.to_le_bytes()),
     }
     Some(Ok(()))
+}
+
+/// The lo interface (for netlink and procfs answers).
+pub(crate) fn lo_interface(ns: &NetNs) -> Interface {
+    let lo = ns.lo.borrow();
+    let mut addrs: Vec<(i32, Vec<u8>, u8)> = lo
+        .v4
+        .iter()
+        .map(|(a, len)| (AF_INET, a.to_vec(), *len))
+        .collect();
+    if lo.v6 {
+        addrs.push((AF_INET6, LOOPBACK6.to_vec(), 128));
+    }
+    Interface {
+        name: "lo".into(),
+        index: LO_INDEX,
+        flags: if lo.up {
+            IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
+        } else {
+            IFF_LOOPBACK
+        },
+        mtu: lo.mtu.unwrap_or(65536),
+        mac: None,
+        addrs,
+    }
+}
+
+/// Brings lo up or down (`RTM_NEWLINK`, `SIOCSIFFLAGS`): bringing it up adds 127.0.0.1/8 when
+/// it has no IPv4 address (Linux's `inetdev_event`), and adds ::1 (addrconf); bringing it down
+/// removes ::1 with it.
+pub(crate) fn set_up(lo: &mut Loopback, up: bool) {
+    if up && !lo.up {
+        if lo.v4.is_empty() {
+            lo.v4.push(([127, 0, 0, 1], 8));
+        }
+        lo.v6 = true;
+    } else if !up {
+        lo.v6 = false;
+    }
+    lo.up = up;
 }
 
 /// `SIOCGIFCONF`: lo while it is up with an IPv4 address (Linux's `inet_gifconf` lists only IPv4
