@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys; the tab bar's and extra keys' labels in dp, not following the system font scale)
+> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys; the tab bar's and extra keys' labels in dp, not following the system font scale; the tab bar as one row of numbered 32 dp squares with `×`, `+` and `⋮` in any window, a long press showing a tab's title in a toast, `×` asking before closing a running tab; the next tab shown after closing the current one; closing the other tabs or all of them from the `⋮` menu; the switcher, the list of tabs, the swipe, the tab menu and renaming removed)
 
 ## Responsibilities
 
@@ -34,10 +34,7 @@ libghostty-vt with Zig (`android/native`).
 ## Key types
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
-  tabs and a switcher with its `Swipe` touch listener, one of them shown) and the list of tabs
-  while open (AppCompat's `ListPopupWindow` over the `TabList` adapter, rows from
-  `list_tab.xml`); `Host : VtView.Host`,
-  `Keys : ExtraKeysView.Target`.
+  numbered tabs, then `×`, `+` and `⋮`); `Host : VtView.Host`, `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
@@ -91,41 +88,35 @@ libghostty-vt with Zig (`android/native`).
 
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
-- Tabs are labelled `N: name` with the name the user gave them, else `N: title` (`sh` when the
-  program set no title), muted with "(ended)" once the shell ended. The bar is 32 dp tall; its tabs,
-  switcher and buttons fill that height with their labels centred, sized in dp (14, the tab count
-  12) so the system font scale leaves them as they are (the list of tabs, dialogs and menus follow
-  it). It ends with `+` (opens a
-  session while the kernel runs) and `⋮` (Settings); its other part depends on the window's width,
-  checked again on every configuration change:
-  - at least 600 dp: a scrolling row of all tabs, each at most 220 dp wide with an ellipsis, the
-    current one in the primary colour and scrolled into view after each change; tap switches;
-  - narrower (a phone held upright): the switcher, with the number of tabs in an outlined box and
-    the current tab's label; tapping it opens the list of tabs below the bar: one row per tab, the
-    current one highlighted, each with a ✕ that closes it; tapping a row switches and closes the
-    list. The list is modal and leaves the IME up, follows tab and title changes while open, and
-    is closed on configuration changes, when the activity stops, when the tab bar switches to the
-    row and when no tabs are left. A horizontal swipe of at least 48 dp over the switcher shows
-    the next tab (to the left) or the previous one (to the right), without going round; the title
-    follows the finger, with more resistance where there is no tab.
-- A long press on a tab in the row, on the switcher (the current tab) or on a row of the list
-  opens a menu: "Rename tab" (closes the list; a dialog with an outlined text field,
-  `dialog_rename.xml`, holding the name selected, with the program's title as its placeholder and
-  the rule as its helper text; Enter confirms; an empty name shows the program's title again;
-  `TerminalService.renameSession`) and "Close tab".
-- Its dialogs (rename, notices, the paste confirmation), its menus (⋮, the tab menu) and the list
-  of tabs are Material 3 in the theme's dark colours, from the wallpaper on Android 12 and later
-  (`DynamicColors`); the list highlights the current tab in the secondary container colour. The
-  tab bar, the extra keys and what lies under the system bars are black like the terminal; their
-  labels, buttons and the status text take the muted on-surface-variant colour, and the title of
-  the tab shown the on-surface one.
+- The bar is one 32 dp row in any window: a scrolling row of tabs taking what the buttons leave,
+  then `×` (closes the current tab; hidden while there is none), `+` (opens a session while the
+  kernel runs) and `⋮` (a menu: "Close other tabs", disabled when there is no other, "Close all
+  tabs" and Settings), every tab and button a 32 dp square with its label centred. A
+  tab shows its number (from 1, by position): the current one in the primary colour inside a 2 dp
+  outlined box and scrolled into view after each change, the others muted, an ended one faded (38%
+  opacity). Labels are sized in dp (numbers 12 bold, buttons 14) so the system font scale leaves
+  them as they are (dialogs, menus and toasts follow it).
+- Tapping a tab shows it; a long press shows its title in a toast (cancelling the previous one):
+  the program's title (`sh` when it set none), with "(ended)" once the shell ended. TalkBack reads
+  "Tab N: title".
+- `×` and the menu's "Close other tabs" and "Close all tabs" close at once when every shell they
+  close has ended, else after a confirmation dialog ("Close this tab?" or "Close N tabs?"; closing
+  hangs up a shell, which usually ends the programs in it); several tabs are closed with the
+  current one last, so no other tab is shown (and its shell started) on the way, and closing all
+  ends like closing the last tab. Ctrl+Shift+W and Enter in an ended tab close without asking.
+- Its dialogs (close, notices, the paste confirmation) and its menu (⋮) are Material 3 in the
+  theme's dark colours, from the wallpaper on Android 12 and later (`DynamicColors`). The tab bar,
+  the extra keys and what lies under the system bars are black like the terminal; their labels,
+  buttons and the status text take the muted on-surface-variant colour, and the current tab's
+  number the primary one.
 - Hardware-keyboard shortcuts, taken by the activity (`dispatchKeyEvent`) before the terminal sees
   them, together with the matching key release: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
   current one (both once per press), Ctrl+Tab and Ctrl+Shift+Tab show the next and the previous
   one, going round and repeating while held. They are also listed in the system's keyboard
   shortcuts screen (Meta+/).
-- Closing a tab hangs it up at once. Closing the last tab while the kernel runs finishes the
-  activity (the service stays). After a reconnect the focused tab is the service's `focus` or the
+- Closing a tab hangs it up at once; when it was the current one, the tab after it, now in its
+  place, is shown (the one before when it was the last). Closing the last tab while the kernel runs
+  finishes the activity (the service stays). After a reconnect the focused tab is the service's `focus` or the
   last one.
 - Showing a tab attaches it to the view (`VtView.attach`); `onRestarting` and `onDestroy` detach
   it, so sessions never keep a destroyed Activity's view.
@@ -298,8 +289,7 @@ libghostty-vt with Zig (`android/native`).
 - `Native` (`openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`), hence the kernel's host
   console; `login.sh`; `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
-  and the page layouts, `MainActivity`'s dialogs, menus and list of tabs, `VtView`'s paste
-  confirmation).
+  and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation).
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
   (`android/native`); `Machine::read_console`, `write_console` and `resize_console` called from
@@ -355,13 +345,15 @@ libghostty-vt with Zig (`android/native`).
 - `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
   injected keys) the system would cover the whole view with a translucent grey.
 - `MainActivity` is a framework `Activity` on a Material theme: Material dialogs and AppCompat's
-  `PopupMenu` and `ListPopupWindow` take the theme, but the views it inflates from XML are the
-  framework's (no AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing
-  there (`ic_close` carries its own tint). The text selection handles `VtView` draws and the
-  floating text menu read framework attributes, which AppCompat forwards to the Material 3
-  colours (the handles are the primary colour). Theme.Material3 does not set the system bars'
-  colours, which Android applies up to version 14, so `Theme.Appine.Terminal` sets them black,
-  as the framework theme had them.
+  `PopupMenu` take the theme, but the views it builds or inflates from XML are the framework's (no
+  AppCompat inflater), so AppCompat view attributes such as `app:tint` do nothing there. The text
+  selection handles `VtView` draws and the floating text menu read framework attributes, which
+  AppCompat forwards to the Material 3 colours (the handles are the primary colour).
+  Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
+  so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
+- The tab bar's buttons are characters in the system font: `+`, `⋮` and `×` (the multiplication
+  sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
+  glyph is larger and thinner than the others.
 - Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
   change recreates them with the other colours; an AppCompat activity that handles `uiMode`
   itself would keep the views it already made in the old ones.
@@ -384,6 +376,8 @@ libghostty-vt with Zig (`android/native`).
 
 - Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
   (the root ignores cutout insets).
+- The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
+  foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side.
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English.

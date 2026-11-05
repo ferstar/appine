@@ -1,40 +1,32 @@
 package io.github.mthli.appine
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ComponentName
-import android.content.DialogInterface
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
 import android.view.Menu
-import android.view.MotionEvent
 import android.view.View
-import android.view.ViewConfiguration
 import android.view.ViewGroup
-import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
-import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.appcompat.widget.ListPopupWindow
+import android.widget.Toast
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
 import androidx.core.view.ViewCompat
@@ -43,9 +35,6 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.textfield.TextInputEditText
-import com.google.android.material.textfield.TextInputLayout
-import kotlin.math.abs
 
 /**
  * The terminal screen: the tab bar on top, the terminal ([VtView]) in the middle, and below it the
@@ -53,33 +42,31 @@ import kotlin.math.abs
  * Sessions belong to [TerminalService]; this only handles display and input: the view shows the
  * current tab's [VtSession].
  *
- * The tab bar lists every tab in a row only when the window is at least [WIDE_DP] wide; narrower
- * (a phone held upright) it shows the number of tabs and the current tab's title, and tapping them
- * opens the list of tabs.
+ * The tab bar is one row in any window: a scrolling row of tabs, each a square with its number
+ * (a long press shows its title), then `×` (closes the current tab), `+` and `⋮`.
  *
- * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark);
- * the tab bar and the extra keys are black like the terminal, with labels in the theme's colours.
- * The activity itself stays a framework one, and so do the views it builds.
+ * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
+ * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
+ * stays a framework one, and so do the views it builds.
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
     private lateinit var screen: VtView
-    private lateinit var bar: LinearLayout
     private lateinit var strip: HorizontalScrollView
     private lateinit var tabs: LinearLayout
-    private lateinit var switcher: LinearLayout
-    private lateinit var tabCount: TextView
-    private lateinit var tabTitle: TextView
+    private lateinit var closeButton: TextView
     private lateinit var status: TextView
     private lateinit var keys: ExtraKeysView
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
+
+    /** [current]'s position when the tabs were last shown, where its successor is taken from. */
+    private var currentIndex = 0
     private var fontSize = 0
 
-    /** The list of tabs while it is open (narrow windows), showing [tabList]. */
-    private var list: ListPopupWindow? = null
-    private val tabList = TabList()
+    /** The last tab title shown by a long press, cancelled by the next. */
+    private var toast: Toast? = null
 
     /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
     private var shortcutKey = 0
@@ -88,13 +75,10 @@ class MainActivity : Activity(), TerminalService.Listener {
     // applied them. The tab bar, the extra keys and what lies under the system bars are black, as
     // the terminal is
 
-    /** The bar's buttons and other tabs, and an ended tab's title. */
+    /** The bar's buttons, other tabs' numbers and the status text. */
     private val mutedColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant) }
 
-    /** The title of the tab shown (not "titleColor", which Activity already has). */
-    private val textColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurface) }
-
-    /** The current tab in the row of tabs. */
+    /** The current tab's number and its box. */
     private val currentTabColor by lazy { themeColor(androidx.appcompat.R.attr.colorPrimary) }
 
     private val connection = object : ServiceConnection {
@@ -132,54 +116,21 @@ class MainActivity : Activity(), TerminalService.Listener {
             isHorizontalScrollBarEnabled = false
             addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
-        // The number of tabs in a box, like a browser's tab switcher
-        tabCount = TextView(this).apply {
-            setTextColor(mutedColor)
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_COUNT_DP)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            minWidth = dp(20)
-            minHeight = dp(20)
-            setPadding(dp(4), 0, dp(4), 0)
-            background = GradientDrawable().apply {
-                setStroke(dp(2), mutedColor)
-                cornerRadius = dp(4).toFloat()
-            }
-        }
-        tabTitle = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
-            isSingleLine = true
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        switcher = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), 0, dp(12), 0)
-            background = touchFeedback()
-            addView(tabCount)
-            // The title moves with a swipe; its own frame clips it, so it never covers the count
-            addView(FrameLayout(this@MainActivity).apply { addView(tabTitle) },
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    marginStart = dp(12)
-                })
-            setOnClickListener { openList() }
-            setOnLongClickListener { v ->
-                current?.let { showTabMenu(v, it) }
-                true
-            }
-            setOnTouchListener(Swipe())
+        // The multiplication sign, which Roboto draws like its +; U+2715 (✕) is not in Roboto, and
+        // the fallback font's is larger and thinner than + and ⋮
+        closeButton = barButton("×") { current?.let { confirmClose(listOf(it)) } }.apply {
+            contentDescription = getString(R.string.close_tab)
         }
         keys = ExtraKeysView(this, Keys())
 
-        bar = LinearLayout(this).apply {
+        val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.BLACK)
             addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-            addView(switcher, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            addView(closeButton, barItem())
             addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) }, barItem())
             addView(barButton("⋮") { showMenu(it) }, barItem())
         }
-        renderTabs()
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(screen)
@@ -192,6 +143,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
+        renderTabs()
         // Content is drawn behind the system bars (the default for targetSdk 35 from Android 15 on;
         // done here on every version): leave room for the system bars and the IME
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -218,16 +170,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         bindService(intent, connection, BIND_AUTO_CREATE)
     }
 
-    /** The activity handles size changes itself: the bar may switch between the row and the list. */
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // The list is as wide as the bar was when it opened
-        list?.dismiss()
-        renderTabs()
-    }
-
     override fun onStop() {
-        list?.dismiss()
         service?.removeListener(this)
         unbindService(connection)
         service = null
@@ -235,7 +178,6 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onDestroy() {
-        list?.dismiss()
         // Sessions outlive the Activity: do not leave them pointing at this view
         screen.attach(null)
         super.onDestroy()
@@ -270,14 +212,15 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onSessionsChanged() {
         val s = service ?: return
         if (current != null && current !in s.sessions) {
+            // The current tab was closed: show the one after it, now in its place (the one before
+            // when it was the last)
             current = null
-            s.sessions.lastOrNull()?.let { show(it) }
+            s.sessions.getOrNull(currentIndex.coerceAtMost(s.sessions.lastIndex))?.let { show(it) }
         }
         if (s.sessions.isEmpty() && s.machine != 0L) {
             // The last tab was closed: the UI exits. The service stays in the background while it
             // still has guest processes (services started by OpenRC and so on), and exits by itself
             // when there are none (the android/service map)
-            list?.dismiss()
             finish()
             return
         }
@@ -330,75 +273,79 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * Shows the tabs: a row of all of them in wide windows, else their number and the current one's
-     * title (and the open list, kept up to date). Called whenever tabs, titles, the current tab or
-     * the window's width change.
+     * Shows the tabs, a number each, the current one boxed and scrolled into view. Called whenever
+     * tabs, titles or the current tab change.
      */
     private fun renderTabs() {
         val sessions = service?.sessions.orEmpty().toList()
-        tabList.items = sessions
-        val wide = resources.configuration.screenWidthDp >= WIDE_DP
-        strip.visibility = if (wide) View.VISIBLE else View.GONE
-        // Invisible rather than gone, so + and ⋮ stay at the right
-        switcher.visibility = when {
-            wide -> View.GONE
-            sessions.isEmpty() -> View.INVISIBLE
-            else -> View.VISIBLE
-        }
-        if (wide || sessions.isEmpty()) list?.dismiss()
         tabs.removeAllViews()
+        sessions.forEachIndexed { i, session -> tabs.addView(tabButton(i, session), barItem()) }
 
-        if (!wide) {
-            val i = sessions.indexOf(current)
-            tabCount.text = "%d".format(sessions.size)
-            tabCount.contentDescription = resources.getQuantityString(R.plurals.tabs, sessions.size, sessions.size)
-            tabTitle.text = if (i < 0) "" else label(i, sessions[i])
-            tabTitle.setTextColor(if (current?.isRunning == false) mutedColor else textColor)
-            return
-        }
-        sessions.forEachIndexed { i, session ->
-            tabs.addView(barButton(label(i, session)) { show(session) }.apply {
-                maxWidth = dp(TAB_MAX_DP)
-                isSingleLine = true
-                ellipsize = TextUtils.TruncateAt.END
-                setTextColor(if (session == current) currentTabColor else mutedColor)
-                setOnLongClickListener { v ->
-                    showTabMenu(v, session)
-                    true
-                }
-            }, barItem())
-        }
+        val shown = current?.takeIf { it in sessions }
+        closeButton.visibility = if (shown == null) View.INVISIBLE else View.VISIBLE
+        if (shown != null) currentIndex = sessions.indexOf(shown)
+
         // Bring the current tab into view once the new row is laid out (this runs after the
         // layout pass that adding the tabs requested)
-        val shown = tabs.getChildAt(sessions.indexOf(current)) ?: return
+        val tab = tabs.getChildAt(sessions.indexOf(shown)) ?: return
         strip.post {
             when {
-                shown.left < strip.scrollX -> strip.smoothScrollTo(shown.left, 0)
-                shown.right > strip.scrollX + strip.width -> strip.smoothScrollTo(shown.right - strip.width, 0)
+                tab.left < strip.scrollX -> strip.smoothScrollTo(tab.left, 0)
+                tab.right > strip.scrollX + strip.width -> strip.smoothScrollTo(tab.right - strip.width, 0)
             }
         }
     }
 
     /**
-     * `N: name`, else `N: title` (`sh` when the program set none), marked once the shell has ended.
+     * A tab in the row: its number in a square as tall as the bar, the current one in the primary
+     * colour and an outlined box, an ended one faded. Tap shows it; a long press shows its title.
      */
-    private fun label(i: Int, session: VtSession): String {
-        val text = "${i + 1}: ${session.name ?: session.title?.takeIf { it.isNotBlank() } ?: "sh"}"
+    private fun tabButton(i: Int, session: VtSession) = TextView(this).apply {
+        text = "%d".format(i + 1)
+        contentDescription = getString(R.string.tab_description, i + 1, title(session))
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        if (session == current) {
+            setTextColor(currentTabColor)
+            background = InsetDrawable(
+                GradientDrawable().apply {
+                    setStroke(dp(2), currentTabColor)
+                    cornerRadius = dp(4).toFloat()
+                },
+                dp(TAB_BOX_INSET_DP),
+            )
+        } else {
+            setTextColor(mutedColor)
+        }
+        if (!session.isRunning) alpha = ENDED_ALPHA
+        foreground = touchFeedback()
+        setOnClickListener { show(session) }
+        setOnLongClickListener {
+            toast?.cancel()
+            toast = Toast.makeText(this@MainActivity, title(session), Toast.LENGTH_SHORT).apply { show() }
+            true
+        }
+    }
+
+    /** The program's title (`sh` when it set none), marked once the shell has ended. */
+    private fun title(session: VtSession): String {
+        val text = session.title?.takeIf { it.isNotBlank() } ?: "sh"
         return if (session.isRunning) text else getString(R.string.tab_ended, text)
     }
 
-    /** A tab in the row or a button, as tall as the bar ([barItem]) with its label centred. */
+    /** A button in the bar: a square as tall as the bar ([barItem]) with its label centred. */
     private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
         text = label
         setTextColor(mutedColor)
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
         gravity = Gravity.CENTER
-        setPadding(dp(12), 0, dp(12), 0)
         background = touchFeedback()
         setOnClickListener(onClick)
     }
 
-    private fun barItem() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    /** A tab or a button: a square as tall as the bar. */
+    private fun barItem() = LinearLayout.LayoutParams(dp(BAR_DP), ViewGroup.LayoutParams.MATCH_PARENT)
 
     /** The theme's ripple for something that can be tapped. */
     private fun touchFeedback(): Drawable? {
@@ -406,8 +353,19 @@ class MainActivity : Activity(), TerminalService.Listener {
         return a.getDrawable(0).also { a.recycle() }
     }
 
+    /** `⋮`: closing the other tabs (none other: disabled) or all of them, and Settings. */
     private fun showMenu(anchor: View) {
+        val sessions = service?.sessions.orEmpty().toList()
+        val others = sessions.filter { it != current }
         PopupMenu(this, anchor).apply {
+            menu.add(R.string.close_other_tabs).apply { isEnabled = others.isNotEmpty() }.setOnMenuItemClickListener {
+                confirmClose(others)
+                true
+            }
+            menu.add(R.string.close_all_tabs).apply { isEnabled = sessions.isNotEmpty() }.setOnMenuItemClickListener {
+                confirmClose(sessions)
+                true
+            }
             menu.add(R.string.menu_settings).setOnMenuItemClickListener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                 true
@@ -416,194 +374,38 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** Opens the list of tabs below the bar: tap a tab to show it, ✕ to close it. */
-    private fun openList() {
-        if (tabList.items.isEmpty()) return
-        list?.dismiss()
-        list = ListPopupWindow(this).apply {
-            anchorView = bar
-            setAdapter(tabList)
-            isModal = true
-            // The IME stays up (the list may cover it), as the terminal still has the input focus
-            inputMethodMode = ListPopupWindow.INPUT_METHOD_NOT_NEEDED
-            setOnItemClickListener { _, _, position, _ ->
-                tabList.items.getOrNull(position)?.let { show(it) }
-                dismiss()
-            }
-            setOnDismissListener { list = null }
-            show()
-            setSelection(tabList.items.indexOf(current).coerceAtLeast(0))
-            // The list view exists once shown
-            listView?.setOnItemLongClickListener { _, row, position, _ ->
-                tabList.items.getOrNull(position)?.let { showTabMenu(row, it) }
-                true
-            }
-        }
-    }
-
     /**
-     * The rows of the list of tabs (list_tab.xml): `N: title`, the current one highlighted in the
-     * theme's secondary container colour, and a close button.
+     * `×` and the menu: closes [targets] at once when all their shells have ended, else after
+     * asking, as closing hangs a shell up and with it, usually, the programs it runs.
      */
-    private inner class TabList : BaseAdapter() {
-        var items: List<VtSession> = emptyList()
-            set(value) {
-                field = value
-                notifyDataSetChanged()
-            }
-
-        private val currentBackground by lazy { themeColor(com.google.android.material.R.attr.colorSecondaryContainer) }
-        private val currentText by lazy { themeColor(com.google.android.material.R.attr.colorOnSecondaryContainer) }
-
-        override fun getCount() = items.size
-
-        override fun getItem(position: Int) = items[position]
-
-        override fun getItemId(position: Int) = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val row = convertView ?: layoutInflater.inflate(R.layout.list_tab, parent, false)
-            val session = items[position]
-            row.findViewById<TextView>(R.id.title).apply {
-                text = label(position, session)
-                setTextColor(
-                    when {
-                        session == current -> currentText
-                        session.isRunning -> textColor
-                        else -> mutedColor
-                    }
-                )
-            }
-            row.setBackgroundColor(if (session == current) currentBackground else Color.TRANSPARENT)
-            row.findViewById<View>(R.id.close).setOnClickListener { close(session) }
-            return row
+    private fun confirmClose(targets: List<VtSession>) {
+        if (targets.none { it.isRunning }) {
+            close(targets)
+            return
         }
-    }
-
-    /**
-     * A horizontal swipe over the switcher shows the next tab (to the left) or the previous one (to
-     * the right); the title follows the finger, with more resistance where there is no tab. Taps and
-     * long presses still reach the switcher's own listeners.
-     */
-    private inner class Swipe : View.OnTouchListener {
-        private val slop = ViewConfiguration.get(this@MainActivity).scaledTouchSlop
-        private var downX = 0f
-        private var downY = 0f
-        private var swiping = false
-
-        // Taps go on to the switcher's own onTouchEvent, which calls performClick
-        @SuppressLint("ClickableViewAccessibility")
-        override fun onTouch(v: View, e: MotionEvent): Boolean {
-            val dx = e.rawX - downX
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = e.rawX
-                    downY = e.rawY
-                    swiping = false
-                    tabTitle.animate().cancel()
-                    tabTitle.translationX = 0f
-                    tabTitle.alpha = 1f
-                }
-
-                MotionEvent.ACTION_MOVE -> {
-                    if (!swiping && abs(dx) > slop && abs(dx) > abs(e.rawY - downY)) {
-                        swiping = true
-                        // A swipe, not a tap: end the switcher's press, so it neither clicks nor
-                        // long-clicks
-                        val cancel = MotionEvent.obtain(e).apply { action = MotionEvent.ACTION_CANCEL }
-                        v.onTouchEvent(cancel)
-                        cancel.recycle()
-                    }
-                    if (swiping) tabTitle.translationX = dx * if (hasTab(dx)) 0.5f else 0.15f
-                }
-
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (swiping) {
-                    swiping = false
-                    val far = e.actionMasked == MotionEvent.ACTION_UP && abs(dx) >= dp(SWIPE_DP)
-                    if (far && switchBy(if (dx < 0) 1 else -1, wrap = false)) {
-                        // The new title comes in from the side the finger moved away from
-                        tabTitle.translationX = if (dx < 0) dp(SWIPE_DP).toFloat() else -dp(SWIPE_DP).toFloat()
-                        tabTitle.alpha = 0f
-                        tabTitle.animate().translationX(0f).alpha(1f).setDuration(SWIPE_MS)
-                    } else {
-                        tabTitle.animate().translationX(0f).setDuration(SWIPE_MS)
-                    }
-                    return true
-                }
-            }
-            return swiping
-        }
-
-        /** Whether a tab lies in the direction of a swipe [dx] (to the left: the next one). */
-        private fun hasTab(dx: Float): Boolean {
-            val sessions = service?.sessions ?: return false
-            val i = sessions.indexOf(current)
-            return i >= 0 && (if (dx < 0) i + 1 else i - 1) in sessions.indices
-        }
-    }
-
-    /**
-     * Shows the tab [delta] places after the current one, going round from the last to the first
-     * when [wrap] is set; false when there is no such tab.
-     */
-    private fun switchBy(delta: Int, wrap: Boolean): Boolean {
-        val sessions = service?.sessions ?: return false
-        val i = sessions.indexOf(current)
-        if (i < 0 || sessions.size < 2) return false
-        val j = if (wrap) Math.floorMod(i + delta, sessions.size) else i + delta
-        if (j !in sessions.indices) return false
-        show(sessions[j])
-        return true
-    }
-
-    /** What a long press on a tab offers: renaming and closing it. */
-    private fun showTabMenu(anchor: View, session: VtSession) {
-        PopupMenu(this, anchor).apply {
-            menu.add(R.string.rename_tab).setOnMenuItemClickListener {
-                list?.dismiss()
-                rename(session)
-                true
-            }
-            menu.add(R.string.close_tab).setOnMenuItemClickListener {
-                close(session)
-                true
-            }
-            show()
-        }
-    }
-
-    /**
-     * Asks for a tab's name (dialog_rename.xml); an empty one shows the program's title again,
-     * which is the field's placeholder.
-     */
-    // A dialog's view has no parent to inflate it into
-    @SuppressLint("InflateParams")
-    private fun rename(session: VtSession) {
-        val view = layoutInflater.inflate(R.layout.dialog_rename, null)
-        view.findViewById<TextInputLayout>(R.id.field).placeholderText =
-            session.title?.takeIf { it.isNotBlank() } ?: "sh"
-        val input = view.findViewById<TextInputEditText>(R.id.name).apply {
-            setText(session.name.orEmpty())
-            selectAll()
-        }
-        val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.rename_tab)
-            .setView(view)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                service?.renameSession(session, input.text?.toString().orEmpty())
+        val one = targets.size == 1
+        MaterialAlertDialogBuilder(this)
+            .setTitle(
+                if (one) getString(R.string.close_tab_title)
+                else resources.getQuantityString(R.plurals.close_tabs_title, targets.size, targets.size)
+            )
+            .setMessage(if (one) R.string.close_tab_message else R.string.close_tabs_message)
+            .setPositiveButton(R.string.close) { _, _ ->
+                // Some may have been closed meanwhile (their kernel restarting)
+                close(targets.filter { service?.sessions?.contains(it) == true })
             }
             .setNegativeButton(android.R.string.cancel, null)
-            .create()
-        input.setOnEditorActionListener { _, action, _ ->
-            if (action != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
-            dialog.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
-            true
-        }
-        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
-        // The terminal takes the keyboard again
-        dialog.setOnDismissListener { screen.requestFocus() }
-        dialog.show()
-        input.requestFocus()
+            // The terminal takes the keyboard again
+            .setOnDismissListener { screen.requestFocus() }
+            .show()
+    }
+
+    /**
+     * Closes [targets], the current tab last: closed earlier, it would have another tab shown (and
+     * its shell started) only to close that one too.
+     */
+    private fun close(targets: List<VtSession>) {
+        targets.sortedBy { it == current }.forEach { close(it) }
     }
 
     private fun close(session: VtSession) {
@@ -635,13 +437,21 @@ class MainActivity : Activity(), TerminalService.Listener {
         // Holding Ctrl+Tab keeps switching; holding the others acts once
         val first = event.repeatCount == 0
         when {
-            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1, wrap = true)
+            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
             !event.isShiftPressed -> return false
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
             event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
             else -> return false
         }
         return true
+    }
+
+    /** Shows the tab [delta] places after the current one, going round from the last to the first. */
+    private fun switchBy(delta: Int) {
+        val sessions = service?.sessions ?: return
+        val i = sessions.indexOf(current)
+        if (i < 0 || sessions.size < 2) return
+        show(sessions[Math.floorMod(i + delta, sessions.size)])
     }
 
     /** Lists the tab shortcuts in the system's keyboard shortcuts screen (Meta+/). */
@@ -703,28 +513,22 @@ class MainActivity : Activity(), TerminalService.Listener {
     companion object {
         private const val PREF_FONT_SIZE = "font_size"
 
-        /** The tab bar's height. */
+        /** The tab bar's height, and the side of its tabs and buttons. */
         private const val BAR_DP = 32
 
         /**
-         * The size of the tab bar's labels: tabs, the switcher's title and the buttons. In dp, not
-         * sp: the bar's height is fixed, so its labels ignore the system font scale.
+         * The size of the tab bar's buttons' labels. In dp, not sp: the bar's height is fixed, so
+         * its labels ignore the system font scale.
          */
         private const val BAR_LABEL_DP = 14f
 
-        /** The size of the number in the switcher's box (dp, like [BAR_LABEL_DP]). */
-        private const val TAB_COUNT_DP = 12f
+        /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
+        private const val TAB_NUMBER_DP = 12f
 
-        /** From this window width (dp, the usual tablet breakpoint) the bar lists every tab in a row. */
-        private const val WIDE_DP = 600
+        /** How far the current tab's box lies inside its square (dp), leaving a 20 dp box. */
+        private const val TAB_BOX_INSET_DP = 6
 
-        /** The widest a tab in the row gets; longer titles end in "…". */
-        private const val TAB_MAX_DP = 220
-
-        /** How far (dp) a swipe over the switcher goes to change tabs. */
-        private const val SWIPE_DP = 48
-
-        /** How long the title takes to slide into place after a swipe. */
-        private const val SWIPE_MS = 150L
+        /** The opacity of an ended tab's number (Material's disabled content). */
+        private const val ENDED_ALPHA = 0.38f
     }
 }

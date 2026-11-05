@@ -17,16 +17,20 @@
     <string name="listening_direct">同一网络里的其他设备连得上它。</string>
     <string name="new_tab">新建标签页</string>
     <string name="close_tab">关闭标签页</string>
-    <string name="rename_tab">重命名标签页</string>
-    <string name="rename_tab_hint">留空则显示程序设置的标题。</string>
-    <string name="tab_name">名称</string>
+    <string name="close_tab_title">关闭这个标签页？</string>
+    <string name="close_tab_message">关闭会挂断它的 shell，其中运行的程序通常也会随之结束。</string>
+    <string name="close">关闭</string>
+    <string name="close_other_tabs">关闭其他标签页</string>
+    <string name="close_all_tabs">关闭全部标签页</string>
+    <plurals name="close_tabs_title">
+        <item quantity="other">关闭 %d 个标签页？</item>
+    </plurals>
+    <string name="close_tabs_message">关闭会挂断它们的 shell，其中运行的程序通常也会随之结束。</string>
     <string name="next_tab">下一个标签页</string>
     <string name="previous_tab">上一个标签页</string>
     <string name="shortcuts_tabs">标签页</string>
     <string name="tab_ended">%1$s（已结束）</string>
-    <plurals name="tabs">
-        <item quantity="other">%d 个标签页</item>
-    </plurals>
+    <string name="tab_description">标签页 %1$d：%2$s</string>
     <string name="menu_settings">设置</string>
     <string name="settings">设置</string>
     <string name="navigate_up">返回</string>
