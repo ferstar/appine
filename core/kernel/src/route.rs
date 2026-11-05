@@ -98,61 +98,10 @@ pub(crate) struct Entry {
     pub host: bool,
 }
 
-/// The first `prefix` bits of `addr`, with the rest cleared.
-pub(crate) fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
-    addr.iter()
-        .enumerate()
-        .map(|(i, &b)| {
-            let keep = (prefix as usize).saturating_sub(i * 8).min(8);
-            if keep == 0 {
-                0
-            } else {
-                b & (0xff << (8 - keep))
-            }
-        })
-        .collect()
-}
-
-/// The broadcast address of an IPv4 subnet: all ones after the first `prefix` bits.
-fn broadcast(addr: &[u8], prefix: u8) -> Vec<u8> {
-    let mask = u32::MAX.checked_shr(prefix as u32).unwrap_or(0);
-    (u32::from_be_bytes(addr.try_into().unwrap()) | mask)
-        .to_be_bytes()
-        .to_vec()
-}
-
-fn bit(addr: &[u8], n: usize) -> u8 {
-    (addr[n / 8] >> (7 - n % 8)) & 1
-}
-
-/// The order of two routes of the same table in Linux's dumps (module docs).
-fn order(a: &Entry, b: &Entry) -> Ordering {
-    if a.family == AF_INET {
-        let key = |e: &Entry| u32::from_be_bytes(e.dst[..4].try_into().unwrap());
-        return key(a).cmp(&key(b)).then(b.prefix.cmp(&a.prefix));
-    }
-    let common = a.prefix.min(b.prefix) as usize;
-    (0..common)
-        .map(|n| bit(&a.dst, n).cmp(&bit(&b.dst, n)))
-        .find(|o| o.is_ne())
-        .unwrap_or_else(|| b.prefix.cmp(&a.prefix))
-}
-
-/// The interface the host uses for sending to the internet ([`crate::traffic`]'s default
-/// interface), or None when there is no route for this address family.
-fn default_iface(ifaces: &[Interface], family: i32) -> Option<&Interface> {
-    owner(ifaces, &crate::traffic::outgoing_source(family)?)
-}
-
-/// The interface that has address `ip`.
-fn owner<'a>(ifaces: &'a [Interface], ip: &[u8]) -> Option<&'a Interface> {
-    ifaces
-        .iter()
-        .find(|i| i.addrs.iter().any(|(_, a, _)| a == ip))
-}
-
-fn up(ifaces: &[Interface]) -> impl Iterator<Item = &Interface> {
-    ifaces.iter().filter(|i| i.flags & IFF_UP != 0)
+/// The routes of the host's main table: the ones the host handed over
+/// ([`crate::Machine::set_routes`]), otherwise the host's own read directly.
+pub(crate) fn host_routes(k: &crate::kernel::Kernel) -> Option<Vec<Route>> {
+    k.host_routes.clone().or_else(appine_hal::net::routes)
 }
 
 /// All routes of the main and local tables, in Linux's dump order: IPv4 main and local, then IPv6
@@ -307,6 +256,24 @@ pub(crate) fn tables(ifaces: &[Interface], host: Option<Vec<Route>>) -> Vec<Entr
     all
 }
 
+fn up(ifaces: &[Interface]) -> impl Iterator<Item = &Interface> {
+    ifaces.iter().filter(|i| i.flags & IFF_UP != 0)
+}
+
+/// The interface the host uses for sending to the internet ([`crate::traffic`]'s default
+/// interface), or None when there is no route for this address family.
+fn default_iface(ifaces: &[Interface], family: i32) -> Option<&Interface> {
+    owner(ifaces, &crate::traffic::outgoing_source(family)?)
+}
+
+/// The broadcast address of an IPv4 subnet: all ones after the first `prefix` bits.
+fn broadcast(addr: &[u8], prefix: u8) -> Vec<u8> {
+    let mask = u32::MAX.checked_shr(prefix as u32).unwrap_or(0);
+    (u32::from_be_bytes(addr.try_into().unwrap()) | mask)
+        .to_be_bytes()
+        .to_vec()
+}
+
 /// Merges two sets of routes (each in Linux's order): sorted by address family (IPv4 first),
 /// table number and order within the table ([`order`]), keeping equal ones in their original
 /// order (`a`'s before `b`'s).
@@ -323,42 +290,24 @@ pub(crate) fn merge(a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
     all
 }
 
-/// The routes of the host's main table: the ones the host handed over
-/// ([`crate::Machine::set_routes`]), otherwise the host's own read directly.
-pub(crate) fn host_routes(k: &crate::kernel::Kernel) -> Option<Vec<Route>> {
-    k.host_routes.clone().or_else(appine_hal::net::routes)
+/// The order of two routes of the same table in Linux's dumps (module docs).
+fn order(a: &Entry, b: &Entry) -> Ordering {
+    if a.family == AF_INET {
+        let key = |e: &Entry| u32::from_be_bytes(e.dst[..4].try_into().unwrap());
+        return key(a).cmp(&key(b)).then(b.prefix.cmp(&a.prefix));
+    }
+    let common = a.prefix.min(b.prefix) as usize;
+    (0..common)
+        .map(|n| bit(&a.dst, n).cmp(&bit(&b.dst, n)))
+        .find(|o| o.is_ne())
+        .unwrap_or_else(|| b.prefix.cmp(&a.prefix))
+}
+
+fn bit(addr: &[u8], n: usize) -> u8 {
+    (addr[n / 8] >> (7 - n % 8)) & 1
 }
 
 // ---- netlink ----
-
-fn put(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
-    crate::net::attr(b, ty, data);
-}
-
-/// struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
-#[allow(clippy::too_many_arguments)]
-fn rtmsg(
-    family: i32,
-    dst_len: u8,
-    src_len: u8,
-    table: u8,
-    proto: u8,
-    scope: u8,
-    ty: u8,
-    flags: u32,
-) -> Vec<u8> {
-    let mut p = vec![family as u8, dst_len, src_len, 0, table, proto, scope, ty];
-    p.extend_from_slice(&flags.to_le_bytes());
-    p
-}
-
-/// struct rta_cacheinfo: clntref, lastuse, expires, error, used, id, ts, tsage. In the answer of
-/// `ip route get` clntref is the cache entry's reference count, set to 2, the usual value on Linux.
-fn cacheinfo(clntref: u32) -> [u8; 32] {
-    let mut c = [0u8; 32];
-    c[..4].copy_from_slice(&clntref.to_le_bytes());
-    c
-}
 
 /// One route in a dump (Linux's `fib_dump_info`, `rt6_fill_node`).
 pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
@@ -388,66 +337,6 @@ pub(crate) fn route_message(e: &Entry) -> Vec<u8> {
         put(&mut p, RTA_PREF, &[0]);
     }
     p
-}
-
-/// The attributes in a message: (type, payload).
-pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
-    let mut out = Vec::new();
-    while b.len() >= 4 {
-        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
-        if len < 4 || len > b.len() {
-            break;
-        }
-        out.push((u16::from_le_bytes([b[2], b[3]]) & 0x3fff, &b[4..len]));
-        b = &b[len.next_multiple_of(4).min(b.len())..];
-    }
-    out
-}
-
-/// The route in `entries` with the longest prefix containing `ip`; among equally long ones the
-/// lowest metric (among equal ones the first).
-fn longest_match<'a>(entries: impl Iterator<Item = &'a Entry>, ip: &[u8]) -> Option<&'a Entry> {
-    entries
-        .filter(|e| e.dst.len() == ip.len() && network(ip, e.prefix) == e.dst)
-        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
-}
-
-/// The source address when there is no preferred source (`inet_select_addr`, with IPv6 roughly
-/// following `ipv6_dev_get_saddr`): an address on the output interface in the same subnet as the
-/// gateway (the destination when there is none), then another address on it, then one on another
-/// interface; link-local addresses are not taken unless they are the only ones on the output
-/// interface.
-fn select_source(ifaces: &[Interface], route: &Entry, dst: &[u8]) -> Option<Vec<u8>> {
-    let toward = route.gateway.as_deref().unwrap_or(dst);
-    let family = route.family;
-    let usable = |a: &Vec<u8>| !(family == AF_INET6 && a[0] == 0xfe && a[1] & 0xc0 == 0x80);
-    let of = |i: &Interface| -> Vec<(Vec<u8>, u8)> {
-        i.addrs
-            .iter()
-            .filter(|(f, ..)| *f == family)
-            .map(|(_, a, p)| (a.clone(), *p))
-            .collect()
-    };
-    let out = ifaces.iter().find(|i| i.index == route.index);
-    if let Some(o) = out {
-        let mine = of(o);
-        if let Some((a, _)) = mine
-            .iter()
-            .find(|(a, p)| usable(a) && network(a, *p) == network(toward, *p))
-        {
-            return Some(a.clone());
-        }
-        if let Some((a, _)) = mine.iter().find(|(a, _)| usable(a)) {
-            return Some(a.clone());
-        }
-    }
-    let others = ifaces
-        .iter()
-        .filter(|i| i.flags & IFF_LOOPBACK == 0)
-        .flat_map(of)
-        .find(|(a, _)| usable(a))
-        .map(|(a, _)| a);
-    others.or_else(|| out.and_then(|o| of(o).into_iter().next().map(|(a, _)| a)))
 }
 
 /// `ip route get`: answers the single `RTM_GETROUTE` query `req` (the whole message, attributes
@@ -647,6 +536,91 @@ pub(crate) fn get(
     Ok(p)
 }
 
+/// The attributes in a message: (type, payload).
+pub(crate) fn attrs(mut b: &[u8]) -> Vec<(u16, &[u8])> {
+    let mut out = Vec::new();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            break;
+        }
+        out.push((u16::from_le_bytes([b[2], b[3]]) & 0x3fff, &b[4..len]));
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    out
+}
+
+/// The route in `entries` with the longest prefix containing `ip`; among equally long ones the
+/// lowest metric (among equal ones the first).
+fn longest_match<'a>(entries: impl Iterator<Item = &'a Entry>, ip: &[u8]) -> Option<&'a Entry> {
+    entries
+        .filter(|e| e.dst.len() == ip.len() && network(ip, e.prefix) == e.dst)
+        .min_by_key(|e| (std::cmp::Reverse(e.prefix), e.metric))
+}
+
+/// The source address when there is no preferred source (`inet_select_addr`, with IPv6 roughly
+/// following `ipv6_dev_get_saddr`): an address on the output interface in the same subnet as the
+/// gateway (the destination when there is none), then another address on it, then one on another
+/// interface; link-local addresses are not taken unless they are the only ones on the output
+/// interface.
+fn select_source(ifaces: &[Interface], route: &Entry, dst: &[u8]) -> Option<Vec<u8>> {
+    let toward = route.gateway.as_deref().unwrap_or(dst);
+    let family = route.family;
+    let usable = |a: &Vec<u8>| !(family == AF_INET6 && a[0] == 0xfe && a[1] & 0xc0 == 0x80);
+    let of = |i: &Interface| -> Vec<(Vec<u8>, u8)> {
+        i.addrs
+            .iter()
+            .filter(|(f, ..)| *f == family)
+            .map(|(_, a, p)| (a.clone(), *p))
+            .collect()
+    };
+    let out = ifaces.iter().find(|i| i.index == route.index);
+    if let Some(o) = out {
+        let mine = of(o);
+        if let Some((a, _)) = mine
+            .iter()
+            .find(|(a, p)| usable(a) && network(a, *p) == network(toward, *p))
+        {
+            return Some(a.clone());
+        }
+        if let Some((a, _)) = mine.iter().find(|(a, _)| usable(a)) {
+            return Some(a.clone());
+        }
+    }
+    let others = ifaces
+        .iter()
+        .filter(|i| i.flags & IFF_LOOPBACK == 0)
+        .flat_map(of)
+        .find(|(a, _)| usable(a))
+        .map(|(a, _)| a);
+    others.or_else(|| out.and_then(|o| of(o).into_iter().next().map(|(a, _)| a)))
+}
+
+/// struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags.
+#[allow(clippy::too_many_arguments)]
+fn rtmsg(
+    family: i32,
+    dst_len: u8,
+    src_len: u8,
+    table: u8,
+    proto: u8,
+    scope: u8,
+    ty: u8,
+    flags: u32,
+) -> Vec<u8> {
+    let mut p = vec![family as u8, dst_len, src_len, 0, table, proto, scope, ty];
+    p.extend_from_slice(&flags.to_le_bytes());
+    p
+}
+
+/// struct rta_cacheinfo: clntref, lastuse, expires, error, used, id, ts, tsage. In the answer of
+/// `ip route get` clntref is the cache entry's reference count, set to 2, the usual value on Linux.
+fn cacheinfo(clntref: u32) -> [u8; 32] {
+    let mut c = [0u8; 32];
+    c[..4].copy_from_slice(&clntref.to_le_bytes());
+    c
+}
+
 const FRA_PRIORITY: u16 = 6;
 const FRA_SUPPRESS_PREFIXLEN: u16 = 14;
 const FRA_TABLE: u16 = 15;
@@ -683,6 +657,34 @@ pub(crate) fn rule_messages(family: i32) -> Vec<Vec<u8>> {
             p
         })
         .collect()
+}
+
+fn put(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
+    crate::net::attr(b, ty, data);
+}
+
+// ---- Shared helpers ----
+
+/// The first `prefix` bits of `addr`, with the rest cleared.
+pub(crate) fn network(addr: &[u8], prefix: u8) -> Vec<u8> {
+    addr.iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let keep = (prefix as usize).saturating_sub(i * 8).min(8);
+            if keep == 0 {
+                0
+            } else {
+                b & (0xff << (8 - keep))
+            }
+        })
+        .collect()
+}
+
+/// The interface that has address `ip`.
+fn owner<'a>(ifaces: &'a [Interface], ip: &[u8]) -> Option<&'a Interface> {
+    ifaces
+        .iter()
+        .find(|i| i.addrs.iter().any(|(_, a, _)| a == ip))
 }
 
 // ---- /proc/net ----

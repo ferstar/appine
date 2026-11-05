@@ -94,38 +94,6 @@ pub struct PortMap {
     events: VecDeque<ListenEvent>,
 }
 
-/// A mapping a socket holds bound: returned on drop (the last return removes the registration).
-pub struct Lease {
-    map: Rc<RefCell<PortMap>>,
-    key: Key,
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let mut m = self.map.borrow_mut();
-        let Some(e) = m.entries.get_mut(&self.key) else {
-            return;
-        };
-        e.refs -= 1;
-        if e.refs == 0 {
-            let host = e.host;
-            m.entries.remove(&self.key);
-            let (ns, proto, port, _) = self.key;
-            let now = Instant::now();
-            m.by_host
-                .retain(|_, (_, t)| t.is_none_or(|t| now.duration_since(t) < LINGER));
-            if let Some(v) = m.by_host.get_mut(&(ns, proto, host))
-                && v.0 == port
-            {
-                v.1 = Some(now);
-            }
-            m.released
-                .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
-            m.released.insert(self.key, (host, now));
-        }
-    }
-}
-
 impl PortMap {
     pub fn new() -> PortMap {
         PortMap {
@@ -187,6 +155,38 @@ impl PortMap {
 impl Default for PortMap {
     fn default() -> Self {
         PortMap::new()
+    }
+}
+
+/// A mapping a socket holds bound: returned on drop (the last return removes the registration).
+pub struct Lease {
+    map: Rc<RefCell<PortMap>>,
+    key: Key,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut m = self.map.borrow_mut();
+        let Some(e) = m.entries.get_mut(&self.key) else {
+            return;
+        };
+        e.refs -= 1;
+        if e.refs == 0 {
+            let host = e.host;
+            m.entries.remove(&self.key);
+            let (ns, proto, port, _) = self.key;
+            let now = Instant::now();
+            m.by_host
+                .retain(|_, (_, t)| t.is_none_or(|t| now.duration_since(t) < LINGER));
+            if let Some(v) = m.by_host.get_mut(&(ns, proto, host))
+                && v.0 == port
+            {
+                v.1 = Some(now);
+            }
+            m.released
+                .retain(|_, (_, t)| now.duration_since(*t) < STICKY);
+            m.released.insert(self.key, (host, now));
+        }
     }
 }
 

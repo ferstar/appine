@@ -32,6 +32,13 @@ pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 pub const SOCK_RAW: i32 = 3;
 
+pub(crate) const IPPROTO_ICMP: i32 = 1;
+pub(crate) const IPPROTO_TCP: i32 = 6;
+pub(crate) const IPPROTO_UDP: i32 = 17;
+/// The protocol number of MPTCP (the third argument of `socket(2)`, reported by `SO_PROTOCOL`).
+pub(crate) const IPPROTO_MPTCP: i32 = 262;
+const IPPROTO_ICMPV6: i32 = 58;
+
 /// A guest socket.
 pub(crate) enum Socket {
     Inet(InetSocket),
@@ -241,42 +248,967 @@ impl Drop for InetSocket {
     }
 }
 
+// ---- DNS stub ----
+
+/// The IPv4 address of the DNS stub, 127.0.0.53.
+const STUB_V4: [u8; 4] = [127, 0, 0, 53];
+
+/// Whether an address is that of the DNS stub (`127.0.0.53:53`, or its IPv4-mapped IPv6 address).
+pub fn is_stub(addr: &[u8]) -> bool {
+    if addr.len() < 8 || addr[2..4] != 53u16.to_be_bytes() {
+        return false;
+    }
+    match u16::from_le_bytes([addr[0], addr[1]]) as i32 {
+        AF_INET => addr[4..8] == STUB_V4,
+        AF_INET6 if addr.len() >= 24 => {
+            addr[8..18] == [0; 10] && addr[18..20] == [0xff, 0xff] && addr[20..24] == STUB_V4
+        }
+        _ => false,
+    }
+}
+
+/// The DNS stub's sockaddr, encoded for the socket's address family.
+pub fn stub_addr(family: i32) -> Vec<u8> {
+    use std::net::{Ipv4Addr, SocketAddr};
+    let v4 = Ipv4Addr::from(STUB_V4);
+    let addr = if family == AF_INET6 {
+        SocketAddr::new(v4.to_ipv6_mapped().into(), 53)
+    } else {
+        SocketAddr::new(v4.into(), 53)
+    };
+    appine_hal::net::sockaddr(addr)
+}
+
+/// The answer given to the guest when resolution fails: the query brought back as is, with the
+/// QR and RA bits set and RCODE SERVFAIL, so the resolver fails at once instead of waiting for a
+/// timeout.
+pub fn servfail(query: &[u8]) -> Vec<u8> {
+    let mut r = query.to_vec();
+    if r.len() >= 4 {
+        r[2] |= 0x80;
+        r[3] = (r[3] & 0x70) | 0x80 | 2;
+    }
+    r
+}
+
+// ---- netlink ----
+
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_MULTI: u16 = 2;
+const NLM_F_ACK: u16 = 4;
+const NLM_F_DUMP: u16 = 0x300;
+const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+const RTM_GETNEIGH: u16 = 30;
+const RTM_NEWRULE: u16 = 32;
+const RTM_GETRULE: u16 = 34;
+const RTM_NEWNSID: u16 = 88;
+const RTM_GETNSID: u16 = 90;
+const NETNSA_NSID: u16 = 1;
+/// RTM_GETNSID looks up a network namespace by process ([`Host::peer_net`]).
+pub(crate) const NETNSA_PID: u16 = 2;
+/// RTM_GETNSID looks up a network namespace by namespace file.
+pub(crate) const NETNSA_FD: u16 = 3;
+const NETNSA_TARGET_NSID: u16 = 4;
+const IFLA_ADDRESS: u16 = 1;
+const IFLA_BROADCAST: u16 = 2;
+const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
+const IFLA_QDISC: u16 = 6;
+const IFLA_STATS: u16 = 7;
+const IFLA_TXQLEN: u16 = 13;
+const IFLA_OPERSTATE: u16 = 16;
+const IFLA_LINKMODE: u16 = 17;
+const IFLA_STATS64: u16 = 23;
+const IFLA_GROUP: u16 = 27;
+const IFLA_PROMISCUITY: u16 = 30;
+const IFLA_NUM_TX_QUEUES: u16 = 31;
+const IFLA_NUM_RX_QUEUES: u16 = 32;
+const IFLA_CARRIER: u16 = 33;
+const IFLA_PROTO_DOWN: u16 = 39;
+const IFLA_MASTER: u16 = 10;
+const IFLA_LINKINFO: u16 = 18;
+/// The largest datagram of a dump: split into several when there are many interfaces (musl's
+/// if_nameindex and others use an 8 KiB buffer).
+const DUMP_CHUNK: usize = 8192;
+/// `IF_OPER_*` (RFC 2863 interface states).
+const IF_OPER_UNKNOWN: u8 = 0;
+const IF_OPER_DOWN: u8 = 2;
+const IF_OPER_UP: u8 = 6;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const IFA_LABEL: u16 = 3;
+const IFA_BROADCAST: u16 = 4;
+const IFA_CACHEINFO: u16 = 6;
+const IFA_FLAGS: u16 = 8;
+const IFA_PROTO: u16 = 11;
+/// Addresses added by the kernel: the loopback interface's `::1` and autoconfigured link-local
+/// addresses (`IFAPROT_KERNEL_*`).
+const IFAPROT_KERNEL_LO: u8 = 1;
+const IFAPROT_KERNEL_LL: u8 = 3;
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
+const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_RUNNING: u32 = 0x40;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
+const RT_SCOPE_HOST: u8 = 254;
+/// The address never expires (not a temporary address from DHCP or SLAAC).
+const IFA_F_PERMANENT: u8 = 0x80;
+/// The protocol number of NETLINK_ROUTE.
+pub const NETLINK_ROUTE: i32 = 0;
+/// The protocol number of NETLINK_KOBJECT_UEVENT: hotplug events sent by the kernel.
+pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
+/// The protocol number of NETLINK_GENERIC.
+pub const NETLINK_GENERIC: i32 = 16;
+/// The protocol number of NETLINK_NETFILTER (nftables, [`crate::nft`]).
+pub const NETLINK_NETFILTER: i32 = 12;
+
+/// A netlink socket emulated in process. Only `NETLINK_ROUTE` answers queries; a
+/// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
+/// other protocols cannot be created (`syscall::net::socket`).
+pub(crate) struct NetlinkSocket {
+    pub protocol: i32,
+    /// `nl_pid`: assigned on bind.
+    pub pid: u32,
+    /// Answers waiting for the guest to read them, one datagram per item.
+    pub queue: VecDeque<Vec<u8>>,
+    /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
+    pub arrivals: u64,
+    /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
+    pub rcvtimeo: Option<Duration>,
+    /// The new network namespace it was created in, if any (its lo is answered and configured).
+    pub net: Option<Rc<crate::nsproxy::NetNs>>,
+    /// `NETLINK_EXT_ACK`: error acks carry the extack message (iproute2 prints it as
+    /// `Error: ….`).
+    pub ext_ack: bool,
+    /// `NETLINK_CAP_ACK`: error acks carry only the request's message header.
+    pub cap_ack: bool,
+}
+
+impl NetlinkSocket {
+    pub fn new(protocol: i32) -> NetlinkSocket {
+        NetlinkSocket {
+            protocol,
+            pid: 0,
+            queue: VecDeque::new(),
+            arrivals: 0,
+            rcvtimeo: None,
+            net: None,
+            ext_ack: false,
+            cap_ack: false,
+        }
+    }
+
+    /// Handles one datagram from the guest (which may hold several requests) and queues the
+    /// answers.
+    pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
+        // An nftables batch spans several messages, so the whole datagram is handled together
+        if self.protocol == NETLINK_NETFILTER {
+            let peer = crate::nft::Peer {
+                pid: self.pid,
+                ext_ack: self.ext_ack,
+                cap_ack: self.cap_ack,
+                proc_pid: 0,
+                comm: b"",
+            };
+            for d in host.netfilter(data, &peer) {
+                self.queue.push_back(d);
+                self.arrivals += 1;
+            }
+            return;
+        }
+        if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
+            return;
+        }
+        let mut off = 0;
+        while off + 16 <= data.len() {
+            let h = &data[off..];
+            let len = u32::from_le_bytes(h[..4].try_into().unwrap()) as usize;
+            if len < 16 || off + len > data.len() {
+                break;
+            }
+            let answers = if self.protocol == NETLINK_GENERIC {
+                generic_request(&h[..len], self.pid)
+            } else {
+                self.route_request(&h[..len], host)
+            };
+            for d in answers {
+                self.queue.push_back(d);
+                self.arrivals += 1;
+            }
+            off += len.next_multiple_of(4);
+        }
+    }
+
+    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning the datagrams.
+    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
+        let ty = u16::from_le_bytes([req[4], req[5]]);
+        let flags = u16::from_le_bytes([req[6], req[7]]);
+        let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+        let family = req.get(16).copied().unwrap_or(0) as i32;
+        let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
+        let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
+        let dump = flags & NLM_F_DUMP != 0;
+        if let Some(r) = host.configure(req) {
+            return match r {
+                Err(f) => vec![ack_ext(
+                    req,
+                    f.errno,
+                    self.pid,
+                    f.msg.filter(|_| self.ext_ack),
+                    self.cap_ack,
+                )],
+                Ok(()) if flags & NLM_F_ACK != 0 => vec![ack(req, 0, self.pid)],
+                Ok(()) => Vec::new(),
+            };
+        }
+        let one = |l: &Link| match l {
+            Link::Host(i) => link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name)),
+            Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
+        };
+        match ty {
+            // As on Linux, the interfaces are one datagram (split into several when too large);
+            // the addresses one per address family (IPv4 first for AF_UNSPEC), and NLMSG_DONE
+            // another one. When filtering by IFLA_MASTER or IFLA_LINKINFO's kind, the messages
+            // carry NLM_F_DUMP_FILTERED (Linux's rtnl_dump_ifinfo)
+            RTM_GETLINK if dump => {
+                const NLM_F_DUMP_FILTERED: u16 = 0x20;
+                let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
+                let master = attrs
+                    .iter()
+                    .find(|(t, d)| *t == IFLA_MASTER && d.len() >= 4)
+                    .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
+                    .filter(|&m| m != 0);
+                let kind = attrs
+                    .iter()
+                    .find(|(t, _)| *t == IFLA_LINKINFO)
+                    .and_then(|(_, d)| {
+                        crate::route::attrs(d)
+                            .into_iter()
+                            .find(|(t, _)| *t == 1)
+                            .map(|(_, k)| k.split(|&c| c == 0).next().unwrap_or_default().to_vec())
+                    })
+                    .filter(|k| matches!(&k[..], b"bridge" | b"veth" | b"dummy"));
+                let filtered = master.is_some() || kind.is_some();
+                let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                let mut cur = Vec::new();
+                for l in &host.links() {
+                    let keep = match l {
+                        Link::Host(_) => master.is_none() && kind.is_none(),
+                        Link::Virt(v, _) => {
+                            master.is_none_or(|m| v.master == Some(m))
+                                && kind
+                                    .as_deref()
+                                    .is_none_or(|k| k == v.kind.name().as_bytes())
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
+                    let m = reply(RTM_NEWLINK, mflags, &one(l));
+                    if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                    cur.extend(m);
+                }
+                if !cur.is_empty() {
+                    out.push(cur);
+                }
+                out.push(done());
+                out
+            }
+            RTM_GETADDR if dump => {
+                let links = host.links();
+                let mut out = Vec::new();
+                for f in [AF_INET, AF_INET6] {
+                    if family != 0 && family != f {
+                        continue;
+                    }
+                    let d: Vec<u8> = links
+                        .iter()
+                        .flat_map(|l| match l {
+                            Link::Host(i) => addr_messages(i, f as u8),
+                            Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
+                        })
+                        .flat_map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m))
+                        .collect();
+                    if !d.is_empty() {
+                        out.push(d);
+                    }
+                }
+                out.push(done());
+                out
+            }
+            // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
+            // rtnl_getlink)
+            RTM_GETLINK => {
+                const ENODEV: i32 = 19;
+                let index = req
+                    .get(20..24)
+                    .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
+                let name = crate::route::attrs(req.get(32..).unwrap_or_default())
+                    .into_iter()
+                    .find(|(t, _)| *t == IFLA_IFNAME)
+                    .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
+                if index <= 0 && name.is_none() {
+                    return vec![ack(req, EINVAL, self.pid)];
+                }
+                let found = host.links().into_iter().find(|l| {
+                    if index > 0 {
+                        l.index() as i32 == index
+                    } else {
+                        name.as_deref() == Some(l.name())
+                    }
+                });
+                let Some(l) = found else {
+                    return vec![ack(req, ENODEV, self.pid)];
+                };
+                let mut out = vec![reply(RTM_NEWLINK, 0, &one(&l))];
+                if flags & NLM_F_ACK != 0 {
+                    out.push(ack(req, 0, self.pid));
+                }
+                out
+            }
+            // As on Linux, the routes of each address family are one datagram, and NLMSG_DONE
+            // another one
+            RTM_GETROUTE if dump => {
+                let entries = host.tables();
+                let mut out = Vec::new();
+                for f in [AF_INET, AF_INET6] {
+                    let d: Vec<u8> = entries
+                        .iter()
+                        .filter(|e| e.family == f && (family == 0 || family == f))
+                        .flat_map(|e| {
+                            reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e))
+                        })
+                        .collect();
+                    if !d.is_empty() {
+                        out.push(d);
+                    }
+                }
+                out.push(done());
+                out
+            }
+            RTM_GETROUTE => {
+                let ifaces = host.all_interfaces();
+                let entries = host.tables();
+                match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
+                    Ok(p) => {
+                        let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
+                        if flags & NLM_F_ACK != 0 {
+                            out.push(ack(req, 0, self.pid));
+                        }
+                        out
+                    }
+                    Err(e) => vec![ack(req, e, self.pid)],
+                }
+            }
+            // The rules fit in one datagram, and NLMSG_DONE is another one
+            RTM_GETRULE if dump => {
+                const EAFNOSUPPORT: i32 = 97;
+                let rules = crate::route::rule_messages(family);
+                if rules.is_empty() {
+                    return vec![ack(req, EAFNOSUPPORT, self.pid)];
+                }
+                let d = rules
+                    .iter()
+                    .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
+                    .collect();
+                vec![d, done()]
+            }
+            // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
+            // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
+            // RTM_NEWNSID is EOPNOTSUPP; when the other namespace is found the assigned number is
+            // answered, -1 when unassigned (NETNSA_NSID_NOT_ASSIGNED), and lookups by number never
+            // find anything. The order is the same as Linux's rtnl_net_getid
+            RTM_GETNSID => {
+                let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
+                let get = |t| {
+                    attrs
+                        .iter()
+                        .find(|(a, d)| *a == t && d.len() >= 4)
+                        .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
+                };
+                let peer = if let Some(pid) = get(NETNSA_PID) {
+                    host.peer_net(NETNSA_PID, pid)
+                } else if let Some(fd) = get(NETNSA_FD) {
+                    host.peer_net(NETNSA_FD, fd)
+                } else if get(NETNSA_NSID).is_some() {
+                    Err(ENOENT)
+                } else {
+                    Err(EINVAL)
+                };
+                let r = peer.and_then(|id| match get(NETNSA_TARGET_NSID) {
+                    Some(_) => Err(EINVAL),
+                    None => Ok(id),
+                });
+                match r {
+                    Ok(id) => {
+                        let mut p = vec![0u8; 4];
+                        attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
+                        let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
+                        if flags & NLM_F_ACK != 0 {
+                            out.push(ack(req, 0, self.pid));
+                        }
+                        out
+                    }
+                    Err(e) => vec![ack(req, e, self.pid)],
+                }
+            }
+            // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
+            // always empty
+            RTM_GETNEIGH if dump => vec![done()],
+            RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
+            // Unsupported requests: EOPNOTSUPP; control messages are acked only when an ack is
+            // asked for
+            _ if flags & NLM_F_REQUEST != 0 => {
+                if ty < NLMSG_MIN_TYPE {
+                    if flags & NLM_F_ACK != 0 {
+                        vec![ack(req, 0, self.pid)]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    vec![ack(req, EOPNOTSUPP, self.pid)]
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// This socket's `sockaddr_nl`.
+    pub fn sockaddr(&self) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+        b[4..8].copy_from_slice(&self.pid.to_le_bytes());
+        b
+    }
+}
+
+/// Host information that netlink answers need (replaced with fixed values in tests).
+pub(crate) trait Host {
+    /// The host's network interfaces.
+    fn interfaces(&self) -> Vec<Interface>;
+    /// The traffic counters of an interface ([`crate::traffic`]).
+    fn stats(&self, name: &str) -> IfStats;
+    /// The routes of the host's main table; when None they are synthesized from the interface
+    /// addresses ([`crate::route`]).
+    fn routes(&self) -> Option<Vec<Route>>;
+    /// The interface's transmit queue length (`IFLA_TXQLEN`), None when unavailable.
+    fn tx_queue_len(&self, name: &str) -> Option<u32>;
+    /// The user ID of the requesting process (RTA_UID in the `ip route get` answer).
+    fn uid(&self) -> u32;
+    /// Requests that change interfaces, addresses or routes ([`crate::netdev::request`]): None
+    /// means not handled, Some holds the result.
+    fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
+        None
+    }
+    /// The network namespace RTM_GETNSID looks for: `attr` is [`NETNSA_PID`] (a process) or
+    /// [`NETNSA_FD`] (a namespace file), and `value` its value. When found, the number this
+    /// namespace assigned to it (None when unassigned); otherwise an error number.
+    fn peer_net(&self, _attr: u16, _value: u32) -> Result<Option<i32>, i32> {
+        Ok(None)
+    }
+    /// All interfaces: the host's (or lo) and virtual devices, by index.
+    fn links(&self) -> Vec<Link> {
+        self.interfaces().into_iter().map(Link::Host).collect()
+    }
+    /// The routing tables ([`crate::route::tables`], including those on virtual devices).
+    fn tables(&self) -> Vec<Route2> {
+        crate::route::tables(&self.interfaces(), self.routes())
+    }
+    /// The addresses of all interfaces (virtual devices included), for `ip route get`.
+    fn all_interfaces(&self) -> Vec<Interface> {
+        self.interfaces()
+    }
+    /// This is the boot namespace: `ip route get` may let the host choose the source address.
+    fn init_net(&self) -> bool {
+        true
+    }
+    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
+    /// datagrams.
+    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+}
+
+type Route2 = crate::route::Entry;
+
+/// An interface in a network namespace (for netlink dumps): the host's (or lo in a new namespace),
+/// or a virtual device ([`crate::netdev`], with the number of the namespace its peer is in).
+pub(crate) enum Link {
+    Host(Interface),
+    Virt(crate::netdev::View, Option<i32>),
+}
+
+impl Link {
+    fn index(&self) -> u32 {
+        match self {
+            Link::Host(i) => i.index,
+            Link::Virt(v, _) => v.index,
+        }
+    }
+
+    fn name(&self) -> &[u8] {
+        match self {
+            Link::Host(i) => i.name.as_bytes(),
+            Link::Virt(v, _) => &v.name,
+        }
+    }
+}
+
+/// Requests in the boot network namespace that change a host interface (`RTM_NEWLINK`,
+/// `RTM_SETLINK`; Linux's `rtnl_setlink`, `__rtnl_newlink`). The app cannot change the host's
+/// interfaces, so only requests that change nothing are accepted: after the flags are combined by
+/// `rtnl_dev_combine_flags`, the bits `__dev_change_flags` can change are the same as now, and the
+/// name and MTU carried are also the same as now. That is what dockerd does when it brings up the
+/// already-up lo for a container's default network sandbox (`loopbackUp`). Anything that really
+/// changes something is still EOPNOTSUPP, and so is creating an interface (`NLM_F_CREATE`, veth,
+/// bridge and the like). `net_admin`: whether there is `CAP_NET_ADMIN` (EPERM without it; Linux
+/// checks before parsing). None: neither of these two requests.
+pub(crate) fn configure_host_link(
+    ifaces: &[Interface],
+    net_admin: bool,
+    req: &[u8],
+) -> Option<i32> {
+    const RTM_SETLINK: u16 = 19;
+    const NLM_F_REPLACE: u16 = 0x100;
+    const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
+    const ENODEV: i32 = 19;
+    // The bits __dev_change_flags changes on request (IFF_UP, IFF_PROMISC, IFF_ALLMULTI are
+    // handled separately, and count too)
+    const CHANGEABLE: u32 =
+        0x1 | 0x4 | 0x20 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    if ty != RTM_NEWLINK && ty != RTM_SETLINK {
+        return None;
+    }
+    if !net_admin {
+        return Some(EPERM);
+    }
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    // struct ifinfomsg: address family, type, index, flags, flags to change
+    let Some(m) = req.get(16..32) else {
+        return Some(EINVAL);
+    };
+    let index = i32::from_le_bytes(m[4..8].try_into().unwrap());
+    let ifi_flags = u32::from_le_bytes(m[8..12].try_into().unwrap());
+    let change = u32::from_le_bytes(m[12..16].try_into().unwrap());
+    let attrs = crate::route::attrs(&req[32..]);
+    let name = attrs
+        .iter()
+        .find(|(t, _)| *t == IFLA_IFNAME)
+        .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default());
+    let newlink = ty == RTM_NEWLINK;
+    if newlink && index < 0 {
+        return Some(EINVAL);
+    }
+    // Look up by index, or by name when the index is not positive; when neither is given
+    // RTM_SETLINK is EINVAL and RTM_NEWLINK counts as not found
+    if !newlink && index <= 0 && name.is_none() {
+        return Some(EINVAL);
+    }
+    let found = ifaces.iter().find(|i| {
+        if index > 0 {
+            i.index as i32 == index
+        } else {
+            name.is_some() && name == Some(i.name.as_bytes())
+        }
+    });
+    let Some(dev) = found else {
+        // appine cannot create one when asked to (Linux also gives EOPNOTSUPP when it has no
+        // driver for that kind of interface)
+        return Some(if newlink && flags & NLM_F_CREATE != 0 {
+            EOPNOTSUPP
+        } else {
+            ENODEV
+        });
+    };
+    if newlink && flags & NLM_F_EXCL != 0 {
+        return Some(EEXIST);
+    }
+    if newlink && flags & NLM_F_REPLACE != 0 {
+        return Some(EOPNOTSUPP);
+    }
+    let same = attrs.iter().all(|&(t, d)| match t {
+        IFLA_IFNAME => d.split(|&c| c == 0).next() == Some(dev.name.as_bytes()),
+        IFLA_MTU => d.get(..4) == Some(&dev.mtu.to_le_bytes()[..]),
+        _ => false,
+    });
+    // When ifi_change is 0 the whole ifi_flags counts as wanted (Linux's "bugwards
+    // compatibility"); when both are 0 the flags are not changed
+    let wanted = if change != 0 {
+        (ifi_flags & change) | (dev.flags & !change)
+    } else {
+        ifi_flags
+    };
+    let flags_same = (ifi_flags == 0 && change == 0) || (wanted ^ dev.flags) & CHANGEABLE == 0;
+    Some(if same && flags_same { 0 } else { EOPNOTSUPP })
+}
+
+/// One interface's `RTM_NEWLINK` (Linux's `rtnl_fill_ifinfo`, attributes in the same order): the
+/// items `ip link` uses and programs commonly read; device parameters such as `IFLA_AF_SPEC` are
+/// missing. The transmit queue length `txqlen` comes from the host, or Linux's default 1000 when
+/// unavailable; guest packets are handed to host sockets and the interface has no queueing
+/// discipline of its own, so qdisc is always noqueue.
+fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
+    let loopback = i.flags & IFF_LOOPBACK != 0;
+    // struct ifinfomsg: family, pad, type, index, flags, change
+    let mut p = vec![0u8, 0];
+    let ty = if loopback {
+        ARPHRD_LOOPBACK
+    } else {
+        ARPHRD_ETHER
+    };
+    p.extend_from_slice(&ty.to_le_bytes());
+    p.extend_from_slice(&(i.index as i32).to_le_bytes());
+    p.extend_from_slice(&i.flags.to_le_bytes());
+    p.extend_from_slice(&0u32.to_le_bytes());
+    let mut name = i.name.clone().into_bytes();
+    name.push(0);
+    attr(&mut p, IFLA_IFNAME, &name);
+    attr(&mut p, IFLA_TXQLEN, &txqlen.unwrap_or(1000).to_le_bytes());
+    attr(&mut p, IFLA_OPERSTATE, &[operstate(i)]);
+    attr(&mut p, IFLA_LINKMODE, &[0]);
+    attr(&mut p, IFLA_MTU, &i.mtu.to_le_bytes());
+    attr(&mut p, IFLA_GROUP, &0u32.to_le_bytes());
+    attr(&mut p, IFLA_PROMISCUITY, &0u32.to_le_bytes());
+    attr(&mut p, IFLA_NUM_TX_QUEUES, &1u32.to_le_bytes());
+    attr(&mut p, IFLA_NUM_RX_QUEUES, &1u32.to_le_bytes());
+    attr(
+        &mut p,
+        IFLA_CARRIER,
+        &[u8::from(i.flags & IFF_RUNNING != 0)],
+    );
+    // lo in a new network namespace that is not up yet has no qdisc yet (crate::netns)
+    let qdisc: &[u8] = if i.flags & (IFF_LOOPBACK | IFF_UP) == IFF_LOOPBACK {
+        b"noop\0"
+    } else {
+        b"noqueue\0"
+    };
+    attr(&mut p, IFLA_QDISC, qdisc);
+    attr(&mut p, IFLA_PROTO_DOWN, &[0]);
+    let mac = i.mac.unwrap_or([0; 6]);
+    attr(&mut p, IFLA_ADDRESS, &mac);
+    let bcast = if loopback { [0; 6] } else { [0xff; 6] };
+    attr(&mut p, IFLA_BROADCAST, &bcast);
+    // Traffic counters (crate::traffic): struct rtnl_link_stats64 is 25 u64s in Linux 6.1, and
+    // rtnl_link_stats 24 u32s; the first four are packets in, packets out, bytes in and bytes
+    // out, and everything else is 0
+    let head = [st.rx_packets, st.tx_packets, st.rx_bytes, st.tx_bytes];
+    let field = |n: usize| head.get(n).copied().unwrap_or(0);
+    let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
+    attr(&mut p, IFLA_STATS64, &stats64);
+    let stats: Vec<u8> = (0..24)
+        .flat_map(|n| (field(n) as u32).to_le_bytes())
+        .collect();
+    attr(&mut p, IFLA_STATS, &stats);
+    p
+}
+
+/// The interface's state (`IFLA_OPERSTATE`): as with `/sys/class/net/<interface>/operstate`, the
+/// loopback interface is unknown (Linux's loopback driver does not set it), one that is up and
+/// connected is up, and the others are down.
+pub(crate) fn operstate(i: &Interface) -> u8 {
+    if i.flags & IFF_LOOPBACK != 0 && i.flags & IFF_UP != 0 {
+        IF_OPER_UNKNOWN
+    } else if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 {
+        IF_OPER_UP
+    } else {
+        IF_OPER_DOWN
+    }
+}
+
+/// The `RTM_NEWADDR`s on one interface (Linux's `inet_fill_ifaddr`, `inet6_fill_ifaddr`,
+/// attributes in the same order). Addresses are all taken as never expiring (`IFA_F_PERMANENT`,
+/// `ip addr` shows forever); their creation and update times are not known and are 0.
+fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
+    // struct ifa_cacheinfo: preferred, valid (all ones is permanent), cstamp, tstamp
+    let mut cacheinfo = [0xffu8; 16];
+    cacheinfo[8..].fill(0);
+    i.addrs
+        .iter()
+        .filter(|(f, ..)| family == 0 || *f as u8 == family)
+        .map(|(f, addr, prefix)| {
+            let link_local = *f == AF_INET6 && addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
+            let scope = if i.flags & IFF_LOOPBACK != 0 {
+                RT_SCOPE_HOST
+            } else if link_local {
+                RT_SCOPE_LINK
+            } else {
+                RT_SCOPE_UNIVERSE
+            };
+            // struct ifaddrmsg: family, prefixlen, flags, scope, index
+            let mut p = vec![*f as u8, *prefix, IFA_F_PERMANENT, scope];
+            p.extend_from_slice(&i.index.to_le_bytes());
+            let flags = u32::from(IFA_F_PERMANENT).to_le_bytes();
+            attr(&mut p, IFA_ADDRESS, addr);
+            if *f == AF_INET {
+                attr(&mut p, IFA_LOCAL, addr);
+                if let Some(b) = broadcast_of(i, addr, *prefix) {
+                    attr(&mut p, IFA_BROADCAST, &b);
+                }
+                let mut name = i.name.clone().into_bytes();
+                name.push(0);
+                attr(&mut p, IFA_LABEL, &name);
+                attr(&mut p, IFA_FLAGS, &flags);
+                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
+            } else {
+                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
+                attr(&mut p, IFA_FLAGS, &flags);
+                if i.flags & IFF_LOOPBACK != 0 {
+                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LO]);
+                } else if link_local {
+                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LL]);
+                }
+            }
+            p
+        })
+        .collect()
+}
+
+/// The broadcast address of IPv4 address `addr`/`prefix`: when the interface supports broadcast
+/// and the subnet has more than two addresses, the subnet's last address (what DHCP and
+/// `ip addr add ... brd +` set), consistent with the broadcast route in the local table.
+fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
+    if i.flags & IFF_BROADCAST == 0 || prefix >= 31 {
+        return None;
+    }
+    let ip = u32::from_be_bytes(addr.try_into().ok()?);
+    Some((ip | u32::MAX >> prefix).to_be_bytes())
+}
+
+// ---- NETLINK_GENERIC ----
+//
+// Only the nlctrl family that Linux always has (GENL_ID_CTRL). Subsystems such as nl80211,
+// ethtool, wireguard and TASKSTATS are absent, and querying them gives ENOENT, as on a Linux
+// without them built in: iw, ethtool, wg and iotop report it or fall back to other approaches
+// (before, socket itself gave EPROTONOSUPPORT, which some programs do not expect). The answers'
+// content, error numbers and the requests attached to error messages are byte-identical to Linux
+// 6.8 (differential test).
+
+const GENL_ID_CTRL: u16 = 0x10;
+/// Message types below this are netlink's own control messages (`NLMSG_NOOP` and so on).
+const NLMSG_MIN_TYPE: u16 = 0x10;
+/// The ack carries only the request's message header.
+const NLM_F_CAPPED: u16 = 0x100;
+const CTRL_CMD_NEWFAMILY: u8 = 1;
+const CTRL_CMD_GETFAMILY: u8 = 3;
+const CTRL_CMD_GETPOLICY: u8 = 10;
+const CTRL_ATTR_FAMILY_ID: u16 = 1;
+const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+const CTRL_ATTR_VERSION: u16 = 3;
+const CTRL_ATTR_HDRSIZE: u16 = 4;
+const CTRL_ATTR_MAXATTR: u16 = 5;
+const CTRL_ATTR_OPS: u16 = 6;
+const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+const CTRL_ATTR_OP_ID: u16 = 1;
+const CTRL_ATTR_OP_FLAGS: u16 = 2;
+const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
+const GENL_CMD_CAP_DO: u32 = 2;
+const GENL_CMD_CAP_DUMP: u32 = 4;
+const GENL_CMD_CAP_HASPOL: u32 = 8;
+const NLA_TYPE_MASK: u16 = 0x3fff;
+const EPERM: i32 = 1;
+const ENOENT: i32 = 2;
+const EEXIST: i32 = 17;
+const EINVAL: i32 = 22;
+const EOPNOTSUPP: i32 = 95;
+
+/// Answers one request `req` (the whole message) on `NETLINK_GENERIC`; `pid` is this socket's
+/// `nl_pid`. Returns the datagrams: as on Linux, the answer and the ack are one each
+/// (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
+fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, pid, payload);
+    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    // Linux's netlink_rcv_skb: non-requests and control messages are acked only when an ack is
+    // asked for
+    let r = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+        Ok(None)
+    } else if ty != GENL_ID_CTRL {
+        Err(ENOENT)
+    } else if req.len() < 20 {
+        Err(EINVAL)
+    } else {
+        match req[16] {
+            // The dump is small, and as on Linux NLMSG_DONE follows in the same datagram
+            CTRL_CMD_GETFAMILY if dump => {
+                let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
+                out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
+                Ok(Some(out))
+            }
+            CTRL_CMD_GETFAMILY => {
+                names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
+            }
+            // Policy dumps are not implemented: it can only tell that the requested family does not
+            // exist
+            CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
+            _ => Err(EOPNOTSUPP),
+        }
+    };
+    match r {
+        // No separate ack after a dump (Linux's netlink_dump_start makes netlink_rcv_skb skip the
+        // ack)
+        Ok(answer) => {
+            let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
+            if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
+                out.push(ack(req, 0, pid));
+            }
+            out
+        }
+        Err(e) => vec![ack(req, e, pid)],
+    }
+}
+
+/// nlctrl's `CTRL_CMD_NEWFAMILY`: the genlmsghdr and attributes, the same as Linux 6.8's
+/// `ctrl_fill_info` (since 6.2 each nlctrl command has its own policy, and the family's maxattr
+/// is 0).
+fn nlctrl_family() -> Vec<u8> {
+    let mut p = vec![CTRL_CMD_NEWFAMILY, 2, 0, 0];
+    attr(&mut p, CTRL_ATTR_FAMILY_NAME, b"nlctrl\0");
+    attr(&mut p, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_VERSION, &2u32.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_HDRSIZE, &0u32.to_le_bytes());
+    attr(&mut p, CTRL_ATTR_MAXATTR, &0u32.to_le_bytes());
+    let caps = [
+        (
+            CTRL_CMD_GETFAMILY,
+            GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL,
+        ),
+        (CTRL_CMD_GETPOLICY, GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL),
+    ];
+    let mut ops = Vec::new();
+    for (n, (cmd, flags)) in caps.into_iter().enumerate() {
+        let mut op = Vec::new();
+        attr(&mut op, CTRL_ATTR_OP_ID, &u32::from(cmd).to_le_bytes());
+        attr(&mut op, CTRL_ATTR_OP_FLAGS, &flags.to_le_bytes());
+        attr(&mut ops, n as u16 + 1, &op);
+    }
+    attr(&mut p, CTRL_ATTR_OPS, &ops);
+    let mut group = Vec::new();
+    attr(
+        &mut group,
+        CTRL_ATTR_MCAST_GRP_ID,
+        &u32::from(GENL_ID_CTRL).to_le_bytes(),
+    );
+    attr(&mut group, CTRL_ATTR_MCAST_GRP_NAME, b"notify\0");
+    let mut groups = Vec::new();
+    attr(&mut groups, 1, &group);
+    attr(&mut p, CTRL_ATTR_MCAST_GROUPS, &groups);
+    p
+}
+
+/// Whether request `req` (genlmsghdr and attributes after the message header) refers to the
+/// nlctrl family: looked up by `CTRL_ATTR_FAMILY_ID` or `CTRL_ATTR_FAMILY_NAME` (Linux's
+/// `ctrl_getfamily`); EINVAL when neither is present, ENOENT when not found.
+fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
+    let (mut id, mut name) = (None, None);
+    let mut b = req.get(20..).unwrap_or_default();
+    while b.len() >= 4 {
+        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+        if len < 4 || len > b.len() {
+            break;
+        }
+        let data = &b[4..len];
+        match u16::from_le_bytes([b[2], b[3]]) & NLA_TYPE_MASK {
+            CTRL_ATTR_FAMILY_ID if data.len() >= 2 => {
+                id = Some(u16::from_le_bytes([data[0], data[1]]))
+            }
+            CTRL_ATTR_FAMILY_NAME => {
+                name = Some(data.split(|&c| c == 0).next().unwrap_or_default());
+            }
+            _ => {}
+        }
+        b = &b[len.next_multiple_of(4).min(b.len())..];
+    }
+    match (id, name) {
+        (Some(GENL_ID_CTRL), _) | (_, Some(b"nlctrl")) => Ok(()),
+        (None, None) => Err(EINVAL),
+        _ => Err(ENOENT),
+    }
+}
+
+// ---- Netlink messages ----
+
+pub(crate) fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
+    b.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
+    b.extend_from_slice(&ty.to_le_bytes());
+    b.extend_from_slice(data);
+    align4(b);
+}
+
+/// A netlink message: the message header plus the payload.
+pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16 + payload.len());
+    b.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
+    b.extend_from_slice(&ty.to_le_bytes());
+    b.extend_from_slice(&flags.to_le_bytes());
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pid.to_le_bytes());
+    b.extend_from_slice(payload);
+    align4(&mut b);
+    b
+}
+
+/// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
+/// the request's message header is attached, with `NLM_F_CAPPED`; on error the whole request is
+/// attached (`NETLINK_CAP_ACK` not set).
+fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
+    ack_ext(req, err, pid, None, false)
+}
+
+/// Like [`ack`], also attaching the extack message per `NETLINK_EXT_ACK` (`NLMSGERR_ATTR_MSG`,
+/// with `NLM_F_ACK_TLVS`); `cap` means `NETLINK_CAP_ACK` is set.
+pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
+    const NLM_F_ACK_TLVS: u16 = 0x200;
+    const NLMSGERR_ATTR_MSG: u16 = 1;
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let mut p = (-err).to_le_bytes().to_vec();
+    let mut flags = 0;
+    if err == 0 || cap {
+        p.extend_from_slice(&req[..16]);
+        flags |= NLM_F_CAPPED;
+    } else {
+        p.extend_from_slice(req);
+    }
+    if let Some(m) = msg {
+        align4(&mut p);
+        let mut s = m.as_bytes().to_vec();
+        s.push(0);
+        attr(&mut p, NLMSGERR_ATTR_MSG, &s);
+        flags |= NLM_F_ACK_TLVS;
+    }
+    message(NLMSG_ERROR, flags, seq, pid, &p)
+}
+
+fn align4(b: &mut Vec<u8>) {
+    b.resize(b.len().next_multiple_of(4), 0);
+}
+
 // ---- /proc/net ----
 
 const SOL_SOCKET: i32 = 1;
 const SO_PROTOCOL: i32 = 38;
-pub(crate) const IPPROTO_ICMP: i32 = 1;
-pub(crate) const IPPROTO_TCP: i32 = 6;
-pub(crate) const IPPROTO_UDP: i32 = 17;
-/// The protocol number of MPTCP (the third argument of `socket(2)`, reported by `SO_PROTOCOL`).
-pub(crate) const IPPROTO_MPTCP: i32 = 262;
-const IPPROTO_ICMPV6: i32 = 58;
 const TCP_INFO: i32 = 11;
 /// The st column of `/proc/net` (Linux's TCP states; UDP borrows two of them too).
 const TCP_ESTABLISHED: u8 = 1;
 const TCP_CLOSE: u8 = 7;
 const TCP_LISTEN: u8 = 10;
-
-/// An address in `/proc/net` format: IPv4 is one 32-bit word and IPv6 four, printed as their
-/// in-memory bytes read as little-endian (the same as Linux on arm64); the port as a number.
-fn proc_addr(addr: Option<&[u8]>, v6: bool, port: Option<u16>) -> String {
-    let addr = addr.unwrap_or_default();
-    let port = port.unwrap_or_else(|| {
-        addr.get(2..4)
-            .map_or(0, |p| u16::from_be_bytes([p[0], p[1]]))
-    });
-    let (start, words) = if v6 { (8, 4) } else { (4, 1) };
-    let mut s = String::new();
-    for w in 0..words {
-        let at = start + w * 4;
-        let v = addr
-            .get(at..at + 4)
-            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-        write!(s, "{v:08X}").unwrap();
-    }
-    write!(s, ":{port:04X}").unwrap();
-    s
-}
 
 /// The tables under `/proc/net` that list sockets.
 #[derive(Clone, Copy, PartialEq)]
@@ -398,6 +1330,27 @@ pub(crate) fn proc_listing(
         ));
     }
     lines.iter().map(|l| format!("{l:<width$}\n")).collect()
+}
+
+/// An address in `/proc/net` format: IPv4 is one 32-bit word and IPv6 four, printed as their
+/// in-memory bytes read as little-endian (the same as Linux on arm64); the port as a number.
+fn proc_addr(addr: Option<&[u8]>, v6: bool, port: Option<u16>) -> String {
+    let addr = addr.unwrap_or_default();
+    let port = port.unwrap_or_else(|| {
+        addr.get(2..4)
+            .map_or(0, |p| u16::from_be_bytes([p[0], p[1]]))
+    });
+    let (start, words) = if v6 { (8, 4) } else { (4, 1) };
+    let mut s = String::new();
+    for w in 0..words {
+        let at = start + w * 4;
+        let v = addr
+            .get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        write!(s, "{v:08X}").unwrap();
+    }
+    write!(s, ":{port:04X}").unwrap();
+    s
 }
 
 /// `/proc/net/sockstat`, `sockstat6` (`v6`): how many guest sockets of each kind there are
@@ -700,956 +1653,6 @@ pub(crate) fn proc_netstat(p: &crate::traffic::Protocols) -> String {
 /// `/proc/net/arp`: the neighbour table is always empty (as with `RTM_GETNEIGH`), only the header.
 pub(crate) const PROC_ARP: &str =
     "IP address       HW type     Flags       HW address            Mask     Device\n";
-
-/// A netlink socket emulated in process. Only `NETLINK_ROUTE` answers queries; a
-/// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
-/// other protocols cannot be created (`syscall::net::socket`).
-pub(crate) struct NetlinkSocket {
-    pub protocol: i32,
-    /// `nl_pid`: assigned on bind.
-    pub pid: u32,
-    /// Answers waiting for the guest to read them, one datagram per item.
-    pub queue: VecDeque<Vec<u8>>,
-    /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
-    pub arrivals: u64,
-    /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
-    pub rcvtimeo: Option<Duration>,
-    /// The new network namespace it was created in, if any (its lo is answered and configured).
-    pub net: Option<Rc<crate::nsproxy::NetNs>>,
-    /// `NETLINK_EXT_ACK`: error acks carry the extack message (iproute2 prints it as
-    /// `Error: ….`).
-    pub ext_ack: bool,
-    /// `NETLINK_CAP_ACK`: error acks carry only the request's message header.
-    pub cap_ack: bool,
-}
-
-// ---- DNS stub ----
-
-/// The IPv4 address of the DNS stub, 127.0.0.53.
-const STUB_V4: [u8; 4] = [127, 0, 0, 53];
-
-/// Whether an address is that of the DNS stub (`127.0.0.53:53`, or its IPv4-mapped IPv6 address).
-pub fn is_stub(addr: &[u8]) -> bool {
-    if addr.len() < 8 || addr[2..4] != 53u16.to_be_bytes() {
-        return false;
-    }
-    match u16::from_le_bytes([addr[0], addr[1]]) as i32 {
-        AF_INET => addr[4..8] == STUB_V4,
-        AF_INET6 if addr.len() >= 24 => {
-            addr[8..18] == [0; 10] && addr[18..20] == [0xff, 0xff] && addr[20..24] == STUB_V4
-        }
-        _ => false,
-    }
-}
-
-/// The DNS stub's sockaddr, encoded for the socket's address family.
-pub fn stub_addr(family: i32) -> Vec<u8> {
-    use std::net::{Ipv4Addr, SocketAddr};
-    let v4 = Ipv4Addr::from(STUB_V4);
-    let addr = if family == AF_INET6 {
-        SocketAddr::new(v4.to_ipv6_mapped().into(), 53)
-    } else {
-        SocketAddr::new(v4.into(), 53)
-    };
-    appine_hal::net::sockaddr(addr)
-}
-
-/// The answer given to the guest when resolution fails: the query brought back as is, with the
-/// QR and RA bits set and RCODE SERVFAIL, so the resolver fails at once instead of waiting for a
-/// timeout.
-pub fn servfail(query: &[u8]) -> Vec<u8> {
-    let mut r = query.to_vec();
-    if r.len() >= 4 {
-        r[2] |= 0x80;
-        r[3] = (r[3] & 0x70) | 0x80 | 2;
-    }
-    r
-}
-
-// ---- netlink ----
-
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
-const NLM_F_REQUEST: u16 = 1;
-const NLM_F_MULTI: u16 = 2;
-const NLM_F_ACK: u16 = 4;
-const NLM_F_DUMP: u16 = 0x300;
-const RTM_NEWLINK: u16 = 16;
-const RTM_GETLINK: u16 = 18;
-const RTM_NEWADDR: u16 = 20;
-const RTM_GETADDR: u16 = 22;
-const RTM_NEWROUTE: u16 = 24;
-const RTM_GETROUTE: u16 = 26;
-const RTM_GETNEIGH: u16 = 30;
-const RTM_NEWRULE: u16 = 32;
-const RTM_GETRULE: u16 = 34;
-const RTM_NEWNSID: u16 = 88;
-const RTM_GETNSID: u16 = 90;
-const NETNSA_NSID: u16 = 1;
-/// RTM_GETNSID looks up a network namespace by process ([`Host::peer_net`]).
-pub(crate) const NETNSA_PID: u16 = 2;
-/// RTM_GETNSID looks up a network namespace by namespace file.
-pub(crate) const NETNSA_FD: u16 = 3;
-const NETNSA_TARGET_NSID: u16 = 4;
-const IFLA_ADDRESS: u16 = 1;
-const IFLA_BROADCAST: u16 = 2;
-const IFLA_IFNAME: u16 = 3;
-const IFLA_MTU: u16 = 4;
-const IFLA_QDISC: u16 = 6;
-const IFLA_STATS: u16 = 7;
-const IFLA_TXQLEN: u16 = 13;
-const IFLA_OPERSTATE: u16 = 16;
-const IFLA_LINKMODE: u16 = 17;
-const IFLA_STATS64: u16 = 23;
-const IFLA_GROUP: u16 = 27;
-const IFLA_PROMISCUITY: u16 = 30;
-const IFLA_NUM_TX_QUEUES: u16 = 31;
-const IFLA_NUM_RX_QUEUES: u16 = 32;
-const IFLA_CARRIER: u16 = 33;
-const IFLA_PROTO_DOWN: u16 = 39;
-const IFLA_MASTER: u16 = 10;
-const IFLA_LINKINFO: u16 = 18;
-/// The largest datagram of a dump: split into several when there are many interfaces (musl's
-/// if_nameindex and others use an 8 KiB buffer).
-const DUMP_CHUNK: usize = 8192;
-/// `IF_OPER_*` (RFC 2863 interface states).
-const IF_OPER_UNKNOWN: u8 = 0;
-const IF_OPER_DOWN: u8 = 2;
-const IF_OPER_UP: u8 = 6;
-const IFA_ADDRESS: u16 = 1;
-const IFA_LOCAL: u16 = 2;
-const IFA_LABEL: u16 = 3;
-const IFA_BROADCAST: u16 = 4;
-const IFA_CACHEINFO: u16 = 6;
-const IFA_FLAGS: u16 = 8;
-const IFA_PROTO: u16 = 11;
-/// Addresses added by the kernel: the loopback interface's `::1` and autoconfigured link-local
-/// addresses (`IFAPROT_KERNEL_*`).
-const IFAPROT_KERNEL_LO: u8 = 1;
-const IFAPROT_KERNEL_LL: u8 = 3;
-const ARPHRD_ETHER: u16 = 1;
-const ARPHRD_LOOPBACK: u16 = 772;
-const IFF_UP: u32 = 0x1;
-const IFF_BROADCAST: u32 = 0x2;
-const IFF_LOOPBACK: u32 = 0x8;
-const IFF_RUNNING: u32 = 0x40;
-const RT_SCOPE_UNIVERSE: u8 = 0;
-const RT_SCOPE_LINK: u8 = 253;
-const RT_SCOPE_HOST: u8 = 254;
-/// The address never expires (not a temporary address from DHCP or SLAAC).
-const IFA_F_PERMANENT: u8 = 0x80;
-/// The protocol number of NETLINK_ROUTE.
-pub const NETLINK_ROUTE: i32 = 0;
-/// The protocol number of NETLINK_KOBJECT_UEVENT: hotplug events sent by the kernel.
-pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
-/// The protocol number of NETLINK_GENERIC.
-pub const NETLINK_GENERIC: i32 = 16;
-/// The protocol number of NETLINK_NETFILTER (nftables, [`crate::nft`]).
-pub const NETLINK_NETFILTER: i32 = 12;
-
-fn align4(b: &mut Vec<u8>) {
-    b.resize(b.len().next_multiple_of(4), 0);
-}
-
-pub(crate) fn attr(b: &mut Vec<u8>, ty: u16, data: &[u8]) {
-    b.extend_from_slice(&((4 + data.len()) as u16).to_le_bytes());
-    b.extend_from_slice(&ty.to_le_bytes());
-    b.extend_from_slice(data);
-    align4(b);
-}
-
-/// A netlink message: the message header plus the payload.
-pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(16 + payload.len());
-    b.extend_from_slice(&((16 + payload.len()) as u32).to_le_bytes());
-    b.extend_from_slice(&ty.to_le_bytes());
-    b.extend_from_slice(&flags.to_le_bytes());
-    b.extend_from_slice(&seq.to_le_bytes());
-    b.extend_from_slice(&pid.to_le_bytes());
-    b.extend_from_slice(payload);
-    align4(&mut b);
-    b
-}
-
-/// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
-/// the request's message header is attached, with `NLM_F_CAPPED`; on error the whole request is
-/// attached (`NETLINK_CAP_ACK` not set).
-fn ack(req: &[u8], err: i32, pid: u32) -> Vec<u8> {
-    ack_ext(req, err, pid, None, false)
-}
-
-/// Like [`ack`], also attaching the extack message per `NETLINK_EXT_ACK` (`NLMSGERR_ATTR_MSG`,
-/// with `NLM_F_ACK_TLVS`); `cap` means `NETLINK_CAP_ACK` is set.
-pub(crate) fn ack_ext(req: &[u8], err: i32, pid: u32, msg: Option<&str>, cap: bool) -> Vec<u8> {
-    const NLM_F_ACK_TLVS: u16 = 0x200;
-    const NLMSGERR_ATTR_MSG: u16 = 1;
-    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
-    let mut p = (-err).to_le_bytes().to_vec();
-    let mut flags = 0;
-    if err == 0 || cap {
-        p.extend_from_slice(&req[..16]);
-        flags |= NLM_F_CAPPED;
-    } else {
-        p.extend_from_slice(req);
-    }
-    if let Some(m) = msg {
-        align4(&mut p);
-        let mut s = m.as_bytes().to_vec();
-        s.push(0);
-        attr(&mut p, NLMSGERR_ATTR_MSG, &s);
-        flags |= NLM_F_ACK_TLVS;
-    }
-    message(NLMSG_ERROR, flags, seq, pid, &p)
-}
-
-/// An interface in a network namespace (for netlink dumps): the host's (or lo in a new namespace),
-/// or a virtual device ([`crate::netdev`], with the number of the namespace its peer is in).
-pub(crate) enum Link {
-    Host(Interface),
-    Virt(crate::netdev::View, Option<i32>),
-}
-
-impl Link {
-    fn index(&self) -> u32 {
-        match self {
-            Link::Host(i) => i.index,
-            Link::Virt(v, _) => v.index,
-        }
-    }
-
-    fn name(&self) -> &[u8] {
-        match self {
-            Link::Host(i) => i.name.as_bytes(),
-            Link::Virt(v, _) => &v.name,
-        }
-    }
-}
-
-/// The interface's state (`IFLA_OPERSTATE`): as with `/sys/class/net/<interface>/operstate`, the
-/// loopback interface is unknown (Linux's loopback driver does not set it), one that is up and
-/// connected is up, and the others are down.
-pub(crate) fn operstate(i: &Interface) -> u8 {
-    if i.flags & IFF_LOOPBACK != 0 && i.flags & IFF_UP != 0 {
-        IF_OPER_UNKNOWN
-    } else if i.flags & IFF_UP != 0 && i.flags & IFF_RUNNING != 0 {
-        IF_OPER_UP
-    } else {
-        IF_OPER_DOWN
-    }
-}
-
-/// One interface's `RTM_NEWLINK` (Linux's `rtnl_fill_ifinfo`, attributes in the same order): the
-/// items `ip link` uses and programs commonly read; device parameters such as `IFLA_AF_SPEC` are
-/// missing. The transmit queue length `txqlen` comes from the host, or Linux's default 1000 when
-/// unavailable; guest packets are handed to host sockets and the interface has no queueing
-/// discipline of its own, so qdisc is always noqueue.
-fn link_message(i: &Interface, st: IfStats, txqlen: Option<u32>) -> Vec<u8> {
-    let loopback = i.flags & IFF_LOOPBACK != 0;
-    // struct ifinfomsg: family, pad, type, index, flags, change
-    let mut p = vec![0u8, 0];
-    let ty = if loopback {
-        ARPHRD_LOOPBACK
-    } else {
-        ARPHRD_ETHER
-    };
-    p.extend_from_slice(&ty.to_le_bytes());
-    p.extend_from_slice(&(i.index as i32).to_le_bytes());
-    p.extend_from_slice(&i.flags.to_le_bytes());
-    p.extend_from_slice(&0u32.to_le_bytes());
-    let mut name = i.name.clone().into_bytes();
-    name.push(0);
-    attr(&mut p, IFLA_IFNAME, &name);
-    attr(&mut p, IFLA_TXQLEN, &txqlen.unwrap_or(1000).to_le_bytes());
-    attr(&mut p, IFLA_OPERSTATE, &[operstate(i)]);
-    attr(&mut p, IFLA_LINKMODE, &[0]);
-    attr(&mut p, IFLA_MTU, &i.mtu.to_le_bytes());
-    attr(&mut p, IFLA_GROUP, &0u32.to_le_bytes());
-    attr(&mut p, IFLA_PROMISCUITY, &0u32.to_le_bytes());
-    attr(&mut p, IFLA_NUM_TX_QUEUES, &1u32.to_le_bytes());
-    attr(&mut p, IFLA_NUM_RX_QUEUES, &1u32.to_le_bytes());
-    attr(
-        &mut p,
-        IFLA_CARRIER,
-        &[u8::from(i.flags & IFF_RUNNING != 0)],
-    );
-    // lo in a new network namespace that is not up yet has no qdisc yet (crate::netns)
-    let qdisc: &[u8] = if i.flags & (IFF_LOOPBACK | IFF_UP) == IFF_LOOPBACK {
-        b"noop\0"
-    } else {
-        b"noqueue\0"
-    };
-    attr(&mut p, IFLA_QDISC, qdisc);
-    attr(&mut p, IFLA_PROTO_DOWN, &[0]);
-    let mac = i.mac.unwrap_or([0; 6]);
-    attr(&mut p, IFLA_ADDRESS, &mac);
-    let bcast = if loopback { [0; 6] } else { [0xff; 6] };
-    attr(&mut p, IFLA_BROADCAST, &bcast);
-    // Traffic counters (crate::traffic): struct rtnl_link_stats64 is 25 u64s in Linux 6.1, and
-    // rtnl_link_stats 24 u32s; the first four are packets in, packets out, bytes in and bytes
-    // out, and everything else is 0
-    let head = [st.rx_packets, st.tx_packets, st.rx_bytes, st.tx_bytes];
-    let field = |n: usize| head.get(n).copied().unwrap_or(0);
-    let stats64: Vec<u8> = (0..25).flat_map(|n| field(n).to_le_bytes()).collect();
-    attr(&mut p, IFLA_STATS64, &stats64);
-    let stats: Vec<u8> = (0..24)
-        .flat_map(|n| (field(n) as u32).to_le_bytes())
-        .collect();
-    attr(&mut p, IFLA_STATS, &stats);
-    p
-}
-
-/// The broadcast address of IPv4 address `addr`/`prefix`: when the interface supports broadcast
-/// and the subnet has more than two addresses, the subnet's last address (what DHCP and
-/// `ip addr add ... brd +` set), consistent with the broadcast route in the local table.
-fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
-    if i.flags & IFF_BROADCAST == 0 || prefix >= 31 {
-        return None;
-    }
-    let ip = u32::from_be_bytes(addr.try_into().ok()?);
-    Some((ip | u32::MAX >> prefix).to_be_bytes())
-}
-
-/// The `RTM_NEWADDR`s on one interface (Linux's `inet_fill_ifaddr`, `inet6_fill_ifaddr`,
-/// attributes in the same order). Addresses are all taken as never expiring (`IFA_F_PERMANENT`,
-/// `ip addr` shows forever); their creation and update times are not known and are 0.
-fn addr_messages(i: &Interface, family: u8) -> Vec<Vec<u8>> {
-    // struct ifa_cacheinfo: preferred, valid (all ones is permanent), cstamp, tstamp
-    let mut cacheinfo = [0xffu8; 16];
-    cacheinfo[8..].fill(0);
-    i.addrs
-        .iter()
-        .filter(|(f, ..)| family == 0 || *f as u8 == family)
-        .map(|(f, addr, prefix)| {
-            let link_local = *f == AF_INET6 && addr[0] == 0xfe && addr[1] & 0xc0 == 0x80;
-            let scope = if i.flags & IFF_LOOPBACK != 0 {
-                RT_SCOPE_HOST
-            } else if link_local {
-                RT_SCOPE_LINK
-            } else {
-                RT_SCOPE_UNIVERSE
-            };
-            // struct ifaddrmsg: family, prefixlen, flags, scope, index
-            let mut p = vec![*f as u8, *prefix, IFA_F_PERMANENT, scope];
-            p.extend_from_slice(&i.index.to_le_bytes());
-            let flags = u32::from(IFA_F_PERMANENT).to_le_bytes();
-            attr(&mut p, IFA_ADDRESS, addr);
-            if *f == AF_INET {
-                attr(&mut p, IFA_LOCAL, addr);
-                if let Some(b) = broadcast_of(i, addr, *prefix) {
-                    attr(&mut p, IFA_BROADCAST, &b);
-                }
-                let mut name = i.name.clone().into_bytes();
-                name.push(0);
-                attr(&mut p, IFA_LABEL, &name);
-                attr(&mut p, IFA_FLAGS, &flags);
-                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
-            } else {
-                attr(&mut p, IFA_CACHEINFO, &cacheinfo);
-                attr(&mut p, IFA_FLAGS, &flags);
-                if i.flags & IFF_LOOPBACK != 0 {
-                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LO]);
-                } else if link_local {
-                    attr(&mut p, IFA_PROTO, &[IFAPROT_KERNEL_LL]);
-                }
-            }
-            p
-        })
-        .collect()
-}
-
-// ---- NETLINK_GENERIC ----
-//
-// Only the nlctrl family that Linux always has (GENL_ID_CTRL). Subsystems such as nl80211,
-// ethtool, wireguard and TASKSTATS are absent, and querying them gives ENOENT, as on a Linux
-// without them built in: iw, ethtool, wg and iotop report it or fall back to other approaches
-// (before, socket itself gave EPROTONOSUPPORT, which some programs do not expect). The answers'
-// content, error numbers and the requests attached to error messages are byte-identical to Linux
-// 6.8 (differential test).
-
-const GENL_ID_CTRL: u16 = 0x10;
-/// Message types below this are netlink's own control messages (`NLMSG_NOOP` and so on).
-const NLMSG_MIN_TYPE: u16 = 0x10;
-/// The ack carries only the request's message header.
-const NLM_F_CAPPED: u16 = 0x100;
-const CTRL_CMD_NEWFAMILY: u8 = 1;
-const CTRL_CMD_GETFAMILY: u8 = 3;
-const CTRL_CMD_GETPOLICY: u8 = 10;
-const CTRL_ATTR_FAMILY_ID: u16 = 1;
-const CTRL_ATTR_FAMILY_NAME: u16 = 2;
-const CTRL_ATTR_VERSION: u16 = 3;
-const CTRL_ATTR_HDRSIZE: u16 = 4;
-const CTRL_ATTR_MAXATTR: u16 = 5;
-const CTRL_ATTR_OPS: u16 = 6;
-const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
-const CTRL_ATTR_OP_ID: u16 = 1;
-const CTRL_ATTR_OP_FLAGS: u16 = 2;
-const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
-const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
-const GENL_CMD_CAP_DO: u32 = 2;
-const GENL_CMD_CAP_DUMP: u32 = 4;
-const GENL_CMD_CAP_HASPOL: u32 = 8;
-const NLA_TYPE_MASK: u16 = 0x3fff;
-const EPERM: i32 = 1;
-const ENOENT: i32 = 2;
-const EEXIST: i32 = 17;
-const EINVAL: i32 = 22;
-const EOPNOTSUPP: i32 = 95;
-
-/// nlctrl's `CTRL_CMD_NEWFAMILY`: the genlmsghdr and attributes, the same as Linux 6.8's
-/// `ctrl_fill_info` (since 6.2 each nlctrl command has its own policy, and the family's maxattr
-/// is 0).
-fn nlctrl_family() -> Vec<u8> {
-    let mut p = vec![CTRL_CMD_NEWFAMILY, 2, 0, 0];
-    attr(&mut p, CTRL_ATTR_FAMILY_NAME, b"nlctrl\0");
-    attr(&mut p, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes());
-    attr(&mut p, CTRL_ATTR_VERSION, &2u32.to_le_bytes());
-    attr(&mut p, CTRL_ATTR_HDRSIZE, &0u32.to_le_bytes());
-    attr(&mut p, CTRL_ATTR_MAXATTR, &0u32.to_le_bytes());
-    let caps = [
-        (
-            CTRL_CMD_GETFAMILY,
-            GENL_CMD_CAP_DO | GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL,
-        ),
-        (CTRL_CMD_GETPOLICY, GENL_CMD_CAP_DUMP | GENL_CMD_CAP_HASPOL),
-    ];
-    let mut ops = Vec::new();
-    for (n, (cmd, flags)) in caps.into_iter().enumerate() {
-        let mut op = Vec::new();
-        attr(&mut op, CTRL_ATTR_OP_ID, &u32::from(cmd).to_le_bytes());
-        attr(&mut op, CTRL_ATTR_OP_FLAGS, &flags.to_le_bytes());
-        attr(&mut ops, n as u16 + 1, &op);
-    }
-    attr(&mut p, CTRL_ATTR_OPS, &ops);
-    let mut group = Vec::new();
-    attr(
-        &mut group,
-        CTRL_ATTR_MCAST_GRP_ID,
-        &u32::from(GENL_ID_CTRL).to_le_bytes(),
-    );
-    attr(&mut group, CTRL_ATTR_MCAST_GRP_NAME, b"notify\0");
-    let mut groups = Vec::new();
-    attr(&mut groups, 1, &group);
-    attr(&mut p, CTRL_ATTR_MCAST_GROUPS, &groups);
-    p
-}
-
-/// Whether request `req` (genlmsghdr and attributes after the message header) refers to the
-/// nlctrl family: looked up by `CTRL_ATTR_FAMILY_ID` or `CTRL_ATTR_FAMILY_NAME` (Linux's
-/// `ctrl_getfamily`); EINVAL when neither is present, ENOENT when not found.
-fn names_nlctrl(req: &[u8]) -> Result<(), i32> {
-    let (mut id, mut name) = (None, None);
-    let mut b = req.get(20..).unwrap_or_default();
-    while b.len() >= 4 {
-        let len = u16::from_le_bytes([b[0], b[1]]) as usize;
-        if len < 4 || len > b.len() {
-            break;
-        }
-        let data = &b[4..len];
-        match u16::from_le_bytes([b[2], b[3]]) & NLA_TYPE_MASK {
-            CTRL_ATTR_FAMILY_ID if data.len() >= 2 => {
-                id = Some(u16::from_le_bytes([data[0], data[1]]))
-            }
-            CTRL_ATTR_FAMILY_NAME => {
-                name = Some(data.split(|&c| c == 0).next().unwrap_or_default());
-            }
-            _ => {}
-        }
-        b = &b[len.next_multiple_of(4).min(b.len())..];
-    }
-    match (id, name) {
-        (Some(GENL_ID_CTRL), _) | (_, Some(b"nlctrl")) => Ok(()),
-        (None, None) => Err(EINVAL),
-        _ => Err(ENOENT),
-    }
-}
-
-/// Answers one request `req` (the whole message) on `NETLINK_GENERIC`; `pid` is this socket's
-/// `nl_pid`. Returns the datagrams: as on Linux, the answer and the ack are one each
-/// (`genlmsg_reply`, `netlink_ack`), so a program reading once gets only the answer.
-fn generic_request(req: &[u8], pid: u32) -> Vec<Vec<u8>> {
-    let ty = u16::from_le_bytes([req[4], req[5]]);
-    let flags = u16::from_le_bytes([req[6], req[7]]);
-    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
-    let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, pid, payload);
-    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-    // Linux's netlink_rcv_skb: non-requests and control messages are acked only when an ack is
-    // asked for
-    let r = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
-        Ok(None)
-    } else if ty != GENL_ID_CTRL {
-        Err(ENOENT)
-    } else if req.len() < 20 {
-        Err(EINVAL)
-    } else {
-        match req[16] {
-            // The dump is small, and as on Linux NLMSG_DONE follows in the same datagram
-            CTRL_CMD_GETFAMILY if dump => {
-                let mut out = reply(GENL_ID_CTRL, NLM_F_MULTI, &nlctrl_family());
-                out.extend(reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes()));
-                Ok(Some(out))
-            }
-            CTRL_CMD_GETFAMILY => {
-                names_nlctrl(req).map(|()| Some(reply(GENL_ID_CTRL, 0, &nlctrl_family())))
-            }
-            // Policy dumps are not implemented: it can only tell that the requested family does not
-            // exist
-            CTRL_CMD_GETPOLICY if dump => names_nlctrl(req).and(Err(EOPNOTSUPP)),
-            _ => Err(EOPNOTSUPP),
-        }
-    };
-    match r {
-        // No separate ack after a dump (Linux's netlink_dump_start makes netlink_rcv_skb skip the
-        // ack)
-        Ok(answer) => {
-            let mut out: Vec<Vec<u8>> = answer.into_iter().collect();
-            if flags & NLM_F_ACK != 0 && (!dump || out.is_empty()) {
-                out.push(ack(req, 0, pid));
-            }
-            out
-        }
-        Err(e) => vec![ack(req, e, pid)],
-    }
-}
-
-/// Requests in the boot network namespace that change a host interface (`RTM_NEWLINK`,
-/// `RTM_SETLINK`; Linux's `rtnl_setlink`, `__rtnl_newlink`). The app cannot change the host's
-/// interfaces, so only requests that change nothing are accepted: after the flags are combined by
-/// `rtnl_dev_combine_flags`, the bits `__dev_change_flags` can change are the same as now, and the
-/// name and MTU carried are also the same as now. That is what dockerd does when it brings up the
-/// already-up lo for a container's default network sandbox (`loopbackUp`). Anything that really
-/// changes something is still EOPNOTSUPP, and so is creating an interface (`NLM_F_CREATE`, veth,
-/// bridge and the like). `net_admin`: whether there is `CAP_NET_ADMIN` (EPERM without it; Linux
-/// checks before parsing). None: neither of these two requests.
-pub(crate) fn configure_host_link(
-    ifaces: &[Interface],
-    net_admin: bool,
-    req: &[u8],
-) -> Option<i32> {
-    const RTM_SETLINK: u16 = 19;
-    const NLM_F_REPLACE: u16 = 0x100;
-    const NLM_F_EXCL: u16 = 0x200;
-    const NLM_F_CREATE: u16 = 0x400;
-    const ENODEV: i32 = 19;
-    // The bits __dev_change_flags changes on request (IFF_UP, IFF_PROMISC, IFF_ALLMULTI are
-    // handled separately, and count too)
-    const CHANGEABLE: u32 =
-        0x1 | 0x4 | 0x20 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
-    let ty = u16::from_le_bytes([req[4], req[5]]);
-    if ty != RTM_NEWLINK && ty != RTM_SETLINK {
-        return None;
-    }
-    if !net_admin {
-        return Some(EPERM);
-    }
-    let flags = u16::from_le_bytes([req[6], req[7]]);
-    // struct ifinfomsg: address family, type, index, flags, flags to change
-    let Some(m) = req.get(16..32) else {
-        return Some(EINVAL);
-    };
-    let index = i32::from_le_bytes(m[4..8].try_into().unwrap());
-    let ifi_flags = u32::from_le_bytes(m[8..12].try_into().unwrap());
-    let change = u32::from_le_bytes(m[12..16].try_into().unwrap());
-    let attrs = crate::route::attrs(&req[32..]);
-    let name = attrs
-        .iter()
-        .find(|(t, _)| *t == IFLA_IFNAME)
-        .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default());
-    let newlink = ty == RTM_NEWLINK;
-    if newlink && index < 0 {
-        return Some(EINVAL);
-    }
-    // Look up by index, or by name when the index is not positive; when neither is given
-    // RTM_SETLINK is EINVAL and RTM_NEWLINK counts as not found
-    if !newlink && index <= 0 && name.is_none() {
-        return Some(EINVAL);
-    }
-    let found = ifaces.iter().find(|i| {
-        if index > 0 {
-            i.index as i32 == index
-        } else {
-            name.is_some() && name == Some(i.name.as_bytes())
-        }
-    });
-    let Some(dev) = found else {
-        // appine cannot create one when asked to (Linux also gives EOPNOTSUPP when it has no
-        // driver for that kind of interface)
-        return Some(if newlink && flags & NLM_F_CREATE != 0 {
-            EOPNOTSUPP
-        } else {
-            ENODEV
-        });
-    };
-    if newlink && flags & NLM_F_EXCL != 0 {
-        return Some(EEXIST);
-    }
-    if newlink && flags & NLM_F_REPLACE != 0 {
-        return Some(EOPNOTSUPP);
-    }
-    let same = attrs.iter().all(|&(t, d)| match t {
-        IFLA_IFNAME => d.split(|&c| c == 0).next() == Some(dev.name.as_bytes()),
-        IFLA_MTU => d.get(..4) == Some(&dev.mtu.to_le_bytes()[..]),
-        _ => false,
-    });
-    // When ifi_change is 0 the whole ifi_flags counts as wanted (Linux's "bugwards
-    // compatibility"); when both are 0 the flags are not changed
-    let wanted = if change != 0 {
-        (ifi_flags & change) | (dev.flags & !change)
-    } else {
-        ifi_flags
-    };
-    let flags_same = (ifi_flags == 0 && change == 0) || (wanted ^ dev.flags) & CHANGEABLE == 0;
-    Some(if same && flags_same { 0 } else { EOPNOTSUPP })
-}
-
-/// Host information that netlink answers need (replaced with fixed values in tests).
-pub(crate) trait Host {
-    /// The host's network interfaces.
-    fn interfaces(&self) -> Vec<Interface>;
-    /// The traffic counters of an interface ([`crate::traffic`]).
-    fn stats(&self, name: &str) -> IfStats;
-    /// The routes of the host's main table; when None they are synthesized from the interface
-    /// addresses ([`crate::route`]).
-    fn routes(&self) -> Option<Vec<Route>>;
-    /// The interface's transmit queue length (`IFLA_TXQLEN`), None when unavailable.
-    fn tx_queue_len(&self, name: &str) -> Option<u32>;
-    /// The user ID of the requesting process (RTA_UID in the `ip route get` answer).
-    fn uid(&self) -> u32;
-    /// Requests that change interfaces, addresses or routes ([`crate::netdev::request`]): None
-    /// means not handled, Some holds the result.
-    fn configure(&self, _req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
-        None
-    }
-    /// The network namespace RTM_GETNSID looks for: `attr` is [`NETNSA_PID`] (a process) or
-    /// [`NETNSA_FD`] (a namespace file), and `value` its value. When found, the number this
-    /// namespace assigned to it (None when unassigned); otherwise an error number.
-    fn peer_net(&self, _attr: u16, _value: u32) -> Result<Option<i32>, i32> {
-        Ok(None)
-    }
-    /// All interfaces: the host's (or lo) and virtual devices, by index.
-    fn links(&self) -> Vec<Link> {
-        self.interfaces().into_iter().map(Link::Host).collect()
-    }
-    /// The routing tables ([`crate::route::tables`], including those on virtual devices).
-    fn tables(&self) -> Vec<Route2> {
-        crate::route::tables(&self.interfaces(), self.routes())
-    }
-    /// The addresses of all interfaces (virtual devices included), for `ip route get`.
-    fn all_interfaces(&self) -> Vec<Interface> {
-        self.interfaces()
-    }
-    /// This is the boot namespace: `ip route get` may let the host choose the source address.
-    fn init_net(&self) -> bool {
-        true
-    }
-    /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
-    /// datagrams.
-    fn netfilter(&self, _data: &[u8], _peer: &crate::nft::Peer<'_>) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
-}
-
-type Route2 = crate::route::Entry;
-
-impl NetlinkSocket {
-    pub fn new(protocol: i32) -> NetlinkSocket {
-        NetlinkSocket {
-            protocol,
-            pid: 0,
-            queue: VecDeque::new(),
-            arrivals: 0,
-            rcvtimeo: None,
-            net: None,
-            ext_ack: false,
-            cap_ack: false,
-        }
-    }
-
-    /// Handles one datagram from the guest (which may hold several requests) and queues the
-    /// answers.
-    pub fn handle(&mut self, data: &[u8], host: &dyn Host) {
-        // An nftables batch spans several messages, so the whole datagram is handled together
-        if self.protocol == NETLINK_NETFILTER {
-            let peer = crate::nft::Peer {
-                pid: self.pid,
-                ext_ack: self.ext_ack,
-                cap_ack: self.cap_ack,
-                proc_pid: 0,
-                comm: b"",
-            };
-            for d in host.netfilter(data, &peer) {
-                self.queue.push_back(d);
-                self.arrivals += 1;
-            }
-            return;
-        }
-        if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
-            return;
-        }
-        let mut off = 0;
-        while off + 16 <= data.len() {
-            let h = &data[off..];
-            let len = u32::from_le_bytes(h[..4].try_into().unwrap()) as usize;
-            if len < 16 || off + len > data.len() {
-                break;
-            }
-            let answers = if self.protocol == NETLINK_GENERIC {
-                generic_request(&h[..len], self.pid)
-            } else {
-                self.route_request(&h[..len], host)
-            };
-            for d in answers {
-                self.queue.push_back(d);
-                self.arrivals += 1;
-            }
-            off += len.next_multiple_of(4);
-        }
-    }
-
-    /// Answers one request `req` (the whole message) on `NETLINK_ROUTE`, returning the datagrams.
-    fn route_request(&self, req: &[u8], host: &dyn Host) -> Vec<Vec<u8>> {
-        let ty = u16::from_le_bytes([req[4], req[5]]);
-        let flags = u16::from_le_bytes([req[6], req[7]]);
-        let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
-        let family = req.get(16).copied().unwrap_or(0) as i32;
-        let reply = |ty, flags, payload: &[u8]| message(ty, flags, seq, self.pid, payload);
-        let done = || reply(NLMSG_DONE, NLM_F_MULTI, &0i32.to_le_bytes());
-        let dump = flags & NLM_F_DUMP != 0;
-        if let Some(r) = host.configure(req) {
-            return match r {
-                Err(f) => vec![ack_ext(
-                    req,
-                    f.errno,
-                    self.pid,
-                    f.msg.filter(|_| self.ext_ack),
-                    self.cap_ack,
-                )],
-                Ok(()) if flags & NLM_F_ACK != 0 => vec![ack(req, 0, self.pid)],
-                Ok(()) => Vec::new(),
-            };
-        }
-        let one = |l: &Link| match l {
-            Link::Host(i) => link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name)),
-            Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
-        };
-        match ty {
-            // As on Linux, the interfaces are one datagram (split into several when too large);
-            // the addresses one per address family (IPv4 first for AF_UNSPEC), and NLMSG_DONE
-            // another one. When filtering by IFLA_MASTER or IFLA_LINKINFO's kind, the messages
-            // carry NLM_F_DUMP_FILTERED (Linux's rtnl_dump_ifinfo)
-            RTM_GETLINK if dump => {
-                const NLM_F_DUMP_FILTERED: u16 = 0x20;
-                let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
-                let master = attrs
-                    .iter()
-                    .find(|(t, d)| *t == IFLA_MASTER && d.len() >= 4)
-                    .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
-                    .filter(|&m| m != 0);
-                let kind = attrs
-                    .iter()
-                    .find(|(t, _)| *t == IFLA_LINKINFO)
-                    .and_then(|(_, d)| {
-                        crate::route::attrs(d)
-                            .into_iter()
-                            .find(|(t, _)| *t == 1)
-                            .map(|(_, k)| k.split(|&c| c == 0).next().unwrap_or_default().to_vec())
-                    })
-                    .filter(|k| matches!(&k[..], b"bridge" | b"veth" | b"dummy"));
-                let filtered = master.is_some() || kind.is_some();
-                let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
-                let mut out: Vec<Vec<u8>> = Vec::new();
-                let mut cur = Vec::new();
-                for l in &host.links() {
-                    let keep = match l {
-                        Link::Host(_) => master.is_none() && kind.is_none(),
-                        Link::Virt(v, _) => {
-                            master.is_none_or(|m| v.master == Some(m))
-                                && kind
-                                    .as_deref()
-                                    .is_none_or(|k| k == v.kind.name().as_bytes())
-                        }
-                    };
-                    if !keep {
-                        continue;
-                    }
-                    let m = reply(RTM_NEWLINK, mflags, &one(l));
-                    if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
-                        out.push(std::mem::take(&mut cur));
-                    }
-                    cur.extend(m);
-                }
-                if !cur.is_empty() {
-                    out.push(cur);
-                }
-                out.push(done());
-                out
-            }
-            RTM_GETADDR if dump => {
-                let links = host.links();
-                let mut out = Vec::new();
-                for f in [AF_INET, AF_INET6] {
-                    if family != 0 && family != f {
-                        continue;
-                    }
-                    let d: Vec<u8> = links
-                        .iter()
-                        .flat_map(|l| match l {
-                            Link::Host(i) => addr_messages(i, f as u8),
-                            Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
-                        })
-                        .flat_map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m))
-                        .collect();
-                    if !d.is_empty() {
-                        out.push(d);
-                    }
-                }
-                out.push(done());
-                out
-            }
-            // `ip link show <interface>`: looked up by ifi_index or IFLA_IFNAME (Linux's
-            // rtnl_getlink)
-            RTM_GETLINK => {
-                const ENODEV: i32 = 19;
-                let index = req
-                    .get(20..24)
-                    .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
-                let name = crate::route::attrs(req.get(32..).unwrap_or_default())
-                    .into_iter()
-                    .find(|(t, _)| *t == IFLA_IFNAME)
-                    .map(|(_, d)| d.split(|&c| c == 0).next().unwrap_or_default().to_vec());
-                if index <= 0 && name.is_none() {
-                    return vec![ack(req, EINVAL, self.pid)];
-                }
-                let found = host.links().into_iter().find(|l| {
-                    if index > 0 {
-                        l.index() as i32 == index
-                    } else {
-                        name.as_deref() == Some(l.name())
-                    }
-                });
-                let Some(l) = found else {
-                    return vec![ack(req, ENODEV, self.pid)];
-                };
-                let mut out = vec![reply(RTM_NEWLINK, 0, &one(&l))];
-                if flags & NLM_F_ACK != 0 {
-                    out.push(ack(req, 0, self.pid));
-                }
-                out
-            }
-            // As on Linux, the routes of each address family are one datagram, and NLMSG_DONE
-            // another one
-            RTM_GETROUTE if dump => {
-                let entries = host.tables();
-                let mut out = Vec::new();
-                for f in [AF_INET, AF_INET6] {
-                    let d: Vec<u8> = entries
-                        .iter()
-                        .filter(|e| e.family == f && (family == 0 || family == f))
-                        .flat_map(|e| {
-                            reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e))
-                        })
-                        .collect();
-                    if !d.is_empty() {
-                        out.push(d);
-                    }
-                }
-                out.push(done());
-                out
-            }
-            RTM_GETROUTE => {
-                let ifaces = host.all_interfaces();
-                let entries = host.tables();
-                match crate::route::get(req, &entries, &ifaces, host.uid(), host.init_net()) {
-                    Ok(p) => {
-                        let mut out = vec![reply(RTM_NEWROUTE, 0, &p)];
-                        if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
-                        }
-                        out
-                    }
-                    Err(e) => vec![ack(req, e, self.pid)],
-                }
-            }
-            // The rules fit in one datagram, and NLMSG_DONE is another one
-            RTM_GETRULE if dump => {
-                const EAFNOSUPPORT: i32 = 97;
-                let rules = crate::route::rule_messages(family);
-                if rules.is_empty() {
-                    return vec![ack(req, EAFNOSUPPORT, self.pid)];
-                }
-                let d = rules
-                    .iter()
-                    .flat_map(|m| reply(RTM_NEWRULE, NLM_F_MULTI, m))
-                    .collect();
-                vec![d, done()]
-            }
-            // Network namespace numbers (`ip netns list`): assigned to the namespace of the peer
-            // only when dumping veths (IFLA_LINK_NETNSID, Linux's peernet2id_alloc), and
-            // RTM_NEWNSID is EOPNOTSUPP; when the other namespace is found the assigned number is
-            // answered, -1 when unassigned (NETNSA_NSID_NOT_ASSIGNED), and lookups by number never
-            // find anything. The order is the same as Linux's rtnl_net_getid
-            RTM_GETNSID => {
-                let attrs = crate::route::attrs(req.get(20..).unwrap_or_default());
-                let get = |t| {
-                    attrs
-                        .iter()
-                        .find(|(a, d)| *a == t && d.len() >= 4)
-                        .map(|(_, d)| u32::from_le_bytes(d[..4].try_into().unwrap()))
-                };
-                let peer = if let Some(pid) = get(NETNSA_PID) {
-                    host.peer_net(NETNSA_PID, pid)
-                } else if let Some(fd) = get(NETNSA_FD) {
-                    host.peer_net(NETNSA_FD, fd)
-                } else if get(NETNSA_NSID).is_some() {
-                    Err(ENOENT)
-                } else {
-                    Err(EINVAL)
-                };
-                let r = peer.and_then(|id| match get(NETNSA_TARGET_NSID) {
-                    Some(_) => Err(EINVAL),
-                    None => Ok(id),
-                });
-                match r {
-                    Ok(id) => {
-                        let mut p = vec![0u8; 4];
-                        attr(&mut p, NETNSA_NSID, &id.unwrap_or(-1).to_le_bytes());
-                        let mut out = vec![reply(RTM_NEWNSID, 0, &p)];
-                        if flags & NLM_F_ACK != 0 {
-                            out.push(ack(req, 0, self.pid));
-                        }
-                        out
-                    }
-                    Err(e) => vec![ack(req, e, self.pid)],
-                }
-            }
-            // The neighbour table (ARP, NDP): the app on Android cannot see the host's, so it is
-            // always empty
-            RTM_GETNEIGH if dump => vec![done()],
-            RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
-            // Unsupported requests: EOPNOTSUPP; control messages are acked only when an ack is
-            // asked for
-            _ if flags & NLM_F_REQUEST != 0 => {
-                if ty < NLMSG_MIN_TYPE {
-                    if flags & NLM_F_ACK != 0 {
-                        vec![ack(req, 0, self.pid)]
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    vec![ack(req, EOPNOTSUPP, self.pid)]
-                }
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// This socket's `sockaddr_nl`.
-    pub fn sockaddr(&self) -> Vec<u8> {
-        let mut b = vec![0u8; 12];
-        b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-        b[4..8].copy_from_slice(&self.pid.to_le_bytes());
-        b
-    }
-}
 
 #[cfg(test)]
 mod tests {

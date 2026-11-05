@@ -134,26 +134,6 @@ impl RawIcmp {
         }
     }
 
-    fn echo(&self) -> (u8, u8) {
-        echo_types(self.family)
-    }
-
-    /// The guest sends a message: when it is an echo request, record its id.
-    pub fn sent(&mut self, data: &[u8]) {
-        if data.len() >= 8 && data[0] == self.echo().0 {
-            self.id = Some([data[4], data[5]]);
-        }
-    }
-
-    /// Whether a message of type `ty` passes the filter.
-    fn passes(&self, ty: u8) -> bool {
-        let word = |i: usize| u32::from_le_bytes(self.filter[4 * i..4 * i + 4].try_into().unwrap());
-        !match self.family {
-            AF_INET => ty < 32 && word(0) & (1 << ty) != 0,
-            _ => word(ty as usize >> 5) & (1 << (ty & 31)) != 0,
-        }
-    }
-
     /// The raw socket's own options. Returns None for those not handled here (left to the host).
     pub fn setsockopt(&mut self, level: i32, name: i32, v: &[u8]) -> Option<Result<(), i32>> {
         const EINVAL: i32 = 22;
@@ -219,6 +199,26 @@ impl RawIcmp {
             (AF_INET6, SOL_RAW, _) => return Some(Err(ENOPROTOOPT)),
             _ => return None,
         }))
+    }
+
+    /// The guest sends a message: when it is an echo request, record its id.
+    pub fn sent(&mut self, data: &[u8]) {
+        if data.len() >= 8 && data[0] == self.echo().0 {
+            self.id = Some([data[4], data[5]]);
+        }
+    }
+
+    fn echo(&self) -> (u8, u8) {
+        echo_types(self.family)
+    }
+
+    /// Whether a message of type `ty` passes the filter.
+    fn passes(&self, ty: u8) -> bool {
+        let word = |i: usize| u32::from_le_bytes(self.filter[4 * i..4 * i + 4].try_into().unwrap());
+        !match self.family {
+            AF_INET => ty < 32 && word(0) & (1 << ty) != 0,
+            _ => word(ty as usize >> 5) & (1 << (ty & 31)) != 0,
+        }
     }
 
     /// What the queued message `it` looks like when given to this socket (`key` is its wake
@@ -311,12 +311,7 @@ impl RawIcmp {
     }
 }
 
-fn echo_types(family: i32) -> (u8, u8) {
-    match family {
-        AF_INET => (ICMP_ECHO, ICMP_ECHOREPLY),
-        _ => (ICMPV6_ECHO_REQUEST, ICMPV6_ECHO_REPLY),
-    }
-}
+// ---- Aggregation points ----
 
 /// The ICMP aggregation point of one network namespace (see the module docs).
 pub(crate) struct Tap {
@@ -461,6 +456,247 @@ pub(crate) fn register(tap: &Rc<RefCell<Tap>>, sock: &Rc<RefCell<Socket>>, fd: i
     });
 }
 
+// ---- UDP sockets that set a TTL ----
+
+/// UDP socket options: records that the guest set a TTL, or enabled `IP_RECVERR` itself. When
+/// Some is returned the option is not passed to the host (while the aggregation point watches the
+/// socket, `IP_RECVERR` on the host is always on), and the value is the result the guest wants.
+pub(crate) fn udp_setsockopt(s: &mut InetSocket, level: i32, name: i32, v: &[u8]) -> Option<bool> {
+    if s.ty != SOCK_DGRAM || s.proto != IPPROTO_UDP {
+        return None;
+    }
+    let on = v
+        .first_chunk::<4>()
+        .map_or(v.first().is_some_and(|&b| b != 0), |b| {
+            i32::from_le_bytes(*b) != 0
+        });
+    match (level, name) {
+        (SOL_IP, IP_TTL) | (SOL_IPV6, IPV6_UNICAST_HOPS) => {
+            s.ttl_set = true;
+            None
+        }
+        (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) => {
+            s.guest_recverr = on;
+            // The guest turns it off while watched: only recorded; turning it on: no longer
+            // watched afterwards ([`untap`])
+            s.udp_tap.as_ref().map(|_| on)
+        }
+        _ => None,
+    }
+}
+
+/// UDP socket option values: while the aggregation point watches it, `IP_RECVERR` reports what the
+/// guest set.
+pub(crate) fn udp_getsockopt(s: &InetSocket, level: i32, name: i32) -> Option<Vec<u8>> {
+    match (level, name) {
+        (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) if s.udp_tap.is_some() => {
+            Some(i32::from(s.guest_recverr).to_le_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
+// ---- Sending and receiving ----
+
+/// Host socket `sock` is about to send or receive: a raw socket returns its aggregation point; a
+/// UDP socket that set a TTL, whose guest has not enabled `IP_RECVERR` itself, in a namespace that
+/// also has a raw socket of the same protocol family, is handed to the aggregation point to watch
+/// (enabling `IP_RECVERR` on the host), and the aggregation point is returned. When Some is
+/// returned, the errors on this socket must be taken off before the send or receive ([`dispatch`]
+/// taking only from it).
+pub(crate) fn before_io(k: &Kernel, sock: &Rc<RefCell<Socket>>) -> Option<Rc<RefCell<Tap>>> {
+    let (fd, family, tapped, wanted) = match &*sock.borrow() {
+        Socket::Inet(InetSocket { icmp: Some(r), .. }) => return Some(r.tap.clone()),
+        Socket::Inet(s) if s.ty == SOCK_DGRAM && s.proto == IPPROTO_UDP => (
+            s.fd,
+            s.family,
+            s.udp_tap.clone(),
+            s.ttl_set && !s.guest_recverr,
+        ),
+        _ => return None,
+    };
+    if let Some(t) = tapped {
+        if t.borrow_mut().has_receivers(family) {
+            return Some(t);
+        }
+        // All raw sockets are closed
+        untap(sock);
+        return None;
+    }
+    if !wanted {
+        return None;
+    }
+    let net = match &*sock.borrow() {
+        Socket::Inet(s) => s.net.clone(),
+        _ => None,
+    };
+    let tap = find_tap(k, &net).filter(|t| t.borrow_mut().has_receivers(family))?;
+    let (level, name) = recverr_option(family);
+    appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes()).ok()?;
+    tap.borrow_mut().add_source(sock, fd, family, true);
+    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+        s.udp_tap = Some(tap.clone());
+    }
+    Some(tap)
+}
+
+/// The aggregation point stops watching UDP socket `sock` (the guest wants `IP_RECVERR` itself,
+/// or all raw sockets are closed): errors already arrived are dispatched first, and `IP_RECVERR`
+/// on the host is restored to what the guest set. The caller must not be borrowing any socket.
+pub(crate) fn untap(sock: &Rc<RefCell<Socket>>) {
+    let (tap, fd, family, guest) = match &*sock.borrow() {
+        Socket::Inet(s) => match &s.udp_tap {
+            Some(t) => (t.clone(), s.fd, s.family, s.guest_recverr),
+            None => return,
+        },
+        _ => return,
+    };
+    let _ = dispatch(&tap, Some(fd));
+    tap.borrow_mut().remove_source(fd);
+    let (level, name) = recverr_option(family);
+    let _ = appine_hal::net::setsockopt(fd, level, name, &i32::from(guest).to_le_bytes());
+    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+        s.udp_tap = None;
+    }
+}
+
+fn recverr_option(family: i32) -> (i32, i32) {
+    match family {
+        AF_INET => (SOL_IP, IP_RECVERR),
+        _ => (SOL_IPV6, IPV6_RECVERR),
+    }
+}
+
+/// The ICMP error the aggregation point recorded for `sock` to report to the guest: takes it
+/// (Linux's `sock_error`).
+pub(crate) fn take_error(sock: &RefCell<Socket>) -> Option<Errno> {
+    match &*sock.borrow() {
+        Socket::Inet(s) => Some(Errno(s.icmp_err.replace(0))).filter(|e| e.0 != 0),
+        _ => None,
+    }
+}
+
+/// The errors that sends and receives get because of the `IP_RECVERR` enabled on the host for the
+/// guest (the results of `icmp_err_convert`, `icmpv6_err_convert`): on getting one, take the
+/// errors off first and try again.
+pub(crate) fn from_icmp(e: i32) -> bool {
+    const EHOSTDOWN: i32 = 112;
+    const ENONET: i32 = 64;
+    const EPROTO: i32 = 71;
+    [
+        Errno::ENETUNREACH,
+        Errno::EHOSTUNREACH,
+        Errno::ENOPROTOOPT,
+        Errno::ECONNREFUSED,
+        Errno::EMSGSIZE,
+        Errno::EOPNOTSUPP,
+        Errno::EACCES,
+    ]
+    .iter()
+    .any(|x| x.0 == e)
+        || [EHOSTDOWN, ENONET, EPROTO].contains(&e)
+}
+
+/// Takes one entry from the error queue of raw socket `sock`; the error to report becomes the
+/// next entry's (Linux's `sock_dequeue_err_skb`), or 0 when there is none left.
+pub(crate) fn take_err(tap: &Rc<RefCell<Tap>>, sock: &RefCell<Socket>) -> Option<ErrItem> {
+    let key = wake::of(sock);
+    let mut t = tap.borrow_mut();
+    let r = t.receivers.iter_mut().find(|r| r.key == key)?;
+    let e = r.errors.pop_front()?;
+    if let Socket::Inet(s) = &*sock.borrow() {
+        s.icmp_err.set(r.errors.front().map_or(0, |n| n.errno));
+    }
+    Some(e)
+}
+
+/// Takes a message from the queue of a raw socket (wake object `key`), without removing it when
+/// `peek`.
+pub(crate) fn take(tap: &Rc<RefCell<Tap>>, key: usize, peek: bool) -> Option<Item> {
+    let mut t = tap.borrow_mut();
+    let r = t.receivers.iter_mut().find(|r| r.key == key)?;
+    if peek {
+        return r.queue.front().cloned();
+    }
+    let it = r.queue.pop_front()?;
+    r.bytes -= it.icmp.len();
+    Some(it)
+}
+
+/// Fits control messages into the `room` bytes the guest gave (Linux's `put_cmsg`): the one that
+/// does not fit is cut short (`cmsg_len` written as the remaining length), the ones after it are
+/// left out, and the returned flags include `MSG_CTRUNC`.
+pub(crate) fn fit_control(control: &[u8], room: usize) -> (Vec<u8>, u32) {
+    let mut out = Vec::new();
+    let mut flags = 0;
+    for (_, _, whole, _) in cmsgs(control) {
+        let left = room - out.len();
+        let len = u64::from_le_bytes(whole[..8].try_into().unwrap()) as usize;
+        if left < CMSG_HDR {
+            flags |= MSG_CTRUNC;
+            break;
+        }
+        if left < len {
+            flags |= MSG_CTRUNC;
+            let start = out.len();
+            out.extend_from_slice(&whole[..left]);
+            out[start..start + 8].copy_from_slice(&(left as u64).to_le_bytes());
+            break;
+        }
+        out.extend_from_slice(&whole[..whole.len().min(left)]);
+    }
+    (out, flags)
+}
+
+// ---- Readiness ----
+
+/// Whether the error queue of a raw socket (wake object `key`) has anything in it.
+pub(crate) fn has_errors(tap: &RefCell<Tap>, key: usize) -> bool {
+    let t = tap.borrow();
+    t.receivers
+        .iter()
+        .any(|r| r.key == key && !r.errors.is_empty())
+}
+
+/// The queue of a raw socket (wake object `key`): (whether it has messages, the number of messages
+/// ever put in).
+pub(crate) fn queued(tap: &RefCell<Tap>, key: usize) -> (bool, u64) {
+    let t = tap.borrow();
+    t.receivers
+        .iter()
+        .find(|r| r.key == key)
+        .map_or((false, 0), |r| (!r.queue.is_empty(), r.arrivals))
+}
+
+/// The timer thread: takes what has arrived at each aggregation point on behalf of waiters in poll
+/// and epoll. Returns the host fds to wait on along with the rest.
+pub(crate) fn check_taps(k: &mut Kernel) -> Vec<(i32, i16, i16)> {
+    const POLLIN: i16 = 1;
+    k.icmp_taps.retain(|t| t.strong_count() > 0);
+    let taps: Vec<_> = k.icmp_taps.iter().filter_map(Weak::upgrade).collect();
+    let mut host = Vec::new();
+    for tap in taps {
+        let arrivals = dispatch(&tap, None);
+        account(k, arrivals);
+        host.push((tap.borrow().fd(), POLLIN, 0));
+    }
+    host
+}
+
+/// Records the messages the aggregation point took from ping sockets in the traffic counters
+/// ([`crate::traffic`]).
+pub(crate) fn account(k: &mut Kernel, arrivals: Vec<Arrival>) {
+    for a in arrivals {
+        if let Socket::Inet(s) = &mut *a.sock.borrow_mut()
+            && s.net.is_none()
+        {
+            k.traffic.account(s, true, a.bytes, &a.peer);
+        }
+    }
+}
+
+// ---- Dispatch ----
+
 /// Takes the messages and errors already arrived at the sources and gives them to the queues of
 /// the raw sockets. `only` takes only from this one host fd (clearing its errors before a send or
 /// receive). The caller must not be borrowing any socket. Returns the messages taken from ping
@@ -590,316 +826,6 @@ fn guest_ids(tap: &Rc<RefCell<Tap>>) -> Vec<([u8; 2], [u8; 2])> {
             Some((name.get(2..4)?.try_into().ok()?, guest))
         })
         .collect()
-}
-
-/// Puts messages into the queues of raw sockets of the same protocol family whose filters let them
-/// through, and wakes the threads waiting on them.
-fn deliver(tap: &Rc<RefCell<Tap>>, items: Vec<(i32, Item)>) {
-    if items.is_empty() {
-        return;
-    }
-    let mut woken = Vec::new();
-    let mut t = tap.borrow_mut();
-    t.receivers.retain(|r| r.sock.strong_count() > 0);
-    for r in &mut t.receivers {
-        let Some(sock) = r.sock.upgrade() else {
-            continue;
-        };
-        let s = sock.borrow();
-        let Socket::Inet(InetSocket {
-            icmp: Some(raw), ..
-        }) = &*s
-        else {
-            continue;
-        };
-        let mut got = false;
-        for (family, it) in &items {
-            if *family != r.family || !raw.passes(it.icmp[0]) || r.bytes + it.icmp.len() > QUEUE_MAX
-            {
-                continue;
-            }
-            r.bytes += it.icmp.len();
-            r.arrivals += 1;
-            r.queue.push_back(it.clone());
-            got = true;
-        }
-        drop(s);
-        if got {
-            woken.push(sock);
-        }
-    }
-    drop(t);
-    for s in woken {
-        request_wake_object(wake::of(&s));
-    }
-}
-
-/// Takes a message from the queue of a raw socket (wake object `key`), without removing it when
-/// `peek`.
-pub(crate) fn take(tap: &Rc<RefCell<Tap>>, key: usize, peek: bool) -> Option<Item> {
-    let mut t = tap.borrow_mut();
-    let r = t.receivers.iter_mut().find(|r| r.key == key)?;
-    if peek {
-        return r.queue.front().cloned();
-    }
-    let it = r.queue.pop_front()?;
-    r.bytes -= it.icmp.len();
-    Some(it)
-}
-
-/// Takes one entry from the error queue of raw socket `sock`; the error to report becomes the
-/// next entry's (Linux's `sock_dequeue_err_skb`), or 0 when there is none left.
-pub(crate) fn take_err(tap: &Rc<RefCell<Tap>>, sock: &RefCell<Socket>) -> Option<ErrItem> {
-    let key = wake::of(sock);
-    let mut t = tap.borrow_mut();
-    let r = t.receivers.iter_mut().find(|r| r.key == key)?;
-    let e = r.errors.pop_front()?;
-    if let Socket::Inet(s) = &*sock.borrow() {
-        s.icmp_err.set(r.errors.front().map_or(0, |n| n.errno));
-    }
-    Some(e)
-}
-
-/// Whether the error queue of a raw socket (wake object `key`) has anything in it.
-pub(crate) fn has_errors(tap: &RefCell<Tap>, key: usize) -> bool {
-    let t = tap.borrow();
-    t.receivers
-        .iter()
-        .any(|r| r.key == key && !r.errors.is_empty())
-}
-
-/// The queue of a raw socket (wake object `key`): (whether it has messages, the number of messages
-/// ever put in).
-pub(crate) fn queued(tap: &RefCell<Tap>, key: usize) -> (bool, u64) {
-    let t = tap.borrow();
-    t.receivers
-        .iter()
-        .find(|r| r.key == key)
-        .map_or((false, 0), |r| (!r.queue.is_empty(), r.arrivals))
-}
-
-/// Records the messages the aggregation point took from ping sockets in the traffic counters
-/// ([`crate::traffic`]).
-pub(crate) fn account(k: &mut Kernel, arrivals: Vec<Arrival>) {
-    for a in arrivals {
-        if let Socket::Inet(s) = &mut *a.sock.borrow_mut()
-            && s.net.is_none()
-        {
-            k.traffic.account(s, true, a.bytes, &a.peer);
-        }
-    }
-}
-
-/// The timer thread: takes what has arrived at each aggregation point on behalf of waiters in poll
-/// and epoll. Returns the host fds to wait on along with the rest.
-pub(crate) fn check_taps(k: &mut Kernel) -> Vec<(i32, i16, i16)> {
-    const POLLIN: i16 = 1;
-    k.icmp_taps.retain(|t| t.strong_count() > 0);
-    let taps: Vec<_> = k.icmp_taps.iter().filter_map(Weak::upgrade).collect();
-    let mut host = Vec::new();
-    for tap in taps {
-        let arrivals = dispatch(&tap, None);
-        account(k, arrivals);
-        host.push((tap.borrow().fd(), POLLIN, 0));
-    }
-    host
-}
-
-/// The errors that sends and receives get because of the `IP_RECVERR` enabled on the host for the
-/// guest (the results of `icmp_err_convert`, `icmpv6_err_convert`): on getting one, take the
-/// errors off first and try again.
-pub(crate) fn from_icmp(e: i32) -> bool {
-    const EHOSTDOWN: i32 = 112;
-    const ENONET: i32 = 64;
-    const EPROTO: i32 = 71;
-    [
-        Errno::ENETUNREACH,
-        Errno::EHOSTUNREACH,
-        Errno::ENOPROTOOPT,
-        Errno::ECONNREFUSED,
-        Errno::EMSGSIZE,
-        Errno::EOPNOTSUPP,
-        Errno::EACCES,
-    ]
-    .iter()
-    .any(|x| x.0 == e)
-        || [EHOSTDOWN, ENONET, EPROTO].contains(&e)
-}
-
-/// Host socket `sock` is about to send or receive: a raw socket returns its aggregation point; a
-/// UDP socket that set a TTL, whose guest has not enabled `IP_RECVERR` itself, in a namespace that
-/// also has a raw socket of the same protocol family, is handed to the aggregation point to watch
-/// (enabling `IP_RECVERR` on the host), and the aggregation point is returned. When Some is
-/// returned, the errors on this socket must be taken off before the send or receive ([`dispatch`]
-/// taking only from it).
-pub(crate) fn before_io(k: &Kernel, sock: &Rc<RefCell<Socket>>) -> Option<Rc<RefCell<Tap>>> {
-    let (fd, family, tapped, wanted) = match &*sock.borrow() {
-        Socket::Inet(InetSocket { icmp: Some(r), .. }) => return Some(r.tap.clone()),
-        Socket::Inet(s) if s.ty == SOCK_DGRAM && s.proto == IPPROTO_UDP => (
-            s.fd,
-            s.family,
-            s.udp_tap.clone(),
-            s.ttl_set && !s.guest_recverr,
-        ),
-        _ => return None,
-    };
-    if let Some(t) = tapped {
-        if t.borrow_mut().has_receivers(family) {
-            return Some(t);
-        }
-        // All raw sockets are closed
-        untap(sock);
-        return None;
-    }
-    if !wanted {
-        return None;
-    }
-    let net = match &*sock.borrow() {
-        Socket::Inet(s) => s.net.clone(),
-        _ => None,
-    };
-    let tap = find_tap(k, &net).filter(|t| t.borrow_mut().has_receivers(family))?;
-    let (level, name) = recverr_option(family);
-    appine_hal::net::setsockopt(fd, level, name, &1i32.to_le_bytes()).ok()?;
-    tap.borrow_mut().add_source(sock, fd, family, true);
-    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
-        s.udp_tap = Some(tap.clone());
-    }
-    Some(tap)
-}
-
-fn recverr_option(family: i32) -> (i32, i32) {
-    match family {
-        AF_INET => (SOL_IP, IP_RECVERR),
-        _ => (SOL_IPV6, IPV6_RECVERR),
-    }
-}
-
-/// The aggregation point stops watching UDP socket `sock` (the guest wants `IP_RECVERR` itself,
-/// or all raw sockets are closed): errors already arrived are dispatched first, and `IP_RECVERR`
-/// on the host is restored to what the guest set. The caller must not be borrowing any socket.
-pub(crate) fn untap(sock: &Rc<RefCell<Socket>>) {
-    let (tap, fd, family, guest) = match &*sock.borrow() {
-        Socket::Inet(s) => match &s.udp_tap {
-            Some(t) => (t.clone(), s.fd, s.family, s.guest_recverr),
-            None => return,
-        },
-        _ => return,
-    };
-    let _ = dispatch(&tap, Some(fd));
-    tap.borrow_mut().remove_source(fd);
-    let (level, name) = recverr_option(family);
-    let _ = appine_hal::net::setsockopt(fd, level, name, &i32::from(guest).to_le_bytes());
-    if let Socket::Inet(s) = &mut *sock.borrow_mut() {
-        s.udp_tap = None;
-    }
-}
-
-/// UDP socket options: records that the guest set a TTL, or enabled `IP_RECVERR` itself. When
-/// Some is returned the option is not passed to the host (while the aggregation point watches the
-/// socket, `IP_RECVERR` on the host is always on), and the value is the result the guest wants.
-pub(crate) fn udp_setsockopt(s: &mut InetSocket, level: i32, name: i32, v: &[u8]) -> Option<bool> {
-    if s.ty != SOCK_DGRAM || s.proto != IPPROTO_UDP {
-        return None;
-    }
-    let on = v
-        .first_chunk::<4>()
-        .map_or(v.first().is_some_and(|&b| b != 0), |b| {
-            i32::from_le_bytes(*b) != 0
-        });
-    match (level, name) {
-        (SOL_IP, IP_TTL) | (SOL_IPV6, IPV6_UNICAST_HOPS) => {
-            s.ttl_set = true;
-            None
-        }
-        (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) => {
-            s.guest_recverr = on;
-            // The guest turns it off while watched: only recorded; turning it on: no longer
-            // watched afterwards ([`untap`])
-            s.udp_tap.as_ref().map(|_| on)
-        }
-        _ => None,
-    }
-}
-
-/// UDP socket option values: while the aggregation point watches it, `IP_RECVERR` reports what the
-/// guest set.
-pub(crate) fn udp_getsockopt(s: &InetSocket, level: i32, name: i32) -> Option<Vec<u8>> {
-    match (level, name) {
-        (SOL_IP, IP_RECVERR) | (SOL_IPV6, IPV6_RECVERR) if s.udp_tap.is_some() => {
-            Some(i32::from(s.guest_recverr).to_le_bytes().to_vec())
-        }
-        _ => None,
-    }
-}
-
-/// A message received on a ping socket: for IPv4, takes out the `IP_TTL` and `IP_PKTINFO` the host
-/// enabled for the guest, to be given again by the guest's own options when handed to it
-/// ([`RawIcmp::present`]).
-fn data_item(family: i32, icmp: Vec<u8>, src: Vec<u8>, control: &[u8], key: usize) -> Item {
-    let mut it = Item {
-        icmp,
-        src,
-        ttl: None,
-        pktinfo: None,
-        other: Vec::new(),
-        origin: key,
-    };
-    for (level, ty, whole, data) in cmsgs(control) {
-        match (family, level, ty) {
-            (AF_INET, SOL_IP, IP_TTL) => it.ttl = int_cmsg(data),
-            (AF_INET, SOL_IP, IP_PKTINFO) => it.pktinfo = data.first_chunk::<12>().copied(),
-            _ => it.other.extend_from_slice(whole),
-        }
-    }
-    it
-}
-
-fn int_cmsg(data: &[u8]) -> Option<u8> {
-    data.first_chunk::<4>()
-        .map(|b| i32::from_le_bytes(*b) as u8)
-}
-
-/// One error-queue entry (`struct sock_extended_err` and the reporter's address); None when it was
-/// not reported by ICMP.
-fn extended_err(control: &[u8], level: i32, name: i32, origin: u8) -> Option<(&[u8], &[u8])> {
-    let (_, _, _, data) = cmsgs(control).find(|&(l, t, _, _)| (l, t) == (level, name))?;
-    (data.len() >= 16 && data[4] == origin).then(|| (&data[..16], &data[16..]))
-}
-
-/// The ports (network byte order) in the local address and the original destination address, 0
-/// when unavailable.
-fn ports(local: &[u8], dst: &[u8]) -> ([u8; 2], [u8; 2]) {
-    let port = |a: &[u8]| a.get(2..4).map_or([0; 2], |p| [p[0], p[1]]);
-    (port(local), port(dst))
-}
-
-/// The quoted original message: an ICMP echo request gets the guest's id back; for UDP a UDP
-/// header is added (the error queue gives only the payload; the ports come from the local address
-/// and the original destination address).
-fn quoted(
-    udp: bool,
-    ids: &[([u8; 2], [u8; 2])],
-    echo: u8,
-    data: &[u8],
-    sport: &[u8],
-    dport: &[u8],
-) -> Vec<u8> {
-    if udp {
-        let mut u = Vec::with_capacity(8 + data.len());
-        u.extend_from_slice(sport);
-        u.extend_from_slice(dport);
-        u.extend_from_slice(&((8 + data.len()).min(0xffff) as u16).to_be_bytes());
-        u.extend_from_slice(&[0, 0]);
-        u.extend_from_slice(data);
-        u
-    } else {
-        let mut d = data.to_vec();
-        if d.first() == Some(&echo) {
-            restore_id(&mut d, ids);
-        }
-        d
-    }
 }
 
 /// Reassembles an IPv4 error-queue entry into an ICMP error message: type, code, the attached
@@ -1046,21 +972,45 @@ fn error_v6(
     ))
 }
 
-/// The ICMP errors Linux reports to connected sockets without `IP_RECVERR` (the fatal ones in
-/// `icmp_err_convert`, `icmpv6_err_convert`, plus fragmentation needed and parameter problems);
-/// soft errors such as time exceeded are not reported.
-fn hard(family: i32, ty: u8, code: u8) -> bool {
-    match family {
-        AF_INET => match ty {
-            ICMP_DEST_UNREACH => matches!(code, 2..=4 | 6..=10 | 13..=15),
-            ICMP_PARAMETERPROB => true,
-            _ => false,
-        },
-        _ => match ty {
-            1 => matches!(code, 1 | 4..=6),
-            ICMPV6_PKT_TOOBIG | ICMPV6_PARAMPROB => true,
-            _ => false,
-        },
+/// One error-queue entry (`struct sock_extended_err` and the reporter's address); None when it was
+/// not reported by ICMP.
+fn extended_err(control: &[u8], level: i32, name: i32, origin: u8) -> Option<(&[u8], &[u8])> {
+    let (_, _, _, data) = cmsgs(control).find(|&(l, t, _, _)| (l, t) == (level, name))?;
+    (data.len() >= 16 && data[4] == origin).then(|| (&data[..16], &data[16..]))
+}
+
+/// The ports (network byte order) in the local address and the original destination address, 0
+/// when unavailable.
+fn ports(local: &[u8], dst: &[u8]) -> ([u8; 2], [u8; 2]) {
+    let port = |a: &[u8]| a.get(2..4).map_or([0; 2], |p| [p[0], p[1]]);
+    (port(local), port(dst))
+}
+
+/// The quoted original message: an ICMP echo request gets the guest's id back; for UDP a UDP
+/// header is added (the error queue gives only the payload; the ports come from the local address
+/// and the original destination address).
+fn quoted(
+    udp: bool,
+    ids: &[([u8; 2], [u8; 2])],
+    echo: u8,
+    data: &[u8],
+    sport: &[u8],
+    dport: &[u8],
+) -> Vec<u8> {
+    if udp {
+        let mut u = Vec::with_capacity(8 + data.len());
+        u.extend_from_slice(sport);
+        u.extend_from_slice(dport);
+        u.extend_from_slice(&((8 + data.len()).min(0xffff) as u16).to_be_bytes());
+        u.extend_from_slice(&[0, 0]);
+        u.extend_from_slice(data);
+        u
+    } else {
+        let mut d = data.to_vec();
+        if d.first() == Some(&echo) {
+            restore_id(&mut d, ids);
+        }
+        d
     }
 }
 
@@ -1082,12 +1032,28 @@ fn same_peer(peer: &[u8], dst: &[u8], udp: bool) -> bool {
         && (!udp || peer.get(2..4) == dst.get(2..4))
 }
 
-/// The ICMP error the aggregation point recorded for `sock` to report to the guest: takes it
-/// (Linux's `sock_error`).
-pub(crate) fn take_error(sock: &RefCell<Socket>) -> Option<Errno> {
-    match &*sock.borrow() {
-        Socket::Inet(s) => Some(Errno(s.icmp_err.replace(0))).filter(|e| e.0 != 0),
-        _ => None,
+/// The ICMP errors Linux reports to connected sockets without `IP_RECVERR` (the fatal ones in
+/// `icmp_err_convert`, `icmpv6_err_convert`, plus fragmentation needed and parameter problems);
+/// soft errors such as time exceeded are not reported.
+fn hard(family: i32, ty: u8, code: u8) -> bool {
+    match family {
+        AF_INET => match ty {
+            ICMP_DEST_UNREACH => matches!(code, 2..=4 | 6..=10 | 13..=15),
+            ICMP_PARAMETERPROB => true,
+            _ => false,
+        },
+        _ => match ty {
+            1 => matches!(code, 1 | 4..=6),
+            ICMPV6_PKT_TOOBIG | ICMPV6_PARAMPROB => true,
+            _ => false,
+        },
+    }
+}
+
+fn echo_types(family: i32) -> (u8, u8) {
+    match family {
+        AF_INET => (ICMP_ECHO, ICMP_ECHOREPLY),
+        _ => (ICMPV6_ECHO_REQUEST, ICMPV6_ECHO_REPLY),
     }
 }
 
@@ -1103,24 +1069,95 @@ fn restore_id(icmp: &mut [u8], ids: &[([u8; 2], [u8; 2])]) {
     }
 }
 
-/// The internet checksum (RFC 1071), in network byte order.
-fn checksum(b: &[u8]) -> [u8; 2] {
-    let mut acc: u32 = b
-        .chunks(2)
-        .map(|w| u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]) as u32)
-        .sum();
-    while acc > 0xffff {
-        acc = (acc & 0xffff) + (acc >> 16);
-    }
-    (!(acc as u16)).to_be_bytes()
-}
-
 /// The checksum after one 16-bit word it covers changes from `old` to `new` (equation 3 of RFC
 /// 1624): the rest of the content (ICMPv6's pseudo-header) need not be known.
 fn csum_replace(sum: [u8; 2], old: [u8; 2], new: [u8; 2]) -> [u8; 2] {
     let mut acc = !u16::from_be_bytes(sum) as u32
         + !u16::from_be_bytes(old) as u32
         + u16::from_be_bytes(new) as u32;
+    while acc > 0xffff {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    (!(acc as u16)).to_be_bytes()
+}
+
+/// A message received on a ping socket: for IPv4, takes out the `IP_TTL` and `IP_PKTINFO` the host
+/// enabled for the guest, to be given again by the guest's own options when handed to it
+/// ([`RawIcmp::present`]).
+fn data_item(family: i32, icmp: Vec<u8>, src: Vec<u8>, control: &[u8], key: usize) -> Item {
+    let mut it = Item {
+        icmp,
+        src,
+        ttl: None,
+        pktinfo: None,
+        other: Vec::new(),
+        origin: key,
+    };
+    for (level, ty, whole, data) in cmsgs(control) {
+        match (family, level, ty) {
+            (AF_INET, SOL_IP, IP_TTL) => it.ttl = int_cmsg(data),
+            (AF_INET, SOL_IP, IP_PKTINFO) => it.pktinfo = data.first_chunk::<12>().copied(),
+            _ => it.other.extend_from_slice(whole),
+        }
+    }
+    it
+}
+
+fn int_cmsg(data: &[u8]) -> Option<u8> {
+    data.first_chunk::<4>()
+        .map(|b| i32::from_le_bytes(*b) as u8)
+}
+
+/// Puts messages into the queues of raw sockets of the same protocol family whose filters let them
+/// through, and wakes the threads waiting on them.
+fn deliver(tap: &Rc<RefCell<Tap>>, items: Vec<(i32, Item)>) {
+    if items.is_empty() {
+        return;
+    }
+    let mut woken = Vec::new();
+    let mut t = tap.borrow_mut();
+    t.receivers.retain(|r| r.sock.strong_count() > 0);
+    for r in &mut t.receivers {
+        let Some(sock) = r.sock.upgrade() else {
+            continue;
+        };
+        let s = sock.borrow();
+        let Socket::Inet(InetSocket {
+            icmp: Some(raw), ..
+        }) = &*s
+        else {
+            continue;
+        };
+        let mut got = false;
+        for (family, it) in &items {
+            if *family != r.family || !raw.passes(it.icmp[0]) || r.bytes + it.icmp.len() > QUEUE_MAX
+            {
+                continue;
+            }
+            r.bytes += it.icmp.len();
+            r.arrivals += 1;
+            r.queue.push_back(it.clone());
+            got = true;
+        }
+        drop(s);
+        if got {
+            woken.push(sock);
+        }
+    }
+    drop(t);
+    for s in woken {
+        request_wake_object(wake::of(&s));
+    }
+}
+
+// ---- Checksums and control messages ----
+
+/// The internet checksum (RFC 1071), in network byte order.
+fn checksum(b: &[u8]) -> [u8; 2] {
+    let mut acc: u32 = b
+        .chunks(2)
+        .map(|w| u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]) as u32)
+        .sum();
     while acc > 0xffff {
         acc = (acc & 0xffff) + (acc >> 16);
     }
@@ -1155,31 +1192,6 @@ fn cmsgs(control: &[u8]) -> impl Iterator<Item = (i32, i32, &[u8], &[u8])> {
         off += space;
         Some((level, ty, whole, data))
     })
-}
-
-/// Fits control messages into the `room` bytes the guest gave (Linux's `put_cmsg`): the one that
-/// does not fit is cut short (`cmsg_len` written as the remaining length), the ones after it are
-/// left out, and the returned flags include `MSG_CTRUNC`.
-pub(crate) fn fit_control(control: &[u8], room: usize) -> (Vec<u8>, u32) {
-    let mut out = Vec::new();
-    let mut flags = 0;
-    for (_, _, whole, _) in cmsgs(control) {
-        let left = room - out.len();
-        let len = u64::from_le_bytes(whole[..8].try_into().unwrap()) as usize;
-        if left < CMSG_HDR {
-            flags |= MSG_CTRUNC;
-            break;
-        }
-        if left < len {
-            flags |= MSG_CTRUNC;
-            let start = out.len();
-            out.extend_from_slice(&whole[..left]);
-            out[start..start + 8].copy_from_slice(&(left as u64).to_le_bytes());
-            break;
-        }
-        out.extend_from_slice(&whole[..whole.len().min(left)]);
-    }
-    (out, flags)
 }
 
 #[cfg(test)]

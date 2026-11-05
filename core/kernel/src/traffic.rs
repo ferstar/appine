@@ -102,19 +102,19 @@ struct Table {
 }
 
 impl Table {
+    fn lookup(&self, ip: &[u8]) -> Option<(Rc<str>, u32)> {
+        self.addrs
+            .iter()
+            .find(|(a, ..)| a == ip)
+            .map(|(_, n, mss)| (n.clone(), *mss))
+    }
+
     /// The MSS on interface `name`; with no address on it, by Ethernet's MTU.
     fn mss_of(&self, name: &str) -> u32 {
         self.addrs
             .iter()
             .find(|(_, n, _)| &**n == name)
             .map_or(1500 - TCP_OVERHEAD, |(.., mss)| *mss)
-    }
-
-    fn lookup(&self, ip: &[u8]) -> Option<(Rc<str>, u32)> {
-        self.addrs
-            .iter()
-            .find(|(a, ..)| a == ip)
-            .map(|(_, n, mss)| (n.clone(), *mss))
     }
 }
 
@@ -127,11 +127,6 @@ pub(crate) struct Traffic {
 }
 
 impl Traffic {
-    /// The counters of interface `name`.
-    pub fn get(&self, name: &str) -> IfStats {
-        self.stats.get(name).copied().unwrap_or_default()
-    }
-
     /// Records `bytes` bytes received (`rx`) or sent by socket `s`. `peer` is this call's peer
     /// address (the sendto target or the recvfrom source, as sockaddr bytes), and may be empty.
     pub fn account(&mut self, s: &mut InetSocket, rx: bool, bytes: usize, peer: &[u8]) {
@@ -295,19 +290,11 @@ impl Traffic {
             default,
         });
     }
-}
 
-/// The local address the host chooses for sending to the internet
-/// ([`appine_hal::net::source_for`]), or None when there is no route for this address family.
-pub(crate) fn outgoing_source(family: i32) -> Option<Vec<u8>> {
-    let dst: &[u8] = if family == AF_INET {
-        &[8, 8, 8, 8]
-    } else {
-        &[
-            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
-        ]
-    };
-    appine_hal::net::source_for(dst).ok()
+    /// The counters of interface `name`.
+    pub fn get(&self, name: &str) -> IfStats {
+        self.stats.get(name).copied().unwrap_or_default()
+    }
 }
 
 /// The IP address in a sockaddr: 4 bytes for IPv4, 16 bytes for IPv6, and an IPv4-mapped IPv6
@@ -335,6 +322,19 @@ fn is_loopback(ip: &[u8]) -> bool {
         16 => ip[..15].iter().all(|&b| b == 0) && ip[15] == 1,
         _ => false,
     }
+}
+
+/// The local address the host chooses for sending to the internet
+/// ([`appine_hal::net::source_for`]), or None when there is no route for this address family.
+pub(crate) fn outgoing_source(family: i32) -> Option<Vec<u8>> {
+    let dst: &[u8] = if family == AF_INET {
+        &[8, 8, 8, 8]
+    } else {
+        &[
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ]
+    };
+    appine_hal::net::source_for(dst).ok()
 }
 
 #[cfg(test)]
