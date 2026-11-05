@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tabs running under the buttons and fading out into `×`)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tab row bringing the current tab back after it rests)
 
 ## Responsibilities
 
@@ -98,9 +98,12 @@ libghostty-vt with Zig (`android/native`).
   32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's right fading
   edge, shortening towards that end as the row nears its own; the left edge does not fade). A
   tab shows its number (from 1, by position): the current one in the primary colour above the
-  indicator and scrolled into view after each change, clear of the fade, or to the row's end when
-  less than a fade's width of tabs would be left beyond the padding, the others muted, an ended
-  one faded (38% opacity, its indicator too). The indicator is a rounded bar 16 dp wide and 1 dp high in the
+  indicator, the others muted, an ended one faded (38% opacity, its indicator too). The current
+  tab is scrolled into view after each change, clear of the fade, or to the row's end when less
+  than a fade's width of tabs would be left beyond the padding; scrolled away from it (out of view
+  or into the fade), the row brings it back the same way 3 s after coming to rest: a finger on the
+  row, on a tab too, holds that off, and each later move without one (a fling, TalkBack's
+  scrolling) starts the wait again. The indicator is a rounded bar 16 dp wide and 1 dp high in the
   primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
   draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
   the system font scale leaves them as they are (dialogs, menus and toasts follow it).
@@ -328,6 +331,9 @@ libghostty-vt with Zig (`android/native`).
   padding out of its scroll range and fade strength, and `View` draws the fading edge at the
   padding; the row's right padding offset (`isPaddingOffsetRequired`, `getRightPaddingOffset`)
   carries the edge into `×` without changing either.
+- The row brings the current tab into view after a change with a plain post of its own, not the
+  delayed return's `Runnable`: the scroll that laying out a shorter row makes restarts the return's
+  wait, which would remove that post and leave the tab out of view for 3 s.
 - A `HorizontalScrollView` takes any sideways slide past the touch slop even when it has nothing
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
   scroll, and a held key asks its parents not to intercept.

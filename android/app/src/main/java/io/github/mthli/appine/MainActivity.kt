@@ -19,6 +19,7 @@ import android.view.KeyEvent
 import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
 import android.view.Menu
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -44,7 +45,8 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
  *
  * The tab bar is one row in any window: a scrolling row of tabs, each a square with its number
  * (a long press shows its title), with `×` (closes the current tab), `+` and `⋮` over its end; the
- * tabs fade out into the left part of `×` while more of them lie beyond.
+ * tabs fade out into the left part of `×` while more of them lie beyond. Scrolled away from the
+ * current tab, the row brings it back into view a few seconds after it comes to rest.
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
@@ -67,6 +69,12 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** [current]'s number in the row, which the row draws the indicator under; null with none. */
     private var currentTab: TextView? = null
+
+    /** Whether a finger is on the tab row, which holds off [returnToCurrentTab]. */
+    private var stripTouched = false
+
+    /** Brings the current tab back into view a while after the row was scrolled away from it. */
+    private val returnToCurrentTab = Runnable { revealCurrentTab() }
 
     private var fontSize = 0
 
@@ -127,11 +135,33 @@ class MainActivity : Activity(), TerminalService.Listener {
         // The row runs under the buttons to the bar's end. Its end padding, as wide as the buttons,
         // lets the last tab scroll out from under them. While tabs lie beyond the padding, the
         // right fading edge hints that the row scrolls: a padding offset carries it into the blank
-        // left part of ×, so the tabs fade out under the button rather than at its edge
+        // left part of ×, so the tabs fade out under the button rather than at its edge. Scrolled
+        // away from the current tab, the row brings it back once it has rested for a while
         strip = object : HorizontalScrollView(this) {
             override fun getLeftFadingEdgeStrength() = 0f
             override fun isPaddingOffsetRequired() = true
             override fun getRightPaddingOffset() = dp(FADE_INTO_CLOSE_DP)
+
+            // A finger on the row, on a tab too, holds the return off; lifting it starts the wait
+            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        stripTouched = true
+                        removeCallbacks(returnToCurrentTab)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        stripTouched = false
+                        returnToCurrentTabLater()
+                    }
+                }
+                return super.dispatchTouchEvent(ev)
+            }
+
+            // Every move without a finger (a fling, TalkBack's scroll actions) starts it again
+            override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+                super.onScrollChanged(l, t, oldl, oldt)
+                if (!stripTouched) returnToCurrentTabLater()
+            }
         }.apply {
             isHorizontalScrollBarEnabled = false
             isHorizontalFadingEdgeEnabled = true
@@ -321,29 +351,41 @@ class MainActivity : Activity(), TerminalService.Listener {
         closeButton.visibility = if (shown == null) View.INVISIBLE else View.VISIBLE
         if (shown != null) currentIndex = sessions.indexOf(shown)
 
-        // Indicate the current tab (adding the tabs redraws the row), and bring it into view, clear
-        // of the fade towards the buttons, once the new row is laid out (this runs after the layout
-        // pass that adding the tabs requested)
-        val tab = tabs.getChildAt(sessions.indexOf(shown)) as TextView?
-        currentTab = tab
-        if (tab == null) return
-        strip.post {
-            val fade = strip.horizontalFadingEdgeLength
-            val shownWidth = strip.width - strip.paddingRight
-            val end = tabs.width - shownWidth
-            // Where the fade begins, from the row's visible left edge
-            val clearWidth = shownWidth + dp(FADE_INTO_CLOSE_DP) - fade
-            when {
-                tab.left < strip.scrollX -> strip.smoothScrollTo(tab.left, 0)
-                tab.right > strip.scrollX + clearWidth -> {
-                    val x = tab.right - clearWidth
-                    // Less than a fade's width of tabs left beyond the padding would fade only
-                    // inside ×, leaving the last tab barely faded against it: go to the row's end,
-                    // where nothing fades
-                    strip.smoothScrollTo(if (end - x < fade) end else x, 0)
-                }
+        // Indicate the current tab (adding the tabs redraws the row), and bring it into view once
+        // the new row is laid out (this runs after the layout pass that adding the tabs requested).
+        // Not through returnToCurrentTab: a scroll in that layout (closing tabs can shorten the row)
+        // would put it off
+        currentTab = tabs.getChildAt(sessions.indexOf(shown)) as TextView?
+        if (currentTab != null) strip.post { revealCurrentTab() }
+    }
+
+    /**
+     * Scrolls the row to bring the current tab into view, clear of the fade towards the buttons;
+     * nothing when it already is, or when there is none.
+     */
+    private fun revealCurrentTab() {
+        val tab = currentTab ?: return
+        val fade = strip.horizontalFadingEdgeLength
+        val shownWidth = strip.width - strip.paddingRight
+        val end = tabs.width - shownWidth
+        // Where the fade begins, from the row's visible left edge
+        val clearWidth = shownWidth + dp(FADE_INTO_CLOSE_DP) - fade
+        when {
+            tab.left < strip.scrollX -> strip.smoothScrollTo(tab.left, 0)
+            tab.right > strip.scrollX + clearWidth -> {
+                val x = tab.right - clearWidth
+                // Less than a fade's width of tabs left beyond the padding would fade only inside
+                // ×, leaving the last tab barely faded against it: go to the row's end, where
+                // nothing fades
+                strip.smoothScrollTo(if (end - x < fade) end else x, 0)
             }
         }
+    }
+
+    /** Starts, or starts again, the wait before [returnToCurrentTab]. */
+    private fun returnToCurrentTabLater() {
+        strip.removeCallbacks(returnToCurrentTab)
+        strip.postDelayed(returnToCurrentTab, RETURN_TO_CURRENT_TAB_MS)
     }
 
     /**
@@ -585,5 +627,11 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The opacity of an ended tab's number (Material's disabled content). */
         private const val ENDED_ALPHA = 0.38f
+
+        /**
+         * How long the tab row rests, with no finger on it, before it brings a current tab it was
+         * scrolled away from back into view; longer than a tab's title stays up after a long press.
+         */
+        private const val RETURN_TO_CURRENT_TAB_MS = 3000L
     }
 }
