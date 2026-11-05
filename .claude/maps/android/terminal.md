@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys; the tab bar's and extra keys' labels in dp, not following the system font scale; the tab bar as one row of numbered 32 dp squares with `×`, `+` and `⋮` in any window, a long press showing a tab's title in a toast, `×` asking before closing a running tab; the next tab shown after closing the current one; closing the other tabs or all of them from the `⋮` menu; the switcher, the list of tabs, the swipe, the tab menu and renaming removed; the tabs' numbers in the default weight, the current tab's box replaced by an indicator under its number, drawn the same under locked modifiers and SYM with the symbols shown; a long press on a one-shot modifier locking it, with a toast naming it)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the tabs running under the buttons and fading out into `×`)
 
 ## Responsibilities
 
@@ -34,7 +34,8 @@ libghostty-vt with Zig (`android/native`).
 ## Key types
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
-  numbered tabs, then `×`, `+` and `⋮`); `Host : VtView.Host`, `Keys : ExtraKeysView.Target`.
+  numbered tabs, with `×`, `+` and `⋮` over its end); `Host : VtView.Host`,
+  `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
@@ -88,13 +89,18 @@ libghostty-vt with Zig (`android/native`).
 
 - `onStart` starts and binds the service; `onServiceConnected` registers the listener and replays
   ready/error/progress and pending notices; `onStop` unregisters and unbinds.
-- The bar is one 32 dp row in any window: a scrolling row of tabs taking what the buttons leave,
-  then `×` (closes the current tab; hidden while there is none), `+` (opens a session while the
+- The bar is one 32 dp row in any window: a scrolling row of tabs across its whole width, with
+  `×` (closes the current tab; hidden while there is none), `+` (opens a session while the
   kernel runs) and `⋮` (a menu: "Close other tabs", disabled when there is no other, "Close all
-  tabs" and Settings), every tab and button a 32 dp square with its label centred. A
+  tabs" and Settings) over its end, every tab and button a 32 dp square with its label centred.
+  The tabs pass under the buttons, which hide them, and an end padding as wide as the buttons lets
+  the last tab scroll out from under them; while more tabs lie beyond, the row fades out over
+  32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's right fading
+  edge, shortening towards that end as the row nears its own; the left edge does not fade). A
   tab shows its number (from 1, by position): the current one in the primary colour above the
-  indicator and scrolled into view after each change, the others muted, an ended one faded (38%
-  opacity, its indicator too). The indicator is a rounded bar 16 dp wide and 1 dp high in the
+  indicator and scrolled into view after each change, clear of the fade, or to the row's end when
+  less than a fade's width of tabs would be left beyond the padding, the others muted, an ended
+  one faded (38% opacity, its indicator too). The indicator is a rounded bar 16 dp wide and 1 dp high in the
   primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
   draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
   the system font scale leaves them as they are (dialogs, menus and toasts follow it).
@@ -313,6 +319,15 @@ libghostty-vt with Zig (`android/native`).
 - Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab from a hardware
   keyboard (the tab shortcuts); the release of the shortcut's key is swallowed too, so the Kitty
   protocol sees no release without a press.
+- The tab bar's buttons sit over the row's end, so their group is clickable and black but for the
+  left part of `×` the fade reaches into: a hidden (`INVISIBLE`) `×` takes no touches, and
+  without the group's a tap there would reach a tab under it. The black is an `InsetDrawable`,
+  whose inset a background also sets as the view's padding, so the group clears its padding
+  after it. The group is not important for accessibility, so TalkBack reads each button alone.
+- The row draws into its end padding (`clipToPadding` off). `HorizontalScrollView` leaves the
+  padding out of its scroll range and fade strength, and `View` draws the fading edge at the
+  padding; the row's right padding offset (`isPaddingOffsetRequired`, `getRightPaddingOffset`)
+  carries the edge into `×` without changing either.
 - A `HorizontalScrollView` takes any sideways slide past the touch slop even when it has nothing
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
   scroll, and a held key asks its parents not to intercept.

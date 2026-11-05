@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.InsetDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -27,6 +28,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
+import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -41,7 +43,8 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
  * current tab's [VtSession].
  *
  * The tab bar is one row in any window: a scrolling row of tabs, each a square with its number
- * (a long press shows its title), then `×` (closes the current tab), `+` and `⋮`.
+ * (a long press shows its title), with `×` (closes the current tab), `+` and `⋮` over its end; the
+ * tabs fade out into the left part of `×` while more of them lie beyond.
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
@@ -121,8 +124,19 @@ class MainActivity : Activity(), TerminalService.Listener {
                 currentTab?.let { ExtraKeysView.drawIndicator(canvas, this, it, indicatorPaint) }
             }
         }.apply { orientation = LinearLayout.HORIZONTAL }
-        strip = HorizontalScrollView(this).apply {
+        // The row runs under the buttons to the bar's end. Its end padding, as wide as the buttons,
+        // lets the last tab scroll out from under them. While tabs lie beyond the padding, the
+        // right fading edge hints that the row scrolls: a padding offset carries it into the blank
+        // left part of ×, so the tabs fade out under the button rather than at its edge
+        strip = object : HorizontalScrollView(this) {
+            override fun getLeftFadingEdgeStrength() = 0f
+            override fun isPaddingOffsetRequired() = true
+            override fun getRightPaddingOffset() = dp(FADE_INTO_CLOSE_DP)
+        }.apply {
             isHorizontalScrollBarEnabled = false
+            isHorizontalFadingEdgeEnabled = true
+            setFadingEdgeLength(dp(FADE_DP))
+            clipToPadding = false
             addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         // The multiplication sign, which Roboto draws like its +; U+2715 (✕) is not in Roboto, and
@@ -132,13 +146,26 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         keys = ExtraKeysView(this, Keys())
 
-        val bar = LinearLayout(this).apply {
+        // Black but for the left part of × the fade reaches into, so the tabs under the buttons are
+        // hidden, and taking every touch there, so a tab under the hidden × cannot be tapped;
+        // TalkBack skips the group and reads each button
+        val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.BLACK)
-            addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            background = InsetDrawable(Color.BLACK.toDrawable(), dp(FADE_INTO_CLOSE_DP), 0, 0, 0)
+            // The inset comes as padding with the background, which would widen the group to the
+            // left by as much and keep the black at the left of ×
+            setPadding(0, 0, 0, 0)
+            isClickable = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             addView(closeButton, barItem())
             addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) }, barItem())
             addView(barButton("⋮") { showMenu(it) }, barItem())
+        }
+        strip.setPadding(0, 0, buttons.childCount * dp(BAR_DP), 0)
+        val bar = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            addView(strip, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(buttons, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END))
         }
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -294,15 +321,27 @@ class MainActivity : Activity(), TerminalService.Listener {
         closeButton.visibility = if (shown == null) View.INVISIBLE else View.VISIBLE
         if (shown != null) currentIndex = sessions.indexOf(shown)
 
-        // Indicate the current tab (adding the tabs redraws the row), and bring it into view once
-        // the new row is laid out (this runs after the layout pass that adding the tabs requested)
+        // Indicate the current tab (adding the tabs redraws the row), and bring it into view, clear
+        // of the fade towards the buttons, once the new row is laid out (this runs after the layout
+        // pass that adding the tabs requested)
         val tab = tabs.getChildAt(sessions.indexOf(shown)) as TextView?
         currentTab = tab
         if (tab == null) return
         strip.post {
+            val fade = strip.horizontalFadingEdgeLength
+            val shownWidth = strip.width - strip.paddingRight
+            val end = tabs.width - shownWidth
+            // Where the fade begins, from the row's visible left edge
+            val clearWidth = shownWidth + dp(FADE_INTO_CLOSE_DP) - fade
             when {
                 tab.left < strip.scrollX -> strip.smoothScrollTo(tab.left, 0)
-                tab.right > strip.scrollX + strip.width -> strip.smoothScrollTo(tab.right - strip.width, 0)
+                tab.right > strip.scrollX + clearWidth -> {
+                    val x = tab.right - clearWidth
+                    // Less than a fade's width of tabs left beyond the padding would fade only
+                    // inside ×, leaving the last tab barely faded against it: go to the row's end,
+                    // where nothing fades
+                    strip.smoothScrollTo(if (end - x < fade) end else x, 0)
+                }
             }
         }
     }
@@ -534,6 +573,15 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
         private const val TAB_NUMBER_DP = 12f
+
+        /** The width over which the tabs fade out towards the bar's buttons. */
+        private const val FADE_DP = 32
+
+        /**
+         * How far the fade reaches into `×`, ending in the blank before its glyph; the rest of
+         * [FADE_DP] lies at its left.
+         */
+        private const val FADE_INTO_CLOSE_DP = 12
 
         /** The opacity of an ended tab's number (Material's disabled content). */
         private const val ENDED_ALPHA = 0.38f
