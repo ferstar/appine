@@ -99,6 +99,17 @@ impl Term {
         self.take_replies()
     }
 
+    /// The bytes the terminal wrote for the console since the last call (replies, a paste).
+    fn take_replies(&mut self) -> Vec<u8> {
+        let mut len = 0;
+        let p = unsafe { appine_vt_take_replies(self.0, &mut len) };
+        if len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: vt.c returns len valid bytes, kept until the next feed
+        unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
+    }
+
     /// Text vt.c returned (`len` bytes at `p`, kept until its next text call) as a Java string;
     /// null for a null `p`. Called with the lock held.
     fn text(&self, env: &mut JNIEnv<'_>, p: *const u8, len: usize) -> jstring {
@@ -109,17 +120,6 @@ impl Term {
         let text = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) });
         env.new_string(text)
             .map_or(std::ptr::null_mut(), JString::into_raw)
-    }
-
-    /// The bytes the terminal wrote for the console since the last call (replies, a paste).
-    fn take_replies(&mut self) -> Vec<u8> {
-        let mut len = 0;
-        let p = unsafe { appine_vt_take_replies(self.0, &mut len) };
-        if len == 0 {
-            return Vec::new();
-        }
-        // SAFETY: vt.c returns len valid bytes, kept until the next feed
-        unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 }
 
@@ -140,15 +140,6 @@ struct Tab {
 }
 
 impl Tab {
-    fn term(&self) -> MutexGuard<'_, Term> {
-        self.term.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The kernel, for the duration of one call; None once it is stopped.
-    fn machine(&self) -> Option<Arc<Machine>> {
-        machine(self.machine)
-    }
-
     /// Writes input to the console of `m` (this tab's kernel) until all of it is taken; false once
     /// the console is gone.
     fn write(&self, m: &Machine, mut data: &[u8]) -> bool {
@@ -160,47 +151,19 @@ impl Tab {
         }
         true
     }
+
+    fn term(&self) -> MutexGuard<'_, Term> {
+        self.term.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The kernel, for the duration of one call; None once it is stopped.
+    fn machine(&self) -> Option<Arc<Machine>> {
+        machine(self.machine)
+    }
 }
 
 static TABS: Mutex<BTreeMap<jlong, Arc<Tab>>> = Mutex::new(BTreeMap::new());
 static NEXT_TAB: AtomicI64 = AtomicI64::new(1);
-
-fn tab(handle: jlong) -> Option<Arc<Tab>> {
-    TABS.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&handle)
-        .cloned()
-}
-
-fn size(cols: jint, rows: jint, cell_width: jint, cell_height: jint) -> (u16, u16, u32, u32) {
-    (
-        cols.clamp(1, 0xffff) as u16,
-        rows.clamp(1, 0xffff) as u16,
-        cell_width.max(1) as u32,
-        cell_height.max(1) as u32,
-    )
-}
-
-/// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
-fn cell(v: jint) -> u16 {
-    v.clamp(0, 0xffff) as u16
-}
-
-fn bytes_array(env: &mut JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
-    env.byte_array_from_slice(bytes)
-        .map_or(std::ptr::null_mut(), JByteArray::into_raw)
-}
-
-/// The first `n` bytes of an encoder's output, null when it failed (`n` < 0).
-fn encoded(env: &mut JNIEnv<'_>, out: &[c_char], n: isize) -> jbyteArray {
-    let Ok(n) = usize::try_from(n) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: c_char and u8 have the same layout, and the encoder wrote n <= out.len() bytes
-    bytes_array(env, unsafe {
-        std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), n)
-    })
-}
 
 /// Creates the terminal of an open console; returns the tab handle.
 #[unsafe(no_mangle)]
@@ -237,18 +200,20 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
     id
 }
 
-/// Forgets a tab; its terminal is freed once a running pump has returned too.
+/// Shows bytes from the app itself (not the program) as if the console had printed them; replies
+/// are dropped.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_destroy<'l>(
-    _: JNIEnv<'l>,
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
+    env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
+    data: JByteArray<'l>,
 ) {
-    let removed = TABS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&handle);
-    drop(removed);
+    let Some(tab) = tab(handle) else { return };
+    let Ok(data) = env.convert_byte_array(&data) else {
+        return;
+    };
+    tab.term().feed(&data);
 }
 
 /// Moves the console's output into the terminal until the session ends or the console is closed;
@@ -289,6 +254,22 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
             break;
         }
     }
+}
+
+/// The title a program set (OSC 0/2); null when none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let term = tab.term();
+    let mut len = 0;
+    let p = unsafe { appine_vt_title(term.0, &mut len) };
+    term.text(&mut env, p, len)
 }
 
 /// Captures a frame (vt.c's format) of the rows that changed, or of all rows with `full`. The
@@ -335,17 +316,13 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_resize<'l>(
     }
 }
 
-/// Scrolls the viewport by `delta` rows (negative: back); 0 returns to the bottom.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_scroll<'l>(
-    _: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-    delta: jint,
-) {
-    if let Some(tab) = tab(handle) {
-        unsafe { appine_vt_scroll(tab.term().0, delta) };
-    }
+fn size(cols: jint, rows: jint, cell_width: jint, cell_height: jint) -> (u16, u16, u32, u32) {
+    (
+        cols.clamp(1, 0xffff) as u16,
+        rows.clamp(1, 0xffff) as u16,
+        cell_width.max(1) as u32,
+        cell_height.max(1) as u32,
+    )
 }
 
 /// Encodes a key for the program in the terminal's current modes (cursor keys, keypad, Kitty
@@ -474,6 +451,35 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_focus<'l>(
     encoded(&mut env, &out, n)
 }
 
+/// The first `n` bytes of an encoder's output, null when it failed (`n` < 0).
+fn encoded(env: &mut JNIEnv<'_>, out: &[c_char], n: isize) -> jbyteArray {
+    let Ok(n) = usize::try_from(n) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: c_char and u8 have the same layout, and the encoder wrote n <= out.len() bytes
+    bytes_array(env, unsafe {
+        std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), n)
+    })
+}
+
+fn bytes_array(env: &mut JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
+    env.byte_array_from_slice(bytes)
+        .map_or(std::ptr::null_mut(), JByteArray::into_raw)
+}
+
+/// Scrolls the viewport by `delta` rows (negative: back); 0 returns to the bottom.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_scroll<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    delta: jint,
+) {
+    if let Some(tab) = tab(handle) {
+        unsafe { appine_vt_scroll(tab.term().0, delta) };
+    }
+}
+
 /// Selects the word at viewport cell (`x`, `y`) and anchors drags to it; false when there is no
 /// word there (the selection is then cleared).
 #[unsafe(no_mangle)]
@@ -512,6 +518,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectTo<'l>(
 ) -> jboolean {
     tab(handle).is_some_and(|tab| unsafe { appine_vt_select_to(tab.term().0, cell(x), cell(y)) })
         as jboolean
+}
+
+/// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
+fn cell(v: jint) -> u16 {
+    v.clamp(0, 0xffff) as u16
 }
 
 /// Selects everything, scrollback included.
@@ -553,22 +564,6 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_copy<'l>(
     term.text(&mut env, p, len)
 }
 
-/// The title a program set (OSC 0/2); null when none.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
-    mut env: JNIEnv<'l>,
-    _: JClass<'l>,
-    handle: jlong,
-) -> jstring {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let term = tab.term();
-    let mut len = 0;
-    let p = unsafe { appine_vt_title(term.0, &mut len) };
-    term.text(&mut env, p, len)
-}
-
 /// Shows a yellow line of app notice above the cursor's line; false on the alternate screen.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_message<'l>(
@@ -600,18 +595,23 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
     term.text(&mut env, p, len)
 }
 
-/// Shows bytes from the app itself (not the program) as if the console had printed them; replies
-/// are dropped.
+/// Forgets a tab; its terminal is freed once a running pump has returned too.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
-    env: JNIEnv<'l>,
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_destroy<'l>(
+    _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
-    data: JByteArray<'l>,
 ) {
-    let Some(tab) = tab(handle) else { return };
-    let Ok(data) = env.convert_byte_array(&data) else {
-        return;
-    };
-    tab.term().feed(&data);
+    let removed = TABS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&handle);
+    drop(removed);
+}
+
+fn tab(handle: jlong) -> Option<Arc<Tab>> {
+    TABS.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&handle)
+        .cloned()
 }
