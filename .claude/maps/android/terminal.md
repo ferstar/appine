@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the extra keys taking left-edge slides while they scroll, as the tab row does)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the extra keys fading out into their last column while they scroll, as the tab row into ×)
 
 ## Responsibilities
 
@@ -42,7 +42,8 @@ libghostty-vt with Zig (`android/native`).
   symbols Gboard gives neither on its letters nor from a long press on one, and `-`, with `/ - | ~`
   where they are on the first page): a `Page` is a
   grid of the first seven columns and the key above SYM; the grid shown is in a
-  `HorizontalScrollView`, the last column (SHIFT or `%` over SYM) fixed beside it; keeps CTRL, ALT
+  `HorizontalScrollView` across the view, the last column (SHIFT or `%` over SYM) fixed over its
+  end; keeps CTRL, ALT
   and SHIFT (one-shot or locked) and the page shown, and sends keys, text and notices (a modifier
   locked) to a `Target`; `Press` handles the touch on one key. Its companion's `drawIndicator`
   draws the indicator under a label, for the keys and for the tab row.
@@ -144,12 +145,14 @@ libghostty-vt with Zig (`android/native`).
   are); the eight columns share the width, each at least
   45 dp (the last one takes the pixels left over), so they all fit from 360 dp on. Narrower, the
   first seven columns of both rows scroll sideways together under the finger (turning the page
-  keeps the scroll position), while the last stays
-  at the right edge; a sideways slide past the touch slop then scrolls and cancels the key it
-  started on, unless that key is already held, and with gesture navigation a slide from the
-  screen's left edge scrolls them instead of going back: the scrolling part is excluded from the
-  system's back gesture. With nothing to scroll the keys keep every touch and the edge its
-  gesture. No lines are drawn between or around the keys.
+  keeps the scroll position) and under the last, which stays at the right edge; while more keys
+  lie beyond, they fade out over 32 dp ending 6 dp inside the last column, in the blank before
+  SHIFT, as the tab row's into `×` (no fade at the row's end or on the left), and a touch there
+  goes to the last column's key. A sideways slide past the touch slop then scrolls and cancels the
+  key it started on, unless that key is already held, and with gesture navigation a slide from the
+  screen's left edge scrolls them instead of going back: the scrolling part beside the last column
+  is excluded from the system's back gesture. With nothing to scroll the keys keep every touch and
+  the edge its gesture. No lines are drawn between or around the keys.
 - A key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed (the highest surface container
   colour). Held past the
@@ -330,11 +333,16 @@ libghostty-vt with Zig (`android/native`).
   left part of `×` the fade reaches into: a hidden (`INVISIBLE`) `×` takes no touches, and
   without the group's a tap there would reach a tab under it. The black is an `InsetDrawable`,
   whose inset a background also sets as the view's padding, so the group clears its padding
-  after it. The group is not important for accessibility, so TalkBack reads each button alone.
-- The row draws into its end padding (`clipToPadding` off). `HorizontalScrollView` leaves the
-  padding out of its scroll range and fade strength, and `View` draws the fading edge at the
-  padding; the row's right padding offset (`isPaddingOffsetRequired`, `getRightPaddingOffset`)
-  carries the edge into `×` without changing either.
+  after it, as the extra keys' last column does (its keys would narrow). The group is not
+  important for accessibility, so TalkBack reads each button alone.
+- The tab row and the extra keys' grid draw into their end padding (`clipToPadding` off).
+  `HorizontalScrollView` leaves the padding out of its scroll range and fade strength, and `View`
+  draws the fading edge at the padding; a right padding offset (`isPaddingOffsetRequired`,
+  `getRightPaddingOffset`) carries the edge into `×` or the last column without changing either.
+  `canScrollHorizontally` counts the end padding as shown (from 315 dp on the keys would find
+  nothing to scroll), so the extra keys compare the grid's width with the room between the
+  paddings. How far a fade reaches in (12 dp into `×` at 14 dp, 6 dp into SHIFT at 12 dp) fits
+  the blank before the glyph in Roboto; another label size or font can put the fade over it.
 - The row brings the current tab into view after a change with a plain post of its own, not the
   delayed return's `Runnable`: the scroll that laying out a shorter row makes restarts the return's
   wait, which would remove that post and leave the tab out of view for 3 s.

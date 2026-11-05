@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
@@ -13,9 +14,11 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.graphics.drawable.toDrawable
 import com.google.android.material.color.MaterialColors
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -38,7 +41,8 @@ import kotlin.math.roundToInt
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
  * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
- * sideways beside it.
+ * sideways under it, fading out into the blank left of SHIFT while more of them lie beyond, as the
+ * tab row fades out into ×.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow
  * repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply to the next key typed,
@@ -48,7 +52,7 @@ import kotlin.math.roundToInt
  * page. The android/terminal map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
-internal class ExtraKeysView(context: Context, private val target: Target) : LinearLayout(context) {
+internal class ExtraKeysView(context: Context, private val target: Target) : FrameLayout(context) {
 
     /** Where the keys go: the terminal view of the tab shown. */
     interface Target {
@@ -100,11 +104,29 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private var symbols = false
     private lateinit var symView: TextView
 
-    /** The page shown, scrolled sideways when the view is too narrow for all eight columns. */
+    private val density = resources.displayMetrics.density
+
+    /**
+     * How far the fade reaches into the last column, in whole pixels, rounded down as
+     * MainActivity's dp.
+     */
+    private val fadeIntoLast = (FADE_INTO_LAST_DP * density).toInt()
+
+    /**
+     * The page shown, scrolled sideways when the view is too narrow for all eight columns. It runs
+     * under the last column to the view's end; its end padding, as wide as that column, lets the
+     * grid's last column scroll out from under it. While keys lie beyond the padding, the right
+     * fading edge hints that they scroll: a padding offset carries it into the blank left of SHIFT,
+     * as the tab row's into ×.
+     */
     private val scroll = object : HorizontalScrollView(context) {
         // It would take any sideways slide past the touch slop, cancelling the key under the
         // finger, even with nothing to scroll (360 dp and wider)
         override fun onInterceptTouchEvent(e: MotionEvent) = scrolls() && super.onInterceptTouchEvent(e)
+
+        override fun getLeftFadingEdgeStrength() = 0f
+        override fun isPaddingOffsetRequired() = true
+        override fun getRightPaddingOffset() = fadeIntoLast
 
         // With gesture navigation, a slide from the screen's left edge over keys that scroll
         // scrolls them instead of going back; with nothing to scroll, the edge keeps its gesture.
@@ -115,25 +137,42 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
             super.onLayout(changed, l, t, r, b)
-            excluded.set(0, 0, width, height)
+            // The part beside the last column: under it, the right edge keeps its gesture
+            excluded.set(0, 0, width - paddingRight, height)
             systemGestureExclusionRects = if (scrolls()) exclusion else emptyList()
         }
 
-        private fun scrolls() = canScrollHorizontally(1) || canScrollHorizontally(-1)
-    }.apply { isHorizontalScrollBarEnabled = false }
+        // Not canScrollHorizontally, which counts the end padding as shown, so from 315 dp on it
+        // would find nothing to scroll
+        private fun scrolls() = getChildAt(0).let { it != null && it.width > width - paddingLeft - paddingRight }
+    }.apply {
+        isHorizontalScrollBarEnabled = false
+        isHorizontalFadingEdgeEnabled = true
+        setFadingEdgeLength((FADE_DP * density).toInt())
+        clipToPadding = false
+    }
 
-    /** The last column, fixed at the right edge. */
+    /**
+     * The last column, fixed at the right edge over the grid's end. Black but for its left part the
+     * fade reaches into, so the keys under it are hidden; its keys fill it and take every touch on
+     * it, a key showing through the fade too.
+     */
     private val fixed = object : LinearLayout(context) {
         override fun dispatchDraw(canvas: Canvas) {
             super.dispatchDraw(canvas)
             indicateKeys(canvas, this)
         }
-    }.apply { orientation = VERTICAL }
+    }.apply {
+        orientation = LinearLayout.VERTICAL
+        background = InsetDrawable(Color.BLACK.toDrawable(), fadeIntoLast, 0, 0, 0)
+        // The inset comes as padding with the background, which would narrow the keys and move
+        // them right by as much
+        setPadding(0, 0, 0, 0)
+    }
 
     /** The width of a column in the grid, in pixels, as last measured; 0 before that. */
     private var column = 0
 
-    private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
     // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
@@ -147,7 +186,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val rowHeight = (ROW_DP * density).roundToInt()
 
     init {
-        orientation = HORIZONTAL
         setBackgroundColor(Color.BLACK)
         page(
             arrayOf(
@@ -177,9 +215,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         symView = fixedView(Key("SYM") { turnPage() })
         fixed.addView(symView)
         show(pages[0])
-        addView(scroll, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
-        // Its width is set in onMeasure
-        addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT))
+        // Their widths are set in onMeasure: the scroll view's end padding and the last column's
+        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT, Gravity.END))
         refresh()
     }
 
@@ -201,17 +239,17 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
                 super.dispatchDraw(canvas)
                 indicateKeys(canvas, this)
             }
-        }.apply { orientation = VERTICAL }
+        }.apply { orientation = LinearLayout.VERTICAL }
         for (keys in rows) {
             check(keys.size == COLUMNS - 1)
-            val row = LinearLayout(context).apply { orientation = HORIZONTAL }
+            val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
             for (key in keys) {
                 val view = keyView(key)
                 gridKeys.add(view)
                 // Its width is set in onMeasure
-                row.addView(view, LayoutParams(0, LayoutParams.MATCH_PARENT))
+                row.addView(view, LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT))
             }
-            grid.addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
+            grid.addView(row, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
         }
         pages.add(Page(grid, fixedView(last)))
     }
@@ -233,7 +271,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /** A key for the fixed column, laid out to fill a cell of it. */
     private fun fixedView(key: Key) =
-        keyView(key).apply { layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
+        keyView(key).apply { layoutParams = LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
 
     /**
      * Puts [page] in the view in place of the other one, its last key above SYM. Removing a key's
@@ -267,7 +305,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     /**
      * Shares the width out among the [COLUMNS], each at least [MIN_COLUMN_DP] wide; the last
      * column also takes the pixels left over. When the minimum wins, the grid is wider than the
-     * room beside the last column and scrolls.
+     * room beside the last column and scrolls under it.
      */
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val width = MeasureSpec.getSize(widthMeasureSpec)
@@ -284,7 +322,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
                 for (i in 0 until page.grid.childCount) page.grid.getChildAt(i).forceLayout()
             }
         }
-        fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
+        val last = max(min, width - (COLUMNS - 1) * c)
+        fixed.layoutParams.width = last
+        scroll.setPadding(0, 0, last, 0)
         super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
 
@@ -408,6 +448,19 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
          * sp, so the system font scale cannot outgrow the fixed cells.
          */
         private const val LABEL_DP = 12f
+
+        /**
+         * The width over which a row that scrolls fades out under what is fixed at its end: the
+         * keys under the last column, and the tab bar's tabs under its buttons.
+         */
+        const val FADE_DP = 32
+
+        /**
+         * How far the fade reaches into the last column, ending in the blank before SHIFT, its
+         * widest label (about 33 dp of a 45 dp column in Roboto); the rest of [FADE_DP] lies at its
+         * left.
+         */
+        private const val FADE_INTO_LAST_DP = 6
 
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L

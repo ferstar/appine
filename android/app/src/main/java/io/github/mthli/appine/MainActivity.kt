@@ -166,7 +166,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }.apply {
             isHorizontalScrollBarEnabled = false
             isHorizontalFadingEdgeEnabled = true
-            setFadingEdgeLength(dp(FADE_DP))
+            setFadingEdgeLength(dp(ExtraKeysView.FADE_DP))
             clipToPadding = false
             addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
@@ -623,12 +623,9 @@ class MainActivity : Activity(), TerminalService.Listener {
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
         private const val TAB_NUMBER_DP = 12f
 
-        /** The width over which the tabs fade out towards the bar's buttons. */
-        private const val FADE_DP = 32
-
         /**
          * How far the fade reaches into `×`, ending in the blank before its glyph; the rest of
-         * [FADE_DP] lies at its left.
+         * [ExtraKeysView.FADE_DP] lies at its left.
          */
         private const val FADE_INTO_CLOSE_DP = 12
 
