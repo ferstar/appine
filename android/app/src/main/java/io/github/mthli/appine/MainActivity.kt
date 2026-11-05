@@ -56,9 +56,9 @@ import kotlin.math.abs
  * (a phone held upright) it shows the number of tabs and the current tab's title, and tapping them
  * opens the list of tabs.
  *
- * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark),
- * and the tab bar and the extra keys take the theme's colours; the activity itself stays a
- * framework one, and so do the views it builds.
+ * Its dialogs, menus and the list of tabs are Material 3 (`Theme.Appine.Terminal`, always dark);
+ * the tab bar and the extra keys are black like the terminal, with labels in the theme's colours.
+ * The activity itself stays a framework one, and so do the views it builds.
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
@@ -84,10 +84,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     private var shortcutKey = 0
 
     // The theme's colours, from the wallpaper on Android 12 and later, so read after onCreate has
-    // applied them
-
-    /** The tab bar, the extra keys and what lies under the system bars. */
-    private val barColor by lazy { themeColor(com.google.android.material.R.attr.colorSurfaceContainer) }
+    // applied them. The tab bar, the extra keys and what lies under the system bars are black, as
+    // the terminal is
 
     /** The bar's buttons and other tabs, and an ended tab's title. */
     private val mutedColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant) }
@@ -174,7 +172,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(barColor)
+            setBackgroundColor(Color.BLACK)
             addView(strip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(switcher, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(barButton("+") { newSession() }.apply { contentDescription = getString(R.string.new_tab) })
@@ -188,7 +186,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(barColor)
+            setBackgroundColor(Color.BLACK)
             addView(bar)
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)

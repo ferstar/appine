@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.TypedValue
@@ -11,23 +12,30 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
 import com.google.android.material.color.MaterialColors
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * The keys the soft keyboard lacks, in Termux's default layout: two rows of seven with the arrows
- * as an inverted T.
+ * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
+ * widened to nine columns (DEL deletes forward).
  *
  * ```
- * ESC  /  -    HOME  ↑  END  PGUP
- * TAB CTRL ALT  ←    ↓   →   PGDN
+ * ESC  /   -  HOME  ↑  END  |   ~  │ PGUP
+ * TAB CTRL ALT  ←   ↓   →   `  DEL │ PGDN
  * ```
+ *
+ * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all nine fit from
+ * 360 dp on. In a narrower view the last column stays at the right edge and the first eight scroll
+ * sideways beside it. Faint lines one pixel wide put each key in a cell of its own.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
- * PGUP or PGDN repeats it; swiping up from `-` sends `|` instead. Ctrl and Alt are one-shot
+ * PGUP, PGDN or DEL repeats it; swiping up from `-` sends `|` instead. Ctrl and Alt are one-shot
  * modifiers: tapped, they apply to the next key typed, which reads them ([ctrl], [alt]) and reports
  * taking them ([modifiersUsed]); held, they stay on until tapped again. The android/terminal map.
  */
@@ -65,22 +73,70 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val ctrlKey = Modifier()
     private val altKey = Modifier()
 
+    /** The first eight columns of both rows, and the keys in them (sized in [onMeasure]). */
+    private val grid = object : LinearLayout(context) {
+        // Over the keys, so a pressed key's shading does not hide them; drawn here, inside the
+        // scroll view, the lines between columns scroll with the keys
+        override fun dispatchDraw(canvas: Canvas) {
+            super.dispatchDraw(canvas)
+            for (i in 0 until childCount) {
+                val row = getChildAt(i) as ViewGroup
+                hLine(canvas, row.top, width)
+                for (j in 1 until row.childCount) vLine(canvas, row.left + row.getChildAt(j).left, row.top, row.bottom)
+            }
+            hLine(canvas, height - 1, width)
+        }
+    }.apply { orientation = VERTICAL }
+    private val gridKeys = mutableListOf<View>()
+
+    /** The grid, scrolled sideways when the view is too narrow for all nine columns. */
+    private val scroll = object : HorizontalScrollView(context) {
+        // It would take any sideways slide past the touch slop, cancelling the key under the
+        // finger, even with nothing to scroll (360 dp and wider)
+        override fun onInterceptTouchEvent(e: MotionEvent) =
+            (canScrollHorizontally(1) || canScrollHorizontally(-1)) && super.onInterceptTouchEvent(e)
+    }.apply {
+        isHorizontalScrollBarEnabled = false
+        addView(grid)
+    }
+
+    /** The last column, fixed at the right edge. */
+    private val fixed = object : LinearLayout(context) {
+        // Its left line also ends the grid where it scrolls out of sight
+        override fun dispatchDraw(canvas: Canvas) {
+            super.dispatchDraw(canvas)
+            vLine(canvas, 0, 0, height)
+            for (i in 0 until childCount) hLine(canvas, getChildAt(i).top, width)
+            hLine(canvas, height - 1, width)
+        }
+    }.apply { orientation = VERTICAL }
+
+    /** The width of a column in the grid, in pixels, as last measured; 0 before that. */
+    private var column = 0
+
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
 
     private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
-    // The theme's colours, as the tab bar's: the bar, the labels, a modifier that is on, a key
-    // while pressed and the popup above one
-    private val barColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainer)
+    // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
+    // labels, a modifier that is on, a key while pressed and the popup above one
     private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
     private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
 
+    /**
+     * The lines around the keys: above each row, below the last one (the system bars and what lies
+     * under them are black too) and between the columns, in the divider colour.
+     */
+    private val linePaint = Paint().apply {
+        color = themeColor(com.google.android.material.R.attr.colorOutlineVariant)
+    }
+
     init {
-        orientation = VERTICAL
-        setBackgroundColor(barColor)
+        orientation = HORIZONTAL
+        setBackgroundColor(Color.BLACK)
         row(
             special("ESC", KeyEvent.KEYCODE_ESCAPE),
             char("/"),
@@ -88,6 +144,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             special("HOME", KeyEvent.KEYCODE_MOVE_HOME),
             special("↑", KeyEvent.KEYCODE_DPAD_UP, repeats = true),
             special("END", KeyEvent.KEYCODE_MOVE_END),
+            char("|"),
+            char("~"),
             special("PGUP", KeyEvent.KEYCODE_PAGE_UP, repeats = true),
         )
         row(
@@ -97,9 +155,35 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             special("←", KeyEvent.KEYCODE_DPAD_LEFT, repeats = true),
             special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
             special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
+            char("`"),
+            special("DEL", KeyEvent.KEYCODE_FORWARD_DEL, repeats = true),
             special("PGDN", KeyEvent.KEYCODE_PAGE_DOWN, repeats = true),
         )
+        addView(scroll, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+        // Its width is set in onMeasure
+        addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT))
         refresh()
+    }
+
+    /**
+     * Shares the width out among the [COLUMNS], each at least [MIN_COLUMN_DP] wide; the last
+     * column also takes the pixels left over. When the minimum wins, the grid is wider than the
+     * room beside the last column and scrolls.
+     */
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        val min = (MIN_COLUMN_DP * density).roundToInt()
+        val c = max(min, width / COLUMNS)
+        if (c != column) {
+            column = c
+            for (v in gridKeys) v.layoutParams.width = c
+            // The rows and the grid are measured without a width limit, which need not change
+            // with the columns, so their last measurement could be reused
+            grid.forceLayout()
+            for (i in 0 until grid.childCount) grid.getChildAt(i).forceLayout()
+        }
+        fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
 
     /** The next key or character took the one-shot modifiers; locked ones stay on. */
@@ -116,29 +200,47 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
 
+    /** A line one pixel high from the left edge across [width], its top at [y]. */
+    private fun hLine(canvas: Canvas, y: Int, width: Int) =
+        canvas.drawRect(0f, y.toFloat(), width.toFloat(), y + 1f, linePaint)
+
+    /** A line one pixel wide from [top] to [bottom], its left at [x]. */
+    private fun vLine(canvas: Canvas, x: Int, top: Int, bottom: Int) =
+        canvas.drawRect(x.toFloat(), top.toFloat(), x + 1f, bottom.toFloat(), linePaint)
+
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }
 
     private fun char(text: String, popup: Key? = null) = Key(text, popup = popup) { target.text(text) }
 
-    @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
+    /** One row of [COLUMNS] keys: all but the last in the grid, the last in the fixed column. */
     private fun row(vararg keys: Key) {
+        check(keys.size == COLUMNS)
+        val height = (ROW_DP * density).roundToInt()
         val row = LinearLayout(context).apply { orientation = HORIZONTAL }
-        for (key in keys) {
-            val view = label(key.label)
-            key.modifier?.view = view
-            view.setOnClickListener { tap(key) }
-            view.setOnTouchListener(Press(key, view))
-            row.addView(view, LayoutParams(0, LayoutParams.MATCH_PARENT, 1f))
+        for (key in keys.dropLast(1)) {
+            val view = keyView(key)
+            gridKeys.add(view)
+            // Its width is set in onMeasure
+            row.addView(view, LayoutParams(0, LayoutParams.MATCH_PARENT))
         }
-        addView(row, LayoutParams(LayoutParams.MATCH_PARENT, (ROW_DP * density).roundToInt()))
+        grid.addView(row, LayoutParams(LayoutParams.WRAP_CONTENT, height))
+        fixed.addView(keyView(keys.last()), LayoutParams(LayoutParams.MATCH_PARENT, height))
+    }
+
+    @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
+    private fun keyView(key: Key) = label(key.label).also { view ->
+        key.modifier?.view = view
+        view.setOnClickListener { tap(key) }
+        view.setOnTouchListener(Press(key, view))
     }
 
     private fun label(text: String) = TextView(context).apply {
         this.text = text
         gravity = Gravity.CENTER
         setTextColor(labelColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        // HOME, the widest label, takes about 34 dp of a 40 dp column
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
         isSingleLine = true
     }
 
@@ -172,7 +274,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     /**
      * The touch on one key: highlights it while pressed, taps it on release (through
      * [View.performClick]), repeats it or locks its modifier while held, and shows its popup while
-     * the finger is above the key.
+     * the finger is above the key. A sideways slide on a key that is not yet held or showing its
+     * popup scrolls the grid, if it can scroll, and cancels the key.
      */
     private inner class Press(private val key: Key, private val view: View) : OnTouchListener, Runnable {
         private var held = 0
@@ -220,7 +323,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         /** The long-press timeout passed, then every [REPEAT_MS] while a repeating key is held. */
         override fun run() {
-            held++
+            if (held++ == 0) keepTouch()
             val m = key.modifier
             if (m != null) {
                 view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -230,6 +333,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
                 view.postDelayed(this, REPEAT_MS)
             }
         }
+
+        /** From now on the grid does not take the finger to scroll. */
+        private fun keepTouch() = view.parent.requestDisallowInterceptTouchEvent(true)
 
         private fun outside(v: View, e: MotionEvent) =
             e.x < -slop || e.y < -slop || e.x > v.width + slop || e.y > v.height + slop
@@ -245,6 +351,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         /** The popup key, as large as this one, right above it. */
         private fun showPopup(popupKey: Key) {
             view.removeCallbacks(this)
+            keepTouch()
             val label = label(popupKey.label).apply { setBackgroundColor(pressedColor) }
             window = PopupWindow(label, view.width, view.height).apply {
                 isTouchable = false
@@ -255,8 +362,14 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }
 
     companion object {
-        /** The height of a row, as in Termux. */
-        private const val ROW_DP = 37.5f
+        /** The number of columns: eight in the grid and the fixed one. */
+        private const val COLUMNS = 9
+
+        /** The narrowest a column gets, so nine fit in 360 dp. */
+        private const val MIN_COLUMN_DP = 40f
+
+        /** The height of a row. */
+        private const val ROW_DP = 32f
 
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L

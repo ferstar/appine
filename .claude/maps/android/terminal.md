@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours)
+> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black)
 
 ## Responsibilities
 
@@ -38,9 +38,10 @@ libghostty-vt with Zig (`android/native`).
   while open (AppCompat's `ListPopupWindow` over the `TabList` adapter, rows from
   `list_tab.xml`); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
-- `ExtraKeysView` — Termux's default layout, two rows of seven (ESC, `/`, `-`, HOME, ↑, END, PGUP;
-  TAB, CTRL, ALT, ←, ↓, →, PGDN); keeps CTRL and ALT (one-shot or locked) and sends keys and text
-  to a `Target`; `Press` handles the touch on one key.
+- `ExtraKeysView` — Termux's default keys widened to two rows of nine (ESC, `/`, `-`, HOME, ↑, END,
+  `|`, `~`, PGUP; TAB, CTRL, ALT, ←, ↓, →, `` ` ``, DEL, PGDN): the first eight columns in a
+  `HorizontalScrollView`, the last (PGUP, PGDN) fixed beside it; keeps CTRL and ALT (one-shot or
+  locked) and sends keys and text to a `Target`; `Press` handles the touch on one key.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
   until started.
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
@@ -107,9 +108,9 @@ libghostty-vt with Zig (`android/native`).
 - Its dialogs (rename, notices, the paste confirmation), its menus (⋮, the tab menu) and the list
   of tabs are Material 3 in the theme's dark colours, from the wallpaper on Android 12 and later
   (`DynamicColors`); the list highlights the current tab in the secondary container colour. The
-  tab bar, the extra keys and what lies under the system bars take the surface container colour,
-  their labels, buttons and the status text the muted on-surface-variant one, and the title of
-  the tab shown the on-surface one; the terminal itself stays on black.
+  tab bar, the extra keys and what lies under the system bars are black like the terminal; their
+  labels, buttons and the status text take the muted on-surface-variant colour, and the title of
+  the tab shown the on-surface one.
 - Hardware-keyboard shortcuts, taken by the activity (`dispatchKeyEvent`) before the terminal sees
   them, together with the matching key release: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
   current one (both once per press), Ctrl+Tab and Ctrl+Shift+Tab show the next and the previous
@@ -127,10 +128,19 @@ libghostty-vt with Zig (`android/native`).
 - Whether glyphs in wide cells fill them is a setting kept by the service
   (`TerminalService.fillWide`, on by default, switched in Settings); the activity applies it to
   the view in `onStart` and `onSettingsChanged`, and a change repaints the whole screen.
-- Extra keys: a key acts when the finger lifts (with a key-click haptic), not at all if the finger
+- Extra keys: rows of 32 dp with 12 sp labels; the nine columns share the width, each at least
+  40 dp (the last one takes the pixels left over), so they all fit from 360 dp on. Narrower, the
+  first eight columns of both rows scroll sideways together under the finger, while the last stays
+  at the right edge; a sideways slide past the touch slop then scrolls and cancels the key it
+  started on, unless that key is already held or showing its popup. With nothing to scroll the
+  keys keep every touch. Lines one pixel wide in the outline variant colour run above each row, below
+  the last one and between the columns, drawn over the keys (a pressed key's shading leaves them visible); those
+  of the first eight columns scroll with them.
+- A key acts when the finger lifts (with a key-click haptic), not at all if the finger
   left it by more than the touch slop, and is shaded while pressed (the highest surface container
   colour, as is the popup). Held past the long-press
-  timeout, the arrows, PGUP and PGDN repeat every 80 ms (no act on release then); swiping up from
+  timeout, the arrows, PGUP, PGDN and DEL (forward delete) repeat every 80 ms (no act on release
+  then); swiping up from
   `-` shows `|` in a popup right above it, sent on release (sliding back down sends `-`). CTRL and
   ALT: a tap turns them on for the next key (primary colour) or off; a long press locks them on
   (primary colour, underlined) until tapped, or turns them off. Keys go to `VtView.press` and `type`, which read the
@@ -289,6 +299,12 @@ libghostty-vt with Zig (`android/native`).
 - Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab from a hardware
   keyboard (the tab shortcuts); the release of the shortcut's key is swallowed too, so the Kitty
   protocol sees no release without a press.
+- A `HorizontalScrollView` takes any sideways slide past the touch slop even when it has nothing
+  to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
+  scroll, and a held key or one showing its popup asks its parents not to intercept.
+- The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
+  and the grid inside the scroll view are measured without a width limit, so they are forced to
+  measure again whenever the column width changes.
 
 ### The terminal
 
@@ -335,6 +351,10 @@ libghostty-vt with Zig (`android/native`).
 - **The terminal lacks** the bell, mouse drags and motion for programs (only clicks and the wheel
   are sent), double- and triple-tap or rectangular selection, and handles that flip at the screen
   edges (a selection starting at column 0 has its start handle mostly off-screen).
+- **A display size change while the terminal is open** keeps the sizes its views were built with
+  (tab bar, extra keys, the terminal's font in pixels): `MainActivity` handles `density` itself and
+  builds its views once in `onCreate`, so the new sizes apply only once the activity is created
+  again.
 
 ## Open questions
 
