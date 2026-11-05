@@ -2,6 +2,7 @@ package io.github.mthli.appine
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.TypedValue
@@ -107,7 +108,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }.apply { isHorizontalScrollBarEnabled = false }
 
     /** The last column, fixed at the right edge. */
-    private val fixed = LinearLayout(context).apply { orientation = VERTICAL }
+    private val fixed = object : LinearLayout(context) {
+        override fun dispatchDraw(canvas: Canvas) {
+            super.dispatchDraw(canvas)
+            indicateKeys(canvas, this)
+        }
+    }.apply { orientation = VERTICAL }
 
     /** The width of a column in the grid, in pixels, as last measured; 0 before that. */
     private var column = 0
@@ -116,9 +122,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
 
     // On black like the terminal and the tab bar; the theme's colours, as the tab bar's, for the
-    // labels, a modifier that is on and a key while pressed
+    // labels, a key that is on and its indicator, and a key while pressed
     private val labelColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val onColor = themeColor(androidx.appcompat.R.attr.colorPrimary)
+    private val indicatorPaint = indicatorPaint(onColor)
     private val pressedColor = themeColor(com.google.android.material.R.attr.colorSurfaceContainerHighest)
 
     /** The height of a row, in pixels. */
@@ -173,7 +180,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /** A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last]. */
     private fun page(vararg rows: Array<Key>, last: Key) {
-        val grid = LinearLayout(context).apply { orientation = VERTICAL }
+        val grid = object : LinearLayout(context) {
+            // Drawn here, inside the scroll view, the indicators scroll with the keys
+            override fun dispatchDraw(canvas: Canvas) {
+                super.dispatchDraw(canvas)
+                indicateKeys(canvas, this)
+            }
+        }.apply { orientation = VERTICAL }
         for (keys in rows) {
             check(keys.size == COLUMNS - 1)
             val row = LinearLayout(context).apply { orientation = HORIZONTAL }
@@ -220,14 +233,20 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     private fun refresh() {
         symView.setTextColor(if (symbols) onColor else labelColor)
-        for (m in modifiers) {
-            m.view.setTextColor(if (m.on) onColor else labelColor)
-            m.view.paintFlags = if (m.locked) {
-                m.view.paintFlags or Paint.UNDERLINE_TEXT_FLAG
-            } else {
-                m.view.paintFlags and Paint.UNDERLINE_TEXT_FLAG.inv()
-            }
-        }
+        for (m in modifiers) m.view.setTextColor(if (m.on) onColor else labelColor)
+        // Their indicators
+        for (page in pages) page.grid.invalidate()
+        fixed.invalidate()
+    }
+
+    /**
+     * Draws the indicator, as under the current tab, under the keys in [container] that stay on
+     * until tapped (a locked modifier, and SYM with the symbols shown; a modifier on for the next
+     * key only shows the colour), over the keys so that a pressed key's shading does not hide it.
+     */
+    private fun indicateKeys(canvas: Canvas, container: View) {
+        for (m in modifiers) if (m.locked) drawIndicator(canvas, container, m.view, indicatorPaint)
+        if (symbols) drawIndicator(canvas, container, symView, indicatorPaint)
     }
 
     /**
@@ -377,5 +396,48 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L
+
+        /** The size of the indicator (dp). */
+        private const val INDICATOR_WIDTH_DP = 16
+        private const val INDICATOR_HEIGHT_DP = 1
+
+        /** How far the indicator lies below its label's baseline (dp). */
+        private const val INDICATOR_GAP_DP = 4
+
+        /** The paint for [drawIndicator], in [color]. */
+        fun indicatorPaint(color: Int) = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
+
+        /**
+         * Draws the indicator under [label], which lies in [container] (directly or deeper), for a
+         * state that stays until changed: the current tab, a locked modifier, SYM with the symbols
+         * shown. As in Material's tabs, a short rounded bar, the same width under any label, and a
+         * shape, so it shows without telling colours apart. It hangs [INDICATOR_GAP_DP] below the
+         * label's baseline, where its letters and digits end, so it stays with the label whatever
+         * the height of the bar or the size of the text; it fades with the label. Nothing is drawn
+         * when [label] is not in [container].
+         */
+        fun drawIndicator(canvas: Canvas, container: View, label: TextView, paint: Paint) {
+            // The label's place in the container: its left and top, not
+            // offsetDescendantRectToMyCoords, which subtracts each view's scroll, and a single-line
+            // label scrolls its text far sideways to centre it
+            var x = 0
+            var y = 0
+            var v: View = label
+            while (v !== container) {
+                x += v.left
+                y += v.top
+                v = v.parent as? View ?: return
+            }
+            // In whole pixels, rounded down as MainActivity's dp
+            val density = label.resources.displayMetrics.density
+            val width = (INDICATOR_WIDTH_DP * density).toInt()
+            val height = max(1, (INDICATOR_HEIGHT_DP * density).toInt())
+            val left = x + (label.width - width) / 2f
+            val top = (y + label.baseline + (INDICATOR_GAP_DP * density).toInt()).toFloat()
+            val alpha = paint.alpha
+            paint.alpha = (alpha * label.alpha).roundToInt()
+            canvas.drawRoundRect(left, top, left + width, top + height, height / 2f, height / 2f, paint)
+            paint.alpha = alpha
+        }
     }
 }

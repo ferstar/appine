@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys; the tab bar's and extra keys' labels in dp, not following the system font scale; the tab bar as one row of numbered 32 dp squares with `×`, `+` and `⋮` in any window, a long press showing a tab's title in a toast, `×` asking before closing a running tab; the next tab shown after closing the current one; closing the other tabs or all of them from the `⋮` menu; the switcher, the list of tabs, the swipe, the tab menu and renaming removed)
+> Maintained: 2026-11-06 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column; the tab bar 32 dp tall, its tabs, switcher and buttons as tall as it with centred labels; no lines between or around the extra keys; the tab bar's and extra keys' labels in dp, not following the system font scale; the tab bar as one row of numbered 32 dp squares with `×`, `+` and `⋮` in any window, a long press showing a tab's title in a toast, `×` asking before closing a running tab; the next tab shown after closing the current one; closing the other tabs or all of them from the `⋮` menu; the switcher, the list of tabs, the swipe, the tab menu and renaming removed; the tabs' numbers in the default weight, the current tab's box replaced by an indicator under its number, drawn the same under locked modifiers and SYM with the symbols shown; a long press on a one-shot modifier locking it, with a toast naming it)
 
 ## Responsibilities
 
@@ -42,8 +42,9 @@ libghostty-vt with Zig (`android/native`).
   where they are on the first page): a `Page` is a
   grid of the first seven columns and the key above SYM; the grid shown is in a
   `HorizontalScrollView`, the last column (SHIFT or `%` over SYM) fixed beside it; keeps CTRL, ALT
-  and SHIFT (one-shot or locked) and the page shown, and sends keys and text to a `Target`;
-  `Press` handles the touch on one key.
+  and SHIFT (one-shot or locked) and the page shown, and sends keys, text and notices (a modifier
+  locked) to a `Target`; `Press` handles the touch on one key. Its companion's `drawIndicator`
+  draws the indicator under a label, for the keys and for the tab row.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
   until started.
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
@@ -91,13 +92,15 @@ libghostty-vt with Zig (`android/native`).
   then `×` (closes the current tab; hidden while there is none), `+` (opens a session while the
   kernel runs) and `⋮` (a menu: "Close other tabs", disabled when there is no other, "Close all
   tabs" and Settings), every tab and button a 32 dp square with its label centred. A
-  tab shows its number (from 1, by position): the current one in the primary colour inside a 2 dp
-  outlined box and scrolled into view after each change, the others muted, an ended one faded (38%
-  opacity). Labels are sized in dp (numbers 12 bold, buttons 14) so the system font scale leaves
-  them as they are (dialogs, menus and toasts follow it).
-- Tapping a tab shows it; a long press shows its title in a toast (cancelling the previous one):
-  the program's title (`sh` when it set none), with "(ended)" once the shell ended. TalkBack reads
-  "Tab N: title".
+  tab shows its number (from 1, by position): the current one in the primary colour above the
+  indicator and scrolled into view after each change, the others muted, an ended one faded (38%
+  opacity, its indicator too). The indicator is a rounded bar 16 dp wide and 1 dp high in the
+  primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
+  draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
+  the system font scale leaves them as they are (dialogs, menus and toasts follow it).
+- Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
+  it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
+  tab's title, a locked modifier), cancelling the previous one. TalkBack reads "Tab N: title".
 - `×` and the menu's "Close other tabs" and "Close all tabs" close at once when every shell they
   close has ended, else after a confirmation dialog ("Close this tab?" or "Close N tabs?"; closing
   hangs up a shell, which usually ends the programs in it); several tabs are closed with the
@@ -107,7 +110,7 @@ libghostty-vt with Zig (`android/native`).
   theme's dark colours, from the wallpaper on Android 12 and later (`DynamicColors`). The tab bar,
   the extra keys and what lies under the system bars are black like the terminal; their labels,
   buttons and the status text take the muted on-surface-variant colour, and the current tab's
-  number the primary one.
+  number and indicator the primary one.
 - Hardware-keyboard shortcuts, taken by the activity (`dispatchKeyEvent`) before the terminal sees
   them, together with the matching key release: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the
   current one (both once per press), Ctrl+Tab and Ctrl+Shift+Tab show the next and the previous
@@ -139,13 +142,16 @@ libghostty-vt with Zig (`android/native`).
   colour). Held past the
   long-press timeout, the arrows repeat every 80 ms (no act on release then); no key has a swipe
   or popup. CTRL,
-  ALT and SHIFT: a tap turns them on for the next key (primary colour) or off; a long press locks
-  them on (primary colour, underlined) until tapped, or turns them off. Keys go to `VtView.press` and `type`, which read the
+  ALT and SHIFT: a tap turns them on for the next key (primary colour only) or off, a locked one
+  too; a long press locks them on (primary colour and the tab bar's indicator) until tapped, one a
+  tap turned on included, with a toast naming the key ("CTRL locked"), or turns a locked one off.
+  Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
   leaves locked ones on.
 - SYM shows the symbols in place of every other key (`%` in place of SHIFT) and keeps them, for
   any number of keys, until tapped again (a long press acts as a tap on release); its label takes
-  the primary colour while they are shown. Turning the page leaves the modifiers as they are: CTRL
+  the primary colour and the indicator while they are shown. Turning the page leaves the
+  modifiers as they are: CTRL
   and ALT apply to symbols too (CTRL, SYM, `]` sends Ctrl+]), though they cannot be seen on the
   symbols page, while SHIFT waits there: it applies to no key, the symbols or the IME's, and a
   one-shot SHIFT is not used up, so it applies again once the first page is back. A key still held
@@ -314,6 +320,13 @@ libghostty-vt with Zig (`android/native`).
   and the grids inside the scroll view are measured without a width limit, so they are forced to
   measure again whenever the column width changes, the page not shown too (it keeps the flag until
   it is added back).
+- The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
+  `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
+  label: `refresh` invalidates every grid and the fixed column, and `renderTabs` adds the tabs
+  again. The label's place is the sum of `left` and `top` up to the container:
+  `offsetDescendantRectToMyCoords` subtracts each view's scroll, and a single-line `TextView` (the
+  extra keys' labels) scrolls far sideways to centre its text, which also draws a foreground
+  drawable it is given off the label.
 
 ### The terminal
 

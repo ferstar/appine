@@ -6,11 +6,9 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Typeface
 import android.graphics.drawable.Drawable
-import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.InsetDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -63,6 +61,10 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** [current]'s position when the tabs were last shown, where its successor is taken from. */
     private var currentIndex = 0
+
+    /** [current]'s number in the row, which the row draws the indicator under; null with none. */
+    private var currentTab: TextView? = null
+
     private var fontSize = 0
 
     /** The last toast ([showToast]), cancelled by the next. */
@@ -78,8 +80,9 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The bar's buttons, other tabs' numbers and the status text. */
     private val mutedColor by lazy { themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant) }
 
-    /** The current tab's number and its box. */
+    /** The current tab's number and indicator. */
     private val currentTabColor by lazy { themeColor(androidx.appcompat.R.attr.colorPrimary) }
+    private val indicatorPaint by lazy { ExtraKeysView.indicatorPaint(currentTabColor) }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -111,7 +114,13 @@ class MainActivity : Activity(), TerminalService.Listener {
             gravity = Gravity.CENTER
             setText(R.string.starting)
         }
-        tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tabs = object : LinearLayout(this) {
+            // Over the tabs, as the extra keys draw theirs
+            override fun dispatchDraw(canvas: Canvas) {
+                super.dispatchDraw(canvas)
+                currentTab?.let { ExtraKeysView.drawIndicator(canvas, this, it, indicatorPaint) }
+            }
+        }.apply { orientation = LinearLayout.HORIZONTAL }
         strip = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -273,7 +282,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * Shows the tabs, a number each, the current one boxed and scrolled into view. Called whenever
+     * Shows the tabs, a number each, the current one marked and scrolled into view. Called whenever
      * tabs, titles or the current tab change.
      */
     private fun renderTabs() {
@@ -285,9 +294,11 @@ class MainActivity : Activity(), TerminalService.Listener {
         closeButton.visibility = if (shown == null) View.INVISIBLE else View.VISIBLE
         if (shown != null) currentIndex = sessions.indexOf(shown)
 
-        // Bring the current tab into view once the new row is laid out (this runs after the
-        // layout pass that adding the tabs requested)
-        val tab = tabs.getChildAt(sessions.indexOf(shown)) ?: return
+        // Indicate the current tab (adding the tabs redraws the row), and bring it into view once
+        // the new row is laid out (this runs after the layout pass that adding the tabs requested)
+        val tab = tabs.getChildAt(sessions.indexOf(shown)) as TextView?
+        currentTab = tab
+        if (tab == null) return
         strip.post {
             when {
                 tab.left < strip.scrollX -> strip.smoothScrollTo(tab.left, 0)
@@ -298,26 +309,15 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /**
      * A tab in the row: its number in a square as tall as the bar, the current one in the primary
-     * colour and an outlined box, an ended one faded. Tap shows it; a long press shows its title.
+     * colour above the row's indicator ([currentTab]), an ended one faded. Tap shows it; a long
+     * press shows its title.
      */
     private fun tabButton(i: Int, session: VtSession) = TextView(this).apply {
         text = "%d".format(i + 1)
         contentDescription = getString(R.string.tab_description, i + 1, title(session))
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
-        typeface = Typeface.DEFAULT_BOLD
         gravity = Gravity.CENTER
-        if (session == current) {
-            setTextColor(currentTabColor)
-            background = InsetDrawable(
-                GradientDrawable().apply {
-                    setStroke(dp(2), currentTabColor)
-                    cornerRadius = dp(4).toFloat()
-                },
-                dp(TAB_BOX_INSET_DP),
-            )
-        } else {
-            setTextColor(mutedColor)
-        }
+        setTextColor(if (session == current) currentTabColor else mutedColor)
         if (!session.isRunning) alpha = ENDED_ALPHA
         foreground = touchFeedback()
         setOnClickListener { show(session) }
@@ -534,9 +534,6 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
         private const val TAB_NUMBER_DP = 12f
-
-        /** How far the current tab's box lies inside its square (dp), leaving a 20 dp box. */
-        private const val TAB_BOX_INSET_DP = 6
 
         /** The opacity of an ended tab's number (Material's disabled content). */
         private const val ENDED_ALPHA = 0.38f
