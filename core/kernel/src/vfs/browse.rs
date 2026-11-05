@@ -17,100 +17,13 @@ use std::fs::File;
 use super::store::{Ino, ROOT, Stat, Store, mode};
 use crate::errno::Errno;
 
-/// The limit on the number of symlinks followed, the same as Linux's `MAXSYMLINKS`.
-const MAX_LINKS: usize = 40;
-
-/// What the host changed in the store ([`crate::browse_changing`]): handed to the running kernel
-/// that uses the same store, which reports inotify events as the corresponding syscall would, so
-/// programs watching in the guest (editors, build tools' watch modes) learn that the Files app
-/// changed a file. Directories and names are inodes and dentries in the store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
-    /// `name` was created in directory `dir`.
-    Created {
-        dir: Ino,
-        name: Vec<u8>,
-        is_dir: bool,
-    },
-    /// `name` in directory `dir` was removed (it was `ino`). A whole directory tree is removed
-    /// entry by entry, inside first.
-    Removed {
-        dir: Ino,
-        name: Vec<u8>,
-        ino: Ino,
-        is_dir: bool,
-    },
-    /// `ino` moved from `from` to `to` (directory and name), without overwriting.
-    Moved {
-        from: (Ino, Vec<u8>),
-        to: (Ino, Vec<u8>),
-        ino: Ino,
-        is_dir: bool,
-    },
-    /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
-    /// truncated if `truncated`.
-    Opened {
-        ino: Ino,
-        parent: (Ino, Vec<u8>),
-        truncated: bool,
-    },
-    /// A regular file opened for writing was closed: something was written (the other side
-    /// writes the host object directly, and the kernel does not see each write).
-    Written { ino: Ino, parent: (Ino, Vec<u8>) },
-}
+// ---- Reads ----
 
 /// An entry in a directory: the name and its metadata (after following symlinks).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: Vec<u8>,
     pub stat: Stat,
-}
-
-/// Finds the inode for a guest path, following all symlinks (including in the last component).
-/// `..` at the root directory stays put.
-pub fn resolve(store: &Store, path: &[u8]) -> Result<Ino, Errno> {
-    walk(store, path).map(|(ino, _)| ino)
-}
-
-/// [`resolve`], also giving the components of the real path (with every symlink replaced by where
-/// it points, like realpath).
-fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
-    // The components not walked yet, in reverse (the top of the stack is the next one); following
-    // a symlink pushes the target's components
-    let mut pending: Vec<Vec<u8>> = components(path).rev().collect();
-    // The directories reached: the components of the real path and their inodes (going back one
-    // level for `..` is the real parent)
-    let mut real: Vec<Vec<u8>> = Vec::new();
-    let mut inos: Vec<Ino> = Vec::new();
-    let mut links = 0;
-    while let Some(name) = pending.pop() {
-        let dir = inos.last().copied().unwrap_or(ROOT);
-        if store.kind(dir)? != mode::S_IFDIR {
-            return Err(Errno::ENOTDIR);
-        }
-        if name == b".." {
-            real.pop();
-            inos.pop();
-            continue;
-        }
-        let ino = store.lookup(dir, &name)?.ok_or(Errno::ENOENT)?;
-        if store.kind(ino)? == mode::S_IFLNK {
-            links += 1;
-            if links > MAX_LINKS {
-                return Err(Errno::ELOOP);
-            }
-            let target = store.readlink(ino)?;
-            if target.starts_with(b"/") {
-                real.clear();
-                inos.clear();
-            }
-            pending.extend(components(&target).rev());
-            continue;
-        }
-        real.push(name);
-        inos.push(ino);
-    }
-    Ok((inos.last().copied().unwrap_or(ROOT), real))
 }
 
 /// The metadata of a path (following symlinks). ENOENT for anything but directories and regular
@@ -155,6 +68,11 @@ pub fn list(store: &Store, dir: &[u8]) -> Result<Vec<Entry>, Errno> {
         }
     }
     Ok(out)
+}
+
+/// Only directories and regular files are shown to the host.
+fn shown(st: &Stat) -> bool {
+    matches!(st.kind(), mode::S_IFDIR | mode::S_IFREG)
 }
 
 /// Opens a regular file for reading: returns the object file on the host. EISDIR for a directory.
@@ -260,76 +178,47 @@ pub fn search(
 // or renamed is itself not followed (what is removed is the link, not what it points at); the
 // directory it is in is followed.
 
+/// What the host changed in the store ([`crate::browse_changing`]): handed to the running kernel
+/// that uses the same store, which reports inotify events as the corresponding syscall would, so
+/// programs watching in the guest (editors, build tools' watch modes) learn that the Files app
+/// changed a file. Directories and names are inodes and dentries in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// `name` was created in directory `dir`.
+    Created {
+        dir: Ino,
+        name: Vec<u8>,
+        is_dir: bool,
+    },
+    /// `name` in directory `dir` was removed (it was `ino`). A whole directory tree is removed
+    /// entry by entry, inside first.
+    Removed {
+        dir: Ino,
+        name: Vec<u8>,
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// `ino` moved from `from` to `to` (directory and name), without overwriting.
+    Moved {
+        from: (Ino, Vec<u8>),
+        to: (Ino, Vec<u8>),
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
+    /// truncated if `truncated`.
+    Opened {
+        ino: Ino,
+        parent: (Ino, Vec<u8>),
+        truncated: bool,
+    },
+    /// A regular file opened for writing was closed: something was written (the other side
+    /// writes the host object directly, and the kernel does not see each write).
+    Written { ino: Ino, parent: (Ino, Vec<u8>) },
+}
+
 /// The most names one create tries (`a (1).txt`, `a (2).txt`, ...).
 const MAX_TRIES: u32 = 100;
-
-/// The components of `top`'s real path; it must be a directory other than the root directory
-/// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
-fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
-    let (ino, real) = walk(store, top)?;
-    if store.kind(ino)? != mode::S_IFDIR {
-        return Err(Errno::ENOTDIR);
-    }
-    if real.is_empty() {
-        return Err(Errno::EACCES);
-    }
-    Ok(real)
-}
-
-/// Directory `dir` inside `top` (following symlinks).
-fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
-    let top = top_of(store, top)?;
-    let (ino, real) = walk(store, dir)?;
-    if store.kind(ino)? != mode::S_IFDIR {
-        return Err(Errno::ENOTDIR);
-    }
-    if !real.starts_with(&top) {
-        return Err(Errno::EACCES);
-    }
-    Ok(ino)
-}
-
-/// An entry to remove, rename or move away: its directory is inside `top`, and the name itself is
-/// not followed. `top` itself is not allowed.
-fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Errno> {
-    let comps: Vec<Vec<u8>> = components(path).collect();
-    let (name, dirs) = comps.split_last().ok_or(Errno::EACCES)?;
-    if name == b".." {
-        return Err(Errno::EINVAL);
-    }
-    let dir = dir_in(store, top, &join(dirs))?;
-    store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
-    Ok((dir, name.clone()))
-}
-
-/// A new name: not empty, `.` or `..`, no `/` or NUL, at most 255 bytes.
-fn check_name(name: &[u8]) -> Result<(), Errno> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
-    {
-        return Err(Errno::EINVAL);
-    }
-    if name.len() > NAME_MAX {
-        return Err(Errno::ENAMETOOLONG);
-    }
-    Ok(())
-}
-
-/// The maximum name length, the same as Linux's `NAME_MAX`.
-const NAME_MAX: usize = 255;
-
-/// The name to use when a name is taken: `a (1).txt` for a file (the extension stays last),
-/// `a (1)` for a directory.
-fn numbered(name: &[u8], n: u32, directory: bool) -> Vec<u8> {
-    let dot = name
-        .iter()
-        .rposition(|&b| b == b'.')
-        .filter(|&i| i > 0 && !directory);
-    let (stem, ext) = name.split_at(dot.unwrap_or(name.len()));
-    let mut out = stem.to_vec();
-    out.extend_from_slice(format!(" ({n})").as_bytes());
-    out.extend_from_slice(ext);
-    out
-}
 
 /// Creates a file (0644) or directory (0755) in directory `dir` inside `top`, owned by `uid` and
 /// `gid`. When the name is taken another one is used ([`numbered`]); returns the name actually
@@ -373,6 +262,20 @@ pub fn create(
     Err(Errno::EEXIST)
 }
 
+/// The name to use when a name is taken: `a (1).txt` for a file (the extension stays last),
+/// `a (1)` for a directory.
+fn numbered(name: &[u8], n: u32, directory: bool) -> Vec<u8> {
+    let dot = name
+        .iter()
+        .rposition(|&b| b == b'.')
+        .filter(|&i| i > 0 && !directory);
+    let (stem, ext) = name.split_at(dot.unwrap_or(name.len()));
+    let mut out = stem.to_vec();
+    out.extend_from_slice(format!(" ({n})").as_bytes());
+    out.extend_from_slice(ext);
+    out
+}
+
 /// Removes a file, a symlink or a whole directory tree inside `top` (for a symlink, only the
 /// link).
 pub fn remove(
@@ -410,25 +313,6 @@ fn remove_tree(
     Ok(())
 }
 
-/// Moves `ino` from `from` to `to` (without overwriting) and records it.
-fn moved(
-    store: &Store,
-    from: (Ino, &[u8]),
-    to: (Ino, &[u8]),
-    changes: &mut Vec<Change>,
-) -> Result<(), Errno> {
-    let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
-    let is_dir = store.kind(ino)? == mode::S_IFDIR;
-    store.rename(from.0, from.1, to.0, to.1, true, false)?;
-    changes.push(Change::Moved {
-        from: (from.0, from.1.to_vec()),
-        to: (to.0, to.1.to_vec()),
-        ino,
-        is_dir,
-    });
-    Ok(())
-}
-
 /// Renames within the same directory; EEXIST if the new name is taken, without overwriting.
 pub fn rename(
     store: &Store,
@@ -457,6 +341,66 @@ pub fn move_to(
     let (dir, name) = entry_in(store, top, path)?;
     let to = dir_in(store, top, to)?;
     moved(store, (dir, &name), (to, &name), changes)
+}
+
+/// A new name: not empty, `.` or `..`, no `/` or NUL, at most 255 bytes.
+fn check_name(name: &[u8]) -> Result<(), Errno> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if name.len() > NAME_MAX {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    Ok(())
+}
+
+/// The maximum name length, the same as Linux's `NAME_MAX`.
+const NAME_MAX: usize = 255;
+
+/// An entry to remove, rename or move away: its directory is inside `top`, and the name itself is
+/// not followed. `top` itself is not allowed.
+fn entry_in(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, Vec<u8>), Errno> {
+    let comps: Vec<Vec<u8>> = components(path).collect();
+    let (name, dirs) = comps.split_last().ok_or(Errno::EACCES)?;
+    if name == b".." {
+        return Err(Errno::EINVAL);
+    }
+    let dir = dir_in(store, top, &join(dirs))?;
+    store.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
+    Ok((dir, name.clone()))
+}
+
+/// Directory `dir` inside `top` (following symlinks).
+fn dir_in(store: &Store, top: &[u8], dir: &[u8]) -> Result<Ino, Errno> {
+    let top = top_of(store, top)?;
+    let (ino, real) = walk(store, dir)?;
+    if store.kind(ino)? != mode::S_IFDIR {
+        return Err(Errno::ENOTDIR);
+    }
+    if !real.starts_with(&top) {
+        return Err(Errno::EACCES);
+    }
+    Ok(ino)
+}
+
+/// Moves `ino` from `from` to `to` (without overwriting) and records it.
+fn moved(
+    store: &Store,
+    from: (Ino, &[u8]),
+    to: (Ino, &[u8]),
+    changes: &mut Vec<Change>,
+) -> Result<(), Errno> {
+    let ino = store.lookup(from.0, from.1)?.ok_or(Errno::ENOENT)?;
+    let is_dir = store.kind(ino)? == mode::S_IFDIR;
+    store.rename(from.0, from.1, to.0, to.1, true, false)?;
+    changes.push(Change::Moved {
+        from: (from.0, from.1.to_vec()),
+        to: (to.0, to.1.to_vec()),
+        ino,
+        is_dir,
+    });
+    Ok(())
 }
 
 /// Opens a regular file inside `top` for reading and writing (following symlinks; the file pointed
@@ -515,6 +459,21 @@ fn writable_file(store: &Store, top: &[u8], path: &[u8]) -> Result<(Ino, (Ino, V
     Ok((ino, (dir, name)))
 }
 
+/// The components of `top`'s real path; it must be a directory other than the root directory
+/// (EACCES): an account whose home is `/`, or a link to it, would make the whole system writable.
+fn top_of(store: &Store, top: &[u8]) -> Result<Vec<Vec<u8>>, Errno> {
+    let (ino, real) = walk(store, top)?;
+    if store.kind(ino)? != mode::S_IFDIR {
+        return Err(Errno::ENOTDIR);
+    }
+    if real.is_empty() {
+        return Err(Errno::EACCES);
+    }
+    Ok(real)
+}
+
+// ---- Paths for the host ----
+
 /// The path of directory `dir` in the store (found by climbing the parent and name each directory
 /// records). ENOENT for deleted directories and ones not under the root directory (tmpfs roots).
 pub fn dir_path(store: &Store, dir: Ino) -> Result<Vec<u8>, Errno> {
@@ -530,19 +489,6 @@ pub fn dir_path(store: &Store, dir: Ino) -> Result<Vec<u8>, Errno> {
     }
     comps.reverse();
     Ok(join(&comps))
-}
-
-/// Joins components into an absolute path.
-fn join(comps: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for c in comps {
-        out.push(b'/');
-        out.extend_from_slice(c);
-    }
-    if out.is_empty() {
-        out.push(b'/');
-    }
-    out
 }
 
 /// A guest path → a string on the host (Java) side (the app's document ID): valid UTF-8 parts
@@ -592,9 +538,56 @@ pub fn decode_path(s: &str) -> Vec<u8> {
     out
 }
 
-/// Only directories and regular files are shown to the host.
-fn shown(st: &Stat) -> bool {
-    matches!(st.kind(), mode::S_IFDIR | mode::S_IFREG)
+// ---- Path resolution ----
+
+/// The limit on the number of symlinks followed, the same as Linux's `MAXSYMLINKS`.
+const MAX_LINKS: usize = 40;
+
+/// Finds the inode for a guest path, following all symlinks (including in the last component).
+/// `..` at the root directory stays put.
+pub fn resolve(store: &Store, path: &[u8]) -> Result<Ino, Errno> {
+    walk(store, path).map(|(ino, _)| ino)
+}
+
+/// [`resolve`], also giving the components of the real path (with every symlink replaced by where
+/// it points, like realpath).
+fn walk(store: &Store, path: &[u8]) -> Result<(Ino, Vec<Vec<u8>>), Errno> {
+    // The components not walked yet, in reverse (the top of the stack is the next one); following
+    // a symlink pushes the target's components
+    let mut pending: Vec<Vec<u8>> = components(path).rev().collect();
+    // The directories reached: the components of the real path and their inodes (going back one
+    // level for `..` is the real parent)
+    let mut real: Vec<Vec<u8>> = Vec::new();
+    let mut inos: Vec<Ino> = Vec::new();
+    let mut links = 0;
+    while let Some(name) = pending.pop() {
+        let dir = inos.last().copied().unwrap_or(ROOT);
+        if store.kind(dir)? != mode::S_IFDIR {
+            return Err(Errno::ENOTDIR);
+        }
+        if name == b".." {
+            real.pop();
+            inos.pop();
+            continue;
+        }
+        let ino = store.lookup(dir, &name)?.ok_or(Errno::ENOENT)?;
+        if store.kind(ino)? == mode::S_IFLNK {
+            links += 1;
+            if links > MAX_LINKS {
+                return Err(Errno::ELOOP);
+            }
+            let target = store.readlink(ino)?;
+            if target.starts_with(b"/") {
+                real.clear();
+                inos.clear();
+            }
+            pending.extend(components(&target).rev());
+            continue;
+        }
+        real.push(name);
+        inos.push(ino);
+    }
+    Ok((inos.last().copied().unwrap_or(ROOT), real))
 }
 
 /// The components of a path, dropping empty ones and `.`.
@@ -602,6 +595,19 @@ fn components(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
         .map(<[u8]>::to_vec)
+}
+
+/// Joins components into an absolute path.
+fn join(comps: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in comps {
+        out.push(b'/');
+        out.extend_from_slice(c);
+    }
+    if out.is_empty() {
+        out.push(b'/');
+    }
+    out
 }
 
 #[cfg(test)]

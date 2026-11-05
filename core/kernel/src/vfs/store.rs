@@ -202,6 +202,38 @@ pub struct DirEntry {
     pub mode: u32,
 }
 
+const SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS inodes (
+        ino      INTEGER PRIMARY KEY,
+        mode     INTEGER NOT NULL,
+        uid      INTEGER NOT NULL,
+        gid      INTEGER NOT NULL,
+        nlink    INTEGER NOT NULL,
+        rdev     INTEGER NOT NULL DEFAULT 0,
+        parent   INTEGER NOT NULL DEFAULT 0, -- a directory's parent directory (..)
+        mtime_ns INTEGER NOT NULL DEFAULT 0, -- used only by inodes without an object
+        ctime_ns INTEGER NOT NULL DEFAULT 0,
+        target   BLOB                        -- the symlink's target
+    );
+    CREATE TABLE IF NOT EXISTS dentries (
+        parent INTEGER NOT NULL,
+        name   BLOB NOT NULL,
+        ino    INTEGER NOT NULL,
+        PRIMARY KEY (parent, name)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS xattrs (
+        ino   INTEGER NOT NULL,
+        name  BLOB NOT NULL,
+        value BLOB NOT NULL,
+        PRIMARY KEY (ino, name)
+    ) WITHOUT ROWID;
+    -- Directories not under the root directory (tmpfs roots): deleted at boot along with
+    -- everything in them
+    CREATE TABLE IF NOT EXISTS detached_roots (
+        ino INTEGER PRIMARY KEY
+    );
+";
+
 /// An inode store.
 ///
 /// Not Sync: only one thread uses it at a time. The kernel's store relies on the BKL for this
@@ -253,570 +285,9 @@ pub struct Store {
     fills: RefCell<Vec<Fill>>,
 }
 
-/// Dentries and inode rows created in an operation: their contents are known within the
-/// operation, and they go straight into the cache after it succeeds, so chmod, chown or stat by
-/// path right after creation need not query the database again. If the same operation changes
-/// them later, they are invalidated when changed ([`Store::touch_name`]).
-enum Fill {
-    Name(Ino, Vec<u8>, Ino),
-    Row(Stat),
-}
-
-impl Fill {
-    /// At most this many per operation: importing a rootfs is one whole operation, and comparing
-    /// them one by one on invalidation would become quadratic.
-    const MAX: usize = 64;
-}
-
-/// The metadata cache, and what reading it without the BKL (`syscall::fast`) needs.
-///
-/// Only [`Store`]'s methods modify the cache, holding the write lock while they do; they read it
-/// without locking, because other threads only read: Store is not Sync, so only one thread (the
-/// one holding the BKL) calls its methods at a time. Threads without the BKL read only through
-/// [`Meta::reader`], holding the read lock.
-pub(crate) struct Meta {
-    lock: RwLock<()>,
-    cache: UnsafeCell<Cache>,
-    /// The commit counter at the start of the `lock` file (module docs).
-    commits: Commits,
-    /// The `objects` directory (a host `O_PATH`), so stat-ing an object by inode number need not
-    /// resolve the whole path.
-    objects_dir: OwnedFd,
-    /// Objects waiting for the background thread to delete them, and checkpoints to do
-    /// ([`reap`]).
-    reaper: Reaper,
-    /// Another fd of the `lock` file in the store directory: syncfs needs an ordinary fd, and
-    /// `objects_dir` is `O_PATH`.
-    fs: File,
-    /// The path of the WAL (`meta.db-wal`).
-    wal: PathBuf,
-    /// The commit counter's value before the WAL was last made durable, plus one: with no new
-    /// commits since, there is no need to flush again ([`Meta::sync_metadata`]). 0 means it has
-    /// never been flushed.
-    durable: AtomicU64,
-    /// The counts of making the WAL durable and of flushing renamed-over files before commits
-    /// (for tests).
-    #[cfg(test)]
-    syncs: AtomicU64,
-    #[cfg(test)]
-    flushes: AtomicU64,
-}
-
-/// Objects to delete after a commit are handed to the background thread ([`reap`]): a host
-/// unlink takes a few microseconds each and also takes the `objects` directory's lock; during
-/// `rm -rf` it took over a tenth of the guest thread's time, and it was done holding the BKL. The
-/// app being killed before the deletion does no harm: the inode row stays with nlink = 0 and is
-/// cleaned up at boot. It also does the checkpoints ([`wal_hook`]).
-#[derive(Default)]
-struct Reaper {
-    state: Mutex<Reaping>,
-    /// There is work to do, or it is time to quit.
-    work: Condvar,
-    /// The queue is empty and nothing is being deleted (tests wait for this).
-    idle: Condvar,
-}
-
-#[derive(Default)]
-struct Reaping {
-    queue: Vec<Ino>,
-    /// The committing thread asks it for a checkpoint.
-    checkpoint: bool,
-    /// The number of pages in the WAL at the last checkpoint request: once done, the checkpoint
-    /// has written back at least up to here.
-    requested: c_int,
-    /// The number of pages in the WAL after the latest commit, and how many commits there have
-    /// been in total.
-    pages: c_int,
-    commits: u64,
-    /// The WAL frame the last checkpoint wrote back up to.
-    backfilled: c_int,
-    busy: bool,
-    quit: bool,
-    /// How many have been handed to it in total (for tests).
-    #[cfg(test)]
-    handed: usize,
-    /// How many checkpoints have been done (for tests).
-    #[cfg(test)]
-    checkpoints: usize,
-    /// No checkpoints, simulating a background thread that cannot keep up (for tests).
-    #[cfg(test)]
-    paused: bool,
-}
-
-impl Reaper {
-    /// After a commit the WAL has `pages` pages ([`wal_hook`]): once that is [`CHECKPOINT_PAGES`]
-    /// pages more than at the last request, asks the background thread for a checkpoint.
-    fn committed(&self, pages: c_int) {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        st.pages = pages;
-        st.commits += 1;
-        // Fewer than before: the WAL has been reused from the start
-        if pages < st.requested {
-            st.requested = 0;
-        }
-        if pages < st.backfilled {
-            st.backfilled = 0;
-        }
-        if pages - st.requested >= CHECKPOINT_PAGES {
-            st.requested = pages;
-            st.checkpoint = true;
-            self.work.notify_one();
-        }
-    }
-}
-
-/// The store's background thread, until the Store closes: deletes objects (finishing the queue
-/// before closing) and does checkpoints.
-fn reap(meta: Arc<Meta>, db: PathBuf) {
-    let r = &meta.reaper;
-    // Checkpoints use their own connection, opened the first time one is needed
-    let mut conn = None;
-    let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
-    loop {
-        if !st.queue.is_empty() {
-            let inos = std::mem::take(&mut st.queue);
-            st.busy = true;
-            drop(st);
-            // The commit that removed their last links goes to disk first: otherwise after power
-            // loss the database returns to its earlier state, and the names are still there but
-            // the objects are gone. Objects handed over during the flush accumulate for the next
-            // round
-            if let Err(e) = meta.sync_metadata() {
-                crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
-            }
-            for ino in inos {
-                let _ = remove_object(&meta.objects_dir, ino);
-            }
-            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
-            st.busy = false;
-            continue;
-        }
-        #[cfg(test)]
-        let paused = st.paused;
-        #[cfg(not(test))]
-        let paused = false;
-        if st.checkpoint && !paused {
-            st.checkpoint = false;
-            st.busy = true;
-            drop(st);
-            let backfilled = checkpoint(&mut conn, &db);
-            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
-            st.busy = false;
-            if let Some(n) = backfilled {
-                st.backfilled = n;
-            }
-            #[cfg(test)]
-            {
-                st.checkpoints += 1;
-            }
-            continue;
-        }
-        r.idle.notify_all();
-        if st.quit {
-            return;
-        }
-        // The WAL has grown past one checkpoint and has frames not written back: once writes
-        // stop, write back the rest, so the next write transaction reuses the WAL from the start
-        // ([`wal_hook`]). Sporadic small writes never get this long, and no fsync is spent on them
-        if st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
-            let seen = st.commits;
-            let (g, wait) = r
-                .work
-                .wait_timeout(st, CHECKPOINT_QUIET)
-                .unwrap_or_else(PoisonError::into_inner);
-            st = g;
-            if wait.timed_out() && st.commits == seen {
-                st.checkpoint = true;
-            }
-            continue;
-        }
-        st = r.work.wait(st).unwrap_or_else(PoisonError::into_inner);
-    }
-}
-
-/// A PASSIVE checkpoint: waits for no readers and blocks no writers; frames that cannot be written
-/// back now are left for next time. Returns the frame it wrote back up to. Failures are only
-/// logged; the WAL keeps growing, and at [`INLINE_CHECKPOINT_PAGES`] the committing thread
-/// checkpoints in place.
-fn checkpoint(conn: &mut Option<Connection>, db: &Path) -> Option<c_int> {
-    if conn.is_none() {
-        match Connection::open(db) {
-            Ok(c) => *conn = Some(c),
-            Err(e) => crate::debug::log(format_args!("inode store: checkpoint: {e}")),
-        }
-    }
-    // The result is (whether it was blocked, the number of WAL frames, the frame written back up
-    // to)
-    conn.as_ref()?
-        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(2))
-        .inspect_err(|e| crate::debug::log(format_args!("inode store: checkpoint: {e}")))
-        .ok()
-}
-
-/// Replaces SQLite's default auto-checkpoint (`sqlite3_wal_hook`): called by the committing
-/// thread after every commit, with `pages` the current number of pages in the WAL. A checkpoint
-/// writes the WAL back into the database file and fsyncs twice, while commits mostly hold the BKL
-/// (deferred commits that come due run in the timer thread); on a phone one fsync takes from a
-/// few to tens of milliseconds, during which every guest thread has to wait, so the checkpoint is
-/// handed to the background thread ([`reap`]).
-///
-/// The background checkpoint blocks no writers, but the WAL is reused from the start only by a
-/// write transaction that begins after everything has been written back: with commits coming
-/// all the time, the background thread is always the last few frames behind and the WAL keeps
-/// growing. When writes stop (as they mostly do in interactive use) the background thread catches
-/// up; when writes go on all the way to [`INLINE_CHECKPOINT_PAGES`] pages, the committing thread
-/// finishes the job in place, by which time the background thread has written back most frames
-/// and only those within the last thousand pages are left.
-unsafe extern "C" fn wal_hook(
-    meta: *mut c_void,
-    db: *mut ffi::sqlite3,
-    name: *const c_char,
-    pages: c_int,
-) -> c_int {
-    // SAFETY: registration passed the Meta of the Store this connection belongs to, which
-    // outlives the connection (Store::connect)
-    unsafe { &*meta.cast::<Meta>() }.reaper.committed(pages);
-    if pages >= INLINE_CHECKPOINT_PAGES {
-        // SAFETY: SQLite passes the connection that just committed and the database's name
-        unsafe { ffi::sqlite3_wal_checkpoint(db, name) };
-    }
-    ffi::SQLITE_OK
-}
-
-impl Meta {
-    /// Makes committed metadata durable: commits only write frames into the WAL without flushing
-    /// (`synchronous = NORMAL`), and this waits until the WAL is on disk. Frames a checkpoint
-    /// wrote back are in the database file, which the checkpoint has already flushed; when the WAL
-    /// is gone (written back and deleted when the last connection closed) there is nothing to
-    /// flush either. May be called with the BKL released.
-    pub(crate) fn sync_metadata(&self) -> Result<(), Errno> {
-        let seen = self.commits.get();
-        if self.durable.load(Ordering::Acquire) > seen {
-            return Ok(());
-        }
-        match File::open(&self.wal) {
-            Ok(f) => f.sync_data().map_err(io_err)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err(e)),
-        }
-        #[cfg(test)]
-        self.syncs.fetch_add(1, Ordering::Relaxed);
-        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
-        Ok(())
-    }
-
-    /// Writes the whole host filesystem the store is on to disk (the guest's sync, syncfs): object
-    /// data, the WAL and the database file together. May be called with the BKL released.
-    pub(crate) fn sync_all(&self) -> Result<(), Errno> {
-        let seen = self.commits.get();
-        appine_hal::syncfs(self.fs.as_raw_fd()).map_err(Errno)?;
-        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
-        Ok(())
-    }
-}
-
-/// Deletes an object in the `objects` directory; not an error if it is already gone.
-fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
-    let mut name = [0u8; 21];
-    match appine_hal::unlink_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)) {
-        Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
-        _ => Ok(()),
-    }
-}
-
-// SAFETY: the cache is synchronized by the convention above; the commit counter is an atomic in a
-// shared mapping, and the mapping stays valid for as long as Meta lives
-unsafe impl Send for Meta {}
-unsafe impl Sync for Meta {}
-
-impl Meta {
-    /// Reads the cache without the BKL. When the cache is current (the commit counter has not
-    /// changed), returns a reader, which holds the read lock until it is dropped.
-    pub(crate) fn reader(&self) -> Option<Reader<'_>> {
-        let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: the read lock is held, and a thread modifying the cache waits for its release
-        let cache = unsafe { &*self.cache.get() };
-        (cache.generation == self.commits.get()).then_some(Reader {
-            _guard: guard,
-            cache,
-            objects_dir: &self.objects_dir,
-        })
-    }
-}
-
-/// A reader of the cache without the BKL ([`Meta::reader`]). A query that misses returns None, and
-/// the caller then queries normally with the BKL held (which fills the cache).
-pub(crate) struct Reader<'a> {
-    _guard: RwLockReadGuard<'a, ()>,
-    cache: &'a Cache,
-    objects_dir: &'a OwnedFd,
-}
-
-impl Reader<'_> {
-    /// [`Store::lookup`].
-    pub fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
-        self.cache.dentries.get(&parent)?.get(name).copied()
-    }
-
-    /// [`Store::kind`].
-    pub fn kind(&self, ino: Ino) -> Option<u32> {
-        Some(self.cache.rows.get(&ino)?.kind())
-    }
-
-    /// [`Store::readlink`]: None if it is not a symlink.
-    pub fn readlink(&self, ino: Ino) -> Option<&[u8]> {
-        self.cache.targets.get(&ino).map(Vec::as_slice)
-    }
-
-    /// [`Store::parent`].
-    pub fn parent(&self, dir: Ino) -> Option<Ino> {
-        self.cache.parents.get(&dir).copied()
-    }
-
-    /// [`Store::stat`]. Stats the object while holding the read lock: if the inode number is
-    /// reused after deletion, the result is not half from the old file and half from the new one.
-    /// None on a host error.
-    pub fn stat(&self, ino: Ino) -> Option<Stat> {
-        let mut st = *self.cache.rows.get(&ino)?;
-        if st.kind() == mode::S_IFREG {
-            fill_from_host(&mut st, self.objects_dir, ino).ok()?;
-        }
-        Some(st)
-    }
-}
-
-/// A regular file's size and times are taken from the host object file (for ctime see the module
-/// docs).
-fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
-    let mut name = [0u8; 21];
-    let o =
-        appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)).map_err(Errno)?;
-    st.size = o.st_size as u64;
-    st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
-    st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
-    st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
-    Ok(())
-}
-
-/// An object's file name (the inode number in decimal), without allocating.
-fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
-    let mut i = buf.len() - 1;
-    buf[i] = 0;
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (ino % 10) as u8;
-        ino /= 10;
-        if ino == 0 {
-            return std::ffi::CStr::from_bytes_with_nul(&buf[i..]).unwrap();
-        }
-    }
-}
-
-/// The cache's hasher: keys are inode numbers and file names, with no need to resist hash
-/// collision attacks, so FxHash (as rustc does). The default SipHash took 4–5% of the stat path
-/// of `ls` and `git status`.
-#[derive(Default, Clone, Copy)]
-struct FxHasher {
-    hash: u64,
-}
-
-impl FxHasher {
-    fn add(&mut self, word: u64) {
-        const SEED: u64 = 0x517c_c1b7_2722_0a95;
-        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
-    }
-}
-
-impl std::hash::Hasher for FxHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.add(u64::from_le_bytes(c.try_into().unwrap()));
-        }
-        let rest = chunks.remainder();
-        if !rest.is_empty() {
-            let mut word = [0u8; 8];
-            word[..rest.len()].copy_from_slice(rest);
-            self.add(u64::from_le_bytes(word));
-        }
-    }
-
-    fn write_u64(&mut self, i: u64) {
-        self.add(i);
-    }
-
-    fn write_usize(&mut self, i: usize) {
-        self.add(i as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
-
-type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
-
-/// The metadata cache. Its entries correspond to the database contents at commit count
-/// `generation`.
-#[derive(Default)]
-struct Cache {
-    generation: u64,
-    entries: usize,
-    /// Directory → name → inode (None means it does not exist).
-    dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
-    rows: Map<Ino, Stat>,
-    targets: Map<Ino, Vec<u8>>,
-    parents: Map<Ino, Ino>,
-    /// Directory → inode → one name in the directory pointing at it ([`Store::name_of`]; None
-    /// means there is none).
-    names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
-    /// Complete listings of directories (readdir).
-    listings: Map<Ino, Vec<DirEntry>>,
-    /// Inodes with file capabilities (`security.capability`) ([`Store::has_file_caps`]); None
-    /// means not looked up yet. Writing a file has to check it, so the whole set is cached
-    /// together and invalidated with the commit count.
-    file_caps: Option<Map<Ino, ()>>,
-}
-
-impl Cache {
-    /// The limit on the number of entries: beyond it the whole cache is cleared.
-    const MAX_ENTRIES: usize = 1 << 17;
-
-    fn clear(&mut self, generation: u64) {
-        *self = Cache {
-            generation,
-            ..Cache::default()
-        };
-    }
-}
-
-/// A few words at the start of the `lock` file that all processes map shared: the number of
-/// commits, the number of connections open on the store, and the range of inode numbers newly
-/// allocated by write transactions not yet committed.
-struct Commits {
-    map: appine_hal::FileMapping,
-}
-
-impl Commits {
-    fn open(lock: &File) -> Result<Commits, Errno> {
-        if lock.metadata().map_err(io_err)?.len() < 32 {
-            lock.set_len(32).map_err(io_err)?;
-        }
-        let map = appine_hal::map_file(lock.as_raw_fd(), 0, 32, true, true).map_err(Errno)?;
-        Ok(Commits { map })
-    }
-
-    fn word(&self, i: usize) -> &AtomicU64 {
-        // SAFETY: the mapping is page-aligned, at least 32 bytes, and valid for its whole
-        // lifetime
-        unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast::<u64>().add(i)) }
-    }
-
-    fn get(&self) -> u64 {
-        self.word(0).load(Ordering::SeqCst)
-    }
-
-    /// Adds one, returning the old value.
-    fn bump(&self) -> u64 {
-        self.word(0).fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// The number of [`Store`] connections open on the store (one process may hold several: each
-    /// host call opens its own besides the kernel's). A process that exited abnormally has not
-    /// subtracted its connections, so it may be too high (which only makes other connections stop
-    /// deferring commits); it is reset to zero when the store is opened exclusively (the
-    /// equivalent of boot).
-    fn users(&self) -> &AtomicU64 {
-        self.word(1)
-    }
-
-    /// The minimum and maximum inode numbers newly allocated by write transactions not yet
-    /// committed (0 means none). When a process is killed before committing, these inodes are lost
-    /// with the transaction, but their objects have already been created; the next boot deletes
-    /// them by this range. Otherwise, once the numbers were allocated again to inodes without
-    /// objects, such as directories, the objects would stay forever.
-    fn fresh(&self) -> (&AtomicU64, &AtomicU64) {
-        (self.word(2), self.word(3))
-    }
-}
-
-impl Drop for Commits {
-    fn drop(&mut self) {
-        // SAFETY: the mapping came from map_file and is not accessed afterwards
-        unsafe { appine_hal::unmap(self.map.base, self.map.len) }
-    }
-}
-
-const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS inodes (
-        ino      INTEGER PRIMARY KEY,
-        mode     INTEGER NOT NULL,
-        uid      INTEGER NOT NULL,
-        gid      INTEGER NOT NULL,
-        nlink    INTEGER NOT NULL,
-        rdev     INTEGER NOT NULL DEFAULT 0,
-        parent   INTEGER NOT NULL DEFAULT 0, -- a directory's parent directory (..)
-        mtime_ns INTEGER NOT NULL DEFAULT 0, -- used only by inodes without an object
-        ctime_ns INTEGER NOT NULL DEFAULT 0,
-        target   BLOB                        -- the symlink's target
-    );
-    CREATE TABLE IF NOT EXISTS dentries (
-        parent INTEGER NOT NULL,
-        name   BLOB NOT NULL,
-        ino    INTEGER NOT NULL,
-        PRIMARY KEY (parent, name)
-    ) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS xattrs (
-        ino   INTEGER NOT NULL,
-        name  BLOB NOT NULL,
-        value BLOB NOT NULL,
-        PRIMARY KEY (ino, name)
-    ) WITHOUT ROWID;
-    -- Directories not under the root directory (tmpfs roots): deleted at boot along with
-    -- everything in them
-    CREATE TABLE IF NOT EXISTS detached_roots (
-        ino INTEGER PRIMARY KEY
-    );
-";
-
-fn db_err(e: rusqlite::Error) -> Errno {
-    crate::debug::log(format_args!("inode store: {e}"));
-    Errno::EIO
-}
-
-fn io_err(e: std::io::Error) -> Errno {
-    crate::debug::log(format_args!("inode store: {e}"));
-    e.raw_os_error().map(Errno).unwrap_or(Errno::EIO)
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
-fn to_ns(t: SystemTime) -> i64 {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_nanos() as i64,
-        Err(e) => -(e.duration().as_nanos() as i64),
-    }
-}
-
-fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
-    st.size = meta.len();
-    st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
-    st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
-    st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
-}
-
-/// An error operating on an object on the host (a host error code).
-fn object_err(ino: Ino, e: i32) -> Errno {
-    crate::debug::log(format_args!("inode store: object {ino}: errno {e}"));
-    Errno(e)
-}
-
 impl Store {
+    // ---- Opening and boot cleanup ----
+
     /// Creates a new store, containing only the root directory, in empty (or nonexistent)
     /// directory `dir`.
     pub fn create(dir: &Path) -> Result<Store, Errno> {
@@ -871,6 +342,87 @@ impl Store {
             store.exec("COMMIT")?;
         }
         Ok(store)
+    }
+
+    fn connect(dir: &Path) -> Result<Store, Errno> {
+        let db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
+        db.pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_err)?;
+        db.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(db_err)?;
+        db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)
+            .map_err(db_err)?;
+        // Several appine processes can use the same store at once: wait for others' write
+        // transactions to end instead of failing at once
+        db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
+        // Metadata operations are very frequent: every statement is compiled only once
+        db.set_prepared_statement_cache_capacity(64);
+        db.execute_batch(SCHEMA).map_err(db_err)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("lock"))
+            .map_err(io_err)?;
+        appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
+        let commits = Commits::open(&lock)?;
+        let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
+        let meta = Arc::new(Meta {
+            lock: RwLock::new(()),
+            cache: UnsafeCell::new(Cache {
+                generation: commits.get(),
+                ..Cache::default()
+            }),
+            commits,
+            objects_dir,
+            reaper: Reaper::default(),
+            fs: lock.try_clone().map_err(io_err)?,
+            wal: dir.join("meta.db-wal"),
+            durable: AtomicU64::new(0),
+            #[cfg(test)]
+            syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            flushes: AtomicU64::new(0),
+        });
+        let reaper = {
+            let (meta, db) = (meta.clone(), dir.join("meta.db"));
+            std::thread::Builder::new()
+                .name("objects-reaper".into())
+                .spawn(move || reap(meta, db))
+                .ok()
+        };
+        if reaper.is_some() {
+            // SAFETY: the Meta the hook gets is held by both the Store and the background thread;
+            // conn is the first of the Store's fields to be dropped, and the hook is never called
+            // after the connection closes. Without a background thread, SQLite's own
+            // auto-checkpoint is kept
+            unsafe {
+                ffi::sqlite3_wal_hook(
+                    db.handle(),
+                    Some(wal_hook),
+                    Arc::as_ptr(&meta).cast_mut().cast(),
+                );
+            }
+        }
+        Ok(Store {
+            conn: db,
+            #[cfg(any(debug_assertions, feature = "borrow-check"))]
+            owner: std::sync::atomic::AtomicUsize::new(0),
+            objects: dir.join("objects"),
+            lock,
+            meta,
+            reaper,
+            writing: Cell::new(false),
+            snapshot_at: Cell::new(None),
+            pending: Cell::new(None),
+            delay: COMMIT_DELAY,
+            doomed: RefCell::default(),
+            replaced: RefCell::default(),
+            changed_dirs: RefCell::new(None),
+            waker: RefCell::new(None),
+            fills: RefCell::default(),
+        })
     }
 
     /// Deletes the objects left by inodes lost last time before they could be committed
@@ -974,87 +526,6 @@ impl Store {
         Ok(())
     }
 
-    fn connect(dir: &Path) -> Result<Store, Errno> {
-        let db = Connection::open(dir.join("meta.db")).map_err(db_err)?;
-        db.pragma_update(None, "journal_mode", "WAL")
-            .map_err(db_err)?;
-        db.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(db_err)?;
-        db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)
-            .map_err(db_err)?;
-        // Several appine processes can use the same store at once: wait for others' write
-        // transactions to end instead of failing at once
-        db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
-        // Metadata operations are very frequent: every statement is compiled only once
-        db.set_prepared_statement_cache_capacity(64);
-        db.execute_batch(SCHEMA).map_err(db_err)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .map_err(io_err)?;
-        appine_hal::flock(lock.as_raw_fd(), false, true).map_err(Errno)?;
-        let commits = Commits::open(&lock)?;
-        let objects_dir = appine_hal::open_dir(&dir.join("objects")).map_err(Errno)?;
-        let meta = Arc::new(Meta {
-            lock: RwLock::new(()),
-            cache: UnsafeCell::new(Cache {
-                generation: commits.get(),
-                ..Cache::default()
-            }),
-            commits,
-            objects_dir,
-            reaper: Reaper::default(),
-            fs: lock.try_clone().map_err(io_err)?,
-            wal: dir.join("meta.db-wal"),
-            durable: AtomicU64::new(0),
-            #[cfg(test)]
-            syncs: AtomicU64::new(0),
-            #[cfg(test)]
-            flushes: AtomicU64::new(0),
-        });
-        let reaper = {
-            let (meta, db) = (meta.clone(), dir.join("meta.db"));
-            std::thread::Builder::new()
-                .name("objects-reaper".into())
-                .spawn(move || reap(meta, db))
-                .ok()
-        };
-        if reaper.is_some() {
-            // SAFETY: the Meta the hook gets is held by both the Store and the background thread;
-            // conn is the first of the Store's fields to be dropped, and the hook is never called
-            // after the connection closes. Without a background thread, SQLite's own
-            // auto-checkpoint is kept
-            unsafe {
-                ffi::sqlite3_wal_hook(
-                    db.handle(),
-                    Some(wal_hook),
-                    Arc::as_ptr(&meta).cast_mut().cast(),
-                );
-            }
-        }
-        Ok(Store {
-            conn: db,
-            #[cfg(any(debug_assertions, feature = "borrow-check"))]
-            owner: std::sync::atomic::AtomicUsize::new(0),
-            objects: dir.join("objects"),
-            lock,
-            meta,
-            reaper,
-            writing: Cell::new(false),
-            snapshot_at: Cell::new(None),
-            pending: Cell::new(None),
-            delay: COMMIT_DELAY,
-            doomed: RefCell::default(),
-            replaced: RefCell::default(),
-            changed_dirs: RefCell::new(None),
-            waker: RefCell::new(None),
-            fills: RefCell::default(),
-        })
-    }
-
     /// From now on this store belongs to running kernel `kernel` ([`crate::kernel::Shared::id`])
     /// and may be used only while holding its BKL. In checked builds (debug builds and the
     /// `borrow-check` feature, the same as for [`crate::cell`]), using the database connection or
@@ -1069,329 +540,7 @@ impl Store {
         let _ = kernel;
     }
 
-    /// In checked builds: when it belongs to a running kernel, the current thread must hold that
-    /// kernel's BKL ([`Store::guard_with_bkl`]).
-    #[inline]
-    #[track_caller]
-    fn check_owner(&self) {
-        #[cfg(any(debug_assertions, feature = "borrow-check"))]
-        {
-            let owner = self.owner.load(Ordering::Relaxed);
-            assert!(
-                owner == 0 || owner == crate::kernel::bkl_holder(),
-                "the inode store of a running kernel is used without holding its BKL"
-            );
-        }
-    }
-
-    /// The database connection.
-    #[inline]
-    #[track_caller]
-    fn db(&self) -> &Connection {
-        self.check_owner();
-        &self.conn
-    }
-
-    /// Executes a statement without parameters (BEGIN, COMMIT, savepoints), compiled only once.
-    fn exec(&self, sql: &str) -> Result<(), Errno> {
-        self.db()
-            .prepare_cached(sql)
-            .and_then(|mut st| st.execute([]))
-            .map(drop)
-            .map_err(db_err)
-    }
-
-    /// Runs `f` as one metadata operation: either all of it takes effect or (when `f` fails or
-    /// panics) all of it is rolled back. The operation is a savepoint in the deferred write
-    /// transaction (module docs); the write transaction takes the write lock right at its start
-    /// (`IMMEDIATE`): a transaction that reads first and writes later cannot be upgraded to a
-    /// write transaction after another process has committed, and busy_timeout does not help
-    /// then. When already inside an operation (importing a rootfs is one whole operation), it
-    /// joins the enclosing one.
-    pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
-        self.operation(true, f)
-    }
-
-    /// An operation with only one write statement (changing permissions, owner, times): the
-    /// statement itself is atomic, and on failure SQLite undoes only it, so no savepoint is
-    /// needed.
-    fn statement<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
-        self.operation(false, f)
-    }
-
-    fn operation<T>(
-        &self,
-        savepoint: bool,
-        f: impl FnOnce(&Store) -> Result<T, Errno>,
-    ) -> Result<T, Errno> {
-        // Inside a read transaction ([`Store::snapshot`]) it also runs directly, writing inside the
-        // read transaction as before
-        if self.writing.get() || (self.pending.get().is_none() && !self.db().is_autocommit()) {
-            return f(self);
-        }
-        if self.pending.get().is_none() {
-            self.exec("BEGIN IMMEDIATE")?;
-            self.pending.set(Some(Instant::now()));
-            if self.defers()
-                && let Some(wake) = &*self.waker.borrow()
-            {
-                wake();
-            }
-        }
-        let r = if savepoint {
-            self.exec("SAVEPOINT op")
-        } else {
-            Ok(())
-        };
-        let r = r.and_then(|()| {
-            let op = Op {
-                store: self,
-                savepoint,
-                doomed: self.doomed.borrow().len(),
-                done: false,
-            };
-            self.writing.set(true);
-            let r = f(self);
-            let r = match r {
-                Ok(v) if savepoint => self.exec("RELEASE op").map(|()| v),
-                r => r,
-            };
-            op.finish(r.is_ok());
-            r
-        });
-        // Commit immediately when another process is also using the store, so that it does not
-        // miss the changes; also commit once deferred long enough
-        let overdue = self
-            .pending
-            .get()
-            .is_some_and(|t| t.elapsed() >= self.delay);
-        if overdue || !self.defers() {
-            self.commit()?;
-        }
-        r
-    }
-
-    /// Write transactions may be deferred: no other connection is open on the store.
-    fn defers(&self) -> bool {
-        self.meta.commits.users().load(Ordering::Relaxed) <= 1
-    }
-
-    /// Takes the directories whose dentries changed (created, removed, renamed) since the last
-    /// call; recording starts at the first call (the app has the Files app refresh them, the
-    /// android/documents map). Directories are recorded as of the operation, so ones whose changes
-    /// were later rolled back are included too.
-    pub fn take_changed_dirs(&self) -> Vec<Ino> {
-        let mut dirs = self.changed_dirs.borrow_mut();
-        match dirs.as_mut() {
-            Some(set) => std::mem::take(set).into_iter().collect(),
-            None => {
-                *dirs = Some(Default::default());
-                Vec::new()
-            }
-        }
-    }
-
-    /// Wakes `wake` when a commit is deferred ([`Store::commit_due`]).
-    pub fn set_waker(&self, wake: Box<dyn Fn()>) {
-        *self.waker.borrow_mut() = Some(wake);
-    }
-
-    /// Commits the deferred write transaction if it is due; if not yet, returns when it will be
-    /// due.
-    pub fn commit_due(&self) -> Option<Instant> {
-        let due = self.pending.get()? + self.delay;
-        if Instant::now() < due {
-            return Some(due);
-        }
-        let _ = self.commit();
-        None
-    }
-
-    /// Commits the deferred write transaction (on fsync, sync, close) and then deletes the objects
-    /// waiting for it. If the commit fails, all deferred changes are lost: the database returns to
-    /// the state of the last commit, and the whole cache is cleared. Only writes into the WAL,
-    /// without waiting for it to be durable ([`Meta::sync_metadata`]).
-    pub fn commit(&self) -> Result<(), Errno> {
-        if self.pending.take().is_none() {
-            return Ok(());
-        }
-        self.flush_replaced();
-        let r = self.exec("COMMIT");
-        let doomed = std::mem::take(&mut *self.doomed.borrow_mut());
-        if r.is_err() {
-            if !self.db().is_autocommit() {
-                let _ = self.exec("ROLLBACK");
-            }
-            self.update(|c| c.clear(c.generation));
-            let _ = self.remove_lost_objects();
-            return r;
-        }
-        let (lo, hi) = self.meta.commits.fresh();
-        lo.store(0, Ordering::SeqCst);
-        hi.store(0, Ordering::SeqCst);
-        // The counter must be bumped after the commit: if bumped before, another process could
-        // reread the old content before the commit completes and record it under the new count.
-        // If someone else changed the counter before this, our own cache is invalidated as a
-        // whole too. It must also be bumped before objects are handed to the background thread
-        // for deletion: the thread judges by the counter whether this commit is durable
-        // ([`Meta::sync_metadata`])
-        self.update(|c| {
-            let before = self.meta.commits.bump();
-            if before == c.generation {
-                c.generation = before + 1;
-            } else {
-                c.clear(before + 1);
-            }
-        });
-        self.reap_later(doomed);
-        Ok(())
-    }
-
-    /// Makes the data of regular files in the write transaction that were renamed over other
-    /// files ([`Store::rename`]) durable before the commit: after the commit the host may write
-    /// the WAL back to disk at any time, and by then the new file's content must already be on
-    /// disk, so that after power loss the name does not hold an empty or truncated file. Native
-    /// ext4 does the same on a replacing rename (auto_da_alloc), and apk installing files and
-    /// editors saving rely on it without calling fsync; appine's renames are only in the
-    /// database, invisible to the host. A few files are fdatasynced one by one (writeback is
-    /// started for all of them first, which ext4 merges into one journal commit); for more, the
-    /// whole filesystem is syncfsed once. This holds the BKL, so other processes wait during the
-    /// flush. Failures to flush are only logged.
-    fn flush_replaced(&self) {
-        let mut inos = std::mem::take(&mut *self.replaced.borrow_mut());
-        if inos.is_empty() {
-            return;
-        }
-        inos.sort_unstable();
-        inos.dedup();
-        let r = if inos.len() > FLUSH_EACH {
-            appine_hal::syncfs(self.meta.fs.as_raw_fd())
-        } else {
-            // Files deleted after the rename cannot be opened and need no attention
-            let files: Vec<File> = inos
-                .iter()
-                .filter_map(|&ino| self.open_object(ino, false).ok())
-                .collect();
-            for f in &files {
-                let _ = appine_hal::sync_file_range(
-                    f.as_raw_fd(),
-                    0,
-                    0,
-                    appine_hal::SYNC_FILE_RANGE_WRITE,
-                );
-            }
-            files
-                .iter()
-                .try_for_each(|f| appine_hal::fsync(f.as_raw_fd(), true))
-        };
-        if let Err(e) = r {
-            crate::debug::log(format_args!("inode store: flushing replaced files: {e}"));
-        }
-        #[cfg(test)]
-        self.meta
-            .flushes
-            .fetch_add(inos.len() as u64, Ordering::Relaxed);
-    }
-
-    /// Name `name` in directory `dir` changed: removes the affected entries from our own cache.
-    /// Other processes' caches are invalidated at commit ([`Store::commit`]).
-    fn touch_name(&self, dir: Ino, name: &[u8]) {
-        self.fills
-            .borrow_mut()
-            .retain(|f| !matches!(f, Fill::Name(d, n, _) if *d == dir && n == name));
-        self.update(|c| {
-            if let Some(d) = c.dentries.get_mut(&dir) {
-                d.remove(name);
-            }
-            c.listings.remove(&dir);
-            c.names.remove(&dir);
-        });
-    }
-
-    /// Puts `fill` into the cache after the operation succeeds.
-    fn fill(&self, fill: Fill) {
-        let mut fills = self.fills.borrow_mut();
-        if fills.len() < Fill::MAX {
-            fills.push(fill);
-        }
-    }
-
-    /// The row of inode `ino` changed (as above).
-    fn touch_ino(&self, ino: Ino) {
-        self.fills
-            .borrow_mut()
-            .retain(|f| !matches!(f, Fill::Row(st) if st.ino == ino));
-        self.update(|c| {
-            c.rows.remove(&ino);
-            c.targets.remove(&ino);
-            c.parents.remove(&ino);
-        });
-    }
-
-    /// Reads the cache. Only Store's methods change the cache, so they need no lock to read it
-    /// themselves ([`Meta`]).
-    fn cached<R>(&self, f: impl FnOnce(&Cache) -> R) -> R {
-        self.check_owner();
-        // SAFETY: Store is not Sync, so no other thread modifies it at the same time; f does not
-        // call back into Store's methods, so the borrow does not overlap with update's
-        f(unsafe { &*self.meta.cache.get() })
-    }
-
-    /// Changes the cache: holds the write lock, waiting for threads reading the cache without the
-    /// BKL to finish.
-    fn update<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
-        self.check_owner();
-        let _guard = self
-            .meta
-            .lock
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: the write lock is held, so no other thread is reading; f does not call back into
-        // Store's methods
-        f(unsafe { &mut *self.meta.cache.get() })
-    }
-
-    /// The part needed to read the cache without the BKL ([`Meta`]).
-    pub(crate) fn meta(&self) -> &Arc<Meta> {
-        &self.meta
-    }
-
-    /// Called on a cache miss, before querying the database: inside [`Store::snapshot`], the
-    /// first query starts the read transaction.
-    fn begin_read(&self) -> Result<(), Errno> {
-        if self.snapshot_at.get() == Some(None) {
-            self.snapshot_at.set(Some(Some(self.meta.commits.get())));
-            self.exec("BEGIN")?;
-        }
-        Ok(())
-    }
-
-    /// The cache is current (stale content was cleared before the cache was read): used to fill in
-    /// what an operation created after it succeeds.
-    fn cache_generation_any(&self) -> bool {
-        self.cached(|c| c.generation) == self.meta.commits.get()
-    }
-
-    /// Called before reading the cache: clears it first if it is stale. Returns the current commit
-    /// count when query results may be filled into the cache (not inside an operation).
-    fn cache_generation(&self) -> Option<u64> {
-        let now = self.meta.commits.get();
-        if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
-            self.update(|c| c.clear(now));
-        }
-        (!self.writing.get()).then_some(now)
-    }
-
-    /// Whether a result just queried may go into the cache: nobody has committed since the read
-    /// transaction began, nor during this query (otherwise the result may be older than
-    /// `generation`).
-    fn may_fill(&self, generation: u64) -> bool {
-        self.snapshot_at
-            .get()
-            .flatten()
-            .is_none_or(|s| s == generation)
-            && self.meta.commits.get() == generation
-    }
+    // ---- Reads ----
 
     /// Runs `f` in one read transaction, whose queries see the same snapshot and share one round
     /// of locking: in WAL mode, every statement opening and closing its own read transaction takes
@@ -1411,55 +560,6 @@ impl Store {
         }
         self.snapshot_at.set(None);
         r
-    }
-
-    /// Opens an object (relative to the `objects` directory, without resolving the whole path);
-    /// `flags` are host open flags.
-    fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
-        let mut name = [0u8; 21];
-        let dir = self.meta.objects_dir.as_raw_fd();
-        appine_hal::open_at(dir, object_name(ino, &mut name), flags, OBJECT_MODE)
-            .map_err(|e| object_err(ino, e))
-    }
-
-    /// The database changed the metadata of inode `ino`: for a regular file, chmod the object so
-    /// that the host updates its ctime (see the module docs). Ignored if the object is gone (still
-    /// open after deletion) or cannot be changed; the ctime is then just not updated.
-    fn object_changed(&self, ino: Ino) {
-        if self.kind(ino) == Ok(mode::S_IFREG) {
-            let mut name = [0u8; 21];
-            let dir = self.meta.objects_dir.as_raw_fd();
-            let _ = appine_hal::chmod_at(dir, object_name(ino, &mut name), OBJECT_MODE);
-        }
-    }
-
-    /// Deletes an object; not an error if it is already gone.
-    fn remove_object(&self, ino: Ino) -> Result<(), Errno> {
-        remove_object(&self.meta.objects_dir, ino)
-    }
-
-    /// Hands objects to the background thread for deletion; deletes them itself when the thread
-    /// was not started.
-    fn reap_later(&self, inos: Vec<Ino>) {
-        if inos.is_empty() {
-            return;
-        }
-        if self.reaper.is_none() {
-            let _ = self.meta.sync_metadata();
-            for ino in inos {
-                let _ = self.remove_object(ino);
-            }
-            return;
-        }
-        let r = &self.meta.reaper;
-        let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
-        #[cfg(test)]
-        {
-            st.handed += inos.len();
-        }
-        st.queue.extend(inos);
-        drop(st);
-        r.work.notify_one();
     }
 
     /// Looks up `name` in directory `parent`.
@@ -1680,99 +780,12 @@ impl Store {
         Ok(list)
     }
 
-    /// Opens a regular file's object.
-    pub fn open_object(&self, ino: Ino, write: bool) -> Result<File, Errno> {
-        self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
+    /// The capacity of the host filesystem the store is on (reported to the guest by statfs).
+    pub fn fs_stats(&self) -> Result<appine_hal::FsStats, Errno> {
+        appine_hal::statvfs(&self.objects).map_err(Errno)
     }
 
-    /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
-    /// writes when the host browses the store).
-    pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
-        let append = if append { libc::O_APPEND } else { 0 };
-        self.object(ino, libc::O_RDWR | append)
-    }
-
-    fn new_inode(
-        &self,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        nlink: u32,
-        parent: Ino,
-    ) -> Result<Ino, Errno> {
-        let now = now_ns();
-        self.db()
-            .prepare_cached(
-                "INSERT INTO inodes (mode, uid, gid, nlink, parent, mtime_ns, ctime_ns)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            )
-            .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
-            .map_err(db_err)?;
-        let ino = self.db().last_insert_rowid() as Ino;
-        self.touch_ino(ino);
-        self.fill(Fill::Row(Stat {
-            ino,
-            mode,
-            nlink,
-            uid,
-            gid,
-            rdev: 0,
-            size: 0,
-            atime_ns: now,
-            mtime_ns: now,
-            ctime_ns: now,
-        }));
-        let (lo, hi) = self.meta.commits.fresh();
-        if lo.load(Ordering::Relaxed) == 0 {
-            lo.store(ino, Ordering::Relaxed);
-        }
-        hi.fetch_max(ino, Ordering::Relaxed);
-        Ok(ino)
-    }
-
-    fn add_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        if self.lookup(parent, name)?.is_some() {
-            return Err(Errno::EEXIST);
-        }
-        let dir = self.stat_row(parent)?;
-        if !dir.is_dir() {
-            return Err(Errno::ENOTDIR);
-        }
-        // Nothing can be created in a deleted directory (still someone's cwd, or still open):
-        // Linux's may_create returns ENOENT on seeing IS_DEADDIR
-        if dir.nlink == 0 {
-            return Err(Errno::ENOENT);
-        }
-        self.db()
-            .prepare_cached("INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)")
-            .and_then(|mut st| st.execute(params![parent, name, ino]))
-            .map_err(db_err)?;
-        self.touch_name(parent, name);
-        self.fill(Fill::Name(parent, name.to_vec(), ino));
-        self.dir_changed(parent)
-    }
-
-    /// The names in directory `dir` changed: its mtime and ctime become now, as with Linux's
-    /// create, delete and rename (Python's import, Maildir and git detect changes by directory
-    /// mtime). The new row goes into the cache: path resolution reads the directory's row at every
-    /// level.
-    fn dir_changed(&self, dir: Ino) -> Result<(), Errno> {
-        if let Some(dirs) = self.changed_dirs.borrow_mut().as_mut()
-            && dirs.len() < MAX_CHANGED_DIRS
-        {
-            dirs.insert(dir);
-        }
-        let mut st = self.stat_row(dir)?;
-        let now = now_ns();
-        self.db()
-            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![dir, now]))
-            .map_err(db_err)?;
-        self.touch_ino(dir);
-        (st.atime_ns, st.mtime_ns, st.ctime_ns) = (now, now, now);
-        self.fill(Fill::Row(st));
-        Ok(())
-    }
+    // ---- Changes ----
 
     /// Creates a directory.
     pub fn mkdir(
@@ -1818,12 +831,6 @@ impl Store {
             let file = s.new_object(ino)?;
             Ok((ino, file))
         })
-    }
-
-    /// Creates an empty object for a new inode. An existing one was left by an inode lost before
-    /// it could be committed (the inode number was allocated again), and is emptied and reused.
-    fn new_object(&self, ino: Ino) -> Result<File, Errno> {
-        self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
     }
 
     /// Creates a directory that does not hang under the root directory (a tmpfs root): its parent
@@ -1944,6 +951,72 @@ impl Store {
         })
     }
 
+    fn new_inode(
+        &self,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        nlink: u32,
+        parent: Ino,
+    ) -> Result<Ino, Errno> {
+        let now = now_ns();
+        self.db()
+            .prepare_cached(
+                "INSERT INTO inodes (mode, uid, gid, nlink, parent, mtime_ns, ctime_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            )
+            .and_then(|mut st| st.execute(params![mode, uid, gid, nlink, parent, now]))
+            .map_err(db_err)?;
+        let ino = self.db().last_insert_rowid() as Ino;
+        self.touch_ino(ino);
+        self.fill(Fill::Row(Stat {
+            ino,
+            mode,
+            nlink,
+            uid,
+            gid,
+            rdev: 0,
+            size: 0,
+            atime_ns: now,
+            mtime_ns: now,
+            ctime_ns: now,
+        }));
+        let (lo, hi) = self.meta.commits.fresh();
+        if lo.load(Ordering::Relaxed) == 0 {
+            lo.store(ino, Ordering::Relaxed);
+        }
+        hi.fetch_max(ino, Ordering::Relaxed);
+        Ok(ino)
+    }
+
+    fn add_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
+        if self.lookup(parent, name)?.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let dir = self.stat_row(parent)?;
+        if !dir.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        // Nothing can be created in a deleted directory (still someone's cwd, or still open):
+        // Linux's may_create returns ENOENT on seeing IS_DEADDIR
+        if dir.nlink == 0 {
+            return Err(Errno::ENOENT);
+        }
+        self.db()
+            .prepare_cached("INSERT INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)")
+            .and_then(|mut st| st.execute(params![parent, name, ino]))
+            .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.fill(Fill::Name(parent, name.to_vec(), ino));
+        self.dir_changed(parent)
+    }
+
+    /// Creates an empty object for a new inode. An existing one was left by an inode lost before
+    /// it could be committed (the inode number was allocated again), and is emptied and reused.
+    fn new_object(&self, ino: Ino) -> Result<File, Errno> {
+        self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
+    }
+
     /// Changes the permission bits (keeping the type bits).
     pub fn set_mode(&self, ino: Ino, perm: u32) -> Result<(), Errno> {
         self.statement(|s| {
@@ -2047,67 +1120,16 @@ impl Store {
         Ok(hit)
     }
 
-    /// File capabilities changed: invalidates the cached set.
-    fn touch_file_caps(&self) {
-        self.update(|c| c.file_caps = None);
-    }
-
-    /// Whether a directory is empty.
-    fn is_empty_dir(&self, dir: Ino) -> Result<bool, Errno> {
-        let n: i64 = self
-            .db()
-            .prepare_cached("SELECT count(*) FROM dentries WHERE parent = ?1")
-            .and_then(|mut st| st.query_row(params![dir], |r| r.get(0)))
-            .map_err(db_err)?;
-        Ok(n == 0)
-    }
-
-    /// Removes a dentry pointing at a non-directory; when the last link goes, a regular file's
-    /// object is deleted along with it.
-    fn remove_link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        self.db()
-            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
-            .and_then(|mut st| st.execute(params![parent, name]))
-            .map_err(db_err)?;
-        self.db()
-            .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino, now_ns()]))
-            .map_err(db_err)?;
-        self.touch_name(parent, name);
-        self.touch_ino(ino);
-        self.dir_changed(parent)?;
-        let st = self.stat_row(ino)?;
-        if st.nlink == 0 && st.kind() == mode::S_IFREG {
-            // Deleted after the commit: if the app is killed before the commit, the dentry is
-            // still there, so the object must be too
-            self.doomed.borrow_mut().push(ino);
-        } else {
-            self.object_changed(ino);
-        }
-        Ok(())
-    }
-
-    /// Removes the dentry of an empty directory.
-    fn remove_dir(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        if !self.is_empty_dir(ino)? {
-            return Err(Errno::ENOTEMPTY);
-        }
-        self.db()
-            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
-            .and_then(|mut st| st.execute(params![parent, name]))
-            .map_err(db_err)?;
-        self.db()
-            .prepare_cached("UPDATE inodes SET nlink = 0 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![ino]))
-            .map_err(db_err)?;
-        self.db()
-            .prepare_cached("UPDATE inodes SET nlink = nlink - 1 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![parent]))
-            .map_err(db_err)?;
-        self.touch_name(parent, name);
-        self.touch_ino(ino);
-        self.touch_ino(parent);
-        self.dir_changed(parent)
+    /// Changes the permission bits, owner and group (keeping the type bits).
+    pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
+        self.statement(|s| {
+            s.db().prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
+                .map_err(db_err)?;
+            s.touch_ino(ino);
+            s.object_changed(ino);
+            Ok(())
+        })
     }
 
     /// unlink(2): removes a dentry of a non-directory.
@@ -2129,62 +1151,6 @@ impl Store {
             return Err(Errno::EBUSY);
         }
         self.transaction(|s| s.remove_dir(parent, name, ino))
-    }
-
-    /// Whether `ancestor` is `dir` itself or one of its ancestor directories. The parent of the
-    /// root directory and of directories not under the root directory is itself.
-    fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
-        loop {
-            if dir == ancestor {
-                return Ok(true);
-            }
-            let up = self.parent(dir)?;
-            if up == dir {
-                return Ok(false);
-            }
-            dir = up;
-        }
-    }
-
-    /// Updates `..` and the link counts on both sides when directory `dir` moves from under `from`
-    /// to under `to`.
-    fn reparent_dir(&self, dir: Ino, from: Ino, to: Ino) -> Result<(), Errno> {
-        if from == to {
-            return Ok(());
-        }
-        for (ino, delta) in [(from, -1i64), (to, 1)] {
-            self.db()
-                .prepare_cached("UPDATE inodes SET nlink = nlink + ?2 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![ino, delta]))
-                .map_err(db_err)?;
-        }
-        self.db()
-            .prepare_cached("UPDATE inodes SET parent = ?2 WHERE ino = ?1")
-            .and_then(|mut st| st.execute(params![dir, to]))
-            .map_err(db_err)?;
-        for ino in [dir, from, to] {
-            self.touch_ino(ino);
-        }
-        Ok(())
-    }
-
-    fn set_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
-        self.db()
-            .prepare_cached(
-                "INSERT OR REPLACE INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)",
-            )
-            .and_then(|mut st| st.execute(params![parent, name, ino]))
-            .map_err(db_err)?;
-        self.touch_name(parent, name);
-        self.fill(Fill::Name(parent, name.to_vec(), ino));
-        Ok(())
-    }
-
-    /// A rename changed two directories ([`Store::dir_changed`]); the same directory is changed
-    /// only once.
-    fn dirs_changed(&self, a: Ino, b: Ino) -> Result<(), Errno> {
-        self.dir_changed(a)?;
-        if b != a { self.dir_changed(b) } else { Ok(()) }
     }
 
     /// rename(2)/renameat2(2): `noreplace` is `RENAME_NOREPLACE`, `exchange` is
@@ -2272,26 +1238,140 @@ impl Store {
         })
     }
 
-    /// Truncates a regular file.
-    pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
-        self.open_object(ino, true)?.set_len(len).map_err(io_err)
+    /// Whether `ancestor` is `dir` itself or one of its ancestor directories. The parent of the
+    /// root directory and of directories not under the root directory is itself.
+    fn is_ancestor(&self, ancestor: Ino, mut dir: Ino) -> Result<bool, Errno> {
+        loop {
+            if dir == ancestor {
+                return Ok(true);
+            }
+            let up = self.parent(dir)?;
+            if up == dir {
+                return Ok(false);
+            }
+            dir = up;
+        }
     }
 
-    /// The capacity of the host filesystem the store is on (reported to the guest by statfs).
-    pub fn fs_stats(&self) -> Result<appine_hal::FsStats, Errno> {
-        appine_hal::statvfs(&self.objects).map_err(Errno)
+    /// Removes a dentry pointing at a non-directory; when the last link goes, a regular file's
+    /// object is deleted along with it.
+    fn remove_link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
+            .and_then(|mut st| st.execute(params![parent, name]))
+            .map_err(db_err)?;
+        self.db()
+            .prepare_cached("UPDATE inodes SET nlink = nlink - 1, ctime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, now_ns()]))
+            .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.touch_ino(ino);
+        self.dir_changed(parent)?;
+        let st = self.stat_row(ino)?;
+        if st.nlink == 0 && st.kind() == mode::S_IFREG {
+            // Deleted after the commit: if the app is killed before the commit, the dentry is
+            // still there, so the object must be too
+            self.doomed.borrow_mut().push(ino);
+        } else {
+            self.object_changed(ino);
+        }
+        Ok(())
     }
 
-    /// Changes the permission bits, owner and group (keeping the type bits).
-    pub fn set_owner_mode(&self, ino: Ino, perm: u32, uid: u32, gid: u32) -> Result<(), Errno> {
-        self.statement(|s| {
-            s.db().prepare_cached("UPDATE inodes SET mode = (mode & ?2) | ?3, uid = ?4, gid = ?5, ctime_ns = ?6 WHERE ino = ?1")
-                .and_then(|mut st| st.execute(params![ino, mode::S_IFMT, perm & 0o7777, uid, gid, now_ns()]))
+    /// Removes the dentry of an empty directory.
+    fn remove_dir(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
+        if !self.is_empty_dir(ino)? {
+            return Err(Errno::ENOTEMPTY);
+        }
+        self.db()
+            .prepare_cached("DELETE FROM dentries WHERE parent = ?1 AND name = ?2")
+            .and_then(|mut st| st.execute(params![parent, name]))
+            .map_err(db_err)?;
+        self.db()
+            .prepare_cached("UPDATE inodes SET nlink = 0 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino]))
+            .map_err(db_err)?;
+        self.db()
+            .prepare_cached("UPDATE inodes SET nlink = nlink - 1 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![parent]))
+            .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.touch_ino(ino);
+        self.touch_ino(parent);
+        self.dir_changed(parent)
+    }
+
+    /// Whether a directory is empty.
+    fn is_empty_dir(&self, dir: Ino) -> Result<bool, Errno> {
+        let n: i64 = self
+            .db()
+            .prepare_cached("SELECT count(*) FROM dentries WHERE parent = ?1")
+            .and_then(|mut st| st.query_row(params![dir], |r| r.get(0)))
+            .map_err(db_err)?;
+        Ok(n == 0)
+    }
+
+    fn set_dentry(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached(
+                "INSERT OR REPLACE INTO dentries (parent, name, ino) VALUES (?1, ?2, ?3)",
+            )
+            .and_then(|mut st| st.execute(params![parent, name, ino]))
+            .map_err(db_err)?;
+        self.touch_name(parent, name);
+        self.fill(Fill::Name(parent, name.to_vec(), ino));
+        Ok(())
+    }
+
+    /// Updates `..` and the link counts on both sides when directory `dir` moves from under `from`
+    /// to under `to`.
+    fn reparent_dir(&self, dir: Ino, from: Ino, to: Ino) -> Result<(), Errno> {
+        if from == to {
+            return Ok(());
+        }
+        for (ino, delta) in [(from, -1i64), (to, 1)] {
+            self.db()
+                .prepare_cached("UPDATE inodes SET nlink = nlink + ?2 WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, delta]))
                 .map_err(db_err)?;
-            s.touch_ino(ino);
-            s.object_changed(ino);
-            Ok(())
-        })
+        }
+        self.db()
+            .prepare_cached("UPDATE inodes SET parent = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![dir, to]))
+            .map_err(db_err)?;
+        for ino in [dir, from, to] {
+            self.touch_ino(ino);
+        }
+        Ok(())
+    }
+
+    /// A rename changed two directories ([`Store::dir_changed`]); the same directory is changed
+    /// only once.
+    fn dirs_changed(&self, a: Ino, b: Ino) -> Result<(), Errno> {
+        self.dir_changed(a)?;
+        if b != a { self.dir_changed(b) } else { Ok(()) }
+    }
+
+    /// The names in directory `dir` changed: its mtime and ctime become now, as with Linux's
+    /// create, delete and rename (Python's import, Maildir and git detect changes by directory
+    /// mtime). The new row goes into the cache: path resolution reads the directory's row at every
+    /// level.
+    fn dir_changed(&self, dir: Ino) -> Result<(), Errno> {
+        if let Some(dirs) = self.changed_dirs.borrow_mut().as_mut()
+            && dirs.len() < MAX_CHANGED_DIRS
+        {
+            dirs.insert(dir);
+        }
+        let mut st = self.stat_row(dir)?;
+        let now = now_ns();
+        self.db()
+            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?2 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![dir, now]))
+            .map_err(db_err)?;
+        self.touch_ino(dir);
+        (st.atime_ns, st.mtime_ns, st.ctime_ns) = (now, now, now);
+        self.fill(Fill::Row(st));
+        Ok(())
     }
 
     /// Sets an extended attribute. With `create` (`XATTR_CREATE`) it fails if the attribute
@@ -2430,12 +1510,431 @@ impl Store {
         )
         .map_err(|e| object_err(ino, e))
     }
+
+    // ---- Transactions and deferred commits ----
+
+    /// Runs `f` as one metadata operation: either all of it takes effect or (when `f` fails or
+    /// panics) all of it is rolled back. The operation is a savepoint in the deferred write
+    /// transaction (module docs); the write transaction takes the write lock right at its start
+    /// (`IMMEDIATE`): a transaction that reads first and writes later cannot be upgraded to a
+    /// write transaction after another process has committed, and busy_timeout does not help
+    /// then. When already inside an operation (importing a rootfs is one whole operation), it
+    /// joins the enclosing one.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
+        self.operation(true, f)
+    }
+
+    /// An operation with only one write statement (changing permissions, owner, times): the
+    /// statement itself is atomic, and on failure SQLite undoes only it, so no savepoint is
+    /// needed.
+    fn statement<T>(&self, f: impl FnOnce(&Store) -> Result<T, Errno>) -> Result<T, Errno> {
+        self.operation(false, f)
+    }
+
+    fn operation<T>(
+        &self,
+        savepoint: bool,
+        f: impl FnOnce(&Store) -> Result<T, Errno>,
+    ) -> Result<T, Errno> {
+        // Inside a read transaction ([`Store::snapshot`]) it also runs directly, writing inside the
+        // read transaction as before
+        if self.writing.get() || (self.pending.get().is_none() && !self.db().is_autocommit()) {
+            return f(self);
+        }
+        if self.pending.get().is_none() {
+            self.exec("BEGIN IMMEDIATE")?;
+            self.pending.set(Some(Instant::now()));
+            if self.defers()
+                && let Some(wake) = &*self.waker.borrow()
+            {
+                wake();
+            }
+        }
+        let r = if savepoint {
+            self.exec("SAVEPOINT op")
+        } else {
+            Ok(())
+        };
+        let r = r.and_then(|()| {
+            let op = Op {
+                store: self,
+                savepoint,
+                doomed: self.doomed.borrow().len(),
+                done: false,
+            };
+            self.writing.set(true);
+            let r = f(self);
+            let r = match r {
+                Ok(v) if savepoint => self.exec("RELEASE op").map(|()| v),
+                r => r,
+            };
+            op.finish(r.is_ok());
+            r
+        });
+        // Commit immediately when another process is also using the store, so that it does not
+        // miss the changes; also commit once deferred long enough
+        let overdue = self
+            .pending
+            .get()
+            .is_some_and(|t| t.elapsed() >= self.delay);
+        if overdue || !self.defers() {
+            self.commit()?;
+        }
+        r
+    }
+
+    /// Write transactions may be deferred: no other connection is open on the store.
+    fn defers(&self) -> bool {
+        self.meta.commits.users().load(Ordering::Relaxed) <= 1
+    }
+
+    /// Takes the directories whose dentries changed (created, removed, renamed) since the last
+    /// call; recording starts at the first call (the app has the Files app refresh them, the
+    /// android/documents map). Directories are recorded as of the operation, so ones whose changes
+    /// were later rolled back are included too.
+    pub fn take_changed_dirs(&self) -> Vec<Ino> {
+        let mut dirs = self.changed_dirs.borrow_mut();
+        match dirs.as_mut() {
+            Some(set) => std::mem::take(set).into_iter().collect(),
+            None => {
+                *dirs = Some(Default::default());
+                Vec::new()
+            }
+        }
+    }
+
+    /// Wakes `wake` when a commit is deferred ([`Store::commit_due`]).
+    pub fn set_waker(&self, wake: Box<dyn Fn()>) {
+        *self.waker.borrow_mut() = Some(wake);
+    }
+
+    /// Commits the deferred write transaction if it is due; if not yet, returns when it will be
+    /// due.
+    pub fn commit_due(&self) -> Option<Instant> {
+        let due = self.pending.get()? + self.delay;
+        if Instant::now() < due {
+            return Some(due);
+        }
+        let _ = self.commit();
+        None
+    }
+
+    /// Commits the deferred write transaction (on fsync, sync, close) and then deletes the objects
+    /// waiting for it. If the commit fails, all deferred changes are lost: the database returns to
+    /// the state of the last commit, and the whole cache is cleared. Only writes into the WAL,
+    /// without waiting for it to be durable ([`Meta::sync_metadata`]).
+    pub fn commit(&self) -> Result<(), Errno> {
+        if self.pending.take().is_none() {
+            return Ok(());
+        }
+        self.flush_replaced();
+        let r = self.exec("COMMIT");
+        let doomed = std::mem::take(&mut *self.doomed.borrow_mut());
+        if r.is_err() {
+            if !self.db().is_autocommit() {
+                let _ = self.exec("ROLLBACK");
+            }
+            self.update(|c| c.clear(c.generation));
+            let _ = self.remove_lost_objects();
+            return r;
+        }
+        let (lo, hi) = self.meta.commits.fresh();
+        lo.store(0, Ordering::SeqCst);
+        hi.store(0, Ordering::SeqCst);
+        // The counter must be bumped after the commit: if bumped before, another process could
+        // reread the old content before the commit completes and record it under the new count.
+        // If someone else changed the counter before this, our own cache is invalidated as a
+        // whole too. It must also be bumped before objects are handed to the background thread
+        // for deletion: the thread judges by the counter whether this commit is durable
+        // ([`Meta::sync_metadata`])
+        self.update(|c| {
+            let before = self.meta.commits.bump();
+            if before == c.generation {
+                c.generation = before + 1;
+            } else {
+                c.clear(before + 1);
+            }
+        });
+        self.reap_later(doomed);
+        Ok(())
+    }
+
+    /// Makes the data of regular files in the write transaction that were renamed over other
+    /// files ([`Store::rename`]) durable before the commit: after the commit the host may write
+    /// the WAL back to disk at any time, and by then the new file's content must already be on
+    /// disk, so that after power loss the name does not hold an empty or truncated file. Native
+    /// ext4 does the same on a replacing rename (auto_da_alloc), and apk installing files and
+    /// editors saving rely on it without calling fsync; appine's renames are only in the
+    /// database, invisible to the host. A few files are fdatasynced one by one (writeback is
+    /// started for all of them first, which ext4 merges into one journal commit); for more, the
+    /// whole filesystem is syncfsed once. This holds the BKL, so other processes wait during the
+    /// flush. Failures to flush are only logged.
+    fn flush_replaced(&self) {
+        let mut inos = std::mem::take(&mut *self.replaced.borrow_mut());
+        if inos.is_empty() {
+            return;
+        }
+        inos.sort_unstable();
+        inos.dedup();
+        let r = if inos.len() > FLUSH_EACH {
+            appine_hal::syncfs(self.meta.fs.as_raw_fd())
+        } else {
+            // Files deleted after the rename cannot be opened and need no attention
+            let files: Vec<File> = inos
+                .iter()
+                .filter_map(|&ino| self.open_object(ino, false).ok())
+                .collect();
+            for f in &files {
+                let _ = appine_hal::sync_file_range(
+                    f.as_raw_fd(),
+                    0,
+                    0,
+                    appine_hal::SYNC_FILE_RANGE_WRITE,
+                );
+            }
+            files
+                .iter()
+                .try_for_each(|f| appine_hal::fsync(f.as_raw_fd(), true))
+        };
+        if let Err(e) = r {
+            crate::debug::log(format_args!("inode store: flushing replaced files: {e}"));
+        }
+        #[cfg(test)]
+        self.meta
+            .flushes
+            .fetch_add(inos.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Hands objects to the background thread for deletion; deletes them itself when the thread
+    /// was not started.
+    fn reap_later(&self, inos: Vec<Ino>) {
+        if inos.is_empty() {
+            return;
+        }
+        if self.reaper.is_none() {
+            let _ = self.meta.sync_metadata();
+            for ino in inos {
+                let _ = self.remove_object(ino);
+            }
+            return;
+        }
+        let r = &self.meta.reaper;
+        let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        {
+            st.handed += inos.len();
+        }
+        st.queue.extend(inos);
+        drop(st);
+        r.work.notify_one();
+    }
+
+    // ---- Metadata cache ----
+
+    /// Called before reading the cache: clears it first if it is stale. Returns the current commit
+    /// count when query results may be filled into the cache (not inside an operation).
+    fn cache_generation(&self) -> Option<u64> {
+        let now = self.meta.commits.get();
+        if self.cached(|c| c.generation != now || c.entries > Cache::MAX_ENTRIES) {
+            self.update(|c| c.clear(now));
+        }
+        (!self.writing.get()).then_some(now)
+    }
+
+    /// Called on a cache miss, before querying the database: inside [`Store::snapshot`], the
+    /// first query starts the read transaction.
+    fn begin_read(&self) -> Result<(), Errno> {
+        if self.snapshot_at.get() == Some(None) {
+            self.snapshot_at.set(Some(Some(self.meta.commits.get())));
+            self.exec("BEGIN")?;
+        }
+        Ok(())
+    }
+
+    /// Whether a result just queried may go into the cache: nobody has committed since the read
+    /// transaction began, nor during this query (otherwise the result may be older than
+    /// `generation`).
+    fn may_fill(&self, generation: u64) -> bool {
+        self.snapshot_at
+            .get()
+            .flatten()
+            .is_none_or(|s| s == generation)
+            && self.meta.commits.get() == generation
+    }
+
+    /// Name `name` in directory `dir` changed: removes the affected entries from our own cache.
+    /// Other processes' caches are invalidated at commit ([`Store::commit`]).
+    fn touch_name(&self, dir: Ino, name: &[u8]) {
+        self.fills
+            .borrow_mut()
+            .retain(|f| !matches!(f, Fill::Name(d, n, _) if *d == dir && n == name));
+        self.update(|c| {
+            if let Some(d) = c.dentries.get_mut(&dir) {
+                d.remove(name);
+            }
+            c.listings.remove(&dir);
+            c.names.remove(&dir);
+        });
+    }
+
+    /// The row of inode `ino` changed (as above).
+    fn touch_ino(&self, ino: Ino) {
+        self.fills
+            .borrow_mut()
+            .retain(|f| !matches!(f, Fill::Row(st) if st.ino == ino));
+        self.update(|c| {
+            c.rows.remove(&ino);
+            c.targets.remove(&ino);
+            c.parents.remove(&ino);
+        });
+    }
+
+    /// File capabilities changed: invalidates the cached set.
+    fn touch_file_caps(&self) {
+        self.update(|c| c.file_caps = None);
+    }
+
+    /// Puts `fill` into the cache after the operation succeeds.
+    fn fill(&self, fill: Fill) {
+        let mut fills = self.fills.borrow_mut();
+        if fills.len() < Fill::MAX {
+            fills.push(fill);
+        }
+    }
+
+    /// The cache is current (stale content was cleared before the cache was read): used to fill in
+    /// what an operation created after it succeeds.
+    fn cache_generation_any(&self) -> bool {
+        self.cached(|c| c.generation) == self.meta.commits.get()
+    }
+
+    /// Reads the cache. Only Store's methods change the cache, so they need no lock to read it
+    /// themselves ([`Meta`]).
+    fn cached<R>(&self, f: impl FnOnce(&Cache) -> R) -> R {
+        self.check_owner();
+        // SAFETY: Store is not Sync, so no other thread modifies it at the same time; f does not
+        // call back into Store's methods, so the borrow does not overlap with update's
+        f(unsafe { &*self.meta.cache.get() })
+    }
+
+    /// Changes the cache: holds the write lock, waiting for threads reading the cache without the
+    /// BKL to finish.
+    fn update<R>(&self, f: impl FnOnce(&mut Cache) -> R) -> R {
+        self.check_owner();
+        let _guard = self
+            .meta
+            .lock
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: the write lock is held, so no other thread is reading; f does not call back into
+        // Store's methods
+        f(unsafe { &mut *self.meta.cache.get() })
+    }
+
+    /// The part needed to read the cache without the BKL ([`Meta`]).
+    pub(crate) fn meta(&self) -> &Arc<Meta> {
+        &self.meta
+    }
+
+    // ---- Objects ----
+
+    /// Opens a regular file's object.
+    pub fn open_object(&self, ino: Ino, write: bool) -> Result<File, Errno> {
+        self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
+    }
+
+    /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
+    /// writes when the host browses the store).
+    pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
+        let append = if append { libc::O_APPEND } else { 0 };
+        self.object(ino, libc::O_RDWR | append)
+    }
+
+    /// Truncates a regular file.
+    pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
+        self.open_object(ino, true)?.set_len(len).map_err(io_err)
+    }
+
+    /// Opens an object (relative to the `objects` directory, without resolving the whole path);
+    /// `flags` are host open flags.
+    fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
+        let mut name = [0u8; 21];
+        let dir = self.meta.objects_dir.as_raw_fd();
+        appine_hal::open_at(dir, object_name(ino, &mut name), flags, OBJECT_MODE)
+            .map_err(|e| object_err(ino, e))
+    }
+
+    /// The database changed the metadata of inode `ino`: for a regular file, chmod the object so
+    /// that the host updates its ctime (see the module docs). Ignored if the object is gone (still
+    /// open after deletion) or cannot be changed; the ctime is then just not updated.
+    fn object_changed(&self, ino: Ino) {
+        if self.kind(ino) == Ok(mode::S_IFREG) {
+            let mut name = [0u8; 21];
+            let dir = self.meta.objects_dir.as_raw_fd();
+            let _ = appine_hal::chmod_at(dir, object_name(ino, &mut name), OBJECT_MODE);
+        }
+    }
+
+    /// Deletes an object; not an error if it is already gone.
+    fn remove_object(&self, ino: Ino) -> Result<(), Errno> {
+        remove_object(&self.meta.objects_dir, ino)
+    }
+
+    // ---- Database connection ----
+
+    /// The database connection.
+    #[inline]
+    #[track_caller]
+    fn db(&self) -> &Connection {
+        self.check_owner();
+        &self.conn
+    }
+
+    /// Executes a statement without parameters (BEGIN, COMMIT, savepoints), compiled only once.
+    fn exec(&self, sql: &str) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached(sql)
+            .and_then(|mut st| st.execute([]))
+            .map(drop)
+            .map_err(db_err)
+    }
+
+    /// In checked builds: when it belongs to a running kernel, the current thread must hold that
+    /// kernel's BKL ([`Store::guard_with_bkl`]).
+    #[inline]
+    #[track_caller]
+    fn check_owner(&self) {
+        #[cfg(any(debug_assertions, feature = "borrow-check"))]
+        {
+            let owner = self.owner.load(Ordering::Relaxed);
+            assert!(
+                owner == 0 || owner == crate::kernel::bkl_holder(),
+                "the inode store of a running kernel is used without holding its BKL"
+            );
+        }
+    }
 }
 
-/// Splits nanoseconds into (seconds, nanoseconds).
-fn split_ns(ns: i64) -> (i64, i64) {
-    (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
+impl Drop for Store {
+    fn drop(&mut self) {
+        // The kernel is already gone (the last Arc<Shared> was dropped), so no other thread can
+        // use it
+        #[cfg(any(debug_assertions, feature = "borrow-check"))]
+        self.owner.store(0, Ordering::Relaxed);
+        if let Err(e) = self.commit() {
+            crate::debug::log(format_args!("inode store: final commit failed: {e:?}"));
+        }
+        if let Some(t) = self.reaper.take() {
+            let r = &self.meta.reaper;
+            r.state.lock().unwrap_or_else(PoisonError::into_inner).quit = true;
+            r.work.notify_one();
+            let _ = t.join();
+        }
+        self.meta.commits.users().fetch_sub(1, Ordering::SeqCst);
+    }
 }
+
+// ---- Operations ----
 
 /// An operation in [`Store::transaction`]: when it does not finish normally (an error or a panic),
 /// it rolls back to its savepoint and cancels the object deletions it queued. One without a
@@ -2484,23 +1983,550 @@ impl Drop for Op<'_> {
     }
 }
 
-impl Drop for Store {
-    fn drop(&mut self) {
-        // The kernel is already gone (the last Arc<Shared> was dropped), so no other thread can
-        // use it
-        #[cfg(any(debug_assertions, feature = "borrow-check"))]
-        self.owner.store(0, Ordering::Relaxed);
-        if let Err(e) = self.commit() {
-            crate::debug::log(format_args!("inode store: final commit failed: {e:?}"));
+/// Dentries and inode rows created in an operation: their contents are known within the
+/// operation, and they go straight into the cache after it succeeds, so chmod, chown or stat by
+/// path right after creation need not query the database again. If the same operation changes
+/// them later, they are invalidated when changed ([`Store::touch_name`]).
+enum Fill {
+    Name(Ino, Vec<u8>, Ino),
+    Row(Stat),
+}
+
+impl Fill {
+    /// At most this many per operation: importing a rootfs is one whole operation, and comparing
+    /// them one by one on invalidation would become quadratic.
+    const MAX: usize = 64;
+}
+
+// ---- State shared with readers and the reaper ----
+
+/// The metadata cache, and what reading it without the BKL (`syscall::fast`) needs.
+///
+/// Only [`Store`]'s methods modify the cache, holding the write lock while they do; they read it
+/// without locking, because other threads only read: Store is not Sync, so only one thread (the
+/// one holding the BKL) calls its methods at a time. Threads without the BKL read only through
+/// [`Meta::reader`], holding the read lock.
+pub(crate) struct Meta {
+    lock: RwLock<()>,
+    cache: UnsafeCell<Cache>,
+    /// The commit counter at the start of the `lock` file (module docs).
+    commits: Commits,
+    /// The `objects` directory (a host `O_PATH`), so stat-ing an object by inode number need not
+    /// resolve the whole path.
+    objects_dir: OwnedFd,
+    /// Objects waiting for the background thread to delete them, and checkpoints to do
+    /// ([`reap`]).
+    reaper: Reaper,
+    /// Another fd of the `lock` file in the store directory: syncfs needs an ordinary fd, and
+    /// `objects_dir` is `O_PATH`.
+    fs: File,
+    /// The path of the WAL (`meta.db-wal`).
+    wal: PathBuf,
+    /// The commit counter's value before the WAL was last made durable, plus one: with no new
+    /// commits since, there is no need to flush again ([`Meta::sync_metadata`]). 0 means it has
+    /// never been flushed.
+    durable: AtomicU64,
+    /// The counts of making the WAL durable and of flushing renamed-over files before commits
+    /// (for tests).
+    #[cfg(test)]
+    syncs: AtomicU64,
+    #[cfg(test)]
+    flushes: AtomicU64,
+}
+
+impl Meta {
+    /// Makes committed metadata durable: commits only write frames into the WAL without flushing
+    /// (`synchronous = NORMAL`), and this waits until the WAL is on disk. Frames a checkpoint
+    /// wrote back are in the database file, which the checkpoint has already flushed; when the WAL
+    /// is gone (written back and deleted when the last connection closed) there is nothing to
+    /// flush either. May be called with the BKL released.
+    pub(crate) fn sync_metadata(&self) -> Result<(), Errno> {
+        let seen = self.commits.get();
+        if self.durable.load(Ordering::Acquire) > seen {
+            return Ok(());
         }
-        if let Some(t) = self.reaper.take() {
-            let r = &self.meta.reaper;
-            r.state.lock().unwrap_or_else(PoisonError::into_inner).quit = true;
-            r.work.notify_one();
-            let _ = t.join();
+        match File::open(&self.wal) {
+            Ok(f) => f.sync_data().map_err(io_err)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err(e)),
         }
-        self.meta.commits.users().fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.syncs.fetch_add(1, Ordering::Relaxed);
+        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        Ok(())
     }
+
+    /// Writes the whole host filesystem the store is on to disk (the guest's sync, syncfs): object
+    /// data, the WAL and the database file together. May be called with the BKL released.
+    pub(crate) fn sync_all(&self) -> Result<(), Errno> {
+        let seen = self.commits.get();
+        appine_hal::syncfs(self.fs.as_raw_fd()).map_err(Errno)?;
+        self.durable.fetch_max(seen + 1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+// SAFETY: the cache is synchronized by the convention above; the commit counter is an atomic in a
+// shared mapping, and the mapping stays valid for as long as Meta lives
+unsafe impl Send for Meta {}
+unsafe impl Sync for Meta {}
+
+impl Meta {
+    /// Reads the cache without the BKL. When the cache is current (the commit counter has not
+    /// changed), returns a reader, which holds the read lock until it is dropped.
+    pub(crate) fn reader(&self) -> Option<Reader<'_>> {
+        let guard = self.lock.read().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: the read lock is held, and a thread modifying the cache waits for its release
+        let cache = unsafe { &*self.cache.get() };
+        (cache.generation == self.commits.get()).then_some(Reader {
+            _guard: guard,
+            cache,
+            objects_dir: &self.objects_dir,
+        })
+    }
+}
+
+/// A reader of the cache without the BKL ([`Meta::reader`]). A query that misses returns None, and
+/// the caller then queries normally with the BKL held (which fills the cache).
+pub(crate) struct Reader<'a> {
+    _guard: RwLockReadGuard<'a, ()>,
+    cache: &'a Cache,
+    objects_dir: &'a OwnedFd,
+}
+
+impl Reader<'_> {
+    /// [`Store::lookup`].
+    pub fn lookup(&self, parent: Ino, name: &[u8]) -> Option<Option<Ino>> {
+        self.cache.dentries.get(&parent)?.get(name).copied()
+    }
+
+    /// [`Store::kind`].
+    pub fn kind(&self, ino: Ino) -> Option<u32> {
+        Some(self.cache.rows.get(&ino)?.kind())
+    }
+
+    /// [`Store::readlink`]: None if it is not a symlink.
+    pub fn readlink(&self, ino: Ino) -> Option<&[u8]> {
+        self.cache.targets.get(&ino).map(Vec::as_slice)
+    }
+
+    /// [`Store::parent`].
+    pub fn parent(&self, dir: Ino) -> Option<Ino> {
+        self.cache.parents.get(&dir).copied()
+    }
+
+    /// [`Store::stat`]. Stats the object while holding the read lock: if the inode number is
+    /// reused after deletion, the result is not half from the old file and half from the new one.
+    /// None on a host error.
+    pub fn stat(&self, ino: Ino) -> Option<Stat> {
+        let mut st = *self.cache.rows.get(&ino)?;
+        if st.kind() == mode::S_IFREG {
+            fill_from_host(&mut st, self.objects_dir, ino).ok()?;
+        }
+        Some(st)
+    }
+}
+
+/// A regular file's size and times are taken from the host object file (for ctime see the module
+/// docs).
+fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    let mut name = [0u8; 21];
+    let o =
+        appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)).map_err(Errno)?;
+    st.size = o.st_size as u64;
+    st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
+    st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
+    st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
+    Ok(())
+}
+
+// ---- Cache entries and hashing ----
+
+/// The cache's hasher: keys are inode numbers and file names, with no need to resist hash
+/// collision attacks, so FxHash (as rustc does). The default SipHash took 4–5% of the stat path
+/// of `ls` and `git status`.
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        const SEED: u64 = 0x517c_c1b7_2722_0a95;
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+
+/// The metadata cache. Its entries correspond to the database contents at commit count
+/// `generation`.
+#[derive(Default)]
+struct Cache {
+    generation: u64,
+    entries: usize,
+    /// Directory → name → inode (None means it does not exist).
+    dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
+    rows: Map<Ino, Stat>,
+    targets: Map<Ino, Vec<u8>>,
+    parents: Map<Ino, Ino>,
+    /// Directory → inode → one name in the directory pointing at it ([`Store::name_of`]; None
+    /// means there is none).
+    names: Map<Ino, Map<Ino, Option<Vec<u8>>>>,
+    /// Complete listings of directories (readdir).
+    listings: Map<Ino, Vec<DirEntry>>,
+    /// Inodes with file capabilities (`security.capability`) ([`Store::has_file_caps`]); None
+    /// means not looked up yet. Writing a file has to check it, so the whole set is cached
+    /// together and invalidated with the commit count.
+    file_caps: Option<Map<Ino, ()>>,
+}
+
+impl Cache {
+    /// The limit on the number of entries: beyond it the whole cache is cleared.
+    const MAX_ENTRIES: usize = 1 << 17;
+
+    fn clear(&mut self, generation: u64) {
+        *self = Cache {
+            generation,
+            ..Cache::default()
+        };
+    }
+}
+
+// ---- Counters in the `lock` file ----
+
+/// A few words at the start of the `lock` file that all processes map shared: the number of
+/// commits, the number of connections open on the store, and the range of inode numbers newly
+/// allocated by write transactions not yet committed.
+struct Commits {
+    map: appine_hal::FileMapping,
+}
+
+impl Commits {
+    fn open(lock: &File) -> Result<Commits, Errno> {
+        if lock.metadata().map_err(io_err)?.len() < 32 {
+            lock.set_len(32).map_err(io_err)?;
+        }
+        let map = appine_hal::map_file(lock.as_raw_fd(), 0, 32, true, true).map_err(Errno)?;
+        Ok(Commits { map })
+    }
+
+    fn word(&self, i: usize) -> &AtomicU64 {
+        // SAFETY: the mapping is page-aligned, at least 32 bytes, and valid for its whole
+        // lifetime
+        unsafe { AtomicU64::from_ptr(self.map.ptr.as_ptr().cast::<u64>().add(i)) }
+    }
+
+    fn get(&self) -> u64 {
+        self.word(0).load(Ordering::SeqCst)
+    }
+
+    /// Adds one, returning the old value.
+    fn bump(&self) -> u64 {
+        self.word(0).fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// The number of [`Store`] connections open on the store (one process may hold several: each
+    /// host call opens its own besides the kernel's). A process that exited abnormally has not
+    /// subtracted its connections, so it may be too high (which only makes other connections stop
+    /// deferring commits); it is reset to zero when the store is opened exclusively (the
+    /// equivalent of boot).
+    fn users(&self) -> &AtomicU64 {
+        self.word(1)
+    }
+
+    /// The minimum and maximum inode numbers newly allocated by write transactions not yet
+    /// committed (0 means none). When a process is killed before committing, these inodes are lost
+    /// with the transaction, but their objects have already been created; the next boot deletes
+    /// them by this range. Otherwise, once the numbers were allocated again to inodes without
+    /// objects, such as directories, the objects would stay forever.
+    fn fresh(&self) -> (&AtomicU64, &AtomicU64) {
+        (self.word(2), self.word(3))
+    }
+}
+
+impl Drop for Commits {
+    fn drop(&mut self) {
+        // SAFETY: the mapping came from map_file and is not accessed afterwards
+        unsafe { appine_hal::unmap(self.map.base, self.map.len) }
+    }
+}
+
+// ---- Reaper and checkpoints ----
+
+/// Objects to delete after a commit are handed to the background thread ([`reap`]): a host
+/// unlink takes a few microseconds each and also takes the `objects` directory's lock; during
+/// `rm -rf` it took over a tenth of the guest thread's time, and it was done holding the BKL. The
+/// app being killed before the deletion does no harm: the inode row stays with nlink = 0 and is
+/// cleaned up at boot. It also does the checkpoints ([`wal_hook`]).
+#[derive(Default)]
+struct Reaper {
+    state: Mutex<Reaping>,
+    /// There is work to do, or it is time to quit.
+    work: Condvar,
+    /// The queue is empty and nothing is being deleted (tests wait for this).
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct Reaping {
+    queue: Vec<Ino>,
+    /// The committing thread asks it for a checkpoint.
+    checkpoint: bool,
+    /// The number of pages in the WAL at the last checkpoint request: once done, the checkpoint
+    /// has written back at least up to here.
+    requested: c_int,
+    /// The number of pages in the WAL after the latest commit, and how many commits there have
+    /// been in total.
+    pages: c_int,
+    commits: u64,
+    /// The WAL frame the last checkpoint wrote back up to.
+    backfilled: c_int,
+    busy: bool,
+    quit: bool,
+    /// How many have been handed to it in total (for tests).
+    #[cfg(test)]
+    handed: usize,
+    /// How many checkpoints have been done (for tests).
+    #[cfg(test)]
+    checkpoints: usize,
+    /// No checkpoints, simulating a background thread that cannot keep up (for tests).
+    #[cfg(test)]
+    paused: bool,
+}
+
+impl Reaper {
+    /// After a commit the WAL has `pages` pages ([`wal_hook`]): once that is [`CHECKPOINT_PAGES`]
+    /// pages more than at the last request, asks the background thread for a checkpoint.
+    fn committed(&self, pages: c_int) {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.pages = pages;
+        st.commits += 1;
+        // Fewer than before: the WAL has been reused from the start
+        if pages < st.requested {
+            st.requested = 0;
+        }
+        if pages < st.backfilled {
+            st.backfilled = 0;
+        }
+        if pages - st.requested >= CHECKPOINT_PAGES {
+            st.requested = pages;
+            st.checkpoint = true;
+            self.work.notify_one();
+        }
+    }
+}
+
+/// The store's background thread, until the Store closes: deletes objects (finishing the queue
+/// before closing) and does checkpoints.
+fn reap(meta: Arc<Meta>, db: PathBuf) {
+    let r = &meta.reaper;
+    // Checkpoints use their own connection, opened the first time one is needed
+    let mut conn = None;
+    let mut st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if !st.queue.is_empty() {
+            let inos = std::mem::take(&mut st.queue);
+            st.busy = true;
+            drop(st);
+            // The commit that removed their last links goes to disk first: otherwise after power
+            // loss the database returns to its earlier state, and the names are still there but
+            // the objects are gone. Objects handed over during the flush accumulate for the next
+            // round
+            if let Err(e) = meta.sync_metadata() {
+                crate::debug::log(format_args!("inode store: syncing the WAL: {e:?}"));
+            }
+            for ino in inos {
+                let _ = remove_object(&meta.objects_dir, ino);
+            }
+            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.busy = false;
+            continue;
+        }
+        #[cfg(test)]
+        let paused = st.paused;
+        #[cfg(not(test))]
+        let paused = false;
+        if st.checkpoint && !paused {
+            st.checkpoint = false;
+            st.busy = true;
+            drop(st);
+            let backfilled = checkpoint(&mut conn, &db);
+            st = r.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.busy = false;
+            if let Some(n) = backfilled {
+                st.backfilled = n;
+            }
+            #[cfg(test)]
+            {
+                st.checkpoints += 1;
+            }
+            continue;
+        }
+        r.idle.notify_all();
+        if st.quit {
+            return;
+        }
+        // The WAL has grown past one checkpoint and has frames not written back: once writes
+        // stop, write back the rest, so the next write transaction reuses the WAL from the start
+        // ([`wal_hook`]). Sporadic small writes never get this long, and no fsync is spent on them
+        if st.pages >= CHECKPOINT_PAGES && st.pages > st.backfilled {
+            let seen = st.commits;
+            let (g, wait) = r
+                .work
+                .wait_timeout(st, CHECKPOINT_QUIET)
+                .unwrap_or_else(PoisonError::into_inner);
+            st = g;
+            if wait.timed_out() && st.commits == seen {
+                st.checkpoint = true;
+            }
+            continue;
+        }
+        st = r.work.wait(st).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Deletes an object in the `objects` directory; not an error if it is already gone.
+fn remove_object(objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+    let mut name = [0u8; 21];
+    match appine_hal::unlink_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)) {
+        Err(e) if e != libc::ENOENT => Err(object_err(ino, e)),
+        _ => Ok(()),
+    }
+}
+
+/// A PASSIVE checkpoint: waits for no readers and blocks no writers; frames that cannot be written
+/// back now are left for next time. Returns the frame it wrote back up to. Failures are only
+/// logged; the WAL keeps growing, and at [`INLINE_CHECKPOINT_PAGES`] the committing thread
+/// checkpoints in place.
+fn checkpoint(conn: &mut Option<Connection>, db: &Path) -> Option<c_int> {
+    if conn.is_none() {
+        match Connection::open(db) {
+            Ok(c) => *conn = Some(c),
+            Err(e) => crate::debug::log(format_args!("inode store: checkpoint: {e}")),
+        }
+    }
+    // The result is (whether it was blocked, the number of WAL frames, the frame written back up
+    // to)
+    conn.as_ref()?
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(2))
+        .inspect_err(|e| crate::debug::log(format_args!("inode store: checkpoint: {e}")))
+        .ok()
+}
+
+/// Replaces SQLite's default auto-checkpoint (`sqlite3_wal_hook`): called by the committing
+/// thread after every commit, with `pages` the current number of pages in the WAL. A checkpoint
+/// writes the WAL back into the database file and fsyncs twice, while commits mostly hold the BKL
+/// (deferred commits that come due run in the timer thread); on a phone one fsync takes from a
+/// few to tens of milliseconds, during which every guest thread has to wait, so the checkpoint is
+/// handed to the background thread ([`reap`]).
+///
+/// The background checkpoint blocks no writers, but the WAL is reused from the start only by a
+/// write transaction that begins after everything has been written back: with commits coming
+/// all the time, the background thread is always the last few frames behind and the WAL keeps
+/// growing. When writes stop (as they mostly do in interactive use) the background thread catches
+/// up; when writes go on all the way to [`INLINE_CHECKPOINT_PAGES`] pages, the committing thread
+/// finishes the job in place, by which time the background thread has written back most frames
+/// and only those within the last thousand pages are left.
+unsafe extern "C" fn wal_hook(
+    meta: *mut c_void,
+    db: *mut ffi::sqlite3,
+    name: *const c_char,
+    pages: c_int,
+) -> c_int {
+    // SAFETY: registration passed the Meta of the Store this connection belongs to, which
+    // outlives the connection (Store::connect)
+    unsafe { &*meta.cast::<Meta>() }.reaper.committed(pages);
+    if pages >= INLINE_CHECKPOINT_PAGES {
+        // SAFETY: SQLite passes the connection that just committed and the database's name
+        unsafe { ffi::sqlite3_wal_checkpoint(db, name) };
+    }
+    ffi::SQLITE_OK
+}
+
+// ---- Errors, times and object names ----
+
+fn db_err(e: rusqlite::Error) -> Errno {
+    crate::debug::log(format_args!("inode store: {e}"));
+    Errno::EIO
+}
+
+fn io_err(e: std::io::Error) -> Errno {
+    crate::debug::log(format_args!("inode store: {e}"));
+    e.raw_os_error().map(Errno).unwrap_or(Errno::EIO)
+}
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
+    st.size = meta.len();
+    st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
+    st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
+    st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
+}
+
+fn to_ns(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(e) => -(e.duration().as_nanos() as i64),
+    }
+}
+
+/// An error operating on an object on the host (a host error code).
+fn object_err(ino: Ino, e: i32) -> Errno {
+    crate::debug::log(format_args!("inode store: object {ino}: errno {e}"));
+    Errno(e)
+}
+
+/// An object's file name (the inode number in decimal), without allocating.
+fn object_name(mut ino: Ino, buf: &mut [u8; 21]) -> &std::ffi::CStr {
+    let mut i = buf.len() - 1;
+    buf[i] = 0;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (ino % 10) as u8;
+        ino /= 10;
+        if ino == 0 {
+            return std::ffi::CStr::from_bytes_with_nul(&buf[i..]).unwrap();
+        }
+    }
+}
+
+/// Splits nanoseconds into (seconds, nanoseconds).
+fn split_ns(ns: i64) -> (i64, i64) {
+    (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000))
 }
 
 #[cfg(test)]

@@ -27,40 +27,6 @@ pub struct ImportReport {
     pub nodes: u64,
 }
 
-fn tar_err(e: io::Error) -> Errno {
-    crate::debug::log(format_args!("rootfs import: {e}"));
-    Errno::EIO
-}
-
-/// Splits a path into components, dropping empty components, `.` and the leading `/`; EINVAL on
-/// `..`.
-fn components(path: &[u8]) -> Result<Vec<&[u8]>, Errno> {
-    let mut out = Vec::new();
-    for c in path.split(|&b| b == b'/') {
-        match c {
-            b"" | b"." => {}
-            b".." => return Err(Errno::EINVAL),
-            c => out.push(c),
-        }
-    }
-    Ok(out)
-}
-
-/// Finds (creating it if needed) the directory for a path, without following symlinks.
-fn ensure_dir(store: &Store, comps: &[&[u8]], report: &mut ImportReport) -> Result<Ino, Errno> {
-    let mut dir = ROOT;
-    for c in comps {
-        dir = match store.lookup(dir, c)? {
-            Some(ino) => ino,
-            None => {
-                report.dirs += 1;
-                store.mkdir(dir, c, 0o755, 0, 0)?
-            }
-        };
-    }
-    Ok(dir)
-}
-
 /// Imports from a gzip-compressed tar stream.
 pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, Errno> {
     store.transaction(|store| {
@@ -144,6 +110,40 @@ pub fn import_tar_gz(store: &Store, reader: impl Read) -> Result<ImportReport, E
         }
         Ok(report)
     })
+}
+
+fn tar_err(e: io::Error) -> Errno {
+    crate::debug::log(format_args!("rootfs import: {e}"));
+    Errno::EIO
+}
+
+/// Splits a path into components, dropping empty components, `.` and the leading `/`; EINVAL on
+/// `..`.
+fn components(path: &[u8]) -> Result<Vec<&[u8]>, Errno> {
+    let mut out = Vec::new();
+    for c in path.split(|&b| b == b'/') {
+        match c {
+            b"" | b"." => {}
+            b".." => return Err(Errno::EINVAL),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// Finds (creating it if needed) the directory for a path, without following symlinks.
+fn ensure_dir(store: &Store, comps: &[&[u8]], report: &mut ImportReport) -> Result<Ino, Errno> {
+    let mut dir = ROOT;
+    for c in comps {
+        dir = match store.lookup(dir, c)? {
+            Some(ino) => ino,
+            None => {
+                report.dirs += 1;
+                store.mkdir(dir, c, 0o755, 0, 0)?
+            }
+        };
+    }
+    Ok(dir)
 }
 
 #[cfg(test)]

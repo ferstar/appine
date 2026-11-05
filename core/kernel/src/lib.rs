@@ -70,6 +70,33 @@ use errno::Errno;
 use vfs::import::ImportReport;
 use vfs::store::Store;
 
+/// Creates a new inode store in host directory `store` and imports a rootfs tar.gz into it (the
+/// android/setup map).
+///
+/// Returns `EEXIST` when the directory already holds a store. If the import fails the store stays
+/// empty.
+pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno> {
+    bug::host_call("import_rootfs", || {
+        let file = std::fs::File::open(tarball)
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        let store = Store::create(store)?;
+        let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
+        vfs::dev::ensure_dev_nodes(&store)?;
+        Ok(report)
+    })
+    .unwrap_or(Err(Errno::EIO))
+}
+
+/// Writes the inode store in host directory `store` (along with the whole host filesystem it is on)
+/// to disk: after importing the rootfs and writing the configuration, before renaming it into place
+/// (the android/setup map). Otherwise after a power loss the store could be there while its objects
+/// are still empty.
+pub fn sync_store(store: &Path) -> Result<(), Errno> {
+    let dir =
+        std::fs::File::open(store).map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
+}
+
 /// Writes a file in the inode store (for the host to prepare configuration files, such as
 /// `/etc/profile.d/appine.sh` on first start); `path` is a guest path. See [`vfs::write_file`].
 pub fn write_file(
@@ -124,33 +151,6 @@ pub fn browse_changing<R>(
         let r = Store::open(store, &[]).and_then(|s| f(&s, &mut changes));
         machine::store_changed(store, &changes);
         r
-    })
-    .unwrap_or(Err(Errno::EIO))
-}
-
-/// Writes the inode store in host directory `store` (along with the whole host filesystem it is on)
-/// to disk: after importing the rootfs and writing the configuration, before renaming it into place
-/// (the android/setup map). Otherwise after a power loss the store could be there while its objects
-/// are still empty.
-pub fn sync_store(store: &Path) -> Result<(), Errno> {
-    let dir =
-        std::fs::File::open(store).map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    appine_hal::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)).map_err(Errno)
-}
-
-/// Creates a new inode store in host directory `store` and imports a rootfs tar.gz into it (the
-/// android/setup map).
-///
-/// Returns `EEXIST` when the directory already holds a store. If the import fails the store stays
-/// empty.
-pub fn import_rootfs(store: &Path, tarball: &Path) -> Result<ImportReport, Errno> {
-    bug::host_call("import_rootfs", || {
-        let file = std::fs::File::open(tarball)
-            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-        let store = Store::create(store)?;
-        let report = vfs::import::import_tar_gz(&store, std::io::BufReader::new(file))?;
-        vfs::dev::ensure_dev_nodes(&store)?;
-        Ok(report)
     })
     .unwrap_or(Err(Errno::EIO))
 }
