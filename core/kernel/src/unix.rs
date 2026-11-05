@@ -64,10 +64,358 @@ impl Ucred {
     }
 }
 
+// ---- Sockets ----
+
+/// Connection state.
+pub(crate) enum Link {
+    /// Not connected yet.
+    None,
+    /// Listening: the server-side sockets already connected and waiting for accept.
+    Listening {
+        backlog: usize,
+        pending: VecDeque<Rc<RefCell<Socket>>>,
+        /// The process that called listen; it is the `SO_PEERCRED` connecting sides see.
+        cred: Ucred,
+    },
+    /// The two directions of a stream connection.
+    Stream {
+        rx: ChannelRef,
+        tx: ChannelRef,
+        peer_addr: Vec<u8>,
+    },
+    /// A datagram socket connected to the peer's receive queue.
+    Dgram {
+        tx: Weak<RefCell<Channel>>,
+        peer_addr: Vec<u8>,
+    },
+}
+
+/// An AF_UNIX socket.
+pub(crate) struct UnixSocket {
+    pub ty: i32,
+    /// The bound address (`sockaddr_un` bytes), empty when unbound.
+    pub addr: Vec<u8>,
+    pub link: Link,
+    /// The datagram socket's own receive queue.
+    pub rx: ChannelRef,
+    /// The peer's credentials (`SO_PEERCRED`): recorded at socketpair and stream connect.
+    pub peer_cred: Option<Ucred>,
+    /// `SO_PASSCRED`: every receive attaches the sender's credentials.
+    pub passcred: bool,
+    pub rcvtimeo: Option<Duration>,
+    pub sndtimeo: Option<Duration>,
+    /// The datagram socket did `SHUT_WR`.
+    pub shut_wr: bool,
+    /// The number of connections a listening socket has received (`EPOLLET` triggers on each).
+    pub connections: u64,
+    /// The new network namespace it was created in, if any (abstract addresses are kept apart by
+    /// it, and interface ioctls look at its lo).
+    pub net: Option<Rc<crate::nsproxy::NetNs>>,
+}
+
+impl UnixSocket {
+    pub fn new(ty: i32) -> UnixSocket {
+        UnixSocket {
+            ty,
+            addr: Vec::new(),
+            link: Link::None,
+            rx: ChannelRef::default(),
+            peer_cred: None,
+            passcred: false,
+            rcvtimeo: None,
+            sndtimeo: None,
+            shut_wr: false,
+            connections: 0,
+            net: None,
+        }
+    }
+
+    /// socketpair: two sockets connected to each other.
+    pub fn pair(ty: i32, cred: Ucred) -> (UnixSocket, UnixSocket) {
+        let mut a = UnixSocket::new(ty);
+        let mut b = UnixSocket::new(ty);
+        if ty == SOCK_DGRAM {
+            a.link = Link::Dgram {
+                tx: Rc::downgrade(&b.rx),
+                peer_addr: unnamed(),
+            };
+            b.link = Link::Dgram {
+                tx: Rc::downgrade(&a.rx),
+                peer_addr: unnamed(),
+            };
+        } else {
+            let (ab, ba) = (ChannelRef::default(), ChannelRef::default());
+            a.link = Link::Stream {
+                rx: ba.clone(),
+                tx: ab.clone(),
+                peer_addr: unnamed(),
+            };
+            b.link = Link::Stream {
+                rx: ab,
+                tx: ba,
+                peer_addr: unnamed(),
+            };
+        }
+        a.peer_cred = Some(cred);
+        b.peer_cred = Some(cred);
+        (a, b)
+    }
+
+    /// Stream connect to the listening socket with address `server_addr`: returns the server end,
+    /// which the caller puts into the listening socket's wait queue.
+    pub fn connect_stream(
+        &mut self,
+        server_addr: &[u8],
+        server_cred: Ucred,
+        cred: Ucred,
+    ) -> UnixSocket {
+        let (up, down) = (ChannelRef::default(), ChannelRef::default());
+        let mut server = UnixSocket::new(self.ty);
+        // As in Linux's unix_stream_connect, the new end is created in the connecting side's
+        // network namespace
+        server.net = self.net.clone();
+        server.addr = server_addr.to_vec();
+        server.link = Link::Stream {
+            rx: up.clone(),
+            tx: down.clone(),
+            peer_addr: self.name(),
+        };
+        server.peer_cred = Some(cred);
+        self.link = Link::Stream {
+            rx: down,
+            tx: up,
+            peer_addr: server_addr.to_vec(),
+        };
+        self.peer_cred = Some(server_cred);
+        server
+    }
+
+    /// FIONREAD: for streams the buffered bytes, for datagrams the length of the next datagram.
+    pub fn unread(&self) -> usize {
+        match &self.link {
+            Link::Stream { rx, .. } if self.ty == crate::net::SOCK_STREAM => rx.borrow().bytes,
+            Link::Stream { rx, .. } => rx.borrow().packets.front().map_or(0, |p| p.data.len()),
+            _ => self.rx.borrow().packets.front().map_or(0, |p| p.data.len()),
+        }
+    }
+
+    /// The events ppoll and epoll report, by the same rules as Linux's `unix_poll` and
+    /// `unix_dgram_poll`.
+    pub fn readiness(&self) -> i16 {
+        match &self.link {
+            Link::Listening { pending, .. } => {
+                if pending.is_empty() {
+                    0
+                } else {
+                    POLLIN | POLLRDNORM
+                }
+            }
+            Link::Stream { rx, tx, .. } => {
+                let (r, t) = (rx.borrow(), tx.borrow());
+                let mut ev = 0;
+                if !r.packets.is_empty() {
+                    ev |= POLLIN | POLLRDNORM;
+                }
+                if r.eof {
+                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
+                    if t.eof || t.closed {
+                        ev |= POLLHUP;
+                    }
+                }
+                // Report writable also when the peer has closed, so the writer can get EPIPE
+                if t.writable() || t.closed {
+                    ev |= POLLOUT | POLLWRNORM;
+                }
+                ev
+            }
+            Link::None if self.ty != SOCK_DGRAM => POLLOUT | POLLWRNORM | POLLHUP,
+            Link::None | Link::Dgram { .. } => {
+                let r = self.rx.borrow();
+                let mut ev = 0;
+                if !r.packets.is_empty() {
+                    ev |= POLLIN | POLLRDNORM;
+                }
+                if r.eof {
+                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
+                }
+                let peer_full = match &self.link {
+                    Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| !c.borrow().writable()),
+                    _ => false,
+                };
+                if !peer_full {
+                    ev |= POLLOUT | POLLWRNORM;
+                }
+                ev
+            }
+        }
+    }
+
+    /// The wake objects poll and epoll register when waiting on it: its own receive queue
+    /// (messages of a datagram socket; while listening, an incoming connection and accept taking
+    /// one also request a wake of it), both directions of a stream connection, and for a connected
+    /// datagram socket the peer's receive queue (whether it has room).
+    pub fn wake_objects(&self, out: &mut Vec<wake::Object>) {
+        out.push(wake::of(&self.rx));
+        match &self.link {
+            Link::Stream { rx, tx, .. } => {
+                out.push(wake::of(rx));
+                out.push(wake::of(tx));
+            }
+            Link::Dgram { tx, .. } => {
+                if let Some(c) = tx.upgrade() {
+                    out.push(wake::of(&c));
+                }
+            }
+            Link::None | Link::Listening { .. } => {}
+        }
+    }
+
+    /// How many events have arrived in each of the read and write directions (`syscall::poll`'s
+    /// data generations).
+    pub fn arrivals(&self) -> [u64; 2] {
+        match &self.link {
+            Link::Listening { .. } => [self.connections, 0],
+            Link::Stream { rx, tx, .. } => [rx.borrow().arrivals, tx.borrow().taken],
+            Link::Dgram { tx, .. } => [
+                self.rx.borrow().arrivals,
+                tx.upgrade().map_or(0, |c| c.borrow().taken),
+            ],
+            Link::None => [self.rx.borrow().arrivals, 0],
+        }
+    }
+
+    /// shutdown(2): `how` is SHUT_RD(0), SHUT_WR(1) or SHUT_RDWR(2).
+    pub fn shutdown(&mut self, how: i32) {
+        let (rd, wr) = (how != 1, how != 0);
+        match &self.link {
+            Link::Stream { rx, tx, .. } => {
+                if rd {
+                    let mut r = rx.borrow_mut();
+                    r.eof = true;
+                    r.closed = true;
+                }
+                if wr {
+                    tx.borrow_mut().eof = true;
+                }
+            }
+            _ => {
+                if rd {
+                    self.rx.borrow_mut().eof = true;
+                }
+                self.shut_wr |= wr;
+            }
+        }
+        self.wake();
+    }
+
+    /// Wakes the threads waiting on this socket ([`UnixSocket::wake_objects`]).
+    fn wake(&self) {
+        let mut objects = Vec::new();
+        self.wake_objects(&mut objects);
+        objects.into_iter().for_each(request_wake_object);
+    }
+
+    /// The number of the network namespace it is in.
+    pub fn net_id(&self) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
+    }
+
+    /// Its own address; only the address family when unbound.
+    pub fn name(&self) -> Vec<u8> {
+        if self.addr.is_empty() {
+            unnamed()
+        } else {
+            self.addr.clone()
+        }
+    }
+
+    /// The peer's address, None when not connected.
+    pub fn peer_name(&self) -> Option<Vec<u8>> {
+        match &self.link {
+            Link::Stream { peer_addr, .. } | Link::Dgram { peer_addr, .. } => {
+                Some(peer_addr.clone())
+            }
+            Link::None | Link::Listening { .. } => None,
+        }
+    }
+}
+
+impl Drop for UnixSocket {
+    /// The peer reads EOF and its writes fail, connections waiting for accept close with it, and
+    /// connects waiting for room in the backlog check again ([`UnixSocket::wake_objects`] includes
+    /// its own receive queue).
+    fn drop(&mut self) {
+        self.wake();
+        let stale = match &self.link {
+            Link::Stream { rx, tx, .. } => {
+                tx.borrow_mut().eof = true;
+                rx.borrow_mut().discard()
+            }
+            _ => self.rx.borrow_mut().discard(),
+        };
+        drop(stale);
+    }
+}
+
 /// The `sockaddr_un` of a socket with no bound address: only the address family.
 pub fn unnamed() -> Vec<u8> {
     (AF_UNIX as u16).to_le_bytes().to_vec()
 }
+
+// ---- Names ----
+
+/// A name in the address table.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Name {
+    /// A path address: the inode of the socket node in the store.
+    Path(Ino),
+    /// An abstract address: the number of its network namespace and all bytes of `sun_path`
+    /// (starting with NUL). As on Linux, abstract addresses of different network namespaces are
+    /// unrelated, while path addresses are not kept apart.
+    Abstract(u64, Vec<u8>),
+}
+
+/// Bound addresses (kernel-wide). After a socket closes its weak reference dies, and the address
+/// is released with it.
+#[derive(Default)]
+pub(crate) struct Names {
+    map: BTreeMap<Name, Weak<RefCell<Socket>>>,
+    next_auto: u32,
+}
+
+impl Names {
+    /// Autobind: as on Linux, allocates in network namespace `net` an abstract address of `\0`
+    /// followed by 5 hex digits.
+    pub fn autobind(&mut self, net: u64, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
+        for _ in 0..0x100000 {
+            self.next_auto = (self.next_auto + 1) & 0xfffff;
+            let mut path = vec![0u8];
+            path.extend_from_slice(format!("{:05x}", self.next_auto).as_bytes());
+            if self.insert(Name::Abstract(net, path.clone()), sock) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Registers an address; returns false when a live socket already holds it.
+    pub fn insert(&mut self, name: Name, sock: &Rc<RefCell<Socket>>) -> bool {
+        self.map.retain(|_, w| w.strong_count() > 0);
+        if self.lookup(&name).is_some() {
+            return false;
+        }
+        self.map.insert(name, Rc::downgrade(sock));
+        true
+    }
+
+    pub fn lookup(&self, name: &Name) -> Option<Rc<RefCell<Socket>>> {
+        self.map.get(name).and_then(Weak::upgrade)
+    }
+}
+
+// ---- Channels ----
 
 /// One message: one write on a stream socket, or one datagram.
 pub(crate) struct Packet {
@@ -125,26 +473,11 @@ impl Channel {
         CAPACITY.saturating_sub(self.bytes)
     }
 
-    /// As on Linux: writable is reported only when the buffered data is at most a quarter of the
-    /// capacity.
-    pub fn writable(&self) -> bool {
-        self.bytes * 4 <= CAPACITY
-    }
-
     pub fn push(&mut self, p: Packet) {
         self.bytes += p.remaining();
         self.packets.push_back(p);
         self.arrivals += 1;
         request_wake_object(wake::of_value(self));
-    }
-
-    /// The receiver closed: discard the buffered messages. The messages are handed to the caller
-    /// to drop after its borrows are released, because the open files in them may need other
-    /// channels when dropped.
-    fn discard(&mut self) -> VecDeque<Packet> {
-        self.closed = true;
-        self.bytes = 0;
-        std::mem::take(&mut self.packets)
     }
 
     /// Stream read: takes up to `max` bytes in order. As on Linux, it stops after a message
@@ -225,310 +558,34 @@ impl Channel {
             from,
         })
     }
-}
 
-/// Connection state.
-pub(crate) enum Link {
-    /// Not connected yet.
-    None,
-    /// Listening: the server-side sockets already connected and waiting for accept.
-    Listening {
-        backlog: usize,
-        pending: VecDeque<Rc<RefCell<Socket>>>,
-        /// The process that called listen; it is the `SO_PEERCRED` connecting sides see.
-        cred: Ucred,
-    },
-    /// The two directions of a stream connection.
-    Stream {
-        rx: ChannelRef,
-        tx: ChannelRef,
-        peer_addr: Vec<u8>,
-    },
-    /// A datagram socket connected to the peer's receive queue.
-    Dgram {
-        tx: Weak<RefCell<Channel>>,
-        peer_addr: Vec<u8>,
-    },
-}
-
-/// An AF_UNIX socket.
-pub(crate) struct UnixSocket {
-    pub ty: i32,
-    /// The bound address (`sockaddr_un` bytes), empty when unbound.
-    pub addr: Vec<u8>,
-    pub link: Link,
-    /// The datagram socket's own receive queue.
-    pub rx: ChannelRef,
-    /// The peer's credentials (`SO_PEERCRED`): recorded at socketpair and stream connect.
-    pub peer_cred: Option<Ucred>,
-    /// `SO_PASSCRED`: every receive attaches the sender's credentials.
-    pub passcred: bool,
-    pub rcvtimeo: Option<Duration>,
-    pub sndtimeo: Option<Duration>,
-    /// The datagram socket did `SHUT_WR`.
-    pub shut_wr: bool,
-    /// The number of connections a listening socket has received (`EPOLLET` triggers on each).
-    pub connections: u64,
-    /// The new network namespace it was created in, if any (abstract addresses are kept apart by
-    /// it, and interface ioctls look at its lo).
-    pub net: Option<Rc<crate::nsproxy::NetNs>>,
-}
-
-impl UnixSocket {
-    pub fn new(ty: i32) -> UnixSocket {
-        UnixSocket {
-            ty,
-            addr: Vec::new(),
-            link: Link::None,
-            rx: ChannelRef::default(),
-            peer_cred: None,
-            passcred: false,
-            rcvtimeo: None,
-            sndtimeo: None,
-            shut_wr: false,
-            connections: 0,
-            net: None,
-        }
+    /// As on Linux: writable is reported only when the buffered data is at most a quarter of the
+    /// capacity.
+    pub fn writable(&self) -> bool {
+        self.bytes * 4 <= CAPACITY
     }
 
-    /// The number of the network namespace it is in.
-    pub fn net_id(&self) -> u64 {
-        self.net
-            .as_ref()
-            .map_or(crate::nsproxy::INIT_NET_NS, |n| n.id)
-    }
-
-    /// socketpair: two sockets connected to each other.
-    pub fn pair(ty: i32, cred: Ucred) -> (UnixSocket, UnixSocket) {
-        let mut a = UnixSocket::new(ty);
-        let mut b = UnixSocket::new(ty);
-        if ty == SOCK_DGRAM {
-            a.link = Link::Dgram {
-                tx: Rc::downgrade(&b.rx),
-                peer_addr: unnamed(),
-            };
-            b.link = Link::Dgram {
-                tx: Rc::downgrade(&a.rx),
-                peer_addr: unnamed(),
-            };
-        } else {
-            let (ab, ba) = (ChannelRef::default(), ChannelRef::default());
-            a.link = Link::Stream {
-                rx: ba.clone(),
-                tx: ab.clone(),
-                peer_addr: unnamed(),
-            };
-            b.link = Link::Stream {
-                rx: ab,
-                tx: ba,
-                peer_addr: unnamed(),
-            };
-        }
-        a.peer_cred = Some(cred);
-        b.peer_cred = Some(cred);
-        (a, b)
-    }
-
-    /// Its own address; only the address family when unbound.
-    pub fn name(&self) -> Vec<u8> {
-        if self.addr.is_empty() {
-            unnamed()
-        } else {
-            self.addr.clone()
-        }
-    }
-
-    /// The peer's address, None when not connected.
-    pub fn peer_name(&self) -> Option<Vec<u8>> {
-        match &self.link {
-            Link::Stream { peer_addr, .. } | Link::Dgram { peer_addr, .. } => {
-                Some(peer_addr.clone())
-            }
-            Link::None | Link::Listening { .. } => None,
-        }
-    }
-
-    /// Stream connect to the listening socket with address `server_addr`: returns the server end,
-    /// which the caller puts into the listening socket's wait queue.
-    pub fn connect_stream(
-        &mut self,
-        server_addr: &[u8],
-        server_cred: Ucred,
-        cred: Ucred,
-    ) -> UnixSocket {
-        let (up, down) = (ChannelRef::default(), ChannelRef::default());
-        let mut server = UnixSocket::new(self.ty);
-        // As in Linux's unix_stream_connect, the new end is created in the connecting side's
-        // network namespace
-        server.net = self.net.clone();
-        server.addr = server_addr.to_vec();
-        server.link = Link::Stream {
-            rx: up.clone(),
-            tx: down.clone(),
-            peer_addr: self.name(),
-        };
-        server.peer_cred = Some(cred);
-        self.link = Link::Stream {
-            rx: down,
-            tx: up,
-            peer_addr: server_addr.to_vec(),
-        };
-        self.peer_cred = Some(server_cred);
-        server
-    }
-
-    /// shutdown(2): `how` is SHUT_RD(0), SHUT_WR(1) or SHUT_RDWR(2).
-    pub fn shutdown(&mut self, how: i32) {
-        let (rd, wr) = (how != 1, how != 0);
-        match &self.link {
-            Link::Stream { rx, tx, .. } => {
-                if rd {
-                    let mut r = rx.borrow_mut();
-                    r.eof = true;
-                    r.closed = true;
-                }
-                if wr {
-                    tx.borrow_mut().eof = true;
-                }
-            }
-            _ => {
-                if rd {
-                    self.rx.borrow_mut().eof = true;
-                }
-                self.shut_wr |= wr;
-            }
-        }
-        self.wake();
-    }
-
-    /// The wake objects poll and epoll register when waiting on it: its own receive queue
-    /// (messages of a datagram socket; while listening, an incoming connection and accept taking
-    /// one also request a wake of it), both directions of a stream connection, and for a connected
-    /// datagram socket the peer's receive queue (whether it has room).
-    pub fn wake_objects(&self, out: &mut Vec<wake::Object>) {
-        out.push(wake::of(&self.rx));
-        match &self.link {
-            Link::Stream { rx, tx, .. } => {
-                out.push(wake::of(rx));
-                out.push(wake::of(tx));
-            }
-            Link::Dgram { tx, .. } => {
-                if let Some(c) = tx.upgrade() {
-                    out.push(wake::of(&c));
-                }
-            }
-            Link::None | Link::Listening { .. } => {}
-        }
-    }
-
-    /// Wakes the threads waiting on this socket ([`UnixSocket::wake_objects`]).
-    fn wake(&self) {
-        let mut objects = Vec::new();
-        self.wake_objects(&mut objects);
-        objects.into_iter().for_each(request_wake_object);
-    }
-
-    /// FIONREAD: for streams the buffered bytes, for datagrams the length of the next datagram.
-    pub fn unread(&self) -> usize {
-        match &self.link {
-            Link::Stream { rx, .. } if self.ty == crate::net::SOCK_STREAM => rx.borrow().bytes,
-            Link::Stream { rx, .. } => rx.borrow().packets.front().map_or(0, |p| p.data.len()),
-            _ => self.rx.borrow().packets.front().map_or(0, |p| p.data.len()),
-        }
-    }
-
-    /// How many events have arrived in each of the read and write directions (`syscall::poll`'s
-    /// data generations).
-    pub fn arrivals(&self) -> [u64; 2] {
-        match &self.link {
-            Link::Listening { .. } => [self.connections, 0],
-            Link::Stream { rx, tx, .. } => [rx.borrow().arrivals, tx.borrow().taken],
-            Link::Dgram { tx, .. } => [
-                self.rx.borrow().arrivals,
-                tx.upgrade().map_or(0, |c| c.borrow().taken),
-            ],
-            Link::None => [self.rx.borrow().arrivals, 0],
-        }
-    }
-
-    /// The events ppoll and epoll report, by the same rules as Linux's `unix_poll` and
-    /// `unix_dgram_poll`.
-    pub fn readiness(&self) -> i16 {
-        match &self.link {
-            Link::Listening { pending, .. } => {
-                if pending.is_empty() {
-                    0
-                } else {
-                    POLLIN | POLLRDNORM
-                }
-            }
-            Link::Stream { rx, tx, .. } => {
-                let (r, t) = (rx.borrow(), tx.borrow());
-                let mut ev = 0;
-                if !r.packets.is_empty() {
-                    ev |= POLLIN | POLLRDNORM;
-                }
-                if r.eof {
-                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
-                    if t.eof || t.closed {
-                        ev |= POLLHUP;
-                    }
-                }
-                // Report writable also when the peer has closed, so the writer can get EPIPE
-                if t.writable() || t.closed {
-                    ev |= POLLOUT | POLLWRNORM;
-                }
-                ev
-            }
-            Link::None if self.ty != SOCK_DGRAM => POLLOUT | POLLWRNORM | POLLHUP,
-            Link::None | Link::Dgram { .. } => {
-                let r = self.rx.borrow();
-                let mut ev = 0;
-                if !r.packets.is_empty() {
-                    ev |= POLLIN | POLLRDNORM;
-                }
-                if r.eof {
-                    ev |= POLLIN | POLLRDNORM | POLLRDHUP;
-                }
-                let peer_full = match &self.link {
-                    Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| !c.borrow().writable()),
-                    _ => false,
-                };
-                if !peer_full {
-                    ev |= POLLOUT | POLLWRNORM;
-                }
-                ev
-            }
-        }
+    /// The receiver closed: discard the buffered messages. The messages are handed to the caller
+    /// to drop after its borrows are released, because the open files in them may need other
+    /// channels when dropped.
+    fn discard(&mut self) -> VecDeque<Packet> {
+        self.closed = true;
+        self.bytes = 0;
+        std::mem::take(&mut self.packets)
     }
 }
 
-impl Drop for UnixSocket {
-    /// The peer reads EOF and its writes fail, connections waiting for accept close with it, and
-    /// connects waiting for room in the backlog check again ([`UnixSocket::wake_objects`] includes
-    /// its own receive queue).
-    fn drop(&mut self) {
-        self.wake();
-        let stale = match &self.link {
-            Link::Stream { rx, tx, .. } => {
-                tx.borrow_mut().eof = true;
-                rx.borrow_mut().discard()
-            }
-            _ => self.rx.borrow_mut().discard(),
-        };
-        drop(stale);
-    }
-}
+// ---- /proc/net/unix ----
 
-/// A name in the address table.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Name {
-    /// A path address: the inode of the socket node in the store.
-    Path(Ino),
-    /// An abstract address: the number of its network namespace and all bytes of `sun_path`
-    /// (starting with NUL). As on Linux, abstract addresses of different network namespaces are
-    /// unrelated, while path addresses are not kept apart.
-    Abstract(u64, Vec<u8>),
+/// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/unix` lists them too.
+pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
+    let mut out = Vec::new();
+    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
+        for p in &c.borrow().packets {
+            out.extend(p.fds.iter().filter_map(unix_socket));
+        }
+    }
+    out
 }
 
 /// `/proc/net/unix`: all AF_UNIX sockets. Abstract addresses start with `@`, and the NULs in them
@@ -584,34 +641,7 @@ fn line(s: &mut String, flags: u32, ty: i32, state: u32, ino: u64, addr: &[u8]) 
     s.push('\n');
 }
 
-/// Returns the socket of `f` when it is an AF_UNIX socket.
-fn unix_socket(f: &FileRef) -> Option<Rc<RefCell<Socket>>> {
-    match &f.borrow().kind {
-        FileKind::Socket(s) if matches!(&*s.borrow(), Socket::Unix(_)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// The channels holding messages sent to `u`: a datagram socket's receive queue, the receive
-/// direction of a stream connection, and for a listening socket also those of the connections
-/// waiting for accept (Linux's GC also counts them as received by the listening socket).
-fn inboxes(u: &UnixSocket) -> Vec<ChannelRef> {
-    let mut out = vec![u.rx.clone()];
-    match &u.link {
-        Link::Stream { rx, .. } => out.push(rx.clone()),
-        Link::Listening { pending, .. } => {
-            for s in pending {
-                if let Socket::Unix(e) = &*s.borrow()
-                    && let Link::Stream { rx, .. } = &e.link
-                {
-                    out.push(rx.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-    out
-}
+// ---- Garbage collection ----
 
 /// Records a channel whose messages carry open files; [`collect`] finds in-flight sockets here.
 pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
@@ -619,17 +649,6 @@ pub(crate) fn note_inflight(k: &mut Kernel, c: &ChannelRef) {
     if !k.unix_inflight.iter().any(|w| w.ptr_eq(&weak)) {
         k.unix_inflight.push(weak);
     }
-}
-
-/// In-flight sockets (those only in `SCM_RIGHTS` messages): `/proc/net/unix` lists them too.
-pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
-    let mut out = Vec::new();
-    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
-        for p in &c.borrow().packets {
-            out.extend(p.fds.iter().filter_map(unix_socket));
-        }
-    }
-    out
 }
 
 /// Some open files were closed (close, dup2 over an fd, execve and so on): releases them, and
@@ -727,41 +746,32 @@ pub(crate) fn collect(k: &mut Kernel) {
     drop(garbage);
 }
 
-/// Bound addresses (kernel-wide). After a socket closes its weak reference dies, and the address
-/// is released with it.
-#[derive(Default)]
-pub(crate) struct Names {
-    map: BTreeMap<Name, Weak<RefCell<Socket>>>,
-    next_auto: u32,
-}
-
-impl Names {
-    pub fn lookup(&self, name: &Name) -> Option<Rc<RefCell<Socket>>> {
-        self.map.get(name).and_then(Weak::upgrade)
-    }
-
-    /// Registers an address; returns false when a live socket already holds it.
-    pub fn insert(&mut self, name: Name, sock: &Rc<RefCell<Socket>>) -> bool {
-        self.map.retain(|_, w| w.strong_count() > 0);
-        if self.lookup(&name).is_some() {
-            return false;
-        }
-        self.map.insert(name, Rc::downgrade(sock));
-        true
-    }
-
-    /// Autobind: as on Linux, allocates in network namespace `net` an abstract address of `\0`
-    /// followed by 5 hex digits.
-    pub fn autobind(&mut self, net: u64, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
-        for _ in 0..0x100000 {
-            self.next_auto = (self.next_auto + 1) & 0xfffff;
-            let mut path = vec![0u8];
-            path.extend_from_slice(format!("{:05x}", self.next_auto).as_bytes());
-            if self.insert(Name::Abstract(net, path.clone()), sock) {
-                return Some(path);
+/// The channels holding messages sent to `u`: a datagram socket's receive queue, the receive
+/// direction of a stream connection, and for a listening socket also those of the connections
+/// waiting for accept (Linux's GC also counts them as received by the listening socket).
+fn inboxes(u: &UnixSocket) -> Vec<ChannelRef> {
+    let mut out = vec![u.rx.clone()];
+    match &u.link {
+        Link::Stream { rx, .. } => out.push(rx.clone()),
+        Link::Listening { pending, .. } => {
+            for s in pending {
+                if let Socket::Unix(e) = &*s.borrow()
+                    && let Link::Stream { rx, .. } = &e.link
+                {
+                    out.push(rx.clone());
+                }
             }
         }
-        None
+        _ => {}
+    }
+    out
+}
+
+/// Returns the socket of `f` when it is an AF_UNIX socket.
+fn unix_socket(f: &FileRef) -> Option<Rc<RefCell<Socket>>> {
+    match &f.borrow().kind {
+        FileKind::Socket(s) if matches!(&*s.borrow(), Socket::Unix(_)) => Some(s.clone()),
+        _ => None,
     }
 }
 

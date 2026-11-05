@@ -53,18 +53,7 @@ const CMSG_HDR: usize = 16;
 /// The upper limit of the listen backlog (`SOMAXCONN`).
 const SOMAXCONN: usize = 4096;
 
-/// Checks the socket type and protocol and returns the actual type.
-fn socket_type(ty: i32, protocol: i32) -> Result<i32, Errno> {
-    if protocol != 0 && protocol != AF_UNIX {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-    match ty {
-        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET => Ok(ty),
-        // As on Linux, SOCK_RAW is treated as datagram
-        SOCK_RAW => Ok(SOCK_DGRAM),
-        _ => Err(Errno::ESOCKTNOSUPPORT),
-    }
-}
+// ---- Creating sockets ----
 
 /// Creates an AF_UNIX socket.
 pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
@@ -82,61 +71,20 @@ pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socke
     Ok((Socket::Unix(a), Socket::Unix(b)))
 }
 
-/// Borrows the internal state of an AF_UNIX socket.
-fn with<R>(sock: &SocketRef, f: impl FnOnce(&mut UnixSocket) -> R) -> R {
-    match &mut *sock.borrow_mut() {
-        Socket::Unix(u) => f(u),
-        _ => unreachable!("not an AF_UNIX socket"),
+/// Checks the socket type and protocol and returns the actual type.
+fn socket_type(ty: i32, protocol: i32) -> Result<i32, Errno> {
+    if protocol != 0 && protocol != AF_UNIX {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    match ty {
+        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET => Ok(ty),
+        // As on Linux, SOCK_RAW is treated as datagram
+        SOCK_RAW => Ok(SOCK_DGRAM),
+        _ => Err(Errno::ESOCKTNOSUPPORT),
     }
 }
 
-/// An address given by the guest.
-enum Addr<'a> {
-    /// Only the address family: bind autobinds.
-    Unnamed,
-    /// A path (without the trailing NUL).
-    Path(&'a [u8]),
-    /// An abstract address: all bytes of `sun_path`.
-    Abstract(&'a [u8]),
-}
-
-fn parse(addr: &[u8]) -> Result<Addr<'_>, Errno> {
-    if addr.len() < 2 || addr.len() > SOCKADDR_UN_LEN {
-        return Err(Errno::EINVAL);
-    }
-    if u16::from_le_bytes([addr[0], addr[1]]) as i32 != AF_UNIX {
-        return Err(Errno::EINVAL);
-    }
-    let path = &addr[2..];
-    Ok(match path.first() {
-        None => Addr::Unnamed,
-        Some(0) => Addr::Abstract(path),
-        Some(_) => Addr::Path(&path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())]),
-    })
-}
-
-/// Finds the socket bound at an address (abstract addresses are looked up in the network
-/// namespace of `sock`).
-fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> {
-    let name = match parse(addr)? {
-        Addr::Unnamed => return Err(Errno::EINVAL),
-        Addr::Abstract(p) => Name::Abstract(with(sock, |u| u.net_id()), p.to_vec()),
-        Addr::Path(p) => {
-            let node = lookup_at(cx, AT_FDCWD, p, true)?;
-            let vfs = cx.vfs()?;
-            match node {
-                Node::Store(_, ino) if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK => {
-                    // Connecting to a path address requires write permission on the socket file
-                    cx.cred()
-                        .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;
-                    Name::Path(ino)
-                }
-                _ => return Err(Errno::ECONNREFUSED),
-            }
-        }
-    };
-    cx.kr().unix.lookup(&name).ok_or(Errno::ECONNREFUSED)
-}
+// ---- Names and connections ----
 
 pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
     if with(sock, |u| !u.addr.is_empty()) {
@@ -212,28 +160,6 @@ pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<()
         }
         _ => Err(Errno::EINVAL),
     }
-}
-
-/// The common part of blocking operations: EAGAIN when nonblocking or timed out, ERESTARTSYS on a
-/// signal, otherwise wait until some thread changes the state of channel `on` (a listening
-/// socket's connection queue is recorded on its receive queue).
-fn block(
-    cx: &mut Cx<'_>,
-    nonblock: bool,
-    deadline: Option<Instant>,
-    on: &ChannelRef,
-) -> Result<(), Errno> {
-    if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
-        return Err(Errno::EAGAIN);
-    }
-    if cx.interrupted() {
-        return Err(Errno::ERESTARTSYS);
-    }
-    cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
-}
-
-fn deadline(timeout: Option<Duration>) -> Option<Instant> {
-    timeout.map(|t| Instant::now() + t)
 }
 
 pub(super) fn accept(
@@ -336,72 +262,7 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
     Ok(())
 }
 
-/// Parses sendmsg's control messages, taking out the open files `SCM_RIGHTS` passes and the
-/// credentials `SCM_CREDENTIALS` declares (kernel IDs, global pid).
-fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), Errno> {
-    let mut files = Vec::new();
-    let mut declared = None;
-    let mut off = 0;
-    while off + CMSG_HDR <= control.len() {
-        let h = &control[off..];
-        let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
-        let level = i32::from_le_bytes(h[8..12].try_into().unwrap());
-        let ty = i32::from_le_bytes(h[12..16].try_into().unwrap());
-        if len < CMSG_HDR || len > h.len() {
-            return Err(Errno::EINVAL);
-        }
-        match (level, ty) {
-            (SOL_SOCKET, SCM_RIGHTS) => {
-                let n = (len - CMSG_HDR) / 4;
-                if files.len() + n > SCM_MAX_FD {
-                    return Err(Errno::EINVAL);
-                }
-                for fd in h[CMSG_HDR..CMSG_HDR + n * 4].chunks_exact(4) {
-                    files.push(cx.fds().get(i32::from_le_bytes(fd.try_into().unwrap()))?);
-                }
-            }
-            (SOL_SOCKET, SCM_CREDENTIALS) => {
-                if len != CMSG_HDR + 12 {
-                    return Err(Errno::EINVAL);
-                }
-                let word = |i: usize| {
-                    u32::from_le_bytes(
-                        h[CMSG_HDR + i * 4..CMSG_HDR + i * 4 + 4]
-                            .try_into()
-                            .unwrap(),
-                    )
-                };
-                declared = Some(check_creds(cx, word(0) as i32, word(1), word(2))?);
-            }
-            _ => return Err(Errno::EINVAL),
-        }
-        off += len.next_multiple_of(8);
-    }
-    Ok((files, declared))
-}
-
-/// The credentials the sender declares in `SCM_CREDENTIALS` (Linux's `scm_check_creds` and
-/// `__scm_send`): the IDs must have a mapping in the sender's own namespace (EINVAL); the pid must
-/// be the sender's own, or the sender must have CAP_SYS_ADMIN over the owner of its pid namespace;
-/// the user ID must be one of its real, effective and saved ones, or it must have CAP_SETUID, and
-/// likewise for the group ID (CAP_SETGID), otherwise EPERM; a pid that does not exist is ESRCH.
-fn check_creds(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<Ucred, Errno> {
-    let c = cx.cred();
-    let (Some(kuid), Some(kgid)) = (c.uid_in(uid), c.gid_in(gid)) else {
-        return Err(Errno::EINVAL);
-    };
-    let pid_ok = pid == cx.pid_out(cx.tgid()) || c.ns_capable(&cx.pid_ns().owner, cap::SYS_ADMIN);
-    let uid_ok = [c.ruid, c.euid, c.suid].contains(&kuid) || c.capable_here(cap::SETUID);
-    let gid_ok = [c.rgid, c.egid, c.sgid].contains(&kgid) || c.capable_here(cap::SETGID);
-    if !(pid_ok && uid_ok && gid_ok) {
-        return Err(Errno::EPERM);
-    }
-    let global = cx.pid_in(pid);
-    if pid <= 0 || !cx.kr().tasks.contains_key(&global) {
-        return Err(Errno::ESRCH);
-    }
-    Ok(Ucred::of(global, kuid, kgid))
-}
+// ---- Sending and receiving ----
 
 pub(super) fn send(
     cx: &mut Cx<'_>,
@@ -477,14 +338,71 @@ pub(super) fn send(
     }
 }
 
-fn packet(data: &[u8], fds: Vec<FileRef>, cred: Ucred, from: Vec<u8>) -> Packet {
-    Packet {
-        data: data.to_vec(),
-        off: 0,
-        fds,
-        cred,
-        from,
+/// Parses sendmsg's control messages, taking out the open files `SCM_RIGHTS` passes and the
+/// credentials `SCM_CREDENTIALS` declares (kernel IDs, global pid).
+fn rights(cx: &Cx<'_>, control: &[u8]) -> Result<(Vec<FileRef>, Option<Ucred>), Errno> {
+    let mut files = Vec::new();
+    let mut declared = None;
+    let mut off = 0;
+    while off + CMSG_HDR <= control.len() {
+        let h = &control[off..];
+        let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
+        let level = i32::from_le_bytes(h[8..12].try_into().unwrap());
+        let ty = i32::from_le_bytes(h[12..16].try_into().unwrap());
+        if len < CMSG_HDR || len > h.len() {
+            return Err(Errno::EINVAL);
+        }
+        match (level, ty) {
+            (SOL_SOCKET, SCM_RIGHTS) => {
+                let n = (len - CMSG_HDR) / 4;
+                if files.len() + n > SCM_MAX_FD {
+                    return Err(Errno::EINVAL);
+                }
+                for fd in h[CMSG_HDR..CMSG_HDR + n * 4].chunks_exact(4) {
+                    files.push(cx.fds().get(i32::from_le_bytes(fd.try_into().unwrap()))?);
+                }
+            }
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                if len != CMSG_HDR + 12 {
+                    return Err(Errno::EINVAL);
+                }
+                let word = |i: usize| {
+                    u32::from_le_bytes(
+                        h[CMSG_HDR + i * 4..CMSG_HDR + i * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                };
+                declared = Some(check_creds(cx, word(0) as i32, word(1), word(2))?);
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+        off += len.next_multiple_of(8);
     }
+    Ok((files, declared))
+}
+
+/// The credentials the sender declares in `SCM_CREDENTIALS` (Linux's `scm_check_creds` and
+/// `__scm_send`): the IDs must have a mapping in the sender's own namespace (EINVAL); the pid must
+/// be the sender's own, or the sender must have CAP_SYS_ADMIN over the owner of its pid namespace;
+/// the user ID must be one of its real, effective and saved ones, or it must have CAP_SETUID, and
+/// likewise for the group ID (CAP_SETGID), otherwise EPERM; a pid that does not exist is ESRCH.
+fn check_creds(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<Ucred, Errno> {
+    let c = cx.cred();
+    let (Some(kuid), Some(kgid)) = (c.uid_in(uid), c.gid_in(gid)) else {
+        return Err(Errno::EINVAL);
+    };
+    let pid_ok = pid == cx.pid_out(cx.tgid()) || c.ns_capable(&cx.pid_ns().owner, cap::SYS_ADMIN);
+    let uid_ok = [c.ruid, c.euid, c.suid].contains(&kuid) || c.capable_here(cap::SETUID);
+    let gid_ok = [c.rgid, c.egid, c.sgid].contains(&kgid) || c.capable_here(cap::SETGID);
+    if !(pid_ok && uid_ok && gid_ok) {
+        return Err(Errno::EPERM);
+    }
+    let global = cx.pid_in(pid);
+    if pid <= 0 || !cx.kr().tasks.contains_key(&global) {
+        return Err(Errno::ESRCH);
+    }
+    Ok(Ucred::of(global, kuid, kgid))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,6 +468,16 @@ fn send_dgram(
             }
         }
         block(cx, nonblock, deadline, &rx)?;
+    }
+}
+
+fn packet(data: &[u8], fds: Vec<FileRef>, cred: Ucred, from: Vec<u8>) -> Packet {
+    Packet {
+        data: data.to_vec(),
+        off: 0,
+        fds,
+        cred,
+        from,
     }
 }
 
@@ -686,12 +614,7 @@ fn push_cmsg(out: &mut Vec<u8>, ty: i32, data: &[u8]) {
     out.resize(out.len().next_multiple_of(8), 0);
 }
 
-fn encode_timeval(t: Option<Duration>) -> Vec<u8> {
-    let t = t.unwrap_or_default();
-    let mut b = (t.as_secs() as i64).to_le_bytes().to_vec();
-    b.extend_from_slice(&(t.subsec_micros() as i64).to_le_bytes());
-    b
-}
+// ---- Options and shutdown ----
 
 pub(super) fn setsockopt(
     u: &mut UnixSocket,
@@ -756,6 +679,13 @@ pub(super) fn getsockopt(
     })
 }
 
+fn encode_timeval(t: Option<Duration>) -> Vec<u8> {
+    let t = t.unwrap_or_default();
+    let mut b = (t.as_secs() as i64).to_le_bytes().to_vec();
+    b.extend_from_slice(&(t.subsec_micros() as i64).to_le_bytes());
+    b
+}
+
 pub(super) fn sockname(u: &UnixSocket, peer: bool) -> Result<Vec<u8>, Errno> {
     if peer {
         u.peer_name().ok_or(Errno::ENOTCONN)
@@ -773,4 +703,84 @@ pub(super) fn shutdown(u: &mut UnixSocket, how: i32) -> Result<(), Errno> {
     }
     u.shutdown(how);
     Ok(())
+}
+
+// ---- Addresses and waiting ----
+
+/// An address given by the guest.
+enum Addr<'a> {
+    /// Only the address family: bind autobinds.
+    Unnamed,
+    /// A path (without the trailing NUL).
+    Path(&'a [u8]),
+    /// An abstract address: all bytes of `sun_path`.
+    Abstract(&'a [u8]),
+}
+
+/// Finds the socket bound at an address (abstract addresses are looked up in the network
+/// namespace of `sock`).
+fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> {
+    let name = match parse(addr)? {
+        Addr::Unnamed => return Err(Errno::EINVAL),
+        Addr::Abstract(p) => Name::Abstract(with(sock, |u| u.net_id()), p.to_vec()),
+        Addr::Path(p) => {
+            let node = lookup_at(cx, AT_FDCWD, p, true)?;
+            let vfs = cx.vfs()?;
+            match node {
+                Node::Store(_, ino) if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK => {
+                    // Connecting to a path address requires write permission on the socket file
+                    cx.cred()
+                        .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;
+                    Name::Path(ino)
+                }
+                _ => return Err(Errno::ECONNREFUSED),
+            }
+        }
+    };
+    cx.kr().unix.lookup(&name).ok_or(Errno::ECONNREFUSED)
+}
+
+fn parse(addr: &[u8]) -> Result<Addr<'_>, Errno> {
+    if addr.len() < 2 || addr.len() > SOCKADDR_UN_LEN {
+        return Err(Errno::EINVAL);
+    }
+    if u16::from_le_bytes([addr[0], addr[1]]) as i32 != AF_UNIX {
+        return Err(Errno::EINVAL);
+    }
+    let path = &addr[2..];
+    Ok(match path.first() {
+        None => Addr::Unnamed,
+        Some(0) => Addr::Abstract(path),
+        Some(_) => Addr::Path(&path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())]),
+    })
+}
+
+/// Borrows the internal state of an AF_UNIX socket.
+fn with<R>(sock: &SocketRef, f: impl FnOnce(&mut UnixSocket) -> R) -> R {
+    match &mut *sock.borrow_mut() {
+        Socket::Unix(u) => f(u),
+        _ => unreachable!("not an AF_UNIX socket"),
+    }
+}
+
+fn deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.map(|t| Instant::now() + t)
+}
+
+/// The common part of blocking operations: EAGAIN when nonblocking or timed out, ERESTARTSYS on a
+/// signal, otherwise wait until some thread changes the state of channel `on` (a listening
+/// socket's connection queue is recorded on its receive queue).
+fn block(
+    cx: &mut Cx<'_>,
+    nonblock: bool,
+    deadline: Option<Instant>,
+    on: &ChannelRef,
+) -> Result<(), Errno> {
+    if nonblock || deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(Errno::EAGAIN);
+    }
+    if cx.interrupted() {
+        return Err(Errno::ERESTARTSYS);
+    }
+    cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
 }
