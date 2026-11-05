@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use super::last_errno;
 
+// ---- Host sockets ----
+
 /// Creates a nonblocking, close-on-exec host socket.
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -22,27 +24,6 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let fd = set_flags(unsafe { libc::socket(domain, ty, protocol) });
     if fd < 0 { Err(last_errno()) } else { Ok(fd) }
-}
-
-/// Hosts without `SOCK_NONBLOCK` and accept4: set nonblocking and close-on-exec after creation.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn set_flags(fd: i32) -> i32 {
-    if fd >= 0 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-        }
-    }
-    fd
-}
-
-/// Closes a host fd.
-pub fn close(fd: i32) {
-    unsafe { libc::close(fd) };
-}
-
-fn check(rc: libc::c_int) -> Result<(), i32> {
-    if rc < 0 { Err(last_errno()) } else { Ok(()) }
 }
 
 /// bind(2).
@@ -116,11 +97,6 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>,
     check(unsafe { libc::getsockopt(fd, level, name, buf.as_mut_ptr().cast(), &mut l) })?;
     buf.truncate(l as usize);
     Ok(buf)
-}
-
-/// shutdown(2).
-pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
-    check(unsafe { libc::shutdown(fd, how) })
 }
 
 /// sendmsg(2): an empty `addr` sends to the connected peer. Always adds `MSG_NOSIGNAL`, so a
@@ -200,6 +176,34 @@ pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Resul
     })
 }
 
+/// shutdown(2).
+pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
+    check(unsafe { libc::shutdown(fd, how) })
+}
+
+/// Closes a host fd.
+pub fn close(fd: i32) {
+    unsafe { libc::close(fd) };
+}
+
+/// Hosts without `SOCK_NONBLOCK` and accept4: set nonblocking and close-on-exec after creation.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_flags(fd: i32) -> i32 {
+    if fd >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    fd
+}
+
+fn check(rc: libc::c_int) -> Result<(), i32> {
+    if rc < 0 { Err(last_errno()) } else { Ok(()) }
+}
+
+// ---- Interfaces and routes ----
+
 /// A network interface on the host (for the netlink emulation).
 #[derive(Debug, Clone, Default)]
 pub struct Interface {
@@ -215,10 +219,6 @@ pub struct Interface {
     pub mac: Option<[u8; 6]>,
     /// Addresses: (address family, address, prefix length).
     pub addrs: Vec<(i32, Vec<u8>, u8)>,
-}
-
-fn prefix_len(mask: &[u8]) -> u8 {
-    mask.iter().map(|b| b.count_ones() as u8).sum()
 }
 
 /// The host's network interfaces (getifaddrs).
@@ -291,6 +291,24 @@ pub fn interfaces() -> Vec<Interface> {
     list
 }
 
+fn prefix_len(mask: &[u8]) -> u8 {
+    mask.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+/// The transmit queue length of interface `name` on the host
+/// (`/sys/class/net/<interface>/tx_queue_len`); None when it cannot be read (on Android the app
+/// may be unable to read these sysfs files).
+pub fn tx_queue_len(name: &str) -> Option<u32> {
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{name}/tx_queue_len"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// One route in the host routing table (the main table), for the routing table emulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
@@ -306,20 +324,6 @@ pub struct Route {
     pub iface: String,
     /// Metric (the metric of `ip route`).
     pub metric: u32,
-}
-
-/// The transmit queue length of interface `name` on the host
-/// (`/sys/class/net/<interface>/tx_queue_len`); None when it cannot be read (on Android the app
-/// may be unable to read these sysfs files).
-pub fn tx_queue_len(name: &str) -> Option<u32> {
-    if name.is_empty() || name.contains('/') || name.starts_with('.') {
-        return None;
-    }
-    std::fs::read_to_string(format!("/sys/class/net/{name}/tx_queue_len"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
 }
 
 /// Unicast routes in the host's main table, read from the host's `/proc/net/route` and
@@ -428,6 +432,69 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
     })
 }
 
+// ---- DNS ----
+
+/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
+/// stub in the kernel/net map).
+///
+/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
+/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// in turn. It blocks, so the caller must not hold locks.
+#[cfg(target_os = "android")]
+pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
+    #[link(name = "android")]
+    unsafe extern "C" {
+        fn android_res_nsend(network: u64, msg: *const u8, len: usize, flags: u32) -> i32;
+        fn android_res_nresult(fd: i32, rcode: *mut i32, answer: *mut u8, len: usize) -> i32;
+        fn android_res_cancel(fd: i32);
+    }
+    /// `NETWORK_UNSPECIFIED`: the system's default network.
+    const DEFAULT_NETWORK: u64 = 0;
+    if query.len() < 12 {
+        return Err(libc::EINVAL);
+    }
+    let fd = unsafe { android_res_nsend(DEFAULT_NETWORK, query.as_ptr(), query.len(), 0) };
+    if fd < 0 {
+        return Err(-fd);
+    }
+    // The system resolver retries and times out on its own; this only guards against it never
+    // answering
+    let mut pfd = [(fd, libc::POLLIN, 0)];
+    if !matches!(super::poll(&mut pfd, Some(Duration::from_secs(30))), Ok(1)) {
+        unsafe { android_res_cancel(fd) };
+        return Err(libc::ETIMEDOUT);
+    }
+    let mut answer = vec![0u8; 65535];
+    let mut rcode = 0;
+    let n = unsafe { android_res_nresult(fd, &mut rcode, answer.as_mut_ptr(), answer.len()) };
+    if n < 0 {
+        return Err(-n);
+    }
+    answer.truncate(n as usize);
+    Ok(answer)
+}
+
+/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
+/// stub in the kernel/net map).
+///
+/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
+/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// in turn. It blocks, so the caller must not hold locks.
+#[cfg(not(target_os = "android"))]
+pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
+    if query.len() < 12 {
+        return Err(libc::EINVAL);
+    }
+    let mut last = libc::EHOSTUNREACH;
+    for server in nameservers() {
+        match query_server(&server, query) {
+            Ok(answer) => return Ok(answer),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// The name servers in the host's `/etc/resolv.conf` (as sockaddr bytes).
 #[cfg(not(target_os = "android"))]
 fn nameservers() -> Vec<Vec<u8>> {
@@ -440,37 +507,6 @@ fn nameservers() -> Vec<Vec<u8>> {
         .map(|ip| sockaddr(std::net::SocketAddr::new(ip, 53)))
         .take(3)
         .collect()
-}
-
-/// Encodes a `SocketAddr` as sockaddr bytes.
-pub fn sockaddr(addr: std::net::SocketAddr) -> Vec<u8> {
-    match addr {
-        std::net::SocketAddr::V4(a) => {
-            let mut b = vec![0u8; 16];
-            b[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-            b[2..4].copy_from_slice(&a.port().to_be_bytes());
-            b[4..8].copy_from_slice(&a.ip().octets());
-            b
-        }
-        std::net::SocketAddr::V6(a) => {
-            let mut b = vec![0u8; 28];
-            b[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
-            b[2..4].copy_from_slice(&a.port().to_be_bytes());
-            b[8..24].copy_from_slice(&a.ip().octets());
-            b[24..28].copy_from_slice(&a.scope_id().to_ne_bytes());
-            b
-        }
-    }
-}
-
-/// Waits for an fd to become ready; a timeout returns `ETIMEDOUT`.
-#[cfg(not(target_os = "android"))]
-fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
-    let mut fds = [(fd, events, 0)];
-    match super::poll(&mut fds, Some(timeout))? {
-        0 => Err(libc::ETIMEDOUT),
-        _ => Ok(()),
-    }
 }
 
 /// Queries one name server over UDP, switching to TCP when the answer is truncated (the TC bit).
@@ -538,65 +574,35 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
     result
 }
 
-/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
-/// stub in the kernel/net map).
-///
-/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
-/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
-/// in turn. It blocks, so the caller must not hold locks.
-#[cfg(target_os = "android")]
-pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
-    #[link(name = "android")]
-    unsafe extern "C" {
-        fn android_res_nsend(network: u64, msg: *const u8, len: usize, flags: u32) -> i32;
-        fn android_res_nresult(fd: i32, rcode: *mut i32, answer: *mut u8, len: usize) -> i32;
-        fn android_res_cancel(fd: i32);
+/// Waits for an fd to become ready; a timeout returns `ETIMEDOUT`.
+#[cfg(not(target_os = "android"))]
+fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
+    let mut fds = [(fd, events, 0)];
+    match super::poll(&mut fds, Some(timeout))? {
+        0 => Err(libc::ETIMEDOUT),
+        _ => Ok(()),
     }
-    /// `NETWORK_UNSPECIFIED`: the system's default network.
-    const DEFAULT_NETWORK: u64 = 0;
-    if query.len() < 12 {
-        return Err(libc::EINVAL);
-    }
-    let fd = unsafe { android_res_nsend(DEFAULT_NETWORK, query.as_ptr(), query.len(), 0) };
-    if fd < 0 {
-        return Err(-fd);
-    }
-    // The system resolver retries and times out on its own; this only guards against it never
-    // answering
-    let mut pfd = [(fd, libc::POLLIN, 0)];
-    if !matches!(super::poll(&mut pfd, Some(Duration::from_secs(30))), Ok(1)) {
-        unsafe { android_res_cancel(fd) };
-        return Err(libc::ETIMEDOUT);
-    }
-    let mut answer = vec![0u8; 65535];
-    let mut rcode = 0;
-    let n = unsafe { android_res_nresult(fd, &mut rcode, answer.as_mut_ptr(), answer.len()) };
-    if n < 0 {
-        return Err(-n);
-    }
-    answer.truncate(n as usize);
-    Ok(answer)
 }
 
-/// Hands a DNS query (message) to the host to resolve and returns the answer message (the DNS
-/// stub in the kernel/net map).
-///
-/// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
-/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
-/// in turn. It blocks, so the caller must not hold locks.
-#[cfg(not(target_os = "android"))]
-pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
-    if query.len() < 12 {
-        return Err(libc::EINVAL);
-    }
-    let mut last = libc::EHOSTUNREACH;
-    for server in nameservers() {
-        match query_server(&server, query) {
-            Ok(answer) => return Ok(answer),
-            Err(e) => last = e,
+/// Encodes a `SocketAddr` as sockaddr bytes.
+pub fn sockaddr(addr: std::net::SocketAddr) -> Vec<u8> {
+    match addr {
+        std::net::SocketAddr::V4(a) => {
+            let mut b = vec![0u8; 16];
+            b[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+            b[2..4].copy_from_slice(&a.port().to_be_bytes());
+            b[4..8].copy_from_slice(&a.ip().octets());
+            b
+        }
+        std::net::SocketAddr::V6(a) => {
+            let mut b = vec![0u8; 28];
+            b[..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
+            b[2..4].copy_from_slice(&a.port().to_be_bytes());
+            b[8..24].copy_from_slice(&a.ip().octets());
+            b[24..28].copy_from_slice(&a.scope_id().to_ne_bytes());
+            b
         }
     }
-    Err(last)
 }
 
 #[cfg(test)]
