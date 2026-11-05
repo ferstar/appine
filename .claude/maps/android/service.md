@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: "exit all" during a start, restart or replace finished by them; wake lock over starts and transitions; downloads finishing during a restart kept; failed starts shown and the service stopped without UI; saved tabs kept until restored and transcripts named by content; ended tabs not counted; kill notification ids and visibility; eight bugs removed; tab names and `renameSession` removed with renaming in the terminal)
+> Maintained: 2026-11-05 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust, eight bugs removed; tab names removed)
 
 ## Responsibilities
 
