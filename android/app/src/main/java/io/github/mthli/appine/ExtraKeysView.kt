@@ -23,19 +23,19 @@ import kotlin.math.roundToInt
 
 /**
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
- * widened to nine columns (DEL deletes forward).
+ * widened to eight columns.
  *
  * ```
- * ESC  /   -  HOME  ↑  END  |   ~  │ PGUP
- * TAB CTRL ALT  ←   ↓   →   `  DEL │ PGDN
+ * ESC  /   -  HOME  ↑  END  |  │ PGUP
+ * TAB CTRL ALT  ←   ↓   →   ~  │ PGDN
  * ```
  *
- * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all nine fit from
- * 360 dp on. In a narrower view the last column stays at the right edge and the first eight scroll
+ * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
+ * 360 dp on. In a narrower view the last column stays at the right edge and the first seven scroll
  * sideways beside it. Faint lines one pixel wide put each key in a cell of its own.
  *
  * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
- * PGUP, PGDN or DEL repeats it; swiping up from `-` sends `|` instead. Ctrl and Alt are one-shot
+ * PGUP or PGDN repeats it; swiping up from `-` sends `|` instead. Ctrl and Alt are one-shot
  * modifiers: tapped, they apply to the next key typed, which reads them ([ctrl], [alt]) and reports
  * taking them ([modifiersUsed]); held, they stay on until tapped again. The android/terminal map.
  */
@@ -73,7 +73,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val ctrlKey = Modifier()
     private val altKey = Modifier()
 
-    /** The first eight columns of both rows, and the keys in them (sized in [onMeasure]). */
+    /** The first seven columns of both rows, and the keys in them (sized in [onMeasure]). */
     private val grid = object : LinearLayout(context) {
         // Over the keys, so a pressed key's shading does not hide them; drawn here, inside the
         // scroll view, the lines between columns scroll with the keys
@@ -89,7 +89,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }.apply { orientation = VERTICAL }
     private val gridKeys = mutableListOf<View>()
 
-    /** The grid, scrolled sideways when the view is too narrow for all nine columns. */
+    /** The grid, scrolled sideways when the view is too narrow for all eight columns. */
     private val scroll = object : HorizontalScrollView(context) {
         // It would take any sideways slide past the touch slop, cancelling the key under the
         // finger, even with nothing to scroll (360 dp and wider)
@@ -128,10 +128,11 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /**
      * The lines around the keys: above each row, below the last one (the system bars and what lies
-     * under them are black too) and between the columns, in the divider colour.
+     * under them are black too) and between the columns, in the divider colour at half opacity.
      */
     private val linePaint = Paint().apply {
         color = themeColor(com.google.android.material.R.attr.colorOutlineVariant)
+        alpha = 128 // after color, which sets the alpha from the opaque theme colour
     }
 
     init {
@@ -145,7 +146,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             special("↑", KeyEvent.KEYCODE_DPAD_UP, repeats = true),
             special("END", KeyEvent.KEYCODE_MOVE_END),
             char("|"),
-            char("~"),
             special("PGUP", KeyEvent.KEYCODE_PAGE_UP, repeats = true),
         )
         row(
@@ -155,8 +155,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             special("←", KeyEvent.KEYCODE_DPAD_LEFT, repeats = true),
             special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
             special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
-            char("`"),
-            special("DEL", KeyEvent.KEYCODE_FORWARD_DEL, repeats = true),
+            char("~"),
             special("PGDN", KeyEvent.KEYCODE_PAGE_DOWN, repeats = true),
         )
         addView(scroll, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
@@ -239,7 +238,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         this.text = text
         gravity = Gravity.CENTER
         setTextColor(labelColor)
-        // HOME, the widest label, takes about 34 dp of a 40 dp column
+        // HOME, the widest label, takes about 34 dp of a 45 dp column
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
         isSingleLine = true
     }
@@ -362,11 +361,11 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }
 
     companion object {
-        /** The number of columns: eight in the grid and the fixed one. */
-        private const val COLUMNS = 9
+        /** The number of columns: seven in the grid and the fixed one. */
+        private const val COLUMNS = 8
 
-        /** The narrowest a column gets, so nine fit in 360 dp. */
-        private const val MIN_COLUMN_DP = 40f
+        /** The narrowest a column gets, so eight fit in 360 dp. */
+        private const val MIN_COLUMN_DP = 45f
 
         /** The height of a row. */
         private const val ROW_DP = 32f
