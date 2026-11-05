@@ -38,10 +38,6 @@ internal class VtGlyphs {
         }
     }
 
-    private fun rect(c: Canvas, l: Int, t: Int, r: Int, b: Int) {
-        if (r > l && b > t) c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
-    }
-
     /**
      * Straight lines from the cell edges to the centre: [arms] holds the weight of the up, right,
      * down and left arms (0 none, 1 light, 2 heavy, 3 double) as four digits.
@@ -154,6 +150,10 @@ internal class VtGlyphs {
             rect(c, x1, y, x1 + light, end(left, right, y1 + light, y2 + light))
             rect(c, x2, y, x2 + light, end(right, left, y1 + light, y2 + light))
         }
+    }
+
+    private fun rect(c: Canvas, l: Int, t: Int, r: Int, b: Int) {
+        if (r > l && b > t) c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
     }
 
     /**

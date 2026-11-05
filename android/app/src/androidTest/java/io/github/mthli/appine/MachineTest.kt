@@ -157,80 +157,6 @@ class MachineTest {
         }
     }
 
-    @Test
-    fun interactiveShellTakesInputAndControlC() {
-        val machine = start(1)
-        val console = Native.openConsole(machine, 24, 80)
-        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-i"), ConsolePty.ENVIRONMENT)
-        var output = ""
-        val reader = thread { output = readAll(machine, console) }
-        fun type(s: String) {
-            val b = s.toByteArray()
-            assertEquals(b.size, Native.write(machine, console, b, 0, b.size))
-        }
-        type("sleep 30\n")
-        Thread.sleep(500)
-        // ^C goes through the line discipline and becomes a SIGINT to the foreground process group
-        type("\u0003")
-        type("echo status=\$?\n")
-        type("exit 7\n")
-        assertEquals(7, Native.waitFor(machine, pid))
-        reader.join(5000)
-        assertTrue(output, output.contains("status=130"))
-    }
-
-    @Test
-    fun consolesRunConcurrently() {
-        val machine = start(1)
-        val results = Array(3) { "" }
-        val workers = (0 until 3).map { i ->
-            thread { results[i] = sh(machine, "for n in 1 2 3; do echo $i-\$n; sleep 0.05; done").first }
-        }
-        workers.forEach { it.join(10_000) }
-        for (i in 0 until 3) assertEquals(results[i], "$i-1\n$i-2\n$i-3\n", results[i])
-    }
-
-    /** Releasing caches (onTrimMemory) leaves running processes alone; new ones start as usual. */
-    @Test
-    fun trimMemoryKeepsTheMachineWorking() {
-        val machine = start(1)
-        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
-        var result = "" to -1
-        val running = thread {
-            result = sh(machine, "for n in 1 2 3 4 5; do sha256sum /bin/busybox >/dev/null; sleep 0.05; done; echo done")
-        }
-        repeat(5) {
-            Native.trimMemory(machine)
-            Thread.sleep(50)
-        }
-        running.join(30_000)
-        assertEquals("done\n" to 0, result)
-        Native.trimMemory(machine)
-        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
-    }
-
-    /**
-     * Using a kernel's handle after it stopped is safe: after a session ends, TerminalSession
-     * cleans up the console only later on the main thread, and by then the service may have stopped
-     * the kernel (rootfs reset, service destroyed).
-     */
-    @Test
-    fun callsAfterStopAreHarmless() {
-        val machine = start(1)
-        val console = Native.openConsole(machine, 24, 80)
-        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", "sleep 30"), ConsolePty.ENVIRONMENT)
-        Native.stop(machine)
-        Native.closeConsole(machine, console)
-        Native.resize(machine, console, 30, 100)
-        Native.trimMemory(machine)
-        Native.setRoutes(machine, null)
-        assertEquals(-1, Native.read(machine, console, ByteArray(16)))
-        assertEquals(-1, Native.write(machine, console, ByteArray(1), 0, 1))
-        assertEquals(-9, Native.waitFor(machine, pid))
-        assertThrows(IOException::class.java) { Native.openConsole(machine, 24, 80) }
-        Native.stop(machine)
-    }
-
     /**
      * Booting and shutting down by inittab (the kernel/process map, the android/service map): after
      * boot the once commands are running, the guest's `poweroff` is a request to shut down, and
@@ -301,6 +227,71 @@ class MachineTest {
         }
     }
 
+    @Test
+    fun interactiveShellTakesInputAndControlC() {
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-i"), ConsolePty.ENVIRONMENT)
+        var output = ""
+        val reader = thread { output = readAll(machine, console) }
+        fun type(s: String) {
+            val b = s.toByteArray()
+            assertEquals(b.size, Native.write(machine, console, b, 0, b.size))
+        }
+        type("sleep 30\n")
+        Thread.sleep(500)
+        // ^C goes through the line discipline and becomes a SIGINT to the foreground process group
+        type("\u0003")
+        type("echo status=\$?\n")
+        type("exit 7\n")
+        assertEquals(7, Native.waitFor(machine, pid))
+        reader.join(5000)
+        assertTrue(output, output.contains("status=130"))
+    }
+
+    @Test
+    fun consolesRunConcurrently() {
+        val machine = start(1)
+        val results = Array(3) { "" }
+        val workers = (0 until 3).map { i ->
+            thread { results[i] = sh(machine, "for n in 1 2 3; do echo $i-\$n; sleep 0.05; done").first }
+        }
+        workers.forEach { it.join(10_000) }
+        for (i in 0 until 3) assertEquals(results[i], "$i-1\n$i-2\n$i-3\n", results[i])
+    }
+
+    /**
+     * The current directory of the console's foreground process group follows the shell's cd;
+     * after the shell exits there is none.
+     */
+    @Test
+    fun consoleCwdFollowsTheForegroundShell() {
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_ROOT)
+        val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
+        val reader = thread { readAll(machine, console) }
+        fun waitFor(want: String?): String? {
+            val deadline = System.currentTimeMillis() + 10_000
+            var cwd = Native.consoleCwd(machine, console)
+            while (cwd != want && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
+                cwd = Native.consoleCwd(machine, console)
+            }
+            return cwd
+        }
+        assertEquals("/root", waitFor("/root"))
+        val cd = "cd /usr/lib\n".toByteArray()
+        Native.write(machine, console, cd, 0, cd.size)
+        assertEquals("/usr/lib", waitFor("/usr/lib"))
+        val exit = "exit\n".toByteArray()
+        Native.write(machine, console, exit, 0, exit.size)
+        Native.waitFor(machine, pid)
+        assertEquals(null, waitFor(null))
+        reader.join(5000)
+        Native.closeConsole(machine, console)
+    }
+
     /**
      * The login shell is root's shell in /etc/passwd, also after chsh changed it; it reads
      * /etc/profile.
@@ -348,78 +339,6 @@ class MachineTest {
     }
 
     /**
-     * The current directory of the console's foreground process group follows the shell's cd;
-     * after the shell exits there is none.
-     */
-    @Test
-    fun consoleCwdFollowsTheForegroundShell() {
-        val machine = start(1)
-        val console = Native.openConsole(machine, 24, 80)
-        val argv = ConsolePty.argv(ConsolePty.script(context), ConsolePty.LOGIN_ROOT)
-        val pid = Native.spawn(machine, console, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
-        val reader = thread { readAll(machine, console) }
-        fun waitFor(want: String?): String? {
-            val deadline = System.currentTimeMillis() + 10_000
-            var cwd = Native.consoleCwd(machine, console)
-            while (cwd != want && System.currentTimeMillis() < deadline) {
-                Thread.sleep(50)
-                cwd = Native.consoleCwd(machine, console)
-            }
-            return cwd
-        }
-        assertEquals("/root", waitFor("/root"))
-        val cd = "cd /usr/lib\n".toByteArray()
-        Native.write(machine, console, cd, 0, cd.size)
-        assertEquals("/usr/lib", waitFor("/usr/lib"))
-        val exit = "exit\n".toByteArray()
-        Native.write(machine, console, exit, 0, exit.size)
-        Native.waitFor(machine, pid)
-        assertEquals(null, waitFor(null))
-        reader.join(5000)
-        Native.closeConsole(machine, console)
-    }
-
-    /**
-     * Saved tabs (the android/service map): while the marker is still there (killed) they read back
-     * unchanged (names included), also a second time (killed again before the kernel came up); a
-     * later save replaces them and leaves only the transcripts its index names; after a normal exit
-     * (clear) nothing is read.
-     */
-    @Test
-    fun tabsComeBackOnlyAfterAKill() {
-        Tabs.clear(context)
-        val tabs = listOf(
-            Tabs.Tab("auto", "/etc", "line 1\nline 2", "build"),
-            Tabs.Tab("root", null, "", null),
-        )
-        Tabs.markRunning(context)
-        Tabs.save(context, tabs, 1)
-        val saved = Tabs.takeKilled(context)
-        assertEquals(tabs, saved?.tabs)
-        assertEquals(1, saved?.current)
-        assertTrue(saved!!.time > 0)
-        assertEquals(tabs, Tabs.takeKilled(context)?.tabs)
-        Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
-        assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.tabs?.map { it.transcript })
-        val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
-        assertEquals(transcripts.toString(), 1, transcripts.size)
-        Tabs.clear(context)
-        assertEquals(null, Tabs.takeKilled(context))
-    }
-
-    /**
-     * In the login script's output: `id -un` is alice, `id -nG` contains [group],
-     * `doas`/`sudo -n id -un` is root (compared by line, as terminal output has control sequences
-     * and CRs mixed in).
-     */
-    private fun becameAdmin(out: String, group: String): Boolean {
-        val lines = out.lines().map { it.trim() }
-        val i = lines.indexOf("alice")
-        return i >= 0 && lines.getOrNull(i + 1)?.split(' ')?.containsAll(listOf("alice", group)) == true &&
-            lines.getOrNull(i + 2) == "root"
-    }
-
-    /**
      * The login account (the android/setup map): with only root, root logs in automatically; once a
      * regular user exists it logs in automatically, and on its first login it is added to wheel and
      * the app's bundled doas is installed offline; doas asks no password while none is set, and
@@ -452,6 +371,46 @@ class MachineTest {
                     "rm -rf /var/lib/appine /etc/doas.d",
             )
         }
+    }
+
+    /**
+     * In the login script's output: `id -un` is alice, `id -nG` contains [group],
+     * `doas`/`sudo -n id -un` is root (compared by line, as terminal output has control sequences
+     * and CRs mixed in).
+     */
+    private fun becameAdmin(out: String, group: String): Boolean {
+        val lines = out.lines().map { it.trim() }
+        val i = lines.indexOf("alice")
+        return i >= 0 && lines.getOrNull(i + 1)?.split(' ')?.containsAll(listOf("alice", group)) == true &&
+            lines.getOrNull(i + 2) == "root"
+    }
+
+    /**
+     * Saved tabs (the android/service map): while the marker is still there (killed) they read back
+     * unchanged (names included), also a second time (killed again before the kernel came up); a
+     * later save replaces them and leaves only the transcripts its index names; after a normal exit
+     * (clear) nothing is read.
+     */
+    @Test
+    fun tabsComeBackOnlyAfterAKill() {
+        Tabs.clear(context)
+        val tabs = listOf(
+            Tabs.Tab("auto", "/etc", "line 1\nline 2", "build"),
+            Tabs.Tab("root", null, "", null),
+        )
+        Tabs.markRunning(context)
+        Tabs.save(context, tabs, 1)
+        val saved = Tabs.takeKilled(context)
+        assertEquals(tabs, saved?.tabs)
+        assertEquals(1, saved?.current)
+        assertTrue(saved!!.time > 0)
+        assertEquals(tabs, Tabs.takeKilled(context)?.tabs)
+        Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
+        assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.tabs?.map { it.transcript })
+        val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
+        assertEquals(transcripts.toString(), 1, transcripts.size)
+        Tabs.clear(context)
+        assertEquals(null, Tabs.takeKilled(context))
     }
 
     /**
@@ -563,6 +522,66 @@ class MachineTest {
     }
 
     /**
+     * Downloads the Debian rootfs into another store and, in the login shell (bash), looks at the
+     * system information and DNS and runs apt-get update (when it cannot fetch the indexes it only
+     * warns and still exits 0, so the output is checked); then creates a regular user that logs in
+     * automatically: Ctrl-C while sudo installs skips it, Ctrl-C in the shell does not end the
+     * session, and the next login installs sudo. It downloads about 50 MB and is skipped by
+     * default:
+     * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`.
+     */
+    @Test
+    fun downloadedDistributionsRun() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
+        for (distro in listOf(Rootfs.Distro.DEBIAN)) {
+            val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
+            store.deleteRecursively()
+            Rootfs.prepare(context, distro, store = store)
+            val machine = Native.start(store.path, 1)
+            try {
+                val out = login(
+                    machine,
+                    "grep PRETTY_NAME /etc/os-release; echo shell=\$SHELL; getent hosts localhost | head -n 1; " +
+                        "apt-get update 2>&1 | grep -q 'Failed to fetch' || echo apt-ok\nexit\n",
+                )
+                assertTrue(out, out.contains(distro.label.substringBefore(' ')))
+                assertTrue(out, out.contains("shell=/bin/bash\n"))
+                assertTrue(out, out.contains("apt-ok\n"))
+                // A regular user becomes the login account for the first time: added to the sudo
+                // group, sudo installed from the network. Ctrl-C while apt-get update downloads:
+                // skipped this time, the login goes on as usual. util-linux's su starts no new
+                // session, so the shell has a controlling terminal and job control: Ctrl-C
+                // interrupts only the foreground sleep and does not end the whole session (it used
+                // to close the tab)
+                assertEquals(0, sh(machine, "useradd -m -s /bin/bash alice").second)
+                val skipped = loginSteps(
+                    machine,
+                    "installing sudo" to "",
+                    "% [" to "\u0003",
+                    "$ " to "tty; echo sl''eeping; sleep 30\n",
+                    "sleeping" to "\u0003",
+                    "$ " to "echo still-here; exit\n",
+                )
+                assertTrue(skipped, skipped.contains("appine: skipped installing sudo"))
+                // Neither appears in the echoed input (bash writes \e[?2004l\r before a command's
+                // output, not a newline)
+                assertTrue(skipped, skipped.contains("/dev/pts/"))
+                assertTrue(skipped, skipped.contains("still-here\n"))
+                assertFalse(skipped, skipped.contains("Session terminated"))
+                // The next login installs sudo (showing apt's progress this time); no password
+                // asked while none is set
+                val admin = login(machine, "id -un; id -nG; sudo -n id -un; exit\n")
+                assertTrue(admin, admin.contains("Setting up sudo"))
+                assertTrue(admin, admin.contains("alice is in the sudo group and can become root with sudo"))
+                assertTrue(admin, becameAdmin(admin, "sudo"))
+            } finally {
+                Native.stop(machine)
+                store.deleteRecursively()
+            }
+        }
+    }
+
+    /**
      * A mirror chosen by hand in Settings is written into the sources: also while the kernel runs,
      * and the guest sees it at once; it is recorded as chosen by hand. Only the built-in mirrors'
      * addresses are replaced, and lines the user added (testing, their own repositories,
@@ -641,96 +660,6 @@ class MachineTest {
                     }
                 }
             }.commit()
-        }
-    }
-
-    /**
-     * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
-     * own AGPL notice and full text, libghostty-vt with what it links and the terminal font, the GPL
-     * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the
-     * library (no proc macros), and the full license texts; every file in the index is present.
-     */
-    @Test
-    fun noticesCoverTheApp() {
-        val index = context.assets.open("notices/index.tsv").bufferedReader().readLines().map { it.split('\t') }
-        assertTrue(index.all { it.size == 3 })
-        fun text(title: String) = index.first { it[0].startsWith(title) }
-            .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
-        val titles = index.map { it[0] }
-        assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
-        assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
-        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {
-            assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))
-        }
-        assertTrue(text("JetBrains Mono").contains("SIL OPEN FONT LICENSE"))
-        assertFalse(titles.any { it.contains("Termux") })
-        val alpine = text("Alpine Linux")
-        assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
-        assertTrue(text("Android libraries").contains("androidx.core:core:"))
-        assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
-        assertTrue(titles.any { it.startsWith("SQLite ") })
-        assertFalse("proc macros are not in the library", titles.any { it.startsWith("syn ") || it.startsWith("thiserror-impl ") })
-        assertTrue(text("GNU General Public License 2.0").contains("Version 2, June 1991"))
-        for (row in index) context.assets.open("notices/${row[2]}").close()
-    }
-
-    /**
-     * Downloads the Debian rootfs into another store and, in the login shell (bash), looks at the
-     * system information and DNS and runs apt-get update (when it cannot fetch the indexes it only
-     * warns and still exits 0, so the output is checked); then creates a regular user that logs in
-     * automatically: Ctrl-C while sudo installs skips it, Ctrl-C in the shell does not end the
-     * session, and the next login installs sudo. It downloads about 50 MB and is skipped by
-     * default:
-     * `./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.network=true`.
-     */
-    @Test
-    fun downloadedDistributionsRun() {
-        assumeTrue(InstrumentationRegistry.getArguments().getString("network") == "true")
-        for (distro in listOf(Rootfs.Distro.DEBIAN)) {
-            val store = File(context.cacheDir, "store-${distro.name.lowercase()}")
-            store.deleteRecursively()
-            Rootfs.prepare(context, distro, store = store)
-            val machine = Native.start(store.path, 1)
-            try {
-                val out = login(
-                    machine,
-                    "grep PRETTY_NAME /etc/os-release; echo shell=\$SHELL; getent hosts localhost | head -n 1; " +
-                        "apt-get update 2>&1 | grep -q 'Failed to fetch' || echo apt-ok\nexit\n",
-                )
-                assertTrue(out, out.contains(distro.label.substringBefore(' ')))
-                assertTrue(out, out.contains("shell=/bin/bash\n"))
-                assertTrue(out, out.contains("apt-ok\n"))
-                // A regular user becomes the login account for the first time: added to the sudo
-                // group, sudo installed from the network. Ctrl-C while apt-get update downloads:
-                // skipped this time, the login goes on as usual. util-linux's su starts no new
-                // session, so the shell has a controlling terminal and job control: Ctrl-C
-                // interrupts only the foreground sleep and does not end the whole session (it used
-                // to close the tab)
-                assertEquals(0, sh(machine, "useradd -m -s /bin/bash alice").second)
-                val skipped = loginSteps(
-                    machine,
-                    "installing sudo" to "",
-                    "% [" to "\u0003",
-                    "$ " to "tty; echo sl''eeping; sleep 30\n",
-                    "sleeping" to "\u0003",
-                    "$ " to "echo still-here; exit\n",
-                )
-                assertTrue(skipped, skipped.contains("appine: skipped installing sudo"))
-                // Neither appears in the echoed input (bash writes \e[?2004l\r before a command's
-                // output, not a newline)
-                assertTrue(skipped, skipped.contains("/dev/pts/"))
-                assertTrue(skipped, skipped.contains("still-here\n"))
-                assertFalse(skipped, skipped.contains("Session terminated"))
-                // The next login installs sudo (showing apt's progress this time); no password
-                // asked while none is set
-                val admin = login(machine, "id -un; id -nG; sudo -n id -un; exit\n")
-                assertTrue(admin, admin.contains("Setting up sudo"))
-                assertTrue(admin, admin.contains("alice is in the sudo group and can become root with sudo"))
-                assertTrue(admin, becameAdmin(admin, "sudo"))
-            } finally {
-                Native.stop(machine)
-                store.deleteRecursively()
-            }
         }
     }
 
@@ -820,33 +749,6 @@ class MachineTest {
         assertEquals(out, 0, Native.waitFor(machine, pid))
         assertEquals(0, Native.takeListens(machine)?.size)
         return out
-    }
-
-    /**
-     * A kernel-layer or engine bug ends only the guest process that hit it (the engine map, design
-     * doc §12 item 5), simulated with the test hooks of the debug app. In the app process, when the
-     * engine faults on the host the SIGSEGV first goes through ART's libsigchain: only when ART
-     * does not claim it does it reach the engine's handler, which siglongjmps back. When the kernel
-     * layer panics in a host call (JNI), that call fails and the console is hung up. Afterwards ART
-     * and the Machine both keep working.
-     */
-    @Test
-    fun bugsKillOnlyTheGuestProcess() {
-        Os.setenv("APPINE_TEST_HOOKS", "1", true)
-        val store = Rootfs.store(context).path
-        for ((name, code) in GUESTS) Native.writeFile(store, "/tmp/$name", elf(code), 0x1ed, true)
-        for (tier in 0..1) {
-            val machine = start(tier)
-            assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/engine-fault", "engine-fault").second)
-            assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/kernel-panic", "kernel-panic").second)
-            // The kernel layer panics while the console is read: the read gets -1, the session
-            // leader gets SIGHUP
-            assertEquals("tier $tier", "" to -SIGHUP, run(machine, "/tmp/host-call", "host-call"))
-            // ART keeps working: GC, and a stack overflow becomes a StackOverflowError
-            Runtime.getRuntime().gc()
-            assertTrue(runCatching { depth(0) }.exceptionOrNull() is StackOverflowError)
-            assertEquals("ok\n" to 0, sh(machine, "echo ok"))
-        }
     }
 
     /**
@@ -1114,6 +1016,33 @@ class MachineTest {
         }
     }
 
+    /**
+     * A kernel-layer or engine bug ends only the guest process that hit it (the engine map, design
+     * doc §12 item 5), simulated with the test hooks of the debug app. In the app process, when the
+     * engine faults on the host the SIGSEGV first goes through ART's libsigchain: only when ART
+     * does not claim it does it reach the engine's handler, which siglongjmps back. When the kernel
+     * layer panics in a host call (JNI), that call fails and the console is hung up. Afterwards ART
+     * and the Machine both keep working.
+     */
+    @Test
+    fun bugsKillOnlyTheGuestProcess() {
+        Os.setenv("APPINE_TEST_HOOKS", "1", true)
+        val store = Rootfs.store(context).path
+        for ((name, code) in GUESTS) Native.writeFile(store, "/tmp/$name", elf(code), 0x1ed, true)
+        for (tier in 0..1) {
+            val machine = start(tier)
+            assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/engine-fault", "engine-fault").second)
+            assertEquals("tier $tier", -SIGSEGV, run(machine, "/tmp/kernel-panic", "kernel-panic").second)
+            // The kernel layer panics while the console is read: the read gets -1, the session
+            // leader gets SIGHUP
+            assertEquals("tier $tier", "" to -SIGHUP, run(machine, "/tmp/host-call", "host-call"))
+            // ART keeps working: GC, and a stack overflow becomes a StackOverflowError
+            Runtime.getRuntime().gc()
+            assertTrue(runCatching { depth(0) }.exceptionOrNull() is StackOverflowError)
+            assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+        }
+    }
+
     private fun depth(n: Int): Int = if (n < 0) 0 else depth(n + 1) + 1
 
     /**
@@ -1155,6 +1084,77 @@ class MachineTest {
         assertEquals(listOf("awk", "oom", "/oomt", "16777216"), oom.subList(2, 5) + oom[6])
         assertTrue(oom[5], oom[5].toLong() > 16777216)
         assertEquals(0, Native.takeKills(machine)?.size)
+    }
+
+    /** Releasing caches (onTrimMemory) leaves running processes alone; new ones start as usual. */
+    @Test
+    fun trimMemoryKeepsTheMachineWorking() {
+        val machine = start(1)
+        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+        var result = "" to -1
+        val running = thread {
+            result = sh(machine, "for n in 1 2 3 4 5; do sha256sum /bin/busybox >/dev/null; sleep 0.05; done; echo done")
+        }
+        repeat(5) {
+            Native.trimMemory(machine)
+            Thread.sleep(50)
+        }
+        running.join(30_000)
+        assertEquals("done\n" to 0, result)
+        Native.trimMemory(machine)
+        assertEquals("ok\n" to 0, sh(machine, "echo ok"))
+    }
+
+    /**
+     * Using a kernel's handle after it stopped is safe: after a session ends, TerminalSession
+     * cleans up the console only later on the main thread, and by then the service may have stopped
+     * the kernel (rootfs reset, service destroyed).
+     */
+    @Test
+    fun callsAfterStopAreHarmless() {
+        val machine = start(1)
+        val console = Native.openConsole(machine, 24, 80)
+        val pid = Native.spawn(machine, console, "/bin/sh", arrayOf("sh", "-c", "sleep 30"), ConsolePty.ENVIRONMENT)
+        Native.stop(machine)
+        Native.closeConsole(machine, console)
+        Native.resize(machine, console, 30, 100)
+        Native.trimMemory(machine)
+        Native.setRoutes(machine, null)
+        assertEquals(-1, Native.read(machine, console, ByteArray(16)))
+        assertEquals(-1, Native.write(machine, console, ByteArray(1), 0, 1))
+        assertEquals(-9, Native.waitFor(machine, pid))
+        assertThrows(IOException::class.java) { Native.openConsole(machine, 24, 80) }
+        Native.stop(machine)
+    }
+
+    /**
+     * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
+     * own AGPL notice and full text, libghostty-vt with what it links and the terminal font, the GPL
+     * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the
+     * library (no proc macros), and the full license texts; every file in the index is present.
+     */
+    @Test
+    fun noticesCoverTheApp() {
+        val index = context.assets.open("notices/index.tsv").bufferedReader().readLines().map { it.split('\t') }
+        assertTrue(index.all { it.size == 3 })
+        fun text(title: String) = index.first { it[0].startsWith(title) }
+            .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
+        val titles = index.map { it[0] }
+        assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
+        assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
+        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {
+            assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))
+        }
+        assertTrue(text("JetBrains Mono").contains("SIL OPEN FONT LICENSE"))
+        assertFalse(titles.any { it.contains("Termux") })
+        val alpine = text("Alpine Linux")
+        assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
+        assertTrue(text("Android libraries").contains("androidx.core:core:"))
+        assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
+        assertTrue(titles.any { it.startsWith("SQLite ") })
+        assertFalse("proc macros are not in the library", titles.any { it.startsWith("syn ") || it.startsWith("thiserror-impl ") })
+        assertTrue(text("GNU General Public License 2.0").contains("Version 2, June 1991"))
+        for (row in index) context.assets.open("notices/${row[2]}").close()
     }
 
     private companion object {

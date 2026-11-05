@@ -45,22 +45,6 @@ internal object Tabs {
      */
     private val written = HashMap<String, Int>()
 
-    /** The kernel is up: leave the "running" marker. */
-    fun markRunning(context: Context) {
-        runCatching {
-            dir(context).mkdirs()
-            marker(context).createNewFile()
-        }.onFailure { Log.w(TAG, "cannot mark the tabs as running", it) }
-    }
-
-    /** Normal exit: delete the marker and the saved tabs. */
-    fun clear(context: Context) {
-        synchronized(this) {
-            written.clear()
-            dir(context).deleteRecursively()
-        }
-    }
-
     /**
      * Called once when the service starts: returns the saved tabs when the last run did not exit
      * normally (the marker is still there), otherwise deletes the old ones and returns null. The
@@ -93,6 +77,14 @@ internal object Tabs {
             )
         }
         return Saved(tabs, json.optInt("current"), json.optLong("time"))
+    }
+
+    /** The kernel is up: leave the "running" marker. */
+    fun markRunning(context: Context) {
+        runCatching {
+            dir(context).mkdirs()
+            marker(context).createNewFile()
+        }.onFailure { Log.w(TAG, "cannot mark the tabs as running", it) }
     }
 
     /**
@@ -150,5 +142,13 @@ internal object Tabs {
         val tmp = File(file.path + ".tmp")
         tmp.writeText(text)
         if (!tmp.renameTo(file)) throw IOException("cannot move ${tmp.name} into place")
+    }
+
+    /** Normal exit: delete the marker and the saved tabs. */
+    fun clear(context: Context) {
+        synchronized(this) {
+            written.clear()
+            dir(context).deleteRecursively()
+        }
     }
 }

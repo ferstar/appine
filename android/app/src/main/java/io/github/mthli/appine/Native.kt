@@ -136,10 +136,6 @@ internal object Native {
     @Throws(IOException::class)
     external fun start(store: String, tier: Int): Long
 
-    /** Ends all guest processes and releases the handle. */
-    @JvmStatic
-    external fun stop(machine: Long)
-
     /**
      * Boots by `/etc/inittab` (the kernel/process map; OpenRC on Alpine): blocks until the sysinit
      * and wait commands have all finished, with the output in the guest's `/var/log/boot.log`. Not
@@ -149,73 +145,12 @@ internal object Native {
     external fun boot(machine: Long)
 
     /**
-     * Shuts down: runs the shutdown commands in inittab (at most 30 seconds), sends SIGTERM to all
-     * processes and waits at most 1 second, ends those left, and then releases the handle. Not
-     * called on the main thread.
-     */
-    @JvmStatic
-    external fun shutdown(machine: Long)
-
-    /** Takes the guest's power request (busybox's reboot, halt, poweroff): [POWER_NONE] etc. */
-    @JvmStatic
-    external fun takePower(machine: Long): Int
-
-    /** Number of guest processes still running (not counting init). */
-    @JvmStatic
-    external fun processes(machine: Long): Int
-
-    /**
-     * The current directory of the console's foreground process group (to restore tabs after the
-     * app was killed); null once the shell has exited.
-     */
-    @JvmStatic
-    external fun consoleCwd(machine: Long, console: Int): String?
-
-    const val POWER_NONE = 0
-    const val POWER_REBOOT = 1
-    const val POWER_HALT = 2
-    const val POWER_OFF = 3
-
-    /**
-     * Drops caches that can be rebuilt (translations kept in the pool and so on) and commits the
-     * deferred write transaction. Takes the BKL; not called on the main thread.
-     */
-    @JvmStatic
-    external fun trimMemory(machine: Long)
-
-    /**
      * The host's default network changed: the guest's routing table becomes [routes], with entries
      * `<destination network in hex>/<prefix length> <gateway in hex or -> <interface>`; with null
      * it goes back to being synthesised from the interfaces' addresses.
      */
     @JvmStatic
     external fun setRoutes(machine: Long, routes: Array<String>?)
-
-    /**
-     * Takes the ports the guest listened on for the first time on a non-loopback address (design
-     * doc §12 item 7): each entry is `<process name>\t<port>\t<host port>`. Ports below 1024 that
-     * the host refuses have been moved to other ports, and other devices must connect to the one on
-     * the host. Takes the BKL; not called on the main thread.
-     */
-    @JvmStatic
-    external fun takeListens(machine: Long): Array<String>?
-
-    /**
-     * Takes the processes the kernel layer ended:
-     * `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the report;
-     * for oom, a is the cgroup (empty for the app's limit), b and c the usage and the limit
-     * (bytes).
-     */
-    @JvmStatic
-    external fun takeKills(machine: Long): Array<String>?
-
-    /**
-     * Takes the directories whose entries (create, delete, rename) the guest changed, written as
-     * document IDs, so the Files app refreshes them. Recording starts only with the first call.
-     * Takes the BKL; not called on the main thread.
-     */
-    @JvmStatic
-    external fun takeChangedDirs(machine: Long): Array<String>?
 
     /** Creates a console (an in-process PTY) and returns its number. */
     @JvmStatic
@@ -254,4 +189,69 @@ internal object Native {
      */
     @JvmStatic
     external fun waitFor(machine: Long, pid: Int): Int
+
+    /**
+     * The current directory of the console's foreground process group (to restore tabs after the
+     * app was killed); null once the shell has exited.
+     */
+    @JvmStatic
+    external fun consoleCwd(machine: Long, console: Int): String?
+
+    /**
+     * Takes the ports the guest listened on for the first time on a non-loopback address (design
+     * doc §12 item 7): each entry is `<process name>\t<port>\t<host port>`. Ports below 1024 that
+     * the host refuses have been moved to other ports, and other devices must connect to the one on
+     * the host. Takes the BKL; not called on the main thread.
+     */
+    @JvmStatic
+    external fun takeListens(machine: Long): Array<String>?
+
+    /**
+     * Takes the processes the kernel layer ended:
+     * `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the report;
+     * for oom, a is the cgroup (empty for the app's limit), b and c the usage and the limit
+     * (bytes).
+     */
+    @JvmStatic
+    external fun takeKills(machine: Long): Array<String>?
+
+    /** Takes the guest's power request (busybox's reboot, halt, poweroff): [POWER_NONE] etc. */
+    @JvmStatic
+    external fun takePower(machine: Long): Int
+
+    const val POWER_NONE = 0
+    const val POWER_REBOOT = 1
+    const val POWER_HALT = 2
+    const val POWER_OFF = 3
+
+    /** Number of guest processes still running (not counting init). */
+    @JvmStatic
+    external fun processes(machine: Long): Int
+
+    /**
+     * Takes the directories whose entries (create, delete, rename) the guest changed, written as
+     * document IDs, so the Files app refreshes them. Recording starts only with the first call.
+     * Takes the BKL; not called on the main thread.
+     */
+    @JvmStatic
+    external fun takeChangedDirs(machine: Long): Array<String>?
+
+    /**
+     * Drops caches that can be rebuilt (translations kept in the pool and so on) and commits the
+     * deferred write transaction. Takes the BKL; not called on the main thread.
+     */
+    @JvmStatic
+    external fun trimMemory(machine: Long)
+
+    /**
+     * Shuts down: runs the shutdown commands in inittab (at most 30 seconds), sends SIGTERM to all
+     * processes and waits at most 1 second, ends those left, and then releases the handle. Not
+     * called on the main thread.
+     */
+    @JvmStatic
+    external fun shutdown(machine: Long)
+
+    /** Ends all guest processes and releases the handle. */
+    @JvmStatic
+    external fun stop(machine: Long)
 }

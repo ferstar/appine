@@ -76,16 +76,16 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         val send: () -> Unit = {},
     )
 
-    private val ctrlKey = Modifier()
-    private val altKey = Modifier()
-    private val shiftKey = Modifier()
-    private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
-
     /**
      * A page: the [grid] of its first seven columns, and the [last] key, above SYM. Only the page
      * shown is in the view.
      */
     private class Page(val grid: LinearLayout, val last: View)
+
+    private val ctrlKey = Modifier()
+    private val altKey = Modifier()
+    private val shiftKey = Modifier()
+    private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
 
     /** The keys, then the symbols SYM shows. */
     private val pages = mutableListOf<Page>()
@@ -118,10 +118,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
     /** The width of a column in the grid, in pixels, as last measured; 0 before that. */
     private var column = 0
-
-    val ctrl get() = ctrlKey.on
-    val alt get() = altKey.on
-    val shift get() = shiftKey.on && !symbols
 
     private val density = resources.displayMetrics.density
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
@@ -181,54 +177,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         refresh()
     }
 
-    /**
-     * Shares the width out among the [COLUMNS], each at least [MIN_COLUMN_DP] wide; the last
-     * column also takes the pixels left over. When the minimum wins, the grid is wider than the
-     * room beside the last column and scrolls.
-     */
-    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val width = MeasureSpec.getSize(widthMeasureSpec)
-        val min = (MIN_COLUMN_DP * density).roundToInt()
-        val c = max(min, width / COLUMNS)
-        if (c != column) {
-            column = c
-            for (v in gridKeys) v.layoutParams.width = c
-            // The rows and the grids are measured without a width limit, which need not change
-            // with the columns, so their last measurement could be reused; the page not shown
-            // keeps the flag until it is shown
-            for (page in pages) {
-                page.grid.forceLayout()
-                for (i in 0 until page.grid.childCount) page.grid.getChildAt(i).forceLayout()
-            }
-        }
-        fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
-        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-    }
-
-    /**
-     * The next key or character took the one-shot modifiers; locked ones stay on, and so does
-     * Shift while it waits with the symbols shown.
-     */
-    fun modifiersUsed() {
-        var changed = false
-        for (m in modifiers) {
-            if (m.on && !m.locked && !(symbols && m === shiftKey)) {
-                m.on = false
-                changed = true
-            }
-        }
-        if (changed) post { refresh() }
-    }
-
     private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
-
-    /** A line one pixel high from the left edge across [width], its top at [y]. */
-    private fun hLine(canvas: Canvas, y: Int, width: Int) =
-        canvas.drawRect(0f, y.toFloat(), width.toFloat(), y + 1f, linePaint)
-
-    /** A line one pixel wide from [top] to [bottom], its left at [x]. */
-    private fun vLine(canvas: Canvas, x: Int, top: Int, bottom: Int) =
-        canvas.drawRect(x.toFloat(), top.toFloat(), x + 1f, bottom.toFloat(), linePaint)
 
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }
@@ -269,10 +218,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         pages.add(Page(grid, fixedView(last)))
     }
 
-    /** A key for the fixed column, laid out to fill a cell of it. */
-    private fun fixedView(key: Key) =
-        keyView(key).apply { layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
-
     @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
     private fun keyView(key: Key) = label(key.label).also { view ->
         key.modifier?.view = view
@@ -289,28 +234,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         isSingleLine = true
     }
 
-    /** A tap, also what accessibility services perform as a click. */
-    private fun tap(key: Key) {
-        key.modifier?.let {
-            it.on = !it.on
-            it.locked = false
-            refresh()
-        } ?: key.send()
-    }
-
-    /** A long press on Ctrl, Alt or Shift: locks it on, or turns it off. */
-    private fun hold(m: Modifier) {
-        m.on = !m.on
-        m.locked = m.on
-        refresh()
-    }
-
-    /** SYM: shows the symbols in place of the first page, or the first page again. */
-    private fun turnPage() {
-        symbols = !symbols
-        show(pages[if (symbols) 1 else 0])
-        refresh()
-    }
+    /** A key for the fixed column, laid out to fill a cell of it. */
+    private fun fixedView(key: Key) =
+        keyView(key).apply { layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
 
     /**
      * Puts [page] in the view in place of the other one, its last key above SYM. Removing a key's
@@ -334,6 +260,38 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             }
         }
     }
+
+    /**
+     * Shares the width out among the [COLUMNS], each at least [MIN_COLUMN_DP] wide; the last
+     * column also takes the pixels left over. When the minimum wins, the grid is wider than the
+     * room beside the last column and scrolls.
+     */
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        val min = (MIN_COLUMN_DP * density).roundToInt()
+        val c = max(min, width / COLUMNS)
+        if (c != column) {
+            column = c
+            for (v in gridKeys) v.layoutParams.width = c
+            // The rows and the grids are measured without a width limit, which need not change
+            // with the columns, so their last measurement could be reused; the page not shown
+            // keeps the flag until it is shown
+            for (page in pages) {
+                page.grid.forceLayout()
+                for (i in 0 until page.grid.childCount) page.grid.getChildAt(i).forceLayout()
+            }
+        }
+        fixed.layoutParams.width = max(min, width - (COLUMNS - 1) * c)
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+
+    /** A line one pixel high from the left edge across [width], its top at [y]. */
+    private fun hLine(canvas: Canvas, y: Int, width: Int) =
+        canvas.drawRect(0f, y.toFloat(), width.toFloat(), y + 1f, linePaint)
+
+    /** A line one pixel wide from [top] to [bottom], its left at [x]. */
+    private fun vLine(canvas: Canvas, x: Int, top: Int, bottom: Int) =
+        canvas.drawRect(x.toFloat(), top.toFloat(), x + 1f, bottom.toFloat(), linePaint)
 
     /**
      * The touch on one key: highlights it while pressed, taps it on release (through
@@ -392,6 +350,48 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
             view.removeCallbacks(this)
             view.background = null
         }
+    }
+
+    /** A tap, also what accessibility services perform as a click. */
+    private fun tap(key: Key) {
+        key.modifier?.let {
+            it.on = !it.on
+            it.locked = false
+            refresh()
+        } ?: key.send()
+    }
+
+    /** A long press on Ctrl, Alt or Shift: locks it on, or turns it off. */
+    private fun hold(m: Modifier) {
+        m.on = !m.on
+        m.locked = m.on
+        refresh()
+    }
+
+    /** SYM: shows the symbols in place of the first page, or the first page again. */
+    private fun turnPage() {
+        symbols = !symbols
+        show(pages[if (symbols) 1 else 0])
+        refresh()
+    }
+
+    val ctrl get() = ctrlKey.on
+    val alt get() = altKey.on
+    val shift get() = shiftKey.on && !symbols
+
+    /**
+     * The next key or character took the one-shot modifiers; locked ones stay on, and so does
+     * Shift while it waits with the symbols shown.
+     */
+    fun modifiersUsed() {
+        var changed = false
+        for (m in modifiers) {
+            if (m.on && !m.locked && !(symbols && m === shiftKey)) {
+                m.on = false
+                changed = true
+            }
+        }
+        if (changed) post { refresh() }
     }
 
     companion object {

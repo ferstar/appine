@@ -217,6 +217,14 @@ class MainActivity : Activity(), TerminalService.Listener {
         bindService(intent, connection, BIND_AUTO_CREATE)
     }
 
+    /** The activity handles size changes itself: the bar may switch between the row and the list. */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // The list is as wide as the bar was when it opened
+        list?.dismiss()
+        renderTabs()
+    }
+
     override fun onStop() {
         list?.dismiss()
         service?.removeListener(this)
@@ -232,66 +240,13 @@ class MainActivity : Activity(), TerminalService.Listener {
         super.onDestroy()
     }
 
-    /** The activity handles size changes itself: the bar may switch between the row and the list. */
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // The list is as wide as the bar was when it opened
-        list?.dismiss()
-        renderTabs()
-    }
-
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && shortcut(event)) {
-            shortcutKey = event.keyCode
-            return true
-        }
-        // Its release too, or the terminal would send a release (Kitty protocol) for a key it never
-        // saw pressed
-        if (event.action == KeyEvent.ACTION_UP && event.keyCode == shortcutKey) {
-            shortcutKey = 0
-            return true
-        }
-        return super.dispatchKeyEvent(event)
-    }
-
-    /**
-     * The tab shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
-     * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
-     * previous one (going round). They are taken before the terminal sees them; false for any other
-     * key.
-     */
-    private fun shortcut(event: KeyEvent): Boolean {
-        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
-        // Holding Ctrl+Tab keeps switching; holding the others acts once
-        val first = event.repeatCount == 0
-        when {
-            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1, wrap = true)
-            !event.isShiftPressed -> return false
-            event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
-            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
-            else -> return false
-        }
-        return true
-    }
-
-    /** Lists the tab shortcuts in the system's keyboard shortcuts screen (Meta+/). */
-    override fun onProvideKeyboardShortcuts(data: MutableList<KeyboardShortcutGroup>, menu: Menu?, deviceId: Int) {
-        val ctrl = KeyEvent.META_CTRL_ON
-        val ctrlShift = KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
-        data.add(
-            KeyboardShortcutGroup(
-                getString(R.string.shortcuts_tabs),
-                listOf(
-                    KeyboardShortcutInfo(getString(R.string.new_tab), KeyEvent.KEYCODE_T, ctrlShift),
-                    KeyboardShortcutInfo(getString(R.string.close_tab), KeyEvent.KEYCODE_W, ctrlShift),
-                    KeyboardShortcutInfo(getString(R.string.next_tab), KeyEvent.KEYCODE_TAB, ctrl),
-                    KeyboardShortcutInfo(getString(R.string.previous_tab), KeyEvent.KEYCODE_TAB, ctrlShift),
-                ),
-            ),
-        )
-    }
-
     // ---- TerminalService.Listener ----
+
+    override fun onProgress(text: String) {
+        screen.visibility = View.INVISIBLE
+        status.visibility = View.VISIBLE
+        status.text = text
+    }
 
     override fun onMachineReady(error: String?) {
         val s = service ?: return
@@ -311,28 +266,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /** Settings changed while this activity is visible too (split screen). */
-    override fun onSettingsChanged() {
-        screen.setFillWide(TerminalService.fillWide(this))
-    }
-
-    override fun onProgress(text: String) {
-        screen.visibility = View.INVISIBLE
-        status.visibility = View.VISIBLE
-        status.text = text
-    }
-
-    /**
-     * A distro switch failed (the download failed, or the import failed and fell back to Alpine).
-     */
-    override fun onNotice() {
-        val text = service?.takeNotice() ?: return
-        MaterialAlertDialogBuilder(this)
-            .setMessage(text)
-            .setPositiveButton(android.R.string.ok, null)
-            .show()
-    }
-
     override fun onSessionsChanged() {
         val s = service ?: return
         if (current != null && current !in s.sessions) {
@@ -350,8 +283,20 @@ class MainActivity : Activity(), TerminalService.Listener {
         renderTabs()
     }
 
-    override fun onExitAll() {
-        finish()
+    /** Settings changed while this activity is visible too (split screen). */
+    override fun onSettingsChanged() {
+        screen.setFillWide(TerminalService.fillWide(this))
+    }
+
+    /**
+     * A distro switch failed (the download failed, or the import failed and fell back to Alpine).
+     */
+    override fun onNotice() {
+        val text = service?.takeNotice() ?: return
+        MaterialAlertDialogBuilder(this)
+            .setMessage(text)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
     }
 
     override fun onRestarting() {
@@ -362,14 +307,8 @@ class MainActivity : Activity(), TerminalService.Listener {
         status.setText(R.string.restarting)
     }
 
-    private fun showMenu(anchor: View) {
-        PopupMenu(this, anchor).apply {
-            menu.add(R.string.menu_settings).setOnMenuItemClickListener {
-                startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
-                true
-            }
-            show()
-        }
+    override fun onExitAll() {
+        finish()
     }
 
     // ---- Sessions ----
@@ -387,24 +326,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         screen.attach(session)
         screen.requestFocus()
         renderTabs()
-    }
-
-    private fun close(session: VtSession) {
-        service?.removeSession(session)
-    }
-
-    /**
-     * Shows the tab [delta] places after the current one, going round from the last to the first
-     * when [wrap] is set; false when there is no such tab.
-     */
-    private fun switchBy(delta: Int, wrap: Boolean): Boolean {
-        val sessions = service?.sessions ?: return false
-        val i = sessions.indexOf(current)
-        if (i < 0 || sessions.size < 2) return false
-        val j = if (wrap) Math.floorMod(i + delta, sessions.size) else i + delta
-        if (j !in sessions.indices) return false
-        show(sessions[j])
-        return true
     }
 
     /**
@@ -465,54 +386,29 @@ class MainActivity : Activity(), TerminalService.Listener {
         return if (session.isRunning) text else getString(R.string.tab_ended, text)
     }
 
-    /** What a long press on a tab offers: renaming and closing it. */
-    private fun showTabMenu(anchor: View, session: VtSession) {
+    private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
+        text = label
+        setTextColor(mutedColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setPadding(dp(12), dp(10), dp(12), dp(10))
+        background = touchFeedback()
+        setOnClickListener(onClick)
+    }
+
+    /** The theme's ripple for something that can be tapped. */
+    private fun touchFeedback(): Drawable? {
+        val a = obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
+        return a.getDrawable(0).also { a.recycle() }
+    }
+
+    private fun showMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
-            menu.add(R.string.rename_tab).setOnMenuItemClickListener {
-                list?.dismiss()
-                rename(session)
-                true
-            }
-            menu.add(R.string.close_tab).setOnMenuItemClickListener {
-                close(session)
+            menu.add(R.string.menu_settings).setOnMenuItemClickListener {
+                startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
                 true
             }
             show()
         }
-    }
-
-    /**
-     * Asks for a tab's name (dialog_rename.xml); an empty one shows the program's title again,
-     * which is the field's placeholder.
-     */
-    // A dialog's view has no parent to inflate it into
-    @SuppressLint("InflateParams")
-    private fun rename(session: VtSession) {
-        val view = layoutInflater.inflate(R.layout.dialog_rename, null)
-        view.findViewById<TextInputLayout>(R.id.field).placeholderText =
-            session.title?.takeIf { it.isNotBlank() } ?: "sh"
-        val input = view.findViewById<TextInputEditText>(R.id.name).apply {
-            setText(session.name.orEmpty())
-            selectAll()
-        }
-        val dialog = MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.rename_tab)
-            .setView(view)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                service?.renameSession(session, input.text?.toString().orEmpty())
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .create()
-        input.setOnEditorActionListener { _, action, _ ->
-            if (action != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
-            dialog.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
-            true
-        }
-        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
-        // The terminal takes the keyboard again
-        dialog.setOnDismissListener { screen.requestFocus() }
-        dialog.show()
-        input.requestFocus()
     }
 
     /** Opens the list of tabs below the bar: tap a tab to show it, ✕ to close it. */
@@ -540,24 +436,44 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
-        text = label
-        setTextColor(mutedColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        setPadding(dp(12), dp(10), dp(12), dp(10))
-        background = touchFeedback()
-        setOnClickListener(onClick)
+    /**
+     * The rows of the list of tabs (list_tab.xml): `N: title`, the current one highlighted in the
+     * theme's secondary container colour, and a close button.
+     */
+    private inner class TabList : BaseAdapter() {
+        var items: List<VtSession> = emptyList()
+            set(value) {
+                field = value
+                notifyDataSetChanged()
+            }
+
+        private val currentBackground by lazy { themeColor(com.google.android.material.R.attr.colorSecondaryContainer) }
+        private val currentText by lazy { themeColor(com.google.android.material.R.attr.colorOnSecondaryContainer) }
+
+        override fun getCount() = items.size
+
+        override fun getItem(position: Int) = items[position]
+
+        override fun getItemId(position: Int) = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val row = convertView ?: layoutInflater.inflate(R.layout.list_tab, parent, false)
+            val session = items[position]
+            row.findViewById<TextView>(R.id.title).apply {
+                text = label(position, session)
+                setTextColor(
+                    when {
+                        session == current -> currentText
+                        session.isRunning -> textColor
+                        else -> mutedColor
+                    }
+                )
+            }
+            row.setBackgroundColor(if (session == current) currentBackground else Color.TRANSPARENT)
+            row.findViewById<View>(R.id.close).setOnClickListener { close(session) }
+            return row
+        }
     }
-
-    /** The theme's ripple for something that can be tapped. */
-    private fun touchFeedback(): Drawable? {
-        val a = obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
-        return a.getDrawable(0).also { a.recycle() }
-    }
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
-    private fun themeColor(attr: Int) = MaterialColors.getColor(this, attr, Color.WHITE)
 
     /**
      * A horizontal swipe over the switcher shows the next tab (to the left) or the previous one (to
@@ -622,49 +538,122 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * The rows of the list of tabs (list_tab.xml): `N: title`, the current one highlighted in the
-     * theme's secondary container colour, and a close button.
+     * Shows the tab [delta] places after the current one, going round from the last to the first
+     * when [wrap] is set; false when there is no such tab.
      */
-    private inner class TabList : BaseAdapter() {
-        var items: List<VtSession> = emptyList()
-            set(value) {
-                field = value
-                notifyDataSetChanged()
+    private fun switchBy(delta: Int, wrap: Boolean): Boolean {
+        val sessions = service?.sessions ?: return false
+        val i = sessions.indexOf(current)
+        if (i < 0 || sessions.size < 2) return false
+        val j = if (wrap) Math.floorMod(i + delta, sessions.size) else i + delta
+        if (j !in sessions.indices) return false
+        show(sessions[j])
+        return true
+    }
+
+    /** What a long press on a tab offers: renaming and closing it. */
+    private fun showTabMenu(anchor: View, session: VtSession) {
+        PopupMenu(this, anchor).apply {
+            menu.add(R.string.rename_tab).setOnMenuItemClickListener {
+                list?.dismiss()
+                rename(session)
+                true
             }
-
-        private val currentBackground by lazy { themeColor(com.google.android.material.R.attr.colorSecondaryContainer) }
-        private val currentText by lazy { themeColor(com.google.android.material.R.attr.colorOnSecondaryContainer) }
-
-        override fun getCount() = items.size
-
-        override fun getItem(position: Int) = items[position]
-
-        override fun getItemId(position: Int) = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val row = convertView ?: layoutInflater.inflate(R.layout.list_tab, parent, false)
-            val session = items[position]
-            row.findViewById<TextView>(R.id.title).apply {
-                text = label(position, session)
-                setTextColor(
-                    when {
-                        session == current -> currentText
-                        session.isRunning -> textColor
-                        else -> mutedColor
-                    }
-                )
+            menu.add(R.string.close_tab).setOnMenuItemClickListener {
+                close(session)
+                true
             }
-            row.setBackgroundColor(if (session == current) currentBackground else Color.TRANSPARENT)
-            row.findViewById<View>(R.id.close).setOnClickListener { close(session) }
-            return row
+            show()
         }
     }
 
-    /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
-    private inner class Keys : ExtraKeysView.Target {
-        override fun key(keyCode: Int) = screen.press(keyCode)
+    /**
+     * Asks for a tab's name (dialog_rename.xml); an empty one shows the program's title again,
+     * which is the field's placeholder.
+     */
+    // A dialog's view has no parent to inflate it into
+    @SuppressLint("InflateParams")
+    private fun rename(session: VtSession) {
+        val view = layoutInflater.inflate(R.layout.dialog_rename, null)
+        view.findViewById<TextInputLayout>(R.id.field).placeholderText =
+            session.title?.takeIf { it.isNotBlank() } ?: "sh"
+        val input = view.findViewById<TextInputEditText>(R.id.name).apply {
+            setText(session.name.orEmpty())
+            selectAll()
+        }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.rename_tab)
+            .setView(view)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                service?.renameSession(session, input.text?.toString().orEmpty())
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        input.setOnEditorActionListener { _, action, _ ->
+            if (action != EditorInfo.IME_ACTION_DONE) return@setOnEditorActionListener false
+            dialog.getButton(DialogInterface.BUTTON_POSITIVE).performClick()
+            true
+        }
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+        // The terminal takes the keyboard again
+        dialog.setOnDismissListener { screen.requestFocus() }
+        dialog.show()
+        input.requestFocus()
+    }
 
-        override fun text(text: String) = screen.type(text)
+    private fun close(session: VtSession) {
+        service?.removeSession(session)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && shortcut(event)) {
+            shortcutKey = event.keyCode
+            return true
+        }
+        // Its release too, or the terminal would send a release (Kitty protocol) for a key it never
+        // saw pressed
+        if (event.action == KeyEvent.ACTION_UP && event.keyCode == shortcutKey) {
+            shortcutKey = 0
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * The tab shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
+     * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
+     * previous one (going round). They are taken before the terminal sees them; false for any other
+     * key.
+     */
+    private fun shortcut(event: KeyEvent): Boolean {
+        if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
+        // Holding Ctrl+Tab keeps switching; holding the others acts once
+        val first = event.repeatCount == 0
+        when {
+            event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1, wrap = true)
+            !event.isShiftPressed -> return false
+            event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
+            event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            else -> return false
+        }
+        return true
+    }
+
+    /** Lists the tab shortcuts in the system's keyboard shortcuts screen (Meta+/). */
+    override fun onProvideKeyboardShortcuts(data: MutableList<KeyboardShortcutGroup>, menu: Menu?, deviceId: Int) {
+        val ctrl = KeyEvent.META_CTRL_ON
+        val ctrlShift = KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
+        data.add(
+            KeyboardShortcutGroup(
+                getString(R.string.shortcuts_tabs),
+                listOf(
+                    KeyboardShortcutInfo(getString(R.string.new_tab), KeyEvent.KEYCODE_T, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.close_tab), KeyEvent.KEYCODE_W, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.next_tab), KeyEvent.KEYCODE_TAB, ctrl),
+                    KeyboardShortcutInfo(getString(R.string.previous_tab), KeyEvent.KEYCODE_TAB, ctrlShift),
+                ),
+            ),
+        )
     }
 
     /** The [VtView]'s side: starting the shell, input, zoom and the extra keys' modifiers. */
@@ -694,6 +683,17 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         override fun modifiersUsed() = keys.modifiersUsed()
     }
+
+    /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
+    private inner class Keys : ExtraKeysView.Target {
+        override fun key(keyCode: Int) = screen.press(keyCode)
+
+        override fun text(text: String) = screen.type(text)
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun themeColor(attr: Int) = MaterialColors.getColor(this, attr, Color.WHITE)
 
     companion object {
         private const val PREF_FONT_SIZE = "font_size"

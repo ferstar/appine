@@ -265,27 +265,6 @@ class Documents : DocumentsProvider() {
         throw FileNotFoundException("$documentId is outside $home")
     }
 
-    private fun writableHome(context: Context): Home =
-        home(context) ?: throw FileNotFoundException("no home directory")
-
-    /**
-     * A document to modify: canonical and inside the home directory (with [top], also the home
-     * directory itself); otherwise read-only.
-     */
-    private fun writable(home: Home, documentId: String, top: Boolean = false): String {
-        val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
-        if ((top && path == home.path) || isChildDocument(home.path, path)) return path
-        throw UnsupportedOperationException("$documentId is read-only")
-    }
-
-    /** Something in directory [dir] changed: the Files app lists it again. */
-    private fun childrenChanged(context: Context, dir: String) {
-        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
-    }
-
-    /** ContentProvider's requireContext needs API 30. */
-    private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
-
     private fun <T> browse(call: (String) -> T): T {
         val store = Rootfs.store(attached()).path
         return try {
@@ -296,6 +275,9 @@ class Documents : DocumentsProvider() {
             throw FileNotFoundException(e.message)
         }
     }
+
+    /** ContentProvider's requireContext needs API 30. */
+    private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
 
     /**
      * The regular files in [docs] (paths and metadata) whose type the extension cannot tell and
@@ -344,6 +326,24 @@ class Documents : DocumentsProvider() {
         if (!isChildDocument(home, path)) return 0
         val common = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_MOVE
         return common or if (dir) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
+    }
+
+    private fun writableHome(context: Context): Home =
+        home(context) ?: throw FileNotFoundException("no home directory")
+
+    /**
+     * A document to modify: canonical and inside the home directory (with [top], also the home
+     * directory itself); otherwise read-only.
+     */
+    private fun writable(home: Home, documentId: String, top: Boolean = false): String {
+        val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
+        if ((top && path == home.path) || isChildDocument(home.path, path)) return path
+        throw UnsupportedOperationException("$documentId is read-only")
+    }
+
+    /** Something in directory [dir] changed: the Files app lists it again. */
+    private fun childrenChanged(context: Context, dir: String) {
+        context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
     }
 
     companion object {

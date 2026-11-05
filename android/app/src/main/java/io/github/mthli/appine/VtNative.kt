@@ -15,8 +15,8 @@ internal object VtNative {
     /** Creates the terminal of an open [console] of [machine]; returns the tab handle. */
     @JvmStatic external fun create(machine: Long, console: Int, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): Long
 
-    /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
-    @JvmStatic external fun destroy(tab: Long)
+    /** Shows bytes from the app as if the console had printed them. */
+    @JvmStatic external fun print(tab: Long, data: ByteArray)
 
     /**
      * Blocks, moving console output into the terminal until the session ends or the console is
@@ -24,6 +24,9 @@ internal object VtNative {
      * [frame], and `session.onTitle()` when a program set the title.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
+
+    /** The title a program set (OSC 0/2); null when none. */
+    @JvmStatic external fun title(tab: Long): String?
 
     /**
      * The rows that changed since the last frame, all of them with [full] (the frame format is in
@@ -33,9 +36,6 @@ internal object VtNative {
 
     /** Resizes the terminal, then the console (SIGWINCH). */
     @JvmStatic external fun resize(tab: Long, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int)
-
-    /** Scrolls the viewport by [delta] rows (negative: back); 0 returns to the bottom. */
-    @JvmStatic external fun scroll(tab: Long, delta: Int)
 
     /**
      * Encodes a key for the program ([VtKeys] has the key numbers and modifier bits); null when
@@ -60,6 +60,9 @@ internal object VtNative {
     /** Encodes focus gained or lost; empty when the program did not ask for focus events. */
     @JvmStatic external fun focus(tab: Long, gained: Boolean): ByteArray?
 
+    /** Scrolls the viewport by [delta] rows (negative: back); 0 returns to the bottom. */
+    @JvmStatic external fun scroll(tab: Long, delta: Int)
+
     /**
      * Selects the word at viewport cell ([x], [y]) and anchors later [selectTo] calls to it;
      * false when there is no word there (the selection is then cleared).
@@ -83,9 +86,6 @@ internal object VtNative {
     /** The selection as plain text (soft wraps joined, trailing blanks trimmed), null for none. */
     @JvmStatic external fun copy(tab: Long): String?
 
-    /** The title a program set (OSC 0/2); null when none. */
-    @JvmStatic external fun title(tab: Long): String?
-
     /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the
      * alternate screen, where nothing is written.
@@ -98,6 +98,6 @@ internal object VtNative {
      */
     @JvmStatic external fun transcript(tab: Long): String?
 
-    /** Shows bytes from the app as if the console had printed them. */
-    @JvmStatic external fun print(tab: Long, data: ByteArray)
+    /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
+    @JvmStatic external fun destroy(tab: Long)
 }

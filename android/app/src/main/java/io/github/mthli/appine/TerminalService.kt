@@ -53,24 +53,14 @@ class TerminalService : Service() {
      * implements only the ones it needs.
      */
     interface Listener {
-        /** The kernel has started (or failed to start, with [error] non-null). */
-        fun onMachineReady(error: String?) {}
-
         /** Progress of preparing the rootfs ([progress]). */
         fun onProgress(text: String) {}
 
+        /** The kernel has started (or failed to start, with [error] non-null). */
+        fun onMachineReady(error: String?) {}
+
         /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
-
-        /** Exit all: the user chose "Exit all" in the notification, or the guest shut down. */
-        fun onExitAll() {}
-
-        /**
-         * About to restart: the guest's `reboot`, or (in a debug build) the execution tier changed
-         * in Settings. All sessions have ended; the kernel shuts down and starts again (followed by
-         * [onMachineReady]).
-         */
-        fun onRestarting() {}
 
         /**
          * State shown in Settings changed: the download progress of a distro switch ([switching]),
@@ -80,6 +70,16 @@ class TerminalService : Service() {
 
         /** There is something to tell the user ([takeNotice]): a distro switch failed. */
         fun onNotice() {}
+
+        /**
+         * About to restart: the guest's `reboot`, or (in a debug build) the execution tier changed
+         * in Settings. All sessions have ended; the kernel shuts down and starts again (followed by
+         * [onMachineReady]).
+         */
+        fun onRestarting() {}
+
+        /** Exit all: the user chose "Exit all" in the notification, or the guest shut down. */
+        fun onExitAll() {}
     }
 
     /**
@@ -219,6 +219,9 @@ class TerminalService : Service() {
     /** [network] is registered. */
     private var watchingNetwork = false
 
+    /** The `PARTIAL_WAKE_LOCK` held while keeping running with the screen off. */
+    private var wakeLock: PowerManager.WakeLock? = null
+
     /** The tabs. */
     internal val sessions = mutableListOf<VtSession>()
 
@@ -240,6 +243,21 @@ class TerminalService : Service() {
 
     /** The tab the Activity is showing (saving tabs records which one it is). */
     internal var current: VtSession? = null
+
+    /**
+     * What the sessions report (title changes, ends) goes to the current Activity (if any); their
+     * screens go to their views directly.
+     */
+    private val sessionEvents = object : VtSession.Events {
+        override fun onTitleChanged(session: VtSession) {
+            each { it.onSessionsChanged() }
+        }
+
+        override fun onFinished(session: VtSession) {
+            // The notification counts running tabs, and an ended tab is no longer saved
+            sessionsChanged()
+        }
+    }
 
     /**
      * Tabs are saved every [SAVE_MS] while the kernel runs, and at once when the UI is hidden or
@@ -280,53 +298,6 @@ class TerminalService : Service() {
      */
     private val listeners = mutableListOf<Listener>()
 
-    fun addListener(l: Listener) {
-        if (l !in listeners) listeners.add(l)
-        main.removeCallbacks(trimWhenHidden)
-    }
-
-    fun removeListener(l: Listener) {
-        listeners.remove(l)
-        if (listeners.isEmpty()) {
-            main.removeCallbacks(trimWhenHidden)
-            main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
-            // The UI is gone and the app may be killed at any time: save the tabs first
-            saveTabs()
-            stopIfFailed()
-        }
-    }
-
-    /**
-     * The start failed and no UI is left to show it: stop rather than keep a foreground service
-     * and its notification with nothing running (without a kernel there is no poll to end it).
-     * Opening the app again tries again.
-     */
-    private fun stopIfFailed() {
-        if (machine == 0L && startError != null && !starting && !transitioning && !exiting && listeners.isEmpty()) {
-            stopSelf()
-        }
-    }
-
-    /** A UI may remove itself during a callback, so iterate over a copy. */
-    private fun each(f: (Listener) -> Unit) = listeners.toList().forEach(f)
-
-    /**
-     * What the sessions report (title changes, ends) goes to the current Activity (if any); their
-     * screens go to their views directly.
-     */
-    private val sessionEvents = object : VtSession.Events {
-        override fun onTitleChanged(session: VtSession) {
-            each { it.onSessionsChanged() }
-        }
-
-        override fun onFinished(session: VtSession) {
-            // The notification counts running tabs, and an ended tab is no longer saved
-            sessionsChanged()
-        }
-    }
-
-    override fun onBind(intent: Intent): IBinder = binder
-
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -343,52 +314,73 @@ class TerminalService : Service() {
         start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
     }
 
-    /**
-     * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
-     * takes it from Settings, effective at the next kernel start; a release build always runs Tier
-     * 1, ignoring a value recorded by an earlier debug install.
-     */
-    val tier: Int
-        get() = if (BuildConfig.DEBUG) getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1) else 1
-
-    /**
-     * The login account of new tabs (chosen in Settings, the android/setup map):
-     * [ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or an account name. Goes back to automatic
-     * after a distro switch or a rootfs reset.
-     */
-    val login: String get() = login(this)
-
-    /**
-     * A login account was chosen in Settings: tabs opened from now on use it, open ones are
-     * unchanged; the home directory in the Files app follows.
-     */
-    fun setLogin(value: String) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
-        Documents.rootsChanged(this)
-        settingsChanged()
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, getString(R.string.channel_sessions), NotificationManager.IMPORTANCE_LOW,
+        )
+        val services = NotificationChannel(
+            NETWORK_CHANNEL_ID, getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
+        )
+        val problems = NotificationChannel(
+            PROBLEMS_CHANNEL_ID, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
+        )
+        getSystemService(NotificationManager::class.java)
+            .createNotificationChannels(listOf(channel, services, problems))
     }
 
-    /**
-     * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by
-     * default, the android/documents map).
-     */
-    val systemDocuments: Boolean get() = showSystemDocuments(this)
-
-    fun setSystemDocuments(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_SYSTEM_DOCUMENTS, on).apply()
-        Documents.rootsChanged(this)
-        settingsChanged()
+    private fun notification(): Notification {
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val exit = PendingIntent.getService(
+            this, 1, Intent(this, TerminalService::class.java).setAction(ACTION_EXIT_ALL),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        // Tabs whose shell has ended stay open but are not running
+        val n = sessions.count { it.isRunning }
+        val sw = switching
+        val error = startError
+        val state = when {
+            exiting -> getString(R.string.stopping)
+            machine == 0L && progress != null -> progress
+            machine == 0L && error != null -> getString(R.string.start_failed, error)
+            n == 0 && machine != 0L -> getString(R.string.background_running)
+            else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
+        }
+        val text = if (wakeLock != null) getString(R.string.kept_awake, state) else state
+        val builder = Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setContentIntent(open)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+        if (sw != null) {
+            // A distro switch download: progress on the second line, cancellable from the
+            // notification
+            val cancel = PendingIntent.getService(
+                this, 2, Intent(this, TerminalService::class.java).setAction(ACTION_CANCEL_SWITCH),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
+            if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
+            builder.addAction(Notification.Action.Builder(null, getString(R.string.cancel_download), cancel).build())
+        }
+        if (!exiting) {
+            val toggle = PendingIntent.getService(
+                this, 3, Intent(this, TerminalService::class.java).setAction(ACTION_TOGGLE_KEEP_AWAKE),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            val label = getString(if (keepAwake) R.string.allow_sleep else R.string.keep_awake)
+            builder.addAction(Notification.Action.Builder(null, label, toggle).build())
+        }
+        return builder
+            .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
+            .build()
     }
 
-    /**
-     * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
-     * on by default, the android/terminal map); [MainActivity] reads it whenever it starts.
-     */
-    val fillWide: Boolean get() = fillWide(this)
-
-    fun setFillWide(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FILL_WIDE, on).apply()
-        settingsChanged()
+    private fun updateNotification() {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
     }
 
     /**
@@ -514,283 +506,11 @@ class TerminalService : Service() {
     /** Takes what there is to tell the user (given to one UI only). */
     fun takeNotice(): String? = notice.also { notice = null }
 
-    /**
-     * Switching distros or resetting the rootfs is possible: the kernel is running, or the start
-     * failed (this is how a broken store is recovered).
-     */
-    val canSwitch: Boolean get() = switching == null && downloader == null && (machine != 0L || startError != null)
-
-    /**
-     * Switches to [distro] (from Settings; resetting the rootfs switches to the installed one). The
-     * tarball is first downloaded and verified in the background while the old system keeps
-     * running, which can be cancelled ([cancelSwitch]); only when the download is done are all
-     * sessions ended, the kernel stopped and the store deleted, and the new one imported. If the
-     * download fails the old system stays untouched.
-     */
-    internal fun switchTo(distro: Rootfs.Distro) {
-        if (!canSwitch) return
-        val sw = Switch(distro)
-        switching = sw
-        downloader = sw
-        settingsChanged()
-        thread(name = "appine-download") {
-            val result = runCatching {
-                Rootfs.download(this, distro, progress = { done, total ->
-                    sw.done = done
-                    sw.total = total
-                    main.post { if (switching === sw) settingsChanged() }
-                }, cancelled = { sw.cancelled })
-            }
-            main.post {
-                if (downloader === sw) downloader = null
-                if (switching !== sw) {
-                    // Already cancelled: the result is not wanted, it is just that switching is
-                    // possible again now
-                    settingsChanged()
-                    return@post
-                }
-                switching = null
-                result.onSuccess {
-                    when {
-                        machine != 0L || startError != null -> replace(distro)
-                        // The kernel is restarting (a guest reboot): replace once it is up
-                        starting || transitioning -> pendingReplace = distro
-                    }
-                }.onFailure {
-                    if (it !is Rootfs.Cancelled) {
-                        Log.w(TAG, "cannot download ${distro.label}", it)
-                        tell(getString(R.string.download_failed, distro.label, it.message ?: it.toString()))
-                    }
-                }
-                settingsChanged()
-            }
-        }
-    }
-
-    /** No switch after all: abort the download (keeping no partial file). */
-    fun cancelSwitch() {
-        val sw = switching ?: return
-        sw.cancelled = true
-        switching = null
-        settingsChanged()
-    }
-
-    /**
-     * After [switchTo] has downloaded: ends all sessions, stops the kernel (there is none if the
-     * start failed), deletes the store and imports [distro]. Stopping the kernel and deleting files
-     * are done on [worker].
-     */
-    private fun replace(distro: Rootfs.Distro) {
-        // The old accounts were all deleted with the store
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
-        transitioning = true
-        val m = detach()
-        startError = null
-        preparing(getString(R.string.preparing, distro.label))
-        worker.execute {
-            if (m != 0L) Native.stop(m)
-            mirrorThread?.join()
-            Rootfs.reset(this)
-            main.post {
-                transitioning = false
-                // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro
-                // (the start then stops it again) rather than leave the next start to import Alpine
-                start(distro)
-            }
-        }
-    }
-
-    /**
-     * A mirror was chosen in Settings: write it into the sources (on [worker], as the store has to
-     * be opened).
-     */
-    fun setMirror(mirror: String) {
-        val distro = Rootfs.installed(this) ?: return
-        if (machine == 0L || switching != null) return
-        worker.execute {
-            val written = runCatching { Rootfs.setMirror(this, distro, mirror) }
-                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-                .getOrDefault(true)
-            main.post {
-                if (!written) mirrorNotFound()
-                settingsChanged()
-            }
-        }
-    }
-
-    /**
-     * The sources contain no built-in mirror at all (all replaced by mirrors outside the list), so
-     * the mirror chosen in Settings was not written: tell the user to edit them by hand. Since
-     * Android 12 toasts have at most two lines, so no path is given.
-     */
-    private fun mirrorNotFound() {
-        Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
-    }
-
-    /** "Automatic" was chosen in Settings: probe again and write the fastest. */
-    fun autoMirror() {
-        val distro = Rootfs.installed(this) ?: return
-        if (machine == 0L || switching != null || mirrorThread?.isAlive == true) return
-        mirrorThread = thread(name = "appine-mirrors") {
-            val written = Rootfs.chooseMirror(this, distro)
-            main.post {
-                if (!written) mirrorNotFound()
-                settingsChanged()
-            }
-        }
-    }
-
-    /**
-     * The execution tier was changed in Settings (debug builds only): record it and restart the
-     * kernel.
-     */
-    fun setTier(value: Int) {
-        if (!BuildConfig.DEBUG || value == tier) return
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_TIER, value).apply()
-        restart()
-    }
-
-    private fun settingsChanged() {
-        updateNotification()
-        each { it.onSettingsChanged() }
-    }
-
-    /**
-     * Keep running with the screen off (a switch in Settings and in the notification, off by
-     * default, the android/service map).
-     */
-    val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
-
-    fun setKeepAwake(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_KEEP_AWAKE, on).apply()
-        updateWakeLock()
-        settingsChanged()
-    }
-
-    /** The `PARTIAL_WAKE_LOCK` held while keeping running with the screen off. */
-    private var wakeLock: PowerManager.WakeLock? = null
-
-    /**
-     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
-     * while the switch is on and the kernel is starting, running, restarting, being replaced or
-     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
-     * goes off and the guest's processes stop with it.
-     *
-     * The app always has a foreground service, so the lock stays effective in Doze:
-     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
-     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
-     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
-     * needed.
-     */
-    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
-    // fixed duration, and not released within the same call
-    @SuppressLint("WakelockTimeout", "Wakelock")
-    private fun updateWakeLock() {
-        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
-        val held = wakeLock
-        if (want && held == null) {
-            wakeLock = getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
-                .apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-        } else if (!want && held != null) {
-            held.release()
-            wakeLock = null
-        } else {
-            return
-        }
-        updateNotification()
-    }
-
-    /**
-     * Exit all (the button in the notification, the guest's `poweroff`, or no guest processes left
-     * after the last tab was closed): first shut down by inittab (OpenRC stops the services, so
-     * PostgreSQL and the like need no crash recovery next time), and only then stop the service;
-     * meanwhile the foreground service and the notification remain, so the app process is not
-     * killed as a cached process.
-     */
-    fun exitAll() {
-        if (exiting) return
-        exiting = true
-        // Activities release only in onStop, and the shutdown may be faster than that: treat them
-        // as already gone, and a UI present after the shutdown means the user opened the app again
-        switching?.cancelled = true
-        switching = null
-        pendingReplace = null
-        each { it.onExitAll() }
-        listeners.clear()
-        val m = detach()
-        updateNotification()
-        // A start, restart or replacement in progress finishes exiting itself once its kernel is up
-        // (or has failed): there is nothing to shut down yet, and stopping the service now would
-        // leave that kernel running
-        if (starting || transitioning) return
-        finishExit(m)
-    }
-
-    /**
-     * The rest of [exitAll]: shuts [m] down by inittab (or, not [booted] yet, just stops it), then
-     * stops the service.
-     */
-    private fun finishExit(m: Long, booted: Boolean = true) {
-        worker.execute {
-            if (m != 0L) {
-                if (booted) Native.shutdown(m) else Native.stop(m)
-            }
-            main.post {
-                exiting = false
-                updateWakeLock()
-                // Normal exit: do not restore the tabs next time. Tabs of a killed run that have not
-                // been restored yet (the start never succeeded) are kept for the next start
-                if (restore == null) Tabs.clear(this)
-                // The user opened the app again during the shutdown: start again, otherwise the UI
-                // stays at "Starting…" forever
-                if (listeners.isNotEmpty()) start(null) else stopSelf()
-            }
-        }
-    }
-
-    /**
-     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
-     * shut down, then start a new kernel (after which the Activity opens new sessions).
-     */
-    private fun restart() {
-        if (machine == 0L) return
-        transitioning = true
-        val m = detach()
-        each { it.onRestarting() }
-        worker.execute {
-            Native.shutdown(m)
-            main.post {
-                transitioning = false
-                // "Exit all" meanwhile left the rest to here
-                if (exiting) finishExit(0) else start(null)
-            }
-        }
-    }
-
-    /**
-     * Stops using the current kernel: stops listening to network callbacks and polling, ends all
-     * sessions, and returns the old handle. The handle is cleared first: otherwise, seeing the
-     * kernel still there when the sessions end, the Activity would think the last tab was closed.
-     */
-    private fun detach(): Long {
+    private fun setRoutes(routes: Array<String>) {
         val m = machine
-        if (watchingNetwork) {
-            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-            watchingNetwork = false
-        }
-        machine = 0
-        updateWakeLock()
-        main.removeCallbacks(poll)
-        main.removeCallbacks(periodicSave)
-        for (s in sessions) s.release()
-        sessions.clear()
-        unshown.clear()
-        sessionsChanged()
-        return m
+        // Callbacks may interleave with onDestroy: once worker is shut down there is no need to
+        // hand it over
+        if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -806,54 +526,37 @@ class TerminalService : Service() {
         return START_NOT_STICKY
     }
 
-    override fun onDestroy() {
+    override fun onBind(intent: Intent): IBinder = binder
+
+    fun addListener(l: Listener) {
+        if (l !in listeners) listeners.add(l)
         main.removeCallbacks(trimWhenHidden)
-        main.removeCallbacks(poll)
-        main.removeCallbacks(periodicSave)
-        main.removeCallbacks(saveSoon)
-        // The service stopped normally (after exitAll, or a failed start with no UI): do not restore
-        // next time, except tabs of a killed run that were never restored. Being killed never gets
-        // here
-        if (restore == null) Tabs.clear(this)
-        if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        for (s in sessions) s.release()
-        sessions.clear()
-        val m = machine
-        machine = 0
-        // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
-        // guest threads to exit, so not on the main thread
-        if (m != 0L) worker.execute { Native.shutdown(m) }
-        worker.shutdown()
-        wakeLock?.release()
-        wakeLock = null
-        super.onDestroy()
     }
 
-    /**
-     * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
-     * translations kept in the pool take up to 70–80 MB). Since Android 14 the `RUNNING_*` levels
-     * are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by [removeListener].
-     */
-    @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
-    override fun onTrimMemory(level: Int) {
-        super.onTrimMemory(level)
-        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
-            trimMemory()
+    fun removeListener(l: Listener) {
+        listeners.remove(l)
+        if (listeners.isEmpty()) {
+            main.removeCallbacks(trimWhenHidden)
+            main.postDelayed(trimWhenHidden, TRIM_DELAY_MS)
+            // The UI is gone and the app may be killed at any time: save the tabs first
             saveTabs()
+            stopIfFailed()
         }
     }
 
-    private fun trimMemory() {
-        val m = machine
-        if (m != 0L) worker.execute { Native.trimMemory(m) }
+    /**
+     * The start failed and no UI is left to show it: stop rather than keep a foreground service
+     * and its notification with nothing running (without a kernel there is no poll to end it).
+     * Opening the app again tries again.
+     */
+    private fun stopIfFailed() {
+        if (machine == 0L && startError != null && !starting && !transitioning && !exiting && listeners.isEmpty()) {
+            stopSelf()
+        }
     }
 
-    private fun setRoutes(routes: Array<String>) {
-        val m = machine
-        // Callbacks may interleave with onDestroy: once worker is shut down there is no need to
-        // hand it over
-        if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
-    }
+    /** A UI may remove itself during a callback, so iterate over a copy. */
+    private fun each(f: (Listener) -> Unit) = listeners.toList().forEach(f)
 
     /**
      * Opens a new terminal session (a login shell), logged in as [account] and starting in [cwd]
@@ -939,22 +642,33 @@ class TerminalService : Service() {
         }
     }
 
-    private fun updateNotification() {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
-    }
-
-    private fun createChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID, getString(R.string.channel_sessions), NotificationManager.IMPORTANCE_LOW,
+    /**
+     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. One notification per
+     * port.
+     */
+    private fun notifyListen(line: String) {
+        val fields = line.split('\t')
+        if (fields.size != 3) return
+        val comm = fields[0]
+        val port = fields[1].toIntOrNull() ?: return
+        val hostPort = fields[2].toIntOrNull() ?: return
+        val text = if (hostPort != port) {
+            getString(R.string.listening_mapped, hostPort, port)
+        } else {
+            getString(R.string.listening_direct)
+        }
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val services = NotificationChannel(
-            NETWORK_CHANNEL_ID, getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        val problems = NotificationChannel(
-            PROBLEMS_CHANNEL_ID, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannels(listOf(channel, services, problems))
+        val notification = Notification.Builder(this, NETWORK_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.listening_title, comm, port))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(LISTEN_NOTIFICATION_BASE + port, notification)
     }
 
     /**
@@ -1072,83 +786,369 @@ class TerminalService : Service() {
     }
 
     /**
-     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. One notification per
-     * port.
+     * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
+     * translations kept in the pool take up to 70–80 MB). Since Android 14 the `RUNNING_*` levels
+     * are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by [removeListener].
      */
-    private fun notifyListen(line: String) {
-        val fields = line.split('\t')
-        if (fields.size != 3) return
-        val comm = fields[0]
-        val port = fields[1].toIntOrNull() ?: return
-        val hostPort = fields[2].toIntOrNull() ?: return
-        val text = if (hostPort != port) {
-            getString(R.string.listening_mapped, hostPort, port)
-        } else {
-            getString(R.string.listening_direct)
+    @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
+            trimMemory()
+            saveTabs()
         }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, NETWORK_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.listening_title, comm, port))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(LISTEN_NOTIFICATION_BASE + port, notification)
     }
 
-    private fun notification(): Notification {
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val exit = PendingIntent.getService(
-            this, 1, Intent(this, TerminalService::class.java).setAction(ACTION_EXIT_ALL),
-            PendingIntent.FLAG_IMMUTABLE,
-        )
-        // Tabs whose shell has ended stay open but are not running
-        val n = sessions.count { it.isRunning }
-        val sw = switching
-        val error = startError
-        val state = when {
-            exiting -> getString(R.string.stopping)
-            machine == 0L && progress != null -> progress
-            machine == 0L && error != null -> getString(R.string.start_failed, error)
-            n == 0 && machine != 0L -> getString(R.string.background_running)
-            else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
+    private fun trimMemory() {
+        val m = machine
+        if (m != 0L) worker.execute { Native.trimMemory(m) }
+    }
+
+    /**
+     * Switching distros or resetting the rootfs is possible: the kernel is running, or the start
+     * failed (this is how a broken store is recovered).
+     */
+    val canSwitch: Boolean get() = switching == null && downloader == null && (machine != 0L || startError != null)
+
+    /**
+     * Switches to [distro] (from Settings; resetting the rootfs switches to the installed one). The
+     * tarball is first downloaded and verified in the background while the old system keeps
+     * running, which can be cancelled ([cancelSwitch]); only when the download is done are all
+     * sessions ended, the kernel stopped and the store deleted, and the new one imported. If the
+     * download fails the old system stays untouched.
+     */
+    internal fun switchTo(distro: Rootfs.Distro) {
+        if (!canSwitch) return
+        val sw = Switch(distro)
+        switching = sw
+        downloader = sw
+        settingsChanged()
+        thread(name = "appine-download") {
+            val result = runCatching {
+                Rootfs.download(this, distro, progress = { done, total ->
+                    sw.done = done
+                    sw.total = total
+                    main.post { if (switching === sw) settingsChanged() }
+                }, cancelled = { sw.cancelled })
+            }
+            main.post {
+                if (downloader === sw) downloader = null
+                if (switching !== sw) {
+                    // Already cancelled: the result is not wanted, it is just that switching is
+                    // possible again now
+                    settingsChanged()
+                    return@post
+                }
+                switching = null
+                result.onSuccess {
+                    when {
+                        machine != 0L || startError != null -> replace(distro)
+                        // The kernel is restarting (a guest reboot): replace once it is up
+                        starting || transitioning -> pendingReplace = distro
+                    }
+                }.onFailure {
+                    if (it !is Rootfs.Cancelled) {
+                        Log.w(TAG, "cannot download ${distro.label}", it)
+                        tell(getString(R.string.download_failed, distro.label, it.message ?: it.toString()))
+                    }
+                }
+                settingsChanged()
+            }
         }
-        val text = if (wakeLock != null) getString(R.string.kept_awake, state) else state
-        val builder = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
-            .setContentIntent(open)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-        if (sw != null) {
-            // A distro switch download: progress on the second line, cancellable from the
-            // notification
-            val cancel = PendingIntent.getService(
-                this, 2, Intent(this, TerminalService::class.java).setAction(ACTION_CANCEL_SWITCH),
-                PendingIntent.FLAG_IMMUTABLE,
-            )
-            builder.setSubText(getString(R.string.downloading, sw.distro.label, sw.done shr 20, sw.total shr 20))
-            if (sw.total > 0) builder.setProgress(sw.total.toInt(), sw.done.toInt(), false)
-            builder.addAction(Notification.Action.Builder(null, getString(R.string.cancel_download), cancel).build())
+    }
+
+    /** No switch after all: abort the download (keeping no partial file). */
+    fun cancelSwitch() {
+        val sw = switching ?: return
+        sw.cancelled = true
+        switching = null
+        settingsChanged()
+    }
+
+    /**
+     * After [switchTo] has downloaded: ends all sessions, stops the kernel (there is none if the
+     * start failed), deletes the store and imports [distro]. Stopping the kernel and deleting files
+     * are done on [worker].
+     */
+    private fun replace(distro: Rootfs.Distro) {
+        // The old accounts were all deleted with the store
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
+        transitioning = true
+        val m = detach()
+        startError = null
+        preparing(getString(R.string.preparing, distro.label))
+        worker.execute {
+            if (m != 0L) Native.stop(m)
+            mirrorThread?.join()
+            Rootfs.reset(this)
+            main.post {
+                transitioning = false
+                // Also after "Exit all" meanwhile: the store is gone, so import the chosen distro
+                // (the start then stops it again) rather than leave the next start to import Alpine
+                start(distro)
+            }
         }
-        if (!exiting) {
-            val toggle = PendingIntent.getService(
-                this, 3, Intent(this, TerminalService::class.java).setAction(ACTION_TOGGLE_KEEP_AWAKE),
-                PendingIntent.FLAG_IMMUTABLE,
-            )
-            val label = getString(if (keepAwake) R.string.allow_sleep else R.string.keep_awake)
-            builder.addAction(Notification.Action.Builder(null, label, toggle).build())
+    }
+
+    /**
+     * A mirror was chosen in Settings: write it into the sources (on [worker], as the store has to
+     * be opened).
+     */
+    fun setMirror(mirror: String) {
+        val distro = Rootfs.installed(this) ?: return
+        if (machine == 0L || switching != null) return
+        worker.execute {
+            val written = runCatching { Rootfs.setMirror(this, distro, mirror) }
+                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+                .getOrDefault(true)
+            main.post {
+                if (!written) mirrorNotFound()
+                settingsChanged()
+            }
         }
-        return builder
-            .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
-            .build()
+    }
+
+    /** "Automatic" was chosen in Settings: probe again and write the fastest. */
+    fun autoMirror() {
+        val distro = Rootfs.installed(this) ?: return
+        if (machine == 0L || switching != null || mirrorThread?.isAlive == true) return
+        mirrorThread = thread(name = "appine-mirrors") {
+            val written = Rootfs.chooseMirror(this, distro)
+            main.post {
+                if (!written) mirrorNotFound()
+                settingsChanged()
+            }
+        }
+    }
+
+    /**
+     * The sources contain no built-in mirror at all (all replaced by mirrors outside the list), so
+     * the mirror chosen in Settings was not written: tell the user to edit them by hand. Since
+     * Android 12 toasts have at most two lines, so no path is given.
+     */
+    private fun mirrorNotFound() {
+        Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
+    }
+
+    /**
+     * The login account of new tabs (chosen in Settings, the android/setup map):
+     * [ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or an account name. Goes back to automatic
+     * after a distro switch or a rootfs reset.
+     */
+    val login: String get() = login(this)
+
+    /**
+     * A login account was chosen in Settings: tabs opened from now on use it, open ones are
+     * unchanged; the home directory in the Files app follows.
+     */
+    fun setLogin(value: String) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
+        Documents.rootsChanged(this)
+        settingsChanged()
+    }
+
+    /**
+     * Keep running with the screen off (a switch in Settings and in the notification, off by
+     * default, the android/service map).
+     */
+    val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
+
+    fun setKeepAwake(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_KEEP_AWAKE, on).apply()
+        updateWakeLock()
+        settingsChanged()
+    }
+
+    /**
+     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
+     * while the switch is on and the kernel is starting, running, restarting, being replaced or
+     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
+     * goes off and the guest's processes stop with it.
+     *
+     * The app always has a foreground service, so the lock stays effective in Doze:
+     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
+     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
+     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
+     * needed.
+     */
+    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
+    // fixed duration, and not released within the same call
+    @SuppressLint("WakelockTimeout", "Wakelock")
+    private fun updateWakeLock() {
+        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
+        val held = wakeLock
+        if (want && held == null) {
+            wakeLock = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (!want && held != null) {
+            held.release()
+            wakeLock = null
+        } else {
+            return
+        }
+        updateNotification()
+    }
+
+    /**
+     * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by
+     * default, the android/documents map).
+     */
+    val systemDocuments: Boolean get() = showSystemDocuments(this)
+
+    fun setSystemDocuments(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_SYSTEM_DOCUMENTS, on).apply()
+        Documents.rootsChanged(this)
+        settingsChanged()
+    }
+
+    /**
+     * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
+     * on by default, the android/terminal map); [MainActivity] reads it whenever it starts.
+     */
+    val fillWide: Boolean get() = fillWide(this)
+
+    fun setFillWide(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FILL_WIDE, on).apply()
+        settingsChanged()
+    }
+
+    /**
+     * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
+     * takes it from Settings, effective at the next kernel start; a release build always runs Tier
+     * 1, ignoring a value recorded by an earlier debug install.
+     */
+    val tier: Int
+        get() = if (BuildConfig.DEBUG) getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1) else 1
+
+    /**
+     * The execution tier was changed in Settings (debug builds only): record it and restart the
+     * kernel.
+     */
+    fun setTier(value: Int) {
+        if (!BuildConfig.DEBUG || value == tier) return
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_TIER, value).apply()
+        restart()
+    }
+
+    private fun settingsChanged() {
+        updateNotification()
+        each { it.onSettingsChanged() }
+    }
+
+    /**
+     * Exit all (the button in the notification, the guest's `poweroff`, or no guest processes left
+     * after the last tab was closed): first shut down by inittab (OpenRC stops the services, so
+     * PostgreSQL and the like need no crash recovery next time), and only then stop the service;
+     * meanwhile the foreground service and the notification remain, so the app process is not
+     * killed as a cached process.
+     */
+    fun exitAll() {
+        if (exiting) return
+        exiting = true
+        // Activities release only in onStop, and the shutdown may be faster than that: treat them
+        // as already gone, and a UI present after the shutdown means the user opened the app again
+        switching?.cancelled = true
+        switching = null
+        pendingReplace = null
+        each { it.onExitAll() }
+        listeners.clear()
+        val m = detach()
+        updateNotification()
+        // A start, restart or replacement in progress finishes exiting itself once its kernel is up
+        // (or has failed): there is nothing to shut down yet, and stopping the service now would
+        // leave that kernel running
+        if (starting || transitioning) return
+        finishExit(m)
+    }
+
+    /**
+     * The rest of [exitAll]: shuts [m] down by inittab (or, not [booted] yet, just stops it), then
+     * stops the service.
+     */
+    private fun finishExit(m: Long, booted: Boolean = true) {
+        worker.execute {
+            if (m != 0L) {
+                if (booted) Native.shutdown(m) else Native.stop(m)
+            }
+            main.post {
+                exiting = false
+                updateWakeLock()
+                // Normal exit: do not restore the tabs next time. Tabs of a killed run that have not
+                // been restored yet (the start never succeeded) are kept for the next start
+                if (restore == null) Tabs.clear(this)
+                // The user opened the app again during the shutdown: start again, otherwise the UI
+                // stays at "Starting…" forever
+                if (listeners.isNotEmpty()) start(null) else stopSelf()
+            }
+        }
+    }
+
+    /**
+     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
+     * shut down, then start a new kernel (after which the Activity opens new sessions).
+     */
+    private fun restart() {
+        if (machine == 0L) return
+        transitioning = true
+        val m = detach()
+        each { it.onRestarting() }
+        worker.execute {
+            Native.shutdown(m)
+            main.post {
+                transitioning = false
+                // "Exit all" meanwhile left the rest to here
+                if (exiting) finishExit(0) else start(null)
+            }
+        }
+    }
+
+    /**
+     * Stops using the current kernel: stops listening to network callbacks and polling, ends all
+     * sessions, and returns the old handle. The handle is cleared first: otherwise, seeing the
+     * kernel still there when the sessions end, the Activity would think the last tab was closed.
+     */
+    private fun detach(): Long {
+        val m = machine
+        if (watchingNetwork) {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
+            watchingNetwork = false
+        }
+        machine = 0
+        updateWakeLock()
+        main.removeCallbacks(poll)
+        main.removeCallbacks(periodicSave)
+        for (s in sessions) s.release()
+        sessions.clear()
+        unshown.clear()
+        sessionsChanged()
+        return m
+    }
+
+    override fun onDestroy() {
+        main.removeCallbacks(trimWhenHidden)
+        main.removeCallbacks(poll)
+        main.removeCallbacks(periodicSave)
+        main.removeCallbacks(saveSoon)
+        // The service stopped normally (after exitAll, or a failed start with no UI): do not restore
+        // next time, except tabs of a killed run that were never restored. Being killed never gets
+        // here
+        if (restore == null) Tabs.clear(this)
+        if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
+        for (s in sessions) s.release()
+        sessions.clear()
+        val m = machine
+        machine = 0
+        // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
+        // guest threads to exit, so not on the main thread
+        if (m != 0L) worker.execute { Native.shutdown(m) }
+        worker.shutdown()
+        wakeLock?.release()
+        wakeLock = null
+        super.onDestroy()
     }
 
     companion object {

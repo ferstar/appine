@@ -73,48 +73,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         }
     }
 
-    /**
-     * One settings row (list_item.xml): a title, with the current value or a description below; a
-     * [toggle] row has a switch at the end (tapping the whole row toggles it; the switch itself
-     * only displays, and accessibility services see the row as the switch).
-     */
-    private inner class Row(title: Int, toggle: Boolean = false, onClick: () -> Unit) {
-        val view: View = layoutInflater.inflate(R.layout.list_item, list, false)
-        private val summary: TextView = view.findViewById(R.id.summary)
-        private val switch: MaterialSwitch? = view.findViewById<MaterialSwitch>(R.id.toggle).takeIf { toggle }
-
-        /** Before the first [set], so that the first state jumps into place instead of sliding. */
-        private var shown = false
-
-        init {
-            view.findViewById<TextView>(R.id.title).setText(title)
-            switch?.let { sw ->
-                sw.visibility = View.VISIBLE
-                view.accessibilityDelegate = object : View.AccessibilityDelegate() {
-                    override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
-                        super.onInitializeAccessibilityNodeInfo(host, info)
-                        info.className = Switch::class.java.name
-                        info.isCheckable = true
-                        info.isChecked = sw.isChecked
-                    }
-                }
-            }
-            view.setOnClickListener { onClick() }
-        }
-
-        fun set(text: CharSequence, enabled: Boolean, checked: Boolean = false) {
-            summary.text = text
-            switch?.let {
-                it.isChecked = checked
-                // Ends the thumb's slide, which SwitchCompat starts for a change after layout
-                if (!shown) it.jumpDrawablesToCurrentState()
-            }
-            shown = true
-            view.isEnabled = enabled
-            view.alpha = if (enabled) 1f else DISABLED_ALPHA
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         enableEdgeToEdge()
@@ -165,12 +123,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         }
     }
 
-    /** A heading (list_header.xml) and its rows. */
-    private fun group(heading: Int, vararg rows: Row) {
-        list.addView((layoutInflater.inflate(R.layout.list_header, list, false) as TextView).apply { setText(heading) })
-        for (row in rows) list.addView(row.view)
-    }
-
     override fun onStart() {
         super.onStart()
         val intent = Intent(this, TerminalService::class.java)
@@ -185,14 +137,55 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         super.onStop()
     }
 
-    // ---- TerminalService.Listener ----
+    /**
+     * One settings row (list_item.xml): a title, with the current value or a description below; a
+     * [toggle] row has a switch at the end (tapping the whole row toggles it; the switch itself
+     * only displays, and accessibility services see the row as the switch).
+     */
+    private inner class Row(title: Int, toggle: Boolean = false, onClick: () -> Unit) {
+        val view: View = layoutInflater.inflate(R.layout.list_item, list, false)
+        private val summary: TextView = view.findViewById(R.id.summary)
+        private val switch: MaterialSwitch? = view.findViewById<MaterialSwitch>(R.id.toggle).takeIf { toggle }
 
-    override fun onMachineReady(error: String?) {
-        render()
-        loadAccounts()
+        /** Before the first [set], so that the first state jumps into place instead of sliding. */
+        private var shown = false
+
+        init {
+            view.findViewById<TextView>(R.id.title).setText(title)
+            switch?.let { sw ->
+                sw.visibility = View.VISIBLE
+                view.accessibilityDelegate = object : View.AccessibilityDelegate() {
+                    override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                        super.onInitializeAccessibilityNodeInfo(host, info)
+                        info.className = Switch::class.java.name
+                        info.isCheckable = true
+                        info.isChecked = sw.isChecked
+                    }
+                }
+            }
+            view.setOnClickListener { onClick() }
+        }
+
+        fun set(text: CharSequence, enabled: Boolean, checked: Boolean = false) {
+            summary.text = text
+            switch?.let {
+                it.isChecked = checked
+                // Ends the thumb's slide, which SwitchCompat starts for a change after layout
+                if (!shown) it.jumpDrawablesToCurrentState()
+            }
+            shown = true
+            view.isEnabled = enabled
+            view.alpha = if (enabled) 1f else DISABLED_ALPHA
+        }
     }
 
-    override fun onSettingsChanged() = render()
+    /** A heading (list_header.xml) and its rows. */
+    private fun group(heading: Int, vararg rows: Row) {
+        list.addView((layoutInflater.inflate(R.layout.list_header, list, false) as TextView).apply { setText(heading) })
+        for (row in rows) list.addView(row.view)
+    }
+
+    // ---- TerminalService.Listener ----
 
     /**
      * Replacing the store (importing a new distro) begins: go back to the terminal to see the
@@ -200,9 +193,12 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
      */
     override fun onProgress(text: String) = finish()
 
-    override fun onRestarting() = finish()
+    override fun onMachineReady(error: String?) {
+        render()
+        loadAccounts()
+    }
 
-    override fun onExitAll() = finish()
+    override fun onSettingsChanged() = render()
 
     /** The download for a distro switch failed. */
     override fun onNotice() {
@@ -212,6 +208,10 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             .setPositiveButton(android.R.string.ok, null)
             .show()
     }
+
+    override fun onRestarting() = finish()
+
+    override fun onExitAll() = finish()
 
     // ---- Display ----
 
@@ -251,6 +251,23 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
     }
 
+    private fun loginSummary(login: String): String = when (login) {
+        ConsolePty.LOGIN_AUTO -> accounts.firstOrNull()?.let { getString(R.string.login_auto_user, it.name) }
+            ?: getString(R.string.login_auto_root)
+        ConsolePty.LOGIN_ROOT -> login
+        else -> if (accounts.any { it.name == login }) login else getString(R.string.login_missing, login)
+    }
+
+    private fun loadAccounts() {
+        thread(name = "appine-accounts") {
+            val list = Rootfs.regularAccounts(this)
+            runOnUiThread {
+                accounts = list
+                render()
+            }
+        }
+    }
+
     // ---- Actions ----
 
     private fun onDistro() {
@@ -278,31 +295,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             .show()
     }
 
-    /** When the very first import failed (no store), resets to Alpine, as on the first run. */
-    private fun onReset() {
-        val installed = Rootfs.installed(this) ?: Rootfs.Distro.ALPINE
-        confirmSwitch(installed, getString(R.string.reset_title))
-    }
-
-    /**
-     * Confirms before switching to [distro] (a reset switches to the installed one): every file in
-     * the rootfs is deleted.
-     */
-    private fun confirmSwitch(distro: Rootfs.Distro, title: String) {
-        val download = distro.download
-        val message = if (download != null) {
-            getString(R.string.switch_message_download, distro.label, download.size shr 20)
-        } else {
-            getString(R.string.switch_message, distro.label)
-        }
-        MaterialAlertDialogBuilder(this)
-            .setTitle(title)
-            .setMessage(message)
-            .setPositiveButton(R.string.switch_confirm) { _, _ -> service?.switchTo(distro) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
     private fun onMirror() {
         val distro = Rootfs.installed(this) ?: return
         val current = Rootfs.mirror(this)
@@ -316,23 +308,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
-    }
-
-    private fun loadAccounts() {
-        thread(name = "appine-accounts") {
-            val list = Rootfs.regularAccounts(this)
-            runOnUiThread {
-                accounts = list
-                render()
-            }
-        }
-    }
-
-    private fun loginSummary(login: String): String = when (login) {
-        ConsolePty.LOGIN_AUTO -> accounts.firstOrNull()?.let { getString(R.string.login_auto_user, it.name) }
-            ?: getString(R.string.login_auto_root)
-        ConsolePty.LOGIN_ROOT -> login
-        else -> if (accounts.any { it.name == login }) login else getString(R.string.login_missing, login)
     }
 
     /**
@@ -354,6 +329,31 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
                 }
                 Toast.makeText(this, getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
             }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /** When the very first import failed (no store), resets to Alpine, as on the first run. */
+    private fun onReset() {
+        val installed = Rootfs.installed(this) ?: Rootfs.Distro.ALPINE
+        confirmSwitch(installed, getString(R.string.reset_title))
+    }
+
+    /**
+     * Confirms before switching to [distro] (a reset switches to the installed one): every file in
+     * the rootfs is deleted.
+     */
+    private fun confirmSwitch(distro: Rootfs.Distro, title: String) {
+        val download = distro.download
+        val message = if (download != null) {
+            getString(R.string.switch_message_download, distro.label, download.size shr 20)
+        } else {
+            getString(R.string.switch_message, distro.label)
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton(R.string.switch_confirm) { _, _ -> service?.switchTo(distro) }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
     }

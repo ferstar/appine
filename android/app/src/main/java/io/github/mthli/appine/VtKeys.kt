@@ -80,11 +80,11 @@ internal object VtKeys {
         KeyEvent.KEYCODE_NUM_LOCK, KeyEvent.KEYCODE_SCROLL_LOCK,
     )
 
-    /** Modifier and lock keys, which programs normally never see on their own. */
-    fun isModifier(keyCode: Int) = keyCode in modifiers
-
     /** The physical key, 0 (unidentified) for keys libghostty-vt has no number for. */
     fun of(keyCode: Int): Int = keys[keyCode] ?: 0
+
+    /** Modifier and lock keys, which programs normally never see on their own. */
+    fun isModifier(keyCode: Int) = keyCode in modifiers
 
     /** libghostty-vt's modifier bits of a key event's meta state. */
     fun mods(metaState: Int): Int {

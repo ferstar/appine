@@ -82,8 +82,14 @@ internal object Rootfs {
         ),
     }
 
-    /** The mirror's host name, for display in Settings. */
-    fun host(mirror: String): String = mirror.substringAfter("://").substringBefore('/')
+    /** Thrown when a download is aborted ([download]'s `cancelled` returns true). */
+    class Cancelled : IOException("cancelled")
+
+    /** The server sent more than the pinned length ([fetch]); resuming would not help. */
+    private class Oversize(message: String) : IOException(message)
+
+    /** An account in `/etc/passwd`. */
+    data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
     /** The most bytes and time a probe downloads. */
     private const val PROBE_BYTES = 512 * 1024
@@ -103,6 +109,15 @@ internal object Rootfs {
     private const val KEY_MIRROR = "mirror"
     private const val KEY_MIRROR_MANUAL = "mirror_manual"
 
+    /**
+     * The store's read-write lock. The kernel must be the only user of the store when it opens it;
+     * only then does it do the boot cleanup (emptying `/dev/shm` and `/run`, deleting objects that
+     * were not committed last time); the DocumentsProvider may open the store separately at any
+     * time on binder threads, holding the read lock each time, and starting the kernel or deleting
+     * the store holds the write lock.
+     */
+    val access = ReentrantReadWriteLock()
+
     fun store(context: Context): File = File(context.filesDir, "rootfs")
 
     /** The store has been imported and configured. */
@@ -121,33 +136,6 @@ internal object Rootfs {
         if (!isReady(context)) return null
         val name = prefs(context).getString(KEY_DISTRO, null) ?: return Distro.ALPINE
         return Distro.entries.firstOrNull { it.name == name } ?: Distro.ALPINE
-    }
-
-    /** Thrown when a download is aborted ([download]'s `cancelled` returns true). */
-    class Cancelled : IOException("cancelled")
-
-    /** The server sent more than the pinned length ([fetch]); resuming would not help. */
-    private class Oversize(message: String) : IOException(message)
-
-    private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
-
-    /**
-     * Downloads the tarball of [distro] into the cache directory, unless a verified one is already
-     * in the cache. While downloading, [progress] receives the bytes downloaded so far and in
-     * total; when [cancelled] returns true the download aborts, throwing [Cancelled]. Blocks; call
-     * it on a background thread.
-     */
-    @Throws(IOException::class)
-    fun download(
-        context: Context,
-        distro: Distro,
-        progress: (Long, Long) -> Unit = { _, _ -> },
-        cancelled: () -> Boolean = { false },
-    ) {
-        val download = distro.download ?: return
-        val tarball = tarball(context, distro)
-        if (tarball.length() == download.size && sha256(tarball) == download.sha256) return
-        fetch(download, tarball, cancelled, progress)
     }
 
     /**
@@ -196,6 +184,78 @@ internal object Rootfs {
         syncDir(store.parentFile!!)
     }
 
+    private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
+
+    @Throws(IOException::class)
+    private fun configure(store: String, distro: Distro) {
+        val (sources, content) = sources(distro, distro.mirrors[0])
+        write(store, sources, content)
+        write(store, "/etc/hostname", "localhost\n")
+        if (distro == Distro.ALPINE) {
+            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
+        } else {
+            // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
+            // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
+            // take effect
+            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
+            write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
+        }
+        write(store, "/etc/profile.d/appine.sh", PROFILE)
+        val install = when (distro) {
+            Distro.ALPINE -> "apk add git python3"
+            Distro.DEBIAN -> "apt update && apt install git python3"
+        }
+        write(
+            store, "/etc/motd",
+            """
+            Welcome to appine: ${distro.label}, running inside an Android app.
+
+            Install packages with ${install.substringBefore(' ')}, for example:  $install
+
+            """.trimIndent(),
+        )
+    }
+
+    /** The package manager's sources: which file they are written in and what the content is. */
+    private fun sources(distro: Distro, mirror: String): Pair<String, String> = when (distro) {
+        Distro.ALPINE -> "/etc/apk/repositories" to
+            "$mirror/${BuildConfig.ALPINE_BRANCH}/main\n$mirror/${BuildConfig.ALPINE_BRANCH}/community\n"
+        // The rootfs has no ca-certificates, so apt uses http (the packages are signed)
+        Distro.DEBIAN -> "/etc/apt/sources.list.d/debian.sources" to
+            """
+            Types: deb
+            URIs: http://$mirror/debian
+            Suites: trixie trixie-updates
+            Components: main
+            Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+
+            Types: deb
+            URIs: http://$mirror/debian-security
+            Suites: trixie-security
+            Components: main
+            Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
+
+            """.trimIndent()
+    }
+
+    /**
+     * `/etc/profile.d/appine.sh`: shows the motd, sets the terminal and language environment
+     * variables and a coloured prompt. Which directory the shell starts in is decided by the
+     * assets' `login.sh` (tabs restored after the app was killed start in their original directory,
+     * the android/service map).
+     */
+    private val PROFILE = """
+        cat /etc/motd 2>/dev/null
+        export TERM=xterm-256color
+        export LANG=C.UTF-8
+        export NMAP_UNPRIVILEGED=1
+        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+
+    """.trimIndent()
+
+    private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
+        Native.writeFile(store, path, text.toByteArray(), 420 /* 0644 */, overwrite)
+
     /** Makes renames and deletions in directory [dir] durable. */
     private fun syncDir(dir: File) {
         try {
@@ -210,10 +270,273 @@ internal object Rootfs {
         }
     }
 
-    /** Deletes the app's store (distro switch, rootfs reset). The kernel must be stopped first. */
-    fun reset(context: Context) = access.write {
-        File(context.filesDir, "rootfs.tmp").deleteRecursively()
-        if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
+    /**
+     * Probes the mirrors of [distro] concurrently and writes the fastest into the package manager's
+     * sources ([writeMirror]); if all fail, nothing changes. When the user chose a mirror in
+     * Settings (also during the probe), it is left alone. Returns false when the sources have no
+     * built-in mirror and nothing changed. Blocks for a few seconds; call it on a background
+     * thread. Debian's mirrors are written as host names only, and probed with https.
+     */
+    fun chooseMirror(context: Context, distro: Distro): Boolean {
+        prefs(context).edit().putBoolean(KEY_MIRROR_MANUAL, false).apply()
+        val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
+        val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
+        val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return true
+        Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
+        synchronized(this) {
+            if (isMirrorManual(context)) return true
+            // Could not write (an I/O error): the sources and the recorded mirror both stay as they
+            // were, and the "no built-in mirror" hint would be wrong
+            val written = runCatching { writeMirror(store(context).path, distro, best.first) }
+                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+                .getOrElse { return true }
+            if (written) {
+                prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
+            } else {
+                Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
+            }
+            return written
+        }
+    }
+
+    /**
+     * [urls] sorted by measured speed from fast to slow; those that could not be measured follow in
+     * their original order. Not probed when there is only one.
+     */
+    private fun fastest(urls: List<String>): List<String> {
+        if (urls.size < 2) return urls
+        val speeds = probeAll(urls)
+        Log.i(TAG, "download speeds: ${urls.zip(speeds)}")
+        return urls.indices.sortedByDescending { speeds[it] ?: -1.0 }.map { urls[it] }
+    }
+
+    /**
+     * Probes [urls] concurrently and returns each one's speed (bytes per ms), null for failures.
+     * Blocks for a few seconds.
+     */
+    private fun probeAll(urls: List<String>): List<Double?> {
+        val pool = Executors.newFixedThreadPool(urls.size)
+        val results = urls.map { url -> pool.submit<Double?> { probe(url) } }
+        val speeds = results.map {
+            runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull()
+        }
+        pool.shutdownNow()
+        return speeds
+    }
+
+    /**
+     * Downloads the beginning of [address] and returns the speed (bytes per ms, including
+     * connection setup); null when not a single byte arrived. Compared by throughput rather than by
+     * the time to finish a small piece: some mirrors are fast for a small piece at the start and
+     * are throttled after that.
+     */
+    private fun probe(address: String): Double? = runCatching {
+        val url = URL(address)
+        val start = System.nanoTime()
+        val elapsed = { (System.nanoTime() - start) / 1_000_000 }
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = PROBE_TIMEOUT_MS
+        conn.readTimeout = PROBE_TIMEOUT_MS
+        conn.setRequestProperty("Range", "bytes=0-${PROBE_BYTES - 1}")
+        try {
+            if (conn.responseCode !in 200..299) return@runCatching null
+            val buf = ByteArray(16 * 1024)
+            var total = 0
+            conn.inputStream.use { input ->
+                while (total < PROBE_BYTES && elapsed() < PROBE_TIMEOUT_MS) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    total += n
+                }
+            }
+            if (total == 0) null else total.toDouble() / elapsed().coerceAtLeast(1)
+        } finally {
+            conn.disconnect()
+        }
+    }.getOrNull()
+
+    /**
+     * [mirror] was chosen in Settings: write it into the package manager's sources of [distro]
+     * ([writeMirror]), after which no probe replaces it. Returns false when the sources have no
+     * built-in mirror and nothing changed.
+     */
+    @Throws(IOException::class)
+    fun setMirror(context: Context, distro: Distro, mirror: String): Boolean = synchronized(this) {
+        if (!writeMirror(store(context).path, distro, mirror)) return false
+        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
+        return true
+    }
+
+    /**
+     * Switches the package manager's sources of [distro] to [mirror] ([retarget]); when the sources
+     * file is gone it is rewritten by [sources]. When the sources contain no built-in mirror at all
+     * (all replaced by mirrors outside the list), nothing changes and false is returned. It can be
+     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
+     * caches are invalidated with it (the kernel/store map).
+     */
+    @Throws(IOException::class)
+    private fun writeMirror(store: String, distro: Distro, mirror: String): Boolean {
+        val (path, content) = sources(distro, mirror)
+        val old = Native.readFile(store, path) ?: return true.also { write(store, path, content) }
+        val new = retarget(distro, String(old), mirror) ?: return false
+        if (new != String(old)) write(store, path, new)
+        return true
+    }
+
+    /**
+     * Replaces the addresses of built-in mirrors (any of [Distro.mirrors], http or https) in the
+     * sources file content [text] with [mirror], keeping the scheme; other addresses (repositories
+     * the user added, mirrors outside the list) are left alone. Lines the user added (Alpine's
+     * testing, Debian's backports) and changed components stay, and commented-out lines are
+     * replaced too. Returns null when there is no built-in mirror anywhere.
+     */
+    fun retarget(distro: Distro, text: String, mirror: String): String? {
+        val bare = { m: String -> m.substringAfter("://") }
+        val known = distro.mirrors.joinToString("|") { Regex.escape(bare(it)) }
+        val address = Regex("""(https?://)(?:$known)(?=[/\s]|$)""")
+        if (!address.containsMatchIn(text)) return null
+        return address.replace(text) { it.groupValues[1] + bare(mirror) }
+    }
+
+    /** The mirror's host name, for display in Settings. */
+    fun host(mirror: String): String = mirror.substringAfter("://").substringBefore('/')
+
+    /**
+     * The mirror written into the package manager's sources (an entry of [Distro.mirrors]); null
+     * while there is no store.
+     */
+    fun mirror(context: Context): String? = if (isReady(context)) prefs(context).getString(KEY_MIRROR, null) else null
+
+    /** The user chose the mirror in Settings (rather than a probe). */
+    fun isMirrorManual(context: Context): Boolean = prefs(context).getBoolean(KEY_MIRROR_MANUAL, false)
+
+    /**
+     * An `/etc/network/interfaces` with only the loopback interface (written before every kernel
+     * start, only when missing; one the user changed is left alone), the same as setup-alpine
+     * writes. The network is the host's (the kernel/net map); services that need the network (nginx
+     * and so on) have OpenRC bring up networking, which fails without this file, and then the
+     * services do not start either. `rc_provide` in rc.conf is not used: it is added to every
+     * service, and providing `clock` as well makes a cycle. Without OpenRC and ifupdown nobody
+     * reads this file.
+     */
+    @Throws(IOException::class)
+    fun ensureNetworkConfig(context: Context) = write(
+        store(context).path, "/etc/network/interfaces",
+        "auto lo\niface lo inet loopback\n",
+        overwrite = false,
+    )
+
+    /**
+     * On Alpine, puts the doas package bundled with the app into the store
+     * (`/var/cache/appine/doas.apk`): the login script installs it offline when a regular user
+     * first becomes the login account (the android/setup map). Written before every kernel start,
+     * so it is replaced by the new one after an app upgrade.
+     */
+    @Throws(IOException::class)
+    fun ensureLoginTools(context: Context) {
+        if (installed(context) != Distro.ALPINE) return
+        val data = context.assets.open("doas.apk").use { it.readBytes() }
+        Native.writeFile(store(context).path, "/var/cache/appine/doas.apk", data, 420 /* 0644 */, true)
+    }
+
+    /**
+     * The copy written before round 194: it ended with one more line, `cd "$HOME"`, which took
+     * restored tabs back to the home directory.
+     */
+    private val OLD_PROFILE = PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
+
+    /**
+     * Replaces the profile the app wrote into a previously imported store with the current one, if
+     * it was not changed.
+     */
+    @Throws(IOException::class)
+    fun updateProfile(context: Context) {
+        val path = "/etc/profile.d/appine.sh"
+        val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
+        if (String(old) == OLD_PROFILE) write(store(context).path, path, PROFILE)
+    }
+
+    /**
+     * Run in the guest before every boot (`sh -c`): when OpenRC is installed and none of
+     * hwclock/osclock/swclock is in any runlevel, adds osclock to boot. busybox's syslog does
+     * `need clock`, and OpenRC provides clock with hwclock by default, which cannot read an RTC or
+     * set the host's time, so the boot log always has a failure; osclock means "the operating
+     * system manages the time" and does nothing (the kernel/process map). Whichever clock service
+     * the user put in place is left alone.
+     */
+    const val PREFER_OSCLOCK = "[ -x /sbin/rc-update ] && [ -e /etc/init.d/osclock ] || exit 0; " +
+        "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
+        "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
+        "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
+
+    /**
+     * The services that did not start at this boot: OpenRC writes
+     * ` * ERROR: <service> failed to start` into `/var/log/boot.log` (the kernel empties this file
+     * at every boot, the kernel/process map). Empty without OpenRC or when it cannot be read.
+     */
+    fun failedServices(context: Context): List<String> {
+        val log = runCatching { Native.readFile(store(context).path, "/var/log/boot.log") }.getOrNull()
+            ?: return emptyList()
+        return Regex("""ERROR: (\S+) failed to start""").findAll(String(log)).map { it.groupValues[1] }.distinct().toList()
+    }
+
+    /**
+     * Which account the login setting [login] ([ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or
+     * an account name) actually is: the rules are the same as in `login.sh`; automatic is the first
+     * regular user created, or root when there is none, and a named account that no longer exists
+     * is root too. When `/etc/passwd` cannot be read, it is root with home directory `/root`.
+     */
+    fun loginAccount(context: Context, login: String): Account {
+        val all = accounts(context).map { it.first }
+        val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, 0, "/root")
+        return when (login) {
+            ConsolePty.LOGIN_AUTO -> regularAccounts(context).firstOrNull() ?: root
+            ConsolePty.LOGIN_ROOT -> root
+            else -> all.firstOrNull { it.name == login } ?: root
+        }
+    }
+
+    /**
+     * The regular users that can be the login account: UID 1000–65533 with a login shell (not
+     * nologin or false), sorted by UID; the first one is the one logged in "automatically". The
+     * rules are the same as in the assets' `login.sh`. Empty when it cannot be read.
+     */
+    fun regularAccounts(context: Context): List<Account> = accounts(context).mapNotNull { (account, shell) ->
+        if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
+        if (account.uid !in 1000..65533) return@mapNotNull null
+        account
+    }.sortedBy { it.uid }
+
+    /** The accounts in `/etc/passwd`, empty when it cannot be read. */
+    private fun accounts(context: Context): List<Pair<Account, String>> {
+        val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
+            ?: return emptyList()
+        return String(passwd).lines().mapNotNull { line ->
+            val f = line.split(':')
+            if (f.size < 7) return@mapNotNull null
+            val uid = f[2].toIntOrNull() ?: return@mapNotNull null
+            val gid = f[3].toIntOrNull() ?: return@mapNotNull null
+            Account(f[0], uid, gid, f[5]) to f[6]
+        }
+    }
+
+    /**
+     * Downloads the tarball of [distro] into the cache directory, unless a verified one is already
+     * in the cache. While downloading, [progress] receives the bytes downloaded so far and in
+     * total; when [cancelled] returns true the download aborts, throwing [Cancelled]. Blocks; call
+     * it on a background thread.
+     */
+    @Throws(IOException::class)
+    fun download(
+        context: Context,
+        distro: Distro,
+        progress: (Long, Long) -> Unit = { _, _ -> },
+        cancelled: () -> Boolean = { false },
+    ) {
+        val download = distro.download ?: return
+        val tarball = tarball(context, distro)
+        if (tarball.length() == download.size && sha256(tarball) == download.sha256) return
+        fetch(download, tarball, cancelled, progress)
     }
 
     /**
@@ -333,332 +656,9 @@ internal object Rootfs {
 
     private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
 
-    private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
-        Native.writeFile(store, path, text.toByteArray(), 420 /* 0644 */, overwrite)
-
-    /**
-     * Run in the guest before every boot (`sh -c`): when OpenRC is installed and none of
-     * hwclock/osclock/swclock is in any runlevel, adds osclock to boot. busybox's syslog does
-     * `need clock`, and OpenRC provides clock with hwclock by default, which cannot read an RTC or
-     * set the host's time, so the boot log always has a failure; osclock means "the operating
-     * system manages the time" and does nothing (the kernel/process map). Whichever clock service
-     * the user put in place is left alone.
-     */
-    const val PREFER_OSCLOCK = "[ -x /sbin/rc-update ] && [ -e /etc/init.d/osclock ] || exit 0; " +
-        "for s in hwclock osclock swclock; do for l in /etc/runlevels/*/\$s; do " +
-        "[ -e \"\$l\" ] || [ -L \"\$l\" ] && exit 0; done; done; " +
-        "exec /sbin/rc-update -q add osclock boot >/dev/null 2>&1"
-
-    /**
-     * An `/etc/network/interfaces` with only the loopback interface (written before every kernel
-     * start, only when missing; one the user changed is left alone), the same as setup-alpine
-     * writes. The network is the host's (the kernel/net map); services that need the network (nginx
-     * and so on) have OpenRC bring up networking, which fails without this file, and then the
-     * services do not start either. `rc_provide` in rc.conf is not used: it is added to every
-     * service, and providing `clock` as well makes a cycle. Without OpenRC and ifupdown nobody
-     * reads this file.
-     */
-    @Throws(IOException::class)
-    fun ensureNetworkConfig(context: Context) = write(
-        store(context).path, "/etc/network/interfaces",
-        "auto lo\niface lo inet loopback\n",
-        overwrite = false,
-    )
-
-    /**
-     * On Alpine, puts the doas package bundled with the app into the store
-     * (`/var/cache/appine/doas.apk`): the login script installs it offline when a regular user
-     * first becomes the login account (the android/setup map). Written before every kernel start,
-     * so it is replaced by the new one after an app upgrade.
-     */
-    @Throws(IOException::class)
-    fun ensureLoginTools(context: Context) {
-        if (installed(context) != Distro.ALPINE) return
-        val data = context.assets.open("doas.apk").use { it.readBytes() }
-        Native.writeFile(store(context).path, "/var/cache/appine/doas.apk", data, 420 /* 0644 */, true)
+    /** Deletes the app's store (distro switch, rootfs reset). The kernel must be stopped first. */
+    fun reset(context: Context) = access.write {
+        File(context.filesDir, "rootfs.tmp").deleteRecursively()
+        if (!store(context).deleteRecursively()) Log.w(TAG, "cannot delete all of the rootfs")
     }
-
-    /**
-     * The services that did not start at this boot: OpenRC writes
-     * ` * ERROR: <service> failed to start` into `/var/log/boot.log` (the kernel empties this file
-     * at every boot, the kernel/process map). Empty without OpenRC or when it cannot be read.
-     */
-    fun failedServices(context: Context): List<String> {
-        val log = runCatching { Native.readFile(store(context).path, "/var/log/boot.log") }.getOrNull()
-            ?: return emptyList()
-        return Regex("""ERROR: (\S+) failed to start""").findAll(String(log)).map { it.groupValues[1] }.distinct().toList()
-    }
-
-    /** An account in `/etc/passwd`. */
-    data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
-
-    /** The accounts in `/etc/passwd`, empty when it cannot be read. */
-    private fun accounts(context: Context): List<Pair<Account, String>> {
-        val passwd = runCatching { Native.readFile(store(context).path, "/etc/passwd") }.getOrNull()
-            ?: return emptyList()
-        return String(passwd).lines().mapNotNull { line ->
-            val f = line.split(':')
-            if (f.size < 7) return@mapNotNull null
-            val uid = f[2].toIntOrNull() ?: return@mapNotNull null
-            val gid = f[3].toIntOrNull() ?: return@mapNotNull null
-            Account(f[0], uid, gid, f[5]) to f[6]
-        }
-    }
-
-    /**
-     * The regular users that can be the login account: UID 1000–65533 with a login shell (not
-     * nologin or false), sorted by UID; the first one is the one logged in "automatically". The
-     * rules are the same as in the assets' `login.sh`. Empty when it cannot be read.
-     */
-    fun regularAccounts(context: Context): List<Account> = accounts(context).mapNotNull { (account, shell) ->
-        if (shell.isEmpty() || shell.endsWith("/nologin") || shell.endsWith("/false")) return@mapNotNull null
-        if (account.uid !in 1000..65533) return@mapNotNull null
-        account
-    }.sortedBy { it.uid }
-
-    /**
-     * Which account the login setting [login] ([ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or
-     * an account name) actually is: the rules are the same as in `login.sh`; automatic is the first
-     * regular user created, or root when there is none, and a named account that no longer exists
-     * is root too. When `/etc/passwd` cannot be read, it is root with home directory `/root`.
-     */
-    fun loginAccount(context: Context, login: String): Account {
-        val all = accounts(context).map { it.first }
-        val root = all.firstOrNull { it.name == ConsolePty.LOGIN_ROOT } ?: Account(ConsolePty.LOGIN_ROOT, 0, 0, "/root")
-        return when (login) {
-            ConsolePty.LOGIN_AUTO -> regularAccounts(context).firstOrNull() ?: root
-            ConsolePty.LOGIN_ROOT -> root
-            else -> all.firstOrNull { it.name == login } ?: root
-        }
-    }
-
-    /**
-     * The store's read-write lock. The kernel must be the only user of the store when it opens it;
-     * only then does it do the boot cleanup (emptying `/dev/shm` and `/run`, deleting objects that
-     * were not committed last time); the DocumentsProvider may open the store separately at any
-     * time on binder threads, holding the read lock each time, and starting the kernel or deleting
-     * the store holds the write lock.
-     */
-    val access = ReentrantReadWriteLock()
-
-    /**
-     * `/etc/profile.d/appine.sh`: shows the motd, sets the terminal and language environment
-     * variables and a coloured prompt. Which directory the shell starts in is decided by the
-     * assets' `login.sh` (tabs restored after the app was killed start in their original directory,
-     * the android/service map).
-     */
-    private val PROFILE = """
-        cat /etc/motd 2>/dev/null
-        export TERM=xterm-256color
-        export LANG=C.UTF-8
-        export NMAP_UNPRIVILEGED=1
-        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-
-    """.trimIndent()
-
-    /**
-     * The copy written before round 194: it ended with one more line, `cd "$HOME"`, which took
-     * restored tabs back to the home directory.
-     */
-    private val OLD_PROFILE = PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
-
-    /**
-     * Replaces the profile the app wrote into a previously imported store with the current one, if
-     * it was not changed.
-     */
-    @Throws(IOException::class)
-    fun updateProfile(context: Context) {
-        val path = "/etc/profile.d/appine.sh"
-        val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
-        if (String(old) == OLD_PROFILE) write(store(context).path, path, PROFILE)
-    }
-
-    /** The package manager's sources: which file they are written in and what the content is. */
-    private fun sources(distro: Distro, mirror: String): Pair<String, String> = when (distro) {
-        Distro.ALPINE -> "/etc/apk/repositories" to
-            "$mirror/${BuildConfig.ALPINE_BRANCH}/main\n$mirror/${BuildConfig.ALPINE_BRANCH}/community\n"
-        // The rootfs has no ca-certificates, so apt uses http (the packages are signed)
-        Distro.DEBIAN -> "/etc/apt/sources.list.d/debian.sources" to
-            """
-            Types: deb
-            URIs: http://$mirror/debian
-            Suites: trixie trixie-updates
-            Components: main
-            Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
-
-            Types: deb
-            URIs: http://$mirror/debian-security
-            Suites: trixie-security
-            Components: main
-            Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp
-
-            """.trimIndent()
-    }
-
-    @Throws(IOException::class)
-    private fun configure(store: String, distro: Distro) {
-        val (sources, content) = sources(distro, distro.mirrors[0])
-        write(store, sources, content)
-        write(store, "/etc/hostname", "localhost\n")
-        if (distro == Distro.ALPINE) {
-            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
-        } else {
-            // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
-            // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
-            // take effect
-            write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
-            write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
-        }
-        write(store, "/etc/profile.d/appine.sh", PROFILE)
-        val install = when (distro) {
-            Distro.ALPINE -> "apk add git python3"
-            Distro.DEBIAN -> "apt update && apt install git python3"
-        }
-        write(
-            store, "/etc/motd",
-            """
-            Welcome to appine: ${distro.label}, running inside an Android app.
-
-            Install packages with ${install.substringBefore(' ')}, for example:  $install
-
-            """.trimIndent(),
-        )
-    }
-
-    /**
-     * The mirror written into the package manager's sources (an entry of [Distro.mirrors]); null
-     * while there is no store.
-     */
-    fun mirror(context: Context): String? = if (isReady(context)) prefs(context).getString(KEY_MIRROR, null) else null
-
-    /** The user chose the mirror in Settings (rather than a probe). */
-    fun isMirrorManual(context: Context): Boolean = prefs(context).getBoolean(KEY_MIRROR_MANUAL, false)
-
-    /**
-     * Replaces the addresses of built-in mirrors (any of [Distro.mirrors], http or https) in the
-     * sources file content [text] with [mirror], keeping the scheme; other addresses (repositories
-     * the user added, mirrors outside the list) are left alone. Lines the user added (Alpine's
-     * testing, Debian's backports) and changed components stay, and commented-out lines are
-     * replaced too. Returns null when there is no built-in mirror anywhere.
-     */
-    fun retarget(distro: Distro, text: String, mirror: String): String? {
-        val bare = { m: String -> m.substringAfter("://") }
-        val known = distro.mirrors.joinToString("|") { Regex.escape(bare(it)) }
-        val address = Regex("""(https?://)(?:$known)(?=[/\s]|$)""")
-        if (!address.containsMatchIn(text)) return null
-        return address.replace(text) { it.groupValues[1] + bare(mirror) }
-    }
-
-    /**
-     * Switches the package manager's sources of [distro] to [mirror] ([retarget]); when the sources
-     * file is gone it is rewritten by [sources]. When the sources contain no built-in mirror at all
-     * (all replaced by mirrors outside the list), nothing changes and false is returned. It can be
-     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
-     * caches are invalidated with it (the kernel/store map).
-     */
-    @Throws(IOException::class)
-    private fun writeMirror(store: String, distro: Distro, mirror: String): Boolean {
-        val (path, content) = sources(distro, mirror)
-        val old = Native.readFile(store, path) ?: return true.also { write(store, path, content) }
-        val new = retarget(distro, String(old), mirror) ?: return false
-        if (new != String(old)) write(store, path, new)
-        return true
-    }
-
-    /**
-     * [mirror] was chosen in Settings: write it into the package manager's sources of [distro]
-     * ([writeMirror]), after which no probe replaces it. Returns false when the sources have no
-     * built-in mirror and nothing changed.
-     */
-    @Throws(IOException::class)
-    fun setMirror(context: Context, distro: Distro, mirror: String): Boolean = synchronized(this) {
-        if (!writeMirror(store(context).path, distro, mirror)) return false
-        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
-        return true
-    }
-
-    /**
-     * Probes the mirrors of [distro] concurrently and writes the fastest into the package manager's
-     * sources ([writeMirror]); if all fail, nothing changes. When the user chose a mirror in
-     * Settings (also during the probe), it is left alone. Returns false when the sources have no
-     * built-in mirror and nothing changed. Blocks for a few seconds; call it on a background
-     * thread. Debian's mirrors are written as host names only, and probed with https.
-     */
-    fun chooseMirror(context: Context, distro: Distro): Boolean {
-        prefs(context).edit().putBoolean(KEY_MIRROR_MANUAL, false).apply()
-        val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
-        val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
-        val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return true
-        Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
-        synchronized(this) {
-            if (isMirrorManual(context)) return true
-            // Could not write (an I/O error): the sources and the recorded mirror both stay as they
-            // were, and the "no built-in mirror" hint would be wrong
-            val written = runCatching { writeMirror(store(context).path, distro, best.first) }
-                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-                .getOrElse { return true }
-            if (written) {
-                prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
-            } else {
-                Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
-            }
-            return written
-        }
-    }
-
-    /**
-     * [urls] sorted by measured speed from fast to slow; those that could not be measured follow in
-     * their original order. Not probed when there is only one.
-     */
-    private fun fastest(urls: List<String>): List<String> {
-        if (urls.size < 2) return urls
-        val speeds = probeAll(urls)
-        Log.i(TAG, "download speeds: ${urls.zip(speeds)}")
-        return urls.indices.sortedByDescending { speeds[it] ?: -1.0 }.map { urls[it] }
-    }
-
-    /**
-     * Probes [urls] concurrently and returns each one's speed (bytes per ms), null for failures.
-     * Blocks for a few seconds.
-     */
-    private fun probeAll(urls: List<String>): List<Double?> {
-        val pool = Executors.newFixedThreadPool(urls.size)
-        val results = urls.map { url -> pool.submit<Double?> { probe(url) } }
-        val speeds = results.map {
-            runCatching { it.get(PROBE_TIMEOUT_MS * 2L, TimeUnit.MILLISECONDS) }.getOrNull()
-        }
-        pool.shutdownNow()
-        return speeds
-    }
-
-    /**
-     * Downloads the beginning of [address] and returns the speed (bytes per ms, including
-     * connection setup); null when not a single byte arrived. Compared by throughput rather than by
-     * the time to finish a small piece: some mirrors are fast for a small piece at the start and
-     * are throttled after that.
-     */
-    private fun probe(address: String): Double? = runCatching {
-        val url = URL(address)
-        val start = System.nanoTime()
-        val elapsed = { (System.nanoTime() - start) / 1_000_000 }
-        val conn = url.openConnection() as HttpURLConnection
-        conn.connectTimeout = PROBE_TIMEOUT_MS
-        conn.readTimeout = PROBE_TIMEOUT_MS
-        conn.setRequestProperty("Range", "bytes=0-${PROBE_BYTES - 1}")
-        try {
-            if (conn.responseCode !in 200..299) return@runCatching null
-            val buf = ByteArray(16 * 1024)
-            var total = 0
-            conn.inputStream.use { input ->
-                while (total < PROBE_BYTES && elapsed() < PROBE_TIMEOUT_MS) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    total += n
-                }
-            }
-            if (total == 0) null else total.toDouble() / elapsed().coerceAtLeast(1)
-        } finally {
-            conn.disconnect()
-        }
-    }.getOrNull()
 }

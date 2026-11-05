@@ -24,18 +24,18 @@ internal class VtSession(
     private val events: Events,
 ) {
 
-    /** The kernel console, -1 before the shell starts. */
-    val console: Int get() = pty.console
-
-    /** The login account setting the tab was opened with ([ConsolePty.login]). */
-    val login: String get() = pty.login
-
     /** What the service hears about (main thread). */
     interface Events {
         fun onTitleChanged(session: VtSession)
 
         fun onFinished(session: VtSession)
     }
+
+    /** The kernel console, -1 before the shell starts. */
+    val console: Int get() = pty.console
+
+    /** The login account setting the tab was opened with ([ConsolePty.login]). */
+    val login: String get() = pty.login
 
     /** The terminal ([VtNative]), 0 until [start] created it. */
     @Volatile
@@ -167,6 +167,18 @@ internal class VtSession(
         view?.onStarted()
     }
 
+    /** From vt.rs, on the pump thread: the screen changed since the last frame. */
+    @Suppress("unused")
+    fun onOutput() {
+        view?.postInvalidateOnAnimation()
+    }
+
+    /** From vt.rs, on the pump thread: a program set the title. */
+    @Suppress("unused")
+    fun onTitle() {
+        main.post { if (!released) events.onTitleChanged(this) }
+    }
+
     /** The grid changed: the terminal reflows and the console's foreground group gets SIGWINCH. */
     fun resize(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {
         if (tab == 0L) return
@@ -190,26 +202,6 @@ internal class VtSession(
         }
     }
 
-    /** Hangs up the console when the shell still runs: it gets SIGHUP. */
-    fun finishIfRunning() {
-        if (isRunning) hangUp()
-    }
-
-    /** The tab is closed or its kernel goes away: hang up and free the terminal. */
-    fun release() {
-        if (released) return
-        released = true
-        finishIfRunning()
-        writer?.shutdown()
-        // A running pump keeps the terminal until it returns
-        if (tab != 0L) VtNative.destroy(tab)
-    }
-
-    /** Closes the console once, so a later close cannot hang up a tab that reused its number. */
-    private fun hangUp() {
-        if (hungUp.compareAndSet(false, true)) pty.close()
-    }
-
     private fun exited(code: Int) {
         if (exit != null) return
         exit = code
@@ -228,15 +220,23 @@ internal class VtSession(
         events.onFinished(this)
     }
 
-    /** From vt.rs, on the pump thread: the screen changed since the last frame. */
-    @Suppress("unused")
-    fun onOutput() {
-        view?.postInvalidateOnAnimation()
+    /** The tab is closed or its kernel goes away: hang up and free the terminal. */
+    fun release() {
+        if (released) return
+        released = true
+        finishIfRunning()
+        writer?.shutdown()
+        // A running pump keeps the terminal until it returns
+        if (tab != 0L) VtNative.destroy(tab)
     }
 
-    /** From vt.rs, on the pump thread: a program set the title. */
-    @Suppress("unused")
-    fun onTitle() {
-        main.post { if (!released) events.onTitleChanged(this) }
+    /** Hangs up the console when the shell still runs: it gets SIGHUP. */
+    fun finishIfRunning() {
+        if (isRunning) hangUp()
+    }
+
+    /** Closes the console once, so a later close cannot hang up a tab that reused its number. */
+    private fun hangUp() {
+        if (hungUp.compareAndSet(false, true)) pty.close()
     }
 }

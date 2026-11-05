@@ -93,35 +93,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The shown tab's terminal, 0 when there is none or its shell has not started. */
     private val tab: Long get() = session?.tab ?: 0L
 
-    /**
-     * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
-     * again, and a selection drag or menu of the previous tab ends.
-     */
-    fun attach(s: VtSession?) {
-        if (s === session) return
-        session?.let { if (it.view === this) it.view = null }
-        menu?.finish()
-        drag = DRAG_NONE
-        autoscroll = 0
-        removeCallbacks(autoscrollTick)
-        selected = false
-        session = s
-        s?.view = this
-        if (s != null && cols > 0) {
-            s.resize(cols, rows, cellWidth, cellHeight)
-            // A tab whose shell has not started yet starts on this grid
-            host.onGrid(cols, rows, cellWidth, cellHeight)
-        }
-        full = true
-        invalidate()
-    }
-
-    /** The session's shell started: take the whole screen. */
-    fun onStarted() {
-        full = true
-        invalidate()
-    }
-
     private val upright = font("fonts/JetBrainsMono.ttf", 400)
     private val paints = arrayOf(
         textPaint(upright),
@@ -278,6 +249,35 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             fontFeatureSettings = "'calt' 0, 'liga' 0"
         }
 
+    /**
+     * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
+     * again, and a selection drag or menu of the previous tab ends.
+     */
+    fun attach(s: VtSession?) {
+        if (s === session) return
+        session?.let { if (it.view === this) it.view = null }
+        menu?.finish()
+        drag = DRAG_NONE
+        autoscroll = 0
+        removeCallbacks(autoscrollTick)
+        selected = false
+        session = s
+        s?.view = this
+        if (s != null && cols > 0) {
+            s.resize(cols, rows, cellWidth, cellHeight)
+            // A tab whose shell has not started yet starts on this grid
+            host.onGrid(cols, rows, cellWidth, cellHeight)
+        }
+        full = true
+        invalidate()
+    }
+
+    /** The session's shell started: take the whole screen. */
+    fun onStarted() {
+        full = true
+        invalidate()
+    }
+
     // ---- Metrics and the grid ----
 
     /**
@@ -381,24 +381,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
-    private fun stats(nanos: Long) {
-        frames++
-        frameNanos += nanos
-        frameMax = max(frameMax, nanos)
-        if (frames == 120) {
-            Log.d(
-                "appine-vt",
-                "frames: avg %.2f ms, max %.2f ms, %.1f rows each".format(
-                    frameNanos / 1e6 / frames, frameMax / 1e6, frameRows.toFloat() / frames,
-                ),
-            )
-            frames = 0
-            frameNanos = 0
-            frameMax = 0
-            frameRows = 0
-        }
-    }
-
     /** Takes a frame (format in `hosts/android/src/vt.c`) into the mirror and the bitmap. */
     private fun apply(b: ByteBuffer) {
         b.order(ByteOrder.LITTLE_ENDIAN)
@@ -493,18 +475,25 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun coordinate(b: ByteBuffer, at: Int): Int =
         (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
 
-    // ---- Painting ----
-
-    private fun fgOf(i: Int): Int {
-        val a = attrs[i]
-        val color = if (a and INVERSE != 0) bg[i].takeIf { it != 0 } ?: defaultBg else fg[i].takeIf { it != 0 } ?: defaultFg
-        return if (a and FAINT != 0) (color and 0x00ffffff) or 0x80000000.toInt() else color
+    private fun stats(nanos: Long) {
+        frames++
+        frameNanos += nanos
+        frameMax = max(frameMax, nanos)
+        if (frames == 120) {
+            Log.d(
+                "appine-vt",
+                "frames: avg %.2f ms, max %.2f ms, %.1f rows each".format(
+                    frameNanos / 1e6 / frames, frameMax / 1e6, frameRows.toFloat() / frames,
+                ),
+            )
+            frames = 0
+            frameNanos = 0
+            frameMax = 0
+            frameRows = 0
+        }
     }
 
-    private fun bgOf(i: Int): Int =
-        if (attrs[i] and INVERSE != 0) fg[i].takeIf { it != 0 } ?: defaultFg else bg[i].takeIf { it != 0 } ?: defaultBg
-
-    private fun paintOf(i: Int): Paint = paints[(attrs[i] and BOLD) or ((attrs[i] and ITALIC))]
+    // ---- Painting ----
 
     private fun drawRow(c: Canvas, y: Int) {
         val top = y * cellHeight
@@ -583,6 +572,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         flush()
         c.restore()
     }
+
+    private fun bgOf(i: Int): Int =
+        if (attrs[i] and INVERSE != 0) fg[i].takeIf { it != 0 } ?: defaultFg else bg[i].takeIf { it != 0 } ?: defaultBg
+
+    private fun fgOf(i: Int): Int {
+        val a = attrs[i]
+        val color = if (a and INVERSE != 0) bg[i].takeIf { it != 0 } ?: defaultBg else fg[i].takeIf { it != 0 } ?: defaultFg
+        return if (a and FAINT != 0) (color and 0x00ffffff) or 0x80000000.toInt() else color
+    }
+
+    private fun paintOf(i: Int): Paint = paints[(attrs[i] and BOLD) or ((attrs[i] and ITALIC))]
 
     /**
      * One cell's glyph, centred in its [span] cells: a wide one enlarged by [wideScale], and any
@@ -707,38 +707,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Input ----
 
-    /** Bytes for the program; the viewport returns to the bottom first. */
-    private fun send(data: ByteArray?) {
-        if (data == null || data.isEmpty()) return
-        if (!atBottom && tab != 0L) {
-            VtNative.scroll(tab, 0)
-            invalidate()
-        }
-        host.onInput(data)
-    }
-
-    /** Typed or pasted input, which also ends a selection. */
-    private fun input(data: ByteArray?) {
-        if (data == null || data.isEmpty()) return
-        if (selected) clearSelection()
-        send(data)
-    }
-
-    /** Text from the input method or the extra keys; one character with a one-shot modifier is a key. */
-    fun type(text: String) {
-        if ((host.ctrl || host.alt || host.shift) && text.codePointCount(0, text.length) == 1) {
-            val events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(text.toCharArray())
-            val down = events?.firstOrNull { it.action == KeyEvent.ACTION_DOWN && it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT }
-            if (down != null && key(down)) return
-        }
-        input(text.replace('\n', '\r').toByteArray())
-    }
-
-    /** A key from the extra keys row. */
-    fun press(keyCode: Int) {
-        key(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-    }
-
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
         key(event) || super.onKeyDown(keyCode, event)
 
@@ -829,6 +797,38 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
+    /** A key from the extra keys row. */
+    fun press(keyCode: Int) {
+        key(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+    }
+
+    /** Text from the input method or the extra keys; one character with a one-shot modifier is a key. */
+    fun type(text: String) {
+        if ((host.ctrl || host.alt || host.shift) && text.codePointCount(0, text.length) == 1) {
+            val events = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(text.toCharArray())
+            val down = events?.firstOrNull { it.action == KeyEvent.ACTION_DOWN && it.keyCode != KeyEvent.KEYCODE_SHIFT_LEFT }
+            if (down != null && key(down)) return
+        }
+        input(text.replace('\n', '\r').toByteArray())
+    }
+
+    /** Typed or pasted input, which also ends a selection. */
+    private fun input(data: ByteArray?) {
+        if (data == null || data.isEmpty()) return
+        if (selected) clearSelection()
+        send(data)
+    }
+
+    /** Bytes for the program; the viewport returns to the bottom first. */
+    private fun send(data: ByteArray?) {
+        if (data == null || data.isEmpty()) return
+        if (!atBottom && tab != 0L) {
+            VtNative.scroll(tab, 0)
+            invalidate()
+        }
+        host.onInput(data)
+    }
+
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
         // Focus events (mode 1004): editors reload changed files when they regain focus
@@ -843,22 +843,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_ACTION_NONE
         return Connection()
-    }
-
-    /** Tells the IME where the cursor and the composing text are, for a candidate window next to them. */
-    private fun updateCursorAnchor() {
-        val location = IntArray(2)
-        getLocationOnScreen(location)
-        val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
-        val x = (cursorX * cellWidth).toFloat() + paints[0].measureText(preedit)
-        val top = (cursorY * cellHeight).toFloat()
-        val info = CursorAnchorInfo.Builder()
-            .setMatrix(matrix)
-            .setSelectionRange(preedit.length, preedit.length)
-            .setComposingText(0, preedit)
-            .setInsertionMarkerLocation(x, top, top + baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
-            .build()
-        context.getSystemService(InputMethodManager::class.java).updateCursorAnchorInfo(this, info)
     }
 
     /**
@@ -925,6 +909,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (monitorCursor) updateCursorAnchor()
     }
 
+    /** Tells the IME where the cursor and the composing text are, for a candidate window next to them. */
+    private fun updateCursorAnchor() {
+        val location = IntArray(2)
+        getLocationOnScreen(location)
+        val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
+        val x = (cursorX * cellWidth).toFloat() + paints[0].measureText(preedit)
+        val top = (cursorY * cellHeight).toFloat()
+        val info = CursorAnchorInfo.Builder()
+            .setMatrix(matrix)
+            .setSelectionRange(preedit.length, preedit.length)
+            .setComposingText(0, preedit)
+            .setInsertionMarkerLocation(x, top, top + baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
+            .build()
+        context.getSystemService(InputMethodManager::class.java).updateCursorAnchorInfo(this, info)
+    }
+
     // ---- Clipboard ----
 
     private val clipboard get() = context.getSystemService(ClipboardManager::class.java)
@@ -964,52 +964,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     // ---- Selection ----
-
-    private fun clearSelection() {
-        if (tab != 0L) VtNative.selectClear(tab)
-        selected = false
-        menu?.finish()
-        invalidate()
-    }
-
-    /** Handles at the selection's ends (when they are in the viewport), as text fields have. */
-    private fun drawHandles(c: Canvas) {
-        if (!selected) return
-        handleBounds(true)?.let { b -> handleStart?.let { it.bounds = b; it.draw(c) } }
-        handleBounds(false)?.let { b -> handleEnd?.let { it.bounds = b; it.draw(c) } }
-    }
-
-    /**
-     * Where a handle is drawn: below its end's cell, pointing at the cell's left edge (start) or
-     * right edge (end), as Android's own text handles do.
-     */
-    private fun handleBounds(start: Boolean): Rect? {
-        val d = (if (start) handleStart else handleEnd) ?: return null
-        val x = if (start) selStartX else selEndX
-        val y = if (start) selStartY else selEndY
-        if (x < 0 || y < 0 || x >= cols || y >= rows) return null
-        val edge = if (start) {
-            x * cellWidth
-        } else {
-            (x + if ((attrs[y * cols + x] shr 12) and 3 == WIDE) 2 else 1) * cellWidth
-        }
-        val w = d.intrinsicWidth
-        val left = if (start) edge - w * 3 / 4 else edge - w / 4
-        val top = (y + 1) * cellHeight
-        return Rect(left, top, left + w, top + d.intrinsicHeight)
-    }
-
-    /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE. */
-    private fun handleAt(x: Float, y: Float): Int {
-        if (!selected) return DRAG_NONE
-        val slop = (8 * resources.displayMetrics.density).toInt()
-        for (start in booleanArrayOf(false, true)) {
-            val b = handleBounds(start) ?: continue
-            b.inset(-slop, -slop)
-            if (b.contains(x.toInt(), y.toInt())) return if (start) DRAG_START else DRAG_END
-        }
-        return DRAG_NONE
-    }
 
     private fun startDrag(kind: Int, x: Float, y: Float) {
         drag = kind
@@ -1119,37 +1073,81 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         )
     }
 
-    // ---- Gestures ----
-
-    private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
-
-    private fun cellY(y: Float) = floor(y / cellHeight).toInt().coerceIn(0, rows - 1)
-
-    /** A left click at a tap, for a program tracking the mouse. */
-    private fun click(e: MotionEvent) {
-        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
-        send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    /** Handles at the selection's ends (when they are in the viewport), as text fields have. */
+    private fun drawHandles(c: Canvas) {
+        if (!selected) return
+        handleBounds(true)?.let { b -> handleStart?.let { it.bounds = b; it.draw(c) } }
+        handleBounds(false)?.let { b -> handleEnd?.let { it.bounds = b; it.draw(c) } }
     }
 
     /**
-     * Scrolls by [n] rows (positive: towards the newest output): wheel events for a program
-     * tracking the mouse, arrow keys on the alternate screen with alternate scroll, else the
-     * viewport.
+     * Where a handle is drawn: below its end's cell, pointing at the cell's left edge (start) or
+     * right edge (end), as Android's own text handles do.
      */
-    private fun scrollBy(n: Int, x: Float, y: Float) {
-        when {
-            mouseTracking -> repeat(abs(n)) {
-                send(VtNative.mouse(tab, MOUSE_PRESS, if (n > 0) MOUSE_WHEEL_DOWN else MOUSE_WHEEL_UP, 0, x, y, false))
-            }
-            altScreen && altScroll -> {
-                val arrow = VtKeys.of(if (n > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
-                repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0)) }
-            }
-            else -> {
-                VtNative.scroll(tab, n)
-                invalidate()
+    private fun handleBounds(start: Boolean): Rect? {
+        val d = (if (start) handleStart else handleEnd) ?: return null
+        val x = if (start) selStartX else selEndX
+        val y = if (start) selStartY else selEndY
+        if (x < 0 || y < 0 || x >= cols || y >= rows) return null
+        val edge = if (start) {
+            x * cellWidth
+        } else {
+            (x + if ((attrs[y * cols + x] shr 12) and 3 == WIDE) 2 else 1) * cellWidth
+        }
+        val w = d.intrinsicWidth
+        val left = if (start) edge - w * 3 / 4 else edge - w / 4
+        val top = (y + 1) * cellHeight
+        return Rect(left, top, left + w, top + d.intrinsicHeight)
+    }
+
+    /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE. */
+    private fun handleAt(x: Float, y: Float): Int {
+        if (!selected) return DRAG_NONE
+        val slop = (8 * resources.displayMetrics.density).toInt()
+        for (start in booleanArrayOf(false, true)) {
+            val b = handleBounds(start) ?: continue
+            b.inset(-slop, -slop)
+            if (b.contains(x.toInt(), y.toInt())) return if (start) DRAG_START else DRAG_END
+        }
+        return DRAG_NONE
+    }
+
+    private fun clearSelection() {
+        if (tab != 0L) VtNative.selectClear(tab)
+        selected = false
+        menu?.finish()
+        invalidate()
+    }
+
+    // ---- Gestures ----
+
+    @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        // A handle drag owns the whole gesture
+        if (event.actionMasked == MotionEvent.ACTION_DOWN && tab != 0L) {
+            val handle = handleAt(event.x, event.y)
+            if (handle != DRAG_NONE && VtNative.selectGrab(tab, handle == DRAG_END)) {
+                startDrag(handle, event.x, event.y)
+                return true
             }
         }
+        if (drag == DRAG_START || drag == DRAG_END) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
+            }
+            return true
+        }
+        scaler.onTouchEvent(event)
+        if (!scaler.isInProgress) gestures.onTouchEvent(event)
+        // After a long press selected a word, moving on extends the selection
+        if (drag == DRAG_WORD) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
+            }
+        }
+        return true
     }
 
     private val gestures = GestureDetector(
@@ -1210,35 +1208,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         },
     )
 
-    @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        // A handle drag owns the whole gesture
-        if (event.actionMasked == MotionEvent.ACTION_DOWN && tab != 0L) {
-            val handle = handleAt(event.x, event.y)
-            if (handle != DRAG_NONE && VtNative.selectGrab(tab, handle == DRAG_END)) {
-                startDrag(handle, event.x, event.y)
-                return true
-            }
-        }
-        if (drag == DRAG_START || drag == DRAG_END) {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
-            }
-            return true
-        }
-        scaler.onTouchEvent(event)
-        if (!scaler.isInProgress) gestures.onTouchEvent(event)
-        // After a long press selected a word, moving on extends the selection
-        if (drag == DRAG_WORD) {
-            when (event.actionMasked) {
-                MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
-            }
-        }
-        return true
-    }
-
     /** A mouse wheel (or touchpad scroll) scrolls like a drag. */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER) && event.actionMasked == MotionEvent.ACTION_SCROLL) {
@@ -1250,6 +1219,37 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         return super.onGenericMotionEvent(event)
     }
+
+    /** A left click at a tap, for a program tracking the mouse. */
+    private fun click(e: MotionEvent) {
+        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
+        send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    }
+
+    /**
+     * Scrolls by [n] rows (positive: towards the newest output): wheel events for a program
+     * tracking the mouse, arrow keys on the alternate screen with alternate scroll, else the
+     * viewport.
+     */
+    private fun scrollBy(n: Int, x: Float, y: Float) {
+        when {
+            mouseTracking -> repeat(abs(n)) {
+                send(VtNative.mouse(tab, MOUSE_PRESS, if (n > 0) MOUSE_WHEEL_DOWN else MOUSE_WHEEL_UP, 0, x, y, false))
+            }
+            altScreen && altScroll -> {
+                val arrow = VtKeys.of(if (n > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
+                repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0)) }
+            }
+            else -> {
+                VtNative.scroll(tab, n)
+                invalidate()
+            }
+        }
+    }
+
+    private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
+
+    private fun cellY(y: Float) = floor(y / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
         // Cell attributes (vt.c)
