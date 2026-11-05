@@ -253,27 +253,6 @@ pub struct Termios {
     pub ospeed: u32,
 }
 
-/// The speeds of the `CBAUD` steps (Linux's `baud_table`, not the sparc one): B0–B38400, then
-/// `CBAUDEX` plus 1–15.
-const BAUD_TABLE: [u32; 31] = [
-    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
-    115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
-    3000000, 3500000, 4000000,
-];
-
-/// The speed for a set of `CBAUD` bits; `other` for `BOTHER`.
-fn baud(cbaud: u32, other: u32) -> u32 {
-    if cbaud == BOTHER {
-        return other;
-    }
-    let i = if cbaud & CBAUDEX != 0 {
-        (cbaud & !CBAUDEX) + 15
-    } else {
-        cbaud
-    };
-    BAUD_TABLE.get(i as usize).copied().unwrap_or(0)
-}
-
 impl Default for Termios {
     /// The initial settings of a PTY slave, the same as Linux's `tty_std_termios`.
     fn default() -> Self {
@@ -355,6 +334,27 @@ impl Termios {
     fn is(&self, c: u8, which: usize) -> bool {
         self.cc[which] != 0 && self.cc[which] == c
     }
+}
+
+/// The speeds of the `CBAUD` steps (Linux's `baud_table`, not the sparc one): B0–B38400, then
+/// `CBAUDEX` plus 1–15.
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000,
+    3000000, 3500000, 4000000,
+];
+
+/// The speed for a set of `CBAUD` bits; `other` for `BOTHER`.
+fn baud(cbaud: u32, other: u32) -> u32 {
+    if cbaud == BOTHER {
+        return other;
+    }
+    let i = if cbaud & CBAUDEX != 0 {
+        (cbaud & !CBAUDEX) + 15
+    } else {
+        cbaud
+    };
+    BAUD_TABLE.get(i as usize).copied().unwrap_or(0)
 }
 
 /// The window size (`struct winsize`).
@@ -523,36 +523,6 @@ impl Tty {
         }
     }
 
-    /// The slave read data (`mtime` false) or wrote data: as with Linux 6.1's `tty_update_time`,
-    /// only the seconds change, and only when they differ from the old value by 8 seconds or more;
-    /// the exact moment would leak the rhythm of someone's typing.
-    pub fn touch(&mut self, mtime: bool) {
-        let sec = wall_ns().div_euclid(NS);
-        let t = if mtime {
-            &mut self.mtime_ns
-        } else {
-            &mut self.atime_ns
-        };
-        if (sec ^ t.div_euclid(NS)) & !7 != 0 {
-            *t = sec * NS + t.rem_euclid(NS);
-        }
-    }
-
-    /// The owner, mode or times were changed (chmod, chown, utimensat): the status change time
-    /// is now.
-    pub fn changed(&mut self) {
-        self.ctime_ns = wall_ns();
-    }
-
-    /// Whether in canonical mode (ICANON).
-    pub fn canonical(&self) -> bool {
-        self.termios.l(ICANON)
-    }
-
-    fn pending_input(&self) -> usize {
-        self.editing.len() + self.lines.iter().map(Vec::len).sum::<usize>() + self.raw.len()
-    }
-
     /// How many more bytes the input queue can take (master writes block by this). In canonical
     /// mode it still accepts input when the line is already full: the extra characters are dropped
     /// and only line terminators take effect, so it never waits forever for a newline.
@@ -568,281 +538,8 @@ impl Tty {
         }
     }
 
-    /// Whether the slave has data to read now (in canonical mode a complete line is needed).
-    pub fn readable(&self) -> bool {
-        if self.canonical() {
-            !self.lines.is_empty()
-        } else {
-            !self.raw.is_empty()
-        }
-    }
-
-    /// The number of bytes that have arrived in non-canonical mode (for VMIN).
-    pub fn raw_len(&self) -> usize {
-        self.raw.len()
-    }
-
-    /// One slave read: at most one line in canonical mode, returning 0 at EOF. Returns None when
-    /// there is no data.
-    pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if self.canonical() {
-            let line = self.lines.front_mut()?;
-            let n = buf.len().min(line.len());
-            buf[..n].copy_from_slice(&line[..n]);
-            line.drain(..n);
-            if line.is_empty() {
-                self.lines.pop_front();
-            }
-            Some(n)
-        } else {
-            if self.raw.is_empty() {
-                return None;
-            }
-            let n = buf.len().min(self.raw.len());
-            for (d, s) in buf.iter_mut().zip(self.raw.drain(..n)) {
-                *d = s;
-            }
-            Some(n)
-        }
-    }
-
-    /// The number of readable bytes in the input queue (FIONREAD).
-    pub fn input_len(&self) -> usize {
-        if self.canonical() {
-            self.lines.iter().map(Vec::len).sum()
-        } else {
-            self.raw.len()
-        }
-    }
-
-    /// The number of bytes in the output queue (TIOCOUTQ).
-    pub fn output_len(&self) -> usize {
-        self.output.len()
-    }
-
-    /// How many more bytes the output queue can take: none while output is stopped (Linux's
-    /// `pty_write_room`).
-    pub fn output_room(&self) -> usize {
-        if self.held_from.is_some() {
-            return 0;
-        }
-        OUTPUT_MAX.saturating_sub(self.output.len())
-    }
-
-    /// The number of bytes the master can read now ([`Tty::held_from`]).
-    fn visible(&self) -> usize {
-        self.held_from
-            .map_or(self.output.len(), |v| v.min(self.output.len()))
-    }
-
-    /// One master read: takes output.
-    pub fn take_output(&mut self, max: usize) -> Vec<u8> {
-        let n = max.min(self.visible());
-        if let Some(v) = self.held_from.as_mut() {
-            *v = (*v).min(self.output.len()) - n;
-        }
-        self.output.drain(..n).collect()
-    }
-
-    /// Whether the master has output to read.
-    pub fn has_output(&self) -> bool {
-        self.visible() > 0
-    }
-
-    /// In packet mode, records status `set` and removes `clear`, which makes the master's readers
-    /// ready (Linux records it only when the master is in packet mode).
-    fn report(&mut self, set: u8, clear: u8) {
-        if self.packet {
-            self.pktstatus = self.pktstatus & !clear | set;
-            self.arrivals[1] += 1;
-        }
-    }
-
-    /// In packet mode, reports a flush on the slave side (Linux's `n_tty_packet_mode_flush` for
-    /// input, `pty_flush_buffer` for output). Flushes on the master side are not reported.
-    pub fn report_flush(&mut self, input: bool, output: bool) {
-        let set = if input { pkt::FLUSHREAD } else { 0 } | if output { pkt::FLUSHWRITE } else { 0 };
-        if set != 0 {
-            self.report(set, 0);
-        }
-    }
-
-    /// The status byte one master read returns in packet mode; takes it.
-    pub fn take_pktstatus(&mut self) -> Option<u8> {
-        if self.packet && self.pktstatus != 0 {
-            Some(std::mem::take(&mut self.pktstatus))
-        } else {
-            None
-        }
-    }
-
-    /// Stops the slave's output (^S, Linux's `__stop_tty`; `pty_stop` reports STOP).
-    fn stop(&mut self) {
-        if self.held_from.is_none() {
-            self.held_from = Some(self.output.len());
-            self.report(pkt::STOP, pkt::START);
-        }
-    }
-
-    /// Restarts the slave's output (^Q, IXANY, when generating signals; Linux's `start_tty`,
-    /// `pty_start` reports START): output stopped by TCOOFF is left alone.
-    fn start(&mut self) {
-        if !self.tco_stopped && self.held_from.take().is_some() {
-            self.report(pkt::START, pkt::STOP);
-        }
-    }
-
-    /// TCOOFF on the slave.
-    pub fn stop_output(&mut self) {
-        if !self.tco_stopped {
-            self.tco_stopped = true;
-            self.stop();
-        }
-    }
-
-    /// TCOON on the slave: output stopped by ^S restarts too.
-    pub fn start_output(&mut self) {
-        if self.tco_stopped {
-            self.tco_stopped = false;
-            self.start();
-        }
-    }
-
-    /// TCIOFF and TCION on the slave send the STOP or START character to the master, and TIOCSTI
-    /// on the master puts a byte in its input: readable by the master regardless of stopped
-    /// output, ahead of the held echoes (Linux's `tty_send_xchar`).
-    pub fn send_xchar(&mut self, c: u8) {
-        let at = self.visible();
-        self.output.insert(at, c);
-        if let Some(v) = self.held_from.as_mut() {
-            *v = at + 1;
-        }
-        self.arrivals[1] += 1;
-    }
-
-    /// Whether a file opened after this side's `born`-th vhangup (on the master when `master`) has
-    /// been hung up: for the slave once all masters have closed, and for either side when it was
-    /// hung up again by vhangup or TIOCVHANGUP after the open.
-    pub fn hung(&self, master: bool, born: u32) -> bool {
-        (!master && self.hung_up) || self.vhangups[master as usize] != born
-    }
-
-    /// Flushes the input queue (TCIFLUSH, when generating signals).
-    pub fn flush_input(&mut self) {
-        self.editing.clear();
-        self.lines.clear();
-        self.raw.clear();
-        self.lnext = false;
-    }
-
-    /// Flushes the output queue (TCOFLUSH).
-    pub fn flush_output(&mut self) {
-        self.output.clear();
-        if let Some(v) = self.held_from.as_mut() {
-            *v = 0;
-        }
-    }
-
-    /// Changes termios. The address bit stays (Linux's `tty_set_termios`), and a PTY is always 8
-    /// bits, without parity, with the receiver enabled (`pty_set_termios`). When canonical mode is
-    /// switched on or off, input already queued is moved between the two queues.
-    pub fn set_termios(&mut self, mut t: Termios) {
-        t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
-        t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
-        // In packet mode report ^S/^Q flow control being switched, and with EXTPROC report that
-        // termios changed (`pty_set_termios`)
-        let flow = |t: &Termios| t.i(IXON) && t.cc[VSTOP] == 0o23 && t.cc[VSTART] == 0o21;
-        let (old_flow, new_flow) = (flow(&self.termios), flow(&t));
-        let extproc = (self.termios.lflag | t.lflag) & EXTPROC != 0;
-        if old_flow != new_flow {
-            let set = if new_flow { pkt::DOSTOP } else { pkt::NOSTOP };
-            self.report(set, pkt::DOSTOP | pkt::NOSTOP);
-        }
-        if extproc {
-            self.report(pkt::IOCTL, 0);
-        }
-        let was = self.canonical();
-        self.termios = t;
-        match (was, self.canonical()) {
-            (true, false) => {
-                let lines: Vec<u8> = self.lines.drain(..).flatten().collect();
-                self.raw.extend(lines);
-                self.raw.extend(self.editing.drain(..));
-            }
-            (false, true) => self.editing.extend(self.raw.drain(..)),
-            _ => {}
-        }
-    }
-
-    /// A slave write: goes through output processing into the output queue.
-    pub fn write_output(&mut self, data: &[u8]) {
-        for &c in data {
-            self.put_output(c);
-        }
-        self.arrivals[1] += 1;
-    }
-
-    fn put_output(&mut self, c: u8) {
-        let t = &self.termios;
-        if t.oflag & OPOST != 0 {
-            if c == b'\n' && t.oflag & ONLCR != 0 {
-                self.output.extend(b"\r\n");
-                return;
-            }
-            if c == b'\r' && t.oflag & OCRNL != 0 {
-                self.output.push_back(b'\n');
-                return;
-            }
-        }
-        self.output.push_back(c);
-    }
-
-    /// Echoes a character: with ECHOCTL, control characters show as `^X`.
-    fn echo(&mut self, c: u8) {
-        if !self.termios.l(ECHO) {
-            return;
-        }
-        if self.termios.l(ECHOCTL) && is_ctrl(c) {
-            self.output.extend([b'^', c ^ 0x40]);
-        } else {
-            self.put_output(c);
-        }
-    }
-
-    /// Erases one character on the screen (ECHOE). Echoed control characters take two columns.
-    fn echo_erase(&mut self, erased: &[u8]) {
-        if !self.termios.l(ECHO) {
-            return;
-        }
-        if !self.termios.l(ECHOE) {
-            if let Some(&c) = erased.first() {
-                self.echo(c);
-            }
-            return;
-        }
-        let width = match erased {
-            [c] if self.termios.l(ECHOCTL) && is_ctrl(*c) => 2,
-            _ => 1,
-        };
-        for _ in 0..width {
-            self.output.extend(b"\x08 \x08");
-        }
-    }
-
-    /// Removes one character from the end of the line being edited (a whole character with
-    /// UTF-8) and returns the removed bytes.
-    fn pop_char(&mut self) -> Option<Vec<u8>> {
-        let mut erased = vec![self.editing.pop()?];
-        // UTF-8 continuation bytes are 10xxxxxx: keep deleting until the leading byte
-        if self.termios.i(IUTF8) {
-            while erased[0] & 0xc0 == 0x80 {
-                match self.editing.pop() {
-                    Some(b) => erased.insert(0, b),
-                    None => break,
-                }
-            }
-        }
-        Some(erased)
+    fn pending_input(&self) -> usize {
+        self.editing.len() + self.lines.iter().map(Vec::len).sum::<usize>() + self.raw.len()
     }
 
     /// A master write (input from the terminal); returns the signals to send to the foreground
@@ -1006,6 +703,309 @@ impl Tty {
             self.raw.push_back(c);
             self.echo(c);
         }
+    }
+
+    /// Removes one character from the end of the line being edited (a whole character with
+    /// UTF-8) and returns the removed bytes.
+    fn pop_char(&mut self) -> Option<Vec<u8>> {
+        let mut erased = vec![self.editing.pop()?];
+        // UTF-8 continuation bytes are 10xxxxxx: keep deleting until the leading byte
+        if self.termios.i(IUTF8) {
+            while erased[0] & 0xc0 == 0x80 {
+                match self.editing.pop() {
+                    Some(b) => erased.insert(0, b),
+                    None => break,
+                }
+            }
+        }
+        Some(erased)
+    }
+
+    /// Erases one character on the screen (ECHOE). Echoed control characters take two columns.
+    fn echo_erase(&mut self, erased: &[u8]) {
+        if !self.termios.l(ECHO) {
+            return;
+        }
+        if !self.termios.l(ECHOE) {
+            if let Some(&c) = erased.first() {
+                self.echo(c);
+            }
+            return;
+        }
+        let width = match erased {
+            [c] if self.termios.l(ECHOCTL) && is_ctrl(*c) => 2,
+            _ => 1,
+        };
+        for _ in 0..width {
+            self.output.extend(b"\x08 \x08");
+        }
+    }
+
+    /// Echoes a character: with ECHOCTL, control characters show as `^X`.
+    fn echo(&mut self, c: u8) {
+        if !self.termios.l(ECHO) {
+            return;
+        }
+        if self.termios.l(ECHOCTL) && is_ctrl(c) {
+            self.output.extend([b'^', c ^ 0x40]);
+        } else {
+            self.put_output(c);
+        }
+    }
+
+    /// Whether the slave has data to read now (in canonical mode a complete line is needed).
+    pub fn readable(&self) -> bool {
+        if self.canonical() {
+            !self.lines.is_empty()
+        } else {
+            !self.raw.is_empty()
+        }
+    }
+
+    /// The number of bytes that have arrived in non-canonical mode (for VMIN).
+    pub fn raw_len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// One slave read: at most one line in canonical mode, returning 0 at EOF. Returns None when
+    /// there is no data.
+    pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if self.canonical() {
+            let line = self.lines.front_mut()?;
+            let n = buf.len().min(line.len());
+            buf[..n].copy_from_slice(&line[..n]);
+            line.drain(..n);
+            if line.is_empty() {
+                self.lines.pop_front();
+            }
+            Some(n)
+        } else {
+            if self.raw.is_empty() {
+                return None;
+            }
+            let n = buf.len().min(self.raw.len());
+            for (d, s) in buf.iter_mut().zip(self.raw.drain(..n)) {
+                *d = s;
+            }
+            Some(n)
+        }
+    }
+
+    /// How many more bytes the output queue can take: none while output is stopped (Linux's
+    /// `pty_write_room`).
+    pub fn output_room(&self) -> usize {
+        if self.held_from.is_some() {
+            return 0;
+        }
+        OUTPUT_MAX.saturating_sub(self.output.len())
+    }
+
+    /// A slave write: goes through output processing into the output queue.
+    pub fn write_output(&mut self, data: &[u8]) {
+        for &c in data {
+            self.put_output(c);
+        }
+        self.arrivals[1] += 1;
+    }
+
+    fn put_output(&mut self, c: u8) {
+        let t = &self.termios;
+        if t.oflag & OPOST != 0 {
+            if c == b'\n' && t.oflag & ONLCR != 0 {
+                self.output.extend(b"\r\n");
+                return;
+            }
+            if c == b'\r' && t.oflag & OCRNL != 0 {
+                self.output.push_back(b'\n');
+                return;
+            }
+        }
+        self.output.push_back(c);
+    }
+
+    /// The status byte one master read returns in packet mode; takes it.
+    pub fn take_pktstatus(&mut self) -> Option<u8> {
+        if self.packet && self.pktstatus != 0 {
+            Some(std::mem::take(&mut self.pktstatus))
+        } else {
+            None
+        }
+    }
+
+    /// Whether the master has output to read.
+    pub fn has_output(&self) -> bool {
+        self.visible() > 0
+    }
+
+    /// One master read: takes output.
+    pub fn take_output(&mut self, max: usize) -> Vec<u8> {
+        let n = max.min(self.visible());
+        if let Some(v) = self.held_from.as_mut() {
+            *v = (*v).min(self.output.len()) - n;
+        }
+        self.output.drain(..n).collect()
+    }
+
+    /// Changes termios. The address bit stays (Linux's `tty_set_termios`), and a PTY is always 8
+    /// bits, without parity, with the receiver enabled (`pty_set_termios`). When canonical mode is
+    /// switched on or off, input already queued is moved between the two queues.
+    pub fn set_termios(&mut self, mut t: Termios) {
+        t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
+        t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
+        // In packet mode report ^S/^Q flow control being switched, and with EXTPROC report that
+        // termios changed (`pty_set_termios`)
+        let flow = |t: &Termios| t.i(IXON) && t.cc[VSTOP] == 0o23 && t.cc[VSTART] == 0o21;
+        let (old_flow, new_flow) = (flow(&self.termios), flow(&t));
+        let extproc = (self.termios.lflag | t.lflag) & EXTPROC != 0;
+        if old_flow != new_flow {
+            let set = if new_flow { pkt::DOSTOP } else { pkt::NOSTOP };
+            self.report(set, pkt::DOSTOP | pkt::NOSTOP);
+        }
+        if extproc {
+            self.report(pkt::IOCTL, 0);
+        }
+        let was = self.canonical();
+        self.termios = t;
+        match (was, self.canonical()) {
+            (true, false) => {
+                let lines: Vec<u8> = self.lines.drain(..).flatten().collect();
+                self.raw.extend(lines);
+                self.raw.extend(self.editing.drain(..));
+            }
+            (false, true) => self.editing.extend(self.raw.drain(..)),
+            _ => {}
+        }
+    }
+
+    /// Flushes the input queue (TCIFLUSH, when generating signals).
+    pub fn flush_input(&mut self) {
+        self.editing.clear();
+        self.lines.clear();
+        self.raw.clear();
+        self.lnext = false;
+    }
+
+    /// Flushes the output queue (TCOFLUSH).
+    pub fn flush_output(&mut self) {
+        self.output.clear();
+        if let Some(v) = self.held_from.as_mut() {
+            *v = 0;
+        }
+    }
+
+    /// In packet mode, reports a flush on the slave side (Linux's `n_tty_packet_mode_flush` for
+    /// input, `pty_flush_buffer` for output). Flushes on the master side are not reported.
+    pub fn report_flush(&mut self, input: bool, output: bool) {
+        let set = if input { pkt::FLUSHREAD } else { 0 } | if output { pkt::FLUSHWRITE } else { 0 };
+        if set != 0 {
+            self.report(set, 0);
+        }
+    }
+
+    /// TCOOFF on the slave.
+    pub fn stop_output(&mut self) {
+        if !self.tco_stopped {
+            self.tco_stopped = true;
+            self.stop();
+        }
+    }
+
+    /// TCOON on the slave: output stopped by ^S restarts too.
+    pub fn start_output(&mut self) {
+        if self.tco_stopped {
+            self.tco_stopped = false;
+            self.start();
+        }
+    }
+
+    /// Stops the slave's output (^S, Linux's `__stop_tty`; `pty_stop` reports STOP).
+    fn stop(&mut self) {
+        if self.held_from.is_none() {
+            self.held_from = Some(self.output.len());
+            self.report(pkt::STOP, pkt::START);
+        }
+    }
+
+    /// Restarts the slave's output (^Q, IXANY, when generating signals; Linux's `start_tty`,
+    /// `pty_start` reports START): output stopped by TCOOFF is left alone.
+    fn start(&mut self) {
+        if !self.tco_stopped && self.held_from.take().is_some() {
+            self.report(pkt::START, pkt::STOP);
+        }
+    }
+
+    /// TCIOFF and TCION on the slave send the STOP or START character to the master, and TIOCSTI
+    /// on the master puts a byte in its input: readable by the master regardless of stopped
+    /// output, ahead of the held echoes (Linux's `tty_send_xchar`).
+    pub fn send_xchar(&mut self, c: u8) {
+        let at = self.visible();
+        self.output.insert(at, c);
+        if let Some(v) = self.held_from.as_mut() {
+            *v = at + 1;
+        }
+        self.arrivals[1] += 1;
+    }
+
+    /// The number of bytes the master can read now ([`Tty::held_from`]).
+    fn visible(&self) -> usize {
+        self.held_from
+            .map_or(self.output.len(), |v| v.min(self.output.len()))
+    }
+
+    /// In packet mode, records status `set` and removes `clear`, which makes the master's readers
+    /// ready (Linux records it only when the master is in packet mode).
+    fn report(&mut self, set: u8, clear: u8) {
+        if self.packet {
+            self.pktstatus = self.pktstatus & !clear | set;
+            self.arrivals[1] += 1;
+        }
+    }
+
+    /// The number of readable bytes in the input queue (FIONREAD).
+    pub fn input_len(&self) -> usize {
+        if self.canonical() {
+            self.lines.iter().map(Vec::len).sum()
+        } else {
+            self.raw.len()
+        }
+    }
+
+    /// The number of bytes in the output queue (TIOCOUTQ).
+    pub fn output_len(&self) -> usize {
+        self.output.len()
+    }
+
+    /// Whether in canonical mode (ICANON).
+    pub fn canonical(&self) -> bool {
+        self.termios.l(ICANON)
+    }
+
+    /// Whether a file opened after this side's `born`-th vhangup (on the master when `master`) has
+    /// been hung up: for the slave once all masters have closed, and for either side when it was
+    /// hung up again by vhangup or TIOCVHANGUP after the open.
+    pub fn hung(&self, master: bool, born: u32) -> bool {
+        (!master && self.hung_up) || self.vhangups[master as usize] != born
+    }
+
+    /// The slave read data (`mtime` false) or wrote data: as with Linux 6.1's `tty_update_time`,
+    /// only the seconds change, and only when they differ from the old value by 8 seconds or more;
+    /// the exact moment would leak the rhythm of someone's typing.
+    pub fn touch(&mut self, mtime: bool) {
+        let sec = wall_ns().div_euclid(NS);
+        let t = if mtime {
+            &mut self.mtime_ns
+        } else {
+            &mut self.atime_ns
+        };
+        if (sec ^ t.div_euclid(NS)) & !7 != 0 {
+            *t = sec * NS + t.rem_euclid(NS);
+        }
+    }
+
+    /// The owner, mode or times were changed (chmod, chown, utimensat): the status change time
+    /// is now.
+    pub fn changed(&mut self) {
+        self.ctime_ns = wall_ns();
     }
 }
 

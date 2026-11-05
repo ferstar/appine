@@ -22,20 +22,7 @@ use crate::process::Signal;
 use crate::signal::{self, SigInfo};
 use crate::tty::{PtyEnd, Tty, Winsize};
 
-/// A terminal attached to the host ([`RunOptions::terminal`](crate::RunOptions::terminal)).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Terminal {
-    /// Host fd that keyboard input is read from.
-    pub input: i32,
-    /// Host fd that terminal output is written to.
-    pub output: i32,
-    /// Host terminal whose window size is followed (TIOCGWINSZ); without one the window size is
-    /// 24×80.
-    pub size: Option<i32>,
-    /// Host fd that becomes readable when the window size changes (for example a pipe written by
-    /// a SIGWINCH handler).
-    pub resize: Option<i32>,
-}
+// ---- Consoles ----
 
 /// A console.
 pub(crate) struct Console {
@@ -44,19 +31,6 @@ pub(crate) struct Console {
     /// A process already has it as controlling terminal: from then on, all slaves being closed
     /// means the session has ended.
     pub attached: bool,
-}
-
-const POLLIN: i16 = 1;
-/// How much input to read from the host at a time.
-const READ_CHUNK: usize = 4096;
-
-/// The host terminal's window size.
-fn host_winsize(fd: i32) -> Option<Winsize> {
-    const TIOCGWINSZ: u64 = 0x5413;
-    let mut b = [0u8; 8];
-    appine_hal::ioctl(fd, TIOCGWINSZ, &mut b).ok()?;
-    let w = Winsize::decode(&b);
-    (w.rows > 0 && w.cols > 0).then_some(w)
 }
 
 /// Creates a console and returns its PTY number (`/dev/pts/<number>`).
@@ -105,13 +79,6 @@ pub(crate) fn attach(
         Some(path),
     );
     Ok((slave, tty))
-}
-
-fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
-    k.consoles
-        .get(&id)
-        .map(|c| c.master.tty.clone())
-        .ok_or(Errno::ENOENT)
 }
 
 /// The wake objects to register when waiting for console `id`'s output or for room in its input
@@ -204,6 +171,27 @@ pub(crate) fn close(k: &mut Kernel, id: u32) -> Result<(), Errno> {
     Ok(())
 }
 
+// ---- The appine-run bridge ----
+
+/// A terminal attached to the host ([`RunOptions::terminal`](crate::RunOptions::terminal)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Terminal {
+    /// Host fd that keyboard input is read from.
+    pub input: i32,
+    /// Host fd that terminal output is written to.
+    pub output: i32,
+    /// Host terminal whose window size is followed (TIOCGWINSZ); without one the window size is
+    /// 24×80.
+    pub size: Option<i32>,
+    /// Host fd that becomes readable when the window size changes (for example a pipe written by
+    /// a SIGWINCH handler).
+    pub resize: Option<i32>,
+}
+
+const POLLIN: i16 = 1;
+/// How much input to read from the host at a time.
+const READ_CHUNK: usize = 4096;
+
 /// The EOF handed to the program after the host's input ends ([`send_eof`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Eof {
@@ -214,62 +202,6 @@ enum Eof {
     /// Sent in canonical mode: VEOF is the EOF marker at the end of a line.
     Canonical,
     Sent,
-}
-
-/// After the host's input ends, sends a VEOF (^D) into the console's input, as util-linux's
-/// script does: in canonical mode a VEOF at the start of a line makes read return 0, so programs
-/// that end at EOF, such as a shell or cat, exit; outside canonical mode the program receives the
-/// character (a shell's line editor treats it as EOF). As script does, it waits until the program
-/// has read the input already sent in; while that is unread it returns None, and the console's PTY
-/// wakes the bridge thread when the program reads input. Once sent, returns whether it was sent in
-/// canonical mode. Sends nothing when VEOF is disabled.
-fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
-    let Ok(tty) = tty_of(k, id) else {
-        return Some(false);
-    };
-    let (eof, canonical) = {
-        let t = tty.borrow();
-        if t.readable() {
-            return None;
-        }
-        (t.termios.cc[crate::tty::cc::VEOF], t.canonical())
-    };
-    if eof != 0 {
-        let _ = feed(k, id, &[eof]);
-    }
-    Some(canonical)
-}
-
-/// The step after an EOF sent in canonical mode: if the program switched to non-canonical mode
-/// before reading it (a shell switches back to canonical mode to run a command after reading a
-/// line, the bridge thread sends VEOF then, and back at the prompt the line editor switches to
-/// non-canonical mode again), the EOF marker is lost (on Linux it becomes a NUL byte; script has
-/// the same problem), so it is sent once more, this time as a character.
-fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
-    match eof {
-        Eof::Pending => match send_eof(k, id) {
-            Some(true) => Eof::Canonical,
-            Some(false) => Eof::Sent,
-            None => Eof::Pending,
-        },
-        Eof::Canonical if tty_of(k, id).is_ok_and(|t| !t.borrow().canonical()) => {
-            match send_eof(k, id) {
-                Some(_) => Eof::Sent,
-                None => Eof::Canonical,
-            }
-        }
-        e => e,
-    }
-}
-
-/// Writes all the data to the host fd; drops it when the host side has closed.
-fn write_all(fd: i32, mut data: &[u8]) {
-    while !data.is_empty() {
-        match appine_hal::write(fd, data) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => data = &data[n..],
-        }
-    }
 }
 
 /// The host terminal's current window size; 24×80 when it is not a terminal.
@@ -343,4 +275,78 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
             }
         }
     }
+}
+
+/// Writes all the data to the host fd; drops it when the host side has closed.
+fn write_all(fd: i32, mut data: &[u8]) {
+    while !data.is_empty() {
+        match appine_hal::write(fd, data) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => data = &data[n..],
+        }
+    }
+}
+
+/// The step after an EOF sent in canonical mode: if the program switched to non-canonical mode
+/// before reading it (a shell switches back to canonical mode to run a command after reading a
+/// line, the bridge thread sends VEOF then, and back at the prompt the line editor switches to
+/// non-canonical mode again), the EOF marker is lost (on Linux it becomes a NUL byte; script has
+/// the same problem), so it is sent once more, this time as a character.
+fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
+    match eof {
+        Eof::Pending => match send_eof(k, id) {
+            Some(true) => Eof::Canonical,
+            Some(false) => Eof::Sent,
+            None => Eof::Pending,
+        },
+        Eof::Canonical if tty_of(k, id).is_ok_and(|t| !t.borrow().canonical()) => {
+            match send_eof(k, id) {
+                Some(_) => Eof::Sent,
+                None => Eof::Canonical,
+            }
+        }
+        e => e,
+    }
+}
+
+/// After the host's input ends, sends a VEOF (^D) into the console's input, as util-linux's
+/// script does: in canonical mode a VEOF at the start of a line makes read return 0, so programs
+/// that end at EOF, such as a shell or cat, exit; outside canonical mode the program receives the
+/// character (a shell's line editor treats it as EOF). As script does, it waits until the program
+/// has read the input already sent in; while that is unread it returns None, and the console's PTY
+/// wakes the bridge thread when the program reads input. Once sent, returns whether it was sent in
+/// canonical mode. Sends nothing when VEOF is disabled.
+fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
+    let Ok(tty) = tty_of(k, id) else {
+        return Some(false);
+    };
+    let (eof, canonical) = {
+        let t = tty.borrow();
+        if t.readable() {
+            return None;
+        }
+        (t.termios.cc[crate::tty::cc::VEOF], t.canonical())
+    };
+    if eof != 0 {
+        let _ = feed(k, id, &[eof]);
+    }
+    Some(canonical)
+}
+
+/// The host terminal's window size.
+fn host_winsize(fd: i32) -> Option<Winsize> {
+    const TIOCGWINSZ: u64 = 0x5413;
+    let mut b = [0u8; 8];
+    appine_hal::ioctl(fd, TIOCGWINSZ, &mut b).ok()?;
+    let w = Winsize::decode(&b);
+    (w.rows > 0 && w.cols > 0).then_some(w)
+}
+
+// ---- Shared helpers ----
+
+fn tty_of(k: &Kernel, id: u32) -> Result<Rc<RefCell<Tty>>, Errno> {
+    k.consoles
+        .get(&id)
+        .map(|c| c.master.tty.clone())
+        .ok_or(Errno::ENOENT)
 }

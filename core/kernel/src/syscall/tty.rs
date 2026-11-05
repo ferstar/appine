@@ -61,6 +61,19 @@ const TIOCGPTLCK: u32 = 0x8004_5439;
 /// SIGQUIT, SIGTSTP).
 const TIOCSIG: u32 = 0x4004_5436;
 
+// ---- Allocation and opening ----
+
+/// Opens ptmx: allocates a new PTY pair in devpts instance `fs` (found through mount `mnt`) and
+/// returns the master. `pin`: it was opened through the ptmx in that mount.
+pub(crate) fn open_ptmx(
+    k: &mut Kernel,
+    (fs, mnt, pin): (u64, crate::vfs::MountId, bool),
+    owner: (u32, u32),
+) -> Result<FileKind, Errno> {
+    let tty = new_pty(k, fs, owner)?;
+    Ok(FileKind::Pty(PtyEnd::new(tty, true).via(mnt, pin)))
+}
+
 /// Allocates a new PTY pair in devpts instance `fs` (a device number) (Linux's
 /// `devpts_new_index`, `devpts_pty_new`): the index is the lowest free one in the instance, and
 /// reaching the instance's `max` is ENOSPC; the slave's owner, group and mode follow the
@@ -89,17 +102,6 @@ pub(crate) fn new_pty(
     }
     k.ptys.insert((fs, index), Rc::downgrade(&tty));
     Ok(tty)
-}
-
-/// Opens ptmx: allocates a new PTY pair in devpts instance `fs` (found through mount `mnt`) and
-/// returns the master. `pin`: it was opened through the ptmx in that mount.
-pub(crate) fn open_ptmx(
-    k: &mut Kernel,
-    (fs, mnt, pin): (u64, crate::vfs::MountId, bool),
-    owner: (u32, u32),
-) -> Result<FileKind, Errno> {
-    let tty = new_pty(k, fs, owner)?;
-    Ok(FileKind::Pty(PtyEnd::new(tty, true).via(mnt, pin)))
 }
 
 /// Opens `/dev/pts/<n>`. When a session leader without a controlling terminal opens it (without
@@ -176,40 +178,72 @@ pub(crate) fn open_ctty(cx: &mut Cx<'_>) -> Result<FileKind, Errno> {
     Ok(FileKind::Pty(PtyEnd::new(tty, false)))
 }
 
-/// A background process group accessing its controlling terminal (`sig` is SIGTTIN or SIGTTOU):
-/// following Linux's `tty_check_change`, signals its own process group and makes the syscall
-/// restart; when the signal is ignored or blocked, reads return EIO while writes and setting
-/// changes proceed as usual.
-fn check_background(cx: &mut Cx<'_>, tty: &Rc<RefCell<Tty>>, sig: Signal) -> Result<(), Errno> {
-    let (pgid, is_ctty) = {
-        let g = cx.t.group.borrow();
-        (g.pgid, g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)))
-    };
-    let fg = tty.borrow().fg;
-    if !is_ctty || fg.is_none_or(|fg| fg == pgid) {
-        return Ok(());
+// ---- Reading and writing ----
+
+/// One read of a PTY. `born` is the open file's [`PtyEnd::born`].
+pub(crate) fn read(
+    cx: &mut Cx<'_>,
+    tty: &Rc<RefCell<Tty>>,
+    (master, born): (bool, u32),
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    if master {
+        master_read(cx, tty, born, nonblock, buf)
+    } else {
+        let n = slave_read(cx, tty, born, nonblock, buf)?;
+        if n > 0 {
+            tty.borrow_mut().touch(false);
+        }
+        Ok(n)
     }
-    let ignored = cx.t.group.borrow().sighand.borrow().get(sig).handler == SigAction::IGNORE;
-    let blocked = cx.task.sigmask.get() & sig.bit() != 0;
-    if ignored || blocked {
-        return if sig == Signal::TTIN {
-            Err(Errno::EIO)
-        } else {
-            Ok(())
-        };
-    }
-    if signal::pgrp_orphaned(cx.kr(), pgid) {
-        return Err(Errno::EIO);
-    }
-    signal::send_to_pgrp(cx.kr(), pgid, sig, SigInfo::kernel());
-    Err(Errno::ERESTARTSYS)
 }
 
-/// Sends a signal to the terminal's foreground process group (SIGINT and the like from the line
-/// discipline, window size changes).
-pub(crate) fn signal_fg(k: &Kernel, tty: &Rc<RefCell<Tty>>, sig: Signal) {
-    if let Some(fg) = tty.borrow().fg {
-        signal::send_to_pgrp(k, fg, sig, SigInfo::kernel());
+/// A master read: takes output. Returns EIO once the slave has been opened and then all its ends
+/// closed, and 0 when the master side was hung up by TIOCVHANGUP. In packet mode (Linux's
+/// `n_tty_read`), when there is a status only that one status byte is read; otherwise the data is
+/// preceded by a `TIOCPKT_DATA` (which also counts toward the read length).
+fn master_read(
+    cx: &mut Cx<'_>,
+    tty: &Rc<RefCell<Tty>>,
+    born: u32,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, Errno> {
+    loop {
+        {
+            let mut t = tty.borrow_mut();
+            if t.hung(true, born) {
+                return Ok(0);
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if let Some(status) = t.take_pktstatus() {
+                buf[0] = status;
+                return Ok(1);
+            }
+            let head = t.packet as usize;
+            if t.has_output() {
+                let out = t.take_output(buf.len() - head);
+                if head == 1 {
+                    buf[0] = pkt::DATA;
+                }
+                buf[head..head + out.len()].copy_from_slice(&out);
+                request_wake_object(wake::of(tty));
+                return Ok(head + out.len());
+            }
+            if t.slave_closed {
+                return Err(Errno::EIO);
+            }
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -273,95 +307,22 @@ fn slave_read(
     }
 }
 
-/// A slave write: goes through output processing, and waits for the master to read when the
-/// output queue is full.
-fn slave_write(
+/// One write of a PTY. `born` is the open file's [`PtyEnd::born`].
+pub(crate) fn write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
-    born: u32,
+    (master, born): (bool, u32),
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
-    if tty.borrow().hung(false, born) {
-        return Err(Errno::EIO);
-    }
-    if tty.borrow().termios.lflag & flags::TOSTOP != 0 {
-        check_background(cx, tty, Signal::TTOU)?;
-    }
-    let mut done = 0;
-    loop {
-        {
-            let mut t = tty.borrow_mut();
-            if t.masters == 0 || t.hung(false, born) {
-                return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
-            }
-            let n = t.output_room().min(data.len() - done);
-            if n > 0 {
-                t.write_output(&data[done..done + n]);
-                done += n;
-                request_wake_object(wake::of(tty));
-            }
+    if master {
+        master_write(cx, tty, born, nonblock, data)
+    } else {
+        let n = slave_write(cx, tty, born, nonblock, data)?;
+        if n > 0 {
+            tty.borrow_mut().touch(true);
         }
-        if done == data.len() {
-            return Ok(done);
-        }
-        if nonblock || cx.interrupted() {
-            let e = if nonblock {
-                Errno::EAGAIN
-            } else {
-                Errno::ERESTARTSYS
-            };
-            return if done > 0 { Ok(done) } else { Err(e) };
-        }
-        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
-    }
-}
-
-/// A master read: takes output. Returns EIO once the slave has been opened and then all its ends
-/// closed, and 0 when the master side was hung up by TIOCVHANGUP. In packet mode (Linux's
-/// `n_tty_read`), when there is a status only that one status byte is read; otherwise the data is
-/// preceded by a `TIOCPKT_DATA` (which also counts toward the read length).
-fn master_read(
-    cx: &mut Cx<'_>,
-    tty: &Rc<RefCell<Tty>>,
-    born: u32,
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    loop {
-        {
-            let mut t = tty.borrow_mut();
-            if t.hung(true, born) {
-                return Ok(0);
-            }
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            if let Some(status) = t.take_pktstatus() {
-                buf[0] = status;
-                return Ok(1);
-            }
-            let head = t.packet as usize;
-            if t.has_output() {
-                let out = t.take_output(buf.len() - head);
-                if head == 1 {
-                    buf[0] = pkt::DATA;
-                }
-                buf[head..head + out.len()].copy_from_slice(&out);
-                request_wake_object(wake::of(tty));
-                return Ok(head + out.len());
-            }
-            if t.slave_closed {
-                return Err(Errno::EIO);
-            }
-        }
-        if nonblock {
-            return Err(Errno::EAGAIN);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
+        Ok(n)
     }
 }
 
@@ -407,147 +368,47 @@ fn master_write(
     }
 }
 
-/// One read of a PTY. `born` is the open file's [`PtyEnd::born`].
-pub(crate) fn read(
+/// A slave write: goes through output processing, and waits for the master to read when the
+/// output queue is full.
+fn slave_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
-    (master, born): (bool, u32),
-    nonblock: bool,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
-    if master {
-        master_read(cx, tty, born, nonblock, buf)
-    } else {
-        let n = slave_read(cx, tty, born, nonblock, buf)?;
-        if n > 0 {
-            tty.borrow_mut().touch(false);
-        }
-        Ok(n)
-    }
-}
-
-/// One write of a PTY. `born` is the open file's [`PtyEnd::born`].
-pub(crate) fn write(
-    cx: &mut Cx<'_>,
-    tty: &Rc<RefCell<Tty>>,
-    (master, born): (bool, u32),
+    born: u32,
     nonblock: bool,
     data: &[u8],
 ) -> Result<usize, Errno> {
-    if master {
-        master_write(cx, tty, born, nonblock, data)
-    } else {
-        let n = slave_write(cx, tty, born, nonblock, data)?;
-        if n > 0 {
-            tty.borrow_mut().touch(true);
+    if tty.borrow().hung(false, born) {
+        return Err(Errno::EIO);
+    }
+    if tty.borrow().termios.lflag & flags::TOSTOP != 0 {
+        check_background(cx, tty, Signal::TTOU)?;
+    }
+    let mut done = 0;
+    loop {
+        {
+            let mut t = tty.borrow_mut();
+            if t.masters == 0 || t.hung(false, born) {
+                return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
+            }
+            let n = t.output_room().min(data.len() - done);
+            if n > 0 {
+                t.write_output(&data[done..done + n]);
+                done += n;
+                request_wake_object(wake::of(tty));
+            }
         }
-        Ok(n)
-    }
-}
-
-/// Hangs up a terminal (Linux's `__tty_hangup`): the session leader receives SIGHUP and SIGCONT,
-/// and the foreground process group is recorded so that they are sent to it when the leader exits
-/// (`process::release_ctty`); the processes in the session that have it as controlling terminal
-/// lose it, and open slaves read EOF and fail writes from then on ([`Tty::hung_up`]).
-/// `/dev/pts/<n>` disappears with it and the index can go to a new terminal (Linux's
-/// `devpts_pty_kill`). Called when the last master is closed (Linux's `pty_close`,
-/// [`hang_up_closed`]) and when a console is closed ([`crate::terminal::close`]); does nothing
-/// for a terminal already hung up.
-pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
-    let (key, session, fg) = {
-        let mut t = tty.borrow_mut();
-        if t.hung_up {
-            return;
+        if done == data.len() {
+            return Ok(done);
         }
-        t.hung_up = true;
-        ((t.fs, t.index), t.session.take(), t.fg.take())
-    };
-    if k.ptys
-        .get(&key)
-        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(tty)))
-    {
-        k.ptys.remove(&key);
-    }
-    detach(k, tty, session, fg);
-}
-
-/// Hangs up one side of a terminal (Linux's `tty_vhangup`, vhangup(2), TIOCVHANGUP): every file
-/// open on this side is hung up ([`Tty::hung`]) and unread input is discarded (the line
-/// discipline's buffers are cleared with it). The slave side also signals the session leader and
-/// detaches the session from the controlling terminal, as [`hang_up`] does; unlike closing the
-/// master, `/dev/pts/<n>` stays and works again when reopened (login and agetty rely on this to
-/// chase leftover processes off the terminal). The master side has no session: only the master's
-/// files are hung up and the slave's output that has not been read yet is discarded. Does nothing
-/// when the side has not been reopened since its hangup (Linux's `TTY_HUPPED`).
-pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
-    let side = master as usize;
-    let session = {
-        let mut t = tty.borrow_mut();
-        if t.hupped[side] || (!master && t.hung_up) {
-            return;
+        if nonblock || cx.interrupted() {
+            let e = if nonblock {
+                Errno::EAGAIN
+            } else {
+                Errno::ERESTARTSYS
+            };
+            return if done > 0 { Ok(done) } else { Err(e) };
         }
-        t.hupped[side] = true;
-        t.vhangups[side] = t.vhangups[side].wrapping_add(1);
-        if master {
-            t.flush_output();
-            None
-        } else {
-            // Linux's tty_ldisc_hangup flushes the slave's input, then __tty_hangup discards the
-            // packet-mode status
-            t.flush_input();
-            t.pktstatus = 0;
-            Some((t.session.take(), t.fg.take()))
-        }
-    };
-    match session {
-        Some((session, fg)) => detach(k, tty, session, fg),
-        None => request_wake_object(wake::of(tty)),
-    }
-}
-
-/// The session part of a hangup (Linux's `tty_signal_session_leader`): the processes that have it
-/// as controlling terminal lose it, the session leader receives SIGHUP and SIGCONT, and the
-/// foreground process group `fg` is recorded so that they are sent to it when the leader exits
-/// (`process::release_ctty`). Wakes the threads waiting on this terminal.
-fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Option<Tid>) {
-    for g in k.groups.values() {
-        let mut g = g.borrow_mut();
-        if g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)) {
-            g.ctty = None;
-        }
-    }
-    if let Some(leader) = session {
-        // When the leader exits it has no controlling terminal any more, so SIGHUP goes to the
-        // foreground process group of this moment (Linux's tty_old_pgrp)
-        if let Some(g) = k.groups.get(&leader) {
-            g.borrow_mut().tty_old_pgrp = fg;
-        }
-        signal::send_to_group(k, leader, Signal::HUP, SigInfo::kernel());
-        signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
-    }
-    request_wake_object(wake::of(tty));
-}
-
-/// vhangup(2): hangs up the caller's controlling terminal ([`vhangup`]); does nothing without a
-/// controlling terminal. Requires `CAP_SYS_TTY_CONFIG` (Linux's capable(), which looks only at the
-/// boot user namespace). A caller that is the session leader also receives SIGHUP and SIGCONT
-/// itself (login ignores SIGHUP first).
-pub(super) fn vhangup_ctty(cx: &mut Cx<'_>) -> SysResult {
-    if !cx.cred().capable(cap::SYS_TTY_CONFIG) {
-        return Err(Errno::EPERM);
-    }
-    let ctty = cx.t.group.borrow().ctty.clone();
-    if let Some(tty) = ctty {
-        vhangup(cx.k(), &tty, false);
-    }
-    Ok(0)
-}
-
-/// Hangs up the terminals whose last master this thread closed ([`crate::tty::take_closed`]).
-/// Called before releasing the BKL ([`crate::kernel::Bkl`]).
-pub(crate) fn hang_up_closed(k: &mut Kernel) {
-    for tty in crate::tty::take_closed() {
-        hang_up(k, &tty);
+        cx.wait_objects(None, &mut [], wake::FILE, &[wake::of(tty)])?;
     }
 }
 
@@ -590,14 +451,7 @@ pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
     ev
 }
 
-/// Whether this terminal is the caller's controlling terminal.
-fn is_ctty(cx: &Cx<'_>, tty: &Rc<RefCell<Tty>>) -> bool {
-    cx.t.group
-        .borrow()
-        .ctty
-        .as_ref()
-        .is_some_and(|c| Rc::ptr_eq(c, tty))
-}
+// ---- ioctls ----
 
 /// The ioctls of a PTY. `born` is the open file's [`PtyEnd::born`].
 pub(crate) fn ioctl(
@@ -912,4 +766,160 @@ pub(crate) fn ioctl(
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// Whether this terminal is the caller's controlling terminal.
+fn is_ctty(cx: &Cx<'_>, tty: &Rc<RefCell<Tty>>) -> bool {
+    cx.t.group
+        .borrow()
+        .ctty
+        .as_ref()
+        .is_some_and(|c| Rc::ptr_eq(c, tty))
+}
+
+// ---- Job control ----
+
+/// A background process group accessing its controlling terminal (`sig` is SIGTTIN or SIGTTOU):
+/// following Linux's `tty_check_change`, signals its own process group and makes the syscall
+/// restart; when the signal is ignored or blocked, reads return EIO while writes and setting
+/// changes proceed as usual.
+fn check_background(cx: &mut Cx<'_>, tty: &Rc<RefCell<Tty>>, sig: Signal) -> Result<(), Errno> {
+    let (pgid, is_ctty) = {
+        let g = cx.t.group.borrow();
+        (g.pgid, g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)))
+    };
+    let fg = tty.borrow().fg;
+    if !is_ctty || fg.is_none_or(|fg| fg == pgid) {
+        return Ok(());
+    }
+    let ignored = cx.t.group.borrow().sighand.borrow().get(sig).handler == SigAction::IGNORE;
+    let blocked = cx.task.sigmask.get() & sig.bit() != 0;
+    if ignored || blocked {
+        return if sig == Signal::TTIN {
+            Err(Errno::EIO)
+        } else {
+            Ok(())
+        };
+    }
+    if signal::pgrp_orphaned(cx.kr(), pgid) {
+        return Err(Errno::EIO);
+    }
+    signal::send_to_pgrp(cx.kr(), pgid, sig, SigInfo::kernel());
+    Err(Errno::ERESTARTSYS)
+}
+
+/// Sends a signal to the terminal's foreground process group (SIGINT and the like from the line
+/// discipline, window size changes).
+pub(crate) fn signal_fg(k: &Kernel, tty: &Rc<RefCell<Tty>>, sig: Signal) {
+    if let Some(fg) = tty.borrow().fg {
+        signal::send_to_pgrp(k, fg, sig, SigInfo::kernel());
+    }
+}
+
+// ---- Hangup ----
+
+/// Hangs up the terminals whose last master this thread closed ([`crate::tty::take_closed`]).
+/// Called before releasing the BKL ([`crate::kernel::Bkl`]).
+pub(crate) fn hang_up_closed(k: &mut Kernel) {
+    for tty in crate::tty::take_closed() {
+        hang_up(k, &tty);
+    }
+}
+
+/// Hangs up a terminal (Linux's `__tty_hangup`): the session leader receives SIGHUP and SIGCONT,
+/// and the foreground process group is recorded so that they are sent to it when the leader exits
+/// (`process::release_ctty`); the processes in the session that have it as controlling terminal
+/// lose it, and open slaves read EOF and fail writes from then on ([`Tty::hung_up`]).
+/// `/dev/pts/<n>` disappears with it and the index can go to a new terminal (Linux's
+/// `devpts_pty_kill`). Called when the last master is closed (Linux's `pty_close`,
+/// [`hang_up_closed`]) and when a console is closed ([`crate::terminal::close`]); does nothing
+/// for a terminal already hung up.
+pub(crate) fn hang_up(k: &mut Kernel, tty: &Rc<RefCell<Tty>>) {
+    let (key, session, fg) = {
+        let mut t = tty.borrow_mut();
+        if t.hung_up {
+            return;
+        }
+        t.hung_up = true;
+        ((t.fs, t.index), t.session.take(), t.fg.take())
+    };
+    if k.ptys
+        .get(&key)
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(tty)))
+    {
+        k.ptys.remove(&key);
+    }
+    detach(k, tty, session, fg);
+}
+
+/// vhangup(2): hangs up the caller's controlling terminal ([`vhangup`]); does nothing without a
+/// controlling terminal. Requires `CAP_SYS_TTY_CONFIG` (Linux's capable(), which looks only at the
+/// boot user namespace). A caller that is the session leader also receives SIGHUP and SIGCONT
+/// itself (login ignores SIGHUP first).
+pub(super) fn vhangup_ctty(cx: &mut Cx<'_>) -> SysResult {
+    if !cx.cred().capable(cap::SYS_TTY_CONFIG) {
+        return Err(Errno::EPERM);
+    }
+    let ctty = cx.t.group.borrow().ctty.clone();
+    if let Some(tty) = ctty {
+        vhangup(cx.k(), &tty, false);
+    }
+    Ok(0)
+}
+
+/// Hangs up one side of a terminal (Linux's `tty_vhangup`, vhangup(2), TIOCVHANGUP): every file
+/// open on this side is hung up ([`Tty::hung`]) and unread input is discarded (the line
+/// discipline's buffers are cleared with it). The slave side also signals the session leader and
+/// detaches the session from the controlling terminal, as [`hang_up`] does; unlike closing the
+/// master, `/dev/pts/<n>` stays and works again when reopened (login and agetty rely on this to
+/// chase leftover processes off the terminal). The master side has no session: only the master's
+/// files are hung up and the slave's output that has not been read yet is discarded. Does nothing
+/// when the side has not been reopened since its hangup (Linux's `TTY_HUPPED`).
+pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
+    let side = master as usize;
+    let session = {
+        let mut t = tty.borrow_mut();
+        if t.hupped[side] || (!master && t.hung_up) {
+            return;
+        }
+        t.hupped[side] = true;
+        t.vhangups[side] = t.vhangups[side].wrapping_add(1);
+        if master {
+            t.flush_output();
+            None
+        } else {
+            // Linux's tty_ldisc_hangup flushes the slave's input, then __tty_hangup discards the
+            // packet-mode status
+            t.flush_input();
+            t.pktstatus = 0;
+            Some((t.session.take(), t.fg.take()))
+        }
+    };
+    match session {
+        Some((session, fg)) => detach(k, tty, session, fg),
+        None => request_wake_object(wake::of(tty)),
+    }
+}
+
+/// The session part of a hangup (Linux's `tty_signal_session_leader`): the processes that have it
+/// as controlling terminal lose it, the session leader receives SIGHUP and SIGCONT, and the
+/// foreground process group `fg` is recorded so that they are sent to it when the leader exits
+/// (`process::release_ctty`). Wakes the threads waiting on this terminal.
+fn detach(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, session: Option<Tid>, fg: Option<Tid>) {
+    for g in k.groups.values() {
+        let mut g = g.borrow_mut();
+        if g.ctty.as_ref().is_some_and(|c| Rc::ptr_eq(c, tty)) {
+            g.ctty = None;
+        }
+    }
+    if let Some(leader) = session {
+        // When the leader exits it has no controlling terminal any more, so SIGHUP goes to the
+        // foreground process group of this moment (Linux's tty_old_pgrp)
+        if let Some(g) = k.groups.get(&leader) {
+            g.borrow_mut().tty_old_pgrp = fg;
+        }
+        signal::send_to_group(k, leader, Signal::HUP, SigInfo::kernel());
+        signal::send_to_group(k, leader, Signal::CONT, SigInfo::kernel());
+    }
+    request_wake_object(wake::of(tty));
 }
