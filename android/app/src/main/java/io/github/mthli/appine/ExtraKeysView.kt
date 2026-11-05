@@ -22,16 +22,18 @@ import kotlin.math.roundToInt
 
 /**
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
- * widened to eight columns, with SYM and Shift in the last. Until it is tapped again, SYM puts
+ * widened to eight columns, with Shift and SYM in the last. Until it is tapped again, SYM puts
  * symbols in place of the keys that are not, so that page has every ASCII symbol Gboard types
- * neither directly nor from a long press on a letter.
+ * neither directly nor from a long press on a letter. SYM is under Shift as the symbol key of a
+ * phone keyboard is and fn on a laptop, and on the edge next to the IME, where a stray tap turns
+ * the whole page rather than silently shifting the IME's next letter.
  *
  * ```
- * ESC  /   -  HOME  ↑  END  |  │ SYM
- * TAB CTRL ALT  ←   ↓   →   ~  │ SHIFT
+ * ESC  /   -  HOME  ↑  END  |  │ SHIFT
+ * TAB CTRL ALT  ←   ↓   →   ~  │ SYM
  *
- *  `   /   -   =   ^   \   |   │ SYM
- *  [   ]   {   }   <   >   ~   │  %
+ *  `   /   -   =   ^   \   |   │  %
+ *  [   ]   {   }   <   >   ~   │ SYM
  * ```
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
@@ -80,7 +82,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
 
     /**
-     * A page: the [grid] of its first seven columns, and the [last] key, under SYM. Only the page
+     * A page: the [grid] of its first seven columns, and the [last] key, above SYM. Only the page
      * shown is in the view.
      */
     private class Page(val grid: LinearLayout, val last: View)
@@ -311,14 +313,14 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
     }
 
     /**
-     * Puts [page] in the view in place of the other one. Removing a key's view cancels its touch,
-     * so a key still held on the page going away stops repeating.
+     * Puts [page] in the view in place of the other one, its last key above SYM. Removing a key's
+     * view cancels its touch, so a key still held on the page going away stops repeating.
      */
     private fun show(page: Page) {
         scroll.removeAllViews()
         scroll.addView(page.grid)
-        if (fixed.childCount > 1) fixed.removeViewAt(1)
-        fixed.addView(page.last)
+        if (fixed.childCount > 1) fixed.removeViewAt(0)
+        fixed.addView(page.last, 0)
     }
 
     private fun refresh() {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits)
+> Maintained: 2026-11-05 (targeted verification: added the experimental libghostty-vt terminal in the debug source set and its emulator shim and JNI in `hosts/android`; its tabs now name their kernel by handle; its input: selection and copy, paste, mouse, focus, IME and Kitty releases; libghostty-vt tabs in `TerminalService`, `VtActivity` removed; the Termux emulator removed, libghostty-vt the only terminal; the tab bar by window width, a row of tabs or a switcher with a list of tabs, and closing tabs from a menu or the list; swiping over the switcher, renaming tabs, the tab shortcuts of a hardware keyboard; the extra keys in Termux's two-row layout with held keys repeating, a swipe-up popup and locked modifiers; glyphs in wide cells enlarged evenly to fill them, a setting in Settings; Material 3 themes and page layouts for Settings and the licenses; the terminal's dialogs, menus and list of tabs in Material 3, always dark; the tab bar and extra keys in the theme's colours; the extra keys in two rows of nine, the first eight columns scrolling below 360 dp, 1 px lines between the keys; the tab bar, extra keys and system-bar areas black; the extra keys in eight columns of at least 45 dp, without `` ` `` and DEL, the lines at half opacity; SHIFT in the fixed column instead of PGUP and PGDN, under a blank cell, the extra keys' modifiers folded into the key event's meta state; the swipe up from `-` to `|` and its popup removed; SYM in the blank cell, turning the other keys to a page of the symbols Gboard has no long press for until tapped again, with `%` in place of SHIFT, which waits; SHIFT and `%` above SYM in the fixed column)
 
 ## Responsibilities
 
@@ -39,12 +39,12 @@ libghostty-vt with Zig (`android/native`).
   `list_tab.xml`); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
-  `|`, SYM; TAB, CTRL, ALT, ←, ↓, →, `~`, SHIFT), with a second page of symbols for every key but
-  SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`; `[`, `]`, `{`, `}`, `<`, `>`, `~`, `%`: the ASCII
+  `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
+  SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
   symbols Gboard gives neither on its letters nor from a long press on one, and `-`, with `/ - | ~`
   where they are on the first page): a `Page` is a
-  grid of the first seven columns and the key under SYM; the grid shown is in a
-  `HorizontalScrollView`, the last column (SYM over SHIFT or `%`) fixed beside it; keeps CTRL, ALT
+  grid of the first seven columns and the key above SYM; the grid shown is in a
+  `HorizontalScrollView`, the last column (SHIFT or `%` over SYM) fixed beside it; keeps CTRL, ALT
   and SHIFT (one-shot or locked) and the page shown, and sends keys and text to a `Target`;
   `Press` handles the touch on one key.
 - `ConsolePty` — `start` (open console, spawn `login.sh`), `waitFor`, `close`; `console` is −1
