@@ -54,20 +54,6 @@ pub(crate) struct Tunables {
     pub shmmni: u64,
 }
 
-impl Default for Tunables {
-    fn default() -> Tunables {
-        Tunables {
-            msgmax: 8192,
-            msgmnb: 16384,
-            msgmni: 32000,
-            sem: [32000, 1_024_000_000, 500, 32000],
-            shmmax: u64::MAX - (1 << 24),
-            shmall: u64::MAX - (1 << 24),
-            shmmni: 4096,
-        }
-    }
-}
-
 impl Tunables {
     /// The contents of `/proc/sys/kernel/<name>`; returns None for a file that is not one of these.
     pub fn read(&self, name: &[u8]) -> Option<String> {
@@ -125,9 +111,18 @@ impl Tunables {
     }
 }
 
-/// Current CLOCK_REALTIME seconds (for timestamps such as `*_stime`).
-pub(crate) fn now() -> i64 {
-    appine_hal::clock_gettime(0).map_or(0, |(s, _)| s)
+impl Default for Tunables {
+    fn default() -> Tunables {
+        Tunables {
+            msgmax: 8192,
+            msgmnb: 16384,
+            msgmni: 32000,
+            sem: [32000, 1_024_000_000, 500, 32000],
+            shmmax: u64::MAX - (1 << 24),
+            shmall: u64::MAX - (1 << 24),
+            shmmni: 4096,
+        }
+    }
 }
 
 /// `struct ipc_perm`.
@@ -213,98 +208,7 @@ pub(crate) struct Table<T> {
     seqs: Vec<u16>,
 }
 
-impl<T> Default for Table<T> {
-    fn default() -> Table<T> {
-        Table {
-            slots: Vec::new(),
-            seqs: Vec::new(),
-        }
-    }
-}
-
 impl<T> Table<T> {
-    fn index_of(id: i32) -> Option<(usize, u16)> {
-        (id >= 0).then_some(((id % IPCMNI) as usize, (id / IPCMNI) as u16))
-    }
-
-    /// The object for an id; EINVAL when there is none (including when it was removed or its index
-    /// allocated again).
-    pub fn get(&self, id: i32) -> Result<&(Perm, T), Errno> {
-        let (i, seq) = Self::index_of(id).ok_or(Errno::EINVAL)?;
-        self.slots
-            .get(i)
-            .and_then(Option::as_ref)
-            .filter(|(p, _)| p.seq == seq)
-            .ok_or(Errno::EINVAL)
-    }
-
-    pub fn get_mut(&mut self, id: i32) -> Result<&mut (Perm, T), Errno> {
-        let (i, seq) = Self::index_of(id).ok_or(Errno::EINVAL)?;
-        self.slots
-            .get_mut(i)
-            .and_then(Option::as_mut)
-            .filter(|(p, _)| p.seq == seq)
-            .ok_or(Errno::EINVAL)
-    }
-
-    /// Looks up by index (the `*_STAT` commands), returning the full id.
-    pub fn by_index(&self, index: i32) -> Result<(i32, &(Perm, T)), Errno> {
-        let slot = usize::try_from(index)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .and_then(Option::as_ref)
-            .ok_or(Errno::EINVAL)?;
-        Ok((slot.0.seq as i32 * IPCMNI + index, slot))
-    }
-
-    /// The highest index in use (the return value of `IPC_INFO` and the like).
-    pub fn max_index(&self) -> i32 {
-        self.slots.iter().rposition(Option::is_some).unwrap_or(0) as i32
-    }
-
-    fn find(&self, key: i32) -> Option<i32> {
-        self.iter()
-            .find(|(_, p, _)| p.key == key)
-            .map(|(id, _, _)| id)
-    }
-
-    fn insert(&mut self, mut perm: Perm, obj: T) -> Result<i32, Errno> {
-        let i = match self.slots.iter().position(Option::is_none) {
-            Some(i) => i,
-            None if self.slots.len() < IPCMNI as usize => {
-                self.slots.push(None);
-                self.seqs.push(0);
-                self.slots.len() - 1
-            }
-            None => return Err(Errno::ENOSPC),
-        };
-        perm.seq = self.seqs[i];
-        // The sequence number must fit in an id: (sequence * 32768 + index) must not overflow i32
-        self.seqs[i] = (self.seqs[i] + 1) % (i32::MAX / IPCMNI) as u16;
-        let id = perm.seq as i32 * IPCMNI + i as i32;
-        self.slots[i] = Some((perm, obj));
-        Ok(id)
-    }
-
-    pub fn remove(&mut self, id: i32) -> Option<(Perm, T)> {
-        self.get(id).ok()?;
-        let (i, _) = Self::index_of(id)?;
-        request_wake();
-        self.slots[i].take()
-    }
-
-    /// All objects: (id, permissions, object).
-    pub fn iter(&self) -> impl Iterator<Item = (i32, &Perm, &T)> {
-        self.slots.iter().enumerate().filter_map(|(i, s)| {
-            s.as_ref()
-                .map(|(p, o)| (p.seq as i32 * IPCMNI + i as i32, p, o))
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
-    }
-
     /// The common part of msgget, semget and shmget: finds an existing object by key (`existing`
     /// does the object's own checks), or creates a new one (`create`); at most `max` (`msgmni`
     /// etc.) exist at once.
@@ -345,6 +249,97 @@ impl<T> Table<T> {
         };
         let obj = create()?;
         self.insert(perm, obj)
+    }
+
+    fn find(&self, key: i32) -> Option<i32> {
+        self.iter()
+            .find(|(_, p, _)| p.key == key)
+            .map(|(id, _, _)| id)
+    }
+
+    fn insert(&mut self, mut perm: Perm, obj: T) -> Result<i32, Errno> {
+        let i = match self.slots.iter().position(Option::is_none) {
+            Some(i) => i,
+            None if self.slots.len() < IPCMNI as usize => {
+                self.slots.push(None);
+                self.seqs.push(0);
+                self.slots.len() - 1
+            }
+            None => return Err(Errno::ENOSPC),
+        };
+        perm.seq = self.seqs[i];
+        // The sequence number must fit in an id: (sequence * 32768 + index) must not overflow i32
+        self.seqs[i] = (self.seqs[i] + 1) % (i32::MAX / IPCMNI) as u16;
+        let id = perm.seq as i32 * IPCMNI + i as i32;
+        self.slots[i] = Some((perm, obj));
+        Ok(id)
+    }
+
+    /// The object for an id; EINVAL when there is none (including when it was removed or its index
+    /// allocated again).
+    pub fn get(&self, id: i32) -> Result<&(Perm, T), Errno> {
+        let (i, seq) = Self::index_of(id).ok_or(Errno::EINVAL)?;
+        self.slots
+            .get(i)
+            .and_then(Option::as_ref)
+            .filter(|(p, _)| p.seq == seq)
+            .ok_or(Errno::EINVAL)
+    }
+
+    pub fn get_mut(&mut self, id: i32) -> Result<&mut (Perm, T), Errno> {
+        let (i, seq) = Self::index_of(id).ok_or(Errno::EINVAL)?;
+        self.slots
+            .get_mut(i)
+            .and_then(Option::as_mut)
+            .filter(|(p, _)| p.seq == seq)
+            .ok_or(Errno::EINVAL)
+    }
+
+    /// Looks up by index (the `*_STAT` commands), returning the full id.
+    pub fn by_index(&self, index: i32) -> Result<(i32, &(Perm, T)), Errno> {
+        let slot = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.slots.get(i))
+            .and_then(Option::as_ref)
+            .ok_or(Errno::EINVAL)?;
+        Ok((slot.0.seq as i32 * IPCMNI + index, slot))
+    }
+
+    /// The highest index in use (the return value of `IPC_INFO` and the like).
+    pub fn max_index(&self) -> i32 {
+        self.slots.iter().rposition(Option::is_some).unwrap_or(0) as i32
+    }
+
+    pub fn remove(&mut self, id: i32) -> Option<(Perm, T)> {
+        self.get(id).ok()?;
+        let (i, _) = Self::index_of(id)?;
+        request_wake();
+        self.slots[i].take()
+    }
+
+    fn index_of(id: i32) -> Option<(usize, u16)> {
+        (id >= 0).then_some(((id % IPCMNI) as usize, (id / IPCMNI) as u16))
+    }
+
+    /// All objects: (id, permissions, object).
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &Perm, &T)> {
+        self.slots.iter().enumerate().filter_map(|(i, s)| {
+            s.as_ref()
+                .map(|(p, o)| (p.seq as i32 * IPCMNI + i as i32, p, o))
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+impl<T> Default for Table<T> {
+    fn default() -> Table<T> {
+        Table {
+            slots: Vec::new(),
+            seqs: Vec::new(),
+        }
     }
 }
 
@@ -407,6 +402,14 @@ impl MsgQueue {
     }
 }
 
+/// One semop operation (`struct sembuf`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SemOp {
+    pub num: u16,
+    pub op: i16,
+    pub flg: i16,
+}
+
 /// A semaphore set.
 pub(crate) struct SemSet {
     pub vals: Vec<i32>,
@@ -417,14 +420,6 @@ pub(crate) struct SemSet {
     pub zcnt: Vec<u32>,
     pub otime: i64,
     pub ctime: i64,
-}
-
-/// One semop operation (`struct sembuf`).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SemOp {
-    pub num: u16,
-    pub op: i16,
-    pub flg: i16,
 }
 
 impl SemSet {
@@ -564,22 +559,6 @@ impl Ipc {
     }
 }
 
-/// How many times a shared memory segment is attached: counts the mappings in all address spaces
-/// (each address space counted only once).
-pub(crate) fn nattch(k: &Kernel, id: ShmKey) -> u64 {
-    let mut seen: Vec<*const crate::cell::RefCell<crate::mm::Mm>> = Vec::new();
-    let mut n = 0;
-    for t in k.tasks.values() {
-        let mm = t.res.borrow().mm.clone();
-        if seen.contains(&Rc::as_ptr(&mm)) {
-            continue;
-        }
-        seen.push(Rc::as_ptr(&mm));
-        n += mm.borrow().shm_attachments(id) as u64;
-    }
-    n
-}
-
 /// Frees shared memory segments marked for removal that have no mappings left (in every IPC
 /// namespace).
 pub(crate) fn reap_shm(k: &mut Kernel) {
@@ -673,6 +652,27 @@ pub(crate) fn proc_listing(k: &Kernel, ns: u64, which: &[u8], reader: &Cred) -> 
         }
     }
     s
+}
+
+/// How many times a shared memory segment is attached: counts the mappings in all address spaces
+/// (each address space counted only once).
+pub(crate) fn nattch(k: &Kernel, id: ShmKey) -> u64 {
+    let mut seen: Vec<*const crate::cell::RefCell<crate::mm::Mm>> = Vec::new();
+    let mut n = 0;
+    for t in k.tasks.values() {
+        let mm = t.res.borrow().mm.clone();
+        if seen.contains(&Rc::as_ptr(&mm)) {
+            continue;
+        }
+        seen.push(Rc::as_ptr(&mm));
+        n += mm.borrow().shm_attachments(id) as u64;
+    }
+    n
+}
+
+/// Current CLOCK_REALTIME seconds (for timestamps such as `*_stime`).
+pub(crate) fn now() -> i64 {
+    appine_hal::clock_gettime(0).map_or(0, |(s, _)| s)
 }
 
 #[cfg(test)]

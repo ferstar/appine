@@ -61,23 +61,6 @@ impl AioContext {
     }
 }
 
-fn event(data: u64, obj: u64, res: i64) -> [u8; 32] {
-    let mut b = [0u8; 32];
-    b[..8].copy_from_slice(&data.to_le_bytes());
-    b[8..16].copy_from_slice(&obj.to_le_bytes());
-    b[16..24].copy_from_slice(&res.to_le_bytes());
-    b
-}
-
-fn context(cx: &Cx<'_>, ctx: u64) -> Result<Rc<RefCell<AioContext>>, Errno> {
-    cx.t.group
-        .borrow()
-        .aio
-        .get(&ctx)
-        .cloned()
-        .ok_or(Errno::EINVAL)
-}
-
 pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     let cur = u64::from_le_bytes(get(cx, ctxp)?);
     if cur != 0 || nr == 0 || nr > 0x1000_0000 / 32 {
@@ -108,89 +91,31 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     Ok(0)
 }
 
-/// Destroys a context: pending polls are cancelled (producing no completion events), and threads
-/// waiting for it in io_getevents return after waking, as with Linux's `kill_ioctx`. mariadb
-/// relies on this to end its event-waiting threads at shutdown.
-pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
-    let c =
-        cx.t.group
-            .borrow_mut()
-            .aio
-            .remove(&ctx)
-            .ok_or(Errno::EINVAL)?;
-    {
-        let mut c = c.borrow_mut();
-        c.dead = true;
-        c.polls.clear();
+pub(super) fn io_submit(cx: &mut Cx<'_>, ctx: u64, nr: i64, iocbpp: u64) -> SysResult {
+    let c = context(cx, ctx)?;
+    if nr < 0 {
+        return Err(Errno::EINVAL);
     }
-    released(cx.k(), std::iter::once((ctx, c)));
-    let _ = cx.mm_mut().munmap(ctx, 4096);
-    request_wake();
-    Ok(0)
-}
-
-/// A context is no longer used (io_destroy, execve, process exit): subtract it from aio-nr.
-pub(crate) fn released(
-    k: &mut crate::kernel::Kernel,
-    contexts: impl IntoIterator<Item = (u64, Rc<RefCell<AioContext>>)>,
-) {
-    for (_, c) in contexts {
-        k.aio_nr = k.aio_nr.saturating_sub(c.borrow().max as u64 * 2);
-    }
-}
-
-/// On completion, notifies the eventfd (`IOCB_FLAG_RESFD`): its count goes up by one.
-fn notify_resfd(cx: &mut Cx<'_>, fd: Option<i32>) {
-    let Some(fd) = fd else {
-        return;
-    };
-    if let Ok(file) = cx.fds().get(fd)
-        && let FileKind::EventFd(e) = &file.borrow().kind
-    {
-        let mut e = e.borrow_mut();
-        e.count = e.count.saturating_add(1).min(u64::MAX - 1);
-        // Counts as one arrival, like a write to the eventfd (EPOLLET fires again)
-        e.writes += 1;
+    let mut done = 0;
+    for i in 0..nr as u64 {
+        let r = get::<8>(cx, iocbpp.wrapping_add(i * 8))
+            .map(u64::from_le_bytes)
+            .and_then(|obj| {
+                if obj == 0 {
+                    Err(Errno::EFAULT)
+                } else {
+                    Ok(obj)
+                }
+            })
+            .and_then(|obj| submit_one(cx, &c, obj));
+        match r {
+            Ok(()) => done += 1,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
     }
     request_wake();
-}
-
-/// Runs a read or write request, returning the io_event's res (negative is an errno).
-fn read_write(
-    cx: &mut Cx<'_>,
-    file: &FileRef,
-    fd: i32,
-    op: u16,
-    (buf, len, offset): (u64, u64, i64),
-    rw_flags: u32,
-) -> i64 {
-    // Files that cannot seek (pipes, sockets) ignore the offset; with RWF_NOWAIT, do not wait
-    let at = super::fs::seekable(&file.borrow()).then_some(offset as u64);
-    let saved = file.borrow().flags;
-    let mut f = saved;
-    if rw_flags & RWF_NOWAIT != 0 {
-        f |= oflags::O_NONBLOCK;
-    }
-    if rw_flags & RWF_APPEND != 0 {
-        f |= oflags::O_APPEND;
-    }
-    file.borrow_mut().flags = f;
-    let len = len as usize;
-    let r = match op {
-        IOCB_CMD_PREAD => super::fs::read_file(cx, file, buf, len, at),
-        IOCB_CMD_PWRITE => super::fs::write_file(cx, file, buf, len, at),
-        IOCB_CMD_PREADV => super::fs::vectored(cx, fd, buf, len, at, false),
-        _ => super::fs::vectored(cx, fd, buf, len, at, true),
-    };
-    // Restore only the two flags added temporarily: other threads may have changed other flags
-    // while the request ran
-    let temp = oflags::O_NONBLOCK | oflags::O_APPEND;
-    let restored = (file.borrow().flags & !temp) | (saved & temp);
-    file.borrow_mut().flags = restored;
-    match r {
-        Ok(n) => n as i64,
-        Err(e) => -(e.0 as i64),
-    }
+    Ok(done)
 }
 
 /// Submits one request: reads, writes and fsync complete on the spot, and a poll that is not ready
@@ -263,31 +188,42 @@ fn submit_one(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>, obj: u64) -> Result<
     Ok(())
 }
 
-pub(super) fn io_submit(cx: &mut Cx<'_>, ctx: u64, nr: i64, iocbpp: u64) -> SysResult {
-    let c = context(cx, ctx)?;
-    if nr < 0 {
-        return Err(Errno::EINVAL);
+/// Runs a read or write request, returning the io_event's res (negative is an errno).
+fn read_write(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    fd: i32,
+    op: u16,
+    (buf, len, offset): (u64, u64, i64),
+    rw_flags: u32,
+) -> i64 {
+    // Files that cannot seek (pipes, sockets) ignore the offset; with RWF_NOWAIT, do not wait
+    let at = super::fs::seekable(&file.borrow()).then_some(offset as u64);
+    let saved = file.borrow().flags;
+    let mut f = saved;
+    if rw_flags & RWF_NOWAIT != 0 {
+        f |= oflags::O_NONBLOCK;
     }
-    let mut done = 0;
-    for i in 0..nr as u64 {
-        let r = get::<8>(cx, iocbpp.wrapping_add(i * 8))
-            .map(u64::from_le_bytes)
-            .and_then(|obj| {
-                if obj == 0 {
-                    Err(Errno::EFAULT)
-                } else {
-                    Ok(obj)
-                }
-            })
-            .and_then(|obj| submit_one(cx, &c, obj));
-        match r {
-            Ok(()) => done += 1,
-            Err(e) if done == 0 => return Err(e),
-            Err(_) => break,
-        }
+    if rw_flags & RWF_APPEND != 0 {
+        f |= oflags::O_APPEND;
     }
-    request_wake();
-    Ok(done)
+    file.borrow_mut().flags = f;
+    let len = len as usize;
+    let r = match op {
+        IOCB_CMD_PREAD => super::fs::read_file(cx, file, buf, len, at),
+        IOCB_CMD_PWRITE => super::fs::write_file(cx, file, buf, len, at),
+        IOCB_CMD_PREADV => super::fs::vectored(cx, fd, buf, len, at, false),
+        _ => super::fs::vectored(cx, fd, buf, len, at, true),
+    };
+    // Restore only the two flags added temporarily: other threads may have changed other flags
+    // while the request ran
+    let temp = oflags::O_NONBLOCK | oflags::O_APPEND;
+    let restored = (file.borrow().flags & !temp) | (saved & temp);
+    file.borrow_mut().flags = restored;
+    match r {
+        Ok(n) => n as i64,
+        Err(e) => -(e.0 as i64),
+    }
 }
 
 pub(super) fn io_cancel(cx: &mut Cx<'_>, ctx: u64, iocb: u64, _result: u64) -> SysResult {
@@ -308,29 +244,6 @@ pub(super) fn io_cancel(cx: &mut Cx<'_>, ctx: u64, iocb: u64, _result: u64) -> S
     c.events.push_back(event(p.data, p.obj, 0));
     request_wake();
     Err(Errno::EINPROGRESS)
-}
-
-/// Completes the pending polls that have become ready.
-fn complete_polls(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>) {
-    let mut done = Vec::new();
-    {
-        let mut c = c.borrow_mut();
-        let mut i = 0;
-        while i < c.polls.len() {
-            let p = &c.polls[i];
-            let ready = super::poll::poll_once(&p.file.borrow(), p.events, true);
-            if ready != 0 {
-                let p = c.polls.remove(i);
-                c.events.push_back(event(p.data, p.obj, ready as i64));
-                done.push(p.resfd);
-            } else {
-                i += 1;
-            }
-        }
-    }
-    for resfd in done {
-        notify_resfd(cx, resfd);
-    }
 }
 
 pub(super) fn io_getevents(
@@ -382,6 +295,29 @@ pub(super) fn io_getevents(
     Ok(take as u64)
 }
 
+/// Completes the pending polls that have become ready.
+fn complete_polls(cx: &mut Cx<'_>, c: &Rc<RefCell<AioContext>>) {
+    let mut done = Vec::new();
+    {
+        let mut c = c.borrow_mut();
+        let mut i = 0;
+        while i < c.polls.len() {
+            let p = &c.polls[i];
+            let ready = super::poll::poll_once(&p.file.borrow(), p.events, true);
+            if ready != 0 {
+                let p = c.polls.remove(i);
+                c.events.push_back(event(p.data, p.obj, ready as i64));
+                done.push(p.resfd);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for resfd in done {
+        notify_resfd(cx, resfd);
+    }
+}
+
 /// The last argument of io_pgetevents: `struct { const sigset_t *sigmask; size_t sigsetsize; }`.
 pub(super) fn sigmask_arg(cx: &Cx<'_>, usig: u64) -> Result<Option<(u64, usize)>, Errno> {
     if usig == 0 {
@@ -391,4 +327,68 @@ pub(super) fn sigmask_arg(cx: &Cx<'_>, usig: u64) -> Result<Option<(u64, usize)>
     let mask = u64::from_le_bytes(b[..8].try_into().unwrap());
     let size = u64::from_le_bytes(b[8..].try_into().unwrap()) as usize;
     Ok((mask != 0).then_some((mask, size)))
+}
+
+/// Destroys a context: pending polls are cancelled (producing no completion events), and threads
+/// waiting for it in io_getevents return after waking, as with Linux's `kill_ioctx`. mariadb
+/// relies on this to end its event-waiting threads at shutdown.
+pub(super) fn io_destroy(cx: &mut Cx<'_>, ctx: u64) -> SysResult {
+    let c =
+        cx.t.group
+            .borrow_mut()
+            .aio
+            .remove(&ctx)
+            .ok_or(Errno::EINVAL)?;
+    {
+        let mut c = c.borrow_mut();
+        c.dead = true;
+        c.polls.clear();
+    }
+    released(cx.k(), std::iter::once((ctx, c)));
+    let _ = cx.mm_mut().munmap(ctx, 4096);
+    request_wake();
+    Ok(0)
+}
+
+/// A context is no longer used (io_destroy, execve, process exit): subtract it from aio-nr.
+pub(crate) fn released(
+    k: &mut crate::kernel::Kernel,
+    contexts: impl IntoIterator<Item = (u64, Rc<RefCell<AioContext>>)>,
+) {
+    for (_, c) in contexts {
+        k.aio_nr = k.aio_nr.saturating_sub(c.borrow().max as u64 * 2);
+    }
+}
+
+fn context(cx: &Cx<'_>, ctx: u64) -> Result<Rc<RefCell<AioContext>>, Errno> {
+    cx.t.group
+        .borrow()
+        .aio
+        .get(&ctx)
+        .cloned()
+        .ok_or(Errno::EINVAL)
+}
+
+fn event(data: u64, obj: u64, res: i64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&data.to_le_bytes());
+    b[8..16].copy_from_slice(&obj.to_le_bytes());
+    b[16..24].copy_from_slice(&res.to_le_bytes());
+    b
+}
+
+/// On completion, notifies the eventfd (`IOCB_FLAG_RESFD`): its count goes up by one.
+fn notify_resfd(cx: &mut Cx<'_>, fd: Option<i32>) {
+    let Some(fd) = fd else {
+        return;
+    };
+    if let Ok(file) = cx.fds().get(fd)
+        && let FileKind::EventFd(e) = &file.borrow().kind
+    {
+        let mut e = e.borrow_mut();
+        e.count = e.count.saturating_add(1).min(u64::MAX - 1);
+        // Counts as one arrival, like a write to the eventfd (EPOLLET fires again)
+        e.writes += 1;
+    }
+    request_wake();
 }

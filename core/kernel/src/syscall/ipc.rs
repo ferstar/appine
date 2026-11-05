@@ -59,34 +59,6 @@ const SHM_EXEC: i32 = 0o100000;
 const READ: u32 = 0o444;
 const WRITE: u32 = 0o222;
 
-/// Concatenates a list of integers in little-endian (to encode `*_ds`, `*info`).
-fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
-    for (i, v) in values.iter().enumerate() {
-        let off = at + i * width;
-        out[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
-    }
-}
-
-/// `*_STAT` and `IPC_STAT`: finds the object by index or by id, without checking read permission
-/// when `any`. Returns the id.
-fn stat_target<'t, T>(
-    table: &'t crate::ipc::Table<T>,
-    cred: &Cred,
-    id: i32,
-    by_index: bool,
-    any: bool,
-) -> Result<(i32, &'t (Perm, T)), Errno> {
-    let (id, entry) = if by_index {
-        table.by_index(id)?
-    } else {
-        (id, table.get(id)?)
-    };
-    if !any {
-        entry.0.check(cred, READ)?;
-    }
-    Ok((id, entry))
-}
-
 // ---- Message queues ----
 
 pub(super) fn msgget(cx: &mut Cx<'_>, key: i32, flags: i32) -> SysResult {
@@ -198,28 +170,6 @@ pub(super) fn msgrcv(
     Ok(n as u64)
 }
 
-/// `struct msqid64_ds` (120 bytes).
-/// `pid` translates a recorded pid into the one the caller sees.
-fn encode_msqid(perm: &Perm, cred: &Cred, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
-    let mut b = [0u8; 120];
-    b[..48].copy_from_slice(&perm.encode(cred));
-    words(
-        &mut b,
-        48,
-        &[
-            q.stime as u64,
-            q.rtime as u64,
-            q.ctime as u64,
-            q.cbytes,
-            q.msgs.len() as u64,
-            q.qbytes,
-        ],
-        8,
-    );
-    words(&mut b, 96, &[pid(q.lspid) as u64, pid(q.lrpid) as u64], 4);
-    b
-}
-
 pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
     let cmd = cmd & !IPC_64;
     let cred = cx.cred();
@@ -281,6 +231,28 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
     }
 }
 
+/// `struct msqid64_ds` (120 bytes).
+/// `pid` translates a recorded pid into the one the caller sees.
+fn encode_msqid(perm: &Perm, cred: &Cred, q: &MsgQueue, pid: impl Fn(Tid) -> Tid) -> [u8; 120] {
+    let mut b = [0u8; 120];
+    b[..48].copy_from_slice(&perm.encode(cred));
+    words(
+        &mut b,
+        48,
+        &[
+            q.stime as u64,
+            q.rtime as u64,
+            q.ctime as u64,
+            q.cbytes,
+            q.msgs.len() as u64,
+            q.qbytes,
+        ],
+        8,
+    );
+    words(&mut b, 96, &[pid(q.lspid) as u64, pid(q.lrpid) as u64], 4);
+    b
+}
+
 // ---- Semaphores ----
 
 pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysResult {
@@ -313,19 +285,6 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
             },
         )
         .map(|id| id as u64)
-}
-
-/// `struct semid64_ds` (88 bytes).
-fn encode_semid(perm: &Perm, cred: &Cred, s: &SemSet) -> [u8; 88] {
-    let mut b = [0u8; 88];
-    b[..48].copy_from_slice(&perm.encode(cred));
-    words(
-        &mut b,
-        48,
-        &[s.otime as u64, s.ctime as u64, s.vals.len() as u64],
-        8,
-    );
-    b
 }
 
 pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> SysResult {
@@ -458,6 +417,19 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `struct semid64_ds` (88 bytes).
+fn encode_semid(perm: &Perm, cred: &Cred, s: &SemSet) -> [u8; 88] {
+    let mut b = [0u8; 88];
+    b[..48].copy_from_slice(&perm.encode(cred));
+    words(
+        &mut b,
+        48,
+        &[s.otime as u64, s.ctime as u64, s.vals.len() as u64],
+        8,
+    );
+    b
 }
 
 pub(super) fn semtimedop(
@@ -650,28 +622,6 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
     Ok(0)
 }
 
-/// `struct shmid64_ds` (112 bytes).
-/// `pid` translates a recorded pid into the one the caller sees.
-fn encode_shmid(
-    perm: &Perm,
-    cred: &Cred,
-    s: &ShmSeg,
-    nattch: u64,
-    pid: impl Fn(Tid) -> Tid,
-) -> [u8; 112] {
-    let mut b = [0u8; 112];
-    b[..48].copy_from_slice(&perm.encode(cred));
-    words(
-        &mut b,
-        48,
-        &[s.size, s.atime as u64, s.dtime as u64, s.ctime as u64],
-        8,
-    );
-    words(&mut b, 80, &[pid(s.cpid) as u64, pid(s.lpid) as u64], 4);
-    words(&mut b, 88, &[nattch], 8);
-    b
-}
-
 pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
     let cmd = cmd & !IPC_64;
     let cred = cx.cred();
@@ -755,5 +705,57 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             Ok(0)
         }
         _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `struct shmid64_ds` (112 bytes).
+/// `pid` translates a recorded pid into the one the caller sees.
+fn encode_shmid(
+    perm: &Perm,
+    cred: &Cred,
+    s: &ShmSeg,
+    nattch: u64,
+    pid: impl Fn(Tid) -> Tid,
+) -> [u8; 112] {
+    let mut b = [0u8; 112];
+    b[..48].copy_from_slice(&perm.encode(cred));
+    words(
+        &mut b,
+        48,
+        &[s.size, s.atime as u64, s.dtime as u64, s.ctime as u64],
+        8,
+    );
+    words(&mut b, 80, &[pid(s.cpid) as u64, pid(s.lpid) as u64], 4);
+    words(&mut b, 88, &[nattch], 8);
+    b
+}
+
+// ---- Shared by msgctl, semctl and shmctl ----
+
+/// `*_STAT` and `IPC_STAT`: finds the object by index or by id, without checking read permission
+/// when `any`. Returns the id.
+fn stat_target<'t, T>(
+    table: &'t crate::ipc::Table<T>,
+    cred: &Cred,
+    id: i32,
+    by_index: bool,
+    any: bool,
+) -> Result<(i32, &'t (Perm, T)), Errno> {
+    let (id, entry) = if by_index {
+        table.by_index(id)?
+    } else {
+        (id, table.get(id)?)
+    };
+    if !any {
+        entry.0.check(cred, READ)?;
+    }
+    Ok((id, entry))
+}
+
+/// Concatenates a list of integers in little-endian (to encode `*_ds`, `*info`).
+fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
+    for (i, v) in values.iter().enumerate() {
+        let off = at + i * width;
+        out[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
     }
 }
