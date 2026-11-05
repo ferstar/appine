@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.Manifest
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Intent
@@ -23,13 +24,17 @@ import android.view.Menu
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.widget.PopupMenu
+import androidx.core.animation.doOnEnd
 import androidx.core.content.edit
+import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -37,6 +42,8 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * The terminal screen: the tab bar on top, the terminal ([VtView]) in the middle, and below it the
@@ -47,7 +54,8 @@ import com.google.android.material.dialog.MaterialAlertDialogBuilder
  * The tab bar is one row in any window: a scrolling row of tabs, each a square with its number
  * (a long press shows its title), with `×` (closes the current tab), `+` and `⋮` over its end; the
  * tabs fade out into the left part of `×` while more of them lie beyond. Scrolled away from the
- * current tab, the row brings it back into view a few seconds after it comes to rest.
+ * current tab, the row brings it back into view a few seconds after it comes to rest. When tabs
+ * close, the ones after them slide into their places and then change their numbers.
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
@@ -70,6 +78,45 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** [current]'s number in the row, which the row draws the indicator under; null with none. */
     private var currentTab: TextView? = null
+
+    /** The row's tabs in its order; a closed one leaves the list as it starts fading out. */
+    private val rowTabs = mutableListOf<Tab>()
+
+    /**
+     * Where each tab's place in the row was on screen before the change that [slideTabs] animates,
+     * or null with none waiting for the next layout. Taken at the first change before that layout:
+     * closing the current tab shows the next one, which renders the row once more.
+     */
+    private var slideFrom: Map<Tab, Int>? = null
+
+    /** Where the current tab's place was on screen, taken with [slideFrom]; null with no tab. */
+    private var indicatorFrom: Int? = null
+
+    /** How far right of [currentTab]'s place the indicator is drawn while it slides there. */
+    private var indicatorShift = 0f
+    private var indicatorSlide: ValueAnimator? = null
+
+    /**
+     * Once the row is laid out after a change, slides each tab from where its place was on screen
+     * to its new one, then gives it the number of that place ([Tab.renumber]). A closed tab keeps
+     * fading out where it was, though the row's scroll moved: a shorter row may scroll less.
+     */
+    private val slideTabs = object : ViewTreeObserver.OnPreDrawListener {
+        override fun onPreDraw(): Boolean {
+            tabs.viewTreeObserver.removeOnPreDrawListener(this)
+            val from = slideFrom ?: return true
+            slideFrom = null
+            for ((tab, x) in from) {
+                val shift = x - (tab.view.left - strip.scrollX)
+                tab.view.translationX += shift
+                // A tab whose place stays on screen but whose number changes waits as long as
+                // those that slide (a 0 to 0 slide); one still sliding renumbers at its end
+                if (tab in rowTabs && (shift != 0 || tab.stale && tab.view.translationX == 0f)) tab.slide()
+            }
+            moveIndicator(closed = from.keys.any { it !in rowTabs })
+            return true
+        }
+    }
 
     /** Whether a finger is on the tab row, which holds off [returnToCurrentTab]. */
     private var stripTouched = false
@@ -130,7 +177,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             // Over the tabs, as the extra keys draw theirs
             override fun dispatchDraw(canvas: Canvas) {
                 super.dispatchDraw(canvas)
-                currentTab?.let { ExtraKeysView.drawIndicator(canvas, this, it, indicatorPaint) }
+                currentTab?.let { ExtraKeysView.drawIndicator(canvas, this, it, indicatorPaint, indicatorShift) }
             }
         }.apply { orientation = LinearLayout.HORIZONTAL }
         // The row runs under the buttons to the bar's end. Its end padding, as wide as the buttons,
@@ -168,6 +215,8 @@ class MainActivity : Activity(), TerminalService.Listener {
             isHorizontalFadingEdgeEnabled = true
             setFadingEdgeLength(dp(ExtraKeysView.FADE_DP))
             clipToPadding = false
+            // A closed last tab fades out past the end of the shortened row (Tab.leave)
+            clipChildren = false
             addView(tabs, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         // The multiplication sign, which Roboto draws like its +; U+2715 (✕) is not in Roboto, and
@@ -348,21 +397,38 @@ class MainActivity : Activity(), TerminalService.Listener {
     /**
      * Shows the tabs, a number each, the current one marked and scrolled into view. Called whenever
      * tabs, titles or the current tab change.
+     *
+     * Closed tabs shrink and fade out in place, and the tabs after them slide into the places left,
+     * keeping their numbers until they are there ([slideTabs]): closing the current tab shows the
+     * next one in its place, under the same number, and it is seen arriving.
      */
     private fun renderTabs() {
         val sessions = service?.sessions.orEmpty().toList()
-        tabs.removeAllViews()
-        sessions.forEachIndexed { i, session -> tabs.addView(tabButton(i, session), barItem()) }
+        if (slideFrom == null && tabs.isLaidOut && rowTabs.isNotEmpty()) {
+            slideFrom = rowTabs.associateWith { it.view.left - strip.scrollX }
+            indicatorFrom = currentTab?.let { it.left - strip.scrollX }
+            tabs.viewTreeObserver.addOnPreDrawListener(slideTabs)
+        }
+        // Out of the list first, so that they renumber no more. Sessions are added only at the end,
+        // so the tabs left keep their order
+        val closed = rowTabs.filter { it.session !in sessions }
+        rowTabs.removeAll(closed)
+        closed.forEach { it.leave() }
+        sessions.forEachIndexed { i, session ->
+            if (i == rowTabs.size) rowTabs.add(Tab(session, i).also { tabs.addView(it.view, barItem()) })
+            rowTabs[i].update(i)
+        }
 
         val shown = current?.takeIf { it in sessions }
         closeButton.visibility = if (shown == null) View.INVISIBLE else View.VISIBLE
         if (shown != null) currentIndex = sessions.indexOf(shown)
 
-        // Indicate the current tab (adding the tabs redraws the row), and bring it into view once
-        // the new row is laid out (this runs after the layout pass that adding the tabs requested).
+        // Indicate the current tab (the row draws the indicator), and bring it into view once the
+        // new row is laid out (this runs after the layout pass that changing the tabs requested).
         // Not through returnToCurrentTab: a scroll in that layout (closing tabs can shorten the row)
         // would put it off
-        currentTab = tabs.getChildAt(sessions.indexOf(shown)) as TextView?
+        currentTab = rowTabs.getOrNull(sessions.indexOf(shown))?.view
+        tabs.invalidate()
         if (currentTab != null) strip.post { revealCurrentTab() }
     }
 
@@ -396,22 +462,125 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * A tab in the row: its number in a square as tall as the bar, the current one in the primary
-     * colour above the row's indicator ([currentTab]), an ended one faded. Tap shows it; a long
-     * press shows its title.
+     * A tab in the row: its number (from [i]) in a square as tall as the bar, the current one in
+     * the primary colour above the row's indicator ([currentTab]), an ended one faded. Tap shows
+     * it; a long press shows its title.
+     *
+     * The indicator goes by the current tab's place in the row ([moveIndicator]), not by where the
+     * tab is while it slides, and only the number's colour fades when it changes, not the view
+     * (whose opacity the indicator takes), so a changing number leaves the indicator as it is.
      */
-    private fun tabButton(i: Int, session: VtSession) = TextView(this).apply {
-        text = "%d".format(i + 1)
-        contentDescription = getString(R.string.tab_description, i + 1, title(session))
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
-        gravity = Gravity.CENTER
-        setTextColor(if (session == current) currentTabColor else mutedColor)
-        if (!session.isRunning) alpha = ENDED_ALPHA
-        foreground = touchFeedback()
-        setOnClickListener { show(session) }
-        setOnLongClickListener {
-            showToast(title(session))
-            true
+    private inner class Tab(val session: VtSession, i: Int) {
+        val view = TextView(this@MainActivity).apply {
+            text = number(i)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
+            gravity = Gravity.CENTER
+            foreground = touchFeedback()
+            setOnClickListener { show(session) }
+            setOnLongClickListener {
+                showToast(title(session))
+                true
+            }
+        }
+
+        /** How much of the number's colour shows: 1 but while it changes ([renumber]). */
+        private var shown = 1f
+        private var renumbering: ValueAnimator? = null
+
+        /**
+         * Whether it shows another number than that of its place in the row: it is still on its
+         * way there.
+         */
+        val stale get() = rowTabs.indexOf(this).let { it >= 0 && view.text.toString() != number(it) }
+
+        /**
+         * Brings it up to date as the [i]th tab; its number waits while a slide is to be worked
+         * out ([slideTabs]), the description (TalkBack) does not.
+         */
+        fun update(i: Int) {
+            view.contentDescription = getString(R.string.tab_description, i + 1, title(session))
+            view.alpha = if (session.isRunning) 1f else ENDED_ALPHA
+            if (slideFrom?.containsKey(this) != true) view.text = number(i)
+            paint()
+        }
+
+        /** Slides to its place in the row, then takes the number of that place. */
+        fun slide() {
+            view.animate().translationX(0f).setDuration(SLIDE_MS).setInterpolator(STANDARD).withEndAction { renumber() }
+        }
+
+        /**
+         * Fades its number out and the number of its place in, when they differ. A change while
+         * one runs is taken at its end.
+         */
+        fun renumber() {
+            if (renumbering != null || !stale) return
+            renumbering = ValueAnimator.ofFloat(-1f, 1f).apply {
+                duration = RENUMBER_MS
+                addUpdateListener {
+                    val f = it.animatedValue as Float
+                    // The new number from halfway on, from its place then
+                    if (f >= 0f && stale) view.text = number(rowTabs.indexOf(this@Tab))
+                    shown = abs(f)
+                    paint()
+                }
+                doOnEnd {
+                    renumbering = null
+                    renumber()
+                }
+                start()
+            }
+        }
+
+        /** Out of the row, into its overlay, where it shrinks and fades out in its place. */
+        fun leave() {
+            renumbering?.cancel()
+            // A slide stops where it is
+            view.animate().cancel()
+            tabs.overlay.add(view)
+            view.animate().alpha(0f).scaleX(LEAVE_SCALE).scaleY(LEAVE_SCALE)
+                .setDuration(LEAVE_MS).setInterpolator(ACCELERATE)
+                .withEndAction { tabs.overlay.remove(view) }
+        }
+
+        private fun paint() {
+            val color = if (session == current) currentTabColor else mutedColor
+            view.setTextColor(ColorUtils.setAlphaComponent(color, (Color.alpha(color) * shown).roundToInt()))
+        }
+    }
+
+    private fun number(i: Int) = "%d".format(i + 1)
+
+    /**
+     * Moves the indicator to the current tab's new place on screen ([slideTabs]): sliding there
+     * from where it was drawn when tabs [closed], at once when another tab was shown. Closing the
+     * current tab of a row that does not scroll leaves its place where it was, so the indicator
+     * stays while the next tab slides in above it; a row scrolled to its end scrolls back as it
+     * shortens, and the indicator slides on to the next tab.
+     */
+    private fun moveIndicator(closed: Boolean) {
+        val tab = currentTab
+        val from = indicatorFrom
+        indicatorFrom = null
+        val shift = if (tab == null || from == null) null else from - (tab.left - strip.scrollX)
+        when {
+            shift == 0 -> {} // the same place: a slide still running goes on
+            shift != null && closed -> {
+                indicatorSlide?.cancel()
+                indicatorSlide = ValueAnimator.ofFloat(indicatorShift + shift, 0f).apply {
+                    duration = SLIDE_MS
+                    interpolator = STANDARD
+                    addUpdateListener {
+                        indicatorShift = it.animatedValue as Float
+                        tabs.invalidate()
+                    }
+                    start()
+                }
+            }
+            else -> {
+                indicatorSlide?.cancel()
+                indicatorShift = 0f
+            }
         }
     }
 
@@ -637,5 +806,21 @@ class MainActivity : Activity(), TerminalService.Listener {
          * scrolled away from back into view; longer than a tab's title stays up after a long press.
          */
         private const val RETURN_TO_CURRENT_TAB_MS = 3000L
+
+        /** How long tabs take to slide into the places of closed ones (Material's short 4). */
+        private const val SLIDE_MS = 200L
+
+        /** How long a closed tab takes to shrink to [LEAVE_SCALE] and fade out. */
+        private const val LEAVE_MS = 150L
+        private const val LEAVE_SCALE = 0.6f
+
+        /** How long a tab takes to fade its number out and the new one in, half each. */
+        private const val RENUMBER_MS = 200L
+
+        /** Material's standard easing, for the slide. */
+        private val STANDARD = PathInterpolator(0.2f, 0f, 0f, 1f)
+
+        /** Material's standard accelerate easing, for a closed tab on its way out. */
+        private val ACCELERATE = PathInterpolator(0.3f, 0f, 1f, 1f)
     }
 }

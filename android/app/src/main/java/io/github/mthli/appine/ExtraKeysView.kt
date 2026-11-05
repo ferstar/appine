@@ -482,9 +482,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
          * shape, so it shows without telling colours apart. It hangs [INDICATOR_GAP_DP] below the
          * label's baseline, where its letters and digits end, so it stays with the label whatever
          * the height of the bar or the size of the text; it fades with the label. Nothing is drawn
-         * when [label] is not in [container].
+         * when [label] is not in [container]. [dx] moves it right of the label's place (the tab
+         * row slides it there after tabs close).
          */
-        fun drawIndicator(canvas: Canvas, container: View, label: TextView, paint: Paint) {
+        fun drawIndicator(canvas: Canvas, container: View, label: TextView, paint: Paint, dx: Float = 0f) {
             // The label's place in the container: its left and top, not
             // offsetDescendantRectToMyCoords, which subtracts each view's scroll, and a single-line
             // label scrolls its text far sideways to centre it
@@ -500,7 +501,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             val density = label.resources.displayMetrics.density
             val width = (INDICATOR_WIDTH_DP * density).toInt()
             val height = max(1, (INDICATOR_HEIGHT_DP * density).toInt())
-            val left = x + (label.width - width) / 2f
+            val left = x + (label.width - width) / 2f + dx
             val top = (y + label.baseline + (INDICATOR_GAP_DP * density).toInt()).toFloat()
             val alpha = paint.alpha
             paint.alpha = (alpha * label.alpha).roundToInt()

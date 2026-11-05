@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, the extra keys fading out into their last column while they scroll, as the tab row into ×)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, closing tabs animated in the tab row)
 
 ## Responsibilities
 
@@ -34,7 +34,8 @@ libghostty-vt with Zig (`android/native`).
 ## Key types
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
-  numbered tabs, with `×`, `+` and `⋮` over its end); `Host : VtView.Host`,
+  numbered tabs, with `×`, `+` and `⋮` over its end); `Tab` (one per session: its number in the
+  row, which slides, changes and fades out when closed); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
@@ -110,6 +111,14 @@ libghostty-vt with Zig (`android/native`).
   primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
   draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
   the system font scale leaves them as they are (dialogs, menus and toasts follow it).
+- Closing tabs is animated (150–200 ms a step, under the system's animator duration scale): a
+  closed tab shrinks and fades out where it was; the tabs after it slide into the places left,
+  still showing their old numbers, then fade the old number out and the new one in. The indicator
+  keeps to the current tab's place on screen, so closing the current tab of a row that does not
+  scroll shows the next one sliding in above it; a row at its end scrolls back as it shortens, the
+  tabs before slide right instead, and the indicator slides on to the new current tab. Showing
+  another tab moves the indicator at once, and TalkBack's descriptions take the new numbers at
+  once.
 - Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier), cancelling the previous one. TalkBack reads "Tab N: title".
@@ -357,11 +366,18 @@ libghostty-vt with Zig (`android/native`).
   it is added back).
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
-  label: `refresh` invalidates every grid and the fixed column, and `renderTabs` adds the tabs
-  again. The label's place is the sum of `left` and `top` up to the container:
+  label: `refresh` invalidates every grid and the fixed column, and `renderTabs` the tab row. The
+  label's place is the sum of `left` and `top` up to the container:
   `offsetDescendantRectToMyCoords` subtracts each view's scroll, and a single-line `TextView` (the
   extra keys' labels) scrolls far sideways to centre its text, which also draws a foreground
   drawable it is given off the label.
+- The tab row keeps its tabs across changes and relies on sessions being added only at the end.
+  It animates a change from the on-screen places taken at the first change before the next
+  layout (closing the current tab renders the row twice), in a pre-draw listener once laid out.
+  Closed tabs are drawn in the row's overlay, past its end once it shortens, so its scroll view
+  does not clip its children. The indicator goes by the label's layout place, not its
+  translation (the row's own slide comes as `drawIndicator`'s `dx`), and takes the label's
+  opacity, so a changing number fades its text colour, not the view.
 
 ### The terminal
 
@@ -424,7 +440,8 @@ libghostty-vt with Zig (`android/native`).
 - Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
   (the root ignores cutout insets).
 - The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
-  foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side.
+  foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing
+  animation upright only, slowed down).
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English.
