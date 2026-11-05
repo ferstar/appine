@@ -8,13 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use appine_lockstep::{AVAILABLE, Config, run};
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().map(|v| {
-        v.parse()
-            .unwrap_or_else(|_| panic!("{name} must be a number"))
-    })
-}
-
 #[test]
 fn interpreter_matches_hardware() {
     if !AVAILABLE {
@@ -50,4 +43,11 @@ fn interpreter_matches_hardware() {
         }
         Err(mismatch) => panic!("{mismatch}"),
     }
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().map(|v| {
+        v.parse()
+            .unwrap_or_else(|_| panic!("{name} must be a number"))
+    })
 }

@@ -187,20 +187,6 @@ const fn case(name: &'static str, generate: fn(&mut Rng, &Env) -> Case, requires
     }
 }
 
-/// Any register number; 31 is XZR in these encodings.
-fn reg(g: &mut Rng) -> u32 {
-    g.bits(5)
-}
-
-/// A register number other than 31, for fields where 31 means SP.
-fn reg_not_sp(g: &mut Rng) -> u32 {
-    g.below(31)
-}
-
-fn imm_width(sf: u32) -> u32 {
-    if sf == 1 { 6 } else { 5 }
-}
-
 // op immlo 10000 immhi Rd
 fn pc_rel(g: &mut Rng) -> u32 {
     (g.bit() << 31) | (g.bits(2) << 29) | (0b10000 << 24) | (g.bits(19) << 5) | reg(g)
@@ -300,6 +286,10 @@ fn add_sub_shifted(g: &mut Rng) -> u32 {
         | (g.bits(imm_width(sf)) << 10)
         | (reg(g) << 5)
         | reg(g)
+}
+
+fn imm_width(sf: u32) -> u32 {
+    if sf == 1 { 6 } else { 5 }
 }
 
 // sf op S 01011 00 1 Rm option imm3 Rn Rd
@@ -425,35 +415,9 @@ fn fuzz_dp(g: &mut Rng) -> u32 {
     (insn & !0x3ff) | (rn << 5) | rd
 }
 
-/// A register in 0–30 that is not in `avoid`.
-fn reg_except(g: &mut Rng, avoid: &[u32]) -> u32 {
-    loop {
-        let r = g.below(31);
-        if !avoid.contains(&r) {
-            return r;
-        }
-    }
-}
-
-/// A register in 0–31 that is not in `avoid`; 31 is ZR in these encodings.
-fn reg_or_zr(g: &mut Rng, avoid: &[u32]) -> u32 {
-    loop {
-        let r = g.bits(5);
-        if !avoid.contains(&r) {
-            return r;
-        }
-    }
-}
-
-/// Target offset of a `len`-byte access, aligned to `align`, guaranteed to fall inside the data
-/// area (it may cross pages).
-fn target(g: &mut Rng, len: u64, align: u64) -> i64 {
-    let slots = (DATA_BYTES - len) / align + 1;
-    (g.below(slots as u32) as u64 * align) as i64
-}
-
-fn signed(g: &mut Rng, bits: u32) -> i64 {
-    g.bits(bits) as i64 - (1 << (bits - 1))
+/// A register number other than 31, for fields where 31 means SP.
+fn reg_not_sp(g: &mut Rng) -> u32 {
+    g.below(31)
 }
 
 /// Integer LDR/STR/LDRS*: unsigned offset, unscaled, pre-index, post-index, register offset.
@@ -466,52 +430,21 @@ fn int_ldst(g: &mut Rng, _: &Env) -> Case {
     single_reg(g, 0x3800_0000, size, opc, size, rn, rt, 1 << size)
 }
 
-/// The common part of single-register accesses; `base` is the encoding base value for V = 0 or 1,
-/// and `scale` is log2 of the byte count.
-#[allow(clippy::too_many_arguments)]
-fn single_reg(
-    g: &mut Rng,
-    base: u32,
-    size: u32,
-    opc: u32,
-    scale: u32,
-    rn: u32,
-    rt: u32,
-    n: u64,
-) -> Case {
-    let mut c = Case::default();
-    let t = target(g, n, 1);
-    let fixed = (size << 30) | base | (opc << 22) | (rn << 5) | rt;
-    let (insn, start) = match g.below(5) {
-        0 => {
-            let imm = g.below(64);
-            (
-                fixed | 0x0100_0000 | (imm << 10),
-                t - ((imm as i64) << scale),
-            )
-        }
-        1..=3 => {
-            let op = g.pick(&[0, 1, 3]);
-            let imm9 = signed(g, 9);
-            let start = if op == 1 { t } else { t - imm9 };
-            (fixed | ((imm9 as u32 & 0x1ff) << 12) | (op << 10), start)
-        }
-        _ => {
-            let rm = reg_except(g, &[rn]);
-            let option = g.pick(&[2, 3, 6, 7]);
-            let s = g.bit();
-            let index = g.below(32) as u64;
-            c.values.push((rm, index));
-            let off = (index << (s * scale)) as i64;
-            (
-                fixed | 0x0020_0800 | (rm << 16) | (option << 13) | (s << 12),
-                t - off,
-            )
-        }
+/// Integer LDP/STP/LDPSW/LDNP/STNP.
+fn int_pair(g: &mut Rng, _: &Env) -> Case {
+    let opc = g.pick(&[0, 1, 2]);
+    let load = if opc == 1 { 1 } else { g.bit() };
+    let n = if opc == 2 { 8 } else { 4 };
+    /* opc = 01 with idx = 00 (LDNPSW) is unallocated, and both sides should reject it */
+    let idx = g.bits(2);
+    let rn = reg_except(g, &[]);
+    let rt = reg_or_zr(g, &[rn]);
+    let rt2 = if load == 1 {
+        reg_or_zr(g, &[rn, rt])
+    } else {
+        reg_or_zr(g, &[rn])
     };
-    c.insns.push(insn);
-    c.pointers.push((rn, start));
-    c
+    pair(g, 0x2800_0000, opc, load, idx, n, rn, rt, rt2)
 }
 
 /// 2–4 accesses based on the same register (Tier 1 makes them share one TLB check): integer and
@@ -681,54 +614,6 @@ fn access_on(g: &mut Rng, rn: u32, keep: &[u32]) -> u32 {
     }
 }
 
-/// Integer LDP/STP/LDPSW/LDNP/STNP.
-fn int_pair(g: &mut Rng, _: &Env) -> Case {
-    let opc = g.pick(&[0, 1, 2]);
-    let load = if opc == 1 { 1 } else { g.bit() };
-    let n = if opc == 2 { 8 } else { 4 };
-    /* opc = 01 with idx = 00 (LDNPSW) is unallocated, and both sides should reject it */
-    let idx = g.bits(2);
-    let rn = reg_except(g, &[]);
-    let rt = reg_or_zr(g, &[rn]);
-    let rt2 = if load == 1 {
-        reg_or_zr(g, &[rn, rt])
-    } else {
-        reg_or_zr(g, &[rn])
-    };
-    pair(g, 0x2800_0000, opc, load, idx, n, rn, rt, rt2)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pair(
-    g: &mut Rng,
-    base: u32,
-    opc: u32,
-    load: u32,
-    idx: u32,
-    n: u64,
-    rn: u32,
-    rt: u32,
-    rt2: u32,
-) -> Case {
-    let imm7 = signed(g, 7);
-    let t = target(g, 2 * n, 1);
-    let start = if idx == 1 { t } else { t - imm7 * n as i64 };
-    Case {
-        insns: vec![
-            (opc << 30)
-                | base
-                | (idx << 23)
-                | (load << 22)
-                | ((imm7 as u32 & 0x7f) << 15)
-                | (rt2 << 10)
-                | (rn << 5)
-                | rt,
-        ],
-        pointers: vec![(rn, start)],
-        ..Case::default()
-    }
-}
-
 /// LDR (literal): both integer and SIMD&FP, with the target in the tested instruction's 4K page.
 /// The interpreter side puts an svc in the 5th word, unlike the hardware, so the target must
 /// avoid it.
@@ -848,6 +733,54 @@ fn simd_ldst(g: &mut Rng, _: &Env) -> Case {
     single_reg(g, 0x3c00_0000, size, opc, scale, rn, rt, 1 << scale)
 }
 
+/// The common part of single-register accesses; `base` is the encoding base value for V = 0 or 1,
+/// and `scale` is log2 of the byte count.
+#[allow(clippy::too_many_arguments)]
+fn single_reg(
+    g: &mut Rng,
+    base: u32,
+    size: u32,
+    opc: u32,
+    scale: u32,
+    rn: u32,
+    rt: u32,
+    n: u64,
+) -> Case {
+    let mut c = Case::default();
+    let t = target(g, n, 1);
+    let fixed = (size << 30) | base | (opc << 22) | (rn << 5) | rt;
+    let (insn, start) = match g.below(5) {
+        0 => {
+            let imm = g.below(64);
+            (
+                fixed | 0x0100_0000 | (imm << 10),
+                t - ((imm as i64) << scale),
+            )
+        }
+        1..=3 => {
+            let op = g.pick(&[0, 1, 3]);
+            let imm9 = signed(g, 9);
+            let start = if op == 1 { t } else { t - imm9 };
+            (fixed | ((imm9 as u32 & 0x1ff) << 12) | (op << 10), start)
+        }
+        _ => {
+            let rm = reg_except(g, &[rn]);
+            let option = g.pick(&[2, 3, 6, 7]);
+            let s = g.bit();
+            let index = g.below(32) as u64;
+            c.values.push((rm, index));
+            let off = (index << (s * scale)) as i64;
+            (
+                fixed | 0x0020_0800 | (rm << 16) | (option << 13) | (s << 12),
+                t - off,
+            )
+        }
+    };
+    c.insns.push(insn);
+    c.pointers.push((rn, start));
+    c
+}
+
 /// SIMD&FP LDP/STP/LDNP/STNP (S/D/Q).
 fn simd_pair(g: &mut Rng, _: &Env) -> Case {
     let opc = g.below(3);
@@ -862,15 +795,35 @@ fn simd_pair(g: &mut Rng, _: &Env) -> Case {
     pair(g, 0x2c00_0000, opc, load, idx, 4 << opc, rn, rt, rt2)
 }
 
-/// Post-index form: Rm = 31 means by the number of bytes transferred, otherwise a general
-/// register is added.
-fn post_index(g: &mut Rng, c: &mut Case, rn: u32) -> u32 {
-    if g.bit() == 1 {
-        return 31;
+#[allow(clippy::too_many_arguments)]
+fn pair(
+    g: &mut Rng,
+    base: u32,
+    opc: u32,
+    load: u32,
+    idx: u32,
+    n: u64,
+    rn: u32,
+    rt: u32,
+    rt2: u32,
+) -> Case {
+    let imm7 = signed(g, 7);
+    let t = target(g, 2 * n, 1);
+    let start = if idx == 1 { t } else { t - imm7 * n as i64 };
+    Case {
+        insns: vec![
+            (opc << 30)
+                | base
+                | (idx << 23)
+                | (load << 22)
+                | ((imm7 as u32 & 0x7f) << 15)
+                | (rt2 << 10)
+                | (rn << 5)
+                | rt,
+        ],
+        pointers: vec![(rn, start)],
+        ..Case::default()
     }
-    let rm = reg_except(g, &[rn]);
-    c.values.push((rm, g.next_u64() & 0xfff));
-    rm
 }
 
 /// LD1–LD4/ST1–ST4 (multiple structures), with post-index.
@@ -949,6 +902,17 @@ fn simd_lane(g: &mut Rng, _: &Env) -> Case {
     c.insns.push(insn);
     c.pointers.push((rn, target(g, selem as u64 * esize, 1)));
     c
+}
+
+/// Post-index form: Rm = 31 means by the number of bytes transferred, otherwise a general
+/// register is added.
+fn post_index(g: &mut Rng, c: &mut Case, rn: u32) -> u32 {
+    if g.bit() == 1 {
+        return 31;
+    }
+    let rm = reg_except(g, &[rn]);
+    c.values.push((rm, g.next_u64() & 0xfff));
+    rm
 }
 
 /// MRS/MSR FPCR, FPSR; the written values contain only bits defined by ARMv8.0.
@@ -1400,20 +1364,20 @@ fn sb(_: &mut Rng, _: &Env) -> Case {
     Case::one(0xd503_30ff)
 }
 
-/// DC CVAP, DC CVADP: the address points at any byte in the data area.
-fn dc_persist(g: &mut Rng, insn: u32) -> Case {
-    let rt = reg_except(g, &[]);
-    let mut c = Case::one(insn | rt);
-    c.pointers.push((rt, target(g, 1, 1)));
-    c
-}
-
 fn dcpop(g: &mut Rng, _: &Env) -> Case {
     dc_persist(g, 0xd50b_7c20)
 }
 
 fn dcpodp(g: &mut Rng, _: &Env) -> Case {
     dc_persist(g, 0xd50b_7d20)
+}
+
+/// DC CVAP, DC CVADP: the address points at any byte in the data area.
+fn dc_persist(g: &mut Rng, insn: u32) -> Case {
+    let rt = reg_except(g, &[]);
+    let mut c = Case::one(insn | rt);
+    c.pointers.push((rt, target(g, 1, 1)));
+    c
 }
 
 /// DIT: first set with MSR DIT, #imm (any CRm) or MSR DIT, Xn (random value), then read back with
@@ -1436,4 +1400,40 @@ fn dit(g: &mut Rng, _: &Env) -> Case {
 /// executed instructions.
 fn fuzz_simd_fp(g: &mut Rng) -> u32 {
     g.next_u64() as u32 | 0x0e00_0000
+}
+
+/// Any register number; 31 is XZR in these encodings.
+fn reg(g: &mut Rng) -> u32 {
+    g.bits(5)
+}
+
+/// A register in 0–30 that is not in `avoid`.
+fn reg_except(g: &mut Rng, avoid: &[u32]) -> u32 {
+    loop {
+        let r = g.below(31);
+        if !avoid.contains(&r) {
+            return r;
+        }
+    }
+}
+
+/// A register in 0–31 that is not in `avoid`; 31 is ZR in these encodings.
+fn reg_or_zr(g: &mut Rng, avoid: &[u32]) -> u32 {
+    loop {
+        let r = g.bits(5);
+        if !avoid.contains(&r) {
+            return r;
+        }
+    }
+}
+
+/// Target offset of a `len`-byte access, aligned to `align`, guaranteed to fall inside the data
+/// area (it may cross pages).
+fn target(g: &mut Rng, len: u64, align: u64) -> i64 {
+    let slots = (DATA_BYTES - len) / align + 1;
+    (g.below(slots as u32) as u64 * align) as i64
+}
+
+fn signed(g: &mut Rng, bits: u32) -> i64 {
+    g.bits(bits) as i64 - (1 << (bits - 1))
 }

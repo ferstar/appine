@@ -11,14 +11,6 @@ const RW: u32 = prot::READ | prot::WRITE;
 /// The range one leaf table covers.
 const LEAF: u64 = PAGE_SIZE << 9;
 
-fn pages(n: usize) -> Box<[Page]> {
-    (0..n).map(|_| Page([0; 4096])).collect()
-}
-
-fn host(p: &mut [Page], i: usize) -> NonNull<u8> {
-    NonNull::new(p[i..].as_mut_ptr().cast::<u8>()).unwrap()
-}
-
 #[test]
 fn fill_only_adds_missing_entries() {
     let mut mem = pages(4);
@@ -99,4 +91,12 @@ fn move_carries_entries_and_their_permissions() {
     assert!(mmu.translate(to + 2 * PAGE_SIZE, 0).is_none());
     // Two overlapping ranges are not allowed
     assert!(mmu.move_entries(to, to + PAGE_SIZE, 2 * PAGE_SIZE).is_err());
+}
+
+fn pages(n: usize) -> Box<[Page]> {
+    (0..n).map(|_| Page([0; 4096])).collect()
+}
+
+fn host(p: &mut [Page], i: usize) -> NonNull<u8> {
+    NonNull::new(p[i..].as_mut_ptr().cast::<u8>()).unwrap()
 }

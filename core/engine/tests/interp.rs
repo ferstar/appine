@@ -269,13 +269,6 @@ fn unimplemented_encodings_are_undefined() {
     }
 }
 
-/// SIMD&FP and native stubs are available only on aarch64 Linux hosts (HWCAP reflects this
-/// faithfully; see the engine map).
-fn has_simd() -> bool {
-    let need = hwcap::FP | hwcap::ASIMD;
-    appine_engine::guest_hwcap() & need == need
-}
-
 #[test]
 fn exclusive_store_succeeds_only_after_a_matching_load() {
     let mut g = Guest::new();
@@ -993,4 +986,11 @@ fn run_fetches_through_the_tlb() {
             ..
         }
     ));
+}
+
+/// SIMD&FP and native stubs are available only on aarch64 Linux hosts (HWCAP reflects this
+/// faithfully; see the engine map).
+fn has_simd() -> bool {
+    let need = hwcap::FP | hwcap::ASIMD;
+    appine_engine::guest_hwcap() & need == need
 }

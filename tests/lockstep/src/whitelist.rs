@@ -87,6 +87,20 @@ pub struct Disagreement {
     pub text: String,
 }
 
+/// Sampling statistics of one encoding space.
+#[derive(Debug, Clone)]
+pub struct SpaceReport {
+    /// Encoding space.
+    pub space: &'static str,
+    /// Number of samples.
+    pub samples: usize,
+    /// Number of samples Tier 0 considers executable.
+    pub defined: usize,
+    /// The guest has the features this space needs (without them the space should have no
+    /// executable encodings).
+    pub available: bool,
+}
+
 /// Finds a usable llvm-mc: the environment variable `APPINE_LLVM_MC`, otherwise from PATH.
 pub fn find_llvm_mc() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("APPINE_LLVM_MC") {
@@ -105,6 +119,67 @@ pub fn find_llvm_mc() -> Option<PathBuf> {
             .output()
             .is_ok_and(|o| o.status.success())
     })
+}
+
+/// Compares Tier 0 with LLVM by sampling. Returns each space's statistics and the list of
+/// disagreements (at most `limit`).
+pub fn check(
+    llvm_mc: &Path,
+    samples: usize,
+    seed: u64,
+    limit: usize,
+) -> (Vec<SpaceReport>, Vec<Disagreement>) {
+    let caps = appine_engine::guest_hwcap();
+    let caps2 = appine_engine::guest_hwcap2();
+    let dir = std::env::temp_dir();
+    let mmu = Mmu::new();
+    // SAFETY: mmu is declared before cpu and dropped after it
+    let mut cpu = unsafe { Cpu::new(&mmu) };
+    let mut found = Vec::new();
+    let mut reports = Vec::new();
+    for (i, space) in SPACES.iter().enumerate() {
+        let mut g = Rng::new(seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let insns: Vec<u32> = (0..samples)
+            .map(|_| (g.next_u64() as u32 & !space.mask) | space.value)
+            .collect();
+        let restricted = disassemble(llvm_mc, &insns, &mattr(caps, caps2), &dir);
+        let mut disagree = Vec::new();
+        let mut defined = 0;
+        for (k, &insn) in insns.iter().enumerate() {
+            cpu.state_mut().pc = 0x1000;
+            cpu.state_mut().sp = 0;
+            let tier0 = !matches!(cpu.exec_insn(insn), Some(Exit::Undefined { .. }));
+            defined += tier0 as usize;
+            if tier0 != restricted[k].0 {
+                disagree.push((insn, tier0, restricted[k].0));
+            }
+        }
+        reports.push(SpaceReport {
+            space: space.name,
+            samples,
+            defined,
+            available: caps & space.requires == space.requires,
+        });
+        if disagree.is_empty() {
+            continue;
+        }
+        // Disassemble again with all features, to identify which instruction a disagreeing
+        // encoding is
+        let codes: Vec<u32> = disagree.iter().map(|d| d.0).collect();
+        let full = disassemble(llvm_mc, &codes, "+all", &dir);
+        for ((insn, tier0, llvm), (_, text)) in disagree.into_iter().zip(full) {
+            if found.len() < limit {
+                found.push(Disagreement {
+                    space: space.name,
+                    insn,
+                    tier0,
+                    llvm,
+                    text,
+                });
+            }
+        }
+    }
+    (reports, found)
 }
 
 /// The LLVM `-mattr` for a guest feature set.
@@ -182,79 +257,4 @@ fn disassemble(llvm_mc: &Path, insns: &[u32], mattr: &str, dir: &Path) -> Vec<(b
             }
         })
         .collect()
-}
-
-/// Sampling statistics of one encoding space.
-#[derive(Debug, Clone)]
-pub struct SpaceReport {
-    /// Encoding space.
-    pub space: &'static str,
-    /// Number of samples.
-    pub samples: usize,
-    /// Number of samples Tier 0 considers executable.
-    pub defined: usize,
-    /// The guest has the features this space needs (without them the space should have no
-    /// executable encodings).
-    pub available: bool,
-}
-
-/// Compares Tier 0 with LLVM by sampling. Returns each space's statistics and the list of
-/// disagreements (at most `limit`).
-pub fn check(
-    llvm_mc: &Path,
-    samples: usize,
-    seed: u64,
-    limit: usize,
-) -> (Vec<SpaceReport>, Vec<Disagreement>) {
-    let caps = appine_engine::guest_hwcap();
-    let caps2 = appine_engine::guest_hwcap2();
-    let dir = std::env::temp_dir();
-    let mmu = Mmu::new();
-    // SAFETY: mmu is declared before cpu and dropped after it
-    let mut cpu = unsafe { Cpu::new(&mmu) };
-    let mut found = Vec::new();
-    let mut reports = Vec::new();
-    for (i, space) in SPACES.iter().enumerate() {
-        let mut g = Rng::new(seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let insns: Vec<u32> = (0..samples)
-            .map(|_| (g.next_u64() as u32 & !space.mask) | space.value)
-            .collect();
-        let restricted = disassemble(llvm_mc, &insns, &mattr(caps, caps2), &dir);
-        let mut disagree = Vec::new();
-        let mut defined = 0;
-        for (k, &insn) in insns.iter().enumerate() {
-            cpu.state_mut().pc = 0x1000;
-            cpu.state_mut().sp = 0;
-            let tier0 = !matches!(cpu.exec_insn(insn), Some(Exit::Undefined { .. }));
-            defined += tier0 as usize;
-            if tier0 != restricted[k].0 {
-                disagree.push((insn, tier0, restricted[k].0));
-            }
-        }
-        reports.push(SpaceReport {
-            space: space.name,
-            samples,
-            defined,
-            available: caps & space.requires == space.requires,
-        });
-        if disagree.is_empty() {
-            continue;
-        }
-        // Disassemble again with all features, to identify which instruction a disagreeing
-        // encoding is
-        let codes: Vec<u32> = disagree.iter().map(|d| d.0).collect();
-        let full = disassemble(llvm_mc, &codes, "+all", &dir);
-        for ((insn, tier0, llvm), (_, text)) in disagree.into_iter().zip(full) {
-            if found.len() < limit {
-                found.push(Disagreement {
-                    space: space.name,
-                    insn,
-                    tier0,
-                    llvm,
-                    text,
-                });
-            }
-        }
-    }
-    (reports, found)
 }

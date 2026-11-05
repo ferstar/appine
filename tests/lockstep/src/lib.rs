@@ -200,106 +200,6 @@ mod runner {
     /// many times.
     const FLAKY_RETRIES: usize = 8;
 
-    /// Makes the random sequences of the classes independent of each other while each can still
-    /// be reproduced alone.
-    fn class_seed(seed: u64, name: &str) -> u64 {
-        name.bytes().fold(seed ^ 0xcbf2_9ce4_8422_2325, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
-        })
-    }
-
-    /// General register values biased towards boundary values, to cover more flag and overflow
-    /// paths.
-    fn random_value(g: &mut Rng) -> u64 {
-        const SPECIAL: &[u64] = &[
-            0,
-            1,
-            2,
-            0x7f,
-            0x80,
-            0xff,
-            0x7fff_ffff,
-            0x8000_0000,
-            0xffff_ffff,
-            0x1_0000_0000,
-            0xffff_ffff_8000_0000,
-            0x7fff_ffff_ffff_ffff,
-            0x8000_0000_0000_0000,
-            0xffff_ffff_ffff_fffe,
-            0xffff_ffff_ffff_ffff,
-        ];
-        match g.below(8) {
-            0 | 1 => g.pick(SPECIAL),
-            2 => g.below(64) as u64,
-            3 => (g.below(64) as i64 - 32) as u64,
-            4 => g.next_u64() & 0xffff_ffff,
-            5 => g.pick(SPECIAL) ^ (1 << g.below(64)),
-            _ => g.next_u64(),
-        }
-    }
-
-    /// A 64-bit vector lane biased towards floating-point special values: one double, or two
-    /// singles.
-    fn random_lane(g: &mut Rng) -> u64 {
-        const F64: &[u64] = &[
-            0,
-            0x8000_0000_0000_0000, // -0
-            0x3ff0_0000_0000_0000, // 1.0
-            0xbff0_0000_0000_0000, // -1.0
-            0x3fe0_0000_0000_0000, // 0.5
-            0x7ff0_0000_0000_0000, // +inf
-            0xfff0_0000_0000_0000, // -inf
-            0x7ff8_0000_0000_0000, // qNaN
-            0x7ff4_0000_0000_0001, // sNaN
-            0x0000_0000_0000_0001, // smallest subnormal
-            0x000f_ffff_ffff_ffff, // largest subnormal
-            0x0010_0000_0000_0000, // smallest normal
-            0x7fef_ffff_ffff_ffff, // largest finite
-            0x41e0_0000_0000_0000, // 2^31
-            0x43e0_0000_0000_0000, // 2^63
-        ];
-        const F32: &[u32] = &[
-            0,
-            0x8000_0000,
-            0x3f80_0000,
-            0xbf80_0000,
-            0x3f00_0000,
-            0x7f80_0000,
-            0xff80_0000,
-            0x7fc0_0000,
-            0x7fa0_0001,
-            0x0000_0001,
-            0x007f_ffff,
-            0x0080_0000,
-            0x7f7f_ffff,
-            0x4f00_0000,
-            0x5f00_0000,
-        ];
-        match g.below(4) {
-            0 => g.pick(F64),
-            1 => g.pick(F32) as u64 | (g.pick(F32) as u64) << 32,
-            _ => g.next_u64(),
-        }
-    }
-
-    fn random_state(g: &mut Rng) -> State {
-        let mut x = [0; 31];
-        for v in &mut x {
-            *v = random_value(g);
-        }
-        let mut v = [[0; 2]; 32];
-        for lanes in &mut v {
-            *lanes = [random_lane(g), random_lane(g)];
-        }
-        State {
-            x,
-            nzcv: (g.bits(4) as u64) << 28,
-            v,
-            fpcr: g.next_u64() & 0x07c0_0000, // AHP, DN, FZ, RMode
-            fpsr: g.next_u64() & 0x0800_009f, // QC and the cumulative exception bits
-        }
-    }
-
     #[repr(C, align(4096))]
     struct Page([u8; 4096]);
 
@@ -341,13 +241,6 @@ mod runner {
                 code,
                 data,
                 slot,
-            }
-        }
-
-        fn data(&self) -> &[u8] {
-            // SAFETY: the two pages are stored contiguously in the array
-            unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<u8>(), DATA_BYTES as usize)
             }
         }
 
@@ -400,6 +293,13 @@ mod runner {
                 fpsr: s.fpsr,
             };
             (exit, after)
+        }
+
+        fn data(&self) -> &[u8] {
+            // SAFETY: the two pages are stored contiguously in the array
+            unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<u8>(), DATA_BYTES as usize)
+            }
         }
     }
 
@@ -588,6 +488,106 @@ mod runner {
         report.tier1_fallback = end.exits_interp - start.exits_interp;
         report.tier1_grouped = end.insns_grouped - start.insns_grouped;
         Ok(report)
+    }
+
+    /// Makes the random sequences of the classes independent of each other while each can still
+    /// be reproduced alone.
+    fn class_seed(seed: u64, name: &str) -> u64 {
+        name.bytes().fold(seed ^ 0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn random_state(g: &mut Rng) -> State {
+        let mut x = [0; 31];
+        for v in &mut x {
+            *v = random_value(g);
+        }
+        let mut v = [[0; 2]; 32];
+        for lanes in &mut v {
+            *lanes = [random_lane(g), random_lane(g)];
+        }
+        State {
+            x,
+            nzcv: (g.bits(4) as u64) << 28,
+            v,
+            fpcr: g.next_u64() & 0x07c0_0000, // AHP, DN, FZ, RMode
+            fpsr: g.next_u64() & 0x0800_009f, // QC and the cumulative exception bits
+        }
+    }
+
+    /// General register values biased towards boundary values, to cover more flag and overflow
+    /// paths.
+    fn random_value(g: &mut Rng) -> u64 {
+        const SPECIAL: &[u64] = &[
+            0,
+            1,
+            2,
+            0x7f,
+            0x80,
+            0xff,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_ffff_8000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            0xffff_ffff_ffff_fffe,
+            0xffff_ffff_ffff_ffff,
+        ];
+        match g.below(8) {
+            0 | 1 => g.pick(SPECIAL),
+            2 => g.below(64) as u64,
+            3 => (g.below(64) as i64 - 32) as u64,
+            4 => g.next_u64() & 0xffff_ffff,
+            5 => g.pick(SPECIAL) ^ (1 << g.below(64)),
+            _ => g.next_u64(),
+        }
+    }
+
+    /// A 64-bit vector lane biased towards floating-point special values: one double, or two
+    /// singles.
+    fn random_lane(g: &mut Rng) -> u64 {
+        const F64: &[u64] = &[
+            0,
+            0x8000_0000_0000_0000, // -0
+            0x3ff0_0000_0000_0000, // 1.0
+            0xbff0_0000_0000_0000, // -1.0
+            0x3fe0_0000_0000_0000, // 0.5
+            0x7ff0_0000_0000_0000, // +inf
+            0xfff0_0000_0000_0000, // -inf
+            0x7ff8_0000_0000_0000, // qNaN
+            0x7ff4_0000_0000_0001, // sNaN
+            0x0000_0000_0000_0001, // smallest subnormal
+            0x000f_ffff_ffff_ffff, // largest subnormal
+            0x0010_0000_0000_0000, // smallest normal
+            0x7fef_ffff_ffff_ffff, // largest finite
+            0x41e0_0000_0000_0000, // 2^31
+            0x43e0_0000_0000_0000, // 2^63
+        ];
+        const F32: &[u32] = &[
+            0,
+            0x8000_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+            0x3f00_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_0000,
+            0x7fa0_0001,
+            0x0000_0001,
+            0x007f_ffff,
+            0x0080_0000,
+            0x7f7f_ffff,
+            0x4f00_0000,
+            0x5f00_0000,
+        ];
+        match g.below(4) {
+            0 => g.pick(F64),
+            1 => g.pick(F32) as u64 | (g.pick(F32) as u64) << 32,
+            _ => g.next_u64(),
+        }
     }
 
     fn run_hardware(

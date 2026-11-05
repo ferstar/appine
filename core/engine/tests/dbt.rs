@@ -29,31 +29,6 @@ const LDR_X0_X2: u32 = 0xf940_0040; // ldr x0, [x2]
 const STR_X3_X4: u32 = 0xf900_0083; // str x3, [x4]
 const LDP_X5_X6_X7: u32 = 0xa940_18e5; // ldp x5, x6, [x7]
 
-fn bl(from: u64, to: u64) -> u32 {
-    0x9400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
-}
-
-fn cbz_x0(from: u64, to: u64) -> u32 {
-    0xb400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
-}
-
-fn cbnz_x0(from: u64, to: u64) -> u32 {
-    0xb500_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
-}
-
-fn adr_x30(from: u64, to: u64) -> u32 {
-    let off = (to as i64 - from as i64) as u32;
-    0x1000_001e | (off & 3) << 29 | ((off >> 2) & 0x7_ffff) << 5
-}
-
-fn movz_x0(imm: u16) -> u32 {
-    0xd280_0000 | (imm as u32) << 5
-}
-
-fn b(from: u64, to: u64) -> u32 {
-    0x1400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
-}
-
 struct Guest {
     // Drop order: cpu → mmu → pages
     cpu: Cpu,
@@ -118,12 +93,6 @@ impl Guest {
         Guest { cpu, mmu, pages }
     }
 
-    /// The 8 bytes at offset `off` of data page `page` (not crossing pages).
-    fn data(&self, page: usize, off: usize) -> u64 {
-        let host = [3, 4, 6, 5, 7, 8][page];
-        u64::from_le_bytes(self.pages[host].0[off..off + 8].try_into().unwrap())
-    }
-
     /// Writes instructions to `addr` (only the two pages this test maps are supported).
     fn code(&mut self, addr: u64, insns: &[u32]) {
         let off = (addr - CODE) as usize;
@@ -144,6 +113,12 @@ impl Guest {
         self.cpu.state_mut().pc = pc;
         assert!(matches!(dbt.run(&mut self.cpu), Exit::Svc { imm: 0 }));
         self.cpu.state().x[0]
+    }
+
+    /// The 8 bytes at offset `off` of data page `page` (not crossing pages).
+    fn data(&self, page: usize, off: usize) -> u64 {
+        let host = [3, 4, 6, 5, 7, 8][page];
+        u64::from_le_bytes(self.pages[host].0[off..off + 8].try_into().unwrap())
     }
 }
 
@@ -465,17 +440,6 @@ fn parking_and_flushing_over_and_over_keeps_free_slots() {
     );
 }
 
-/// Runs to an svc, continuing when interrupted (a full flush needs the other threads to stop).
-fn run_to_svc(dbt: &mut Dbt, cpu: &mut Cpu) {
-    loop {
-        match dbt.run(cpu) {
-            Exit::Svc { imm: 0 } => return,
-            Exit::Kick => {}
-            e => panic!("unexpected exit {e:?}"),
-        }
-    }
-}
-
 #[test]
 fn flushing_waits_for_threads_running_and_entering_the_same_space() {
     if Dbt::new().is_none() {
@@ -550,6 +514,21 @@ fn flushing_waits_for_threads_running_and_entering_the_same_space() {
     assert_eq!(flushes, 200);
 }
 
+fn cbnz_x0(from: u64, to: u64) -> u32 {
+    0xb500_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
+}
+
+/// Runs to an svc, continuing when interrupted (a full flush needs the other threads to stop).
+fn run_to_svc(dbt: &mut Dbt, cpu: &mut Cpu) {
+    loop {
+        match dbt.run(cpu) {
+            Exit::Svc { imm: 0 } => return,
+            Exit::Kick => {}
+            e => panic!("unexpected exit {e:?}"),
+        }
+    }
+}
+
 #[test]
 fn returns_follow_x30_even_when_the_prediction_is_wrong() {
     let Some(mut dbt) = Dbt::new() else {
@@ -569,6 +548,11 @@ fn returns_follow_x30_even_when_the_prediction_is_wrong() {
     g.code(other, &[movz_x0(9), SVC]);
     dbt.invalidate(&g.cpu, f, 4);
     assert_eq!(g.run(&mut dbt), 9);
+}
+
+fn adr_x30(from: u64, to: u64) -> u32 {
+    let off = (to as i64 - from as i64) as u32;
+    0x1000_001e | (off & 3) << 29 | ((off >> 2) & 0x7_ffff) << 5
 }
 
 #[test]
@@ -621,20 +605,6 @@ fn deep_recursion_wraps_the_shadow_stack() {
         assert_eq!(g.cpu.state().x[1], 200);
         assert_eq!(g.cpu.state().sp, STACK);
     }
-}
-
-/// The address of the first byte of data page `page` minus `before`: an access starting here
-/// crosses into page `page`.
-fn before_page(page: u64, before: u64) -> u64 {
-    DATA + page * PAGE_SIZE - before
-}
-
-/// The expected value of a cross-page access: the last `before` bytes of page `page - 1` followed
-/// by the first bytes of page `page`.
-fn crossing(g: &Guest, page: usize, before: usize) -> u64 {
-    let lo = g.data(page - 1, 4096 - 8) >> (8 * (8 - before));
-    let hi = g.data(page, 0) << (8 * before);
-    lo | hi
 }
 
 #[test]
@@ -832,12 +802,6 @@ fn shared_checks_cover_accesses_behind_branches() {
     }
 }
 
-/// Runs from `pc` to an svc or a fault.
-fn go(g: &mut Guest, dbt: &mut Dbt, pc: u64) -> Exit {
-    g.cpu.state_mut().pc = pc;
-    dbt.run(&mut g.cpu)
-}
-
 #[test]
 fn watchpoints_send_only_watched_pages_to_tier0() {
     let Some(mut dbt) = Dbt::new() else {
@@ -969,4 +933,40 @@ fn watchpoints_stop_inside_shared_checks_and_atomics() {
     );
     assert_eq!(g.cpu.state().pc, f);
     assert_eq!(g.data(4, 0x200), after);
+}
+
+fn bl(from: u64, to: u64) -> u32 {
+    0x9400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
+}
+
+fn cbz_x0(from: u64, to: u64) -> u32 {
+    0xb400_0000 | ((((to as i64 - from as i64) / 4) as u32 & 0x7_ffff) << 5)
+}
+
+fn movz_x0(imm: u16) -> u32 {
+    0xd280_0000 | (imm as u32) << 5
+}
+
+fn b(from: u64, to: u64) -> u32 {
+    0x1400_0000 | (((to as i64 - from as i64) / 4) as u32 & 0x3ff_ffff)
+}
+
+/// The address of the first byte of data page `page` minus `before`: an access starting here
+/// crosses into page `page`.
+fn before_page(page: u64, before: u64) -> u64 {
+    DATA + page * PAGE_SIZE - before
+}
+
+/// The expected value of a cross-page access: the last `before` bytes of page `page - 1` followed
+/// by the first bytes of page `page`.
+fn crossing(g: &Guest, page: usize, before: usize) -> u64 {
+    let lo = g.data(page - 1, 4096 - 8) >> (8 * (8 - before));
+    let hi = g.data(page, 0) << (8 * before);
+    lo | hi
+}
+
+/// Runs from `pc` to an svc or a fault.
+fn go(g: &mut Guest, dbt: &mut Dbt, pc: u64) -> Exit {
+    g.cpu.state_mut().pc = pc;
+    dbt.run(&mut g.cpu)
 }

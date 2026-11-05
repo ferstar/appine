@@ -50,6 +50,22 @@ struct ItlbEntry {
     addend: u64,
 }
 
+/// Maximum number of hardware breakpoints, and of watchpoints (C's `APPINE_HW_SLOTS`).
+pub const HW_SLOTS: usize = 16;
+/// Watchpoint kinds: read and write (can be combined).
+pub const WATCH_LOAD: u32 = 1;
+pub const WATCH_STORE: u32 = 2;
+
+/// C's `struct appine_watch`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq)]
+struct WatchSlot {
+    lo: u64,
+    hi: u64,
+    ty: u32,
+    reserved: u32,
+}
+
 /// Guest CPU state, mirroring C's `struct appine_cpu` field by field.
 #[repr(C)]
 pub struct CpuState {
@@ -101,22 +117,6 @@ pub struct CpuState {
     reserved: u32,
     brk: [u64; HW_SLOTS],
     watch: [WatchSlot; HW_SLOTS],
-}
-
-/// Maximum number of hardware breakpoints, and of watchpoints (C's `APPINE_HW_SLOTS`).
-pub const HW_SLOTS: usize = 16;
-/// Watchpoint kinds: read and write (can be combined).
-pub const WATCH_LOAD: u32 = 1;
-pub const WATCH_STORE: u32 = 2;
-
-/// C's `struct appine_watch`.
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq)]
-struct WatchSlot {
-    lo: u64,
-    hi: u64,
-    ty: u32,
-    reserved: u32,
 }
 
 impl CpuState {
@@ -232,6 +232,8 @@ struct RawHostFault {
     pc: u64,
 }
 
+// ---- Page table ----
+
 /// Invalid argument or out of memory while modifying the page table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapError {
@@ -252,14 +254,6 @@ impl fmt::Display for MapError {
 }
 
 impl std::error::Error for MapError {}
-
-fn map_result(rc: c_int) -> Result<(), MapError> {
-    match rc {
-        0 => Ok(()),
-        -2 => Err(MapError::OutOfMemory),
-        _ => Err(MapError::InvalidArgument),
-    }
-}
 
 /// The software page table of one guest address space (the kernel/mm map).
 pub struct Mmu {
@@ -381,6 +375,16 @@ impl Drop for Mmu {
     }
 }
 
+fn map_result(rc: c_int) -> Result<(), MapError> {
+    match rc {
+        0 => Ok(()),
+        -2 => Err(MapError::OutOfMemory),
+        _ => Err(MapError::InvalidArgument),
+    }
+}
+
+// ---- CPU state and exits ----
+
 /// Memory access type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -476,26 +480,6 @@ pub struct Cpu {
 // concurrent walks
 unsafe impl Send for Cpu {}
 
-/// A handle for interrupting a [`Cpu`] from other threads ([`Cpu::kicker`]).
-#[derive(Clone, Copy)]
-pub struct Kicker(NonNull<CpuState>);
-
-// SAFETY: kick only does an atomic write to the CpuState's pending field
-unsafe impl Send for Kicker {}
-unsafe impl Sync for Kicker {}
-
-impl Kicker {
-    /// Makes the corresponding Cpu return [`Exit::Kick`] at the next instruction boundary (the
-    /// next block entry in Tier 1); if it is not running now, its next run returns immediately.
-    ///
-    /// # Safety
-    ///
-    /// The Cpu that created this handle must still be alive.
-    pub unsafe fn kick(&self) {
-        unsafe { appine_cpu_kick(self.0.as_ptr()) }
-    }
-}
-
 impl Cpu {
     /// Creates a CPU with all registers 0, bound to `mmu`.
     ///
@@ -510,48 +494,9 @@ impl Cpu {
         Cpu { state }
     }
 
-    /// Clears all state and rebinds to `mmu` (used by execve); the [`Kicker`] stays valid.
-    ///
-    /// # Safety
-    ///
-    /// `mmu` must outlive this `Cpu`.
-    pub unsafe fn reset(&mut self, mmu: &Mmu) {
-        unsafe { appine_cpu_init(self.state.as_ptr(), mmu.raw.as_ptr()) }
-    }
-
     /// A handle for interrupting this Cpu.
     pub fn kicker(&self) -> Kicker {
         Kicker(self.state)
-    }
-
-    /// Guest registers.
-    pub fn state(&self) -> &CpuState {
-        // SAFETY: state is valid while the Cpu is alive, and &self enforces the borrow rules
-        unsafe { self.state.as_ref() }
-    }
-
-    /// Mutable guest registers.
-    pub fn state_mut(&mut self) -> &mut CpuState {
-        // SAFETY: as above; &mut self guarantees exclusive access
-        unsafe { self.state.as_mut() }
-    }
-
-    /// Looks up the host pointer for a guest address through the bound page table
-    /// ([`Mmu::translate`]); returns None when no page table is bound. The page table may be
-    /// walked while another thread modifies it; the caller guarantees how long the memory the
-    /// pointer refers to stays valid.
-    pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
-        let mmu = self.state().mmu;
-        if mmu.is_null() {
-            return None;
-        }
-        // SAFETY: the bound mmu outlives the Cpu (Cpu::new, Cpu::reset)
-        NonNull::new(unsafe { appine_mmu_translate(mmu, gva, required_prot) }.cast())
-    }
-
-    /// Invalidates the whole software TLB.
-    pub fn tlb_flush(&mut self) {
-        unsafe { appine_cpu_tlb_flush(self.state.as_ptr()) }
     }
 
     /// Executes from the current pc until the kernel layer is needed.
@@ -616,6 +561,45 @@ impl Cpu {
             _ => panic!("unknown appine_exit {rc}"),
         })
     }
+
+    /// Looks up the host pointer for a guest address through the bound page table
+    /// ([`Mmu::translate`]); returns None when no page table is bound. The page table may be
+    /// walked while another thread modifies it; the caller guarantees how long the memory the
+    /// pointer refers to stays valid.
+    pub fn translate(&self, gva: u64, required_prot: u32) -> Option<NonNull<u8>> {
+        let mmu = self.state().mmu;
+        if mmu.is_null() {
+            return None;
+        }
+        // SAFETY: the bound mmu outlives the Cpu (Cpu::new, Cpu::reset)
+        NonNull::new(unsafe { appine_mmu_translate(mmu, gva, required_prot) }.cast())
+    }
+
+    /// Invalidates the whole software TLB.
+    pub fn tlb_flush(&mut self) {
+        unsafe { appine_cpu_tlb_flush(self.state.as_ptr()) }
+    }
+
+    /// Clears all state and rebinds to `mmu` (used by execve); the [`Kicker`] stays valid.
+    ///
+    /// # Safety
+    ///
+    /// `mmu` must outlive this `Cpu`.
+    pub unsafe fn reset(&mut self, mmu: &Mmu) {
+        unsafe { appine_cpu_init(self.state.as_ptr(), mmu.raw.as_ptr()) }
+    }
+
+    /// Guest registers.
+    pub fn state(&self) -> &CpuState {
+        // SAFETY: state is valid while the Cpu is alive, and &self enforces the borrow rules
+        unsafe { self.state.as_ref() }
+    }
+
+    /// Mutable guest registers.
+    pub fn state_mut(&mut self) -> &mut CpuState {
+        // SAFETY: as above; &mut self guarantees exclusive access
+        unsafe { self.state.as_mut() }
+    }
 }
 
 impl Drop for Cpu {
@@ -623,6 +607,28 @@ impl Drop for Cpu {
         unsafe { appine_cpu_free(self.state.as_ptr()) }
     }
 }
+
+/// A handle for interrupting a [`Cpu`] from other threads ([`Cpu::kicker`]).
+#[derive(Clone, Copy)]
+pub struct Kicker(NonNull<CpuState>);
+
+// SAFETY: kick only does an atomic write to the CpuState's pending field
+unsafe impl Send for Kicker {}
+unsafe impl Sync for Kicker {}
+
+impl Kicker {
+    /// Makes the corresponding Cpu return [`Exit::Kick`] at the next instruction boundary (the
+    /// next block entry in Tier 1); if it is not running now, its next run returns immediately.
+    ///
+    /// # Safety
+    ///
+    /// The Cpu that created this handle must still be alive.
+    pub unsafe fn kick(&self) {
+        unsafe { appine_cpu_kick(self.0.as_ptr()) }
+    }
+}
+
+// ---- Tier 1 ----
 
 /// Tier 1 translation and run statistics (the engine map).
 #[repr(C)]
@@ -680,6 +686,16 @@ pub enum DbtRegs {
     Go,
 }
 
+/// A mapping that translations come from ([`DbtSpace::set_sources`]): a guest address range, and
+/// an identity (the file and its version) from which identical content can be concluded.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbtSource {
+    pub start: u64,
+    pub len: u64,
+    pub id: [u64; 5],
+}
+
 /// The Tier 1 translations of one address space (code cache, translation table), shared by all
 /// threads in that address space: each thread gets its own [`Dbt`] through [`Dbt::attach`]. Once
 /// the last [`Dbt`] and the references here are gone, it goes back to the pool; when there are
@@ -692,16 +708,6 @@ pub struct DbtSpace {
 // SAFETY: the C side protects the shared parts with its own lock (dbt.c's struct appine_dbt)
 unsafe impl Send for DbtSpace {}
 unsafe impl Sync for DbtSpace {}
-
-/// A mapping that translations come from ([`DbtSpace::set_sources`]): a guest address range, and
-/// an identity (the file and its version) from which identical content can be concluded.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DbtSource {
-    pub start: u64,
-    pub len: u64,
-    pub id: [u64; 5],
-}
 
 impl DbtSpace {
     /// The most ranges [`DbtSpace::set_sources`] records.
@@ -716,18 +722,20 @@ impl DbtSpace {
             .map(|raw| Arc::new(DbtSpace { raw, key }))
     }
 
-    /// The address space is no longer in use (the translations go back to the pool): records the
-    /// mappings the translations come from, at most [`Self::SOURCES`] ranges. The caller
-    /// guarantees that mappings with the same identity have the same content.
-    pub fn set_sources(&self, sources: &[DbtSource]) {
-        unsafe { appine_dbt_set_sources(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
-    }
-
     /// Before translations taken from the pool first run in a new address space: blocks in
     /// mappings of the new address space that are exactly the same as the recorded ones
     /// ([`Self::set_sources`]) need not be checked block by block.
     pub fn trust(&self, sources: &[DbtSource]) {
         unsafe { appine_dbt_trust(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
+    }
+
+    /// Allocates a tag for one address space sharing this instance (not repeated until the
+    /// instance goes back to the pool); returns `None` when they run out (60-some thousand).
+    pub fn new_tag(&self) -> Option<u16> {
+        match unsafe { appine_dbt_new_tag(self.raw.as_ptr()) } {
+            0 => None,
+            tag => Some(tag as u16),
+        }
     }
 
     /// Retires blocks whose guest pc is not in these mappings (parked ones included), except
@@ -746,35 +754,12 @@ impl DbtSpace {
         unsafe { appine_dbt_share(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
 
-    /// Allocates a tag for one address space sharing this instance (not repeated until the
-    /// instance goes back to the pool); returns `None` when they run out (60-some thousand).
-    pub fn new_tag(&self) -> Option<u16> {
-        match unsafe { appine_dbt_new_tag(self.raw.as_ptr()) } {
-            0 => None,
-            tag => Some(tag as u16),
-        }
+    /// The address space is no longer in use (the translations go back to the pool): records the
+    /// mappings the translations come from, at most [`Self::SOURCES`] ranges. The caller
+    /// guarantees that mappings with the same identity have the same content.
+    pub fn set_sources(&self, sources: &[DbtSource]) {
+        unsafe { appine_dbt_set_sources(self.raw.as_ptr(), sources.as_ptr(), sources.len()) }
     }
-}
-
-/// Releases the Tier 1 translations kept in the pool: nobody is using them, so they can be
-/// dropped when host memory is tight (Android's `onTrimMemory`), and the next run of the same
-/// program copies the templates again.
-pub fn trim_dbt_pool() {
-    unsafe { appine_dbt_trim() }
-}
-
-/// Unmaps the pages of Tier 1's code cache that were written through the writable view (content
-/// kept). The code cache is mapped twice for W^X, the host's RSS counts pages per mapping, and
-/// pages touched through both views count twice; writing again later only faults them back in.
-/// Must be called periodically: the kernel layer's timer thread does it once a second.
-pub fn unmap_written_code() {
-    unsafe { appine_dbt_unmap_written() }
-}
-
-/// How many bytes in total were written through the writable view and not yet unmapped
-/// ([`unmap_written_code`]): they count twice in the host's RSS.
-pub fn written_code_bytes() -> u64 {
-    unsafe { appine_dbt_written_bytes() }
 }
 
 impl Drop for DbtSpace {
@@ -824,11 +809,6 @@ impl Dbt {
         })
     }
 
-    /// The attached instance.
-    pub fn space(&self) -> &Arc<DbtSpace> {
-        &self.space
-    }
-
     /// Same semantics as [`Cpu::run`], but executes in translated code.
     pub fn run(&mut self, cpu: &mut Cpu) -> Exit {
         let rc = unsafe { appine_dbt_run(self.raw.as_ptr(), cpu.state.as_ptr()) };
@@ -858,6 +838,11 @@ impl Dbt {
         unsafe { appine_dbt_invalidate(self.raw.as_ptr(), cpu.state.as_ptr(), start, len) }
     }
 
+    /// The attached instance.
+    pub fn space(&self) -> &Arc<DbtSpace> {
+        &self.space
+    }
+
     /// This thread's statistics: how many times it exited, and the translations and
     /// invalidations it did.
     pub fn stats(&self) -> DbtStats {
@@ -872,6 +857,29 @@ impl Drop for Dbt {
         unsafe { appine_dbt_detach(self.raw.as_ptr()) }
     }
 }
+
+/// Releases the Tier 1 translations kept in the pool: nobody is using them, so they can be
+/// dropped when host memory is tight (Android's `onTrimMemory`), and the next run of the same
+/// program copies the templates again.
+pub fn trim_dbt_pool() {
+    unsafe { appine_dbt_trim() }
+}
+
+/// Unmaps the pages of Tier 1's code cache that were written through the writable view (content
+/// kept). The code cache is mapped twice for W^X, the host's RSS counts pages per mapping, and
+/// pages touched through both views count twice; writing again later only faults them back in.
+/// Must be called periodically: the kernel layer's timer thread does it once a second.
+pub fn unmap_written_code() {
+    unsafe { appine_dbt_unmap_written() }
+}
+
+/// How many bytes in total were written through the writable view and not yet unmapped
+/// ([`unmap_written_code`]): they count twice in the host's RSS.
+pub fn written_code_bytes() -> u64 {
+    unsafe { appine_dbt_written_bytes() }
+}
+
+// ---- Process-wide ----
 
 /// Installs the host-side fault guard (the engine map, design doc §12 item 5); may be called
 /// repeatedly. Afterwards, SIGSEGV, SIGBUS and SIGILL received by the host while [`Cpu::run`] or
