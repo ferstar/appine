@@ -16,6 +16,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import androidx.core.view.updatePadding
 import androidx.core.widget.NestedScrollView
 import com.google.android.material.appbar.MaterialToolbar
@@ -159,7 +160,14 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
                         super.onInitializeAccessibilityNodeInfo(host, info)
                         info.className = Switch::class.java.name
                         info.isCheckable = true
-                        info.isChecked = sw.isChecked
+                        // Android 16 replaced the boolean with a tri-state; the compat setter picks
+                        // whichever the device has
+                        AccessibilityNodeInfoCompat.wrap(info).checked =
+                            if (sw.isChecked) {
+                                AccessibilityNodeInfoCompat.CHECKED_STATE_TRUE
+                            } else {
+                                AccessibilityNodeInfoCompat.CHECKED_STATE_FALSE
+                            }
                     }
                 }
             }

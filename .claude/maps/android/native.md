@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: `shutdown` drops the last `Arc<Machine>` outside the table lock; removed that bug)
+> Maintained: 2026-11-05 (targeted verification: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational)
 
 ## Responsibilities
 
@@ -108,6 +108,11 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
   versions are copies kept by hand and change with the Ghostty version.
 - SDK: min 29, compile and target 37; uncompressed native libraries (`useLegacyPackaging = false`)
   so 16 KB-aligned `LOAD` segments (NDK 29's default) map directly from the APK.
+- Warnings fail: every Kotlin compilation (the app and the instrumentation tests, local builds
+  included) treats compiler warnings as errors, and lint treats its warnings as errors, except
+  the checks that follow data outside the repository (newer libraries or AGP, the newest SDK
+  level, Play's target SDK deadlines, libraries marked outdated in the Play SDK Index), which are
+  informational.
 - Manifest: launcher, settings and licenses activities (the application theme `Theme.Appine`,
   Material 3; the launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave
   `uiMode` out of their configuration changes), the `specialUse` foreground service with its subtype
@@ -160,6 +165,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
   lazy Zig packages are fetched only for the options the configure phase sees.
 - Zig 0.17 unpacks every package already in its global cache into `zig-pkg/`, needed or not; only
   an empty cache shows what a build uses.
+- The K2 compiler reports unused variables and never-read assignments only with its extra
+  warnings, which are off: they flag a variable read only by a local function as never read.
 
 ## Confirmed bugs / technical debt
 

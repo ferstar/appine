@@ -25,6 +25,7 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
+import androidx.core.content.edit
 import java.util.concurrent.Executors
 import java.text.DateFormat
 import java.text.DecimalFormat
@@ -872,7 +873,7 @@ class TerminalService : Service() {
      */
     private fun replace(distro: Rootfs.Distro) {
         // The old accounts were all deleted with the store
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_LOGIN).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { remove(KEY_LOGIN) }
         transitioning = true
         val m = detach()
         startError = null
@@ -942,7 +943,7 @@ class TerminalService : Service() {
      * unchanged; the home directory in the Files app follows.
      */
     fun setLogin(value: String) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_LOGIN, value).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putString(KEY_LOGIN, value) }
         Documents.rootsChanged(this)
         settingsChanged()
     }
@@ -954,7 +955,7 @@ class TerminalService : Service() {
     val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
 
     fun setKeepAwake(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_KEEP_AWAKE, on).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_KEEP_AWAKE, on) }
         updateWakeLock()
         settingsChanged()
     }
@@ -1000,7 +1001,7 @@ class TerminalService : Service() {
     val systemDocuments: Boolean get() = showSystemDocuments(this)
 
     fun setSystemDocuments(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_SYSTEM_DOCUMENTS, on).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_SYSTEM_DOCUMENTS, on) }
         Documents.rootsChanged(this)
         settingsChanged()
     }
@@ -1012,7 +1013,7 @@ class TerminalService : Service() {
     val fillWide: Boolean get() = fillWide(this)
 
     fun setFillWide(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_FILL_WIDE, on).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_FILL_WIDE, on) }
         settingsChanged()
     }
 
@@ -1030,7 +1031,7 @@ class TerminalService : Service() {
      */
     fun setTier(value: Int) {
         if (!BuildConfig.DEBUG || value == tier) return
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_TIER, value).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putInt(KEY_TIER, value) }
         restart()
     }
 

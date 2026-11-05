@@ -6,6 +6,7 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
+import androidx.core.content.edit
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -169,11 +170,11 @@ internal object Rootfs {
         configure(tmp.path, distro)
         if (store == store(context)) {
             // Written to disk before the rename: once the store is there, the record is its own
-            prefs(context).edit()
-                .putString(KEY_DISTRO, distro.name)
-                .putString(KEY_MIRROR, distro.mirrors[0])
-                .putBoolean(KEY_MIRROR_MANUAL, false)
-                .commit()
+            prefs(context).edit(commit = true) {
+                putString(KEY_DISTRO, distro.name)
+                putString(KEY_MIRROR, distro.mirrors[0])
+                putBoolean(KEY_MIRROR_MANUAL, false)
+            }
         }
         // Sync before the rename: otherwise after a power loss the store could be in place while
         // its files are empty; after the rename, sync the directory too, so what is later written
@@ -278,7 +279,7 @@ internal object Rootfs {
      * thread. Debian's mirrors are written as host names only, and probed with https.
      */
     fun chooseMirror(context: Context, distro: Distro): Boolean {
-        prefs(context).edit().putBoolean(KEY_MIRROR_MANUAL, false).apply()
+        prefs(context).edit { putBoolean(KEY_MIRROR_MANUAL, false) }
         val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
         val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
         val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return true
@@ -291,7 +292,7 @@ internal object Rootfs {
                 .onFailure { Log.w(TAG, "cannot write the package sources", it) }
                 .getOrElse { return true }
             if (written) {
-                prefs(context).edit().putString(KEY_MIRROR, best.first).apply()
+                prefs(context).edit { putString(KEY_MIRROR, best.first) }
             } else {
                 Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
             }
@@ -363,7 +364,10 @@ internal object Rootfs {
     @Throws(IOException::class)
     fun setMirror(context: Context, distro: Distro, mirror: String): Boolean = synchronized(this) {
         if (!writeMirror(store(context).path, distro, mirror)) return false
-        prefs(context).edit().putString(KEY_MIRROR, mirror).putBoolean(KEY_MIRROR_MANUAL, true).apply()
+        prefs(context).edit {
+            putString(KEY_MIRROR, mirror)
+            putBoolean(KEY_MIRROR_MANUAL, true)
+        }
         return true
     }
 

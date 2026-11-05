@@ -36,6 +36,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.widget.ListPopupWindow
 import androidx.appcompat.widget.PopupMenu
+import androidx.core.content.edit
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -674,7 +675,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         override fun onZoom(fontPx: Int) {
             fontSize = fontPx
-            getPreferences(MODE_PRIVATE).edit().putInt(PREF_FONT_SIZE, fontSize).apply()
+            getPreferences(MODE_PRIVATE).edit { putInt(PREF_FONT_SIZE, fontSize) }
         }
 
         override val ctrl: Boolean get() = keys.ctrl

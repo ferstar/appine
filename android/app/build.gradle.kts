@@ -70,6 +70,28 @@ android {
         // from it (also on 16K-page devices)
         jniLibs.useLegacyPackaging = false
     }
+
+    lint {
+        // A lint warning fails lint (CI runs lintDebug), as `-D warnings` fails clippy
+        warningsAsErrors = true
+        // These follow what is published or dated outside the repository (newer libraries, AGP or
+        // SDK levels, Play's target SDK deadlines, the Play SDK Index), so as errors they would fail
+        // an unchanged tree; they stay in the report
+        informational += listOf(
+            "GradleDependency",
+            "AndroidGradlePluginVersion",
+            "OldTargetApi",
+            "ExpiringTargetSdkVersion",
+            "OutdatedLibrary",
+        )
+    }
+}
+
+kotlin {
+    compilerOptions {
+        // A compiler warning fails the build, main and test sources alike
+        allWarningsAsErrors = true
+    }
 }
 
 /**

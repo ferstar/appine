@@ -34,6 +34,9 @@ import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.withClip
+import androidx.core.graphics.withScale
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -325,7 +328,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         selFrom = IntArray(r) { -1 }
         selTo = IntArray(r) { -1 }
         bitmap?.recycle()
-        bitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888).also { canvas = Canvas(it) }
+        bitmap = createBitmap(bw, bh).also { canvas = Canvas(it) }
         full = true
         session?.resize(c, r, cellWidth, cellHeight)
         host.onGrid(c, r, cellWidth, cellHeight)
@@ -498,79 +501,78 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun drawRow(c: Canvas, y: Int) {
         val top = y * cellHeight
         val base = y * cols
-        c.save()
-        c.clipRect(0, top, cols * cellWidth, top + cellHeight)
-        fill.color = defaultBg
-        c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-        var x = 0
-        while (x < cols) {
-            val color = bgOf(base + x)
-            var end = x + 1
-            while (end < cols && bgOf(base + end) == color) end++
-            if (color != defaultBg) {
-                fill.color = color
-                c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-            }
-            x = end
-        }
-        val from = selFrom[y]
-        if (from >= 0) {
-            // The highlight covers a wide character whose first cell ends the selection
-            val to = selTo[y] + if ((attrs[base + selTo[y]] shr 12) and 3 == WIDE) 2 else 1
-            fill.color = SELECTION
-            c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-        }
-
-        // Runs of plain ASCII in one style go out in one call; other cells one at a time
-        var runStart = -1
-        var runLength = 0
-        var runPaint: Paint? = null
-        var runColor = 0
-        var runDecor = 0
-        fun flush() {
-            if (runLength > 0) {
-                runPaint!!.color = runColor
-                c.drawText(runChars, 0, runLength, (runStart * cellWidth).toFloat(), (top + baseline).toFloat(), runPaint!!)
-                decorate(c, runDecor, runStart, runStart + runLength, top, runColor)
-            }
-            runStart = -1
-            runLength = 0
-        }
-        x = 0
-        while (x < cols) {
-            val i = base + x
-            val a = attrs[i]
-            val wide = (a shr 12) and 3
-            if (wide == SPACER_TAIL || wide == SPACER_HEAD) {
-                x++
-                continue
-            }
-            val code = cp[i]
-            val color = fgOf(i)
-            val paint = paintOf(i)
-            val decor = a and DECORATIONS
-            val plain = clusters[i] == null && wide == NARROW && a and INVISIBLE == 0 &&
-                (code == 0 || code in 0x20..0x7e)
-            if (plain) {
-                if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor)) flush()
-                if (runLength == 0) {
-                    runStart = x
-                    runPaint = paint
-                    runColor = color
-                    runDecor = decor
+        c.withClip(0, top, cols * cellWidth, top + cellHeight) {
+            fill.color = defaultBg
+            c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+            var x = 0
+            while (x < cols) {
+                val color = bgOf(base + x)
+                var end = x + 1
+                while (end < cols && bgOf(base + end) == color) end++
+                if (color != defaultBg) {
+                    fill.color = color
+                    c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
                 }
-                runChars[runLength++] = if (code == 0) ' ' else code.toChar()
-                x++
-                continue
+                x = end
+            }
+            val from = selFrom[y]
+            if (from >= 0) {
+                // The highlight covers a wide character whose first cell ends the selection
+                val to = selTo[y] + if ((attrs[base + selTo[y]] shr 12) and 3 == WIDE) 2 else 1
+                fill.color = SELECTION
+                c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+            }
+
+            // Runs of plain ASCII in one style go out in one call; other cells one at a time
+            var runStart = -1
+            var runLength = 0
+            var runPaint: Paint? = null
+            var runColor = 0
+            var runDecor = 0
+            fun flush() {
+                if (runLength > 0) {
+                    runPaint!!.color = runColor
+                    c.drawText(runChars, 0, runLength, (runStart * cellWidth).toFloat(), (top + baseline).toFloat(), runPaint!!)
+                    decorate(c, runDecor, runStart, runStart + runLength, top, runColor)
+                }
+                runStart = -1
+                runLength = 0
+            }
+            x = 0
+            while (x < cols) {
+                val i = base + x
+                val a = attrs[i]
+                val wide = (a shr 12) and 3
+                if (wide == SPACER_TAIL || wide == SPACER_HEAD) {
+                    x++
+                    continue
+                }
+                val code = cp[i]
+                val color = fgOf(i)
+                val paint = paintOf(i)
+                val decor = a and DECORATIONS
+                val plain = clusters[i] == null && wide == NARROW && a and INVISIBLE == 0 &&
+                    (code == 0 || code in 0x20..0x7e)
+                if (plain) {
+                    if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor)) flush()
+                    if (runLength == 0) {
+                        runStart = x
+                        runPaint = paint
+                        runColor = color
+                        runDecor = decor
+                    }
+                    runChars[runLength++] = if (code == 0) ' ' else code.toChar()
+                    x++
+                    continue
+                }
+                flush()
+                val span = if (wide == WIDE) 2 else 1
+                if (a and INVISIBLE == 0) drawGlyph(c, i, x, span, top, color, paint)
+                decorate(c, decor, x, x + span, top, color)
+                x += span
             }
             flush()
-            val span = if (wide == WIDE) 2 else 1
-            if (a and INVISIBLE == 0) drawGlyph(c, i, x, span, top, color, paint)
-            decorate(c, decor, x, x + span, top, color)
-            x += span
         }
-        flush()
-        c.restore()
     }
 
     private fun bgOf(i: Int): Int =
@@ -612,10 +614,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (s == 1f) {
             c.drawText(text, l, (top + baseline).toFloat(), paint)
         } else {
-            c.save()
-            c.scale(s, s, l, top + cellHeight / 2f)
-            c.drawText(text, l, (top + baseline).toFloat(), paint)
-            c.restore()
+            c.withScale(s, s, l, top + cellHeight / 2f) { c.drawText(text, l, (top + baseline).toFloat(), paint) }
         }
     }
 
@@ -681,11 +680,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 c.drawRect(l + light / 2f, t + light / 2f, r - light / 2f, b - light / 2f, stroke)
             else -> {
                 // A block: the cell's glyph in the background colour on top
-                c.save()
-                c.clipRect(l, t, r, b)
-                c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
-                if (attrs[i] and INVISIBLE == 0) drawGlyph(c, i, cursorX, span, t, bgOf(i), paintOf(i))
-                c.restore()
+                c.withClip(l, t, r, b) {
+                    c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
+                    if (attrs[i] and INVISIBLE == 0) drawGlyph(c, i, cursorX, span, t, bgOf(i), paintOf(i))
+                }
             }
         }
     }
