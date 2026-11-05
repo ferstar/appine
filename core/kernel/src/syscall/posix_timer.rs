@@ -34,46 +34,6 @@ const MAX_TIMERS: usize = 4096;
 /// The capability the wake-alarm clocks require (`CAP_WAKE_ALARM`).
 const CAP_WAKE_ALARM: u32 = 35;
 
-/// The way of keeping time that a clock id stands for.
-fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
-    Ok(match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Wall(clockid),
-        // Wake alarms: the host app cannot wake the device, so they are timed as ordinary clocks
-        CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
-            if !cx.cred().capable(CAP_WAKE_ALARM) {
-                return Err(Errno::EPERM);
-            }
-            Clock::Wall(if clockid == CLOCK_REALTIME_ALARM {
-                CLOCK_REALTIME
-            } else {
-                CLOCK_BOOTTIME
-            })
-        }
-        CLOCK_PROCESS_CPUTIME_ID => Clock::Process(cx.tgid()),
-        CLOCK_THREAD_CPUTIME_ID => Clock::Thread(cx.tid()),
-        // Clocks encoded by clock_getcpuclockid: (~pid << 3) | type, bit 2 meaning a thread
-        c if c < 0 && c & 3 != 3 => {
-            let thread = c & 4 != 0;
-            let pid = match !(c >> 3) {
-                0 if thread => cx.tid(),
-                0 => cx.tgid(),
-                p => p,
-            };
-            let k = cx.kr();
-            if thread {
-                k.tasks.get(&pid).ok_or(Errno::EINVAL)?;
-                Clock::Thread(pid)
-            } else {
-                k.groups.get(&pid).ok_or(Errno::EINVAL)?;
-                Clock::Process(pid)
-            }
-        }
-        // CLOCK_MONOTONIC_RAW and the coarse clocks cannot be used for timers
-        4..=6 => return Err(Errno::EOPNOTSUPP),
-        _ => return Err(Errno::EINVAL),
-    })
-}
-
 pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -> SysResult {
     let clock = clock_of(cx, clockid)?;
     // Without a sigevent: SIGEV_SIGNAL, SIGALRM, and sigev_value is the timer id
@@ -131,30 +91,44 @@ pub(super) fn timer_create(cx: &mut Cx<'_>, clockid: i32, sevp: u64, idp: u64) -
     Ok(0)
 }
 
-/// `struct itimerspec`: the interval and how long until the next expiry (both 0 when not armed).
-fn encode_itimerspec(t: &PosixTimer, left: Option<Duration>) -> [u8; 32] {
-    let left = left.unwrap_or(Duration::ZERO);
-    // A timer that has not expired yet reports at least 1 nanosecond, as on Linux
-    let left = if t.deadline.is_some() {
-        left.max(Duration::from_nanos(1))
-    } else {
-        left
-    };
-    let mut b = [0u8; 32];
-    for (o, d) in [(0, t.interval), (16, left)] {
-        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
-        b[o + 8..o + 16].copy_from_slice(&(d.subsec_nanos() as i64).to_le_bytes());
-    }
-    b
-}
-
-fn timer(cx: &Cx<'_>, id: i32) -> Result<PosixTimer, Errno> {
-    cx.t.group
-        .borrow()
-        .posix_timers
-        .get(&id)
-        .cloned()
-        .ok_or(Errno::EINVAL)
+/// The way of keeping time that a clock id stands for.
+fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
+    Ok(match clockid {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Wall(clockid),
+        // Wake alarms: the host app cannot wake the device, so they are timed as ordinary clocks
+        CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => {
+            if !cx.cred().capable(CAP_WAKE_ALARM) {
+                return Err(Errno::EPERM);
+            }
+            Clock::Wall(if clockid == CLOCK_REALTIME_ALARM {
+                CLOCK_REALTIME
+            } else {
+                CLOCK_BOOTTIME
+            })
+        }
+        CLOCK_PROCESS_CPUTIME_ID => Clock::Process(cx.tgid()),
+        CLOCK_THREAD_CPUTIME_ID => Clock::Thread(cx.tid()),
+        // Clocks encoded by clock_getcpuclockid: (~pid << 3) | type, bit 2 meaning a thread
+        c if c < 0 && c & 3 != 3 => {
+            let thread = c & 4 != 0;
+            let pid = match !(c >> 3) {
+                0 if thread => cx.tid(),
+                0 => cx.tgid(),
+                p => p,
+            };
+            let k = cx.kr();
+            if thread {
+                k.tasks.get(&pid).ok_or(Errno::EINVAL)?;
+                Clock::Thread(pid)
+            } else {
+                k.groups.get(&pid).ok_or(Errno::EINVAL)?;
+                Clock::Process(pid)
+            }
+        }
+        // CLOCK_MONOTONIC_RAW and the coarse clocks cannot be used for timers
+        4..=6 => return Err(Errno::EOPNOTSUPP),
+        _ => return Err(Errno::EINVAL),
+    })
 }
 
 pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old: u64) -> SysResult {
@@ -208,4 +182,30 @@ pub(super) fn timer_delete(cx: &mut Cx<'_>, id: i32) -> SysResult {
         .remove(&id)
         .map(|_| 0)
         .ok_or(Errno::EINVAL)
+}
+
+fn timer(cx: &Cx<'_>, id: i32) -> Result<PosixTimer, Errno> {
+    cx.t.group
+        .borrow()
+        .posix_timers
+        .get(&id)
+        .cloned()
+        .ok_or(Errno::EINVAL)
+}
+
+/// `struct itimerspec`: the interval and how long until the next expiry (both 0 when not armed).
+fn encode_itimerspec(t: &PosixTimer, left: Option<Duration>) -> [u8; 32] {
+    let left = left.unwrap_or(Duration::ZERO);
+    // A timer that has not expired yet reports at least 1 nanosecond, as on Linux
+    let left = if t.deadline.is_some() {
+        left.max(Duration::from_nanos(1))
+    } else {
+        left
+    };
+    let mut b = [0u8; 32];
+    for (o, d) in [(0, t.interval), (16, left)] {
+        b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
+        b[o + 8..o + 16].copy_from_slice(&(d.subsec_nanos() as i64).to_le_bytes());
+    }
+    b
 }

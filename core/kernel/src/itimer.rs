@@ -115,15 +115,6 @@ pub(crate) struct PosixTimer {
 }
 
 impl PosixTimer {
-    /// The clock's current value: None for the wall clock (compare with `Instant::now()` directly).
-    fn cpu_now(&self, k: &Kernel) -> Option<u64> {
-        match self.clock {
-            Clock::Wall(_) => None,
-            Clock::Process(tgid) => Some(k.groups.get(&tgid).map_or(0, |g| g.borrow().cpu_ns(k))),
-            Clock::Thread(tid) => Some(k.tasks.get(&tid).map_or(0, |t| t.cpu_ns())),
-        }
-    }
-
     /// How long until the next expiry; None when not armed.
     pub fn remaining(&self, k: &Kernel) -> Option<Duration> {
         match self.deadline? {
@@ -170,6 +161,15 @@ impl PosixTimer {
         });
         Some(periods.min(i32::MAX as u128) as u32)
     }
+
+    /// The clock's current value: None for the wall clock (compare with `Instant::now()` directly).
+    fn cpu_now(&self, k: &Kernel) -> Option<u64> {
+        match self.clock {
+            Clock::Wall(_) => None,
+            Clock::Process(tgid) => Some(k.groups.get(&tgid).map_or(0, |g| g.borrow().cpu_ns(k))),
+            Clock::Thread(tid) => Some(k.tasks.get(&tid).map_or(0, |t| t.cpu_ns())),
+        }
+    }
 }
 
 /// Signals the processes whose timers expired and returns when to check next.
@@ -190,13 +190,6 @@ pub(crate) fn expire(k: &Kernel) -> Option<Instant> {
         }
     }
     next
-}
-
-/// Stops all of a process's timers.
-fn disarm(g: &mut ThreadGroup) {
-    g.itimer = None;
-    g.cpu_itimers = [None; 2];
-    g.posix_timers.clear();
 }
 
 /// Handles the timers of process `tgid` and returns when it should next be checked.
@@ -323,6 +316,13 @@ fn add_overrun(k: &Kernel, tgid: Tid, tid: Option<Tid>, sig: Signal, id: i32, mi
             .get(&tgid)
             .is_some_and(|g| bump(&mut g.borrow_mut().pending)),
     }
+}
+
+/// Stops all of a process's timers.
+fn disarm(g: &mut ThreadGroup) {
+    g.itimer = None;
+    g.cpu_itimers = [None; 2];
+    g.posix_timers.clear();
 }
 
 #[cfg(test)]

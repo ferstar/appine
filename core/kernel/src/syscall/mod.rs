@@ -39,6 +39,7 @@ pub(crate) use mount::collect_namespaces;
 pub(crate) use mqueue::{Limits as MqLimits, MessageQueue, MqDir, find as mqueue_find};
 pub(crate) use net::{SocketRef, deliver_dns, unmap_addr};
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
+pub(crate) use proc::{interp_label, label_image};
 pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
 pub(crate) use tty::{hang_up, hang_up_closed};
@@ -90,57 +91,6 @@ const NO_SYSCALL: u64 = u64::MAX;
 /// The number a process invisible in the pid namespace is translated to: lookups everywhere fail
 /// to find it and report ESRCH, ECHILD etc. by their own rules (it is larger than `PID_MAX`).
 pub(crate) const NO_PID: Tid = 0x3fff_ffff;
-
-/// Calling `nr` in pid namespace `ns`: pids, tids and process group IDs in the arguments are
-/// translated to global numbers (Linux's `find_vpid`), and invisible ones to [`NO_PID`]. Special
-/// values such as 0 and -1 are unchanged, and a negative process group ID is translated negated.
-/// Those inside structs (capget, `F_SETOWN_EX`, `TIOCSPGRP`, `SCM_CREDENTIALS`) are each
-/// translated on their own.
-fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
-    let global = |v: u64| -> u64 {
-        let p = v as i32;
-        let g = |l: Tid| ns.find(l).unwrap_or(NO_PID);
-        (match p {
-            p if p > 0 => g(p),
-            p if p < -1 && p != i32::MIN => -g(-p),
-            p => p,
-        }) as u32 as u64
-    };
-    let idx: &[usize] = match nr {
-        // process_vm_readv/writev, get_robust_list, sched_*, kill, tkill, rt_sigqueueinfo,
-        // getpgid, getsid, prlimit64, wait4, sched_setattr/getattr, pidfd_open
-        270
-        | 271
-        | 100
-        | 118..=123
-        | 127
-        | 129
-        | 130
-        | 138
-        | 155
-        | 156
-        | 261
-        | 260
-        | 274
-        | 275
-        | 434 => &[0],
-        // ptrace (the first argument is the request)
-        117 => &[1],
-        // tgkill, rt_tgsigqueueinfo, setpgid, kcmp
-        131 | 240 | 154 | 272 => &[0, 1],
-        // waitid(P_PID or P_PGID), setpriority/getpriority(PRIO_PROCESS or PRIO_PGRP)
-        95 if matches!(a[0], 1 | 2) => &[1],
-        140 | 141 if matches!(a[0], 0 | 1) => &[1],
-        // ioprio_set/ioprio_get(IOPRIO_WHO_PROCESS or IOPRIO_WHO_PGRP)
-        30 | 31 if matches!(a[0], 1 | 2) => &[1],
-        // fcntl(F_SETOWN)
-        25 if a[1] == 8 => &[2],
-        _ => &[],
-    };
-    for &i in idx {
-        a[i] = global(a[i]);
-    }
-}
 
 /// Handles one `svc #0` by the aarch64 Linux convention: x8 is the number, x0–x5 the arguments,
 /// and the return value is written back to x0.
@@ -624,6 +574,57 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     signal::deliver(cx, cpu, true)
 }
 
+/// Calling `nr` in pid namespace `ns`: pids, tids and process group IDs in the arguments are
+/// translated to global numbers (Linux's `find_vpid`), and invisible ones to [`NO_PID`]. Special
+/// values such as 0 and -1 are unchanged, and a negative process group ID is translated negated.
+/// Those inside structs (capget, `F_SETOWN_EX`, `TIOCSPGRP`, `SCM_CREDENTIALS`) are each
+/// translated on their own.
+fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
+    let global = |v: u64| -> u64 {
+        let p = v as i32;
+        let g = |l: Tid| ns.find(l).unwrap_or(NO_PID);
+        (match p {
+            p if p > 0 => g(p),
+            p if p < -1 && p != i32::MIN => -g(-p),
+            p => p,
+        }) as u32 as u64
+    };
+    let idx: &[usize] = match nr {
+        // process_vm_readv/writev, get_robust_list, sched_*, kill, tkill, rt_sigqueueinfo,
+        // getpgid, getsid, prlimit64, wait4, sched_setattr/getattr, pidfd_open
+        270
+        | 271
+        | 100
+        | 118..=123
+        | 127
+        | 129
+        | 130
+        | 138
+        | 155
+        | 156
+        | 261
+        | 260
+        | 274
+        | 275
+        | 434 => &[0],
+        // ptrace (the first argument is the request)
+        117 => &[1],
+        // tgkill, rt_tgsigqueueinfo, setpgid, kcmp
+        131 | 240 | 154 | 272 => &[0, 1],
+        // waitid(P_PID or P_PGID), setpriority/getpriority(PRIO_PROCESS or PRIO_PGRP)
+        95 if matches!(a[0], 1 | 2) => &[1],
+        140 | 141 if matches!(a[0], 0 | 1) => &[1],
+        // ioprio_set/ioprio_get(IOPRIO_WHO_PROCESS or IOPRIO_WHO_PGRP)
+        30 | 31 if matches!(a[0], 1 | 2) => &[1],
+        // fcntl(F_SETOWN)
+        25 if a[1] == 8 => &[2],
+        _ => &[],
+    };
+    for &i in idx {
+        a[i] = global(a[i]);
+    }
+}
+
 /// execve succeeded (`old_tid` is the tid before): when traced, reports the exec
 /// (`PTRACE_EVENT_EXEC` or SIGTRAP) and the system call exit, and delivers signals before the
 /// first instruction of the new program runs.
@@ -641,16 +642,18 @@ fn exec_done(cx: &mut Cx<'_>, cpu: &mut Cpu, old_tid: crate::kernel::Tid) -> Flo
     }
 }
 
-pub(crate) use proc::{interp_label, label_image};
-
 /// Reads a guest path argument.
 fn read_path(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     cx.mm().read_cstr(addr, PATH_MAX - 1)
 }
 
-/// Writes an integer type to guest memory.
-fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
-    cx.mm().write(UserSlice::new(addr, N), &bytes)
+/// Reads a `struct timespec` ([`timespec`]); returns EINVAL when the seconds or nanoseconds are
+/// out of range.
+fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
+    let b: [u8; 16] = get(cx, addr)?;
+    let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
+    timespec(sec, nsec).ok_or(Errno::EINVAL)
 }
 
 /// Reads a fixed-length byte array from guest memory.
@@ -675,19 +678,15 @@ fn timespec(sec: i64, nsec: i64) -> Option<std::time::Duration> {
     Some(std::time::Duration::new(sec as u64, nsec as u32).min(KTIME_MAX))
 }
 
-/// Reads a `struct timespec` ([`timespec`]); returns EINVAL when the seconds or nanoseconds are
-/// out of range.
-fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
-    let b: [u8; 16] = get(cx, addr)?;
-    let sec = i64::from_le_bytes(b[..8].try_into().unwrap());
-    let nsec = i64::from_le_bytes(b[8..].try_into().unwrap());
-    timespec(sec, nsec).ok_or(Errno::EINVAL)
-}
-
 /// Writes a pair of 64-bit integers (timespec, timeval, rlimit).
 fn write_pair(cx: &Cx<'_>, addr: u64, a: i64, b: i64) -> Result<(), Errno> {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&a.to_le_bytes());
     buf[8..].copy_from_slice(&b.to_le_bytes());
     put(cx, addr, buf)
+}
+
+/// Writes an integer type to guest memory.
+fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
+    cx.mm().write(UserSlice::new(addr, N), &bytes)
 }

@@ -278,42 +278,6 @@ pub(crate) const RLIM_NLIMITS: usize = 16;
 /// The smallest value `threads-max` accepts (Linux's `MIN_THREADS`).
 pub(crate) const MIN_THREADS: usize = 20;
 
-/// Default for `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing
-/// at once, which stops fork bombs and applies to root too (`RLIMIT_NPROC` cannot limit root).
-/// Every guest thread is a host thread and also takes a host fd (the eventfd for waiting), so it
-/// is one per MB of physical memory (Linux: one per 128 KB), and at most half the host fd limit,
-/// leaving room for open files.
-pub(crate) fn default_threads_max() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        let by_memory = match appine_hal::memory_info().0 {
-            0 => 4096,
-            total => (total >> 20) as usize,
-        };
-        let by_fds = usize::try_from(appine_hal::fd_limit() / 2).unwrap_or(usize::MAX);
-        by_memory.min(by_fds).max(MIN_THREADS)
-    })
-}
-
-fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
-    let mut r = [(u64::MAX, u64::MAX); RLIM_NLIMITS];
-    r[RLIMIT_STACK as usize] = (loader::STACK_SIZE, u64::MAX);
-    r[RLIMIT_CORE as usize] = (0, u64::MAX);
-    let (soft, hard) = crate::fd::DEFAULT_NOFILE;
-    r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
-    // The same as the default since Linux 5.16
-    r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
-    // Half of threads-max, as on Linux; root is not limited by it
-    let nproc = default_threads_max() as u64 / 2;
-    r[RLIMIT_NPROC as usize] = (nproc, nproc);
-    // Linux computes it from the memory size (max_threads / 2); this is the value for 4 GB of
-    // memory
-    r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
-    r[RLIMIT_NICE as usize] = (0, 0);
-    r[RLIMIT_RTPRIO as usize] = (0, 0);
-    r
-}
-
 /// A guest process, that is, a thread group. After its threads exit, the thread group may remain
 /// as a zombie process until the parent reaps it.
 pub(crate) struct ThreadGroup {
@@ -505,20 +469,15 @@ impl ThreadGroup {
 }
 
 impl ThreadGroup {
-    /// CPU time used: exited threads plus live threads.
-    pub fn cpu(&self, k: &Kernel) -> CpuTime {
-        let threads = self.threads.iter().filter_map(|t| k.tasks.get(t));
-        threads.fold(self.cpu, |sum, t| sum + t.cpu())
-    }
-
     /// The total of [`ThreadGroup::cpu`].
     pub fn cpu_ns(&self, k: &Kernel) -> u64 {
         self.cpu(k).total_ns
     }
 
-    /// Samples resident memory once and updates the peak.
-    pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
-        self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(false) * 4);
+    /// CPU time used: exited threads plus live threads.
+    pub fn cpu(&self, k: &Kernel) -> CpuTime {
+        let threads = self.threads.iter().filter_map(|t| k.tasks.get(t));
+        threads.fold(self.cpu, |sum, t| sum + t.cpu())
     }
 
     /// The sample before execve replaces the address space: a process that was forked, has not
@@ -545,6 +504,47 @@ impl ThreadGroup {
         self.rss_sampled = Some(now);
         self.sample_rss(mm);
     }
+
+    /// Samples resident memory once and updates the peak.
+    pub fn sample_rss(&mut self, mm: &crate::mm::Mm) {
+        self.maxrss_kb = self.maxrss_kb.max(mm.peak_resident_pages(false) * 4);
+    }
+}
+
+fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
+    let mut r = [(u64::MAX, u64::MAX); RLIM_NLIMITS];
+    r[RLIMIT_STACK as usize] = (loader::STACK_SIZE, u64::MAX);
+    r[RLIMIT_CORE as usize] = (0, u64::MAX);
+    let (soft, hard) = crate::fd::DEFAULT_NOFILE;
+    r[RLIMIT_NOFILE as usize] = (soft as u64, hard as u64);
+    // The same as the default since Linux 5.16
+    r[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
+    // Half of threads-max, as on Linux; root is not limited by it
+    let nproc = default_threads_max() as u64 / 2;
+    r[RLIMIT_NPROC as usize] = (nproc, nproc);
+    // Linux computes it from the memory size (max_threads / 2); this is the value for 4 GB of
+    // memory
+    r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
+    r[RLIMIT_NICE as usize] = (0, 0);
+    r[RLIMIT_RTPRIO as usize] = (0, 0);
+    r
+}
+
+/// Default for `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing
+/// at once, which stops fork bombs and applies to root too (`RLIMIT_NPROC` cannot limit root).
+/// Every guest thread is a host thread and also takes a host fd (the eventfd for waiting), so it
+/// is one per MB of physical memory (Linux: one per 128 KB), and at most half the host fd limit,
+/// leaving room for open files.
+pub(crate) fn default_threads_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let by_memory = match appine_hal::memory_info().0 {
+            0 => 4096,
+            total => (total >> 20) as usize,
+        };
+        let by_fds = usize::try_from(appine_hal::fd_limit() / 2).unwrap_or(usize::MAX);
+        by_memory.min(by_fds).max(MIN_THREADS)
+    })
 }
 
 /// CPU time used, of which `sys_ns` is the kernel-mode part (not more than `total_ns`, see
@@ -598,50 +598,183 @@ impl Rusage {
     }
 }
 
-/// The first thread of process `g` that is alive and not being ended (Linux's
-/// `find_alive_thread`, leader first); the first thread when all are being ended, and `tgid`
-/// when there are no threads. It becomes the parent thread when orphans are reparented to a
-/// process.
-pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
-    g.threads
-        .iter()
-        .copied()
-        .find(|t| k.tasks.get(t).is_some_and(|t| !t.killed.get()))
-        .or_else(|| g.threads.first().copied())
-        .unwrap_or(g.tgid)
+// ---- execve ----
+
+/// The program file a process is executing (Linux's `mm->exe_file`): reading `/proc/<pid>/exe`
+/// gives its path, and following it leads straight to this file without resolving the path
+/// again. After the program file is renamed, deleted or replaced (dpkg upgrades replace running
+/// programs with rename), what is opened or executed through exe is still the original. Shared
+/// by fork, replaced by execve.
+pub struct ExeFile {
+    /// The absolute path at execution, with all symbolic links resolved: musl expands the main
+    /// program's `$ORIGIN` from it, and programs started through a link such as /usr/bin/java rely
+    /// on it to find their libraries.
+    pub path: Rc<[u8]>,
+    /// The mount passed through and the inode in the store; None for a host file used in
+    /// development (no store), which is followed by path.
+    pub node: Option<(MountId, Ino)>,
+    /// The last directory passed through and the name: the path of a program executed through exe
+    /// is computed from it ([`Pseudo::follow_dentry`]).
+    pub dentry: Option<Dentry>,
+    /// The open host file (the object in the store): after the program file is deleted the object
+    /// is deleted too, and reopening or executing relies on it ([`open_exe_file`]).
+    pub host: Option<Arc<File>>,
 }
 
-/// The signals that the threads with `PR_SET_PDEATHSIG` in the child processes `children` should
-/// each receive because their parent thread exited (Linux's `forget_original_parent`: one per such
-/// thread, sent to its process).
-pub(crate) fn pdeath_signals(k: &Kernel, children: &[Tid]) -> Vec<(Tid, Signal)> {
-    let mut out = Vec::new();
-    for c in children {
-        let Some(g) = k.groups.get(c) else {
-            continue;
+impl ExeFile {
+    /// The just-executed program `file` (inode `ino` in the store). `walked` is the node and the
+    /// last directory entry obtained by walking the path at execution again ([`Vfs::walk`]); when
+    /// that fails (executing a deleted file through an fd), the opened node `opened` is used
+    /// (absent when a script was executed: the program is the interpreter). When a deleted program
+    /// is executed through another process's exe ([`crate::pseudo::PseudoNode::OpenExe`]), the
+    /// mount and inode are taken over from that process's `from`.
+    pub(crate) fn new(
+        path: Rc<[u8]>,
+        walked: Option<(Node, Option<Dentry>)>,
+        opened: Option<&Node>,
+        from: Option<&ExeFile>,
+        ino: Option<Ino>,
+        file: &Executable,
+    ) -> ExeFile {
+        let (node, dentry) = match (walked, opened, from) {
+            (Some((Node::Store(mnt, i), found)), ..) if Some(i) == ino => (Some((mnt, i)), found),
+            (Some((Node::Pseudo(..), found)), _, Some(from)) => (from.node, found),
+            (_, Some(&Node::Store(mnt, i)), _) if Some(i) == ino => (Some((mnt, i)), None),
+            (_, Some(Node::Pseudo(..)), Some(from)) => (from.node, from.dentry.clone()),
+            _ => (None, None),
         };
-        for t in &g.borrow().threads {
-            if let Some(sig) = k.tasks.get(t).and_then(|t| Signal::new(t.pdeathsig.get())) {
-                out.push((*c, sig));
-            }
+        ExeFile {
+            path,
+            node,
+            dentry,
+            host: file.host(),
         }
     }
-    out
 }
 
-/// Sends the [`pdeath_signals`] signals: as on Linux they are `SI_USER`, the sender is the parent
-/// process `parent` (whose real user ID is `ruid`), its pid is 0 when the child's pid namespace
-/// cannot see it, and they are handled as forced signals.
-pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, ruid: u32) {
-    for (c, sig) in signals {
-        let Some(g) = k.groups.get(&c) else {
-            continue;
-        };
-        let uid = g.borrow().cred.uid_out(ruid);
-        let info = SigInfo::kill(signal::code::SI_USER, k.pid_seen_by(c, parent), uid).from(parent);
-        signal::send_to_group(k, c, sig, info);
+/// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
+/// `/proc/<pid>/exe`): opened through the recorded host file, with the same checks as
+/// [`open_node`].
+pub(crate) fn open_exe_file(
+    vfs: &Vfs,
+    cred: &Cred,
+    exe: &ExeFile,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+        return Err(Errno::ENOENT);
+    };
+    let st = vfs.store().stat_open(ino, host)?;
+    if st.kind() != mode::S_IFREG {
+        return Err(Errno::EACCES);
     }
+    cred.permission(&st, MAY_EXEC)?;
+    let flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    let file = host
+        .try_clone()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok((Executable::open(file)?, st, nosuid))
 }
+
+/// Executing through an open file (fexecve, execveat's `AT_EMPTY_PATH`, `/proc/<pid>/fd/<n>`):
+/// uses its host file, because the objects of deleted files and of memfds are gone and cannot be
+/// opened by inode. The checks are the same as [`open_node`], with noexec and nosuid taken from
+/// the mount it was opened through (a memfd goes through no mount). A file that is not regular
+/// is EACCES.
+pub(crate) fn open_open_file(
+    vfs: &Vfs,
+    cred: &Cred,
+    f: &crate::fd::OpenFile,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let crate::fd::FileKind::Regular { ino, file } = &f.kind else {
+        return Err(Errno::EACCES);
+    };
+    let st = vfs.store().stat_open(*ino, file)?;
+    if st.kind() != mode::S_IFREG {
+        return Err(Errno::EACCES);
+    }
+    cred.permission(&st, MAY_EXEC)?;
+    let flags = if f.pseudo {
+        0
+    } else {
+        vfs.mount_flags(&Node::Store(f.mnt, *ino)).unwrap_or(0)
+    };
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    let file = file
+        .try_clone()
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok((Executable::open(file)?, st, nosuid))
+}
+
+/// [`open_executable`], keeping only the file itself.
+pub(crate) fn read_executable(
+    vfs: &Vfs,
+    ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
+    cwd: &Node,
+    path: &[u8],
+) -> Result<Executable, Errno> {
+    open_executable(vfs, ps, cred, root, cwd, path).map(|(file, ..)| file)
+}
+
+/// Opens a guest file by the rules of execve: it must be a regular file in the store, and a
+/// process with credentials `cred` must have execute permission. Also returns the file's
+/// metadata (setuid and setgid bits).
+pub(crate) fn open_executable(
+    vfs: &Vfs,
+    ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
+    cwd: &Node,
+    path: &[u8],
+) -> Result<(Executable, Stat, bool), Errno> {
+    open_node(vfs, cred, &vfs.resolve(ps, cred, root, cwd, path, true)?)
+}
+
+/// Opens the file `node` to execute (a path or fd execveat has already resolved). An unfollowed
+/// symbolic link is ELOOP (`AT_SYMLINK_NOFOLLOW`), and one on a noexec mount is EACCES (Linux's
+/// `path_noexec`). The third item is whether it is on a nosuid mount: setuid and setgid bits and
+/// file capabilities then have no effect.
+pub(crate) fn open_node(
+    vfs: &Vfs,
+    cred: &Cred,
+    node: &Node,
+) -> Result<(Executable, Stat, bool), Errno> {
+    let Node::Store(_, ino) = *node else {
+        return Err(Errno::EACCES);
+    };
+    let st = vfs.store().stat(ino)?;
+    match st.kind() {
+        mode::S_IFREG => {}
+        mode::S_IFLNK => return Err(Errno::ELOOP),
+        _ => return Err(Errno::EACCES),
+    }
+    cred.permission(&st, MAY_EXEC)?;
+    let flags = vfs.mount_flags(node).unwrap_or(0);
+    if flags & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
+    Ok((vfs.executable(ino)?, st, nosuid))
+}
+
+/// The last component of a program path, truncated to 15 bytes (`comm`).
+pub(crate) fn comm_of(path: &[u8]) -> [u8; 16] {
+    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let n = name.len().min(15);
+    let mut comm = [0u8; 16];
+    comm[..n].copy_from_slice(&name[..n]);
+    comm
+}
+
+// ---- Exit and reaping ----
 
 /// Thread `from` in process `parent` exited: the children it created get thread `to` of the same
 /// process as their parent thread, and move to the end of the child list (Linux's
@@ -796,6 +929,92 @@ fn find_subreaper(k: &Kernel, group: &ThreadGroup) -> Option<Tid> {
     None
 }
 
+/// The first thread of process `g` that is alive and not being ended (Linux's
+/// `find_alive_thread`, leader first); the first thread when all are being ended, and `tgid`
+/// when there are no threads. It becomes the parent thread when orphans are reparented to a
+/// process.
+pub(crate) fn alive_thread(k: &Kernel, g: &ThreadGroup) -> Tid {
+    g.threads
+        .iter()
+        .copied()
+        .find(|t| k.tasks.get(t).is_some_and(|t| !t.killed.get()))
+        .or_else(|| g.threads.first().copied())
+        .unwrap_or(g.tgid)
+}
+
+/// The signals that the threads with `PR_SET_PDEATHSIG` in the child processes `children` should
+/// each receive because their parent thread exited (Linux's `forget_original_parent`: one per such
+/// thread, sent to its process).
+pub(crate) fn pdeath_signals(k: &Kernel, children: &[Tid]) -> Vec<(Tid, Signal)> {
+    let mut out = Vec::new();
+    for c in children {
+        let Some(g) = k.groups.get(c) else {
+            continue;
+        };
+        for t in &g.borrow().threads {
+            if let Some(sig) = k.tasks.get(t).and_then(|t| Signal::new(t.pdeathsig.get())) {
+                out.push((*c, sig));
+            }
+        }
+    }
+    out
+}
+
+/// Sends the [`pdeath_signals`] signals: as on Linux they are `SI_USER`, the sender is the parent
+/// process `parent` (whose real user ID is `ruid`), its pid is 0 when the child's pid namespace
+/// cannot see it, and they are handled as forced signals.
+pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, ruid: u32) {
+    for (c, sig) in signals {
+        let Some(g) = k.groups.get(&c) else {
+            continue;
+        };
+        let uid = g.borrow().cred.uid_out(ruid);
+        let info = SigInfo::kill(signal::code::SI_USER, k.pid_seen_by(c, parent), uid).from(parent);
+        signal::send_to_group(k, c, sig, info);
+    }
+}
+
+/// The session leader exits: the controlling terminal no longer belongs to this session, and the
+/// foreground process group gets SIGHUP and SIGCONT (Linux's `disassociate_ctty`). If the
+/// controlling terminal has already hung up, they go to the foreground process group at hangup:
+/// when a tmux window is closed, a command started by `sh -c` is in the same process group as an
+/// sh that does not exec (dash), and when the group leader sh gets SIGHUP and exits, they get
+/// SIGHUP.
+fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let (tgid, sid, ctty, old_pgrp) = {
+        let mut g = group.borrow_mut();
+        (g.tgid, g.sid, g.ctty.clone(), g.tty_old_pgrp.take())
+    };
+    if sid != tgid {
+        return;
+    }
+    let Some(tty) = ctty else {
+        if let Some(pgrp) = old_pgrp {
+            signal::send_to_pgrp(k, pgrp, Signal::HUP, SigInfo::kernel());
+            signal::send_to_pgrp(k, pgrp, Signal::CONT, SigInfo::kernel());
+        }
+        return;
+    };
+    let fg = {
+        let mut t = tty.borrow_mut();
+        if t.session != Some(sid) {
+            return;
+        }
+        t.session = None;
+        t.fg.take()
+    };
+    for g in k.groups.values() {
+        let mut g = g.borrow_mut();
+        if g.sid == sid {
+            g.ctty = None;
+        }
+    }
+    if let Some(fg) = fg {
+        signal::send_to_pgrp(k, fg, Signal::HUP, SigInfo::kernel());
+        signal::send_to_pgrp(k, fg, Signal::CONT, SigInfo::kernel());
+    }
+}
+
 /// The second half of [`finish_group`]: reporting to the tracer and the parent. Pid 1 of a pid
 /// namespace does this half only once the other processes in the namespace have all been reaped
 /// ([`Kernel::release_pid`]).
@@ -853,6 +1072,14 @@ pub(crate) fn finish_reported(
     finished(k, tgid);
 }
 
+/// Process `tgid` has ended: wakes the threads waiting for children, and the host too if it is
+/// waiting for it. The other waiters need not wake: the changes they care about (closing files,
+/// semaphore undo, sending signals) each request their own wake-ups.
+fn finished(k: &Kernel, tgid: Tid) {
+    let watched = k.watched.contains_key(&tgid);
+    request_wake_on(wake::CHILD | if watched { wake::WATCHED } else { 0 });
+}
+
 /// Step `n`, `what`, of [`finish_group`]: contains kernel-layer bugs, reports on an error and
 /// returns None.
 fn step<R>(
@@ -872,14 +1099,6 @@ fn step<R>(
         ));
     }
     r
-}
-
-/// Process `tgid` has ended: wakes the threads waiting for children, and the host too if it is
-/// waiting for it. The other waiters need not wake: the changes they care about (closing files,
-/// semaphore undo, sending signals) each request their own wake-ups.
-fn finished(k: &Kernel, tgid: Tid) {
-    let watched = k.watched.contains_key(&tgid);
-    request_wake_on(wake::CHILD | if watched { wake::WATCHED } else { 0 });
 }
 
 /// The tracer has taken the ended process `group` (or exited without taking it): hands it to the
@@ -927,219 +1146,4 @@ fn hand_to_parent(
             signal::send_to_group(k, ppid, sig, info);
         }
     }
-}
-
-/// The session leader exits: the controlling terminal no longer belongs to this session, and the
-/// foreground process group gets SIGHUP and SIGCONT (Linux's `disassociate_ctty`). If the
-/// controlling terminal has already hung up, they go to the foreground process group at hangup:
-/// when a tmux window is closed, a command started by `sh -c` is in the same process group as an
-/// sh that does not exec (dash), and when the group leader sh gets SIGHUP and exits, they get
-/// SIGHUP.
-fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let (tgid, sid, ctty, old_pgrp) = {
-        let mut g = group.borrow_mut();
-        (g.tgid, g.sid, g.ctty.clone(), g.tty_old_pgrp.take())
-    };
-    if sid != tgid {
-        return;
-    }
-    let Some(tty) = ctty else {
-        if let Some(pgrp) = old_pgrp {
-            signal::send_to_pgrp(k, pgrp, Signal::HUP, SigInfo::kernel());
-            signal::send_to_pgrp(k, pgrp, Signal::CONT, SigInfo::kernel());
-        }
-        return;
-    };
-    let fg = {
-        let mut t = tty.borrow_mut();
-        if t.session != Some(sid) {
-            return;
-        }
-        t.session = None;
-        t.fg.take()
-    };
-    for g in k.groups.values() {
-        let mut g = g.borrow_mut();
-        if g.sid == sid {
-            g.ctty = None;
-        }
-    }
-    if let Some(fg) = fg {
-        signal::send_to_pgrp(k, fg, Signal::HUP, SigInfo::kernel());
-        signal::send_to_pgrp(k, fg, Signal::CONT, SigInfo::kernel());
-    }
-}
-
-/// The program file a process is executing (Linux's `mm->exe_file`): reading `/proc/<pid>/exe`
-/// gives its path, and following it leads straight to this file without resolving the path
-/// again. After the program file is renamed, deleted or replaced (dpkg upgrades replace running
-/// programs with rename), what is opened or executed through exe is still the original. Shared
-/// by fork, replaced by execve.
-pub struct ExeFile {
-    /// The absolute path at execution, with all symbolic links resolved: musl expands the main
-    /// program's `$ORIGIN` from it, and programs started through a link such as /usr/bin/java rely
-    /// on it to find their libraries.
-    pub path: Rc<[u8]>,
-    /// The mount passed through and the inode in the store; None for a host file used in
-    /// development (no store), which is followed by path.
-    pub node: Option<(MountId, Ino)>,
-    /// The last directory passed through and the name: the path of a program executed through exe
-    /// is computed from it ([`Pseudo::follow_dentry`]).
-    pub dentry: Option<Dentry>,
-    /// The open host file (the object in the store): after the program file is deleted the object
-    /// is deleted too, and reopening or executing relies on it ([`open_exe_file`]).
-    pub host: Option<Arc<File>>,
-}
-
-impl ExeFile {
-    /// The just-executed program `file` (inode `ino` in the store). `walked` is the node and the
-    /// last directory entry obtained by walking the path at execution again ([`Vfs::walk`]); when
-    /// that fails (executing a deleted file through an fd), the opened node `opened` is used
-    /// (absent when a script was executed: the program is the interpreter). When a deleted program
-    /// is executed through another process's exe ([`crate::pseudo::PseudoNode::OpenExe`]), the
-    /// mount and inode are taken over from that process's `from`.
-    pub(crate) fn new(
-        path: Rc<[u8]>,
-        walked: Option<(Node, Option<Dentry>)>,
-        opened: Option<&Node>,
-        from: Option<&ExeFile>,
-        ino: Option<Ino>,
-        file: &Executable,
-    ) -> ExeFile {
-        let (node, dentry) = match (walked, opened, from) {
-            (Some((Node::Store(mnt, i), found)), ..) if Some(i) == ino => (Some((mnt, i)), found),
-            (Some((Node::Pseudo(..), found)), _, Some(from)) => (from.node, found),
-            (_, Some(&Node::Store(mnt, i)), _) if Some(i) == ino => (Some((mnt, i)), None),
-            (_, Some(Node::Pseudo(..)), Some(from)) => (from.node, from.dentry.clone()),
-            _ => (None, None),
-        };
-        ExeFile {
-            path,
-            node,
-            dentry,
-            host: file.host(),
-        }
-    }
-}
-
-/// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
-/// `/proc/<pid>/exe`): opened through the recorded host file, with the same checks as
-/// [`open_node`].
-pub(crate) fn open_exe_file(
-    vfs: &Vfs,
-    cred: &Cred,
-    exe: &ExeFile,
-) -> Result<(Executable, Stat, bool), Errno> {
-    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
-        return Err(Errno::ENOENT);
-    };
-    let st = vfs.store().stat_open(ino, host)?;
-    if st.kind() != mode::S_IFREG {
-        return Err(Errno::EACCES);
-    }
-    cred.permission(&st, MAY_EXEC)?;
-    let flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
-    if flags & crate::vfs::ms::NOEXEC != 0 {
-        return Err(Errno::EACCES);
-    }
-    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
-    let file = host
-        .try_clone()
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    Ok((Executable::open(file)?, st, nosuid))
-}
-
-/// Executing through an open file (fexecve, execveat's `AT_EMPTY_PATH`, `/proc/<pid>/fd/<n>`):
-/// uses its host file, because the objects of deleted files and of memfds are gone and cannot be
-/// opened by inode. The checks are the same as [`open_node`], with noexec and nosuid taken from
-/// the mount it was opened through (a memfd goes through no mount). A file that is not regular
-/// is EACCES.
-pub(crate) fn open_open_file(
-    vfs: &Vfs,
-    cred: &Cred,
-    f: &crate::fd::OpenFile,
-) -> Result<(Executable, Stat, bool), Errno> {
-    let crate::fd::FileKind::Regular { ino, file } = &f.kind else {
-        return Err(Errno::EACCES);
-    };
-    let st = vfs.store().stat_open(*ino, file)?;
-    if st.kind() != mode::S_IFREG {
-        return Err(Errno::EACCES);
-    }
-    cred.permission(&st, MAY_EXEC)?;
-    let flags = if f.pseudo {
-        0
-    } else {
-        vfs.mount_flags(&Node::Store(f.mnt, *ino)).unwrap_or(0)
-    };
-    if flags & crate::vfs::ms::NOEXEC != 0 {
-        return Err(Errno::EACCES);
-    }
-    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
-    let file = file
-        .try_clone()
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-    Ok((Executable::open(file)?, st, nosuid))
-}
-
-/// Opens a guest file by the rules of execve: it must be a regular file in the store, and a
-/// process with credentials `cred` must have execute permission. Also returns the file's
-/// metadata (setuid and setgid bits).
-pub(crate) fn open_executable(
-    vfs: &Vfs,
-    ps: &dyn Pseudo,
-    cred: &Cred,
-    root: &Node,
-    cwd: &Node,
-    path: &[u8],
-) -> Result<(Executable, Stat, bool), Errno> {
-    open_node(vfs, cred, &vfs.resolve(ps, cred, root, cwd, path, true)?)
-}
-
-/// Opens the file `node` to execute (a path or fd execveat has already resolved). An unfollowed
-/// symbolic link is ELOOP (`AT_SYMLINK_NOFOLLOW`), and one on a noexec mount is EACCES (Linux's
-/// `path_noexec`). The third item is whether it is on a nosuid mount: setuid and setgid bits and
-/// file capabilities then have no effect.
-pub(crate) fn open_node(
-    vfs: &Vfs,
-    cred: &Cred,
-    node: &Node,
-) -> Result<(Executable, Stat, bool), Errno> {
-    let Node::Store(_, ino) = *node else {
-        return Err(Errno::EACCES);
-    };
-    let st = vfs.store().stat(ino)?;
-    match st.kind() {
-        mode::S_IFREG => {}
-        mode::S_IFLNK => return Err(Errno::ELOOP),
-        _ => return Err(Errno::EACCES),
-    }
-    cred.permission(&st, MAY_EXEC)?;
-    let flags = vfs.mount_flags(node).unwrap_or(0);
-    if flags & crate::vfs::ms::NOEXEC != 0 {
-        return Err(Errno::EACCES);
-    }
-    let nosuid = flags & crate::vfs::ms::NOSUID != 0;
-    Ok((vfs.executable(ino)?, st, nosuid))
-}
-
-/// [`open_executable`], keeping only the file itself.
-pub(crate) fn read_executable(
-    vfs: &Vfs,
-    ps: &dyn Pseudo,
-    cred: &Cred,
-    root: &Node,
-    cwd: &Node,
-    path: &[u8],
-) -> Result<Executable, Errno> {
-    open_executable(vfs, ps, cred, root, cwd, path).map(|(file, ..)| file)
-}
-
-/// The last component of a program path, truncated to 15 bytes (`comm`).
-pub(crate) fn comm_of(path: &[u8]) -> [u8; 16] {
-    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
-    let n = name.len().min(15);
-    let mut comm = [0u8; 16];
-    comm[..n].copy_from_slice(&name[..n]);
-    comm
 }

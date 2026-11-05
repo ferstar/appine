@@ -113,6 +113,9 @@ pub(crate) mod wake {
 /// next thread that releases any BKL. Normal requests are recorded per thread ([`PENDING`]).
 static WAKE: AtomicU32 = AtomicU32::new(0);
 
+/// Objects requested to be woken without the BKL (the fallback of [`WAKE`]).
+static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
+
 thread_local! {
     /// Events to signal, recorded while holding the BKL ([`signal_later`]).
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
@@ -132,82 +135,7 @@ thread_local! {
         const { std::cell::RefCell::new((0, Vec::new())) };
 }
 
-/// Records a wake request ([`request_wake`] and the like): on this thread while holding the BKL,
-/// otherwise (which should not happen) in the global fallback.
-fn note_wake(channels: u32, object: Option<wake::Object>) {
-    if HELD.get() != 0 {
-        PENDING.with_borrow_mut(|(c, objects)| {
-            *c |= channels;
-            if let Some(o) = object
-                && !objects.contains(&o)
-            {
-                objects.push(o);
-            }
-        });
-        return;
-    }
-    if let Some(o) = object {
-        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
-        if !objects.contains(&o) {
-            objects.push(o);
-        }
-    }
-    WAKE.fetch_or(channels, Ordering::Relaxed);
-}
-
-/// Whether the current thread holds the BKL.
-pub(crate) fn bkl_held() -> bool {
-    HELD.get() != 0
-}
-
-/// Which kernel's BKL the current thread holds ([`Shared::id`]), 0 meaning none. Used only by
-/// checking builds ([`crate::vfs::store::Store::guard_with_bkl`]).
-#[cfg(any(debug_assertions, feature = "borrow-check"))]
-pub(crate) fn bkl_holder() -> usize {
-    HELD.get()
-}
-
-/// Signals `event` only after the BKL is released. The woken thread will take the BKL right away:
-/// woken before the release, it would only go back to sleep waiting for the lock, and would need
-/// waking once more when this side releases it (every time a shell waits for a child). The caller
-/// holds the BKL.
-pub(crate) fn signal_later(event: &Arc<Event>) {
-    SIGNALS.with_borrow_mut(|s| {
-        if !s.iter().any(|e| Arc::ptr_eq(e, event)) {
-            s.push(event.clone());
-        }
-    });
-}
-
-/// Objects requested to be woken without the BKL (the fallback of [`WAKE`]).
-static WAKE_OBJECTS: Mutex<Vec<wake::Object>> = Mutex::new(Vec::new());
-
-/// Requests that all waiting threads be woken when the BKL is released. The caller holds the BKL.
-pub(crate) fn request_wake() {
-    note_wake(wake::ALL, None);
-}
-
-/// A file lock, lease or open-file position lock was released or changed: wakes only the waiters
-/// interested in [`wake::LOCK`]. The caller holds the BKL.
-pub(crate) fn request_wake_locks() {
-    request_wake_on(wake::LOCK);
-}
-
-/// Requests that, when the BKL is released, the waiters interested in any channel in `channels`
-/// ([`wake`]) be woken. The caller holds the BKL.
-pub(crate) fn request_wake_on(channels: u32) {
-    note_wake(channels, None);
-}
-
-/// A change that affects only object `object` (data in a pipe, an eventfd's count, a PTY's input
-/// and output, messages in an AF_UNIX channel...): wakes only the waiters that registered this
-/// object ([`Cx::wait_object`], [`Cx::wait_objects`]), plus [`wake::FILE`] waiters that named no
-/// objects. Every pipe read or write of a shell used to wake the processes reading other pipes
-/// (the shell outside `$(...)`, `tail`), and poll and epoll waiters were also woken by every such
-/// change. The caller holds the BKL.
-pub(crate) fn request_wake_object(object: wake::Object) {
-    note_wake(wake::OBJECTS, Some(object));
-}
+// ---- Global state ----
 
 /// A waiting thread: its event, the channels it is interested in ([`wake`]) and the objects it
 /// waits on (sorted; with None, a change on any object wakes it). One epoll may watch thousands
@@ -475,18 +403,6 @@ impl Kernel {
         }
     }
 
-    /// Allocates a tid not taken by a thread or a thread group (zombies included).
-    pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
-        for _ in 0..PID_MAX {
-            let tid = self.next_tid;
-            self.next_tid = if tid >= PID_MAX { INIT + 1 } else { tid + 1 };
-            if !self.tasks.contains_key(&tid) && !self.groups.contains_key(&tid) {
-                return Ok(tid);
-            }
-        }
-        Err(Errno::EAGAIN)
-    }
-
     /// Chooses the global number for a new thread or process in pid namespace `ns` (the checking
     /// part of Linux's `alloc_pid`). `set_tid` holds the numbers clone3 specified for each level,
     /// from the level of `ns` outwards: there may not be more levels than `ns` has; each number
@@ -527,6 +443,18 @@ impl Kernel {
             Some(&tid) => Ok(tid),
             None => self.alloc_tid(),
         }
+    }
+
+    /// Allocates a tid not taken by a thread or a thread group (zombies included).
+    pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
+        for _ in 0..PID_MAX {
+            let tid = self.next_tid;
+            self.next_tid = if tid >= PID_MAX { INIT + 1 } else { tid + 1 };
+            if !self.tasks.contains_key(&tid) && !self.groups.contains_key(&tid) {
+                return Ok(tid);
+            }
+        }
+        Err(Errno::EAGAIN)
     }
 
     /// Creates an empty IPC namespace owned by user namespace `owner` (Linux's `create_ipc_ns`:
@@ -661,17 +589,17 @@ impl Kernel {
         self.held_reapers.push((ns, group, pgrps));
     }
 
+    /// The number of global number `g` in the pid namespace of process `viewer`, 0 when it cannot
+    /// be seen.
+    pub fn pid_seen_by(&self, viewer: Tid, g: Tid) -> Tid {
+        self.pid_ns_of(viewer).vnr(g).unwrap_or(0)
+    }
+
     /// The pid namespace that process `tgid` is in.
     pub fn pid_ns_of(&self, tgid: Tid) -> Rc<crate::pidns::PidNs> {
         self.groups
             .get(&tgid)
             .map_or_else(crate::pidns::PidNs::init, |g| g.borrow().pid_ns.clone())
-    }
-
-    /// The number of global number `g` in the pid namespace of process `viewer`, 0 when it cannot
-    /// be seen.
-    pub fn pid_seen_by(&self, viewer: Tid, g: Tid) -> Tid {
-        self.pid_ns_of(viewer).vnr(g).unwrap_or(0)
     }
 
     /// The last allocated tid (`/proc/sys/kernel/ns_last_pid`).
@@ -736,24 +664,14 @@ impl Kernel {
     }
 }
 
+// ---- The BKL ----
+
 /// How long at most to spin when taking the BKL ([`Shared::lock`]). It used to spin 100 times
 /// (under 1 µs), and with four processes starting processes at once the total throughput was lower
 /// than with one: as soon as the holder released the lock, the waiters had all gone to sleep, and
 /// the lock stayed free while they were being woken. Anything from 10 to 60 µs is about the same;
 /// with longer spins the spinning threads take the holder's core instead.
 const BKL_SPIN: std::time::Duration = std::time::Duration::from_micros(30);
-
-/// The most threads waiting for the BKL that spin at once ([`Shared::lock`]); the rest go straight
-/// to sleep: half the host CPUs, 1 to 4. It used to let only one spin; with 8 processes starting
-/// processes at once on 8 cores the lock almost always had waiters, and as soon as the spinning one
-/// got the lock, the next handover could only wake a sleeper, with the lock free while it woke
-/// (30% of the time). Letting 4 spin makes concurrent exec 7–10% faster and pipelines 13% faster,
-/// using 18% more CPU; go build and Maven are unchanged. More is not faster; the spinning threads
-/// would take the holder's core instead.
-fn max_spinners() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
-}
 
 /// DNS stub answers resolved by host threads: (query number, answer message)
 /// ([`Shared::dns_answers`]).
@@ -789,13 +707,6 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    /// Distinguishes the kernels in one host process (in tests, when the app switches kernels):
-    /// [`bkl_holder`] uses it to tell which BKL is held. It is the address of [`Shared::held`],
-    /// which does not change while Shared lives and is never 0.
-    pub fn id(&self) -> usize {
-        &self.held as *const AtomicBool as usize
-    }
-
     pub fn new(kernel: Kernel) -> Shared {
         Shared {
             kernel: Mutex::new(kernel),
@@ -806,33 +717,6 @@ impl Shared {
             checks_idle: AtomicBool::new(false),
             fast: AtomicU64::new(0),
             futexes: Mutex::new(Futexes::default()),
-        }
-    }
-
-    /// The state threads recorded for no-BKL syscalls (`syscall::fast`) may be stale: some
-    /// thread's root directory, current directory or credentials changed. Called while holding
-    /// the BKL.
-    pub fn fast_changed(&self) {
-        self.fast.fetch_add(1, Ordering::Release);
-    }
-
-    /// The number of [`Shared::fast_changed`] calls.
-    pub fn fast_epoch(&self) -> u64 {
-        self.fast.load(Ordering::Acquire)
-    }
-
-    /// The futex wait queue ([`Shared::futexes`]).
-    pub fn futexes(&self) -> MutexGuard<'_, Futexes> {
-        self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The thread is about to go on running guest code: wakes the timer thread if the periodic
-    /// checks are stopped. Does not need the BKL.
-    pub fn resume_checks(&self) {
-        if self.checks_idle.load(Ordering::Relaxed)
-            && self.checks_idle.swap(false, Ordering::Relaxed)
-        {
-            self.timers.signal();
         }
     }
 
@@ -892,6 +776,40 @@ impl Shared {
         self.spinning.fetch_sub(1, Ordering::Release);
         None
     }
+
+    /// Distinguishes the kernels in one host process (in tests, when the app switches kernels):
+    /// [`bkl_holder`] uses it to tell which BKL is held. It is the address of [`Shared::held`],
+    /// which does not change while Shared lives and is never 0.
+    pub fn id(&self) -> usize {
+        &self.held as *const AtomicBool as usize
+    }
+
+    /// The state threads recorded for no-BKL syscalls (`syscall::fast`) may be stale: some
+    /// thread's root directory, current directory or credentials changed. Called while holding
+    /// the BKL.
+    pub fn fast_changed(&self) {
+        self.fast.fetch_add(1, Ordering::Release);
+    }
+
+    /// The number of [`Shared::fast_changed`] calls.
+    pub fn fast_epoch(&self) -> u64 {
+        self.fast.load(Ordering::Acquire)
+    }
+
+    /// The futex wait queue ([`Shared::futexes`]).
+    pub fn futexes(&self) -> MutexGuard<'_, Futexes> {
+        self.futexes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The thread is about to go on running guest code: wakes the timer thread if the periodic
+    /// checks are stopped. Does not need the BKL.
+    pub fn resume_checks(&self) {
+        if self.checks_idle.load(Ordering::Relaxed)
+            && self.checks_idle.swap(false, Ordering::Relaxed)
+        {
+            self.timers.signal();
+        }
+    }
 }
 
 /// Proof of holding the BKL; on release it wakes the waiting threads, then returns to the host
@@ -940,70 +858,36 @@ impl Drop for Bkl<'_> {
     }
 }
 
+/// The most threads waiting for the BKL that spin at once ([`Shared::lock`]); the rest go straight
+/// to sleep: half the host CPUs, 1 to 4. It used to let only one spin; with 8 processes starting
+/// processes at once on 8 cores the lock almost always had waiters, and as soon as the spinning one
+/// got the lock, the next handover could only wake a sleeper, with the lock free while it woke
+/// (30% of the time). Letting 4 spin makes concurrent exec 7–10% faster and pipelines 13% faster,
+/// using 18% more CPU; go build and Maven are unchanged. More is not faster; the spinning threads
+/// would take the holder's core instead.
+fn max_spinners() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
+}
+
 /// Signals the events collected by [`signal_later`].
 pub(crate) fn flush_signals() {
     SIGNALS.with_borrow_mut(|s| s.drain(..).for_each(|e| e.signal()));
 }
 
-/// Releases the BKL and waits: re-takes the BKL and returns when the event is signalled
-/// ([`request_wake`], signals), a host fd in `host` becomes ready, or `deadline` is reached. The
-/// caller re-checks its own condition. `interest` is the channels of interest ([`wake`]); when it
-/// is 0 the waiter is not put on the list [`request_wake`] wakes, and wakes only when `event` is
-/// signalled directly (futex).
-pub(crate) fn block<'a>(
-    shared: &'a Shared,
-    k: Bkl<'a>,
-    event: &Arc<Event>,
-    deadline: Option<Instant>,
-    host: &mut [(i32, i16, i16)],
-    interest: u32,
-) -> (Bkl<'a>, Result<(), Errno>) {
-    block_for(shared, k, event, deadline, host, interest, None)
+/// Whether the current thread holds the BKL.
+pub(crate) fn bkl_held() -> bool {
+    HELD.get() != 0
 }
 
-/// [`block`]; when `objects` is not None, changes that affect only other objects
-/// ([`request_wake_object`]) do not wake it.
-pub(crate) fn block_for<'a>(
-    shared: &'a Shared,
-    mut k: Bkl<'a>,
-    event: &Arc<Event>,
-    deadline: Option<Instant>,
-    host: &mut [(i32, i16, i16)],
-    interest: u32,
-    objects: Option<&[wake::Object]>,
-) -> (Bkl<'a>, Result<(), Errno>) {
-    const POLLIN: i16 = 1;
-    crate::cell::assert_none_held();
-    let listed = interest != 0;
-    if listed {
-        let objects = objects.map(|o| {
-            let mut o = Box::<[wake::Object]>::from(o);
-            o.sort_unstable();
-            o
-        });
-        k.waiters.push((event.clone(), interest, objects));
-    }
-    drop(k);
-    let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-    let mut fds: Vec<(i32, i16, i16)> = host.iter().map(|&(fd, ev, _)| (fd, ev, 0)).collect();
-    fds.push((event.fd(), POLLIN, 0));
-    let r = appine_hal::poll(&mut fds, timeout);
-    let mut k = shared.lock();
-    event.clear();
-    if listed {
-        k.waiters.retain(|(e, ..)| !Arc::ptr_eq(e, event));
-    }
-    for (h, f) in host.iter_mut().zip(&fds) {
-        h.2 = f.2;
-    }
-    let r = match r {
-        Ok(_) => Ok(()),
-        // A host signal interrupted poll (a debugger, say): treat it as an ordinary wake-up
-        Err(e) if e == Errno::EINTR.0 => Ok(()),
-        Err(e) => Err(Errno(e)),
-    };
-    (k, r)
+/// Which kernel's BKL the current thread holds ([`Shared::id`]), 0 meaning none. Used only by
+/// checking builds ([`crate::vfs::store::Store::guard_with_bkl`]).
+#[cfg(any(debug_assertions, feature = "borrow-check"))]
+pub(crate) fn bkl_holder() -> usize {
+    HELD.get()
 }
+
+// ---- Syscall context ----
 
 /// The context of one entry into the kernel (syscall, signal delivery): the proof of holding the
 /// BKL, and the current thread.
@@ -1318,6 +1202,130 @@ impl Drop for Relock<'_, '_> {
         }
         self.0.task.sleeping.store(false, Ordering::Relaxed);
     }
+}
+
+// ---- Waiting and waking ----
+
+/// Releases the BKL and waits: re-takes the BKL and returns when the event is signalled
+/// ([`request_wake`], signals), a host fd in `host` becomes ready, or `deadline` is reached. The
+/// caller re-checks its own condition. `interest` is the channels of interest ([`wake`]); when it
+/// is 0 the waiter is not put on the list [`request_wake`] wakes, and wakes only when `event` is
+/// signalled directly (futex).
+pub(crate) fn block<'a>(
+    shared: &'a Shared,
+    k: Bkl<'a>,
+    event: &Arc<Event>,
+    deadline: Option<Instant>,
+    host: &mut [(i32, i16, i16)],
+    interest: u32,
+) -> (Bkl<'a>, Result<(), Errno>) {
+    block_for(shared, k, event, deadline, host, interest, None)
+}
+
+/// [`block`]; when `objects` is not None, changes that affect only other objects
+/// ([`request_wake_object`]) do not wake it.
+pub(crate) fn block_for<'a>(
+    shared: &'a Shared,
+    mut k: Bkl<'a>,
+    event: &Arc<Event>,
+    deadline: Option<Instant>,
+    host: &mut [(i32, i16, i16)],
+    interest: u32,
+    objects: Option<&[wake::Object]>,
+) -> (Bkl<'a>, Result<(), Errno>) {
+    const POLLIN: i16 = 1;
+    crate::cell::assert_none_held();
+    let listed = interest != 0;
+    if listed {
+        let objects = objects.map(|o| {
+            let mut o = Box::<[wake::Object]>::from(o);
+            o.sort_unstable();
+            o
+        });
+        k.waiters.push((event.clone(), interest, objects));
+    }
+    drop(k);
+    let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+    let mut fds: Vec<(i32, i16, i16)> = host.iter().map(|&(fd, ev, _)| (fd, ev, 0)).collect();
+    fds.push((event.fd(), POLLIN, 0));
+    let r = appine_hal::poll(&mut fds, timeout);
+    let mut k = shared.lock();
+    event.clear();
+    if listed {
+        k.waiters.retain(|(e, ..)| !Arc::ptr_eq(e, event));
+    }
+    for (h, f) in host.iter_mut().zip(&fds) {
+        h.2 = f.2;
+    }
+    let r = match r {
+        Ok(_) => Ok(()),
+        // A host signal interrupted poll (a debugger, say): treat it as an ordinary wake-up
+        Err(e) if e == Errno::EINTR.0 => Ok(()),
+        Err(e) => Err(Errno(e)),
+    };
+    (k, r)
+}
+
+/// Requests that all waiting threads be woken when the BKL is released. The caller holds the BKL.
+pub(crate) fn request_wake() {
+    note_wake(wake::ALL, None);
+}
+
+/// A file lock, lease or open-file position lock was released or changed: wakes only the waiters
+/// interested in [`wake::LOCK`]. The caller holds the BKL.
+pub(crate) fn request_wake_locks() {
+    request_wake_on(wake::LOCK);
+}
+
+/// Requests that, when the BKL is released, the waiters interested in any channel in `channels`
+/// ([`wake`]) be woken. The caller holds the BKL.
+pub(crate) fn request_wake_on(channels: u32) {
+    note_wake(channels, None);
+}
+
+/// A change that affects only object `object` (data in a pipe, an eventfd's count, a PTY's input
+/// and output, messages in an AF_UNIX channel...): wakes only the waiters that registered this
+/// object ([`Cx::wait_object`], [`Cx::wait_objects`]), plus [`wake::FILE`] waiters that named no
+/// objects. Every pipe read or write of a shell used to wake the processes reading other pipes
+/// (the shell outside `$(...)`, `tail`), and poll and epoll waiters were also woken by every such
+/// change. The caller holds the BKL.
+pub(crate) fn request_wake_object(object: wake::Object) {
+    note_wake(wake::OBJECTS, Some(object));
+}
+
+/// Records a wake request ([`request_wake`] and the like): on this thread while holding the BKL,
+/// otherwise (which should not happen) in the global fallback.
+fn note_wake(channels: u32, object: Option<wake::Object>) {
+    if HELD.get() != 0 {
+        PENDING.with_borrow_mut(|(c, objects)| {
+            *c |= channels;
+            if let Some(o) = object
+                && !objects.contains(&o)
+            {
+                objects.push(o);
+            }
+        });
+        return;
+    }
+    if let Some(o) = object {
+        let mut objects = WAKE_OBJECTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if !objects.contains(&o) {
+            objects.push(o);
+        }
+    }
+    WAKE.fetch_or(channels, Ordering::Relaxed);
+}
+
+/// Signals `event` only after the BKL is released. The woken thread will take the BKL right away:
+/// woken before the release, it would only go back to sleep waiting for the lock, and would need
+/// waking once more when this side releases it (every time a shell waits for a child). The caller
+/// holds the BKL.
+pub(crate) fn signal_later(event: &Arc<Event>) {
+    SIGNALS.with_borrow_mut(|s| {
+        if !s.iter().any(|e| Arc::ptr_eq(e, event)) {
+            s.push(event.clone());
+        }
+    });
 }
 
 #[cfg(test)]

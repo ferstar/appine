@@ -73,6 +73,81 @@ impl PidNs {
         })
     }
 
+    /// A new thread or process `g` in namespace `ns`: allocates a number in it and in every
+    /// ancestor (except the boot namespace); `set_tid` is what clone3 specified, from the level of
+    /// `ns` outwards (already checked, see [`crate::kernel::Kernel::choose_pid`]). The process
+    /// numbered 1 is the namespace's reaper; after the reaper exits this is ENOMEM.
+    pub fn register(ns: &Rc<PidNs>, g: Tid, set_tid: &[Tid]) -> Result<(), Errno> {
+        if ns.dead.get() {
+            return Err(Errno::ENOMEM);
+        }
+        let mut done: Vec<&PidNs> = Vec::new();
+        let mut cur = Some(&**ns);
+        let mut want = set_tid.iter().copied();
+        while let Some(n) = cur.filter(|n| n.level > 0) {
+            match n.alloc(g, want.next()) {
+                Ok(1) if n.reaper.get().is_none() => {
+                    n.reaper.set(Some(g));
+                    done.push(n);
+                }
+                Ok(_) => done.push(n),
+                Err(e) => {
+                    for d in done {
+                        d.release(g);
+                    }
+                    return Err(e);
+                }
+            }
+            cur = n.parent.as_deref();
+        }
+        Ok(())
+    }
+
+    /// Allocates a local number for global number `g`: `want` if given (EEXIST if already in use),
+    /// otherwise an unused one after the last, wrapping to 300 at `PID_MAX` (Linux's
+    /// `RESERVED_PIDS`, `alloc_pid`).
+    fn alloc(&self, g: Tid, want: Option<Tid>) -> Result<Tid, Errno> {
+        let mut global = self.global.borrow_mut();
+        if let Some(l) = want {
+            if global.contains_key(&l) {
+                return Err(Errno::EEXIST);
+            }
+            global.insert(l, g);
+            self.local.borrow_mut().insert(g, l);
+            return Ok(l);
+        }
+        let mut l = self.next.get();
+        for _ in 0..PID_MAX {
+            if l >= PID_MAX {
+                l = RESERVED_PIDS;
+            }
+            if let std::collections::hash_map::Entry::Vacant(e) = global.entry(l) {
+                e.insert(g);
+                self.local.borrow_mut().insert(g, l);
+                self.next.set(l + 1);
+                return Ok(l);
+            }
+            l += 1;
+        }
+        Err(Errno::EAGAIN)
+    }
+
+    /// Global number `g` is no longer used (both thread and zombie are gone): removes it from `ns`
+    /// and its ancestors.
+    pub fn unregister(ns: &PidNs, g: Tid) {
+        let mut cur = Some(ns);
+        while let Some(n) = cur.filter(|n| n.level > 0) {
+            n.release(g);
+            cur = n.parent.as_deref();
+        }
+    }
+
+    fn release(&self, g: Tid) {
+        if let Some(l) = self.local.borrow_mut().remove(&g) {
+            self.global.borrow_mut().remove(&l);
+        }
+    }
+
     /// The number of global number `g` in this namespace; None if not visible here (`pid_nr_ns`).
     pub fn vnr(&self, g: Tid) -> Option<Tid> {
         if self.level == 0 {
@@ -134,81 +209,6 @@ impl PidNs {
     /// The last allocated local number (`/proc/sys/kernel/ns_last_pid`).
     pub fn last_pid(&self) -> Tid {
         self.next.get() - 1
-    }
-
-    /// Allocates a local number for global number `g`: `want` if given (EEXIST if already in use),
-    /// otherwise an unused one after the last, wrapping to 300 at `PID_MAX` (Linux's
-    /// `RESERVED_PIDS`, `alloc_pid`).
-    fn alloc(&self, g: Tid, want: Option<Tid>) -> Result<Tid, Errno> {
-        let mut global = self.global.borrow_mut();
-        if let Some(l) = want {
-            if global.contains_key(&l) {
-                return Err(Errno::EEXIST);
-            }
-            global.insert(l, g);
-            self.local.borrow_mut().insert(g, l);
-            return Ok(l);
-        }
-        let mut l = self.next.get();
-        for _ in 0..PID_MAX {
-            if l >= PID_MAX {
-                l = RESERVED_PIDS;
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) = global.entry(l) {
-                e.insert(g);
-                self.local.borrow_mut().insert(g, l);
-                self.next.set(l + 1);
-                return Ok(l);
-            }
-            l += 1;
-        }
-        Err(Errno::EAGAIN)
-    }
-
-    /// A new thread or process `g` in namespace `ns`: allocates a number in it and in every
-    /// ancestor (except the boot namespace); `set_tid` is what clone3 specified, from the level of
-    /// `ns` outwards (already checked, see [`crate::kernel::Kernel::choose_pid`]). The process
-    /// numbered 1 is the namespace's reaper; after the reaper exits this is ENOMEM.
-    pub fn register(ns: &Rc<PidNs>, g: Tid, set_tid: &[Tid]) -> Result<(), Errno> {
-        if ns.dead.get() {
-            return Err(Errno::ENOMEM);
-        }
-        let mut done: Vec<&PidNs> = Vec::new();
-        let mut cur = Some(&**ns);
-        let mut want = set_tid.iter().copied();
-        while let Some(n) = cur.filter(|n| n.level > 0) {
-            match n.alloc(g, want.next()) {
-                Ok(1) if n.reaper.get().is_none() => {
-                    n.reaper.set(Some(g));
-                    done.push(n);
-                }
-                Ok(_) => done.push(n),
-                Err(e) => {
-                    for d in done {
-                        d.release(g);
-                    }
-                    return Err(e);
-                }
-            }
-            cur = n.parent.as_deref();
-        }
-        Ok(())
-    }
-
-    /// Global number `g` is no longer used (both thread and zombie are gone): removes it from `ns`
-    /// and its ancestors.
-    pub fn unregister(ns: &PidNs, g: Tid) {
-        let mut cur = Some(ns);
-        while let Some(n) = cur.filter(|n| n.level > 0) {
-            n.release(g);
-            cur = n.parent.as_deref();
-        }
-    }
-
-    fn release(&self, g: Tid) {
-        if let Some(l) = self.local.borrow_mut().remove(&g) {
-            self.global.borrow_mut().remove(&l);
-        }
     }
 }
 

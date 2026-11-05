@@ -43,14 +43,44 @@ const SCHED_ATTR_SIZE: usize = 56;
 /// The `SCHED_RR` time slice (Linux's `RR_TIMESLICE`, 100 ms).
 const RR_TIMESLICE_NS: i64 = 100_000_000;
 
-/// Whether the scheduling parameters of a process with credentials `target` may be changed
-/// (`check_same_owner`).
-fn same_owner(cred: &Cred, target: &Cred) -> bool {
-    cred.euid == target.euid || cred.euid == target.ruid || cred.capable(cap::SYS_NICE)
-}
+// ---- Nice values ----
 
 /// One thread that getpriority or setpriority acts on, and its process.
 type Target = (Option<Rc<Task>>, Rc<RefCell<ThreadGroup>>);
+
+pub(super) fn getpriority(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
+    // As Linux's syscall does, return 20 - nice (1–40); libc converts it back
+    let nice = targets(cx, which, who)?
+        .iter()
+        .map(|(t, _)| t.as_ref().map_or(0, |t| t.nice.get()))
+        .min()
+        .unwrap();
+    Ok((20 - nice) as u64)
+}
+
+pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> SysResult {
+    let nice = nice.clamp(-20, 19);
+    let cred = cx.cred();
+    let mut result = Ok(0);
+    for (t, g) in targets(cx, which, who)? {
+        let g = g.borrow();
+        let current = t.as_ref().map_or(0, |t| t.nice.get());
+        // Another's process needs the same effective user ID; raising priority (lowering nice)
+        // must be within the target's RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice)
+        if !same_owner(&cred, &g.cred) {
+            result = Err(Errno::EPERM);
+        } else if nice < current
+            && (20 - nice) as u64 > g.rlimits[RLIMIT_NICE as usize].0
+            && !cred.capable(cap::SYS_NICE)
+        {
+            result = Err(Errno::EACCES);
+        } else if let Some(t) = t {
+            t.nice.set(nice);
+            apply_host(&t);
+        }
+    }
+    result
+}
 
 /// The threads getpriority and setpriority act on (zombies excluded). As on Linux, `PRIO_PROCESS`
 /// is one thread, and `PRIO_PGRP` and `PRIO_USER` are every thread of those processes. The
@@ -111,40 +141,6 @@ fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
     Ok(found)
 }
 
-pub(super) fn getpriority(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
-    // As Linux's syscall does, return 20 - nice (1–40); libc converts it back
-    let nice = targets(cx, which, who)?
-        .iter()
-        .map(|(t, _)| t.as_ref().map_or(0, |t| t.nice.get()))
-        .min()
-        .unwrap();
-    Ok((20 - nice) as u64)
-}
-
-pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> SysResult {
-    let nice = nice.clamp(-20, 19);
-    let cred = cx.cred();
-    let mut result = Ok(0);
-    for (t, g) in targets(cx, which, who)? {
-        let g = g.borrow();
-        let current = t.as_ref().map_or(0, |t| t.nice.get());
-        // Another's process needs the same effective user ID; raising priority (lowering nice)
-        // must be within the target's RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice)
-        if !same_owner(&cred, &g.cred) {
-            result = Err(Errno::EPERM);
-        } else if nice < current
-            && (20 - nice) as u64 > g.rlimits[RLIMIT_NICE as usize].0
-            && !cred.capable(cap::SYS_NICE)
-        {
-            result = Err(Errno::EACCES);
-        } else if let Some(t) = t {
-            t.nice.set(nice);
-            apply_host(&t);
-        }
-    }
-    result
-}
-
 // ---- I/O priority (Linux 6.1's block/ioprio.c, blk-ioc.c) ----
 
 const IOPRIO_WHO_PROCESS: i32 = 1;
@@ -159,12 +155,122 @@ const IOPRIO_CLASS_IDLE: u16 = 3;
 /// The number of RT and BE levels (0 is highest).
 const IOPRIO_NR_LEVELS: u16 = 8;
 
-fn ioprio_class(ioprio: u16) -> u16 {
-    (ioprio >> IOPRIO_CLASS_SHIFT) & 7
+pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> SysResult {
+    let cred = cx.cred();
+    // io_context holds an unsigned short, so the high bits are dropped (the check looks only at
+    // bits 0–15)
+    let ioprio = ioprio as u16;
+    ioprio_check(&cred, ioprio)?;
+    // Linux uses make_kuid(current_user_ns(), who) here: who = 0 is root, not the caller
+    let uid = (which == IOPRIO_WHO_USER)
+        .then(|| cred.uid_in(who as u32))
+        .flatten();
+    for (t, g) in ioprio_targets(cx, which, who, uid)? {
+        // set_task_ioprio: the target's real user ID must equal the caller's effective or real
+        // user ID, or CAP_SYS_NICE is needed; for a process group or user the first failure
+        // returns, with the earlier ones already changed
+        let target = g.borrow().cred.ruid;
+        if target != cred.euid && target != cred.ruid && !cred.capable(cap::SYS_NICE) {
+            return Err(Errno::EPERM);
+        }
+        if let Some(t) = t {
+            set_task_ioprio(cx, &t, ioprio);
+        }
+    }
+    Ok(0)
 }
 
-fn ioprio_value(class: u16, data: u16) -> u16 {
-    (class << IOPRIO_CLASS_SHIFT) | data
+/// Whether the ioprio_set value itself is valid and the caller may set it (`ioprio_check_cap`):
+/// RT needs `CAP_SYS_ADMIN` or `CAP_SYS_NICE`, RT and BE levels are 0–7, the NONE level must be
+/// 0, and the IDLE level is not checked.
+fn ioprio_check(cred: &Cred, ioprio: u16) -> Result<(), Errno> {
+    let data = ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1);
+    match ioprio_class(ioprio) {
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE => {
+            if ioprio_class(ioprio) == IOPRIO_CLASS_RT
+                && !cred.capable(cap::SYS_ADMIN)
+                && !cred.capable(cap::SYS_NICE)
+            {
+                return Err(Errno::EPERM);
+            }
+            if data >= IOPRIO_NR_LEVELS {
+                return Err(Errno::EINVAL);
+            }
+            Ok(())
+        }
+        IOPRIO_CLASS_IDLE => Ok(()),
+        IOPRIO_CLASS_NONE if data == 0 => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// Records thread `t`'s I/O priority (creating an io_context if it has none) and hands it to the
+/// host thread. Threads sharing this one through `CLONE_IO` are handed to the host too.
+fn set_task_ioprio(cx: &Cx<'_>, t: &Rc<Task>, ioprio: u16) {
+    let shared = {
+        let mut slot = t.ioprio.borrow_mut();
+        let cell = slot.get_or_insert_with(|| Rc::new(Cell::new(0)));
+        cell.set(ioprio);
+        Rc::strong_count(cell) > 1
+    };
+    if shared {
+        let mine = t.ioprio.borrow().clone();
+        for other in cx.kr().tasks.values() {
+            let same =
+                matches!((&*other.ioprio.borrow(), &mine), (Some(a), Some(b)) if Rc::ptr_eq(a, b));
+            if same {
+                apply_host_ioprio(other, false);
+            }
+        }
+    } else {
+        apply_host_ioprio(t, false);
+    }
+}
+
+pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
+    let cred = cx.cred();
+    // Here who = 0 is the caller's real user (current_user())
+    let uid = (which == IOPRIO_WHO_USER)
+        .then(|| {
+            if who == 0 {
+                Some(cred.ruid)
+            } else {
+                cred.uid_in(who as u32)
+            }
+        })
+        .flatten();
+    let targets = ioprio_targets(cx, which, who, uid)?;
+    // For one thread, the value it originally set (`get_task_raw_ioprio`); for a process group
+    // or user, the highest of the effective priorities (the smallest value, `ioprio_best`)
+    let prio = if which == IOPRIO_WHO_PROCESS {
+        targets[0].0.as_deref().map_or(0, raw_ioprio)
+    } else {
+        targets
+            .iter()
+            .map(|(t, _)| effective_ioprio(t.as_deref()))
+            .min()
+            .unwrap()
+    };
+    Ok(prio as u64)
+}
+
+/// The thread's effective I/O priority (`__get_task_ioprio`): class NONE is derived from the
+/// scheduling policy and the nice value, IDLE for `SCHED_IDLE`, RT for real-time policies and BE
+/// otherwise, at level (nice + 20) / 5. The built-in init is BE 4.
+fn effective_ioprio(t: Option<&Task>) -> u16 {
+    let Some(t) = t else {
+        return ioprio_value(IOPRIO_CLASS_BE, 4);
+    };
+    let raw = raw_ioprio(t);
+    if ioprio_class(raw) != IOPRIO_CLASS_NONE {
+        return raw;
+    }
+    let class = match t.sched.get().0 & !SCHED_RESET_ON_FORK {
+        SCHED_IDLE => IOPRIO_CLASS_IDLE,
+        SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => IOPRIO_CLASS_RT,
+        _ => IOPRIO_CLASS_BE,
+    };
+    ioprio_value(class, ((t.nice.get() + 20) / 5) as u16)
 }
 
 /// The threads ioprio_set and ioprio_get act on. As on Linux, `IOPRIO_WHO_PROCESS` is one thread,
@@ -237,291 +343,7 @@ fn ioprio_targets(
     Ok(found)
 }
 
-/// Whether the ioprio_set value itself is valid and the caller may set it (`ioprio_check_cap`):
-/// RT needs `CAP_SYS_ADMIN` or `CAP_SYS_NICE`, RT and BE levels are 0–7, the NONE level must be
-/// 0, and the IDLE level is not checked.
-fn ioprio_check(cred: &Cred, ioprio: u16) -> Result<(), Errno> {
-    let data = ioprio & ((1 << IOPRIO_CLASS_SHIFT) - 1);
-    match ioprio_class(ioprio) {
-        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE => {
-            if ioprio_class(ioprio) == IOPRIO_CLASS_RT
-                && !cred.capable(cap::SYS_ADMIN)
-                && !cred.capable(cap::SYS_NICE)
-            {
-                return Err(Errno::EPERM);
-            }
-            if data >= IOPRIO_NR_LEVELS {
-                return Err(Errno::EINVAL);
-            }
-            Ok(())
-        }
-        IOPRIO_CLASS_IDLE => Ok(()),
-        IOPRIO_CLASS_NONE if data == 0 => Ok(()),
-        _ => Err(Errno::EINVAL),
-    }
-}
-
-pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> SysResult {
-    let cred = cx.cred();
-    // io_context holds an unsigned short, so the high bits are dropped (the check looks only at
-    // bits 0–15)
-    let ioprio = ioprio as u16;
-    ioprio_check(&cred, ioprio)?;
-    // Linux uses make_kuid(current_user_ns(), who) here: who = 0 is root, not the caller
-    let uid = (which == IOPRIO_WHO_USER)
-        .then(|| cred.uid_in(who as u32))
-        .flatten();
-    for (t, g) in ioprio_targets(cx, which, who, uid)? {
-        // set_task_ioprio: the target's real user ID must equal the caller's effective or real
-        // user ID, or CAP_SYS_NICE is needed; for a process group or user the first failure
-        // returns, with the earlier ones already changed
-        let target = g.borrow().cred.ruid;
-        if target != cred.euid && target != cred.ruid && !cred.capable(cap::SYS_NICE) {
-            return Err(Errno::EPERM);
-        }
-        if let Some(t) = t {
-            set_task_ioprio(cx, &t, ioprio);
-        }
-    }
-    Ok(0)
-}
-
-/// Records thread `t`'s I/O priority (creating an io_context if it has none) and hands it to the
-/// host thread. Threads sharing this one through `CLONE_IO` are handed to the host too.
-fn set_task_ioprio(cx: &Cx<'_>, t: &Rc<Task>, ioprio: u16) {
-    let shared = {
-        let mut slot = t.ioprio.borrow_mut();
-        let cell = slot.get_or_insert_with(|| Rc::new(Cell::new(0)));
-        cell.set(ioprio);
-        Rc::strong_count(cell) > 1
-    };
-    if shared {
-        let mine = t.ioprio.borrow().clone();
-        for other in cx.kr().tasks.values() {
-            let same =
-                matches!((&*other.ioprio.borrow(), &mine), (Some(a), Some(b)) if Rc::ptr_eq(a, b));
-            if same {
-                apply_host_ioprio(other, false);
-            }
-        }
-    } else {
-        apply_host_ioprio(t, false);
-    }
-}
-
-/// The thread's raw I/O priority: 0 if never set (`IOPRIO_DEFAULT`, class NONE).
-fn raw_ioprio(t: &Task) -> u16 {
-    t.ioprio.borrow().as_ref().map_or(0, |c| c.get())
-}
-
-/// The thread's effective I/O priority (`__get_task_ioprio`): class NONE is derived from the
-/// scheduling policy and the nice value, IDLE for `SCHED_IDLE`, RT for real-time policies and BE
-/// otherwise, at level (nice + 20) / 5. The built-in init is BE 4.
-fn effective_ioprio(t: Option<&Task>) -> u16 {
-    let Some(t) = t else {
-        return ioprio_value(IOPRIO_CLASS_BE, 4);
-    };
-    let raw = raw_ioprio(t);
-    if ioprio_class(raw) != IOPRIO_CLASS_NONE {
-        return raw;
-    }
-    let class = match t.sched.get().0 & !SCHED_RESET_ON_FORK {
-        SCHED_IDLE => IOPRIO_CLASS_IDLE,
-        SCHED_FIFO | SCHED_RR | SCHED_DEADLINE => IOPRIO_CLASS_RT,
-        _ => IOPRIO_CLASS_BE,
-    };
-    ioprio_value(class, ((t.nice.get() + 20) / 5) as u16)
-}
-
-pub(super) fn ioprio_get(cx: &mut Cx<'_>, which: i32, who: i32) -> SysResult {
-    let cred = cx.cred();
-    // Here who = 0 is the caller's real user (current_user())
-    let uid = (which == IOPRIO_WHO_USER)
-        .then(|| {
-            if who == 0 {
-                Some(cred.ruid)
-            } else {
-                cred.uid_in(who as u32)
-            }
-        })
-        .flatten();
-    let targets = ioprio_targets(cx, which, who, uid)?;
-    // For one thread, the value it originally set (`get_task_raw_ioprio`); for a process group
-    // or user, the highest of the effective priorities (the smallest value, `ioprio_best`)
-    let prio = if which == IOPRIO_WHO_PROCESS {
-        targets[0].0.as_deref().map_or(0, raw_ioprio)
-    } else {
-        targets
-            .iter()
-            .map(|(t, _)| effective_ioprio(t.as_deref()))
-            .min()
-            .unwrap()
-    };
-    Ok(prio as u64)
-}
-
-/// A new thread's I/O priority (`copy_io`): when the creator has an io_context, `CLONE_IO` shares
-/// it, otherwise a copy is made if its class is not NONE; if the creator has none, neither does
-/// the new thread.
-pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Option<Rc<Cell<u16>>> {
-    const CLONE_IO: u64 = 0x8000_0000;
-    let p = parent.as_ref()?;
-    if flags & CLONE_IO != 0 {
-        Some(p.clone())
-    } else {
-        (ioprio_class(p.get()) != IOPRIO_CLASS_NONE).then(|| Rc::new(Cell::new(p.get())))
-    }
-}
-
-/// Sets a guest thread's host thread I/O priority from the guest thread's: RT becomes BE at the
-/// same level (as with nice values, the guest may not let the host thread's I/O override the UI),
-/// and NONE lets the host derive it from the nice value. With `reset`, it is written once even if
-/// never set (a host thread reused from the pool still has the previous guest thread's).
-fn apply_host_ioprio(t: &Task, reset: bool) {
-    let tid = t.host_tid.get();
-    if tid == 0 || (!reset && t.ioprio.borrow().is_none()) {
-        return;
-    }
-    let raw = raw_ioprio(t);
-    let host = if ioprio_class(raw) == IOPRIO_CLASS_RT {
-        ioprio_value(IOPRIO_CLASS_BE, raw & ((1 << IOPRIO_CLASS_SHIFT) - 1))
-    } else {
-        raw
-    };
-    appine_hal::set_thread_ioprio(tid, host);
-}
-
-/// When the guest raises priority, the host thread's nice value goes no lower than this: never
-/// above Android's display-related threads (-4 to -10), so guest busy loops do not slow the UI.
-const HOST_NICE_FLOOR: i32 = -4;
-
-/// A host thread starts running guest thread `t`: it has inherited the priority, I/O priority and
-/// affinity of the host thread that created it (of the previous guest thread when `reused`), and
-/// switches to `t`'s own.
-pub(crate) fn host_started(t: &Task, reused: bool) {
-    apply_host(t);
-    apply_host_ioprio(t, reused);
-    let mask = t.affinity.get() & online_cpus();
-    // A host thread reused from the pool still has the previous guest thread's affinity
-    if mask != online_cpus() || reused {
-        appine_hal::set_thread_affinity(t.host_tid.get(), mask);
-    }
-}
-
-/// Sets a guest thread's host thread nice value from the guest thread's nice value and scheduling
-/// policy. `SCHED_IDLE` uses the host's lowest priority. If the host thread has not started
-/// running yet, it is set when it starts.
-fn apply_host(t: &Task) {
-    let tid = t.host_tid.get();
-    if tid == 0 {
-        return;
-    }
-    let nice = if t.sched.get().0 & !SCHED_RESET_ON_FORK == SCHED_IDLE {
-        19
-    } else {
-        t.nice.get().max(HOST_NICE_FLOOR)
-    };
-    appine_hal::set_thread_nice(tid, nice);
-}
-
-/// The target thread of `sched_*`: pid 0 is the caller. The built-in init has no threads and
-/// returns None. Zombies (and processes whose leader has exited) are None too: on Linux the leader
-/// can still be found until it is reaped, and is handled with the default scheduling parameters.
-fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
-    match pid {
-        p if p < 0 => Err(Errno::EINVAL),
-        0 => Ok(Some(cx.task.clone())),
-        INIT => Ok(None),
-        p => match cx.kr().tasks.get(&p) {
-            Some(t) => Ok(Some(t.clone())),
-            None if cx.kr().groups.contains_key(&p) => Ok(None),
-            None => Err(Errno::ESRCH),
-        },
-    }
-}
-
-/// The credentials of the thread's process.
-fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
-    task.and_then(|t| cx.kr().groups.get(&t.tgid))
-        .map_or_else(Cred::root, |g| g.borrow().cred.clone())
-}
-
-/// The scheduling policy and nice value a new thread inherits: with `SCHED_RESET_ON_FORK`,
-/// real-time policies go back to the normal policy and negative nice values back to 0.
-pub(super) fn inherit((policy, priority): (i32, i32), nice: i32) -> ((i32, i32), i32) {
-    if policy & SCHED_RESET_ON_FORK != 0 {
-        let base = policy & !SCHED_RESET_ON_FORK;
-        if matches!(base, SCHED_FIFO | SCHED_RR) {
-            return ((SCHED_OTHER, 0), 0);
-        }
-        return ((base, priority), nice.max(0));
-    }
-    ((policy, priority), nice)
-}
-
-/// Sets the scheduling policy: checks the policy, priority and permissions.
-fn set_policy(
-    cx: &Cx<'_>,
-    task: Option<&Rc<Task>>,
-    policy: i32,
-    priority: i32,
-) -> Result<(), Errno> {
-    let base = policy & !SCHED_RESET_ON_FORK;
-    let rt = match base {
-        SCHED_FIFO | SCHED_RR => true,
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => false,
-        _ => return Err(Errno::EINVAL),
-    };
-    if rt && !(1..=99).contains(&priority) || !rt && priority != 0 {
-        return Err(Errno::EINVAL);
-    }
-    let cred = cx.cred();
-    if !same_owner(&cred, &cred_of(cx, task)) || rt && !cred.capable(cap::SYS_NICE) {
-        return Err(Errno::EPERM);
-    }
-    if let Some(t) = task {
-        t.sched.set((policy, priority));
-        apply_host(t);
-    }
-    Ok(())
-}
-
-/// Sets `SCHED_DEADLINE` (`__checkparam_dl`): runtime ≤ deadline ≤ period, runtime at least
-/// 1024 ns, and a period of 0 equals the deadline.
-fn set_deadline(
-    cx: &Cx<'_>,
-    task: Option<&Rc<Task>>,
-    priority: i32,
-    (runtime, deadline, period): (u64, u64, u64),
-) -> SysResult {
-    let period = if period == 0 { deadline } else { period };
-    if priority != 0
-        || deadline == 0
-        || runtime < 1024
-        || (deadline | period) & (1 << 63) != 0
-        || period < deadline
-        || deadline < runtime
-    {
-        return Err(Errno::EINVAL);
-    }
-    let cred = cx.cred();
-    if !same_owner(&cred, &cred_of(cx, task)) || !cred.capable(cap::SYS_NICE) {
-        return Err(Errno::EPERM);
-    }
-    if let Some(t) = task {
-        t.sched.set((SCHED_DEADLINE, 0));
-        t.deadline.set((runtime, deadline, period));
-    }
-    Ok(0)
-}
-
-/// Reads the priority of a `struct sched_param`.
-fn read_priority(cx: &Cx<'_>, param: u64) -> Result<i32, Errno> {
-    if param == 0 {
-        return Err(Errno::EINVAL);
-    }
-    Ok(i32::from_le_bytes(get(cx, param)?))
-}
+// ---- sched_* ----
 
 pub(super) fn sched_setscheduler(cx: &mut Cx<'_>, pid: i32, policy: i32, param: u64) -> SysResult {
     if pid < 0 {
@@ -540,6 +362,14 @@ pub(super) fn sched_setparam(cx: &mut Cx<'_>, pid: i32, param: u64) -> SysResult
     let task = target(cx, pid)?;
     let policy = task.as_ref().map_or(SCHED_OTHER, |t| t.sched.get().0);
     set_policy(cx, task.as_ref(), policy, priority).map(|()| 0)
+}
+
+/// Reads the priority of a `struct sched_param`.
+fn read_priority(cx: &Cx<'_>, param: u64) -> Result<i32, Errno> {
+    if param == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(i32::from_le_bytes(get(cx, param)?))
 }
 
 pub(super) fn sched_getscheduler(cx: &mut Cx<'_>, pid: i32) -> SysResult {
@@ -608,6 +438,62 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     Ok(0)
 }
 
+/// Sets `SCHED_DEADLINE` (`__checkparam_dl`): runtime ≤ deadline ≤ period, runtime at least
+/// 1024 ns, and a period of 0 equals the deadline.
+fn set_deadline(
+    cx: &Cx<'_>,
+    task: Option<&Rc<Task>>,
+    priority: i32,
+    (runtime, deadline, period): (u64, u64, u64),
+) -> SysResult {
+    let period = if period == 0 { deadline } else { period };
+    if priority != 0
+        || deadline == 0
+        || runtime < 1024
+        || (deadline | period) & (1 << 63) != 0
+        || period < deadline
+        || deadline < runtime
+    {
+        return Err(Errno::EINVAL);
+    }
+    let cred = cx.cred();
+    if !same_owner(&cred, &cred_of(cx, task)) || !cred.capable(cap::SYS_NICE) {
+        return Err(Errno::EPERM);
+    }
+    if let Some(t) = task {
+        t.sched.set((SCHED_DEADLINE, 0));
+        t.deadline.set((runtime, deadline, period));
+    }
+    Ok(0)
+}
+
+/// Sets the scheduling policy: checks the policy, priority and permissions.
+fn set_policy(
+    cx: &Cx<'_>,
+    task: Option<&Rc<Task>>,
+    policy: i32,
+    priority: i32,
+) -> Result<(), Errno> {
+    let base = policy & !SCHED_RESET_ON_FORK;
+    let rt = match base {
+        SCHED_FIFO | SCHED_RR => true,
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => false,
+        _ => return Err(Errno::EINVAL),
+    };
+    if rt && !(1..=99).contains(&priority) || !rt && priority != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let cred = cx.cred();
+    if !same_owner(&cred, &cred_of(cx, task)) || rt && !cred.capable(cap::SYS_NICE) {
+        return Err(Errno::EPERM);
+    }
+    if let Some(t) = task {
+        t.sched.set((policy, priority));
+        apply_host(t);
+    }
+    Ok(())
+}
+
 pub(super) fn sched_getattr(
     cx: &mut Cx<'_>,
     pid: i32,
@@ -646,25 +532,6 @@ pub(super) fn sched_getattr(
         .map(|()| 0)
 }
 
-/// The mask for the host's CPU count (at most 64).
-fn online_cpus() -> u64 {
-    let cpus = appine_hal::host_cpus().len();
-    if cpus == 64 {
-        u64::MAX
-    } else {
-        (1u64 << cpus) - 1
-    }
-}
-
-/// The affinity target thread: as on Linux, a negative pid is a process not found (ESRCH), not
-/// EINVAL.
-fn affinity_target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
-    if pid < 0 {
-        return Err(Errno::ESRCH);
-    }
-    target(cx, pid)
-}
-
 pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64) -> SysResult {
     // A mask shorter than the kernel's cpumask (8 bytes) leaves the remaining bits 0; any longer
     // part is ignored
@@ -700,6 +567,15 @@ pub(super) fn sched_getaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
     Ok(8)
 }
 
+/// The affinity target thread: as on Linux, a negative pid is a process not found (ESRCH), not
+/// EINVAL.
+fn affinity_target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
+    if pid < 0 {
+        return Err(Errno::ESRCH);
+    }
+    target(cx, pid)
+}
+
 pub(super) fn sched_priority_range(policy: i32, max: bool) -> SysResult {
     match policy {
         SCHED_FIFO | SCHED_RR => Ok(if max { 99 } else { 1 }),
@@ -718,4 +594,136 @@ pub(super) fn sched_rr_get_interval(cx: &mut Cx<'_>, pid: i32, ts: u64) -> SysRe
         0
     };
     write_pair(cx, ts, 0, ns).map(|()| 0)
+}
+
+// ---- New threads and their host threads ----
+
+/// When the guest raises priority, the host thread's nice value goes no lower than this: never
+/// above Android's display-related threads (-4 to -10), so guest busy loops do not slow the UI.
+const HOST_NICE_FLOOR: i32 = -4;
+
+/// The scheduling policy and nice value a new thread inherits: with `SCHED_RESET_ON_FORK`,
+/// real-time policies go back to the normal policy and negative nice values back to 0.
+pub(super) fn inherit((policy, priority): (i32, i32), nice: i32) -> ((i32, i32), i32) {
+    if policy & SCHED_RESET_ON_FORK != 0 {
+        let base = policy & !SCHED_RESET_ON_FORK;
+        if matches!(base, SCHED_FIFO | SCHED_RR) {
+            return ((SCHED_OTHER, 0), 0);
+        }
+        return ((base, priority), nice.max(0));
+    }
+    ((policy, priority), nice)
+}
+
+/// A new thread's I/O priority (`copy_io`): when the creator has an io_context, `CLONE_IO` shares
+/// it, otherwise a copy is made if its class is not NONE; if the creator has none, neither does
+/// the new thread.
+pub(super) fn inherit_ioprio(parent: &Option<Rc<Cell<u16>>>, flags: u64) -> Option<Rc<Cell<u16>>> {
+    const CLONE_IO: u64 = 0x8000_0000;
+    let p = parent.as_ref()?;
+    if flags & CLONE_IO != 0 {
+        Some(p.clone())
+    } else {
+        (ioprio_class(p.get()) != IOPRIO_CLASS_NONE).then(|| Rc::new(Cell::new(p.get())))
+    }
+}
+
+/// A host thread starts running guest thread `t`: it has inherited the priority, I/O priority and
+/// affinity of the host thread that created it (of the previous guest thread when `reused`), and
+/// switches to `t`'s own.
+pub(crate) fn host_started(t: &Task, reused: bool) {
+    apply_host(t);
+    apply_host_ioprio(t, reused);
+    let mask = t.affinity.get() & online_cpus();
+    // A host thread reused from the pool still has the previous guest thread's affinity
+    if mask != online_cpus() || reused {
+        appine_hal::set_thread_affinity(t.host_tid.get(), mask);
+    }
+}
+
+/// Sets a guest thread's host thread nice value from the guest thread's nice value and scheduling
+/// policy. `SCHED_IDLE` uses the host's lowest priority. If the host thread has not started
+/// running yet, it is set when it starts.
+fn apply_host(t: &Task) {
+    let tid = t.host_tid.get();
+    if tid == 0 {
+        return;
+    }
+    let nice = if t.sched.get().0 & !SCHED_RESET_ON_FORK == SCHED_IDLE {
+        19
+    } else {
+        t.nice.get().max(HOST_NICE_FLOOR)
+    };
+    appine_hal::set_thread_nice(tid, nice);
+}
+
+/// Sets a guest thread's host thread I/O priority from the guest thread's: RT becomes BE at the
+/// same level (as with nice values, the guest may not let the host thread's I/O override the UI),
+/// and NONE lets the host derive it from the nice value. With `reset`, it is written once even if
+/// never set (a host thread reused from the pool still has the previous guest thread's).
+fn apply_host_ioprio(t: &Task, reset: bool) {
+    let tid = t.host_tid.get();
+    if tid == 0 || (!reset && t.ioprio.borrow().is_none()) {
+        return;
+    }
+    let raw = raw_ioprio(t);
+    let host = if ioprio_class(raw) == IOPRIO_CLASS_RT {
+        ioprio_value(IOPRIO_CLASS_BE, raw & ((1 << IOPRIO_CLASS_SHIFT) - 1))
+    } else {
+        raw
+    };
+    appine_hal::set_thread_ioprio(tid, host);
+}
+
+// ---- Shared helpers ----
+
+/// The target thread of `sched_*`: pid 0 is the caller. The built-in init has no threads and
+/// returns None. Zombies (and processes whose leader has exited) are None too: on Linux the leader
+/// can still be found until it is reaped, and is handled with the default scheduling parameters.
+fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
+    match pid {
+        p if p < 0 => Err(Errno::EINVAL),
+        0 => Ok(Some(cx.task.clone())),
+        INIT => Ok(None),
+        p => match cx.kr().tasks.get(&p) {
+            Some(t) => Ok(Some(t.clone())),
+            None if cx.kr().groups.contains_key(&p) => Ok(None),
+            None => Err(Errno::ESRCH),
+        },
+    }
+}
+
+/// The credentials of the thread's process.
+fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
+    task.and_then(|t| cx.kr().groups.get(&t.tgid))
+        .map_or_else(Cred::root, |g| g.borrow().cred.clone())
+}
+
+/// Whether the scheduling parameters of a process with credentials `target` may be changed
+/// (`check_same_owner`).
+fn same_owner(cred: &Cred, target: &Cred) -> bool {
+    cred.euid == target.euid || cred.euid == target.ruid || cred.capable(cap::SYS_NICE)
+}
+
+/// The mask for the host's CPU count (at most 64).
+fn online_cpus() -> u64 {
+    let cpus = appine_hal::host_cpus().len();
+    if cpus == 64 {
+        u64::MAX
+    } else {
+        (1u64 << cpus) - 1
+    }
+}
+
+/// The thread's raw I/O priority: 0 if never set (`IOPRIO_DEFAULT`, class NONE).
+fn raw_ioprio(t: &Task) -> u16 {
+    t.ioprio.borrow().as_ref().map_or(0, |c| c.get())
+}
+
+fn ioprio_class(ioprio: u16) -> u16 {
+    (ioprio >> IOPRIO_CLASS_SHIFT) & 7
+}
+
+fn ioprio_value(class: u16, data: u16) -> u16 {
+    (class << IOPRIO_CLASS_SHIFT) | data
 }

@@ -96,25 +96,7 @@ const MAX_INTERP_DEPTH: usize = 4;
 /// `#!` lines are read up to this many bytes (Linux's `BINPRM_BUF_SIZE`).
 const SHEBANG_MAX: usize = 256;
 
-pub(super) fn exit(cx: &mut Cx<'_>, code: i32) -> Flow {
-    let status = ExitStatus::Exited(code & 0xff);
-    cx.task.exit_status.set(status);
-    if cx.tid() == cx.tgid() {
-        cx.t.group.borrow_mut().leader_status = status;
-    }
-    Flow::Exit
-}
-
-pub(super) fn exit_group(cx: &mut Cx<'_>, code: i32) -> Flow {
-    let group = cx.t.group.clone();
-    signal::group_exit(cx.k(), &group, ExitStatus::Exited(code & 0xff));
-    Flow::Exit
-}
-
-pub(super) fn set_tid_address(cx: &mut Cx<'_>, addr: u64) -> SysResult {
-    cx.t.clear_child_tid = addr;
-    Ok(cx.tid() as u64)
-}
+// ---- clone ----
 
 /// Arguments of clone and clone3 (Linux's `struct kernel_clone_args`).
 struct CloneArgs {
@@ -589,119 +571,7 @@ fn user_threads(k: &crate::kernel::Kernel, uid: u32) -> u64 {
         .sum()
 }
 
-/// Reads execve's argv or envp: a NULL-terminated array of string pointers. Returns E2BIG when the
-/// strings and pointers together exceed `limit` bytes ([`loader::arg_limit`]).
-fn read_strings(
-    cx: &Cx<'_>,
-    addr: u64,
-    total: &mut usize,
-    limit: usize,
-) -> Result<Vec<Vec<u8>>, Errno> {
-    let mut out = Vec::new();
-    if addr == 0 {
-        return Ok(out);
-    }
-    for i in 0.. {
-        let p = u64::from_le_bytes(super::get(cx, addr.wrapping_add(i * 8))?);
-        if p == 0 {
-            break;
-        }
-        let s = cx.mm().read_cstr(p, MAX_ARG_STRLEN - 1).map_err(|e| {
-            if e == Errno::ENAMETOOLONG {
-                Errno::E2BIG
-            } else {
-                e
-            }
-        })?;
-        *total += s.len() + 1 + 8;
-        if *total > limit {
-            return Err(Errno::E2BIG);
-        }
-        out.push(s);
-    }
-    Ok(out)
-}
-
-/// `#!` line: (interpreter, optional single argument). None when not a script.
-fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-    let head = file.strip_prefix(b"#!")?;
-    let line = &head[..head.len().min(SHEBANG_MAX - 2)];
-    let line = line.split(|&b| b == b'\n').next().unwrap_or(line);
-    let is_space = |b: &u8| *b == b' ' || *b == b'\t';
-    let line = line.trim_ascii();
-    let end = line.iter().position(is_space).unwrap_or(line.len());
-    let interp = &line[..end];
-    if interp.is_empty() {
-        return None;
-    }
-    let rest = line[end..].trim_ascii();
-    Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
-}
-
-/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`). `exe` and `interp` are
-/// the names and the inodes in the store (0 when unknown); for the interpreter's see
-/// [`interp_label`].
-pub(crate) fn label_image(
-    mm: &mut Mm,
-    image: &loader::Image,
-    exe: (&Rc<[u8]>, u64),
-    interp: Option<(Rc<[u8]>, u64)>,
-) {
-    mm.label(
-        image.main.0,
-        image.main.1 - image.main.0,
-        Some(exe.0.clone()),
-        exe.1,
-    );
-    if let (Some((_, start, end)), Some((name, ino))) = (&image.interp, interp) {
-        mm.label(*start, end - start, Some(name), ino);
-    }
-}
-
-/// The program file's capabilities (`security.capability`); None when absent, and execve fails
-/// (EINVAL) when malformed.
-fn file_caps(vfs: &Vfs, ino: Ino) -> Result<Option<FileCaps>, Errno> {
-    let store = vfs.store();
-    if !store.has_file_caps(ino)? {
-        return Ok(None);
-    }
-    match store.get_xattr(ino, XATTR_NAME_CAPS) {
-        Ok(v) => FileCaps::parse(&v),
-        Err(Errno::ENODATA) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// The interpreter's name and inode in maps: the name has its symlinks resolved like the main
-/// program's (Debian's `/lib/ld-linux-aarch64.so.1` is a link); the path from PT_INTERP as is when
-/// not found.
-pub(crate) fn interp_label(
-    vfs: Option<&Vfs>,
-    ps: &dyn Pseudo,
-    cred: &Cred,
-    root: &Node,
-    cwd: &Node,
-    image: &loader::Image,
-) -> Option<(Rc<[u8]>, u64)> {
-    let (path, ..) = image.interp.as_ref()?;
-    let walked = vfs.and_then(|vfs| Some((vfs, vfs.walk(ps, cred, root, cwd, path, true).ok()?)));
-    let Some((vfs, (node, found))) = walked else {
-        return Some((Rc::from(path.as_slice()), 0));
-    };
-    let name = vfs
-        .found_path(ps, root, &node, found.as_ref())
-        .unwrap_or_else(|_| path.clone());
-    let ino = node.ino().unwrap_or(0);
-    Some((Rc::from(name), ino))
-}
-
-fn load_error(e: LoadError) -> Errno {
-    match e {
-        LoadError::NotElf | LoadError::Unsupported(_) | LoadError::Malformed(_) => Errno::ENOEXEC,
-        LoadError::ArgumentsTooLong => Errno::E2BIG,
-        LoadError::Memory(e) | LoadError::Read(e) | LoadError::Interpreter(_, e) => e,
-    }
-}
+// ---- execve ----
 
 pub(super) fn execve(
     cx: &mut Cx<'_>,
@@ -1042,6 +912,120 @@ fn exec(
     Ok(())
 }
 
+/// Reads execve's argv or envp: a NULL-terminated array of string pointers. Returns E2BIG when the
+/// strings and pointers together exceed `limit` bytes ([`loader::arg_limit`]).
+fn read_strings(
+    cx: &Cx<'_>,
+    addr: u64,
+    total: &mut usize,
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, Errno> {
+    let mut out = Vec::new();
+    if addr == 0 {
+        return Ok(out);
+    }
+    for i in 0.. {
+        let p = u64::from_le_bytes(super::get(cx, addr.wrapping_add(i * 8))?);
+        if p == 0 {
+            break;
+        }
+        let s = cx.mm().read_cstr(p, MAX_ARG_STRLEN - 1).map_err(|e| {
+            if e == Errno::ENAMETOOLONG {
+                Errno::E2BIG
+            } else {
+                e
+            }
+        })?;
+        *total += s.len() + 1 + 8;
+        if *total > limit {
+            return Err(Errno::E2BIG);
+        }
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// `#!` line: (interpreter, optional single argument). None when not a script.
+fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    let head = file.strip_prefix(b"#!")?;
+    let line = &head[..head.len().min(SHEBANG_MAX - 2)];
+    let line = line.split(|&b| b == b'\n').next().unwrap_or(line);
+    let is_space = |b: &u8| *b == b' ' || *b == b'\t';
+    let line = line.trim_ascii();
+    let end = line.iter().position(is_space).unwrap_or(line.len());
+    let interp = &line[..end];
+    if interp.is_empty() {
+        return None;
+    }
+    let rest = line[end..].trim_ascii();
+    Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
+}
+
+/// The program file's capabilities (`security.capability`); None when absent, and execve fails
+/// (EINVAL) when malformed.
+fn file_caps(vfs: &Vfs, ino: Ino) -> Result<Option<FileCaps>, Errno> {
+    let store = vfs.store();
+    if !store.has_file_caps(ino)? {
+        return Ok(None);
+    }
+    match store.get_xattr(ino, XATTR_NAME_CAPS) {
+        Ok(v) => FileCaps::parse(&v),
+        Err(Errno::ENODATA) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn load_error(e: LoadError) -> Errno {
+    match e {
+        LoadError::NotElf | LoadError::Unsupported(_) | LoadError::Malformed(_) => Errno::ENOEXEC,
+        LoadError::ArgumentsTooLong => Errno::E2BIG,
+        LoadError::Memory(e) | LoadError::Read(e) | LoadError::Interpreter(_, e) => e,
+    }
+}
+
+/// The interpreter's name and inode in maps: the name has its symlinks resolved like the main
+/// program's (Debian's `/lib/ld-linux-aarch64.so.1` is a link); the path from PT_INTERP as is when
+/// not found.
+pub(crate) fn interp_label(
+    vfs: Option<&Vfs>,
+    ps: &dyn Pseudo,
+    cred: &Cred,
+    root: &Node,
+    cwd: &Node,
+    image: &loader::Image,
+) -> Option<(Rc<[u8]>, u64)> {
+    let (path, ..) = image.interp.as_ref()?;
+    let walked = vfs.and_then(|vfs| Some((vfs, vfs.walk(ps, cred, root, cwd, path, true).ok()?)));
+    let Some((vfs, (node, found))) = walked else {
+        return Some((Rc::from(path.as_slice()), 0));
+    };
+    let name = vfs
+        .found_path(ps, root, &node, found.as_ref())
+        .unwrap_or_else(|_| path.clone());
+    let ino = node.ino().unwrap_or(0);
+    Some((Rc::from(name), ino))
+}
+
+/// Names the program's and interpreter's mappings (`/proc/<pid>/maps`). `exe` and `interp` are
+/// the names and the inodes in the store (0 when unknown); for the interpreter's see
+/// [`interp_label`].
+pub(crate) fn label_image(
+    mm: &mut Mm,
+    image: &loader::Image,
+    exe: (&Rc<[u8]>, u64),
+    interp: Option<(Rc<[u8]>, u64)>,
+) {
+    mm.label(
+        image.main.0,
+        image.main.1 - image.main.0,
+        Some(exe.0.clone()),
+        exe.1,
+    );
+    if let (Some((_, start, end)), Some((name, ino))) = (&image.interp, interp) {
+        mm.label(*start, end - start, Some(name), ino);
+    }
+}
+
 /// execve's de_thread: ends the other threads in the thread group and waits for them to exit.
 /// When execve is called by a thread other than the main thread, it takes over the main thread's
 /// tid.
@@ -1097,6 +1081,28 @@ fn kill_other_threads(cx: &mut Cx<'_>) -> Result<(), Errno> {
         }
     }
     Ok(())
+}
+
+// ---- Exit and reaping ----
+
+pub(super) fn set_tid_address(cx: &mut Cx<'_>, addr: u64) -> SysResult {
+    cx.t.clear_child_tid = addr;
+    Ok(cx.tid() as u64)
+}
+
+pub(super) fn exit(cx: &mut Cx<'_>, code: i32) -> Flow {
+    let status = ExitStatus::Exited(code & 0xff);
+    cx.task.exit_status.set(status);
+    if cx.tid() == cx.tgid() {
+        cx.t.group.borrow_mut().leader_status = status;
+    }
+    Flow::Exit
+}
+
+pub(super) fn exit_group(cx: &mut Cx<'_>, code: i32) -> Flow {
+    let group = cx.t.group.clone();
+    signal::group_exit(cx.k(), &group, ExitStatus::Exited(code & 0xff));
+    Flow::Exit
 }
 
 /// What to wait for: a pid, any child, or a process group.
@@ -1162,6 +1168,133 @@ struct Wanted {
 /// its resource usage (including CPU time used by the children it reaped), and its real user ID
 /// (a kernel ID, waitid's si_uid).
 type Found = (Tid, ChildEvent, process::Rusage, u32);
+
+pub(super) fn wait4(
+    cx: &mut Cx<'_>,
+    pid: i32,
+    wstatus: u64,
+    options: u32,
+    rusage: u64,
+) -> SysResult {
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // -INT_MIN cannot be represented as a process group ID
+    if pid == i32::MIN {
+        return Err(Errno::ESRCH);
+    }
+    let who = match pid {
+        -1 => Who::Any,
+        0 => Who::Pgid(cx.t.group.borrow().pgid),
+        p if p < 0 => Who::Pgid(-p),
+        p => Who::Pid(p),
+    };
+    let want = Wanted {
+        exited: true,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+        consume: true,
+        own_thread: options & WNOTHREAD != 0,
+    };
+    let Some((child, event, usage, _)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
+        return Ok(0);
+    };
+    if wstatus != 0 {
+        put(cx, wstatus, event.wait_status().to_le_bytes())?;
+    }
+    if rusage != 0 {
+        put(cx, rusage, usage.encode())?;
+    }
+    Ok(child as u64)
+}
+
+pub(super) fn waitid(
+    cx: &mut Cx<'_>,
+    idtype: u32,
+    id: i32,
+    infop: u64,
+    options: u32,
+    rusage: u64,
+) -> SysResult {
+    if options & !(WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT | WNOTHREAD | WALL | WCLONE)
+        != 0
+        || options & (WEXITED | WUNTRACED | WCONTINUED) == 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let mut nonblock = false;
+    let who = match idtype {
+        P_ALL => Who::Any,
+        P_PID if id > 0 => Who::Pid(id),
+        P_PGID if id > 0 => Who::Pgid(id),
+        P_PGID if id == 0 => Who::Pgid(cx.t.group.borrow().pgid),
+        // When the process the pidfd refers to has been reaped and its pid given to another, it
+        // cannot be waited for, as on Linux
+        P_PIDFD if id >= 0 => {
+            let file = cx.fds().get(id)?;
+            let f = file.borrow();
+            let FileKind::Pidfd(p) = &f.kind else {
+                return Err(Errno::EBADF);
+            };
+            nonblock = f.nonblocking();
+            match p.group(cx.kr()) {
+                Some(_) => Who::Pid(p.tgid),
+                None => return Err(Errno::ECHILD),
+            }
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    let want = Wanted {
+        exited: options & WEXITED != 0,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+        consume: options & WNOWAIT == 0,
+        own_thread: options & WNOTHREAD != 0,
+    };
+    let nohang = options & WNOHANG != 0;
+    let found = wait_child(cx, who, nohang || nonblock, want)?;
+    // A non-blocking pidfd: EAGAIN when there is no event, unless the caller asked for WNOHANG
+    if found.is_none() && nonblock && !nohang {
+        return Err(Errno::EAGAIN);
+    }
+    if infop != 0 {
+        let info = match found {
+            Some((child, event, _, uid)) => event
+                .siginfo(child, cx.cred().uid_out(uid))
+                .encode(Signal::CHLD),
+            None => [0; 128],
+        };
+        cx.mm().write(UserSlice::new(infop, 128), &info)?;
+    }
+    if rusage != 0 {
+        let usage = found.map_or(process::Rusage::default(), |f| f.2);
+        put(cx, rusage, usage.encode())?;
+    }
+    Ok(0)
+}
+
+/// The part common to wait4 and waitid: waits until a child's state changes.
+fn wait_child(
+    cx: &mut Cx<'_>,
+    who: Who,
+    nohang: bool,
+    want: Wanted,
+) -> Result<Option<Found>, Errno> {
+    loop {
+        if let Some(found) = find_event(cx, who, want)? {
+            return Ok(Some(found));
+        }
+        if nohang {
+            return Ok(None);
+        }
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        // Only child state changes (and directly notified signals) can make the condition here
+        // true (crate::kernel::wake)
+        cx.wait_on(None, &mut [], crate::kernel::wake::CHILD)?;
+    }
+}
 
 /// Finds a matching child state change, consuming it when `consume` (an exited child is reaped at
 /// the same time). ptrace-stops and exits of traced threads (not necessarily children) count too.
@@ -1304,141 +1437,7 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
     if any { Ok(None) } else { Err(Errno::ECHILD) }
 }
 
-/// The part common to wait4 and waitid: waits until a child's state changes.
-fn wait_child(
-    cx: &mut Cx<'_>,
-    who: Who,
-    nohang: bool,
-    want: Wanted,
-) -> Result<Option<Found>, Errno> {
-    loop {
-        if let Some(found) = find_event(cx, who, want)? {
-            return Ok(Some(found));
-        }
-        if nohang {
-            return Ok(None);
-        }
-        if cx.interrupted() {
-            return Err(Errno::ERESTARTSYS);
-        }
-        // Only child state changes (and directly notified signals) can make the condition here
-        // true (crate::kernel::wake)
-        cx.wait_on(None, &mut [], crate::kernel::wake::CHILD)?;
-    }
-}
-
-pub(super) fn wait4(
-    cx: &mut Cx<'_>,
-    pid: i32,
-    wstatus: u64,
-    options: u32,
-    rusage: u64,
-) -> SysResult {
-    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    // -INT_MIN cannot be represented as a process group ID
-    if pid == i32::MIN {
-        return Err(Errno::ESRCH);
-    }
-    let who = match pid {
-        -1 => Who::Any,
-        0 => Who::Pgid(cx.t.group.borrow().pgid),
-        p if p < 0 => Who::Pgid(-p),
-        p => Who::Pid(p),
-    };
-    let want = Wanted {
-        exited: true,
-        stopped: options & WUNTRACED != 0,
-        continued: options & WCONTINUED != 0,
-        consume: true,
-        own_thread: options & WNOTHREAD != 0,
-    };
-    let Some((child, event, usage, _)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
-        return Ok(0);
-    };
-    if wstatus != 0 {
-        put(cx, wstatus, event.wait_status().to_le_bytes())?;
-    }
-    if rusage != 0 {
-        put(cx, rusage, usage.encode())?;
-    }
-    Ok(child as u64)
-}
-
-pub(super) fn waitid(
-    cx: &mut Cx<'_>,
-    idtype: u32,
-    id: i32,
-    infop: u64,
-    options: u32,
-    rusage: u64,
-) -> SysResult {
-    if options & !(WNOHANG | WUNTRACED | WEXITED | WCONTINUED | WNOWAIT | WNOTHREAD | WALL | WCLONE)
-        != 0
-        || options & (WEXITED | WUNTRACED | WCONTINUED) == 0
-    {
-        return Err(Errno::EINVAL);
-    }
-    let mut nonblock = false;
-    let who = match idtype {
-        P_ALL => Who::Any,
-        P_PID if id > 0 => Who::Pid(id),
-        P_PGID if id > 0 => Who::Pgid(id),
-        P_PGID if id == 0 => Who::Pgid(cx.t.group.borrow().pgid),
-        // When the process the pidfd refers to has been reaped and its pid given to another, it
-        // cannot be waited for, as on Linux
-        P_PIDFD if id >= 0 => {
-            let file = cx.fds().get(id)?;
-            let f = file.borrow();
-            let FileKind::Pidfd(p) = &f.kind else {
-                return Err(Errno::EBADF);
-            };
-            nonblock = f.nonblocking();
-            match p.group(cx.kr()) {
-                Some(_) => Who::Pid(p.tgid),
-                None => return Err(Errno::ECHILD),
-            }
-        }
-        _ => return Err(Errno::EINVAL),
-    };
-    let want = Wanted {
-        exited: options & WEXITED != 0,
-        stopped: options & WUNTRACED != 0,
-        continued: options & WCONTINUED != 0,
-        consume: options & WNOWAIT == 0,
-        own_thread: options & WNOTHREAD != 0,
-    };
-    let nohang = options & WNOHANG != 0;
-    let found = wait_child(cx, who, nohang || nonblock, want)?;
-    // A non-blocking pidfd: EAGAIN when there is no event, unless the caller asked for WNOHANG
-    if found.is_none() && nonblock && !nohang {
-        return Err(Errno::EAGAIN);
-    }
-    if infop != 0 {
-        let info = match found {
-            Some((child, event, _, uid)) => event
-                .siginfo(child, cx.cred().uid_out(uid))
-                .encode(Signal::CHLD),
-            None => [0; 128],
-        };
-        cx.mm().write(UserSlice::new(infop, 128), &info)?;
-    }
-    if rusage != 0 {
-        let usage = found.map_or(process::Rusage::default(), |f| f.2);
-        put(cx, rusage, usage.encode())?;
-    }
-    Ok(0)
-}
-
-/// A new pidfd referring to thread group `group` (with pid `tgid`).
-fn new_pidfd(tgid: Tid, group: &Rc<RefCell<ThreadGroup>>, flags: u32) -> FileRef {
-    let p = Pidfd {
-        tgid,
-        group: Rc::downgrade(group),
-    };
-    OpenFile::new(FileKind::Pidfd(p), oflags::O_RDWR | flags)
-}
+// ---- pidfds and kcmp ----
 
 /// pidfd_open: `flags` may only be `PIDFD_NONBLOCK` (`PIDFD_THREAD`, added in 6.9, is not
 /// supported), and pid must be a process, not a thread. The pidfd is always close-on-exec.
@@ -1454,10 +1453,13 @@ pub(super) fn pidfd_open(cx: &mut Cx<'_>, pid: i32, flags: u32) -> SysResult {
     cx.fds_mut().install(file, true, 0).map(|fd| fd as u64)
 }
 
-/// Whether `target` may be accessed as with ptrace (`PTRACE_MODE_ATTACH_REALCREDS`): it is the
-/// caller itself, or [`Cred::may_ptrace`].
-pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
-    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, false)
+/// A new pidfd referring to thread group `group` (with pid `tgid`).
+fn new_pidfd(tgid: Tid, group: &Rc<RefCell<ThreadGroup>>, flags: u32) -> FileRef {
+    let p = Pidfd {
+        tgid,
+        group: Rc::downgrade(group),
+    };
+    OpenFile::new(FileKind::Pidfd(p), oflags::O_RDWR | flags)
 }
 
 /// pidfd_getfd: duplicates `target` of the process the pidfd refers to into the caller, with
@@ -1567,6 +1569,14 @@ pub(super) fn kcmp(
         std::cmp::Ordering::Greater => 2,
     })
 }
+
+/// Whether `target` may be accessed as with ptrace (`PTRACE_MODE_ATTACH_REALCREDS`): it is the
+/// caller itself, or [`Cred::may_ptrace`].
+pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
+    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, false)
+}
+
+// ---- unshare ----
 
 /// unshare: stops sharing some resources with other threads and processes. Every namespace type
 /// is supported (mount, user, pid, UTS, IPC, network, cgroup, time); the caller does not enter a
@@ -1701,13 +1711,7 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     Ok(0)
 }
 
-/// A pid argument of 0 means the caller itself.
-fn group_of(cx: &Cx<'_>, pid: Tid) -> Result<Rc<RefCell<ThreadGroup>>, Errno> {
-    if pid == 0 {
-        return Ok(cx.t.group.clone());
-    }
-    cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)
-}
+// ---- Process groups and sessions ----
 
 pub(super) fn getpgid(cx: &mut Cx<'_>, pid: i32) -> SysResult {
     Ok(group_of(cx, pid)?.borrow().pgid as u64)
@@ -1769,6 +1773,14 @@ pub(super) fn setpgid(cx: &mut Cx<'_>, pid: i32, pgid: i32) -> SysResult {
     }
     target.borrow_mut().pgid = pgid;
     Ok(0)
+}
+
+/// A pid argument of 0 means the caller itself.
+fn group_of(cx: &Cx<'_>, pid: Tid) -> Result<Rc<RefCell<ThreadGroup>>, Errno> {
+    if pid == 0 {
+        return Ok(cx.t.group.clone());
+    }
+    cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)
 }
 
 #[cfg(test)]

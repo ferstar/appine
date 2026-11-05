@@ -61,14 +61,6 @@ impl LoadAvg {
         (!self.stopped).then_some(self.due)
     }
 
-    /// The number of samples missed up to `now` (`now` is not earlier than `due`).
-    fn missed(&self, now: Instant) -> u64 {
-        let behind = (now - self.due).as_nanos() / LOAD_FREQ.as_nanos();
-        1 + u64::try_from(behind)
-            .unwrap_or(u64::MAX)
-            .min(u32::MAX as u64 - 1)
-    }
-
     /// The current averages. Samples that the timer thread has not yet filled in since stopping
     /// (the reading thread has just woken) are filled in here.
     fn current(&self, now: Instant) -> [u64; 3] {
@@ -77,6 +69,14 @@ impl LoadAvg {
         } else {
             self.avenrun
         }
+    }
+
+    /// The number of samples missed up to `now` (`now` is not earlier than `due`).
+    fn missed(&self, now: Instant) -> u64 {
+        let behind = (now - self.due).as_nanos() / LOAD_FREQ.as_nanos();
+        1 + u64::try_from(behind)
+            .unwrap_or(u64::MAX)
+            .min(u32::MAX as u64 - 1)
     }
 }
 
@@ -110,14 +110,6 @@ fn fixed_power(mut x: u64, mut n: u64) -> u64 {
         x = (x * x + FIXED_1 / 2) >> FSHIFT;
     }
     result
-}
-
-/// The number of runnable threads: guest threads not waiting in the kernel.
-pub(crate) fn running(k: &Kernel) -> u64 {
-    k.tasks
-        .values()
-        .filter(|t| !t.sleeping.load(Ordering::Relaxed))
-        .count() as u64
 }
 
 /// Called every time the timer thread wakes. Returns when the next sample is due; when stopped,
@@ -161,6 +153,14 @@ pub(crate) fn sysinfo_loads(k: &Kernel) -> [u64; 3] {
     k.load
         .current(Instant::now())
         .map(|a| a << (SI_LOAD_SHIFT - FSHIFT))
+}
+
+/// The number of runnable threads: guest threads not waiting in the kernel.
+pub(crate) fn running(k: &Kernel) -> u64 {
+    k.tasks
+        .values()
+        .filter(|t| !t.sleeping.load(Ordering::Relaxed))
+        .count() as u64
 }
 
 #[cfg(test)]

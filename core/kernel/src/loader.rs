@@ -139,13 +139,6 @@ pub struct Args<'a> {
     pub stack_limit: u64,
 }
 
-/// The most stack space the strings and pointers of argv and envp may take; beyond it is `E2BIG`.
-/// The same as Linux's `bprm_stack_limits`: 1/4 of the stack size limit, at most 6 MB (3/4 of
-/// `_STK_LIM`), at least [`ARG_MAX`].
-pub fn arg_limit(stack_limit: u64) -> usize {
-    (STACK_SIZE / 4 * 3).min(stack_limit / 4).max(ARG_MAX) as usize
-}
-
 /// The load result: pc and sp when the guest starts running, and the address ranges of the program
 /// and the interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +172,72 @@ pub struct Executable {
     /// The size of the file.
     len: usize,
     file: Option<Arc<File>>,
+}
+
+impl Executable {
+    /// How much of the host file's beginning is read in.
+    const HEAD: usize = 4096;
+
+    /// A host file (an object in the store).
+    pub fn open(file: File) -> Result<Executable, Errno> {
+        use std::os::unix::fs::FileExt;
+        let io = |e: std::io::Error| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0));
+        let len = file.metadata().map_err(io)?.len() as usize;
+        let mut head = vec![0u8; len.min(Self::HEAD)];
+        file.read_exact_at(&mut head, 0).map_err(io)?;
+        Ok(Executable {
+            head: head.into(),
+            len,
+            file: Some(Arc::new(file)),
+        })
+    }
+
+    /// Another handle to the same file ([`ExeCache`]).
+    fn share(&self) -> Executable {
+        Executable {
+            head: self.head.clone(),
+            len: self.len,
+            file: self.file.clone(),
+        }
+    }
+
+    /// Contents in memory, with no host file: the segments are copied into anonymous memory.
+    #[cfg(test)]
+    pub fn from_bytes(data: Vec<u8>) -> Executable {
+        Executable {
+            len: data.len(),
+            head: data.into(),
+            file: None,
+        }
+    }
+
+    /// The beginning of the file (at least [`Executable::HEAD`] bytes, or the whole contents if the
+    /// file is shorter).
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    /// The contents `[off, off + n)` of the file; None if it goes past the end of the file.
+    fn read(&self, off: u64, n: u64) -> Result<Option<std::borrow::Cow<'_, [u8]>>, Errno> {
+        use std::os::unix::fs::FileExt;
+        let Some(end) = off.checked_add(n).filter(|&e| e <= self.len as u64) else {
+            return Ok(None);
+        };
+        let (off, end) = (off as usize, end as usize);
+        if end <= self.head.len() {
+            return Ok(Some(self.head[off..end].into()));
+        }
+        let file = self.file.as_ref().ok_or(Errno::EIO)?;
+        let mut buf = vec![0u8; end - off];
+        file.read_exact_at(&mut buf, off as u64)
+            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+        Ok(Some(buf.into()))
+    }
+
+    /// The host file (which `/proc/<pid>/exe` records, [`crate::process::ExeFile`]).
+    pub fn host(&self) -> Option<Arc<File>> {
+        self.file.clone()
+    }
 }
 
 /// Recently executed program files: the open host file and the beginning read in. Executing the
@@ -258,72 +317,6 @@ impl ExeCache {
     }
 }
 
-impl Executable {
-    /// How much of the host file's beginning is read in.
-    const HEAD: usize = 4096;
-
-    /// A host file (an object in the store).
-    pub fn open(file: File) -> Result<Executable, Errno> {
-        use std::os::unix::fs::FileExt;
-        let io = |e: std::io::Error| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0));
-        let len = file.metadata().map_err(io)?.len() as usize;
-        let mut head = vec![0u8; len.min(Self::HEAD)];
-        file.read_exact_at(&mut head, 0).map_err(io)?;
-        Ok(Executable {
-            head: head.into(),
-            len,
-            file: Some(Arc::new(file)),
-        })
-    }
-
-    /// The host file (which `/proc/<pid>/exe` records, [`crate::process::ExeFile`]).
-    pub fn host(&self) -> Option<Arc<File>> {
-        self.file.clone()
-    }
-
-    /// Another handle to the same file ([`ExeCache`]).
-    fn share(&self) -> Executable {
-        Executable {
-            head: self.head.clone(),
-            len: self.len,
-            file: self.file.clone(),
-        }
-    }
-
-    /// Contents in memory, with no host file: the segments are copied into anonymous memory.
-    #[cfg(test)]
-    pub fn from_bytes(data: Vec<u8>) -> Executable {
-        Executable {
-            len: data.len(),
-            head: data.into(),
-            file: None,
-        }
-    }
-
-    /// The beginning of the file (at least [`Executable::HEAD`] bytes, or the whole contents if the
-    /// file is shorter).
-    pub fn head(&self) -> &[u8] {
-        &self.head
-    }
-
-    /// The contents `[off, off + n)` of the file; None if it goes past the end of the file.
-    fn read(&self, off: u64, n: u64) -> Result<Option<std::borrow::Cow<'_, [u8]>>, Errno> {
-        use std::os::unix::fs::FileExt;
-        let Some(end) = off.checked_add(n).filter(|&e| e <= self.len as u64) else {
-            return Ok(None);
-        };
-        let (off, end) = (off as usize, end as usize);
-        if end <= self.head.len() {
-            return Ok(Some(self.head[off..end].into()));
-        }
-        let file = self.file.as_ref().ok_or(Errno::EIO)?;
-        let mut buf = vec![0u8; end - off];
-        file.read_exact_at(&mut buf, off as u64)
-            .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
-        Ok(Some(buf.into()))
-    }
-}
-
 /// A parsed ELF file.
 struct Elf<'a> {
     exe: &'a Executable,
@@ -338,15 +331,6 @@ struct Elf<'a> {
     segments: Vec<Segment>,
     /// A program built by Go (with Go's build ID note).
     go: bool,
-}
-
-/// An ELF after mapping into memory.
-struct Loaded {
-    bias: u64,
-    entry: u64,
-    phdr: u64,
-    phnum: u64,
-    end: u64,
 }
 
 impl<'a> Elf<'a> {
@@ -460,34 +444,6 @@ impl<'a> Elf<'a> {
         Ok(elf)
     }
 
-    /// The page range `[start, end)` the segments cover (without the bias).
-    fn span(&self) -> (u64, u64) {
-        let lo = self.segments.iter().map(|s| s.vaddr).min().unwrap() & !(PAGE_SIZE - 1);
-        let hi = self
-            .segments
-            .iter()
-            .map(|s| s.vaddr + s.memsz)
-            .max()
-            .unwrap();
-        (lo, hi.next_multiple_of(PAGE_SIZE))
-    }
-
-    /// The in-memory address of the program headers (without the bias): `PT_PHDR` if present,
-    /// otherwise the segment containing the program headers.
-    fn phdr_vaddr(&self) -> Result<u64, LoadError> {
-        if let Some(v) = self.phdr_vaddr {
-            return Ok(v);
-        }
-        let size = self.phnum * PHDR_SIZE;
-        self.segments
-            .iter()
-            .find(|s| {
-                s.offset as u64 <= self.phoff && self.phoff + size <= (s.offset + s.filesz) as u64
-            })
-            .map(|s| s.vaddr + (self.phoff - s.offset as u64))
-            .ok_or(LoadError::Malformed("program headers are not loaded"))
-    }
-
     /// Maps the segments into `mm` with bias `bias`.
     fn map(&self, mm: &mut Mm, bias: u64) -> Result<Loaded, LoadError> {
         let (_, hi) = self.span();
@@ -567,6 +523,34 @@ impl<'a> Elf<'a> {
         Ok(loaded)
     }
 
+    /// The page range `[start, end)` the segments cover (without the bias).
+    fn span(&self) -> (u64, u64) {
+        let lo = self.segments.iter().map(|s| s.vaddr).min().unwrap() & !(PAGE_SIZE - 1);
+        let hi = self
+            .segments
+            .iter()
+            .map(|s| s.vaddr + s.memsz)
+            .max()
+            .unwrap();
+        (lo, hi.next_multiple_of(PAGE_SIZE))
+    }
+
+    /// The in-memory address of the program headers (without the bias): `PT_PHDR` if present,
+    /// otherwise the segment containing the program headers.
+    fn phdr_vaddr(&self) -> Result<u64, LoadError> {
+        if let Some(v) = self.phdr_vaddr {
+            return Ok(v);
+        }
+        let size = self.phnum * PHDR_SIZE;
+        self.segments
+            .iter()
+            .find(|s| {
+                s.offset as u64 <= self.phoff && self.phoff + size <= (s.offset + s.filesz) as u64
+            })
+            .map(|s| s.vaddr + (self.phoff - s.offset as u64))
+            .ok_or(LoadError::Malformed("program headers are not loaded"))
+    }
+
     /// Maps one segment as a private file mapping: the pages holding file contents map the host
     /// file, the part of the last page after the file contents is zeroed (the start of .bss), and
     /// the rest of .bss is anonymous memory.
@@ -606,6 +590,15 @@ impl<'a> Elf<'a> {
         }
         Ok(())
     }
+}
+
+/// An ELF after mapping into memory.
+struct Loaded {
+    bias: u64,
+    entry: u64,
+    phdr: u64,
+    phnum: u64,
+    end: u64,
 }
 
 /// The callback that opens the interpreter file by guest path.
@@ -741,25 +734,6 @@ pub fn load_prepared(
     })
 }
 
-/// Whether a `PT_NOTE` contains Go's build ID note.
-fn has_go_note(mut notes: &[u8]) -> bool {
-    while let (Ok(namesz), Ok(descsz), Ok(kind)) =
-        (u32_at(notes, 0), u32_at(notes, 4), u32_at(notes, 8))
-    {
-        let name = notes.get(12..12 + namesz as usize);
-        if kind == NT_GO_BUILDID && name.is_some_and(|n| n.starts_with(b"Go\0")) {
-            return true;
-        }
-        let end =
-            12 + (namesz as usize).next_multiple_of(4) + (descsz as usize).next_multiple_of(4);
-        let Some(rest) = notes.get(end..) else {
-            return false;
-        };
-        notes = rest;
-    }
-    false
-}
-
 /// Which register set Tier 1 uses for the program: Go programs use a separate one
 /// ([`DbtRegs::Go`]). The environment variable `APPINE_DBT_REGS` (`go` or `default`) makes every
 /// program use the same set, for testing the other one.
@@ -872,6 +846,32 @@ fn build_stack(
     })
 }
 
+/// The most stack space the strings and pointers of argv and envp may take; beyond it is `E2BIG`.
+/// The same as Linux's `bprm_stack_limits`: 1/4 of the stack size limit, at most 6 MB (3/4 of
+/// `_STK_LIM`), at least [`ARG_MAX`].
+pub fn arg_limit(stack_limit: u64) -> usize {
+    (STACK_SIZE / 4 * 3).min(stack_limit / 4).max(ARG_MAX) as usize
+}
+
+/// Whether a `PT_NOTE` contains Go's build ID note.
+fn has_go_note(mut notes: &[u8]) -> bool {
+    while let (Ok(namesz), Ok(descsz), Ok(kind)) =
+        (u32_at(notes, 0), u32_at(notes, 4), u32_at(notes, 8))
+    {
+        let name = notes.get(12..12 + namesz as usize);
+        if kind == NT_GO_BUILDID && name.is_some_and(|n| n.starts_with(b"Go\0")) {
+            return true;
+        }
+        let end =
+            12 + (namesz as usize).next_multiple_of(4) + (descsz as usize).next_multiple_of(4);
+        let Some(rest) = notes.get(end..) else {
+            return false;
+        };
+        notes = rest;
+    }
+    false
+}
+
 fn to_prot(flags: u32) -> u32 {
     let mut p = 0;
     if flags & PF_R != 0 {
@@ -887,16 +887,6 @@ fn to_prot(flags: u32) -> u32 {
     p
 }
 
-fn bytes_at<const N: usize>(file: &[u8], off: usize) -> Result<[u8; N], LoadError> {
-    file.get(
-        off..off
-            .checked_add(N)
-            .ok_or(LoadError::Malformed("truncated"))?,
-    )
-    .map(|b| b.try_into().unwrap())
-    .ok_or(LoadError::Malformed("truncated"))
-}
-
 fn u16_at(file: &[u8], off: usize) -> Result<u16, LoadError> {
     bytes_at(file, off).map(u16::from_le_bytes)
 }
@@ -907,6 +897,16 @@ fn u32_at(file: &[u8], off: usize) -> Result<u32, LoadError> {
 
 fn u64_at(file: &[u8], off: usize) -> Result<u64, LoadError> {
     bytes_at(file, off).map(u64::from_le_bytes)
+}
+
+fn bytes_at<const N: usize>(file: &[u8], off: usize) -> Result<[u8; N], LoadError> {
+    file.get(
+        off..off
+            .checked_add(N)
+            .ok_or(LoadError::Malformed("truncated"))?,
+    )
+    .map(|b| b.try_into().unwrap())
+    .ok_or(LoadError::Malformed("truncated"))
 }
 
 #[cfg(test)]

@@ -58,14 +58,19 @@ impl Futexes {
         self.next_id
     }
 
-    /// Whether the waiter is still queued (if not, it has already been woken).
-    pub fn is_queued(&self, id: u64) -> bool {
-        self.waiting.iter().any(|e| e.id == id)
-    }
-
-    /// Removes a waiter (timed out, interrupted by a signal).
-    pub fn remove(&mut self, id: u64) {
-        self.waiting.retain(|e| e.id != id);
+    /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue` more
+    /// to `key2`. Returns the total woken and moved.
+    pub fn requeue(&mut self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
+        let woken = self.wake(key, n_wake, u32::MAX);
+        let mut moved = 0;
+        for e in self.waiting.iter_mut().filter(|e| e.key == key) {
+            if moved == n_requeue {
+                break;
+            }
+            e.key = key2;
+            moved += 1;
+        }
+        woken + moved
     }
 
     /// Wakes at most `n` waiters on `key` with an intersecting bitset, and returns how many were
@@ -84,19 +89,14 @@ impl Futexes {
         woken
     }
 
-    /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue` more
-    /// to `key2`. Returns the total woken and moved.
-    pub fn requeue(&mut self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
-        let woken = self.wake(key, n_wake, u32::MAX);
-        let mut moved = 0;
-        for e in self.waiting.iter_mut().filter(|e| e.key == key) {
-            if moved == n_requeue {
-                break;
-            }
-            e.key = key2;
-            moved += 1;
-        }
-        woken + moved
+    /// Whether the waiter is still queued (if not, it has already been woken).
+    pub fn is_queued(&self, id: u64) -> bool {
+        self.waiting.iter().any(|e| e.id == id)
+    }
+
+    /// Removes a waiter (timed out, interrupted by a signal).
+    pub fn remove(&mut self, id: u64) {
+        self.waiting.retain(|e| e.id != id);
     }
 }
 

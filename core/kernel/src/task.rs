@@ -280,19 +280,6 @@ impl Task {
         self.sleeping.load(Ordering::Relaxed) && !self.event.is_signaled()
     }
 
-    /// The CPU time the thread has used (nanoseconds), counted by the host thread's CPU time.
-    pub fn cpu_ns(&self) -> u64 {
-        self.host_cpu_ns().saturating_sub(self.cpu_base.get().0)
-    }
-
-    /// The CPU time the host thread has used in total (nanoseconds).
-    fn host_cpu_ns(&self) -> u64 {
-        self.clock
-            .get()
-            .and_then(|c| appine_hal::clock_gettime(c).ok())
-            .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
-    }
-
     /// [`Task::cpu`] called by the thread itself: the kernel-mode time comes from getrusage, with
     /// no need to read /proc (which used to take a fifth of thread exit).
     pub fn cpu_self(&self) -> CpuTime {
@@ -310,6 +297,19 @@ impl Task {
             .unwrap_or(0)
             .saturating_sub(self.cpu_base.get().1);
         self.cpu_adjust(total_ns, sys_ns)
+    }
+
+    /// The CPU time the thread has used (nanoseconds), counted by the host thread's CPU time.
+    pub fn cpu_ns(&self) -> u64 {
+        self.host_cpu_ns().saturating_sub(self.cpu_base.get().0)
+    }
+
+    /// The CPU time the host thread has used in total (nanoseconds).
+    fn host_cpu_ns(&self) -> u64 {
+        self.clock
+            .get()
+            .and_then(|c| appine_hal::clock_gettime(c).ok())
+            .map_or(0, |(s, ns)| s as u64 * 1_000_000_000 + ns as u64)
     }
 
     /// Keeps user and kernel time each from going backwards (Linux's `cputime_adjust`). User time
@@ -838,39 +838,6 @@ fn invalidate_code(cx: &mut Cx<'_>, pages: &[u64]) {
     mm.sync(&sync);
 }
 
-/// The thread leaves its address space (exit, execve): processes the robust futex list, zeroes
-/// `clear_child_tid` and wakes the threads waiting for it (pthread_join), lets the vfork parent
-/// continue, and deregisters it from the users.
-pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
-    let (head, _) = task.robust_list.replace((0, 0));
-    // The lock records the tid the thread itself sees (in its pid namespace)
-    let tid = st.group.borrow().pid_ns.vnr(task.tid.get()).unwrap_or(0);
-    let mut futexes = shared.futexes();
-    crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, tid as u32);
-    let addr = std::mem::take(&mut st.clear_child_tid);
-    {
-        let mm = st.mm.borrow();
-        // As in Linux's mm_release, no notification is needed when nobody else uses the address
-        // space
-        if addr != 0
-            && mm.shared_with_others()
-            && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
-            && let Some(key) = mm.futex_key(addr)
-        {
-            futexes.wake(key, 1, u32::MAX);
-        }
-    }
-    drop(futexes);
-    // The parent waits only for the direct notification: this used to wake every waiter, so each
-    // posix_spawn (musl and glibc both use CLONE_VFORK) woke every thread reading a pipe and
-    // parked in poll
-    if let Some((done, parent)) = st.vfork_done.take() {
-        done.set(true);
-        crate::kernel::signal_later(&parent);
-    }
-    st.mm.borrow_mut().remove_user(&task.sync);
-}
-
 /// Thread exit: releases its resources; when it is the last thread of the thread group, ends the
 /// whole process. `pc` is the thread's last guest pc.
 ///
@@ -1008,4 +975,37 @@ fn add_stats(total: &mut DbtStats, s: &DbtStats) {
     total.blocks_shared += s.blocks_shared;
     total.insns_grouped += s.insns_grouped;
     total.ungrouped += s.ungrouped;
+}
+
+/// The thread leaves its address space (exit, execve): processes the robust futex list, zeroes
+/// `clear_child_tid` and wakes the threads waiting for it (pthread_join), lets the vfork parent
+/// continue, and deregisters it from the users.
+pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
+    let (head, _) = task.robust_list.replace((0, 0));
+    // The lock records the tid the thread itself sees (in its pid namespace)
+    let tid = st.group.borrow().pid_ns.vnr(task.tid.get()).unwrap_or(0);
+    let mut futexes = shared.futexes();
+    crate::futex::exit_robust_list(&mut futexes, &st.mm.borrow(), head, tid as u32);
+    let addr = std::mem::take(&mut st.clear_child_tid);
+    {
+        let mm = st.mm.borrow();
+        // As in Linux's mm_release, no notification is needed when nobody else uses the address
+        // space
+        if addr != 0
+            && mm.shared_with_others()
+            && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
+            && let Some(key) = mm.futex_key(addr)
+        {
+            futexes.wake(key, 1, u32::MAX);
+        }
+    }
+    drop(futexes);
+    // The parent waits only for the direct notification: this used to wake every waiter, so each
+    // posix_spawn (musl and glibc both use CLONE_VFORK) woke every thread reading a pipe and
+    // parked in poll
+    if let Some((done, parent)) = st.vfork_done.take() {
+        done.set(true);
+        crate::kernel::signal_later(&parent);
+    }
+    st.mm.borrow_mut().remove_user(&task.sync);
 }

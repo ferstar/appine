@@ -8,18 +8,6 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("APPINE_LOG").is_some_and(|v| !v.is_empty() && v != "0"))
-}
-
-/// The moment of the first call, the zero point of the trace output.
-fn epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
-}
-
 /// When the syscall started; None when tracing is off.
 pub(crate) fn trace_start() -> Option<Instant> {
     tracing().then(|| {
@@ -53,6 +41,12 @@ pub(crate) fn trace_syscall(
     }
 }
 
+/// The moment of the first call, the zero point of the trace output.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
 /// Records an unimplemented syscall, as input for deciding which syscalls to add next.
 pub(crate) fn unimplemented_syscall(nr: u64) {
     if enabled() {
@@ -65,4 +59,10 @@ pub(crate) fn log(args: fmt::Arguments<'_>) {
     if enabled() {
         eprintln!("appine: {args}");
     }
+}
+
+fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("APPINE_LOG").is_some_and(|v| !v.is_empty() && v != "0"))
 }

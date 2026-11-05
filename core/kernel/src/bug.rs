@@ -47,15 +47,7 @@ use crate::kernel::{Kernel, Tid};
 use crate::process::{ExitStatus, Signal};
 use crate::task::Task;
 
-/// Hitting a bug ends only the guest process, instead of terminating the host process.
-pub(crate) fn contain() -> bool {
-    static CONTAIN: OnceLock<bool> = OnceLock::new();
-    *CONTAIN.get_or_init(|| match std::env::var("APPINE_ON_BUG").as_deref() {
-        Ok("kill") => true,
-        Ok("abort") => false,
-        _ => !cfg!(debug_assertions),
-    })
-}
+// ---- Catching panics ----
 
 thread_local! {
     /// This thread's latest panic message and location ([`install_panic_hook`]), not yet written
@@ -104,20 +96,18 @@ pub(crate) fn install_panic_hook() {
     });
 }
 
-/// Takes this thread's latest panic message and location ([`install_panic_hook`]).
-fn take_panic() -> Option<String> {
-    LAST_PANIC
-        .try_with(|p| p.try_borrow_mut().ok()?.take())
-        .ok()
-        .flatten()
-}
-
-/// `what` followed by the message and location of the panic this thread just had (if any).
-fn with_panic(what: fmt::Arguments<'_>) -> String {
-    match take_panic() {
-        Some(panic) => format!("{what}: {panic}"),
-        None => what.to_string(),
+/// Runs the kernel code in host call `what` (a [`crate::Machine`] method or another public
+/// function of this library): on a kernel-layer panic it reports and returns None, and the caller
+/// returns an error.
+pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
+    let r = catch(|| {
+        trap(Trap::HostCall, HOST);
+        f()
+    });
+    if r.is_none() {
+        report(format_args!("kernel panic in {what}"));
     }
+    r
 }
 
 /// Runs kernel code `f`, catching panics in it: returns None, leaving the cleanup to the caller
@@ -134,19 +124,17 @@ pub(crate) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
     }
 }
 
-/// Runs the kernel code in host call `what` (a [`crate::Machine`] method or another public
-/// function of this library): on a kernel-layer panic it reports and returns None, and the caller
-/// returns an error.
-pub(crate) fn host_call<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
-    let r = catch(|| {
-        trap(Trap::HostCall, HOST);
-        f()
-    });
-    if r.is_none() {
-        report(format_args!("kernel panic in {what}"));
-    }
-    r
+/// Hitting a bug ends only the guest process, instead of terminating the host process.
+pub(crate) fn contain() -> bool {
+    static CONTAIN: OnceLock<bool> = OnceLock::new();
+    *CONTAIN.get_or_init(|| match std::env::var("APPINE_ON_BUG").as_deref() {
+        Ok("kill") => true,
+        Ok("abort") => false,
+        _ => !cfg!(debug_assertions),
+    })
 }
+
+// ---- Ending processes and kill reports ----
 
 /// The kernel layer ended a guest process (the app uses this to explain why in its tab; the
 /// android/service map, design doc §12 item 5).
@@ -182,30 +170,8 @@ pub enum KillReason {
 /// The most reports kept; the oldest is dropped when the app has not taken them in time.
 const MAX_KILLS: usize = 32;
 
-/// Records the report of ending process `tgid`, for the app to take.
-pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReason) {
-    // On hitting a bug the thread group may be borrowed: if it cannot be borrowed, take it to have
-    // no controlling terminal, and record the report all the same
-    let console = k.groups.get(&tgid).and_then(|g| {
-        let tty = g.try_borrow().ok()?.ctty.clone()?;
-        k.consoles
-            .iter()
-            .find(|(_, c)| Rc::ptr_eq(&c.master.tty, &tty))
-            .map(|(id, _)| *id)
-    });
-    let Ok(mut kills) = k.kills.try_borrow_mut() else {
-        return;
-    };
-    if kills.len() >= MAX_KILLS {
-        kills.remove(0);
-    }
-    kills.push(KillReport {
-        pid: tgid,
-        comm,
-        console,
-        reason,
-    });
-}
+/// The report handed to the app carries this many records before it in the kernel log.
+const LOG_BEFORE: u64 = 10;
 
 /// Ends the process of the thread that hit a bug: reports `what` and ends the whole thread group
 /// with SIGSEGV. `pc` is the guest pc at this thread's last entry into the kernel.
@@ -242,8 +208,26 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
     segv(k, tgid);
 }
 
-/// The report handed to the app carries this many records before it in the kernel log.
-const LOG_BEFORE: u64 = 10;
+/// Reports a bug that cannot be attributed to a guest process.
+pub(crate) fn report(what: fmt::Arguments<'_>) {
+    eprintln!("appine: internal error: {}", with_panic(what));
+}
+
+/// `what` followed by the message and location of the panic this thread just had (if any).
+fn with_panic(what: fmt::Arguments<'_>) -> String {
+    match take_panic() {
+        Some(panic) => format!("{what}: {panic}"),
+        None => what.to_string(),
+    }
+}
+
+/// Takes this thread's latest panic message and location ([`install_panic_hook`]).
+fn take_panic() -> Option<String> {
+    LAST_PANIC
+        .try_with(|p| p.try_borrow_mut().ok()?.take())
+        .ok()
+        .flatten()
+}
 
 /// The report of ending a process also goes into the kernel log ([`crate::klog`]), so `dmesg` in
 /// the guest shows why the process ended with SIGSEGV. Linux's oops uses KERN_EMERG, since the
@@ -268,9 +252,29 @@ fn log(k: &Kernel, report: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reports a bug that cannot be attributed to a guest process.
-pub(crate) fn report(what: fmt::Arguments<'_>) {
-    eprintln!("appine: internal error: {}", with_panic(what));
+/// Records the report of ending process `tgid`, for the app to take.
+pub(crate) fn record_kill(k: &Kernel, tgid: Tid, comm: String, reason: KillReason) {
+    // On hitting a bug the thread group may be borrowed: if it cannot be borrowed, take it to have
+    // no controlling terminal, and record the report all the same
+    let console = k.groups.get(&tgid).and_then(|g| {
+        let tty = g.try_borrow().ok()?.ctty.clone()?;
+        k.consoles
+            .iter()
+            .find(|(_, c)| Rc::ptr_eq(&c.master.tty, &tty))
+            .map(|(id, _)| *id)
+    });
+    let Ok(mut kills) = k.kills.try_borrow_mut() else {
+        return;
+    };
+    if kills.len() >= MAX_KILLS {
+        kills.remove(0);
+    }
+    kills.push(KillReport {
+        pid: tgid,
+        comm,
+        console,
+        reason,
+    });
 }
 
 fn segv(k: &Kernel, tgid: Tid) {
@@ -284,6 +288,8 @@ fn segv(k: &Kernel, tgid: Tid) {
         crate::signal::group_exit(k, group, status);
     }
 }
+
+// ---- Test hooks ----
 
 /// Places where the test hooks can plant bugs ([`trap`]).
 #[derive(Debug, Clone, Copy)]
@@ -318,6 +324,19 @@ static FINISH_STEP: AtomicU32 = AtomicU32::new(0);
 /// Host calls belong to no guest process; this number is used when planting for them.
 pub(crate) const HOST: Tid = -1;
 
+/// Step `step` of process `tgid`'s finish: panics, once only, when a test hook has planted a bug on
+/// this step for it.
+#[inline]
+pub(crate) fn trap_finish(tgid: Tid, step: u32) {
+    #[cfg(any(debug_assertions, feature = "test-hooks"))]
+    if FINISH_STEP.load(Ordering::Relaxed) != step {
+        return;
+    }
+    #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
+    let _ = step;
+    trap(Trap::Finish, tgid);
+}
+
 /// Panics, once only, when a test hook has planted a bug on `at` for `id` (a tid, a pid or
 /// [`HOST`]). Does nothing in builds without test hooks.
 #[inline]
@@ -335,19 +354,6 @@ pub(crate) fn trap(at: Trap, id: Tid) {
     }
     #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
     let _ = (at, id);
-}
-
-/// Step `step` of process `tgid`'s finish: panics, once only, when a test hook has planted a bug on
-/// this step for it.
-#[inline]
-pub(crate) fn trap_finish(tgid: Tid, step: u32) {
-    #[cfg(any(debug_assertions, feature = "test-hooks"))]
-    if FINISH_STEP.load(Ordering::Relaxed) != step {
-        return;
-    }
-    #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
-    let _ = step;
-    trap(Trap::Finish, tgid);
 }
 
 /// The test hook's syscall number, far outside Linux's numbers. Exists only in debug builds and in

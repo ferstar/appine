@@ -80,33 +80,6 @@ pub enum Stdio {
 static RUNNING: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<Shared>)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// The host changed `changes` in store `store`: hands them to the running kernels that use it,
-/// each of which reports inotify events as the matching syscall would, with the BKL held
-/// ([`crate::syscall::host_change`]).
-pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::browse::Change]) {
-    if changes.is_empty() {
-        return;
-    }
-    let dir = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
-    let kernels: Vec<Arc<Shared>> = {
-        let mut running = RUNNING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        running.retain(|(_, w)| w.strong_count() > 0);
-        running
-            .iter()
-            .filter(|(d, _)| *d == dir)
-            .filter_map(|(_, w)| w.upgrade())
-            .collect()
-    };
-    for shared in kernels {
-        let k = shared.lock();
-        for c in changes {
-            crate::syscall::host_change(&k, c);
-        }
-    }
-}
-
 /// A guest kernel instance. Dropping it ends every guest process.
 pub struct Machine {
     shared: Arc<Shared>,
@@ -185,6 +158,42 @@ impl Machine {
             shared,
             timers: Some(timers),
         })
+    }
+
+    /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit (waited for), boot and
+    /// bootwait together in file order (only bootwait waited for), and the default runlevel's
+    /// wait (waited for) and once (not waited for), with output written to
+    /// [`crate::inittab::LOG`]. On return the boot and once commands may still be running. Does
+    /// nothing without an inittab or a store. From the start of boot the built-in init accepts
+    /// busybox's reboot, halt and poweroff requests ([`Machine::take_power`]).
+    pub fn boot(&self) {
+        self.shared.lock().init_handlers = true;
+        let entries = self.inittab();
+        let mut first = true;
+        for (process, wait) in crate::inittab::boot_plan(&entries) {
+            if self.shared.lock().stopping {
+                break;
+            }
+            let Some(pid) = self.run_init_process(&process, first) else {
+                continue;
+            };
+            first = false;
+            if wait {
+                self.wait(pid);
+            }
+        }
+        // No command ran at all (OpenRC not installed): the previous boot's output is not kept, so
+        // it is not taken for this boot's (the app looks in it for services that failed to start)
+        if first {
+            crate::bug::host_call("Machine::boot", || {
+                let k = self.shared.lock();
+                let Some(vfs) = &k.vfs else { return };
+                let log = crate::inittab::LOG.as_bytes();
+                if crate::vfs::read_file(vfs.store(), log).is_ok_and(|t| !t.is_empty()) {
+                    let _ = crate::vfs::write_file(vfs.store(), log, b"", 0o644, true);
+                }
+            });
+        }
     }
 
     /// Starts a new process (a child of init) and returns its pid. With a store, `program` is a
@@ -351,80 +360,6 @@ impl Machine {
         Ok(tid as u32)
     }
 
-    /// Checks `cond` repeatedly with the BKL held until it gives a result.
-    fn wait_for<T>(&self, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
-        self.wait_on(wake::ALL, cond)
-    }
-
-    /// The same as [`Machine::wait_for`], but woken only by the channels in `interest` ([`wake`]).
-    fn wait_on<T>(&self, interest: u32, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
-        self.wait_objects(interest, None, cond)
-    }
-
-    /// The same as [`Machine::wait_on`]; when `objects` is not None, changes that affect only other
-    /// objects do not wake it ([`crate::kernel::Cx::wait_objects`]).
-    fn wait_objects<T>(
-        &self,
-        interest: u32,
-        objects: Option<&[wake::Object]>,
-        cond: impl FnMut(&mut Kernel) -> Option<T>,
-    ) -> T {
-        self.wait_deadline(interest, objects, None, cond)
-            .expect("waited without a deadline")
-    }
-
-    /// The same as [`Machine::wait_on`], returning None if nothing comes by `deadline`.
-    fn wait_until<T>(
-        &self,
-        interest: u32,
-        deadline: Option<std::time::Instant>,
-        cond: impl FnMut(&mut Kernel) -> Option<T>,
-    ) -> Option<T> {
-        self.wait_deadline(interest, None, deadline, cond)
-    }
-
-    fn wait_deadline<T>(
-        &self,
-        interest: u32,
-        objects: Option<&[wake::Object]>,
-        deadline: Option<std::time::Instant>,
-        mut cond: impl FnMut(&mut Kernel) -> Option<T>,
-    ) -> Option<T> {
-        EVENT.with(|event| {
-            let mut k = self.shared.lock();
-            loop {
-                if let Some(v) = cond(&mut k) {
-                    return Some(v);
-                }
-                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    return None;
-                }
-                let (k2, _) =
-                    block_for(&self.shared, k, event, deadline, &mut [], interest, objects);
-                k = k2;
-            }
-        })
-    }
-
-    /// Waits for a process started by [`Machine::spawn`] to end.
-    pub fn wait(&self, pid: u32) -> ExitStatus {
-        // This needs waking only when a process the host waits for ends; other processes ending
-        // and files closing need not wake it
-        self.wait_on(wake::WATCHED, |k| {
-            k.watched.get(&(pid as i32)).copied().flatten()
-        })
-    }
-
-    /// Returns how a process started by [`Machine::spawn`] ended, if it has.
-    pub fn try_wait(&self, pid: u32) -> Option<ExitStatus> {
-        self.shared
-            .lock()
-            .watched
-            .get(&(pid as i32))
-            .copied()
-            .flatten()
-    }
-
     /// Creates a console and returns its PTY number (`/dev/pts/<number>`).
     pub fn open_console(&self, rows: u16, cols: u16) -> Result<u32, Errno> {
         self.open_console_with(Winsize {
@@ -502,62 +437,80 @@ impl Machine {
         .unwrap_or(Err(Errno::EIO))
     }
 
-    /// Ends every guest process and waits for every guest thread to exit.
-    pub fn kill_all(&self) {
-        crate::bug::host_call("Machine::kill_all", || {
-            let mut k = self.shared.lock();
-            k.stopping = true;
-            let groups: Vec<_> = k.groups.values().cloned().collect();
-            for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
-                signal::group_exit(
-                    &k,
-                    g,
-                    ExitStatus::Signaled {
-                        signal: Signal::KILL,
-                        pc: None,
-                        fault_addr: None,
-                        core_dumped: false,
-                    },
-                );
-            }
-        });
-        self.wait_for(|k| k.tasks.is_empty().then_some(()));
+    /// The current directory of console `id`'s foreground process group (when the app restores
+    /// tabs after being killed, the new shell starts here; the android/service map). ESRCH if the
+    /// shell has already exited.
+    pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
+            .unwrap_or(Err(Errno::EIO))
     }
 
-    /// Boots from `/etc/inittab` ([`crate::inittab`]): runs in order sysinit (waited for), boot and
-    /// bootwait together in file order (only bootwait waited for), and the default runlevel's
-    /// wait (waited for) and once (not waited for), with output written to
-    /// [`crate::inittab::LOG`]. On return the boot and once commands may still be running. Does
-    /// nothing without an inittab or a store. From the start of boot the built-in init accepts
-    /// busybox's reboot, halt and poweroff requests ([`Machine::take_power`]).
-    pub fn boot(&self) {
-        self.shared.lock().init_handlers = true;
-        let entries = self.inittab();
-        let mut first = true;
-        for (process, wait) in crate::inittab::boot_plan(&entries) {
-            if self.shared.lock().stopping {
-                break;
+    /// Waits for a process started by [`Machine::spawn`] to end.
+    pub fn wait(&self, pid: u32) -> ExitStatus {
+        // This needs waking only when a process the host waits for ends; other processes ending
+        // and files closing need not wake it
+        self.wait_on(wake::WATCHED, |k| {
+            k.watched.get(&(pid as i32)).copied().flatten()
+        })
+    }
+
+    /// Returns how a process started by [`Machine::spawn`] ended, if it has.
+    pub fn try_wait(&self, pid: u32) -> Option<ExitStatus> {
+        self.shared
+            .lock()
+            .watched
+            .get(&(pid as i32))
+            .copied()
+            .flatten()
+    }
+
+    /// Waits for a process started by [`Machine::spawn`] to end, or for the guest to request
+    /// shutdown ([`Machine::take_power`]; the request is not taken).
+    pub fn wait_or_power(&self, pid: u32) -> Result<ExitStatus, crate::Power> {
+        self.wait_on(wake::WATCHED, |k| match k.watched.get(&(pid as i32)) {
+            Some(Some(status)) => Some(Ok(*status)),
+            _ => k.power.map(Err),
+        })
+    }
+
+    /// Host memory is tight and the app's UI has been away for a while (the android/service map):
+    /// drops caches that can be rebuilt, that is the Tier 1 translations kept in the pool, the
+    /// shared read-only file mappings and the dentry/inode caches (those in use by running
+    /// processes are left alone). The app is most likely in the background then and may be killed
+    /// at any time, so deferred write transactions are committed too.
+    pub fn trim_memory(&self) {
+        crate::debug::log(format_args!("trimming memory"));
+        appine_engine::trim_dbt_pool();
+        crate::bug::host_call("Machine::trim_memory", || {
+            let k = self.shared.lock();
+            k.file_maps.clear();
+            if let Some(vfs) = &k.vfs {
+                vfs.trim();
             }
-            let Some(pid) = self.run_init_process(&process, first) else {
-                continue;
-            };
-            first = false;
-            if wait {
-                self.wait(pid);
+        });
+        self.sync();
+    }
+
+    /// The host's network changed (the kernel/net map): the routes in the main table become
+    /// `routes`, which the guest's `ip route`, `/proc/net/route` and so on then see
+    /// ([`crate::route`]). On Android the app cannot read the host routing table, so it takes the
+    /// routes from the default network's `LinkProperties` and passes them in; None switches back to
+    /// reading the host's, synthesised from the interface addresses when that cannot be read.
+    pub fn set_routes(&self, routes: Option<Vec<crate::HostRoute>>) {
+        crate::bug::host_call("Machine::set_routes", || {
+            self.shared.lock().host_routes = routes;
+        });
+    }
+
+    /// Commits the inode store's deferred write transactions (when the app goes to the background,
+    /// [`crate::vfs::store`]).
+    pub fn sync(&self) {
+        crate::bug::host_call("Machine::sync", || {
+            if let Some(vfs) = &self.shared.lock().vfs {
+                let _ = vfs.store().commit();
             }
-        }
-        // No command ran at all (OpenRC not installed): the previous boot's output is not kept, so
-        // it is not taken for this boot's (the app looks in it for services that failed to start)
-        if first {
-            crate::bug::host_call("Machine::boot", || {
-                let k = self.shared.lock();
-                let Some(vfs) = &k.vfs else { return };
-                let log = crate::inittab::LOG.as_bytes();
-                if crate::vfs::read_file(vfs.store(), log).is_ok_and(|t| !t.is_empty()) {
-                    let _ = crate::vfs::write_file(vfs.store(), log, b"", 0o644, true);
-                }
-            });
-        }
+        });
     }
 
     /// Shuts down (busybox init's `run_shutdown_and_kill_processes`): if it has booted, first runs
@@ -599,44 +552,6 @@ impl Machine {
             k.tasks.is_empty().then_some(())
         });
         self.kill_all();
-    }
-
-    /// The current directory of console `id`'s foreground process group (when the app restores
-    /// tabs after being killed, the new shell starts here; the android/service map). ESRCH if the
-    /// shell has already exited.
-    pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
-        let k = self.shared.lock();
-        crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
-            .unwrap_or(Err(Errno::EIO))
-    }
-
-    /// The number of guest processes still running (not counting the built-in init and zombies):
-    /// after the last tab is closed the app uses it to decide whether to stay in the background or
-    /// exit (the android/service map).
-    pub fn processes(&self) -> usize {
-        let k = self.shared.lock();
-        k.groups
-            .values()
-            .filter(|g| {
-                let g = g.borrow();
-                g.tgid != INIT && !g.threads.is_empty()
-            })
-            .count()
-    }
-
-    /// Takes the shutdown request the guest sent to the built-in init (busybox's reboot, halt,
-    /// poweroff). Only present after [`Machine::boot`].
-    pub fn take_power(&self) -> Option<crate::Power> {
-        self.shared.lock().power.take()
-    }
-
-    /// Waits for a process started by [`Machine::spawn`] to end, or for the guest to request
-    /// shutdown ([`Machine::take_power`]; the request is not taken).
-    pub fn wait_or_power(&self, pid: u32) -> Result<ExitStatus, crate::Power> {
-        self.wait_on(wake::WATCHED, |k| match k.watched.get(&(pid as i32)) {
-            Some(Some(status)) => Some(Ok(*status)),
-            _ => k.power.map(Err),
-        })
     }
 
     /// Reads `/etc/inittab` (following symlinks); an empty table if there is none. Read with the
@@ -711,43 +626,46 @@ impl Machine {
         }
     }
 
-    /// Host memory is tight and the app's UI has been away for a while (the android/service map):
-    /// drops caches that can be rebuilt, that is the Tier 1 translations kept in the pool, the
-    /// shared read-only file mappings and the dentry/inode caches (those in use by running
-    /// processes are left alone). The app is most likely in the background then and may be killed
-    /// at any time, so deferred write transactions are committed too.
-    pub fn trim_memory(&self) {
-        crate::debug::log(format_args!("trimming memory"));
-        appine_engine::trim_dbt_pool();
-        crate::bug::host_call("Machine::trim_memory", || {
-            let k = self.shared.lock();
-            k.file_maps.clear();
-            if let Some(vfs) = &k.vfs {
-                vfs.trim();
+    /// Ends every guest process and waits for every guest thread to exit.
+    pub fn kill_all(&self) {
+        crate::bug::host_call("Machine::kill_all", || {
+            let mut k = self.shared.lock();
+            k.stopping = true;
+            let groups: Vec<_> = k.groups.values().cloned().collect();
+            for g in groups.iter().filter(|g| !g.borrow().threads.is_empty()) {
+                signal::group_exit(
+                    &k,
+                    g,
+                    ExitStatus::Signaled {
+                        signal: Signal::KILL,
+                        pc: None,
+                        fault_addr: None,
+                        core_dumped: false,
+                    },
+                );
             }
         });
-        self.sync();
+        self.wait_for(|k| k.tasks.is_empty().then_some(()));
     }
 
-    /// The host's network changed (the kernel/net map): the routes in the main table become
-    /// `routes`, which the guest's `ip route`, `/proc/net/route` and so on then see
-    /// ([`crate::route`]). On Android the app cannot read the host routing table, so it takes the
-    /// routes from the default network's `LinkProperties` and passes them in; None switches back to
-    /// reading the host's, synthesised from the interface addresses when that cannot be read.
-    pub fn set_routes(&self, routes: Option<Vec<crate::HostRoute>>) {
-        crate::bug::host_call("Machine::set_routes", || {
-            self.shared.lock().host_routes = routes;
-        });
+    /// Takes the shutdown request the guest sent to the built-in init (busybox's reboot, halt,
+    /// poweroff). Only present after [`Machine::boot`].
+    pub fn take_power(&self) -> Option<crate::Power> {
+        self.shared.lock().power.take()
     }
 
-    /// Commits the inode store's deferred write transactions (when the app goes to the background,
-    /// [`crate::vfs::store`]).
-    pub fn sync(&self) {
-        crate::bug::host_call("Machine::sync", || {
-            if let Some(vfs) = &self.shared.lock().vfs {
-                let _ = vfs.store().commit();
-            }
-        });
+    /// The number of guest processes still running (not counting the built-in init and zombies):
+    /// after the last tab is closed the app uses it to decide whether to stay in the background or
+    /// exit (the android/service map).
+    pub fn processes(&self) -> usize {
+        let k = self.shared.lock();
+        k.groups
+            .values()
+            .filter(|g| {
+                let g = g.borrow();
+                g.tgid != INIT && !g.threads.is_empty()
+            })
+            .count()
     }
 
     /// Takes the ports the guest first listened on at non-loopback addresses (design doc §12 item
@@ -793,20 +711,61 @@ impl Machine {
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
     }
-}
 
-/// Runs a host call on console `id`. On a kernel-layer panic the console is closed as if the
-/// terminal were hung up (the session leader gets SIGHUP), and EIO is returned.
-fn on_console<T>(
-    k: &mut Kernel,
-    id: u32,
-    what: &str,
-    f: impl FnOnce(&mut Kernel) -> Result<T, Errno>,
-) -> Result<T, Errno> {
-    crate::bug::host_call(what, || f(k)).unwrap_or_else(|| {
-        let _ = crate::bug::host_call("Machine::close_console", || terminal::close(k, id));
-        Err(Errno::EIO)
-    })
+    /// Checks `cond` repeatedly with the BKL held until it gives a result.
+    fn wait_for<T>(&self, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+        self.wait_on(wake::ALL, cond)
+    }
+
+    /// The same as [`Machine::wait_for`], but woken only by the channels in `interest` ([`wake`]).
+    fn wait_on<T>(&self, interest: u32, cond: impl FnMut(&mut Kernel) -> Option<T>) -> T {
+        self.wait_objects(interest, None, cond)
+    }
+
+    /// The same as [`Machine::wait_on`]; when `objects` is not None, changes that affect only other
+    /// objects do not wake it ([`crate::kernel::Cx::wait_objects`]).
+    fn wait_objects<T>(
+        &self,
+        interest: u32,
+        objects: Option<&[wake::Object]>,
+        cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> T {
+        self.wait_deadline(interest, objects, None, cond)
+            .expect("waited without a deadline")
+    }
+
+    /// The same as [`Machine::wait_on`], returning None if nothing comes by `deadline`.
+    fn wait_until<T>(
+        &self,
+        interest: u32,
+        deadline: Option<std::time::Instant>,
+        cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> Option<T> {
+        self.wait_deadline(interest, None, deadline, cond)
+    }
+
+    fn wait_deadline<T>(
+        &self,
+        interest: u32,
+        objects: Option<&[wake::Object]>,
+        deadline: Option<std::time::Instant>,
+        mut cond: impl FnMut(&mut Kernel) -> Option<T>,
+    ) -> Option<T> {
+        EVENT.with(|event| {
+            let mut k = self.shared.lock();
+            loop {
+                if let Some(v) = cond(&mut k) {
+                    return Some(v);
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    return None;
+                }
+                let (k2, _) =
+                    block_for(&self.shared, k, event, deadline, &mut [], interest, objects);
+                k = k2;
+            }
+        })
+    }
 }
 
 impl Drop for Machine {
@@ -918,6 +877,20 @@ fn timers(shared: Arc<Shared>) {
     }
 }
 
+/// Runs a host call on console `id`. On a kernel-layer panic the console is closed as if the
+/// terminal were hung up (the session leader gets SIGHUP), and EIO is returned.
+fn on_console<T>(
+    k: &mut Kernel,
+    id: u32,
+    what: &str,
+    f: impl FnOnce(&mut Kernel) -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    crate::bug::host_call(what, || f(k)).unwrap_or_else(|| {
+        let _ = crate::bug::host_call("Machine::close_console", || terminal::close(k, id));
+        Err(Errno::EIO)
+    })
+}
+
 /// Loads a guest program and runs it until it ends, then ends the other processes
 /// (`appine-run`).
 ///
@@ -976,4 +949,31 @@ pub fn run(
         status,
         dbt_stats: machine.dbt_stats(),
     })
+}
+
+/// The host changed `changes` in store `store`: hands them to the running kernels that use it,
+/// each of which reports inotify events as the matching syscall would, with the BKL held
+/// ([`crate::syscall::host_change`]).
+pub(crate) fn store_changed(store: &std::path::Path, changes: &[crate::vfs::browse::Change]) {
+    if changes.is_empty() {
+        return;
+    }
+    let dir = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
+    let kernels: Vec<Arc<Shared>> = {
+        let mut running = RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.retain(|(_, w)| w.strong_count() > 0);
+        running
+            .iter()
+            .filter(|(d, _)| *d == dir)
+            .filter_map(|(_, w)| w.upgrade())
+            .collect()
+    };
+    for shared in kernels {
+        let k = shared.lock();
+        for c in changes {
+            crate::syscall::host_change(&k, c);
+        }
+    }
 }

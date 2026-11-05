@@ -18,27 +18,7 @@ use crate::pseudo::{NsKind, PseudoNode};
 use crate::task::FsContext;
 use crate::vfs::{MntNs, MountId, Node, Vfs, new_ns_id};
 
-/// Gives `fs` a new mount namespace owned by user namespace `owner`: copies every mount in the old
-/// one and moves the root and the current directory onto the copied mounts (Linux's
-/// `copy_mnt_ns`). Without a rootfs only the number changes.
-pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs>) {
-    let Some(vfs) = vfs else {
-        fs.mnt_ns = Rc::new(MntNs {
-            id: new_ns_id(),
-            owner,
-            anon: false,
-        });
-        return;
-    };
-    let (ns, map) = vfs.copy_ns(fs.mnt_ns.id, owner);
-    let remap = |n: &Node| match map.get(&n.mnt()) {
-        Some(&id) => n.clone().in_mount(id),
-        None => n.clone(),
-    };
-    fs.root = remap(&fs.root);
-    fs.cwd = remap(&fs.cwd);
-    fs.mnt_ns = ns;
-}
+// ---- Creating namespaces (clone, unshare) ----
 
 /// Creates a user namespace (Linux 6.1's `create_user_ns`) and moves `cred` into it: nesting goes
 /// up to level 33 at most (ENOSPC; older kernels give EUSERS), a chrooted process may not (EPERM),
@@ -62,6 +42,15 @@ pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> 
     Ok(())
 }
 
+/// The root directory is not the mount namespace's root (chrooted; Linux's `current_chrooted`).
+pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
+    let Ok(vfs) = cx.vfs() else {
+        return false;
+    };
+    vfs.ns_root(cx.mnt_ns())
+        .is_some_and(|root| root != cx.root())
+}
+
 /// Creates a pid namespace (Linux 6.1's `copy_pid_ns`, `create_pid_namespace`) under `parent` (the
 /// one new children are in), owned by user namespace `owner`: `parent` must be the caller's own
 /// namespace (EINVAL after unshare but before entering it), `owner` must be `parent`'s owner or
@@ -83,6 +72,28 @@ pub(super) fn new_pid_ns(
     Ok(PidNs::child(parent, owner))
 }
 
+/// Gives `fs` a new mount namespace owned by user namespace `owner`: copies every mount in the old
+/// one and moves the root and the current directory onto the copied mounts (Linux's
+/// `copy_mnt_ns`). Without a rootfs only the number changes.
+pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs>) {
+    let Some(vfs) = vfs else {
+        fs.mnt_ns = Rc::new(MntNs {
+            id: new_ns_id(),
+            owner,
+            anon: false,
+        });
+        return;
+    };
+    let (ns, map) = vfs.copy_ns(fs.mnt_ns.id, owner);
+    let remap = |n: &Node| match map.get(&n.mnt()) {
+        Some(&id) => n.clone().in_mount(id),
+        None => n.clone(),
+    };
+    fs.root = remap(&fs.root);
+    fs.cwd = remap(&fs.cwd);
+    fs.mnt_ns = ns;
+}
+
 /// A new cgroup namespace owned by user namespace `owner`, rooted at the caller's cgroup `root`.
 pub(super) fn new_cgroup_ns(owner: Rc<UserNs>, root: u64) -> Rc<crate::nsproxy::CgroupNs> {
     Rc::new(crate::nsproxy::CgroupNs {
@@ -92,56 +103,7 @@ pub(super) fn new_cgroup_ns(owner: Rc<UserNs>, root: u64) -> Rc<crate::nsproxy::
     })
 }
 
-/// The root directory is not the mount namespace's root (chrooted; Linux's `current_chrooted`).
-pub(super) fn chrooted(cx: &Cx<'_>) -> bool {
-    let Ok(vfs) = cx.vfs() else {
-        return false;
-    };
-    vfs.ns_root(cx.mnt_ns())
-        .is_some_and(|root| root != cx.root())
-}
-
-/// The pid namespace numbered `id` that still has processes in it (or below it), or that some
-/// thread uses for its children.
-fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
-    let up = |ns: Rc<PidNs>| {
-        let mut ns = Some(ns);
-        while let Some(n) = ns {
-            if n.id == id {
-                return Some(n);
-            }
-            ns = n.parent.clone();
-        }
-        None
-    };
-    k.groups
-        .values()
-        .find_map(|g| up(g.borrow().pid_ns.clone()))
-        .or_else(|| {
-            k.tasks
-                .values()
-                .find_map(|t| t.pid_ns_children.borrow().clone().and_then(up))
-        })
-}
-
-/// The UTS, IPC, network or cgroup namespace picked by `f` among those that still have threads.
-fn find_nsproxy<T>(k: &Kernel, f: impl Fn(&crate::nsproxy::NsProxy) -> Option<T>) -> Option<T> {
-    k.tasks.values().find_map(|t| f(&t.ns.borrow()))
-}
-
-/// The user namespace numbered `id` that still has processes in it (or below it).
-fn find_user_ns(k: &Kernel, id: u64) -> Option<Rc<UserNs>> {
-    k.groups.values().find_map(|g| {
-        let mut ns = Some(g.borrow().cred.user_ns.clone());
-        while let Some(n) = ns {
-            if n.id == id {
-                return Some(n);
-            }
-            ns = n.parent.clone();
-        }
-        None
-    })
-}
+// ---- Opening namespace files ----
 
 /// The namespace of kind `kind` numbered `id` (when opening a namespace file): one that still has
 /// threads in it (or below it), or one kept by a namespace file that is open or bind-mounted
@@ -181,37 +143,49 @@ pub(crate) fn find(k: &Kernel, vfs: Option<&Vfs>, kind: NsKind, id: u64) -> Opti
         })
 }
 
-/// setns(2) (Linux 6.1): `fd` is an open namespace file (`/proc/<pid>/ns/<kind>`, or one
-/// bind-mounted elsewhere), and `nstype` is 0 or its matching `CLONE_NEW*`; or `fd` is a pidfd and
-/// `nstype` is the kinds of that process's namespaces to switch to (not 0), all at once. An open
-/// namespace file keeps its namespace alive, so it can be entered even after all its processes
-/// have exited.
-pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
-    let file = cx.fds().get(fd)?;
-    let nstype = nstype as u32 as u64;
-    let (flags, set) = match &file.borrow().kind {
-        FileKind::Proc {
-            node: PseudoNode::NsFile(kind, _),
-            ns: Some(ns),
-            ..
-        } => {
-            if nstype != 0 && nstype != kind.clone_flag() {
-                return Err(Errno::EINVAL);
+/// The user namespace numbered `id` that still has processes in it (or below it).
+fn find_user_ns(k: &Kernel, id: u64) -> Option<Rc<UserNs>> {
+    k.groups.values().find_map(|g| {
+        let mut ns = Some(g.borrow().cred.user_ns.clone());
+        while let Some(n) = ns {
+            if n.id == id {
+                return Some(n);
             }
-            (kind.clone_flag(), NsSet::one(ns.clone()))
+            ns = n.parent.clone();
         }
-        FileKind::Pidfd(p) => {
-            if nstype == 0 || nstype & !super::proc::CLONE_NEW_MASK != 0 {
-                return Err(Errno::EINVAL);
-            }
-            (nstype, NsSet::of(cx, p, nstype)?)
-        }
-        _ => return Err(Errno::EINVAL),
-    };
-    let root = validate(cx, &set, flags)?;
-    commit(cx, set, root);
-    Ok(0)
+        None
+    })
 }
+
+/// The pid namespace numbered `id` that still has processes in it (or below it), or that some
+/// thread uses for its children.
+fn find_pid_ns(k: &Kernel, id: u64) -> Option<Rc<PidNs>> {
+    let up = |ns: Rc<PidNs>| {
+        let mut ns = Some(ns);
+        while let Some(n) = ns {
+            if n.id == id {
+                return Some(n);
+            }
+            ns = n.parent.clone();
+        }
+        None
+    };
+    k.groups
+        .values()
+        .find_map(|g| up(g.borrow().pid_ns.clone()))
+        .or_else(|| {
+            k.tasks
+                .values()
+                .find_map(|t| t.pid_ns_children.borrow().clone().and_then(up))
+        })
+}
+
+/// The UTS, IPC, network or cgroup namespace picked by `f` among those that still have threads.
+fn find_nsproxy<T>(k: &Kernel, f: impl Fn(&crate::nsproxy::NsProxy) -> Option<T>) -> Option<T> {
+    k.tasks.values().find_map(|t| f(&t.ns.borrow()))
+}
+
+// ---- setns ----
 
 /// The namespaces setns switches to (Linux's `struct nsset`): only the one kind for a namespace
 /// file, the requested kinds of that process's for a pidfd.
@@ -268,6 +242,38 @@ impl NsSet {
             time: want(NsKind::Time).then(|| ns.time.clone()),
         })
     }
+}
+
+/// setns(2) (Linux 6.1): `fd` is an open namespace file (`/proc/<pid>/ns/<kind>`, or one
+/// bind-mounted elsewhere), and `nstype` is 0 or its matching `CLONE_NEW*`; or `fd` is a pidfd and
+/// `nstype` is the kinds of that process's namespaces to switch to (not 0), all at once. An open
+/// namespace file keeps its namespace alive, so it can be entered even after all its processes
+/// have exited.
+pub(super) fn setns(cx: &mut Cx<'_>, fd: i32, nstype: i32) -> SysResult {
+    let file = cx.fds().get(fd)?;
+    let nstype = nstype as u32 as u64;
+    let (flags, set) = match &file.borrow().kind {
+        FileKind::Proc {
+            node: PseudoNode::NsFile(kind, _),
+            ns: Some(ns),
+            ..
+        } => {
+            if nstype != 0 && nstype != kind.clone_flag() {
+                return Err(Errno::EINVAL);
+            }
+            (kind.clone_flag(), NsSet::one(ns.clone()))
+        }
+        FileKind::Pidfd(p) => {
+            if nstype == 0 || nstype & !super::proc::CLONE_NEW_MASK != 0 {
+                return Err(Errno::EINVAL);
+            }
+            (nstype, NsSet::of(cx, p, nstype)?)
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    let root = validate(cx, &set, flags)?;
+    commit(cx, set, root);
+    Ok(0)
 }
 
 /// Checks, in Linux's order (user, mount, UTS, IPC, pid, cgroup, network, time), whether each kind
@@ -405,6 +411,8 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
         cx.shared.fast_changed();
     }
 }
+
+// ---- ioctls on namespace files ----
 
 const NS_GET_USERNS: u32 = 0xb701;
 const NS_GET_PARENT: u32 = 0xb702;
