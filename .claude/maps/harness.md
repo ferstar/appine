@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: difftest fails a case it did not run or that no lane reported; removed the bug)
+> Maintained: 2026-11-05 (targeted verification: rust-analyzer added to the toolchain file and the dev image; components must match)
 
 ## Responsibilities
 
@@ -147,10 +147,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ### Development container and CI
 
-- `scripts/dev` runs a command in `rust:1.90.0-slim-trixie` plus rustfmt, clippy, llvm, clang and
-  musl-tools, as root, with the repository at `/work`, `CARGO_TARGET_DIR=/work/target/linux-arm64`,
-  volumes for the cargo registry and `/ltp`, `nice` up to 40, the Docker daemon's proxy, `-it` only
-  when attached to a terminal, and only `APPINE_DBT_REGS` forwarded.
+- `scripts/dev` runs a command in `rust:1.90.0-slim-trixie` plus rustfmt, clippy, rust-analyzer,
+  llvm, clang and musl-tools, as root, with the repository at `/work`,
+  `CARGO_TARGET_DIR=/work/target/linux-arm64`, volumes for the cargo registry and `/ltp`, `nice` up
+  to 40, the Docker daemon's proxy, `-it` only when attached to a terminal, and only
+  `APPINE_DBT_REGS` forwarded.
 - CI, Linux arm64 (`ubuntu-24.04-arm`): fmt, clippy (`-D warnings`), fetch the rootfs, `cargo test
   --workspace` with the require switches, the network test, a long lockstep run, release build and
   `appine-bench --runs 3 --skip-tier0`, `scripts/difftest` at Tier 1 with one lane, and the
@@ -186,6 +187,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   only when it started before `ls` read `/proc`, which differs run to run on either side (the
   `bwrap` case failed this way in CI); a shell glob (`set -- /proc/[0-9]*; echo $#`) starts no
   process.
+- The rustup components in `scripts/dev.Dockerfile` must match those in `rust-toolchain.toml`:
+  rustup installs a listed component the image lacks on every `cargo` call, and the container is
+  removed after each run, so it downloads it again every time. CI installs all listed components
+  through `rustup toolchain install`.
 
 ## Confirmed bugs / technical debt
 
