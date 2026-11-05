@@ -15,91 +15,6 @@ use std::process::{Command, Output};
 
 const TIERS: [&str; 2] = ["0", "1"];
 
-/// The path of a built guest program, and the temporary file written while building it: several
-/// test cases may build the same program at once; each writes its own and then renames it into
-/// place, so that none runs a file another one has half written.
-fn output(name: &str) -> (PathBuf, PathBuf) {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let tmp = dir.join(format!("guest-{name}.{}.{n}", std::process::id()));
-    (dir.join(format!("guest-{name}")), tmp)
-}
-
-fn build_guest(name: &str) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/guest")
-        .join(format!("{name}.S"));
-    let (out, tmp) = output(name);
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let status = Command::new(&cc)
-        .args([
-            "-nostdlib",
-            "-static",
-            "-no-pie",
-            "-Wl,--build-id=none",
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(&src)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run {cc}: {e}"));
-    assert!(status.success(), "assembling {} failed", src.display());
-    std::fs::rename(&tmp, &out).unwrap();
-    out
-}
-
-/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
-fn build_c_guest(name: &str) -> Option<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/guest")
-        .join(format!("{name}.c"));
-    let (out, tmp) = output(name);
-    let status = Command::new("musl-gcc")
-        .args([
-            "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
-        ])
-        .arg(&tmp)
-        .arg(&src)
-        .status();
-    let Ok(status) = status else {
-        assert!(
-            std::env::var_os("APPINE_REQUIRE_MUSL").is_none_or(|v| v != "1"),
-            "musl-gcc not found; install musl-tools"
-        );
-        eprintln!("skipping {name}: musl-gcc not found");
-        return None;
-    };
-    assert!(status.success(), "compiling {} failed", src.display());
-    std::fs::rename(&tmp, &out).unwrap();
-    Some(out)
-}
-
-/// Runs a guest program once under each tier, returning (tier, output).
-fn run(name: &str, args: &[&str]) -> Vec<(&'static str, Output)> {
-    let program = build_guest(name);
-    TIERS
-        .iter()
-        .map(|&tier| {
-            let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-                .args(["--tier", tier])
-                .arg(&program)
-                .args(args)
-                .output()
-                .expect("failed to run appine-run");
-            (tier, out)
-        })
-        .collect()
-}
-
-fn stdout(out: &Output) -> &str {
-    std::str::from_utf8(&out.stdout).unwrap()
-}
-
-fn stderr(out: &Output) -> &str {
-    std::str::from_utf8(&out.stderr).unwrap()
-}
-
 #[test]
 fn hello_world() {
     for (tier, out) in run("hello", &[]) {
@@ -590,4 +505,89 @@ fn missing_program_exits_127() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
+}
+
+/// Runs a guest program once under each tier, returning (tier, output).
+fn run(name: &str, args: &[&str]) -> Vec<(&'static str, Output)> {
+    let program = build_guest(name);
+    TIERS
+        .iter()
+        .map(|&tier| {
+            let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+                .args(["--tier", tier])
+                .arg(&program)
+                .args(args)
+                .output()
+                .expect("failed to run appine-run");
+            (tier, out)
+        })
+        .collect()
+}
+
+fn build_guest(name: &str) -> PathBuf {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/guest")
+        .join(format!("{name}.S"));
+    let (out, tmp) = output(name);
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let status = Command::new(&cc)
+        .args([
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+            "-o",
+        ])
+        .arg(&tmp)
+        .arg(&src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {cc}: {e}"));
+    assert!(status.success(), "assembling {} failed", src.display());
+    std::fs::rename(&tmp, &out).unwrap();
+    out
+}
+
+/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
+fn build_c_guest(name: &str) -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/guest")
+        .join(format!("{name}.c"));
+    let (out, tmp) = output(name);
+    let status = Command::new("musl-gcc")
+        .args([
+            "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
+        ])
+        .arg(&tmp)
+        .arg(&src)
+        .status();
+    let Ok(status) = status else {
+        assert!(
+            std::env::var_os("APPINE_REQUIRE_MUSL").is_none_or(|v| v != "1"),
+            "musl-gcc not found; install musl-tools"
+        );
+        eprintln!("skipping {name}: musl-gcc not found");
+        return None;
+    };
+    assert!(status.success(), "compiling {} failed", src.display());
+    std::fs::rename(&tmp, &out).unwrap();
+    Some(out)
+}
+
+/// The path of a built guest program, and the temporary file written while building it: several
+/// test cases may build the same program at once; each writes its own and then renames it into
+/// place, so that none runs a file another one has half written.
+fn output(name: &str) -> (PathBuf, PathBuf) {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let tmp = dir.join(format!("guest-{name}.{}.{n}", std::process::id()));
+    (dir.join(format!("guest-{name}")), tmp)
+}
+
+fn stdout(out: &Output) -> &str {
+    std::str::from_utf8(&out.stdout).unwrap()
+}
+
+fn stderr(out: &Output) -> &str {
+    std::str::from_utf8(&out.stderr).unwrap()
 }

@@ -10,17 +10,6 @@ use std::process::{Command, Output};
 
 use appine_bench::{PROGRAMS, build};
 
-fn check(output: Output, what: &str) -> Vec<u8> {
-    assert!(
-        output.status.success(),
-        "{what} failed ({}): {}{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output.stdout
-}
-
 #[test]
 fn benchmarks_agree_across_tiers() {
     let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("bench-programs");
@@ -48,4 +37,15 @@ fn benchmarks_agree_across_tiers() {
             );
         }
     }
+}
+
+fn check(output: Output, what: &str) -> Vec<u8> {
+    assert!(
+        output.status.success(),
+        "{what} failed ({}): {}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }

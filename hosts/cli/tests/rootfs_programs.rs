@@ -24,83 +24,6 @@ use std::time::{Duration, Instant};
 const TIERS: [&str; 2] = ["0", "1"];
 const PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
 
-fn find_tarball() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("APPINE_ROOTFS_TARBALL") {
-        return Some(PathBuf::from(p));
-    }
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/rootfs");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            let name = p.file_name().unwrap().to_string_lossy();
-            name.starts_with("alpine-minirootfs-") && name.ends_with("-aarch64.tar.gz")
-        })
-        .collect();
-    found.sort();
-    found.pop()
-}
-
-/// Imports the rootfs once; all test cases share the same store.
-fn store() -> Option<&'static Path> {
-    static STORE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STORE
-        .get_or_init(|| {
-            let Some(tarball) = find_tarball() else {
-                assert!(
-                    std::env::var_os("APPINE_REQUIRE_ROOTFS").is_none_or(|v| v != "1"),
-                    "rootfs tarball not found; run scripts/fetch-rootfs"
-                );
-                eprintln!("skipping rootfs tests: run scripts/fetch-rootfs to enable them");
-                return None;
-            };
-            let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rootfs-store");
-            let _ = std::fs::remove_dir_all(&dir);
-            let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
-                .arg("--rootfs")
-                .arg(&dir)
-                .arg("--import")
-                .arg(&tarball)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "import failed: {}", stderr(&out));
-            Some(dir)
-        })
-        .as_deref()
-}
-
-fn command(store: &Path, tier: &str, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_appine-run"));
-    cmd.args(["--tier", tier, "--env", PATH, "--rootfs"])
-        .arg(store)
-        .arg("--")
-        .args(args);
-    cmd
-}
-
-/// Runs once under each tier, returning (tier, output); returns an empty list without a rootfs.
-fn run(args: &[&str]) -> Vec<(&'static str, Output)> {
-    let Some(store) = store() else {
-        return Vec::new();
-    };
-    TIERS
-        .iter()
-        .map(|&tier| (tier, command(store, tier, args).output().unwrap()))
-        .collect()
-}
-
-fn stdout(out: &Output) -> &str {
-    std::str::from_utf8(&out.stdout).unwrap()
-}
-
-fn stderr(out: &Output) -> &str {
-    std::str::from_utf8(&out.stderr).unwrap()
-}
-
-fn assert_ok(tier: &str, out: &Output) {
-    assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(out));
-}
-
 #[test]
 fn busybox_lists_the_root_directory() {
     for (tier, out) in run(&["/bin/busybox", "ls", "/"]) {
@@ -341,31 +264,6 @@ fn fatal_signals_write_core_files() {
     }
 }
 
-/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
-fn build_static(name: &str) -> Option<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/guest")
-        .join(format!("{name}.c"));
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rootfs-{name}"));
-    let status = Command::new("musl-gcc")
-        .args([
-            "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
-        ])
-        .arg(&out)
-        .arg(&src)
-        .status();
-    let Ok(status) = status else {
-        assert!(
-            std::env::var_os("APPINE_REQUIRE_MUSL").is_none_or(|v| v != "1"),
-            "musl-gcc not found; install musl-tools"
-        );
-        eprintln!("skipping {name}: musl-gcc not found");
-        return None;
-    };
-    assert!(status.success(), "compiling {} failed", src.display());
-    Some(out)
-}
-
 #[test]
 fn every_kind_of_wait_releases_the_bkl_without_borrows() {
     // Every kind of system call that waits in the kernel waits once (tests/guest/waits.c): the
@@ -604,12 +502,6 @@ fn missing_or_non_executable_programs_fail_to_start() {
     for (tier, out) in run(&["/etc/passwd"]) {
         assert_eq!(out.status.code(), Some(126), "tier {tier}");
     }
-}
-
-/// Checks that a script run in `sh -c` exits with 0, and returns its stdout.
-fn shell(tier: &str, out: &Output) -> String {
-    assert_ok(tier, out);
-    stdout(out).to_owned()
 }
 
 #[test]
@@ -1366,19 +1258,6 @@ fn importing_into_an_existing_store_fails() {
     assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
 }
 
-/// Reads the console until the session ends (the way the Android terminal tabs use Machine).
-fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match machine.read_console(id, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-        }
-    }
-    String::from_utf8(out).unwrap().replace("\r\n", "\n")
-}
-
 #[test]
 fn threads_max_limits_root_too() {
     // threads-max applies to root too: fork returns EAGAIN when the thread count is at the limit,
@@ -2128,4 +2007,125 @@ fn files_app_changes_reach_inotify_watchers() {
     dirs.sort();
     assert_eq!(dirs, [b"/root/fw".to_vec(), b"/root/fw/d".to_vec()]);
     assert!(machine.take_changed_dirs().is_empty());
+}
+
+/// Runs once under each tier, returning (tier, output); returns an empty list without a rootfs.
+fn run(args: &[&str]) -> Vec<(&'static str, Output)> {
+    let Some(store) = store() else {
+        return Vec::new();
+    };
+    TIERS
+        .iter()
+        .map(|&tier| (tier, command(store, tier, args).output().unwrap()))
+        .collect()
+}
+
+/// Imports the rootfs once; all test cases share the same store.
+fn store() -> Option<&'static Path> {
+    static STORE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let Some(tarball) = find_tarball() else {
+                assert!(
+                    std::env::var_os("APPINE_REQUIRE_ROOTFS").is_none_or(|v| v != "1"),
+                    "rootfs tarball not found; run scripts/fetch-rootfs"
+                );
+                eprintln!("skipping rootfs tests: run scripts/fetch-rootfs to enable them");
+                return None;
+            };
+            let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rootfs-store");
+            let _ = std::fs::remove_dir_all(&dir);
+            let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+                .arg("--rootfs")
+                .arg(&dir)
+                .arg("--import")
+                .arg(&tarball)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "import failed: {}", stderr(&out));
+            Some(dir)
+        })
+        .as_deref()
+}
+
+fn find_tarball() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("APPINE_ROOTFS_TARBALL") {
+        return Some(PathBuf::from(p));
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/rootfs");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name.starts_with("alpine-minirootfs-") && name.ends_with("-aarch64.tar.gz")
+        })
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.
+fn build_static(name: &str) -> Option<PathBuf> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/guest")
+        .join(format!("{name}.c"));
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rootfs-{name}"));
+    let status = Command::new("musl-gcc")
+        .args([
+            "-static", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-o",
+        ])
+        .arg(&out)
+        .arg(&src)
+        .status();
+    let Ok(status) = status else {
+        assert!(
+            std::env::var_os("APPINE_REQUIRE_MUSL").is_none_or(|v| v != "1"),
+            "musl-gcc not found; install musl-tools"
+        );
+        eprintln!("skipping {name}: musl-gcc not found");
+        return None;
+    };
+    assert!(status.success(), "compiling {} failed", src.display());
+    Some(out)
+}
+
+fn command(store: &Path, tier: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_appine-run"));
+    cmd.args(["--tier", tier, "--env", PATH, "--rootfs"])
+        .arg(store)
+        .arg("--")
+        .args(args);
+    cmd
+}
+
+/// Reads the console until the session ends (the way the Android terminal tabs use Machine).
+fn read_console(machine: &appine_kernel::Machine, id: u32) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match machine.read_console(id, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8(out).unwrap().replace("\r\n", "\n")
+}
+
+/// Checks that a script run in `sh -c` exits with 0, and returns its stdout.
+fn shell(tier: &str, out: &Output) -> String {
+    assert_ok(tier, out);
+    stdout(out).to_owned()
+}
+
+fn assert_ok(tier: &str, out: &Output) {
+    assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(out));
+}
+
+fn stdout(out: &Output) -> &str {
+    std::str::from_utf8(&out.stdout).unwrap()
+}
+
+fn stderr(out: &Output) -> &str {
+    std::str::from_utf8(&out.stderr).unwrap()
 }

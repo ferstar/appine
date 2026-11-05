@@ -74,11 +74,6 @@ pub const CFLAGS: &[&str] = &[
     "-Wl,--build-id=none",
 ];
 
-/// Source directory.
-pub fn programs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("programs")
-}
-
 /// Compiles `program` into `out_dir` and returns the executable's path.
 pub fn build(program: &Program, out_dir: &Path) -> Result<PathBuf, String> {
     let dir = programs_dir();
@@ -100,6 +95,11 @@ pub fn build(program: &Program, out_dir: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(out)
+}
+
+/// Source directory.
+pub fn programs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("programs")
 }
 
 /// A short description of the host CPU, read from `/proc/cpuinfo`, counted by grouping core models,

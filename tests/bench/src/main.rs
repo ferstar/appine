@@ -27,121 +27,6 @@ struct Options {
     stats: bool,
 }
 
-fn parse_options() -> Result<Options, String> {
-    let mut o = Options {
-        runs: 5,
-        quick: false,
-        skip_tier0: false,
-        only: None,
-        stats: false,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--runs" => {
-                o.runs = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|&n| n > 0)
-                    .ok_or("--runs expects a positive number")?;
-            }
-            "--quick" => o.quick = true,
-            "--skip-tier0" => o.skip_tier0 = true,
-            "--stats" => o.stats = true,
-            "--only" => {
-                let name = args.next().ok_or("--only expects a program name")?;
-                if !PROGRAMS.iter().any(|p| p.name == name) {
-                    return Err(format!("unknown program `{name}`"));
-                }
-                o.only = Some(name);
-            }
-            _ => return Err(USAGE.into()),
-        }
-    }
-    Ok(o)
-}
-
-/// Runs `runs` times and returns the shortest time and the standard output; every run must succeed
-/// with the same output.
-fn measure(cmd: &[OsString], runs: usize) -> Result<(Duration, Vec<u8>), String> {
-    let mut best = Duration::MAX;
-    let mut first: Option<Vec<u8>> = None;
-    for _ in 0..runs {
-        let start = Instant::now();
-        let out = Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .output()
-            .map_err(|e| format!("failed to run {:?}: {e}", cmd[0]))?;
-        let elapsed = start.elapsed();
-        if !out.status.success() {
-            return Err(format!(
-                "{:?} failed ({}):\n{}{}",
-                cmd,
-                out.status,
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        match &first {
-            Some(f) if *f != out.stdout => {
-                return Err(format!("{cmd:?}: output changed between runs"));
-            }
-            Some(_) => {}
-            None => first = Some(out.stdout),
-        }
-        best = best.min(elapsed);
-    }
-    Ok((best, first.unwrap_or_default()))
-}
-
-fn os(args: &[&dyn AsRef<std::ffi::OsStr>]) -> Vec<OsString> {
-    args.iter().map(|a| a.as_ref().to_owned()).collect()
-}
-
-fn run_program(
-    program: &Program,
-    exe: &Path,
-    appine_run: &Path,
-    o: &Options,
-) -> Result<(Duration, Option<Duration>, Duration), String> {
-    let rounds = if o.quick {
-        (program.rounds / 20).max(1)
-    } else {
-        program.rounds
-    }
-    .to_string();
-    let (native, expected) = measure(&os(&[&exe, &rounds]), o.runs)?;
-    let tier0 = if o.skip_tier0 {
-        None
-    } else {
-        let (t, out) = measure(&os(&[&appine_run, &"--tier", &"0", &exe, &rounds]), 1)?;
-        if out != expected {
-            return Err(format!(
-                "{}: tier 0 output differs from native",
-                program.name
-            ));
-        }
-        Some(t)
-    };
-    let (tier1, out) = measure(&os(&[&appine_run, &"--tier", &"1", &exe, &rounds]), o.runs)?;
-    if out != expected {
-        return Err(format!(
-            "{}: tier 1 output differs from native",
-            program.name
-        ));
-    }
-    if o.stats {
-        let out = Command::new(appine_run)
-            .args(["--tier", "1", "--stats"])
-            .arg(exe)
-            .arg(&rounds)
-            .output()
-            .map_err(|e| e.to_string())?;
-        eprint!("{}", String::from_utf8_lossy(&out.stderr));
-    }
-    Ok((native, tier0, tier1))
-}
-
 fn main() -> ExitCode {
     let o = match parse_options() {
         Ok(o) => o,
@@ -227,4 +112,119 @@ fn main() -> ExitCode {
         geomean(log1, n1)
     );
     ExitCode::SUCCESS
+}
+
+fn parse_options() -> Result<Options, String> {
+    let mut o = Options {
+        runs: 5,
+        quick: false,
+        skip_tier0: false,
+        only: None,
+        stats: false,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--runs" => {
+                o.runs = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n| n > 0)
+                    .ok_or("--runs expects a positive number")?;
+            }
+            "--quick" => o.quick = true,
+            "--skip-tier0" => o.skip_tier0 = true,
+            "--stats" => o.stats = true,
+            "--only" => {
+                let name = args.next().ok_or("--only expects a program name")?;
+                if !PROGRAMS.iter().any(|p| p.name == name) {
+                    return Err(format!("unknown program `{name}`"));
+                }
+                o.only = Some(name);
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    Ok(o)
+}
+
+fn run_program(
+    program: &Program,
+    exe: &Path,
+    appine_run: &Path,
+    o: &Options,
+) -> Result<(Duration, Option<Duration>, Duration), String> {
+    let rounds = if o.quick {
+        (program.rounds / 20).max(1)
+    } else {
+        program.rounds
+    }
+    .to_string();
+    let (native, expected) = measure(&os(&[&exe, &rounds]), o.runs)?;
+    let tier0 = if o.skip_tier0 {
+        None
+    } else {
+        let (t, out) = measure(&os(&[&appine_run, &"--tier", &"0", &exe, &rounds]), 1)?;
+        if out != expected {
+            return Err(format!(
+                "{}: tier 0 output differs from native",
+                program.name
+            ));
+        }
+        Some(t)
+    };
+    let (tier1, out) = measure(&os(&[&appine_run, &"--tier", &"1", &exe, &rounds]), o.runs)?;
+    if out != expected {
+        return Err(format!(
+            "{}: tier 1 output differs from native",
+            program.name
+        ));
+    }
+    if o.stats {
+        let out = Command::new(appine_run)
+            .args(["--tier", "1", "--stats"])
+            .arg(exe)
+            .arg(&rounds)
+            .output()
+            .map_err(|e| e.to_string())?;
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok((native, tier0, tier1))
+}
+
+/// Runs `runs` times and returns the shortest time and the standard output; every run must succeed
+/// with the same output.
+fn measure(cmd: &[OsString], runs: usize) -> Result<(Duration, Vec<u8>), String> {
+    let mut best = Duration::MAX;
+    let mut first: Option<Vec<u8>> = None;
+    for _ in 0..runs {
+        let start = Instant::now();
+        let out = Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .output()
+            .map_err(|e| format!("failed to run {:?}: {e}", cmd[0]))?;
+        let elapsed = start.elapsed();
+        if !out.status.success() {
+            return Err(format!(
+                "{:?} failed ({}):\n{}{}",
+                cmd,
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        match &first {
+            Some(f) if *f != out.stdout => {
+                return Err(format!("{cmd:?}: output changed between runs"));
+            }
+            Some(_) => {}
+            None => first = Some(out.stdout),
+        }
+        best = best.min(elapsed);
+    }
+    Ok((best, first.unwrap_or_default()))
+}
+
+fn os(args: &[&dyn AsRef<std::ffi::OsStr>]) -> Vec<OsString> {
+    args.iter().map(|a| a.as_ref().to_owned()).collect()
 }
