@@ -135,7 +135,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         // The number of tabs in a box, like a browser's tab switcher
         tabCount = TextView(this).apply {
             setTextColor(mutedColor)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_COUNT_DP)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             minWidth = dp(20)
@@ -147,7 +147,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             }
         }
         tabTitle = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
         }
@@ -391,7 +391,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun barButton(label: String, onClick: (View) -> Unit) = TextView(this).apply {
         text = label
         setTextColor(mutedColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, BAR_LABEL_DP)
         gravity = Gravity.CENTER
         setPadding(dp(12), 0, dp(12), 0)
         background = touchFeedback()
@@ -705,6 +705,15 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The tab bar's height. */
         private const val BAR_DP = 32
+
+        /**
+         * The size of the tab bar's labels: tabs, the switcher's title and the buttons. In dp, not
+         * sp: the bar's height is fixed, so its labels ignore the system font scale.
+         */
+        private const val BAR_LABEL_DP = 14f
+
+        /** The size of the number in the switcher's box (dp, like [BAR_LABEL_DP]). */
+        private const val TAB_COUNT_DP = 12f
 
         /** From this window width (dp, the usual tablet breakpoint) the bar lists every tab in a row. */
         private const val WIDE_DP = 600

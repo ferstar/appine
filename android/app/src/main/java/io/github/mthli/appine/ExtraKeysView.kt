@@ -196,8 +196,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
         this.text = text
         gravity = Gravity.CENTER
         setTextColor(labelColor)
-        // HOME, the widest label, takes about 34 dp of a 45 dp column
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, LABEL_DP)
         isSingleLine = true
     }
 
@@ -362,6 +361,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Lin
 
         /** The height of a row. */
         private const val ROW_DP = 32f
+
+        /**
+         * The size of the labels; HOME, the widest, takes about 34 dp of a 45 dp column. In dp, not
+         * sp, so the system font scale cannot outgrow the fixed cells.
+         */
+        private const val LABEL_DP = 12f
 
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L
