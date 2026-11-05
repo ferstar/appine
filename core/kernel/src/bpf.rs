@@ -46,6 +46,8 @@ const STACK: i64 = 512;
 /// The size of `struct bpf_cgroup_dev_ctx`: access_type, major, minor.
 const CTX_SIZE: i64 = 12;
 
+// ---- Programs ----
+
 /// One instruction (`struct bpf_insn`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Insn {
@@ -139,6 +141,56 @@ pub(crate) fn gpl_compatible(license: &[u8]) -> bool {
     )
 }
 
+/// SHA-1 (FIPS 180-1), for program tags.
+pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for block in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (t, word) in block.chunks_exact(4).enumerate() {
+            w[t] = u32::from_be_bytes(word.try_into().unwrap());
+        }
+        for t in 16..80 {
+            w[t] = (w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (t, &wt) in w.iter().enumerate() {
+            let (f, k) = match t {
+                0..20 => ((b & c) | (!b & d), 0x5a827999),
+                20..40 => (b ^ c ^ d, 0x6ed9eba1),
+                40..60 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wt);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (k, v) in h.iter().enumerate() {
+        out[k * 4..k * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+// ---- Verifier ----
+
 /// The verifier rejects a program: the error code and the explanation written to the log.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Reject {
@@ -223,28 +275,10 @@ mod op {
     pub const END: u8 = 0xd0;
 }
 
-/// Bytes accessed (`BPF_SIZE`).
-fn size_of(code: u8) -> i64 {
-    match code & 0x18 {
-        0x00 => 4,
-        0x08 => 2,
-        0x10 => 1,
-        _ => 8,
-    }
-}
-
 /// Helpers device programs may use (those in Linux 6.1's `cgroup_dev_func_proto` that need no
 /// map): ktime_get_ns, get_prandom_u32, get_smp_processor_id, get_current_uid_gid,
 /// get_numa_node_id, get_current_cgroup_id, ktime_get_boot_ns.
 const HELPERS: [i32; 7] = [5, 7, 8, 15, 42, 80, 125];
-
-/// Whether this instruction is a jump (JA and conditional jumps), and if so, its target.
-fn jump_target(pc: usize, i: &Insn) -> Option<i64> {
-    let class = i.code & 7;
-    let o = i.code & 0xf0;
-    let is_jump = (class == op::JMP && o != op::CALL && o != op::EXIT) || class == op::JMP32;
-    is_jump.then(|| pc as i64 + i.off as i64 + 1)
-}
 
 /// Verifies a program (Linux's `bpf_check`: first the control flow, then each instruction in
 /// program order). Returns the number of instructions processed.
@@ -372,19 +406,12 @@ pub(crate) fn verify(insns: &[Insn]) -> Result<u32, Reject> {
     Ok(processed)
 }
 
-fn read_reg(r: &Regs, reg: u8) -> Result<Ty, Reject> {
-    match r[reg as usize] {
-        Ty::Uninit => reject(Errno::EACCES, format!("R{reg} !read_ok")),
-        t => Ok(t),
-    }
-}
-
-fn write_reg(r: &mut Regs, reg: u8, t: Ty) -> Result<(), Reject> {
-    if reg == 10 {
-        return reject(Errno::EACCES, "frame pointer is read only".into());
-    }
-    r[reg as usize] = t;
-    Ok(())
+/// Whether this instruction is a jump (JA and conditional jumps), and if so, its target.
+fn jump_target(pc: usize, i: &Insn) -> Option<i64> {
+    let class = i.code & 7;
+    let o = i.code & 0xf0;
+    let is_jump = (class == op::JMP && o != op::CALL && o != op::EXIT) || class == op::JMP32;
+    is_jump.then(|| pc as i64 + i.off as i64 + 1)
 }
 
 fn alu(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
@@ -520,72 +547,6 @@ fn alu(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
     write_reg(r, i.dst, t)
 }
 
-/// ALU operations (the ALU part of `___bpf_prog_run`): 32-bit ones work on the low 32 bits and
-/// clear the high bits; shift amounts are taken modulo the width; division by 0 gives 0, and
-/// modulo 0 leaves the value unchanged.
-fn alu_value(o: u8, is64: bool, a: u64, b: u64) -> u64 {
-    if is64 {
-        match o {
-            0x00 => a.wrapping_add(b),
-            0x10 => a.wrapping_sub(b),
-            0x20 => a.wrapping_mul(b),
-            0x30 => a.checked_div(b).unwrap_or(0),
-            0x40 => a | b,
-            0x50 => a & b,
-            0x60 => a << (b & 63),
-            0x70 => a >> (b & 63),
-            0x80 => a.wrapping_neg(),
-            0x90 => a.checked_rem(b).unwrap_or(a),
-            0xa0 => a ^ b,
-            0xb0 => b,
-            0xc0 => ((a as i64) >> (b & 63)) as u64,
-            _ => 0,
-        }
-    } else {
-        let (a, b) = (a as u32, b as u32);
-        (match o {
-            0x00 => a.wrapping_add(b),
-            0x10 => a.wrapping_sub(b),
-            0x20 => a.wrapping_mul(b),
-            0x30 => a.checked_div(b).unwrap_or(0),
-            0x40 => a | b,
-            0x50 => a & b,
-            0x60 => a << (b & 31),
-            0x70 => a >> (b & 31),
-            0x80 => a.wrapping_neg(),
-            0x90 => a.checked_rem(b).unwrap_or(a),
-            0xa0 => a ^ b,
-            0xb0 => b,
-            0xc0 => ((a as i32) >> (b & 31)) as u32,
-            _ => 0,
-        }) as u64
-    }
-}
-
-/// Context access (Linux's `cgroup_dev_is_valid_access`): read-only; in bounds and aligned to the
-/// size; access_type may be read in part, major and minor only whole.
-fn ctx_access(off: i64, size: i64) -> bool {
-    off >= 0 && off + size <= CTX_SIZE && off % size == 0 && (size == 4 || off < 4)
-}
-
-/// Stack access: within [-512, 0) and aligned to the size.
-fn stack_access(off: i64, size: i64, write: bool) -> Result<(), Reject> {
-    if off < -STACK || off + size > 0 {
-        let what = if write { "write to" } else { "read from" };
-        return reject(
-            Errno::EACCES,
-            format!("invalid {what} stack off={off} size={size}"),
-        );
-    }
-    if off % size != 0 {
-        return reject(
-            Errno::EACCES,
-            format!("misaligned stack access off {off} size {size}"),
-        );
-    }
-    Ok(())
-}
-
 fn ldx(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
     if i.code & 0xe0 != op::MEM {
         return reject(Errno::EINVAL, format!("unknown opcode {:02x}", i.code));
@@ -630,6 +591,12 @@ fn ldx(r: &mut Regs, i: &Insn) -> Result<(), Reject> {
     write_reg(r, i.dst, Ty::Scalar { min: 0, max })
 }
 
+/// Context access (Linux's `cgroup_dev_is_valid_access`): read-only; in bounds and aligned to the
+/// size; access_type may be read in part, major and minor only whole.
+fn ctx_access(off: i64, size: i64) -> bool {
+    off >= 0 && off + size <= CTX_SIZE && off % size == 0 && (size == 4 || off < 4)
+}
+
 fn store(r: &Regs, i: &Insn) -> Result<(), Reject> {
     let stx = i.code & 7 == op::STX;
     if i.code & 0xe0 != op::MEM {
@@ -657,6 +624,24 @@ fn store(r: &Regs, i: &Insn) -> Result<(), Reject> {
             format!("R{} invalid mem access 'scalar'", i.dst),
         ),
     }
+}
+
+/// Stack access: within [-512, 0) and aligned to the size.
+fn stack_access(off: i64, size: i64, write: bool) -> Result<(), Reject> {
+    if off < -STACK || off + size > 0 {
+        let what = if write { "write to" } else { "read from" };
+        return reject(
+            Errno::EACCES,
+            format!("invalid {what} stack off={off} size={size}"),
+        );
+    }
+    if off % size != 0 {
+        return reject(
+            Errno::EACCES,
+            format!("misaligned stack access off {off} size {size}"),
+        );
+    }
+    Ok(())
 }
 
 /// Jump instructions: returns the successors with their registers (conditional jumps narrow
@@ -772,6 +757,23 @@ fn jmp(mut r: Regs, pc: usize, i: &Insn) -> Result<Vec<(usize, Regs)>, Reject> {
     Ok(out)
 }
 
+fn read_reg(r: &Regs, reg: u8) -> Result<Ty, Reject> {
+    match r[reg as usize] {
+        Ty::Uninit => reject(Errno::EACCES, format!("R{reg} !read_ok")),
+        t => Ok(t),
+    }
+}
+
+fn write_reg(r: &mut Regs, reg: u8, t: Ty) -> Result<(), Reject> {
+    if reg == 10 {
+        return reject(Errno::EACCES, "frame pointer is read only".into());
+    }
+    r[reg as usize] = t;
+    Ok(())
+}
+
+// ---- Interpreter ----
+
 /// The caller's information while a program runs (for helpers).
 pub(crate) struct Env {
     pub uid: u32,
@@ -784,6 +786,25 @@ pub(crate) struct Env {
 /// access finds the context or the stack by which range it falls in.
 const CTX_BASE: u64 = 0x1000_0000_0000_0000;
 const STACK_TOP: u64 = 0x2000_0000_0000_0000;
+
+/// Before a process opens a device node or calls mknod (Linux's `devcgroup_check_permission`):
+/// runs the effective programs of its cgroup; if any one denies (the lowest bit of its return
+/// value is 0), the result is EPERM. `dev_type` is [`DEV_CHAR`] or [`DEV_BLOCK`], and `access` is
+/// a combination of [`ACC_MKNOD`] and the others.
+pub(crate) fn check_device(
+    k: &Kernel,
+    env: &Env,
+    (dev_type, major, minor): (u32, u32, u32),
+    access: u32,
+) -> Result<(), Errno> {
+    let progs = crate::cgroup::effective_device_progs(k, env.cgroup);
+    let ctx = [access << 16 | dev_type, major, minor];
+    if progs.iter().all(|p| run(p, ctx, env) & 1 == 1) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
 
 /// Interprets a verified program (Linux's `___bpf_prog_run`); `ctx` is access_type, major, minor.
 /// Returns r0.
@@ -939,71 +960,56 @@ fn helper(id: i32, env: &Env) -> u64 {
     }
 }
 
-/// Before a process opens a device node or calls mknod (Linux's `devcgroup_check_permission`):
-/// runs the effective programs of its cgroup; if any one denies (the lowest bit of its return
-/// value is 0), the result is EPERM. `dev_type` is [`DEV_CHAR`] or [`DEV_BLOCK`], and `access` is
-/// a combination of [`ACC_MKNOD`] and the others.
-pub(crate) fn check_device(
-    k: &Kernel,
-    env: &Env,
-    (dev_type, major, minor): (u32, u32, u32),
-    access: u32,
-) -> Result<(), Errno> {
-    let progs = crate::cgroup::effective_device_progs(k, env.cgroup);
-    let ctx = [access << 16 | dev_type, major, minor];
-    if progs.iter().all(|p| run(p, ctx, env) & 1 == 1) {
-        Ok(())
+/// ALU operations (the ALU part of `___bpf_prog_run`): 32-bit ones work on the low 32 bits and
+/// clear the high bits; shift amounts are taken modulo the width; division by 0 gives 0, and
+/// modulo 0 leaves the value unchanged.
+fn alu_value(o: u8, is64: bool, a: u64, b: u64) -> u64 {
+    if is64 {
+        match o {
+            0x00 => a.wrapping_add(b),
+            0x10 => a.wrapping_sub(b),
+            0x20 => a.wrapping_mul(b),
+            0x30 => a.checked_div(b).unwrap_or(0),
+            0x40 => a | b,
+            0x50 => a & b,
+            0x60 => a << (b & 63),
+            0x70 => a >> (b & 63),
+            0x80 => a.wrapping_neg(),
+            0x90 => a.checked_rem(b).unwrap_or(a),
+            0xa0 => a ^ b,
+            0xb0 => b,
+            0xc0 => ((a as i64) >> (b & 63)) as u64,
+            _ => 0,
+        }
     } else {
-        Err(Errno::EPERM)
+        let (a, b) = (a as u32, b as u32);
+        (match o {
+            0x00 => a.wrapping_add(b),
+            0x10 => a.wrapping_sub(b),
+            0x20 => a.wrapping_mul(b),
+            0x30 => a.checked_div(b).unwrap_or(0),
+            0x40 => a | b,
+            0x50 => a & b,
+            0x60 => a << (b & 31),
+            0x70 => a >> (b & 31),
+            0x80 => a.wrapping_neg(),
+            0x90 => a.checked_rem(b).unwrap_or(a),
+            0xa0 => a ^ b,
+            0xb0 => b,
+            0xc0 => ((a as i32) >> (b & 31)) as u32,
+            _ => 0,
+        }) as u64
     }
 }
 
-/// SHA-1 (FIPS 180-1), for program tags.
-pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// Bytes accessed (`BPF_SIZE`).
+fn size_of(code: u8) -> i64 {
+    match code & 0x18 {
+        0x00 => 4,
+        0x08 => 2,
+        0x10 => 1,
+        _ => 8,
     }
-    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
-    for block in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (t, word) in block.chunks_exact(4).enumerate() {
-            w[t] = u32::from_be_bytes(word.try_into().unwrap());
-        }
-        for t in 16..80 {
-            w[t] = (w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = h;
-        for (t, &wt) in w.iter().enumerate() {
-            let (f, k) = match t {
-                0..20 => ((b & c) | (!b & d), 0x5a827999),
-                20..40 => (b ^ c ^ d, 0x6ed9eba1),
-                40..60 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-            let tmp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wt);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = tmp;
-        }
-        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
-            *x = x.wrapping_add(y);
-        }
-    }
-    let mut out = [0u8; 20];
-    for (k, v) in h.iter().enumerate() {
-        out[k * 4..k * 4 + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
 }
 
 #[cfg(test)]

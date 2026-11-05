@@ -117,6 +117,8 @@ pub(crate) fn file_mode(name: &[u8]) -> Option<u32> {
     FILES.iter().find(|f| f.0 == name).map(|f| f.1)
 }
 
+// ---- The cgroup tree ----
+
 /// One cgroup.
 pub(crate) struct Cgroup {
     /// Name in the parent directory (empty for the root).
@@ -194,80 +196,6 @@ impl Default for Cgroups {
 }
 
 impl Cgroups {
-    pub fn get(&self, id: u64) -> Option<&Cgroup> {
-        self.map.get(&id)
-    }
-
-    /// `id` and its ancestors, starting with itself.
-    fn ancestors(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
-        std::iter::successors(Some(id), |&c| self.map.get(&c).and_then(|g| g.parent))
-    }
-
-    /// `id` or one of its ancestors asks to be frozen (`cgroup.freeze`): the processes in it must
-    /// stop.
-    pub fn freezing(&self, id: u64) -> bool {
-        self.ancestors(id)
-            .any(|c| self.map.get(&c).is_some_and(|g| g.freeze))
-    }
-
-    /// `id` is below `top` (or is `top` itself).
-    pub fn is_within(&self, id: u64, top: u64) -> bool {
-        self.ancestors(id).any(|c| c == top)
-    }
-
-    /// The number of cgroups below `id` (not counting itself).
-    fn descendants(&self, id: u64) -> usize {
-        self.map.get(&id).map_or(0, |g| {
-            g.children.values().map(|&c| 1 + self.descendants(c)).sum()
-        })
-    }
-
-    /// The path of `id` relative to `root` (the cgroup namespace's root); when it is not below
-    /// it, the path first goes up with `..` to the common ancestor, like Linux's
-    /// `kernfs_path_from_node`.
-    pub fn path(&self, id: u64, root: u64) -> String {
-        let up: Vec<u64> = self.ancestors(root).collect();
-        let mut down = Vec::new();
-        let mut c = id;
-        while !up.contains(&c) {
-            down.push(c);
-            match self.map.get(&c).and_then(|g| g.parent) {
-                Some(p) => c = p,
-                None => break,
-            }
-        }
-        let mut parts: Vec<String> = up
-            .iter()
-            .take_while(|&&a| a != c)
-            .map(|_| "..".to_owned())
-            .collect();
-        parts.extend(
-            down.iter()
-                .rev()
-                .filter_map(|d| self.map.get(d))
-                .map(|g| String::from_utf8_lossy(&g.name).into_owned()),
-        );
-        format!("/{}", parts.join("/"))
-    }
-
-    /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
-    /// otherwise the parent cgroup's `subtree_control`.
-    fn controllers(&self, id: u64) -> u32 {
-        match self.map.get(&id).and_then(|g| g.parent) {
-            None => AVAILABLE,
-            Some(p) => self.map.get(&p).map_or(0, |g| g.subtree_control),
-        }
-    }
-
-    /// The files in cgroup `id`'s directory: the core files plus those of the enabled controllers.
-    pub fn files(&self, id: u64) -> impl Iterator<Item = &'static [u8]> + '_ {
-        let on = self.controllers(id);
-        FILES
-            .iter()
-            .filter(move |f| f.2.is_none_or(|c| on & 1 << c != 0))
-            .map(|f| f.0)
-    }
-
     /// Creates child cgroup `name` under `parent` (Linux's `cgroup_mkdir`), owned by `cred`'s
     /// fsuid and fsgid. An existing name is EEXIST; a newline in the name is EINVAL; exceeding an
     /// ancestor's `cgroup.max.depth` or `cgroup.max.descendants` is EAGAIN.
@@ -307,6 +235,80 @@ impl Cgroups {
             .insert(name.to_vec(), id);
         Ok(id)
     }
+
+    /// The files in cgroup `id`'s directory: the core files plus those of the enabled controllers.
+    pub fn files(&self, id: u64) -> impl Iterator<Item = &'static [u8]> + '_ {
+        let on = self.controllers(id);
+        FILES
+            .iter()
+            .filter(move |f| f.2.is_none_or(|c| on & 1 << c != 0))
+            .map(|f| f.0)
+    }
+
+    /// The controllers enabled in cgroup `id` (`cgroup.controllers`): all of them at the root,
+    /// otherwise the parent cgroup's `subtree_control`.
+    fn controllers(&self, id: u64) -> u32 {
+        match self.map.get(&id).and_then(|g| g.parent) {
+            None => AVAILABLE,
+            Some(p) => self.map.get(&p).map_or(0, |g| g.subtree_control),
+        }
+    }
+
+    /// The number of cgroups below `id` (not counting itself).
+    fn descendants(&self, id: u64) -> usize {
+        self.map.get(&id).map_or(0, |g| {
+            g.children.values().map(|&c| 1 + self.descendants(c)).sum()
+        })
+    }
+
+    /// `id` or one of its ancestors asks to be frozen (`cgroup.freeze`): the processes in it must
+    /// stop.
+    pub fn freezing(&self, id: u64) -> bool {
+        self.ancestors(id)
+            .any(|c| self.map.get(&c).is_some_and(|g| g.freeze))
+    }
+
+    /// `id` is below `top` (or is `top` itself).
+    pub fn is_within(&self, id: u64, top: u64) -> bool {
+        self.ancestors(id).any(|c| c == top)
+    }
+
+    /// The path of `id` relative to `root` (the cgroup namespace's root); when it is not below
+    /// it, the path first goes up with `..` to the common ancestor, like Linux's
+    /// `kernfs_path_from_node`.
+    pub fn path(&self, id: u64, root: u64) -> String {
+        let up: Vec<u64> = self.ancestors(root).collect();
+        let mut down = Vec::new();
+        let mut c = id;
+        while !up.contains(&c) {
+            down.push(c);
+            match self.map.get(&c).and_then(|g| g.parent) {
+                Some(p) => c = p,
+                None => break,
+            }
+        }
+        let mut parts: Vec<String> = up
+            .iter()
+            .take_while(|&&a| a != c)
+            .map(|_| "..".to_owned())
+            .collect();
+        parts.extend(
+            down.iter()
+                .rev()
+                .filter_map(|d| self.map.get(d))
+                .map(|g| String::from_utf8_lossy(&g.name).into_owned()),
+        );
+        format!("/{}", parts.join("/"))
+    }
+
+    /// `id` and its ancestors, starting with itself.
+    fn ancestors(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
+        std::iter::successors(Some(id), |&c| self.map.get(&c).and_then(|g| g.parent))
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Cgroup> {
+        self.map.get(&id)
+    }
 }
 
 /// Removes cgroup `id` (Linux's `cgroup_rmdir`): EBUSY while it still has processes or child
@@ -327,23 +329,7 @@ pub(crate) fn rmdir(k: &mut Kernel, id: u64) -> Result<(), Errno> {
     Ok(())
 }
 
-/// The cgroups of processes still alive (with threads).
-fn members(k: &Kernel) -> impl Iterator<Item = (Tid, u64)> + '_ {
-    k.groups.iter().filter_map(|(&tgid, g)| {
-        let g = g.borrow();
-        (tgid != INIT && !g.threads.is_empty()).then_some((tgid, g.cgroup))
-    })
-}
-
-/// The cgroup of process `tgid`.
-fn group_cgroup(k: &Kernel, tgid: Tid) -> Option<u64> {
-    k.groups.get(&tgid).map(|g| g.borrow().cgroup)
-}
-
-/// Cgroup `id` or one below it has live processes (`populated` in `cgroup.events`).
-fn populated(k: &Kernel, id: u64) -> bool {
-    members(k).any(|(_, c)| k.cgroups.is_within(c, id))
-}
+// ---- Reading ----
 
 /// `/proc/<pid>/cgroup`: the process's cgroup, relative to the root `root` of the reader's cgroup
 /// namespace.
@@ -361,17 +347,6 @@ pub(crate) fn proc_cgroups(k: &Kernel) -> String {
         writeln!(s, "{name}\t0\t{n}\t1").unwrap();
     }
     s
-}
-
-/// Lists the names in a controller bitmask in [`CONTROLLERS`] order, separated by spaces.
-fn names(mask: u32) -> String {
-    let names: Vec<&str> = CONTROLLERS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| mask & 1 << i != 0)
-        .map(|(_, (n, _))| *n)
-        .collect();
-    names.join(" ")
 }
 
 /// The contents of `<name>` in cgroup `id`; None when it is not one of its files.
@@ -486,6 +461,37 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
     Some(s + "\n")
 }
 
+/// Lists the names in a controller bitmask in [`CONTROLLERS`] order, separated by spaces.
+fn names(mask: u32) -> String {
+    let names: Vec<&str> = CONTROLLERS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| mask & 1 << i != 0)
+        .map(|(_, (n, _))| *n)
+        .collect();
+    names.join(" ")
+}
+
+/// One id per line, in increasing order.
+fn list(ids: impl Iterator<Item = crate::kernel::Tid>) -> String {
+    let mut ids: Vec<_> = ids.collect();
+    ids.sort_unstable();
+    let lines: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    lines.join("\n")
+}
+
+/// `frozen` in `cgroup.events`: freezing is requested and the threads in the subtree have all
+/// stopped too (exiting ones do not count). An empty cgroup that is asked to freeze is frozen.
+fn frozen(k: &Kernel, id: u64) -> bool {
+    k.cgroups.freezing(id)
+        && k.tasks.values().all(|t| {
+            t.tgid == INIT
+                || t.frozen.get()
+                || t.killed.get()
+                || group_cgroup(k, t.tgid).is_none_or(|c| !k.cgroups.is_within(c, id))
+        })
+}
+
 /// The contents of `memory.events` (low and high are always 0: there is no reclaim).
 fn events(e: &Events) -> String {
     format!(
@@ -494,115 +500,15 @@ fn events(e: &Events) -> String {
     )
 }
 
-/// The number of tasks in cgroup `id`'s subtree (`pids.current`): as on Linux, tasks count until
-/// they are reaped: a process's live threads, plus 1 when its main thread has exited (zombie
-/// processes, processes whose main thread exited first).
-fn pids_current(k: &Kernel, id: u64) -> usize {
-    k.groups
-        .iter()
-        .filter(|&(&tgid, _)| tgid != INIT)
-        .map(|(_, g)| g.borrow())
-        .filter(|g| k.cgroups.is_within(g.cgroup, id))
-        .map(|g| g.threads.len() + !g.threads.contains(&g.tgid) as usize)
-        .sum()
-}
-
-/// Before a forked task is placed into cgroup `dst` (Linux's `pids_can_fork`): the task count of
-/// it and of every ancestor with pids enabled must not exceed `pids.max`; exceeding it is EAGAIN,
-/// recorded in the `pids.events` of the nearest cgroup with pids enabled, with a kernel log
-/// message the first time.
-pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
-    let enabled = |c: u64| k.cgroups.controllers(c) & 1 << PIDS != 0;
-    let Some(css) = k.cgroups.ancestors(dst).find(|&c| enabled(c)) else {
-        return Ok(());
-    };
-    let over = k.cgroups.ancestors(css).filter(|&c| enabled(c)).any(|c| {
-        let limit = k.cgroups.map[&c].values.get(&b"pids.max"[..]);
-        limit
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_some_and(|max| pids_current(k, c) + 1 > max)
-    });
-    if !over {
-        return Ok(());
-    }
-    let path = k.cgroups.path(css, ROOT);
-    let g = k.cgroups.map.get_mut(&css).unwrap();
-    g.pids_events += 1;
-    if g.pids_events == 1 {
-        crate::klog::printk(
-            &k.klog,
-            crate::klog::level::INFO,
-            format_args!("cgroup: fork rejected by pids controller in {path}"),
-        );
-    }
-    Err(Errno::EAGAIN)
-}
-
-/// The cgroups with `memory.max` set (and the memory controller enabled) and their limits
-/// (bytes). The root's limit is the OOM killer's and is not included here.
-pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
-    k.cgroups
-        .map
-        .iter()
-        .filter(|&(&id, _)| id != ROOT && k.cgroups.controllers(id) & 1 << MEMORY != 0)
-        .filter_map(|(&id, g)| Some((id, g.values.get(&b"memory.max"[..])?.parse().ok()?)))
-        .collect()
-}
-
-/// Measures cgroup `id`'s memory usage (bytes), recording the peak on the way.
-pub(crate) fn measure_memory(k: &Kernel, id: u64) -> u64 {
-    let used = subtree_rss(k, id);
-    if let Some(g) = k.cgroups.get(id) {
-        g.mem_peak.set(g.mem_peak.get().max(used));
-    }
-    used
-}
-
-/// Records a memory event (Linux's `memcg_memory_event`): in `id`'s own `memory.events.local`
-/// and in the `memory.events` of it and its ancestors.
-pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
-    let chain: Vec<u64> = k.cgroups.ancestors(id).collect();
-    for c in chain {
-        if let Some(g) = k.cgroups.map.get_mut(&c) {
-            f(&mut g.mem_events);
-            if c == id {
-                f(&mut g.mem_events_local);
-            }
-        }
-    }
-}
-
-/// The topmost cgroup with `memory.oom.group` set between process `victim`'s cgroup and the OOM
-/// domain `domain` (Linux's `mem_cgroup_get_oom_group`): the processes in it are killed together.
-pub(crate) fn oom_group(k: &Kernel, victim: u64, domain: u64) -> Option<u64> {
-    if !k.cgroups.is_within(victim, domain) {
-        return None;
-    }
-    let mut group = None;
-    for c in k.cgroups.ancestors(victim) {
-        let set = k.cgroups.map[&c].values.get(&b"memory.oom.group"[..]);
-        if set.is_some_and(|v| v == "1") {
-            group = Some(c);
-        }
-        if c == domain {
-            break;
-        }
-    }
-    group
-}
-
-/// The sum of the resident memory of the processes in cgroup `id`'s subtree (bytes): a child
-/// cgroup's `memory.current`.
-fn subtree_rss(k: &Kernel, id: u64) -> u64 {
-    members(k)
-        .filter(|&(_, c)| k.cgroups.is_within(c, id))
-        .filter_map(|(tgid, _)| {
-            let g = k.groups.get(&tgid)?.borrow();
-            let task = k.tasks.get(g.threads.first()?)?;
-            let pages = task.res.borrow().mm.borrow().resident_pages();
-            Some(pages * 4096)
-        })
-        .sum()
+/// `memory.stat`, following Linux 6.1's `memory_stat_format` (for a configuration with swap and
+/// transparent huge pages but no zswap), in bytes. Only the host process's anonymous memory can be
+/// measured (the same as `memory.current`): private and swapped-out memory counts as anon, shared
+/// as shmem (Linux's file includes shmem), all in active_anon; there is no reclaimable page cache,
+/// so inactive_file is 0. .NET's GC computes usage as `memory.current` minus inactive_file, and
+/// without this file looks only at its own process's RSS.
+fn memory_stat() -> String {
+    let u = crate::oom::app_memory().unwrap_or_default();
+    memory_stat_with(u.anon + u.swap, u.shmem)
 }
 
 /// A child cgroup's `memory.stat`: only resident memory is known, and all of it counts as
@@ -610,6 +516,76 @@ fn subtree_rss(k: &Kernel, id: u64) -> u64 {
 fn child_memory_stat(rss: u64) -> String {
     memory_stat_with(rss, 0)
 }
+
+/// The format of [`memory_stat`]: anonymous memory `anon` and shared memory `shmem` (bytes).
+fn memory_stat_with(anon: u64, shmem: u64) -> String {
+    let mut s = String::new();
+    let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();
+    for (name, v) in [("anon", anon), ("file", shmem)] {
+        put(name, v);
+    }
+    for name in [
+        "kernel",
+        "kernel_stack",
+        "pagetables",
+        "sec_pagetables",
+        "percpu",
+        "sock",
+        "vmalloc",
+    ] {
+        put(name, 0);
+    }
+    put("shmem", shmem);
+    for name in [
+        "file_mapped",
+        "file_dirty",
+        "file_writeback",
+        "swapcached",
+        "anon_thp",
+        "file_thp",
+        "shmem_thp",
+        "inactive_anon",
+    ] {
+        put(name, 0);
+    }
+    put("active_anon", anon + shmem);
+    for name in [
+        "inactive_file",
+        "active_file",
+        "unevictable",
+        "slab_reclaimable",
+        "slab_unreclaimable",
+        "slab",
+        "workingset_refault_anon",
+        "workingset_refault_file",
+        "workingset_activate_anon",
+        "workingset_activate_file",
+        "workingset_restore_anon",
+        "workingset_restore_file",
+        "workingset_nodereclaim",
+        "pgscan",
+        "pgsteal",
+        "pgscan_kswapd",
+        "pgscan_direct",
+        "pgsteal_kswapd",
+        "pgsteal_direct",
+        "pgfault",
+        "pgmajfault",
+        "pgrefill",
+        "pgactivate",
+        "pgdeactivate",
+        "pglazyfree",
+        "pglazyfreed",
+        "thp_fault_alloc",
+        "thp_collapse_alloc",
+    ] {
+        put(name, 0);
+    }
+    s.pop();
+    s
+}
+
+// ---- Writing ----
 
 /// The writing process: its thread, its pid namespace (ids in cgroup.procs are in it, and 0 is
 /// itself) and the root of its cgroup namespace.
@@ -705,6 +681,143 @@ pub(crate) fn write(
             }
             Ok(())
         }
+    }
+}
+
+/// Migrates the process of thread `tid` (`procs`) or the thread itself to cgroup `dst` (Linux's
+/// `__cgroup_procs_write`, `cgroup_attach_permissions`): a missing process is ESRCH; the source
+/// and the destination must both be under the root `ns_root` of the writer's cgroup namespace
+/// (ENOENT); a destination with controllers enabled (other than the root) cannot have processes
+/// (EBUSY); migrating a single thread between domain cgroups is EOPNOTSUPP. The write permission
+/// that writing `cgroup.procs` needs is checked when the file is opened.
+fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) -> Result<(), Errno> {
+    let tgid = k.tasks.get(&tid).ok_or(Errno::ESRCH)?.tgid;
+    if tgid == INIT {
+        return Err(Errno::EINVAL);
+    }
+    let g = k.groups.get(&tgid).cloned().ok_or(Errno::ESRCH)?;
+    let src = g.borrow().cgroup;
+    if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
+        return Err(Errno::ENOENT);
+    }
+    let dst_cg = k.cgroups.get(dst).ok_or(Errno::ENOENT)?;
+    if !procs {
+        return if src == dst {
+            Ok(())
+        } else {
+            Err(Errno::EOPNOTSUPP)
+        };
+    }
+    if dst_cg.parent.is_some() && dst_cg.subtree_control != 0 {
+        return Err(Errno::EBUSY);
+    }
+    g.borrow_mut().cgroup = dst;
+    // Migrating into a frozen cgroup stops the process, and migrating out lets it run on (Linux's
+    // cgroup_freezer_migrate_task)
+    refreeze(k, &g);
+    Ok(())
+}
+
+/// Writes `cgroup.subtree_control` (Linux's `cgroup_subtree_control_write`): `+name` and `-name`,
+/// separated by whitespace. An unknown controller or a missing `+`/`-` is EINVAL; enabling one not
+/// in `cgroup.controllers` is ENOENT; controllers cannot be enabled in a non-root cgroup that has
+/// processes (EBUSY); one a child cgroup still has enabled cannot be disabled (EBUSY).
+fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
+    let (mut enable, mut disable) = (0u32, 0u32);
+    for tok in text.split_ascii_whitespace() {
+        let (sign, name) = tok.split_at(1);
+        let i = CONTROLLERS
+            .iter()
+            .position(|(n, _)| *n == name)
+            .ok_or(Errno::EINVAL)?;
+        match sign {
+            "+" => {
+                enable |= 1 << i;
+                disable &= !(1 << i);
+            }
+            "-" => {
+                disable |= 1 << i;
+                enable &= !(1 << i);
+            }
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
+    enable &= !g.subtree_control;
+    disable &= g.subtree_control;
+    if enable == 0 && disable == 0 {
+        return Ok(());
+    }
+    if enable & !k.cgroups.controllers(id) != 0 {
+        return Err(Errno::ENOENT);
+    }
+    let has_procs = members(k).any(|(_, c)| c == id);
+    if enable != 0 && g.parent.is_some() && has_procs {
+        return Err(Errno::EBUSY);
+    }
+    let children: Vec<u64> = g.children.values().copied().collect();
+    if children.iter().any(|c| {
+        k.cgroups
+            .get(*c)
+            .is_some_and(|c| c.subtree_control & disable != 0)
+    }) {
+        return Err(Errno::EBUSY);
+    }
+    let g = k.cgroups.map.get_mut(&id).unwrap();
+    g.subtree_control = (g.subtree_control | enable) & !disable;
+    // The disabled controller's state in child cgroups (Linux's css) is dropped, and is back to
+    // the defaults when enabled again
+    for c in children {
+        let Some(child) = k.cgroups.map.get_mut(&c) else {
+            continue;
+        };
+        child.values.retain(|name, _| {
+            FILES
+                .iter()
+                .find(|f| f.0 == *name)
+                .and_then(|f| f.2)
+                .is_none_or(|ctl| disable & 1 << ctl == 0)
+        });
+        if disable & 1 << PIDS != 0 {
+            child.pids_events = 0;
+        }
+        if disable & 1 << MEMORY != 0 {
+            child.mem_events = Events::default();
+            child.mem_events_local = Events::default();
+            child.mem_peak.set(0);
+        }
+    }
+    Ok(())
+}
+
+/// `cgroup.kill`: sends SIGKILL to every process in the subtree (Linux's `cgroup_kill`).
+fn kill(k: &mut Kernel, id: u64) {
+    let victims: Vec<Tid> = members(k)
+        .filter(|&(_, c)| k.cgroups.is_within(c, id))
+        .map(|(t, _)| t)
+        .collect();
+    for tgid in victims {
+        crate::signal::send_to_group(
+            k,
+            tgid,
+            crate::process::Signal::KILL,
+            crate::signal::SigInfo::kernel(),
+        );
+    }
+}
+
+/// Whether process `group` should be frozen according to its cgroup ([`Cgroups::freezing`]): when
+/// that changes, wakes its threads so that they stop before returning to the guest, or leave that
+/// stop ([`crate::signal::deliver`]).
+fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
+    let freezing = k.cgroups.freezing(group.borrow().cgroup);
+    let mut g = group.borrow_mut();
+    if g.frozen == freezing {
+        return;
+    }
+    g.frozen = freezing;
+    for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
+        crate::signal::wake(t);
     }
 }
 
@@ -822,71 +935,110 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
     })
 }
 
-/// Migrates the process of thread `tid` (`procs`) or the thread itself to cgroup `dst` (Linux's
-/// `__cgroup_procs_write`, `cgroup_attach_permissions`): a missing process is ESRCH; the source
-/// and the destination must both be under the root `ns_root` of the writer's cgroup namespace
-/// (ENOENT); a destination with controllers enabled (other than the root) cannot have processes
-/// (EBUSY); migrating a single thread between domain cgroups is EOPNOTSUPP. The write permission
-/// that writing `cgroup.procs` needs is checked when the file is opened.
-fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) -> Result<(), Errno> {
-    let tgid = k.tasks.get(&tid).ok_or(Errno::ESRCH)?.tgid;
-    if tgid == INIT {
-        return Err(Errno::EINVAL);
-    }
-    let g = k.groups.get(&tgid).cloned().ok_or(Errno::ESRCH)?;
-    let src = g.borrow().cgroup;
+// ---- Fork ----
+
+/// Whether a child forked from cgroup `src` may be placed into cgroup `dst` (clone3's
+/// `CLONE_INTO_CGROUP`, Linux's `cgroup_css_set_fork`): an already removed one is ENODEV; both
+/// must be under the root `ns_root` of the caller's cgroup namespace (ENOENT); one with
+/// controllers enabled (other than the root) cannot have processes (EBUSY).
+pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<(), Errno> {
+    let g = k.cgroups.get(dst).ok_or(Errno::ENODEV)?;
     if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
         return Err(Errno::ENOENT);
     }
-    let dst_cg = k.cgroups.get(dst).ok_or(Errno::ENOENT)?;
-    if !procs {
-        return if src == dst {
-            Ok(())
-        } else {
-            Err(Errno::EOPNOTSUPP)
-        };
-    }
-    if dst_cg.parent.is_some() && dst_cg.subtree_control != 0 {
+    if g.parent.is_some() && g.subtree_control != 0 {
         return Err(Errno::EBUSY);
     }
-    g.borrow_mut().cgroup = dst;
-    // Migrating into a frozen cgroup stops the process, and migrating out lets it run on (Linux's
-    // cgroup_freezer_migrate_task)
-    refreeze(k, &g);
     Ok(())
 }
 
-/// Whether process `group` should be frozen according to its cgroup ([`Cgroups::freezing`]): when
-/// that changes, wakes its threads so that they stop before returning to the guest, or leave that
-/// stop ([`crate::signal::deliver`]).
-fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
-    let freezing = k.cgroups.freezing(group.borrow().cgroup);
-    let mut g = group.borrow_mut();
-    if g.frozen == freezing {
-        return;
+/// Before a forked task is placed into cgroup `dst` (Linux's `pids_can_fork`): the task count of
+/// it and of every ancestor with pids enabled must not exceed `pids.max`; exceeding it is EAGAIN,
+/// recorded in the `pids.events` of the nearest cgroup with pids enabled, with a kernel log
+/// message the first time.
+pub(crate) fn pids_charge(k: &mut Kernel, dst: u64) -> Result<(), Errno> {
+    let enabled = |c: u64| k.cgroups.controllers(c) & 1 << PIDS != 0;
+    let Some(css) = k.cgroups.ancestors(dst).find(|&c| enabled(c)) else {
+        return Ok(());
+    };
+    let over = k.cgroups.ancestors(css).filter(|&c| enabled(c)).any(|c| {
+        let limit = k.cgroups.map[&c].values.get(&b"pids.max"[..]);
+        limit
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|max| pids_current(k, c) + 1 > max)
+    });
+    if !over {
+        return Ok(());
     }
-    g.frozen = freezing;
-    for t in g.threads.iter().filter_map(|t| k.tasks.get(t)) {
-        crate::signal::wake(t);
+    let path = k.cgroups.path(css, ROOT);
+    let g = k.cgroups.map.get_mut(&css).unwrap();
+    g.pids_events += 1;
+    if g.pids_events == 1 {
+        crate::klog::printk(
+            &k.klog,
+            crate::klog::level::INFO,
+            format_args!("cgroup: fork rejected by pids controller in {path}"),
+        );
+    }
+    Err(Errno::EAGAIN)
+}
+
+// ---- OOM killer ----
+
+/// The cgroups with `memory.max` set (and the memory controller enabled) and their limits
+/// (bytes). The root's limit is the OOM killer's and is not included here.
+pub(crate) fn memory_limits(k: &Kernel) -> Vec<(u64, u64)> {
+    k.cgroups
+        .map
+        .iter()
+        .filter(|&(&id, _)| id != ROOT && k.cgroups.controllers(id) & 1 << MEMORY != 0)
+        .filter_map(|(&id, g)| Some((id, g.values.get(&b"memory.max"[..])?.parse().ok()?)))
+        .collect()
+}
+
+/// Measures cgroup `id`'s memory usage (bytes), recording the peak on the way.
+pub(crate) fn measure_memory(k: &Kernel, id: u64) -> u64 {
+    let used = subtree_rss(k, id);
+    if let Some(g) = k.cgroups.get(id) {
+        g.mem_peak.set(g.mem_peak.get().max(used));
+    }
+    used
+}
+
+/// Records a memory event (Linux's `memcg_memory_event`): in `id`'s own `memory.events.local`
+/// and in the `memory.events` of it and its ancestors.
+pub(crate) fn memory_event(k: &mut Kernel, id: u64, f: impl Fn(&mut Events)) {
+    let chain: Vec<u64> = k.cgroups.ancestors(id).collect();
+    for c in chain {
+        if let Some(g) = k.cgroups.map.get_mut(&c) {
+            f(&mut g.mem_events);
+            if c == id {
+                f(&mut g.mem_events_local);
+            }
+        }
     }
 }
 
-/// The programs to run when a process in cgroup `id` opens a device (Linux's
-/// `compute_effective_progs`): going up from the cgroup itself, its own programs all count; once
-/// there are some, an ancestor's count only when it attached them with `BPF_F_ALLOW_MULTI`.
-pub(crate) fn effective_device_progs(k: &Kernel, id: u64) -> Vec<Rc<crate::bpf::Prog>> {
-    let mut progs: Vec<Rc<crate::bpf::Prog>> = Vec::new();
-    for c in k.cgroups.ancestors(id) {
-        let Some(g) = k.cgroups.get(c) else {
-            continue;
-        };
-        if !progs.is_empty() && g.device_flags & crate::bpf::ALLOW_MULTI == 0 {
-            continue;
-        }
-        progs.extend(g.device_progs.iter().cloned());
+/// The topmost cgroup with `memory.oom.group` set between process `victim`'s cgroup and the OOM
+/// domain `domain` (Linux's `mem_cgroup_get_oom_group`): the processes in it are killed together.
+pub(crate) fn oom_group(k: &Kernel, victim: u64, domain: u64) -> Option<u64> {
+    if !k.cgroups.is_within(victim, domain) {
+        return None;
     }
-    progs
+    let mut group = None;
+    for c in k.cgroups.ancestors(victim) {
+        let set = k.cgroups.map[&c].values.get(&b"memory.oom.group"[..]);
+        if set.is_some_and(|v| v == "1") {
+            group = Some(c);
+        }
+        if c == domain {
+            break;
+        }
+    }
+    group
 }
+
+// ---- Device programs ----
 
 /// Whether programs may be attached to cgroup `id` (Linux's `hierarchy_allows_attach`): going
 /// up, the first ancestor with programs attached must have attached them with `ALLOW_MULTI` or
@@ -906,206 +1058,68 @@ pub(crate) fn hierarchy_allows_attach(k: &Kernel, id: u64) -> bool {
     true
 }
 
-/// `frozen` in `cgroup.events`: freezing is requested and the threads in the subtree have all
-/// stopped too (exiting ones do not count). An empty cgroup that is asked to freeze is frozen.
-fn frozen(k: &Kernel, id: u64) -> bool {
-    k.cgroups.freezing(id)
-        && k.tasks.values().all(|t| {
-            t.tgid == INIT
-                || t.frozen.get()
-                || t.killed.get()
-                || group_cgroup(k, t.tgid).is_none_or(|c| !k.cgroups.is_within(c, id))
-        })
-}
-
-/// Writes `cgroup.subtree_control` (Linux's `cgroup_subtree_control_write`): `+name` and `-name`,
-/// separated by whitespace. An unknown controller or a missing `+`/`-` is EINVAL; enabling one not
-/// in `cgroup.controllers` is ENOENT; controllers cannot be enabled in a non-root cgroup that has
-/// processes (EBUSY); one a child cgroup still has enabled cannot be disabled (EBUSY).
-fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
-    let (mut enable, mut disable) = (0u32, 0u32);
-    for tok in text.split_ascii_whitespace() {
-        let (sign, name) = tok.split_at(1);
-        let i = CONTROLLERS
-            .iter()
-            .position(|(n, _)| *n == name)
-            .ok_or(Errno::EINVAL)?;
-        match sign {
-            "+" => {
-                enable |= 1 << i;
-                disable &= !(1 << i);
-            }
-            "-" => {
-                disable |= 1 << i;
-                enable &= !(1 << i);
-            }
-            _ => return Err(Errno::EINVAL),
-        }
-    }
-    let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
-    enable &= !g.subtree_control;
-    disable &= g.subtree_control;
-    if enable == 0 && disable == 0 {
-        return Ok(());
-    }
-    if enable & !k.cgroups.controllers(id) != 0 {
-        return Err(Errno::ENOENT);
-    }
-    let has_procs = members(k).any(|(_, c)| c == id);
-    if enable != 0 && g.parent.is_some() && has_procs {
-        return Err(Errno::EBUSY);
-    }
-    let children: Vec<u64> = g.children.values().copied().collect();
-    if children.iter().any(|c| {
-        k.cgroups
-            .get(*c)
-            .is_some_and(|c| c.subtree_control & disable != 0)
-    }) {
-        return Err(Errno::EBUSY);
-    }
-    let g = k.cgroups.map.get_mut(&id).unwrap();
-    g.subtree_control = (g.subtree_control | enable) & !disable;
-    // The disabled controller's state in child cgroups (Linux's css) is dropped, and is back to
-    // the defaults when enabled again
-    for c in children {
-        let Some(child) = k.cgroups.map.get_mut(&c) else {
+/// The programs to run when a process in cgroup `id` opens a device (Linux's
+/// `compute_effective_progs`): going up from the cgroup itself, its own programs all count; once
+/// there are some, an ancestor's count only when it attached them with `BPF_F_ALLOW_MULTI`.
+pub(crate) fn effective_device_progs(k: &Kernel, id: u64) -> Vec<Rc<crate::bpf::Prog>> {
+    let mut progs: Vec<Rc<crate::bpf::Prog>> = Vec::new();
+    for c in k.cgroups.ancestors(id) {
+        let Some(g) = k.cgroups.get(c) else {
             continue;
         };
-        child.values.retain(|name, _| {
-            FILES
-                .iter()
-                .find(|f| f.0 == *name)
-                .and_then(|f| f.2)
-                .is_none_or(|ctl| disable & 1 << ctl == 0)
-        });
-        if disable & 1 << PIDS != 0 {
-            child.pids_events = 0;
+        if !progs.is_empty() && g.device_flags & crate::bpf::ALLOW_MULTI == 0 {
+            continue;
         }
-        if disable & 1 << MEMORY != 0 {
-            child.mem_events = Events::default();
-            child.mem_events_local = Events::default();
-            child.mem_peak.set(0);
-        }
+        progs.extend(g.device_progs.iter().cloned());
     }
-    Ok(())
+    progs
 }
 
-/// `cgroup.kill`: sends SIGKILL to every process in the subtree (Linux's `cgroup_kill`).
-fn kill(k: &mut Kernel, id: u64) {
-    let victims: Vec<Tid> = members(k)
+// ---- Members ----
+
+/// The cgroup of process `tgid`.
+fn group_cgroup(k: &Kernel, tgid: Tid) -> Option<u64> {
+    k.groups.get(&tgid).map(|g| g.borrow().cgroup)
+}
+
+/// Cgroup `id` or one below it has live processes (`populated` in `cgroup.events`).
+fn populated(k: &Kernel, id: u64) -> bool {
+    members(k).any(|(_, c)| k.cgroups.is_within(c, id))
+}
+
+/// The sum of the resident memory of the processes in cgroup `id`'s subtree (bytes): a child
+/// cgroup's `memory.current`.
+fn subtree_rss(k: &Kernel, id: u64) -> u64 {
+    members(k)
         .filter(|&(_, c)| k.cgroups.is_within(c, id))
-        .map(|(t, _)| t)
-        .collect();
-    for tgid in victims {
-        crate::signal::send_to_group(
-            k,
-            tgid,
-            crate::process::Signal::KILL,
-            crate::signal::SigInfo::kernel(),
-        );
-    }
+        .filter_map(|(tgid, _)| {
+            let g = k.groups.get(&tgid)?.borrow();
+            let task = k.tasks.get(g.threads.first()?)?;
+            let pages = task.res.borrow().mm.borrow().resident_pages();
+            Some(pages * 4096)
+        })
+        .sum()
 }
 
-/// Whether a child forked from cgroup `src` may be placed into cgroup `dst` (clone3's
-/// `CLONE_INTO_CGROUP`, Linux's `cgroup_css_set_fork`): an already removed one is ENODEV; both
-/// must be under the root `ns_root` of the caller's cgroup namespace (ENOENT); one with
-/// controllers enabled (other than the root) cannot have processes (EBUSY).
-pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<(), Errno> {
-    let g = k.cgroups.get(dst).ok_or(Errno::ENODEV)?;
-    if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
-        return Err(Errno::ENOENT);
-    }
-    if g.parent.is_some() && g.subtree_control != 0 {
-        return Err(Errno::EBUSY);
-    }
-    Ok(())
+/// The number of tasks in cgroup `id`'s subtree (`pids.current`): as on Linux, tasks count until
+/// they are reaped: a process's live threads, plus 1 when its main thread has exited (zombie
+/// processes, processes whose main thread exited first).
+fn pids_current(k: &Kernel, id: u64) -> usize {
+    k.groups
+        .iter()
+        .filter(|&(&tgid, _)| tgid != INIT)
+        .map(|(_, g)| g.borrow())
+        .filter(|g| k.cgroups.is_within(g.cgroup, id))
+        .map(|g| g.threads.len() + !g.threads.contains(&g.tgid) as usize)
+        .sum()
 }
 
-/// `memory.stat`, following Linux 6.1's `memory_stat_format` (for a configuration with swap and
-/// transparent huge pages but no zswap), in bytes. Only the host process's anonymous memory can be
-/// measured (the same as `memory.current`): private and swapped-out memory counts as anon, shared
-/// as shmem (Linux's file includes shmem), all in active_anon; there is no reclaimable page cache,
-/// so inactive_file is 0. .NET's GC computes usage as `memory.current` minus inactive_file, and
-/// without this file looks only at its own process's RSS.
-fn memory_stat() -> String {
-    let u = crate::oom::app_memory().unwrap_or_default();
-    memory_stat_with(u.anon + u.swap, u.shmem)
-}
-
-/// The format of [`memory_stat`]: anonymous memory `anon` and shared memory `shmem` (bytes).
-fn memory_stat_with(anon: u64, shmem: u64) -> String {
-    let mut s = String::new();
-    let mut put = |name: &str, v: u64| writeln!(s, "{name} {v}").unwrap();
-    for (name, v) in [("anon", anon), ("file", shmem)] {
-        put(name, v);
-    }
-    for name in [
-        "kernel",
-        "kernel_stack",
-        "pagetables",
-        "sec_pagetables",
-        "percpu",
-        "sock",
-        "vmalloc",
-    ] {
-        put(name, 0);
-    }
-    put("shmem", shmem);
-    for name in [
-        "file_mapped",
-        "file_dirty",
-        "file_writeback",
-        "swapcached",
-        "anon_thp",
-        "file_thp",
-        "shmem_thp",
-        "inactive_anon",
-    ] {
-        put(name, 0);
-    }
-    put("active_anon", anon + shmem);
-    for name in [
-        "inactive_file",
-        "active_file",
-        "unevictable",
-        "slab_reclaimable",
-        "slab_unreclaimable",
-        "slab",
-        "workingset_refault_anon",
-        "workingset_refault_file",
-        "workingset_activate_anon",
-        "workingset_activate_file",
-        "workingset_restore_anon",
-        "workingset_restore_file",
-        "workingset_nodereclaim",
-        "pgscan",
-        "pgsteal",
-        "pgscan_kswapd",
-        "pgscan_direct",
-        "pgsteal_kswapd",
-        "pgsteal_direct",
-        "pgfault",
-        "pgmajfault",
-        "pgrefill",
-        "pgactivate",
-        "pgdeactivate",
-        "pglazyfree",
-        "pglazyfreed",
-        "thp_fault_alloc",
-        "thp_collapse_alloc",
-    ] {
-        put(name, 0);
-    }
-    s.pop();
-    s
-}
-
-/// One id per line, in increasing order.
-fn list(ids: impl Iterator<Item = crate::kernel::Tid>) -> String {
-    let mut ids: Vec<_> = ids.collect();
-    ids.sort_unstable();
-    let lines: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
-    lines.join("\n")
+/// The cgroups of processes still alive (with threads).
+fn members(k: &Kernel) -> impl Iterator<Item = (Tid, u64)> + '_ {
+    k.groups.iter().filter_map(|(&tgid, g)| {
+        let g = g.borrow();
+        (tgid != INIT && !g.threads.is_empty()).then_some((tgid, g.cgroup))
+    })
 }
 
 #[cfg(test)]

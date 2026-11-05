@@ -43,47 +43,6 @@ const PROG_TYPE_CGROUP_SKB: u32 = 8;
 /// Log levels (`BPF_LOG_MASK`).
 const LOG_MASK: u32 = 7;
 
-fn u32_at(a: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(a[off..off + 4].try_into().unwrap())
-}
-
-fn u64_at(a: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(a[off..off + 8].try_into().unwrap())
-}
-
-/// `CHECK_ATTR`: everything after the last field this command uses must be 0.
-fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
-    if attr[end..].iter().any(|&b| b != 0) {
-        return Err(Errno::EINVAL);
-    }
-    Ok(())
-}
-
-/// When the guest's struct is longer than the kernel's, the extra part must be 0
-/// (`bpf_check_uarg_tail_zero`); more than one page is E2BIG. Returns the length to read.
-fn tail_zero(cx: &Cx<'_>, addr: u64, expected: usize, actual: usize) -> Result<usize, Errno> {
-    if actual > PAGE_SIZE {
-        return Err(Errno::E2BIG);
-    }
-    if actual > expected {
-        let mut tail = vec![0u8; actual - expected];
-        cx.mm().read(
-            UserSlice::new(addr + expected as u64, tail.len()),
-            &mut tail,
-        )?;
-        if tail.iter().any(|&b| b != 0) {
-            return Err(Errno::E2BIG);
-        }
-    }
-    Ok(actual.min(expected))
-}
-
-/// `bpf_capable()`: `CAP_BPF` or `CAP_SYS_ADMIN` in the boot-time user namespace.
-fn bpf_capable(cx: &Cx<'_>) -> bool {
-    let cred = cx.cred();
-    cred.capable(cap::BPF) || cred.capable(cap::SYS_ADMIN)
-}
-
 pub(super) fn bpf(cx: &mut Cx<'_>, command: i32, uattr: u64, size: u32) -> SysResult {
     // When kernel.unprivileged_bpf_disabled (default 2) is not 0, every command needs a
     // capability; when it is 0, each command checks on its own
@@ -194,35 +153,6 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     install(cx, prog)
 }
 
-/// New fds are all close-on-exec (`bpf_prog_new_fd`).
-fn install(cx: &mut Cx<'_>, prog: Rc<Prog>) -> SysResult {
-    let file = OpenFile::new(FileKind::Bpf(prog), oflags::O_RDWR);
-    Ok(cx.fds_mut().install(file, true, 0)? as u64)
-}
-
-/// The program on an fd (`bpf_prog_get_type`): a missing fd is EBADF, a non-program EINVAL.
-fn prog_of_fd(cx: &Cx<'_>, fd: u32) -> Result<Rc<Prog>, Errno> {
-    let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
-    let prog = match &file.borrow().kind {
-        FileKind::Bpf(p) => p.clone(),
-        _ => return Err(Errno::EINVAL),
-    };
-    Ok(prog)
-}
-
-/// The cgroup2 directory an fd has open (`cgroup_get_from_fd`, O_PATH ones too); anything else
-/// is EBADF.
-fn cgroup_of_fd(cx: &Cx<'_>, fd: u32) -> Result<u64, Errno> {
-    let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
-    let node = file.borrow().node();
-    match node {
-        Some(Node::Pseudo(_, PseudoNode::Cgroup(id, b""))) if cx.kr().cgroups.get(id).is_some() => {
-            Ok(id)
-        }
-        _ => Err(Errno::EBADF),
-    }
-}
-
 /// BPF_PROG_ATTACH (`bpf_prog_attach`, `__cgroup_bpf_attach`).
 fn prog_attach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     // The last field is replace_bpf_fd
@@ -319,6 +249,16 @@ fn prog_detach(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     Ok(0)
 }
 
+/// The program on an fd (`bpf_prog_get_type`): a missing fd is EBADF, a non-program EINVAL.
+fn prog_of_fd(cx: &Cx<'_>, fd: u32) -> Result<Rc<Prog>, Errno> {
+    let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
+    let prog = match &file.borrow().kind {
+        FileKind::Bpf(p) => p.clone(),
+        _ => return Err(Errno::EINVAL),
+    };
+    Ok(prog)
+}
+
 /// BPF_PROG_QUERY (`bpf_prog_query`, `__cgroup_bpf_query`): needs `CAP_NET_ADMIN`. Writes back
 /// attach_flags (0 when querying only effective ones) and the program count; when the space given
 /// is too small, writes only the ones that fit and returns ENOSPC.
@@ -364,6 +304,19 @@ fn prog_query(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     Ok(0)
 }
 
+/// The cgroup2 directory an fd has open (`cgroup_get_from_fd`, O_PATH ones too); anything else
+/// is EBADF.
+fn cgroup_of_fd(cx: &Cx<'_>, fd: u32) -> Result<u64, Errno> {
+    let file = cx.fds().get(fd as i32).map_err(|_| Errno::EBADF)?;
+    let node = file.borrow().node();
+    match node {
+        Some(Node::Pseudo(_, PseudoNode::Cgroup(id, b""))) if cx.kr().cgroups.get(id).is_some() => {
+            Ok(id)
+        }
+        _ => Err(Errno::EBADF),
+    }
+}
+
 /// BPF_PROG_GET_FD_BY_ID: needs `CAP_SYS_ADMIN`; no program with this id is ENOENT.
 fn prog_get_fd_by_id(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     // The last field is prog_id
@@ -373,6 +326,12 @@ fn prog_get_fd_by_id(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     }
     let prog = cx.kr().bpf.get(u32_at(attr, 0)).ok_or(Errno::ENOENT)?;
     install(cx, prog)
+}
+
+/// New fds are all close-on-exec (`bpf_prog_new_fd`).
+fn install(cx: &mut Cx<'_>, prog: Rc<Prog>) -> SysResult {
+    let file = OpenFile::new(FileKind::Bpf(prog), oflags::O_RDWR);
+    Ok(cx.fds_mut().install(file, true, 0)? as u64)
 }
 
 /// BPF_OBJ_GET_INFO_BY_FD (`bpf_prog_get_info_by_fd`): first reads the guest's `bpf_prog_info`
@@ -452,6 +411,47 @@ fn obj_get_info_by_fd(cx: &mut Cx<'_>, attr: &[u8], uattr: u64) -> SysResult {
     cx.mm().write(UserSlice::new(uinfo, len), &info[..len])?;
     super::put(cx, uattr + 4, (len as u32).to_le_bytes())?;
     Ok(0)
+}
+
+/// `bpf_capable()`: `CAP_BPF` or `CAP_SYS_ADMIN` in the boot-time user namespace.
+fn bpf_capable(cx: &Cx<'_>) -> bool {
+    let cred = cx.cred();
+    cred.capable(cap::BPF) || cred.capable(cap::SYS_ADMIN)
+}
+
+/// When the guest's struct is longer than the kernel's, the extra part must be 0
+/// (`bpf_check_uarg_tail_zero`); more than one page is E2BIG. Returns the length to read.
+fn tail_zero(cx: &Cx<'_>, addr: u64, expected: usize, actual: usize) -> Result<usize, Errno> {
+    if actual > PAGE_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    if actual > expected {
+        let mut tail = vec![0u8; actual - expected];
+        cx.mm().read(
+            UserSlice::new(addr + expected as u64, tail.len()),
+            &mut tail,
+        )?;
+        if tail.iter().any(|&b| b != 0) {
+            return Err(Errno::E2BIG);
+        }
+    }
+    Ok(actual.min(expected))
+}
+
+/// `CHECK_ATTR`: everything after the last field this command uses must be 0.
+fn check_attr(attr: &[u8], end: usize) -> Result<(), Errno> {
+    if attr[end..].iter().any(|&b| b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+fn u32_at(a: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(a[off..off + 4].try_into().unwrap())
+}
+
+fn u64_at(a: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(a[off..off + 8].try_into().unwrap())
 }
 
 /// Runs the device filter programs of the caller's cgroup before opening a device node or mknod

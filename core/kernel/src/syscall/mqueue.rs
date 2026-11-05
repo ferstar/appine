@@ -53,18 +53,6 @@ pub(crate) struct Limits {
     pub msgsize_default: u64,
 }
 
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits {
-            queues_max: 256,
-            msg_max: 10,
-            msgsize_max: 8192,
-            msg_default: 10,
-            msgsize_default: 8192,
-        }
-    }
-}
-
 impl Limits {
     /// The value of `/proc/sys/fs/mqueue/<name>`.
     pub fn get(&self, name: &[u8]) -> Option<u64> {
@@ -88,6 +76,18 @@ impl Limits {
             b"msgsize_default" => &mut self.msgsize_default,
             _ => return None,
         })
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            queues_max: 256,
+            msg_max: 10,
+            msgsize_max: 8192,
+            msg_default: 10,
+            msgsize_default: 8192,
+        }
     }
 }
 
@@ -173,15 +173,6 @@ impl MqDir {
         let now = crate::tty::wall_ns();
         (self.atime_ns, self.mtime_ns, self.ctime_ns) = (now, now, now);
     }
-}
-
-/// The queue whose inode number is `ino` in the namespace, and its name (a node in the mqueue
-/// filesystem).
-pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCell<MessageQueue>>)> {
-    ipc.mqueues
-        .iter()
-        .find(|(_, q)| q.borrow().ino == ino)
-        .map(|(n, q)| (n.as_slice(), q))
 }
 
 impl Default for MqDir {
@@ -307,87 +298,6 @@ impl MessageQueue {
     }
 }
 
-/// Creates queue `name` in IPC namespace `ns` (whose objects are `ipc`) (Linux's
-/// `mqueue_create_attr`): owned by the caller's fsuid and fsgid, and `perm` has the umask removed
-/// already; `size` is the limit of (message count, message length), with `msg_default` and
-/// `msgsize_default` when None. When the queue count has reached `queues_max`, it is ENOSPC without
-/// `CAP_SYS_RESOURCE`. Not registered in the name table yet (mq_open registers it only after
-/// installing the fd).
-pub(crate) fn new_queue(
-    ipc: &crate::ipc::Ipc,
-    ns: u64,
-    cred: &Cred,
-    perm: u32,
-    size: Option<(u64, u64)>,
-) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
-    let limits = &ipc.mq_limits;
-    if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
-        return Err(Errno::ENOSPC);
-    }
-    let (maxmsg, msgsize) = size.unwrap_or((limits.msg_default, limits.msgsize_default));
-    let now = crate::tty::wall_ns();
-    Ok(Rc::new(RefCell::new(MessageQueue {
-        ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
-        ns,
-        uid: cred.fsuid,
-        gid: cred.fsgid,
-        mode: perm & 0o777,
-        atime_ns: now,
-        mtime_ns: now,
-        ctime_ns: now,
-        maxmsg: maxmsg as usize,
-        msgsize: msgsize as usize,
-        messages: VecDeque::new(),
-        notify: None,
-        receivers: 0,
-        sent: 0,
-        received: 0,
-    })))
-}
-
-/// Registers a newly created queue in the name table, updating the root directory's times with it.
-pub(crate) fn insert_queue(ipc: &mut crate::ipc::Ipc, name: Vec<u8>, q: Rc<RefCell<MessageQueue>>) {
-    ipc.mqueues.entry(name).or_insert(q);
-    ipc.mq_dir.borrow_mut().touch();
-}
-
-/// Removes queue `name` (mq_unlink, and unlink in the mqueue filesystem, both Linux's
-/// `vfs_unlink`): the root directory has the sticky bit, so the caller must own the queue or the
-/// root directory, or have `CAP_FOWNER` over the queue; otherwise EPERM (libc's mq_unlink turns
-/// that into EACCES).
-pub(crate) fn remove_queue(
-    ipc: &mut crate::ipc::Ipc,
-    cred: &Cred,
-    name: &[u8],
-) -> Result<(), Errno> {
-    let q = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
-    let st = q.borrow().stat();
-    let dir_uid = ipc.mq_dir.borrow().uid;
-    if cred.fsuid != st.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&st, cap::FOWNER) {
-        return Err(Errno::EPERM);
-    }
-    ipc.mqueues.remove(name);
-    ipc.mq_dir.borrow_mut().touch();
-    Ok(())
-}
-
-/// Strips the leading `/` from the name (musl has already stripped it) and checks length and
-/// characters.
-fn queue_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
-    let name = cx.mm().read_cstr(addr, 4096)?;
-    let name = name.strip_prefix(b"/").unwrap_or(&name).to_vec();
-    if name.len() > NAME_MAX {
-        return Err(Errno::ENAMETOOLONG);
-    }
-    if name.is_empty() {
-        return Err(Errno::ENOENT);
-    }
-    if name.contains(&b'/') || name == b"." || name == b".." {
-        return Err(Errno::EACCES);
-    }
-    Ok(name)
-}
-
 pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u64) -> SysResult {
     let name = queue_name(cx, name)?;
     let accmode = flags & oflags::O_ACCMODE;
@@ -447,6 +357,50 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
     Ok(fd as u64)
 }
 
+/// Creates queue `name` in IPC namespace `ns` (whose objects are `ipc`) (Linux's
+/// `mqueue_create_attr`): owned by the caller's fsuid and fsgid, and `perm` has the umask removed
+/// already; `size` is the limit of (message count, message length), with `msg_default` and
+/// `msgsize_default` when None. When the queue count has reached `queues_max`, it is ENOSPC without
+/// `CAP_SYS_RESOURCE`. Not registered in the name table yet (mq_open registers it only after
+/// installing the fd).
+pub(crate) fn new_queue(
+    ipc: &crate::ipc::Ipc,
+    ns: u64,
+    cred: &Cred,
+    perm: u32,
+    size: Option<(u64, u64)>,
+) -> Result<Rc<RefCell<MessageQueue>>, Errno> {
+    let limits = &ipc.mq_limits;
+    if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
+        return Err(Errno::ENOSPC);
+    }
+    let (maxmsg, msgsize) = size.unwrap_or((limits.msg_default, limits.msgsize_default));
+    let now = crate::tty::wall_ns();
+    Ok(Rc::new(RefCell::new(MessageQueue {
+        ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+        ns,
+        uid: cred.fsuid,
+        gid: cred.fsgid,
+        mode: perm & 0o777,
+        atime_ns: now,
+        mtime_ns: now,
+        ctime_ns: now,
+        maxmsg: maxmsg as usize,
+        msgsize: msgsize as usize,
+        messages: VecDeque::new(),
+        notify: None,
+        receivers: 0,
+        sent: 0,
+        received: 0,
+    })))
+}
+
+/// Registers a newly created queue in the name table, updating the root directory's times with it.
+pub(crate) fn insert_queue(ipc: &mut crate::ipc::Ipc, name: Vec<u8>, q: Rc<RefCell<MessageQueue>>) {
+    ipc.mqueues.entry(name).or_insert(q);
+    ipc.mq_dir.borrow_mut().touch();
+}
+
 pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
     let name = queue_name(cx, name)?;
     let cred = cx.cred();
@@ -454,23 +408,41 @@ pub(super) fn mq_unlink(cx: &mut Cx<'_>, name: u64) -> SysResult {
     Ok(0)
 }
 
-/// The queue of an mq fd, and the open file's access mode.
-fn queue_of(cx: &Cx<'_>, fd: i32) -> Result<(Rc<RefCell<MessageQueue>>, u32), Errno> {
-    let file = cx.fds().get(fd)?;
-    let f = file.borrow();
-    match &f.kind {
-        FileKind::MessageQueue(q) => Ok((q.clone(), f.flags)),
-        _ => Err(Errno::EBADF),
+/// Removes queue `name` (mq_unlink, and unlink in the mqueue filesystem, both Linux's
+/// `vfs_unlink`): the root directory has the sticky bit, so the caller must own the queue or the
+/// root directory, or have `CAP_FOWNER` over the queue; otherwise EPERM (libc's mq_unlink turns
+/// that into EACCES).
+pub(crate) fn remove_queue(
+    ipc: &mut crate::ipc::Ipc,
+    cred: &Cred,
+    name: &[u8],
+) -> Result<(), Errno> {
+    let q = ipc.mqueues.get(name).ok_or(Errno::ENOENT)?;
+    let st = q.borrow().stat();
+    let dir_uid = ipc.mq_dir.borrow().uid;
+    if cred.fsuid != st.uid && cred.fsuid != dir_uid && !cred.capable_wrt(&st, cap::FOWNER) {
+        return Err(Errno::EPERM);
     }
+    ipc.mqueues.remove(name);
+    ipc.mq_dir.borrow_mut().touch();
+    Ok(())
 }
 
-/// Absolute timeout (`CLOCK_REALTIME`); 0 means wait forever.
-fn deadline(cx: &Cx<'_>, timeout: u64) -> Result<Option<Instant>, Errno> {
-    if timeout == 0 {
-        return Ok(None);
+/// Strips the leading `/` from the name (musl has already stripped it) and checks length and
+/// characters.
+fn queue_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
+    let name = cx.mm().read_cstr(addr, 4096)?;
+    let name = name.strip_prefix(b"/").unwrap_or(&name).to_vec();
+    if name.len() > NAME_MAX {
+        return Err(Errno::ENAMETOOLONG);
     }
-    let t = read_timespec(cx, timeout)?;
-    super::misc::deadline_from_clock(0, t).map(Some)
+    if name.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    if name.contains(&b'/') || name == b"." || name == b".." {
+        return Err(Errno::EACCES);
+    }
+    Ok(name)
 }
 
 pub(super) fn mq_timedsend(
@@ -620,6 +592,15 @@ pub(super) fn mq_timedreceive(
     Ok(data.len() as u64)
 }
 
+/// Absolute timeout (`CLOCK_REALTIME`); 0 means wait forever.
+fn deadline(cx: &Cx<'_>, timeout: u64) -> Result<Option<Instant>, Errno> {
+    if timeout == 0 {
+        return Ok(None);
+    }
+    let t = read_timespec(cx, timeout)?;
+    super::misc::deadline_from_clock(0, t).map(Some)
+}
+
 pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     // As on Linux, check the notification method first, then the fd
     let sev = if sev != 0 {
@@ -687,6 +668,16 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     Ok(0)
 }
 
+/// The queue of an mq fd, and the open file's access mode.
+fn queue_of(cx: &Cx<'_>, fd: i32) -> Result<(Rc<RefCell<MessageQueue>>, u32), Errno> {
+    let file = cx.fds().get(fd)?;
+    let f = file.borrow();
+    match &f.kind {
+        FileKind::MessageQueue(q) => Ok((q.clone(), f.flags)),
+        _ => Err(Errno::EBADF),
+    }
+}
+
 pub(super) fn mq_getsetattr(cx: &mut Cx<'_>, fd: i32, new: u64, old: u64) -> SysResult {
     let file = cx.fds().get(fd)?;
     let q = match &file.borrow().kind {
@@ -723,4 +714,13 @@ pub(super) fn mq_getsetattr(cx: &mut Cx<'_>, fd: i32, new: u64, old: u64) -> Sys
         q.borrow_mut().touch_read();
     }
     Ok(0)
+}
+
+/// The queue whose inode number is `ino` in the namespace, and its name (a node in the mqueue
+/// filesystem).
+pub(crate) fn find(ipc: &crate::ipc::Ipc, ino: u64) -> Option<(&[u8], &Rc<RefCell<MessageQueue>>)> {
+    ipc.mqueues
+        .iter()
+        .find(|(_, q)| q.borrow().ino == ino)
+        .map(|(n, q)| (n.as_slice(), q))
 }
