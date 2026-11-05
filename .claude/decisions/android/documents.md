@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -52,3 +52,10 @@
 - **Tradeoffs**: Reading out of the home through symlinks remains an accepted limitation.
 - **Watch out**: Grants outlive moved or deleted directories (open in the map).
 - **Source**: 12c4afa
+
+### D8: Provider helpers follow the framework callbacks that use them
+- **What**: `Documents` keeps its framework callbacks in order (roots, queries, open, changes, search) and puts each helper after its first use, `closer` next to `openDocument`, its only user.
+- **Why**: The user wanted each Kotlin file to read in the order its code runs, and Documents' helpers were not in the order its callbacks use them.
+- **Tradeoffs**: The companion's path and MIME helpers keep their old order.
+- **Watch out**: git blame on the moved lines points at a546fea unless read with -M.
+- **Source**: a546fea

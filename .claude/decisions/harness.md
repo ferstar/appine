@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -93,3 +93,17 @@
 - **Tradeoffs**: The bwrap case no longer runs ls or grep inside the sandbox and expects "2 processes".
 - **Watch out**: Other cases may still count processes or read `/proc` while their own pipelines run; the map's gotchas say how to count.
 - **Source**: 404a804, fe4bb2b
+
+### D15: Test helpers follow the tests that use them
+- **What**: Test files keep their tests in order, a helper with one user follows it and shared helpers follow all tests in the order they run; tests/bench puts `main` right after the types, then its helpers in call order.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; the integration tests opened with their helpers.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; a reader meets the helpers' names before their definitions.
+- **Watch out**: Helpers appended above the tests drift from this order.
+- **Source**: 50f9284
+
+### D16: rust-analyzer is part of the pinned toolchain
+- **What**: rust-toolchain.toml lists rust-analyzer and scripts/dev.Dockerfile installs the same rustup components, with a comment that the two lists must match.
+- **Why**: The VS Code extension's bundled rust-analyzer does not work with the pinned Rust 1.90.0, and a component missing from the dev image is downloaded again in every `--rm` container.
+- **Tradeoffs**: The toolchain's rust-analyzer is older than the extension's own; each CI job and the dev image download one more component; the lists are kept in two places by hand.
+- **Watch out**: A component added to rust-toolchain.toml but not to the Dockerfile makes every `scripts/dev` call download it again (in the map's gotchas).
+- **Source**: 503022d

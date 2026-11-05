@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -61,33 +61,103 @@
 - **Watch out**: The factor comes from one ideograph per font size, so a device whose CJK fallback is not one em wide fills differently, and at 1.2× ideographs come close to the cell's top and bottom, checked only at 6 and 32 dp on an API 34 emulator.
 - **Source**: 0478dd5
 
-### D10: Narrow windows switch tabs through a count, the current title and a list
-- **What**: Below 600 dp (`screenWidthDp`, checked on every configuration change) the bar shows the tab count and the current tab's `N: title`, which open a list of tabs with the current one highlighted and a ✕ to close each; from 600 dp the row stays, each tab at most 220 dp with the current one scrolled into view; ended tabs read "(ended)" in grey.
-- **Why**: On an upright phone the row fit two or three long titles, hid the rest without a hint, could leave the current tab scrolled out of view, and a long press hung a tab up without confirmation.
-- **Tradeoffs**: In narrow windows other tabs' titles take a tap to see and switching takes two taps, and closing still hangs up at once, with no confirmation even when a program is running.
-- **Watch out**: The 600 dp breakpoint is untuned on real phones, tablets and foldables, hardware keys go to the open list rather than the terminal, and the list's height, its overlap with the IME and TalkBack are untested on devices.
-- **Source**: e29142d
+### D11: Desktop shortcuts open, close and cycle tabs
+- **What**: Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs, listed by `onProvideKeyboardShortcuts`.
+- **Why**: Hardware-keyboard users had no keys for tabs.
+- **Tradeoffs**: Programs no longer receive those four key combinations, and Ctrl+Shift+W closes a tab without the confirmation × asks for while its shell runs.
+- **Watch out**: The shortcuts are untested with real keyboards and with IMEs that take Ctrl combinations.
+- **Source**: 2af55e2 (its swipe and renaming removed in 1eac62e)
 
-### D11: Tabs can be swiped, renamed and switched with desktop shortcuts
-- **What**: A horizontal swipe of at least 48 dp over the narrow switcher shows the next or previous tab without going round; a long press on a tab, the switcher or a list row offers Rename tab and Close tab; names show before the program's title; and Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs, listed by `onProvideKeyboardShortcuts`.
-- **Why**: Reaching another tab in narrow windows took opening the list, tabs whose programs set long or identical titles could not be told apart, and hardware-keyboard users had no keys for tabs.
-- **Tradeoffs**: The swipe exists only in narrow windows, programs no longer receive those four key combinations, and a name hides later program titles until it is cleared.
-- **Watch out**: A swipe from a screen edge goes to the system back gesture, the shortcuts are untested with real keyboards and with IMEs that take Ctrl combinations, and `Swipe` suppresses ClickableViewAccessibility assuming the switcher keeps calling `performClick`.
-- **Source**: 2af55e2
-
-### D12: Extra keys use Termux's two-row layout and touch behaviour
-- **What**: Two rows of 37.5 dp (ESC / - HOME ↑ END PGUP; TAB CTRL ALT ← ↓ → PGDN) act on release with a key-click haptic and not at all if the finger left the key, the arrows, PGUP and PGDN repeat every 80 ms after the long-press timeout, a swipe up from - sends |, and a long press locks CTRL or ALT until tapped.
-- **Why**: One row of eleven keys was too cramped to read or hit, held arrows did not repeat, and Ctrl or Alt could not be kept on for several keys.
-- **Tradeoffs**: The bar takes about 75 dp instead of about 39, so the terminal loses two or three rows with the IME up, | needs a swipe, and there are no custom key sets, SHIFT/FN or toggle to hide the bar.
-- **Watch out**: The keys send presses only, so a program using the Kitty protocol's release events sees no release, and TalkBack and the popup in split screen or cramped landscape are untested.
-- **Source**: c3c3b38
+### D12: Extra keys keep Termux's touch behaviour
+- **What**: Keys act on release with a key-click haptic and not at all if the finger left the key, the arrows repeat every 80 ms after the long-press timeout, and CTRL, ALT and SHIFT are one-shot on a tap while a long press locks one (from on as well as off) and toasts "<label> locked" through `ExtraKeysView.Target.notice`, unlocking silently; the layout is D14's.
+- **Why**: One row of eleven keys was too cramped to read or hit, held arrows did not repeat, modifiers could not be kept on for several keys, and a long press on a modifier a tap had turned on turned it off without saying so.
+- **Tradeoffs**: A long press no longer turns a one-shot modifier off (a tap does), the toast covers the keys' first row for about two seconds, and there are no custom key sets or toggle to hide the bar.
+- **Watch out**: The keys send presses only, so a program using the Kitty protocol's release events sees no release; a new caller of `Target.notice` shares the toast with tab titles; TalkBack is untested.
+- **Source**: c3c3b38; ba60e25 (layout replaced by D14)
 
 ### D13: The app is Material 3 with dynamic colours, the terminal always dark
-- **What**: `Theme.Appine` (Material 3 DayNight) serves Settings and the licences on shared page layouts and `Theme.Appine.Terminal` (Material 3 Dark, with a black window and system bars) serves `MainActivity`, both with DynamicColors; the terminal stays a framework `Activity` using Material dialogs and AppCompat's menus and list popup, and its hand-built tab bar and extra keys read the theme's colour roles through `MaterialColors`.
+- **What**: `Theme.Appine` (Material 3 DayNight) serves Settings and the licences on shared page layouts and `Theme.Appine.Terminal` (Material 3 Dark, with a black window and system bars) serves `MainActivity`, both with DynamicColors; the terminal stays a framework `Activity` using Material dialogs and AppCompat's menus and list popup, and its hand-built tab bar and extra keys, black like the terminal, read the theme's colour roles through `MaterialColors`.
 - **Why**: The user asked for Material 3, starting with Settings and then the terminal's dialogs, menus, list of tabs, tab bar and extra keys, and the Material classes need a Material theme on the activity.
-- **Tradeoffs**: Views `MainActivity` inflates are the framework's, so AppCompat attributes such as `app:tint` do nothing there; the selection handles take the primary colour instead of cyan; the current tab in the row is told apart by the primary colour; Android 10/11 get Material's baseline purple; and the bar has no Material elevation or tab indicator.
+- **Tradeoffs**: Views `MainActivity` inflates are the framework's, so AppCompat attributes such as `app:tint` do nothing there; the selection handles take the primary colour instead of cyan; Android 10/11 get Material's baseline purple; and the bars have no Material elevation, their indicator (D20) being drawn by hand.
 - **Watch out**: Turning `MainActivity` into an `AppCompatActivity` later changes its inflation, insets and key handling, colours are read once per activity, and DynamicColors, insets and the black system bars were checked only on an API 34 emulator.
-- **Source**: 55be399, 97707b7, d16025a
+- **Source**: 55be399, 97707b7, d16025a; 883e652, d48dd10
+
+### D14: Extra keys are a black grid of eight columns with SHIFT and SYM fixed at the right
+- **What**: Two 32 dp rows (ESC / - HOME ↑ END | over TAB CTRL ALT ← ↓ → ~) in columns of max(45 dp, width / 8), scrolling below 360 dp, sit beside a fixed last column with SHIFT on top and SYM below; SHIFT is one-shot or locked like CTRL and ALT and folded with them into the key event's meta state (Shift+Tab is back-tab, CTRL+SHIFT+C/V copy and paste); PGUP, PGDN, the swipe up from - and every line between keys are gone, and both bars are black like the terminal.
+- **Why**: The user wanted cells that fit 360 dp without crowding four-letter labels, Shift with Tab and the arrows instead of page keys that only send sequences, the layer key below Shift as on keyboards and away from the IME, and no lines on either bar.
+- **Tradeoffs**: No page keys without a hardware keyboard; ` and forward delete are left to the IME; the shifted character follows the virtual keyboard's US map; Shift+Tab spans both rows; only labels set the black bars apart, and a key's cell shows only while pressed.
+- **Watch out**: Below 360 dp the seventh column barely shows until scrolled (hence D21's fade), a character missing from the key map (CJK) leaves the modifiers on, the column width relies on the rows and grid measuring again when it changes, and the layout was tried only on emulators, not on real phones below 360 dp, in landscape or with TalkBack.
+- **Source**: 883e652, 969e714, 394cd83, d70ee01, a8bdaa2
+
+### D15: A SYM page swaps the scrolling keys for ASCII symbols
+- **What**: SYM turns the other keys into ` / - = ^ \ | over [ ] { } < > ~, with % in SHIFT's cell, until tapped again, its label in the primary colour and marked by D20's indicator meanwhile; CTRL and ALT carry over and apply to symbols, SHIFT waits unused, and the page is not saved.
+- **Why**: The ASCII symbols Gboard has no long press for took four taps each, and only / | ~ were on the bar.
+- **Tradeoffs**: $ & ; : get no key; CTRL, ALT and a waiting SHIFT cannot be seen on the symbols page; the arrows, TAB and ESC take a tap on SYM first while it stays up.
+- **Watch out**: The set follows English Gboard's long presses on one phone, other keyboards and layouts (Samsung Keyboard, CJK) differ, and a key held while another finger turns the page relies on the removed view's touch being cancelled (untested).
+- **Source**: 2c024c1, d70ee01
+
+### D16: Terminal files read in the order their code runs
+- **What**: Kotlin files put types first, properties and init blocks in their original relative order, lifecycle and listener callbacks as they fire, each private helper after its first caller, small utilities and inner adapters near the end and the companion last (VtView by call chain within its sections, ExtraKeysView by its construction); vt.rs follows VtNative.kt's order with each helper after its last caller.
+- **Why**: The user wanted each file to read in the order its code runs.
+- **Tradeoffs**: git blame on the moved lines points at these commits unless read with -M or --color-moved; a helper shared by several features sits next to only one of them.
+- **Watch out**: Code appended at the end of a class drifts from this order; reorders must keep initialised properties in their relative order, since Kotlin initialises them in textual order; a function added to VtNative.kt goes to the same place in vt.rs.
+- **Source**: a546fea, 3511da5
+
+### D17: VtView draws through androidx.core's KTX helpers
+- **What**: The font-size write uses `edit { }`, and VtView's bitmap, row clip, glyph scale and cursor clip use `createBitmap`, `Canvas.withClip` and `withScale`, with `drawRow`'s body inside `withClip`.
+- **Why**: Lint's UseKtx warnings now fail the build (android/native D10).
+- **Tradeoffs**: `drawRow`'s body is reindented (blame needs -w), and each clip and scale runs inside try/finally.
+- **Watch out**: Drawing was only compiled and linted when the helpers went in.
+- **Source**: 4c1a3ce
+
+### D18: The tab bar is one 32 dp row of numbered tabs
+- **What**: In every window a 32 dp bar holds numbered 32 dp tabs (ended ones faded), then ×, + and ⋮ as system-font characters; a long press on a tab toasts its title (the program's, `sh` when none), × asks while the tab's shell runs, closing the current tab shows the one after it (before it when last), and ⋮ offers Close other tabs and Close all tabs, asking once if any runs; tab names, the switcher, its list, the swipe, the tab menu and renaming are gone.
+- **Why**: Upright, reaching another tab took two taps through a list, the title the bar made room for read `sh` in almost every tab on Alpine, and closing hung up a running shell without asking.
+- **Tradeoffs**: Other tabs' titles take a long press or TalkBack, tabs cannot be named or swiped, and tabs and buttons are 32 dp, under the 48 dp touch target.
+- **Watch out**: Touch targets and the × glyph under vendor fonts are unchecked on real phones, × sits next to + with a confirmation only for running tabs, numbers from 100 overflow the 20 dp box, and the toast appears over the IME.
+- **Source**: a8bdaa2, 1eac62e, 7c35183
+
+### D19: The bars' labels are sized in dp
+- **What**: The tab bar's and extra keys' labels use dp constants beside the bars' fixed sizes (`BAR_LABEL_DP` 14 for the buttons and `TAB_NUMBER_DP` 12 for the numbers in `MainActivity`, `LABEL_DP` 12 in `ExtraKeysView`), while dialogs, menus and toasts follow the font scale.
+- **Why**: The bars are fixed in dp, so labels in sp would clip at large font scales (Android 14's nonlinear 200% turns 12 sp into about 24 dp).
+- **Tradeoffs**: Users who raise the system font get no larger labels on the two bars; dimens.xml waits until sizes need per-configuration overrides, when all the bars' sizes should move together.
+- **Watch out**: Not checked at a large font scale, and accessibility scanners may flag text that ignores it.
+- **Source**: 4aa2abf
+
+### D20: An indicator bar marks the current tab, locked modifiers and SYM
+- **What**: A rounded 16 × 1 dp bar in the primary colour, centred 4 dp below the label's baseline (whole pixels, rounded down), is drawn by the containers in `dispatchDraw` through `ExtraKeysView.drawIndicator` under the current tab, a locked modifier and SYM while the symbols show; numbers use the default weight, and one-shot modifiers keep the primary colour alone.
+- **Why**: The current tab's 2 dp box looked heavy, bold numbers outweighed every other label, the primary colour cannot be told from muted labels in grayscale (both tone 80 in Material 3's dark scheme), and a locked modifier's underline matched nothing in the tab bar.
+- **Tradeoffs**: A one-shot modifier still relies on colour alone, a state change must invalidate the drawing container rather than the label, and the bar is 2 px at densities from 2 to 3.
+- **Watch out**: Seen only on an API 34 emulator at density 2.75 with Roboto; the 4 dp gap assumes labels without descenders; changing a label's opacity (as D24's renumbering might) would fade the indicator too.
+- **Source**: d48dd10
+
+### D21: Scrolling rows fade out into the fixed buttons at their end
+- **What**: The tab bar and the extra keys are FrameLayouts whose scrolling row spans them with an end padding as wide as the fixed part and `clipToPadding` off, the fixed part sits over the end in black except a blank left strip (12 dp of ×, 6 dp of SHIFT and SYM, as InsetDrawables), and the row's right fading edge of `ExtraKeysView.FADE_DP` (32 dp) is carried that far in by a padding offset, with no left fade; the tab row scrolls the current tab clear of the fade.
+- **Why**: Nothing showed that more tabs lay beyond × or, below 360 dp, more keys beyond the last column.
+- **Tradeoffs**: Items under the fixed part are drawn only to be hidden, a tap on the blank strip where a fading item shows goes to the fixed button, and a manual scroll can stop with the last tab barely faded.
+- **Watch out**: The strips fit the blank before × and SHIFT's S (about 0.7 dp) at the current label sizes in Roboto, so an OEM font or label change can put the fade over a glyph; `ExtraKeysView.scrolls` must compare the grid with the room between the paddings, since `canScrollHorizontally` counts the end padding as shown; checked only on a Pixel 4a API 34 emulator, not on real devices or Android 10/11.
+- **Source**: a75981b, db4f809
+
+### D22: The current tab comes back into view 3 s after the tab row rests
+- **What**: `revealCurrentTab` runs from a delayed `Runnable` `RETURN_TO_CURRENT_TAB_MS` (3 s) after the row rests; ACTION_DOWN on the row cancels it, ACTION_UP/CANCEL and every finger-less `onScrollChanged` restart the wait, and a tab change still scrolls at once.
+- **Why**: Scrolling the row could leave the tab the terminal shows out of view for as long as nothing else changed.
+- **Tradeoffs**: The row slides back while someone may still be looking at other tabs, a current tab partly under the fade counts as away, and 3 s is a guess.
+- **Watch out**: Checked only with adb swipes and held touches on an API 34 emulator, not on a real phone, with TalkBack's scroll actions or with a hardware keyboard.
+- **Source**: 1118f81
+
+### D23: Scrolling rows are excluded from the left-edge back gesture
+- **What**: The tab bar sets `systemGestureExclusionRects` to itself less the buttons' width on every layout, and the extra keys' scroll view excludes itself up to the last column only while it can scroll, with the rectangle and list allocated once; the fixed parts keep the right edge's gesture.
+- **Why**: With gesture navigation, a left-edge slide over either row went back to the launcher instead of scrolling it.
+- **Tradeoffs**: The left edge no longer goes back at the tab bar's 32 dp, or at the keys' 64 dp below 360 dp.
+- **Watch out**: Android honours at most 200 dp of exclusion per window edge (96 dp used now); checked only on an API 34 emulator in portrait, not with an OEM's own gesture navigation, on real narrow devices or in landscape with side insets.
+- **Source**: ced9f06, 9f21a29
+
+### D24: Tabs slide into closed tabs' places before renumbering
+- **What**: `renderTabs` keeps one `Tab` holder per session and changes the row in place; after a close, tabs whose place moved slide there with `translationX` (FLIP, 200 ms, Material standard easing) and then cross-fade their numbers (200 ms), closed tabs shrink to 0.6 and fade out in 150 ms in the row's overlay, and the indicator slides from its old place (it jumps when another tab is shown).
+- **Why**: Closing a tab renumbered the later tabs at once, so the tab taking the closed current tab's place showed the same number under the same indicator and the switch went unnoticed.
+- **Tradeoffs**: A close takes about 400 ms to settle; at the row's end the tabs before slide right rather than the next one arriving; numbers lag TalkBack's descriptions; the row keeps state across renders.
+- **Watch out**: `renderTabs` matches tabs by position, relying on sessions being added only at the end (reordering tabs would need matching by session); Close other tabs is untried; seen only on an API 34 emulator.
+- **Source**: afd086a
 
 ## Superseded
 
@@ -96,3 +166,10 @@
 - ~~The libghostty-vt terminal as a debug-only `VtActivity` next to the Termux tabs (394aecf)~~ → replaced by **D8** in 6ffb912 (2026-11-04)
 - ~~Wide glyphs are drawn at natural size, centred, and only ever shrunk (D5 in part, 394aecf)~~ → replaced by **D9** in 0478dd5 (2026-11-04)
 - ~~The terminal keeps the framework theme as `Theme.Appine.Terminal` so its dialogs and menus keep their look (55be399)~~ → replaced by **D13** in 97707b7 (2026-11-04)
+- ~~D10: Narrow windows switch tabs through a count, the current title and a list (e29142d)~~ → replaced by **D18** in 1eac62e (2026-11-05)
+- ~~Tabs swiped over the narrow switcher, renamed and closed from a long-press menu, names shown before titles (D11 in part, 2af55e2)~~ → replaced by **D18** in 1eac62e and 7c35183 (2026-11-05)
+- ~~Extra keys in two rows of 37.5 dp with PGUP and PGDN and | on a swipe up from - (D12 in part, c3c3b38), then in nine and eight columns with PGUP and PGDN fixed and 1 px lines between keys (883e652, 969e714)~~ → replaced by **D14** in 394cd83 and a8bdaa2 (2026-11-05)
+- ~~SYM in the fixed column's top cell, above SHIFT (2c024c1)~~ → replaced by **D14** in d70ee01 (2026-11-05)
+- ~~The tab bar and extra keys in the surface container colour (D13 in part, d16025a)~~ → replaced by **D14** in 883e652 (2026-11-05)
+- ~~A long press toggles a modifier, locking only from off, and a locked modifier is underlined (D12 in part, c3c3b38)~~ → replaced by **D12** in ba60e25 and **D20** in d48dd10 (2026-11-06)
+- ~~The current tab told apart by the primary colour (D13 in part, d16025a), then boxed in a 2 dp outline with a bold number (1eac62e)~~ → replaced by **D20** in d48dd10 (2026-11-06)

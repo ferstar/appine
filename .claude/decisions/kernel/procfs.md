@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -91,3 +91,10 @@
 - **Tradeoffs**: A `/proc/<tid>` inode mixes in its group's serial, so a thread id reused within the same process keeps its inode number.
 - **Watch out**: Code outside procfs that treats a pid node's id as a thread group id can still miss threads; the known ones (exe, pidfd_send_signal's directory) use `group_of`.
 - **Source**: 173da76
+
+### D13: Synthetic filesystem files read in the order their code runs
+- **What**: pseudo.rs runs lookup, stat and readdir, per-process files, system-wide files, /proc/<pid>/net, sysfs, writing, contents and shared helpers; cgroup.rs goes from mkdir through reading, writing, fork, the OOM killer and device programs to members; bpf.rs runs programs, verifier, interpreter; syscall/bpf.rs follows dispatch order; syscall/mqueue.rs, filed here, puts the calls taking a name before those taking an fd.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; pseudo.rs had 57 functions above their first caller.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `write_mem` stays with `read_mem`, and `file_mode` with `FILES` since stat calls it.
+- **Watch out**: Code appended at the end of a file drifts from this order; syscall/mqueue.rs is not in the module registry.
+- **Source**: a63a7b4

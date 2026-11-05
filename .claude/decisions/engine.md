@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -140,3 +140,10 @@
 - **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section.
 - **Watch out**: Bugs confirmed at the split stay open in the map, among them the generated table lookup entering the wrong block for target 0, `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread, internal aborts bypassing the fault guard and unregistered locks inside guarded code.
 - **Source**: f9edf81
+
+### D20: Engine files read in the order their code runs
+- **What**: lib.rs is sectioned into the page table, CPU state and exits, Tier 1 and process-wide calls (`Cpu::reset` after `tlb_flush`, as at execve); in tests a helper used by one test follows it and shared helpers follow all tests; lockstep's class functions follow the `CLASSES` table and its runner goes from its types through `run` and `run_class` to the helpers in call order.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; the engine tests defined their helpers before the tests that use them.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; in lockstep's classes.rs, `imm_width`, `single_reg` and `pair` sit after their last user, further from their first.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 91fabe2

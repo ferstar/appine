@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -91,3 +91,10 @@
 - **Tradeoffs**: None.
 - **Watch out**: None known; the only other caller is a unit test.
 - **Source**: ce7d0d8
+
+### D13: Store files read in the order their code runs
+- **What**: store.rs runs constants and `SCHEMA`, then `struct Store` with `impl Store` right under it in sections (opening and boot cleanup, reads, changes, transactions and deferred commits, metadata cache, objects, connection) and its Drop, then operations, shared state, cache entries, the lock file's counters, reaper and checkpoints, errors and names; browse.rs ends with path resolution, import.rs starts with `import_tar_gz`, and lib.rs's host wrappers follow their JNI functions.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; store.rs had no sections and kept `impl Store` hundreds of lines below its struct.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `remove_lost_objects` stays in boot cleanup although commit calls it too.
+- **Watch out**: Code appended at the end of `impl Store` or of a file drifts from this order.
+- **Source**: 27365c6

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -84,3 +84,10 @@
 - **Tradeoffs**: Newer distribution kernels refuse TIOCSTI to everyone without `CAP_SYS_ADMIN`, while appine keeps 6.1's rule for one's own terminal.
 - **Watch out**: None known.
 - **Source**: ef5f836
+
+### D12: Terminal files read in the order their code runs
+- **What**: `impl Tty` follows the module docs' data flow (input, slave read, output, master read, ioctl helpers) with outside accessors last; syscall/tty.rs runs allocation and opening, I/O, ioctls, job control and hangup; terminal.rs puts the consoles `Machine` calls in lifecycle order, then the appine-run bridge, then shared helpers.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; the terminal files were written helpers first.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; Default impls for `Termios` and `Winsize` stay before the inherent impls, and terminal.rs's shared helpers section holds one function.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 688efa0

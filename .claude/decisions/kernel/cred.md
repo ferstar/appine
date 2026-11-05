@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -56,3 +56,10 @@
 - **Tradeoffs**: User namespaces sit in kernel/process although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading.
 - **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, global pids in seccomp notifications, privilege gains despite a shared fs context, untranslated `PRIO_USER`, new-file modes and the ptrace access checks.
 - **Source**: 12c4afa
+
+### D8: Credential and seccomp files read in the order their code runs
+- **What**: cred.rs runs credentials and file capabilities with the user namespace types (owned by kernel/process) last and `impl Cred`'s entry points before id translation and scope checks; syscall/cred.rs runs id syscalls, capabilities, then committing; seccomp.rs goes from installing filters through syscall entry, the sysctls, user notifications, ptrace and thread exit to the always-allow cache, cBPF and shared helpers; constants several sections use stay at the top.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; cred.rs opened with the user namespace types and seccomp.rs mixed the cBPF interpreter into the filter paths.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; two seccomp sections (thread exit, shared helpers) hold one function each.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 159d4f4

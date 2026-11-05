@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -89,6 +89,20 @@
 - **Tradeoffs**: A password set inside a running session keeps NOPASSWD until the next tab logs in (map debt), and a locked account without a hash still counts as passwordless, as `adduser -D` accounts must.
 - **Watch out**: Shadow formats other than Alpine's and Debian's (`!`, `!!`, `*`, `!*`) are judged by the same rule, and the Debian sudo path was not run in a container, only shared with the Alpine path.
 - **Source**: 711b034
+
+### D14: Rootfs and Settings read in the order a start uses them
+- **What**: `Rootfs` runs types and constants, the store, the import, mirror probing and writing, the per-start files, boot, accounts, then downloads and reset; `SettingsActivity` runs lifecycle, row building, listener callbacks, display, then actions in the order of the rows.
+- **Why**: Rootfs interleaved import, mirror, login and download code, unlike the order a start uses them.
+- **Tradeoffs**: `PROFILE` and `OLD_PROFILE` are now apart, each next to its user.
+- **Watch out**: `OLD_PROFILE` is built from `PROFILE` and must stay after it.
+- **Source**: a546fea
+
+### D15: Lint fixes go through androidx compat and KTX helpers
+- **What**: Toggle rows set their accessibility state through `AccessibilityNodeInfoCompat`'s tri-state setter (`setChecked(int)` from API 36, the boolean below), and Rootfs's preference writes use `edit { }`, with `edit(commit = true)` where the import record was committed synchronously.
+- **Why**: `AccessibilityNodeInfo.setChecked(boolean)` is deprecated since Android 16 (compileSdk 37), and UseKtx warnings now fail the build (android/native D10).
+- **Tradeoffs**: A compat wrapper is created for each accessibility query of a toggle row.
+- **Watch out**: The toggles' accessibility state (D12) was not checked with TalkBack on a device.
+- **Source**: 4c1a3ce
 
 ## Superseded
 

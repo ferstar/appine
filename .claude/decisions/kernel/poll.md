@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -63,3 +63,10 @@
 - **Tradeoffs**: Linux's table never shrinks and a forked child's is sized by its parent's open fds, so a set bit on a closed fd just above the estimate is ignored where Linux returns `EBADF` (recorded in the map).
 - **Watch out**: A hung-up host socket in the except set is no longer polled, so a later event on it is noticed only on another wakeup or the timeout.
 - **Source**: 5c179b0
+
+### D9: poll.rs reads from the syscalls down to the readiness model
+- **What**: Shared constants stay at the top, then ppoll and pselect6, epoll, waiting (the exclusive gates in trigger order), signal-driven I/O, the readiness model and data generations, and eventfd last.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; poll.rs started with the readiness helpers and ended with the syscalls that use them.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; the readiness model the module docs describe first now comes near the end.
+- **Watch out**: Code appended at the end of the file drifts from this order.
+- **Source**: d795d07

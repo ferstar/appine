@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
@@ -140,3 +140,10 @@
 - **Tradeoffs**: None.
 - **Watch out**: Code that treats a pid node's id as a thread group id misses threads (kernel/procfs D12).
 - **Source**: 173da76
+
+### D20: VFS files read in the order their code runs
+- **What**: syscall/fs.rs runs opening, reading and writing, directories, syncing, metadata, namespace changes, ownership and times, truncation, then paths, tmpfs accounting and helpers; `impl Vfs` resolves paths top-down; mount.rs, inotify.rs, fd.rs and the smaller files follow their calls' order.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; syscall/fs.rs kept reading and writing at the end and syncing among the namespace calls.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `random_ioctl` stays above `ioctl`, sharing a paragraph with the ioctl constants.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 866b1cf

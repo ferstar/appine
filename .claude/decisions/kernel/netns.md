@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -77,3 +77,10 @@
 - **Tradeoffs**: None; tables are self-contained, so dropping them whole matches `nft_flush_table`.
 - **Watch out**: Owner-flagged tables, which Linux skips for other sockets, cannot exist here, since the flag is `EOPNOTSUPP`.
 - **Source**: d27f421
+
+### D11: Namespace files read in the order their code runs
+- **What**: netdev.rs follows `do_setlink`'s changes, then names, addresses, routes, attributes, ids, ioctl and sysctls before the shared parts; netns.rs goes from `World` through translation, listeners, nat, filter chains and forwarding to address helpers and lo; nft.rs runs requests, changes, queries, execution (nat before filter), expressions and encoding; forward.rs puts the forwarding thread before the client address registry; netconf.rs puts the `NetConf` impls first.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; netdev.rs and netns.rs mostly put helpers above their callers.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; netns.rs now has 10 sections, and `impl Default for NetConf` stays before the inherent impl as its constructor.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 5bc3be5

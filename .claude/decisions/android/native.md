@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -54,12 +54,27 @@
 - **Source**: 55be399
 
 ### D8: Instrumentation tests cover oversized downloads, homeless accounts and repeated reads of saved tabs
-- **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
+- **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test (its tabs built without names since 7c35183) reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
 - **Why**: The fetch cap, homes of `/` and keeping the killed-run marker had no device-side coverage, and the saved-tabs test still expected the marker to be deleted.
-- **Tradeoffs**: Only the `file:` URL path is exercised, not HTTP resumption.
+- **Tradeoffs**: Only the `file:` URL path is exercised, not HTTP resumption, and loading an index written by a version with tab names is untested.
 - **Watch out**: The saved-tabs test assumes transcripts are the only `.txt` files in `files/tabs`, and each home case needs its own login setting so the provider's cached home is not reused.
-- **Source**: 544418f, 711b034, d5dbe29
+- **Source**: 544418f, 711b034, d5dbe29; 7c35183
+
+### D9: `Native` and the JNI bridge follow a kernel's life
+- **What**: `Native` runs init, the store, browsing, start, boot, `setRoutes`, the console functions, the poll's calls in poll order, `trimMemory`, shutdown and stop; hosts/android's JNI functions follow Native.kt's order with `MACHINES` opening the kernel section and the string and error helpers last; `MachineTest` is grouped by app flow without pinning JUnit's method order.
+- **Why**: The user wanted each file to read in the order its code runs; Native's functions and MachineTest's tests followed neither a kernel's life nor the app's flow, and the bridge's helpers sat above the JNI functions using them.
+- **Tradeoffs**: git blame on the moved lines points at these commits unless read with -M or an ignore-revs file; MachineTest's diff is large for no change in behaviour.
+- **Watch out**: A function added to Native.kt goes to the same place in the Rust bridge.
+- **Source**: a546fea, 55d75ac
+
+### D10: Kotlin compiler and lint warnings fail the build
+- **What**: `kotlin.compilerOptions.allWarningsAsErrors` covers every compilation, local builds included, and `lint.warningsAsErrors` is on with GradleDependency, AndroidGradlePluginVersion, OldTargetApi, ExpiringTargetSdkVersion and OutdatedLibrary informational, since they follow data outside the repository; no formatter, detekt or extraWarnings.
+- **Why**: CI ran lintDebug without failing on its warnings and Kotlin warnings were ignored, while the Rust code is held to clippy `-D warnings`.
+- **Tradeoffs**: A warning stops local builds too, unlike local cargo builds; outdated dependencies and target SDK deadlines fail nothing and must be noticed in the report; formatting stays manual.
+- **Watch out**: Upgrading compileSdk, AGP, Kotlin or a library can surface new deprecations or checks as failures; Play SDK Index errors from outside data can still fail lint; an informational issue ID that a later AGP drops would be reported as unknown, now an error.
+- **Source**: 4c1a3ce
 
 ## Superseded
 
 - ~~A `vt` cargo feature behind the `appine.vt` Gradle property, debug only and off by default, probed by `VtNative.available` (394aecf)~~ → replaced by **D6** in b38d29c (2026-11-04)
+- ~~AGP pinned to 9.3.3 so Android Studio 2026.1 can import the project (96d2997)~~ → reverted in f6c6cf5 (2026-11-05) once Android Studio 2026.2.2 supported AGP 9.4.1

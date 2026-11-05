@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -126,3 +126,10 @@
 - **Tradeoffs**: None; this matches Linux.
 - **Watch out**: It relies on exiting threads having dropped their references before `kill_other_threads` returns, which they do under the BKL.
 - **Source**: 68cafce
+
+### D18: Process files read in the order their code runs
+- **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, and bug.rs, debug.rs and syscall/mod.rs are filed here.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; kernel.rs opened with the wake-request helpers and syscall/proc.rs with exit.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `store_changed` sits at the end of machine.rs, away from `RUNNING`, which describes it.
+- **Watch out**: Code appended at the end of a file drifts from this order; bug.rs, debug.rs and syscall/mod.rs are not in the module registry.
+- **Source**: 0758e3c

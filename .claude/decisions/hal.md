@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -62,3 +62,10 @@
 - **Tradeoffs**: There are two implementations behind cfg; a held fd would also have worked but occupies a slot and must survive fd-closing code.
 - **Watch out**: getrandom blocks until the host's entropy pool is initialised, which a booted Android or Linux system already is.
 - **Source**: 9e72dbb
+
+### D10: hal files read in the order of the map's responsibilities
+- **What**: lib.rs runs memory, files and storage, host statistics, waiting, threads, CPUs and time, the CLI's terminal helpers and errors (`last_errno` last), and net.rs runs host sockets, interfaces and routes and DNS with `sockaddr` last; cfg alternatives of one function stay adjacent.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; lib.rs had no sections and mixed memory, file, thread and terminal calls.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `sockaddr`, used by the kernel too, sits under the DNS header.
+- **Watch out**: Code appended at the end of a file drifts from this order, and the Android cfg branches that moved with their Linux twins were only compiled by CI.
+- **Source**: 9e7bfd5

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -98,3 +98,10 @@
 - **Tradeoffs**: The differential test cannot cover it, since kernels from 6.9 infer the scope from the fd and treat this case differently.
 - **Watch out**: None known.
 - **Source**: 173da76
+
+### D14: Signal files read in the order their code runs
+- **What**: signal.rs puts senders and `deliver` before their helpers (the queue limits under generation, the alternate stack under frames); ptrace.rs follows stops from signal delivery to traced exits; klog.rs runs storing, readers, formatting, lookups and positions; the other files, syscall/misc.rs included, put helpers after their callers.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; signal.rs and klog.rs put most helpers above their callers.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; Default impls stay before the inherent impls, as constructors.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: bf240bc

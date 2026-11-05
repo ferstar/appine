@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -34,10 +34,11 @@
 - **Source**: round 37 (`37-trim-memory`)
 
 ### D5: After a kill, tabs come back without their processes
-- **What**: A `running` marker detects an abnormal end; each running tab's login setting, name, foreground cwd and plain-text scrollback (last 256 K, in transcripts named by their content) are saved every minute, when the UI hides, on memory pressure and after tabs open, close, end or are renamed; on restart each tab gets a new shell in its directory below the old scrollback and a notice, and saved tabs are kept until a killed run's tabs have been restored.
+- **What**: A `running` marker detects an abnormal end; each running tab's login setting, foreground cwd and plain-text scrollback (last 256 K, in transcripts named by their content) are saved every minute, when the UI hides, on memory pressure and after tabs open, close or end; on restart each tab gets a new shell in its directory below the old scrollback and a notice, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
 - **Why**: v1 restores only the layout, directories and scrollback, and says so; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash.
-- **Tradeoffs**: Programs are not restored; colours are lost; tabs never shown since the restore keep their old data; each rename rewrites `index.json`.
-- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551
+- **Tradeoffs**: Programs are not restored; colours are lost; tabs never shown since the restore keep their old data; names saved by earlier versions are lost at the next restore.
+- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index.
+- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183
 
 ### D6: Kernel kills are explained in the tab or a notification; appine bugs always notify with a copyable report
 - **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records); OpenRC services that failed at boot are notified too.
@@ -80,6 +81,21 @@
 - **Watch out**: `MainActivity` is not a listener while stopped (Settings covers it), so it must keep rereading the value in `onStart`.
 - **Source**: 0478dd5
 
+### D12: `TerminalService` reads in the order a service runs
+- **What**: TerminalService runs `onCreate` and what it calls, `onStartCommand` and `onBind`, listeners, sessions, poll reports in poll order, memory trimming, settings in the settings screen's order, then the exit and stop paths ending with `onDestroy`; `Listener`'s callbacks and their implementations are in firing order, and `Tabs` runs `takeKilled` and `load`, `markRunning`, `save` and `clear`.
+- **Why**: The service's file mixed settings, lifecycle and session code, so its start and stop paths could not be read in order.
+- **Tradeoffs**: Settings setters that restart or replace the kernel sit before the stop paths they call.
+- **Watch out**: `wakeLock` and `sessionEvents` moved among the properties, which stays safe only while neither initialiser reads another property (Kotlin initialises in textual order).
+- **Source**: a546fea
+
+### D13: Preference writes use androidx.core's `edit { }`
+- **What**: TerminalService's six preference writes use `SharedPreferences.edit { }`, still applied asynchronously.
+- **Why**: Lint's UseKtx warnings now fail the build (android/native D10).
+- **Tradeoffs**: The writes rely on androidx.core's Kotlin extensions, already a dependency.
+- **Watch out**: None known; each write is the same `apply()` as before.
+- **Source**: 4c1a3ce
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
+- ~~A tab's name among D5's saved fields, saved again after each rename (2af55e2, 89ad551)~~ → dropped from **D5** in 7c35183 (2026-11-05), with renaming gone from the terminal

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -42,3 +42,10 @@
 - **Tradeoffs**: The two socket families now share one parser.
 - **Watch out**: None known.
 - **Source**: 96cd8bd
+
+### D6: AF_UNIX files read in a connection's life order
+- **What**: unix.rs runs sockets, names, channels, /proc/net/unix and garbage collection, with methods in the order a connection lives and accessors last; syscall/unix.rs runs creation, names and connections, sending and receiving, options and shutdown, addresses and waiting; the `POLL*` constants stay at the top.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; the AF_UNIX files put most helpers above their callers.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file.
+- **Watch out**: Code appended at the end of a file drifts from this order.
+- **Source**: 2847887

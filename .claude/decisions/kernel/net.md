@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -84,6 +84,13 @@
 - **Tradeoffs**: An IPv6-only `[::]:P` and a dual-stack `[::]:P` now both bind where Linux refuses the second, and binds on different guest addresses that share a host address are still judged by host address.
 - **Watch out**: A new caller of `host_port` must pass the destination's family, or an IPv6 client could reach the IPv4 socket's host port.
 - **Source**: ea08993
+
+### D12: Socket files read in a socket's life order
+- **What**: syscall/net.rs runs creation, binding to accepting, names, options, sending and receiving (shutdown last), netlink, ioctls, readiness, routing, forwarding, low ports and shared helpers, and net.rs, rawicmp.rs, route.rs, traffic.rs and portmap.rs put callers before helpers, with net.rs's `IPPROTO_*` constants at the top and /proc/net last.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; syscall/net.rs kept its socket calls in no particular order and most of net.rs's helpers sat above their callers.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `ensure_bound`, `register_udp` and `count_connect` stay with binding although sending and options use them too.
+- **Watch out**: Code appended at the end of a file drifts from this order, and a constant paragraph shared by several sections must stay above its first user (`IPPROTO_*` was once carried to the end and moved back by hand).
+- **Source**: 412ffba
 
 ## Superseded
 

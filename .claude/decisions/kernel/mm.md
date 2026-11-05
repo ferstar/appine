@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-05 (HEAD = 173da76). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -140,3 +140,10 @@
 - **Tradeoffs**: The child's wiped VMA keeps `written` set, so a later fork of the child still lends it, since clearing it would skip pages the child writes without an mprotect.
 - **Watch out**: Any new path that copies a VMA must carry these flags too, and dontfork on the stack or heap kills the child, exactly as on Linux.
 - **Source**: e020977
+
+### D20: Memory files read in the order their code runs
+- **What**: mm.rs is sectioned into Address space (`impl Mm` from creation and layout through threads and shootdown, faults, kernel access, memory syscalls, fork, files and introspection to VMAs, host backing and population), Consistency and code, Copy-on-write (entry points before their machinery), Introspection types and Host backing; syscall/mem.rs follows a mapping's life from mmap to mincore; oom.rs, filed here, puts the timer thread's `check` before its helpers.
+- **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; mm.rs had no sections and 40 functions sat above their first caller.
+- **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; section headers inside an impl block are new in the repository, and Introspection names two sections.
+- **Watch out**: Code appended at the end of `impl Mm` or of a file drifts from this order; oom.rs is not in the module registry.
+- **Source**: 80d41b5
