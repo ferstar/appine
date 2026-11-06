@@ -261,28 +261,45 @@ fn slave_read(
     }
     check_background(cx, tty, Signal::TTIN)?;
     let mut deadline: Option<Instant> = None;
+    // Reading makes room for input that was waiting, which may hold signal characters
+    let deliver = |cx: &mut Cx<'_>, n: usize| {
+        let signals = tty.borrow_mut().take_signals();
+        for sig in signals {
+            signal_fg(cx.kr(), tty, sig);
+        }
+        request_wake_object(wake::of(tty));
+        Ok(n)
+    };
     loop {
         {
             let mut t = tty.borrow_mut();
             if t.hung(false, born) {
                 return Ok(0);
             }
-            let canonical = t.termios.lflag & flags::ICANON != 0;
-            let vmin = t.termios.cc[cc::VMIN] as usize;
-            let vtime = Duration::from_millis(100 * t.termios.cc[cc::VTIME] as u64);
+            // With EXTPROC a canonical-mode read returns whatever has arrived, as VMIN 1 would
+            let icanon = t.termios.lflag & flags::ICANON != 0;
+            let (vmin, vtime) = if icanon {
+                (1, Duration::ZERO)
+            } else {
+                let tenths = t.termios.cc[cc::VTIME] as u64;
+                (
+                    t.termios.cc[cc::VMIN] as usize,
+                    Duration::from_millis(100 * tenths),
+                )
+            };
             let expired = deadline.is_some_and(|d| Instant::now() >= d);
-            if canonical {
+            if t.canonical() {
                 if let Some(n) = t.read(buf) {
-                    request_wake_object(wake::of(tty));
-                    return Ok(n);
+                    drop(t);
+                    return deliver(cx, n);
                 }
             } else {
                 let avail = t.raw_len();
                 let enough = avail >= vmin.min(buf.len()).max(1);
                 if avail > 0 && (enough || expired || vmin == 0) {
                     let n = t.read(buf).unwrap_or(0);
-                    request_wake_object(wake::of(tty));
-                    return Ok(n);
+                    drop(t);
+                    return deliver(cx, n);
                 }
                 if vmin == 0 && (vtime.is_zero() || expired) {
                     return Ok(0);
@@ -506,13 +523,18 @@ pub(crate) fn ioctl(
             }
             let mut t = Termios::decode(&t);
             t.load_speeds();
-            let mut tt = tty.borrow_mut();
-            if matches!(request, TCSETSF | TCSETAF | TCSETSF2) {
-                // Both sides flush the slave's input (Linux does set_termios on real_tty)
-                tt.flush_input();
-                tt.report_flush(true, false);
+            let signals = {
+                let mut tt = tty.borrow_mut();
+                if matches!(request, TCSETSF | TCSETAF | TCSETSF2) {
+                    // Both sides flush the slave's input (Linux does set_termios on real_tty)
+                    tt.flush_input();
+                    tt.report_flush(true, false);
+                }
+                tt.set_termios(t)
+            };
+            for sig in signals {
+                signal_fg(cx.kr(), tty, sig);
             }
-            tt.set_termios(t);
             request_wake_object(wake::of(tty));
             Ok(0)
         }
@@ -533,16 +555,20 @@ pub(crate) fn ioctl(
                 _ => return Err(Errno::EINVAL),
             };
             // Master and slave are a pair of ttys, and the master's input is the slave's output.
-            // On Linux the master's TCOFLUSH only clears data not yet handed to the slave's line
-            // discipline (pty_flush_buffer); here a write hands it over at once, so there is
-            // nothing to clear
+            // TCOFLUSH drops only what the other side has not taken yet (pty_flush_buffer): on the
+            // master, input not taken by the slave's line discipline; on the slave, output beyond
+            // what the master side has taken
             let mut t = tty.borrow_mut();
             if master {
                 if input {
-                    t.flush_output();
+                    t.clear_output();
+                }
+                if output {
+                    t.discard_unprocessed();
                 }
             } else {
                 if input {
+                    t.discard_unprocessed();
                     t.flush_input();
                 }
                 if output {
@@ -607,11 +633,11 @@ pub(crate) fn ioctl(
             }
             let c: [u8; 1] = get(cx, arg)?;
             if master {
-                tty.borrow_mut().send_xchar(c[0]);
+                tty.borrow_mut().inject_output(c[0]);
                 request_wake_object(wake::of(tty));
                 return Ok(0);
             }
-            let signals = tty.borrow_mut().write_input(&c);
+            let signals = tty.borrow_mut().inject_input(c[0]);
             for sig in signals {
                 signal_fg(cx.kr(), tty, sig);
             }
@@ -885,11 +911,12 @@ pub(crate) fn vhangup(k: &mut Kernel, tty: &Rc<RefCell<Tty>>, master: bool) {
         t.hupped[side] = true;
         t.vhangups[side] = t.vhangups[side].wrapping_add(1);
         if master {
-            t.flush_output();
+            t.clear_output();
             None
         } else {
             // Linux's tty_ldisc_hangup flushes the slave's input, then __tty_hangup discards the
             // packet-mode status
+            t.discard_unprocessed();
             t.flush_input();
             t.pktstatus = 0;
             Some((t.session.take(), t.fg.take()))

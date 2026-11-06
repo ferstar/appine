@@ -115,13 +115,23 @@ impl PtsOptions {
         s
     }
 }
-/// The input queue capacity (Linux's `N_TTY_BUF_SIZE`).
+/// The line discipline's input buffer (Linux's `N_TTY_BUF_SIZE`): one byte always stays free,
+/// except for the terminator of a canonical line.
 pub const INPUT_MAX: usize = 4096;
+/// Master writes the line discipline has not taken yet wait in the PTY's buffer up to this much
+/// (Linux's flip buffer, `TTYB_DEFAULT_MEM_LIMIT`); master writes block once it is full.
+pub const UNPROCESSED_MAX: usize = 64 * 1024;
 /// The output queue capacity: once the slave has filled it, writes block until the master reads.
 pub const OUTPUT_MAX: usize = 64 * 1024;
+/// How much of the slave's output the master side has taken on Linux: its own line discipline
+/// buffers [`INPUT_MAX`] bytes less the free one, and the rest is still in the PTY's buffer, where
+/// TCOFLUSH on the slave drops it.
+const PASSED_ON: usize = INPUT_MAX - 1;
 
 /// termios flag bits (asm-generic values).
 pub mod flags {
+    /// Mark parity errors; a 0xff byte is read doubled.
+    pub const PARMRK: u32 = 0o10;
     /// Strip the 8th bit.
     pub const ISTRIP: u32 = 0o40;
     /// Translate NL to CR.
@@ -130,6 +140,8 @@ pub mod flags {
     pub const IGNCR: u32 = 0o200;
     /// Translate CR to NL.
     pub const ICRNL: u32 = 0o400;
+    /// Map upper case to lower case (with IEXTEN).
+    pub const IUCLC: u32 = 0o1000;
     /// ^S/^Q flow control.
     pub const IXON: u32 = 0o2000;
     /// Any character restarts output stopped by ^S.
@@ -139,10 +151,19 @@ pub mod flags {
 
     /// Output processing.
     pub const OPOST: u32 = 0o1;
+    /// Map lower case to upper case on output.
+    pub const OLCUC: u32 = 0o2;
     /// Translate NL to CR NL on output.
     pub const ONLCR: u32 = 0o4;
     /// Translate CR to NL on output.
     pub const OCRNL: u32 = 0o10;
+    /// No CR output at column 0.
+    pub const ONOCR: u32 = 0o20;
+    /// NL also returns the carriage.
+    pub const ONLRET: u32 = 0o40;
+    /// The tab delay bits; all set (`XTABS`, `TAB3`) expands tabs to spaces.
+    pub const TABDLY: u32 = 0o14000;
+    pub const XTABS: u32 = 0o14000;
 
     /// The character size bits.
     pub const CSIZE: u32 = 0o60;
@@ -186,6 +207,8 @@ pub mod flags {
     pub const TOSTOP: u32 = 0o400;
     /// Echo control characters as `^X`.
     pub const ECHOCTL: u32 = 0o1000;
+    /// Echo erased characters between `\` and `/` (for printing terminals).
+    pub const ECHOPRT: u32 = 0o2000;
     /// KILL erases the whole line character by character.
     pub const ECHOKE: u32 = 0o4000;
     /// Extended functions (LNEXT, WERASE, REPRINT).
@@ -330,6 +353,10 @@ impl Termios {
         self.iflag & f != 0
     }
 
+    fn o(&self, f: u32) -> bool {
+        self.oflag & f != 0
+    }
+
     /// Whether `c` is a given special character (`_POSIX_VDISABLE`, i.e. 0, means disabled).
     fn is(&self, c: u8, which: usize) -> bool {
         self.cc[which] != 0 && self.cc[which] == c
@@ -403,6 +430,35 @@ impl Winsize {
     }
 }
 
+/// One line completed in canonical mode.
+struct Line {
+    data: Vec<u8>,
+    /// Ended by VEOF, which Linux keeps after the data as a `__DISABLED_CHAR` (0) that a read takes
+    /// without returning it: a line with no data is end of file.
+    eof: bool,
+}
+
+/// An echo waiting to be written to the output (Linux's echo buffer). Echoes are formatted, and
+/// the cursor column followed, only when they are committed at the end of a batch of input, so a
+/// signal character later in the batch discards them; while output is stopped they wait.
+#[derive(Clone, Copy, Debug)]
+enum Echo {
+    /// A character through output processing (`echo_char_raw`); 0xff goes out as it is (Linux's
+    /// escaped `ECHO_OP_START`).
+    Char(u8),
+    /// A control character shown as `^X` (ECHOCTL): two columns, no output processing.
+    Ctrl(u8),
+    /// Backspaces over an erased tab (`ECHO_OP_ERASE_TAB`): `columns` taken by the characters
+    /// after the previous tab, or after the start of the line when there is none (`after_tab`
+    /// false), which then counts from the column the line started at.
+    EraseTab { columns: usize, after_tab: bool },
+    /// The canonical line starts at the current column (`ECHO_OP_SET_CANON_COL`).
+    SetCanonColumn,
+    /// One column back (`ECHO_OP_MOVE_BACK_COL`, for each extra byte of a multibyte character that
+    /// ECHOPRT shows).
+    MoveBackColumn,
+}
+
 /// A PTY pair.
 pub struct Tty {
     /// `/dev/pts/<index>`.
@@ -411,22 +467,34 @@ pub struct Tty {
     pub fs: u64,
     pub termios: Termios,
     pub winsize: Winsize,
+    /// Master writes the line discipline has not taken yet (Linux's flip buffer): taken as it
+    /// gets room, when the slave reads or termios changes.
+    unprocessed: VecDeque<u8>,
     /// The line being edited in canonical mode.
     editing: Vec<u8>,
-    /// Lines completed in canonical mode and ready to be read; an empty line means EOF (^D at the
-    /// start of a line).
-    lines: VecDeque<Vec<u8>>,
-    /// Bytes ready to be read in non-canonical mode.
+    /// Lines completed in canonical mode and ready to be read.
+    lines: VecDeque<Line>,
+    /// Bytes ready to be read in non-canonical mode (and with EXTPROC).
     raw: VecDeque<u8>,
+    /// Echoes not written to the output yet ([`Echo`]).
+    echoes: Vec<Echo>,
     /// Output waiting for the master to read it.
     output: VecDeque<u8>,
+    /// The cursor column output processing follows (Linux's `ldata->column`), and the column the
+    /// canonical line being edited started at (`canon_column`): erasing a tab moves back by what
+    /// it took.
+    column: usize,
+    canon_column: usize,
     /// The next character is entered literally (LNEXT).
     lnext: bool,
-    /// While the slave's output is stopped (^S or TCOOFF, Linux's `flow.stopped`), the number of
-    /// bytes written before the stop that the master can still read. While stopped, slave writes
-    /// block; later echoes reach the master only when output restarts (Linux keeps them in the
-    /// echo buffer).
-    held_from: Option<usize>,
+    /// An ECHOPRT erase (`\` and the erased characters) is open; the next character typed closes
+    /// it with `/`.
+    erasing: bool,
+    /// Signals generated by input, for the caller to send to the foreground process group.
+    signals: Vec<Signal>,
+    /// The slave's output is stopped (^S or TCOOFF, Linux's `flow.stopped`): slave writes block
+    /// and echoes wait.
+    stopped: bool,
     /// The output was stopped by TCOOFF: ^Q cannot restart it, TCOON is needed (Linux's
     /// `flow.tco_stopped`).
     tco_stopped: bool,
@@ -494,12 +562,18 @@ impl Tty {
                 xpixel: 0,
                 ypixel: 0,
             },
+            unprocessed: VecDeque::new(),
             editing: Vec::new(),
             lines: VecDeque::new(),
             raw: VecDeque::new(),
+            echoes: Vec::new(),
             output: VecDeque::new(),
+            column: 0,
+            canon_column: 0,
             lnext: false,
-            held_from: None,
+            erasing: false,
+            signals: Vec::new(),
+            stopped: false,
             tco_stopped: false,
             master_stopped: false,
             packet: false,
@@ -523,14 +597,68 @@ impl Tty {
         }
     }
 
-    /// How many more bytes the input queue can take (master writes block by this). In canonical
-    /// mode it still accepts input when the line is already full: the extra characters are dropped
-    /// and only line terminators take effect, so it never waits forever for a newline.
+    // ---- Input: master writes through the line discipline ----
+
+    /// How many more bytes master writes can hand over now: they wait for the line discipline in
+    /// [`Tty::unprocessed`]. None while TCOOFF stops the master's output.
     pub fn input_room(&self) -> usize {
         if self.master_stopped {
             return 0;
         }
-        let room = INPUT_MAX.saturating_sub(self.pending_input());
+        UNPROCESSED_MAX.saturating_sub(self.unprocessed.len())
+    }
+
+    /// A master write (input from the terminal); returns the signals to send to the foreground
+    /// process group. The caller keeps `data` within [`Tty::input_room`].
+    pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
+        self.unprocessed.extend(data);
+        self.process_input();
+        self.take_signals()
+    }
+
+    /// TIOCSTI on the slave: the byte goes to the line discipline directly, ahead of input not
+    /// taken yet, and is dropped when there is no room (Linux's `tiocsti` calls `receive_buf`).
+    pub fn inject_input(&mut self, c: u8) -> Vec<Signal> {
+        if self.ldisc_room() > 0 {
+            self.input_char(c);
+            self.commit_echoes();
+            self.arrivals[0] += 1;
+        }
+        self.take_signals()
+    }
+
+    /// Takes the signals input has generated since the last call (also by input taken when the
+    /// slave read or termios changed).
+    pub fn take_signals(&mut self) -> Vec<Signal> {
+        std::mem::take(&mut self.signals)
+    }
+
+    /// Whether input is waiting for the slave: readable now, or not taken by the line discipline
+    /// yet.
+    pub fn input_pending(&self) -> bool {
+        self.readable() || !self.unprocessed.is_empty()
+    }
+
+    /// Hands as much unprocessed input to the line discipline as it has room for, then commits the
+    /// echoes (Linux's `flush_to_ldisc` into `n_tty_receive_buf`).
+    fn process_input(&mut self) {
+        let mut taken = false;
+        while !self.unprocessed.is_empty() && self.ldisc_room() > 0 {
+            let c = self.unprocessed.pop_front().unwrap();
+            self.input_char(c);
+            taken = true;
+        }
+        self.commit_echoes();
+        if taken {
+            self.arrivals[0] += 1;
+        }
+    }
+
+    /// Room in the line discipline's buffer (Linux's `n_tty_receive_buf_common`): one byte stays
+    /// free; in canonical mode with no complete line one byte is always taken, so a full line
+    /// still lets its terminator or an erase through (other characters are dropped).
+    fn ldisc_room(&self) -> usize {
+        let room = (INPUT_MAX - 1).saturating_sub(self.pending_input());
         if room == 0 && self.canonical() && self.lines.is_empty() {
             1
         } else {
@@ -538,40 +666,104 @@ impl Tty {
         }
     }
 
+    /// Bytes in the line discipline's buffer, counting a VEOF kept at the end of a line.
     fn pending_input(&self) -> usize {
-        self.editing.len() + self.lines.iter().map(Vec::len).sum::<usize>() + self.raw.len()
+        let lines: usize = self
+            .lines
+            .iter()
+            .map(|l| l.data.len() + l.eof as usize)
+            .sum();
+        self.editing.len() + lines + self.raw.len()
     }
 
-    /// A master write (input from the terminal); returns the signals to send to the foreground
-    /// process group. The caller guarantees `data` does not exceed [`Tty::input_room`].
-    pub fn write_input(&mut self, data: &[u8]) -> Vec<Signal> {
-        let mut signals = Vec::new();
-        let echoed = self.output.len();
-        for &c in data {
-            if let Some(sig) = self.input_char(c) {
-                signals.push(sig);
+    /// One byte of input (Linux's `n_tty_receive_buf_standard`): ISTRIP and IUCLC first; after
+    /// VLNEXT the byte is literal, with EXTPROC it is queued as it is, and otherwise characters
+    /// that may be special ([`Tty::special`]) are told apart from ordinary ones.
+    fn input_char(&mut self, c: u8) {
+        let t = self.termios;
+        let c = if t.i(ISTRIP) { c & 0x7f } else { c };
+        let c = if t.i(IUCLC) && t.l(IEXTEN) {
+            to_lower(c)
+        } else {
+            c
+        };
+        if std::mem::take(&mut self.lnext) {
+            self.receive(c);
+        } else if t.l(EXTPROC) {
+            self.raw.push_back(c);
+        } else if self.special(c) {
+            self.receive_special(c);
+        } else {
+            self.receive(c);
+        }
+    }
+
+    /// Whether `c` may need special handling under the current termios (Linux's `char_map`):
+    /// CR and NL when translated, the editing and line-end characters in canonical mode, the flow
+    /// control characters with IXON and the signal characters with ISIG. NUL never is.
+    fn special(&self, c: u8) -> bool {
+        let t = &self.termios;
+        let any = |which: &[usize]| which.iter().any(|&i| t.cc[i] == c);
+        c != 0
+            && (c == b'\r' && (t.i(IGNCR) || t.i(ICRNL))
+                || c == b'\n' && t.i(INLCR)
+                || t.l(ICANON)
+                    && (c == b'\n'
+                        || any(&[VERASE, VKILL, VEOF, VEOL])
+                        || t.l(IEXTEN)
+                            && (any(&[VWERASE, VLNEXT, VEOL2]) || t.l(ECHO) && any(&[VREPRINT])))
+                || t.i(IXON) && any(&[VSTART, VSTOP])
+                || t.l(ISIG) && any(&[VINTR, VQUIT, VSUSP]))
+    }
+
+    /// An ordinary character (Linux's `n_tty_receive_char`): restarts output with IXANY, is echoed
+    /// and queued. In canonical mode a full line drops it.
+    fn receive(&mut self, c: u8) {
+        self.restart_on_any();
+        if !self.fits(c) {
+            return;
+        }
+        if self.termios.l(ECHO) {
+            self.finish_erasing();
+            self.mark_line_start();
+            self.echo_char(c);
+        }
+        self.put(c);
+    }
+
+    /// A character that may be special (Linux's `n_tty_receive_char_special`), in this order: flow
+    /// control (IXON), signal characters (ISIG), IXANY, CR and NL translation, then in canonical
+    /// mode erasing, VLNEXT, VREPRINT and the line ends; anything left is queued as an ordinary
+    /// character, a newline echoed as itself even with ECHOCTL.
+    fn receive_special(&mut self, mut c: u8) {
+        let t = self.termios;
+        if t.i(IXON) {
+            if t.is(c, VSTART) {
+                self.start();
+                return;
+            }
+            if t.is(c, VSTOP) {
+                self.stop();
+                return;
             }
         }
-        self.arrivals[0] += 1;
-        if self.output.len() != echoed {
-            self.arrivals[1] += 1;
+        if t.l(ISIG) {
+            let sig = [
+                (VINTR, Signal::INT),
+                (VQUIT, Signal::QUIT),
+                (VSUSP, Signal::TSTP),
+            ]
+            .into_iter()
+            .find(|&(i, _)| t.is(c, i));
+            if let Some((_, sig)) = sig {
+                self.signal_char(sig, c);
+                return;
+            }
         }
-        signals
-    }
-
-    fn input_char(&mut self, mut c: u8) -> Option<Signal> {
-        let t = self.termios;
-        if t.i(ISTRIP) {
-            c &= 0x7f;
-        }
-        if self.lnext {
-            self.lnext = false;
-            self.receive(c);
-            return None;
-        }
+        self.restart_on_any();
         if c == b'\r' {
             if t.i(IGNCR) {
-                return None;
+                return;
             }
             if t.i(ICRNL) {
                 c = b'\n';
@@ -579,179 +771,306 @@ impl Tty {
         } else if c == b'\n' && t.i(INLCR) {
             c = b'\r';
         }
-        if t.i(IXON) {
-            if t.is(c, VSTOP) {
-                self.stop();
-                return None;
-            }
-            if t.is(c, VSTART) {
-                self.start();
-                return None;
-            }
-            if t.i(IXANY) {
-                self.start();
-            }
-        }
-        if t.l(ISIG) {
-            let sig = if t.is(c, VINTR) {
-                Some(Signal::INT)
-            } else if t.is(c, VQUIT) {
-                Some(Signal::QUIT)
-            } else if t.is(c, VSUSP) {
-                Some(Signal::TSTP)
-            } else {
-                None
-            };
-            if let Some(sig) = sig {
-                if !t.l(NOFLSH) {
-                    self.flush_input();
-                    self.flush_output();
-                    self.report_flush(true, true);
-                }
-                if t.i(IXON) {
-                    self.start();
-                }
-                self.echo(c);
-                return Some(sig);
-            }
-        }
         if t.l(ICANON) {
+            if t.is(c, VERASE) || t.is(c, VKILL) || t.l(IEXTEN) && t.is(c, VWERASE) {
+                self.erase(c);
+                return;
+            }
             if t.l(IEXTEN) && t.is(c, VLNEXT) {
                 self.lnext = true;
-                if t.l(ECHO) && t.l(ECHOCTL) {
-                    self.output.extend(b"^\x08");
-                }
-                return None;
-            }
-            if t.is(c, VERASE) {
-                if let Some(erased) = self.pop_char() {
-                    self.echo_erase(&erased);
-                }
-                return None;
-            }
-            if t.l(IEXTEN) && t.is(c, VWERASE) {
-                // First skip whitespace at the end of the line, then delete up to the next
-                // whitespace
-                while self.editing.last().is_some_and(|b| b.is_ascii_whitespace()) {
-                    let e = self.pop_char().unwrap();
-                    self.echo_erase(&e);
-                }
-                while self
-                    .editing
-                    .last()
-                    .is_some_and(|b| !b.is_ascii_whitespace())
-                {
-                    let e = self.pop_char().unwrap();
-                    self.echo_erase(&e);
-                }
-                return None;
-            }
-            if t.is(c, VKILL) {
-                if t.l(ECHOKE) {
-                    while let Some(e) = self.pop_char() {
-                        self.echo_erase(&e);
-                    }
-                } else {
-                    self.editing.clear();
-                    self.echo(c);
-                    if t.l(ECHOK) {
-                        self.put_output(b'\n');
+                if t.l(ECHO) {
+                    self.finish_erasing();
+                    if t.l(ECHOCTL) {
+                        self.echoes.extend([Echo::Char(b'^'), Echo::Char(b'\x08')]);
                     }
                 }
-                return None;
+                return;
             }
-            if t.l(IEXTEN) && t.is(c, VREPRINT) {
-                self.echo(c);
-                self.put_output(b'\n');
-                let line = self.editing.clone();
-                for b in line {
-                    self.echo(b);
+            if t.l(IEXTEN) && t.l(ECHO) && t.is(c, VREPRINT) {
+                self.finish_erasing();
+                self.echo_char(c);
+                self.echoes.push(Echo::Char(b'\n'));
+                for b in self.editing.clone() {
+                    self.echo_char(b);
                 }
-                return None;
+                return;
+            }
+            if c == b'\n' {
+                if t.l(ECHO) || t.l(ECHONL) {
+                    self.echoes.push(Echo::Char(b'\n'));
+                }
+                self.end_line(Some(c));
+                return;
             }
             if t.is(c, VEOF) {
-                // EOF at the start of a line makes the reader read 0; EOF in the middle of a line
-                // hands what is there to the reader
-                let line = std::mem::take(&mut self.editing);
-                self.lines.push_back(line);
-                return None;
+                self.end_line(None);
+                return;
             }
-            let eol = c == b'\n' || t.is(c, VEOL) || (t.l(IEXTEN) && t.is(c, VEOL2));
-            if eol {
-                self.editing.push(c);
-                if t.l(ECHO) || (c == b'\n' && t.l(ECHONL)) {
-                    self.put_output(c);
+            // VEOL and VEOL2 are echoed like ordinary characters, without closing an ECHOPRT
+            // erase
+            if t.is(c, VEOL) || t.l(IEXTEN) && t.is(c, VEOL2) {
+                if t.l(ECHO) {
+                    self.mark_line_start();
+                    self.echo_char(c);
                 }
-                let line = std::mem::take(&mut self.editing);
-                self.lines.push_back(line);
-                return None;
+                if c == 0xff && t.i(PARMRK) {
+                    self.editing.push(c);
+                }
+                self.end_line(Some(c));
+                return;
             }
         }
-        self.receive(c);
-        None
+        if !self.fits(c) {
+            return;
+        }
+        if t.l(ECHO) {
+            self.finish_erasing();
+            if c == b'\n' {
+                self.echoes.push(Echo::Char(b'\n'));
+            } else {
+                self.mark_line_start();
+                self.echo_char(c);
+            }
+        }
+        self.put(c);
     }
 
-    /// An ordinary character: in canonical mode it is added to the line being edited (dropped
-    /// when the line is full), otherwise it is readable at once.
-    fn receive(&mut self, c: u8) {
-        if self.canonical() {
-            if self.editing.len() < INPUT_MAX - 1 {
-                self.editing.push(c);
-                self.echo(c);
-            }
+    /// A signal character (Linux's `n_tty_receive_signal_char` and `isig`): unless NOFLSH, the
+    /// echoes not written yet, the output the master has not read and the input are discarded
+    /// (reported in packet mode); output stopped by ^S restarts (IXON); the character is echoed.
+    ///
+    /// Linux drops only the output the master side has not taken from the PTY's buffer yet, which
+    /// a workqueue moves on asynchronously; a signal character typed right after other input
+    /// catches its echoes still there, as the recorded scenarios show, so all unread output goes.
+    fn signal_char(&mut self, sig: Signal, c: u8) {
+        self.signals.push(sig);
+        if !self.termios.l(NOFLSH) {
+            self.echoes.clear();
+            self.clear_output();
+            self.flush_input();
+            self.report_flush(true, true);
+        }
+        if self.termios.i(IXON) {
+            self.start();
+        }
+        if self.termios.l(ECHO) {
+            self.echo_char(c);
+        }
+    }
+
+    /// IXANY: any character restarts output stopped by ^S.
+    fn restart_on_any(&mut self) {
+        if self.termios.i(IXON) && self.termios.i(IXANY) {
+            self.start();
+        }
+    }
+
+    /// Whether `c` (doubled when it is 0xff and PARMRK is set) fits in the canonical line being
+    /// edited, which keeps one byte for its terminator; anything fits outside canonical mode.
+    fn fits(&self, c: u8) -> bool {
+        let n = if c == 0xff && self.termios.i(PARMRK) {
+            2
         } else {
-            self.raw.push_back(c);
-            self.echo(c);
-        }
-    }
-
-    /// Removes one character from the end of the line being edited (a whole character with
-    /// UTF-8) and returns the removed bytes.
-    fn pop_char(&mut self) -> Option<Vec<u8>> {
-        let mut erased = vec![self.editing.pop()?];
-        // UTF-8 continuation bytes are 10xxxxxx: keep deleting until the leading byte
-        if self.termios.i(IUTF8) {
-            while erased[0] & 0xc0 == 0x80 {
-                match self.editing.pop() {
-                    Some(b) => erased.insert(0, b),
-                    None => break,
-                }
-            }
-        }
-        Some(erased)
-    }
-
-    /// Erases one character on the screen (ECHOE). Echoed control characters take two columns.
-    fn echo_erase(&mut self, erased: &[u8]) {
-        if !self.termios.l(ECHO) {
-            return;
-        }
-        if !self.termios.l(ECHOE) {
-            if let Some(&c) = erased.first() {
-                self.echo(c);
-            }
-            return;
-        }
-        let width = match erased {
-            [c] if self.termios.l(ECHOCTL) && is_ctrl(*c) => 2,
-            _ => 1,
+            1
         };
-        for _ in 0..width {
-            self.output.extend(b"\x08 \x08");
+        !self.canonical() || self.editing.len() + n < INPUT_MAX
+    }
+
+    /// Queues `c` (Linux's `put_tty_queue`): to the line being edited in canonical mode, readable
+    /// at once otherwise; with PARMRK a 0xff is queued twice.
+    fn put(&mut self, c: u8) {
+        let n = if c == 0xff && self.termios.i(PARMRK) {
+            2
+        } else {
+            1
+        };
+        if self.canonical() {
+            self.editing.extend(std::iter::repeat_n(c, n));
+        } else {
+            self.raw.extend(std::iter::repeat_n(c, n));
         }
     }
 
-    /// Echoes a character: with ECHOCTL, control characters show as `^X`.
-    fn echo(&mut self, c: u8) {
-        if !self.termios.l(ECHO) {
+    /// Completes the canonical line, ended by `end` (kept in the line) or by VEOF (None).
+    fn end_line(&mut self, end: Option<u8>) {
+        let mut data = std::mem::take(&mut self.editing);
+        data.extend(end);
+        self.lines.push_back(Line {
+            data,
+            eof: end.is_none(),
+        });
+    }
+
+    /// Erases from the line being edited (Linux's `eraser`), with the matching echo: one character
+    /// for VERASE, a word for VWERASE (back over one run of letters, digits and underscores, Latin-1
+    /// included, after any other characters: BSD's ALTWERASE), the whole line for VKILL. With IUTF8
+    /// a character is all its bytes, and a stray continuation byte is not erased. VKILL without
+    /// ECHO, or without all of ECHOK, ECHOKE and ECHOE, empties the line at once and echoes the
+    /// character itself (and a newline with ECHOK).
+    fn erase(&mut self, c: u8) {
+        #[derive(PartialEq)]
+        enum Kind {
+            Char,
+            Word,
+            Line,
+        }
+        let t = self.termios;
+        if self.editing.is_empty() {
             return;
         }
-        if self.termios.l(ECHOCTL) && is_ctrl(c) {
-            self.output.extend([b'^', c ^ 0x40]);
+        let kind = if t.cc[VERASE] == c {
+            Kind::Char
+        } else if t.cc[VWERASE] == c {
+            Kind::Word
         } else {
-            self.put_output(c);
+            if !t.l(ECHO) {
+                self.editing.clear();
+                return;
+            }
+            if !t.l(ECHOK) || !t.l(ECHOKE) || !t.l(ECHOE) {
+                self.editing.clear();
+                self.finish_erasing();
+                self.echo_char(t.cc[VKILL]);
+                if t.l(ECHOK) {
+                    self.echoes.push(Echo::Char(b'\n'));
+                }
+                return;
+            }
+            Kind::Line
+        };
+        let mut seen_alnums = 0;
+        while !self.editing.is_empty() {
+            let mut head = self.editing.len() - 1;
+            while head > 0 && self.continuation(self.editing[head]) {
+                head -= 1;
+            }
+            let first = self.editing[head];
+            if self.continuation(first) {
+                break;
+            }
+            if kind == Kind::Word {
+                if is_alnum(first) || first == b'_' {
+                    seen_alnums += 1;
+                } else if seen_alnums > 0 {
+                    break;
+                }
+            }
+            let erased = self.editing.split_off(head);
+            if t.l(ECHO) {
+                self.echo_erased(&erased, kind == Kind::Char);
+            }
+            if kind == Kind::Char {
+                break;
+            }
+        }
+        if self.editing.is_empty() && t.l(ECHO) {
+            self.finish_erasing();
         }
     }
+
+    /// The echo for an erased character (all its bytes in `erased`): with ECHOPRT the character
+    /// itself after an opening `\`; for a single VERASE without ECHOE the erase character; for a
+    /// tab, backspaces back to where it started; otherwise a backspace-space-backspace for each
+    /// column it took (none for a control character echoed without ECHOCTL).
+    fn echo_erased(&mut self, erased: &[u8], single: bool) {
+        let t = self.termios;
+        let c = erased[0];
+        if t.l(ECHOPRT) {
+            if !self.erasing {
+                self.echoes.push(Echo::Char(b'\\'));
+                self.erasing = true;
+            }
+            self.echo_char(c);
+            for &b in &erased[1..] {
+                self.echoes.extend([Echo::Char(b), Echo::MoveBackColumn]);
+            }
+        } else if single && !t.l(ECHOE) {
+            self.echo_char(t.cc[VERASE]);
+        } else if c == b'\t' {
+            let (mut columns, mut after_tab) = (0, false);
+            for &b in self.editing.iter().rev() {
+                if b == b'\t' {
+                    after_tab = true;
+                    break;
+                }
+                if is_ctrl(b) {
+                    columns += if t.l(ECHOCTL) { 2 } else { 0 };
+                } else if !self.continuation(b) {
+                    columns += 1;
+                }
+            }
+            self.echoes.push(Echo::EraseTab { columns, after_tab });
+        } else {
+            let width = match (is_ctrl(c), t.l(ECHOCTL)) {
+                (true, true) => 2,
+                (true, false) => 0,
+                (false, _) => 1,
+            };
+            for _ in 0..width {
+                self.echoes
+                    .extend([Echo::Char(b'\x08'), Echo::Char(b' '), Echo::Char(b'\x08')]);
+            }
+        }
+    }
+
+    /// Echoes `c` (Linux's `echo_char`): with ECHOCTL a control character other than tab shows as
+    /// `^X`.
+    fn echo_char(&mut self, c: u8) {
+        let echo = if self.termios.l(ECHOCTL) && is_ctrl(c) && c != b'\t' {
+            Echo::Ctrl(c)
+        } else {
+            Echo::Char(c)
+        };
+        self.echoes.push(echo);
+    }
+
+    /// Closes an open ECHOPRT erase with `/`.
+    fn finish_erasing(&mut self) {
+        if std::mem::take(&mut self.erasing) {
+            self.echoes.push(Echo::Char(b'/'));
+        }
+    }
+
+    /// Before echoing the first character of a canonical line: the line starts at the column the
+    /// cursor will then be at.
+    fn mark_line_start(&mut self) {
+        if self.canonical() && self.editing.is_empty() {
+            self.echoes.push(Echo::SetCanonColumn);
+        }
+    }
+
+    /// Writes the waiting echoes to the output unless output is stopped (Linux's
+    /// `process_echoes`).
+    fn commit_echoes(&mut self) {
+        if self.stopped || self.echoes.is_empty() {
+            return;
+        }
+        for echo in std::mem::take(&mut self.echoes) {
+            match echo {
+                Echo::Char(0xff) => {
+                    self.output.push_back(0xff);
+                    self.column += 1;
+                }
+                Echo::Char(c) => self.output_char(c),
+                Echo::Ctrl(c) => {
+                    self.output.extend([b'^', c ^ 0x40]);
+                    self.column += 2;
+                }
+                Echo::EraseTab { columns, after_tab } => {
+                    let columns = columns + if after_tab { 0 } else { self.canon_column };
+                    for _ in 0..8 - columns % 8 {
+                        self.output.push_back(b'\x08');
+                        self.column = self.column.saturating_sub(1);
+                    }
+                }
+                Echo::SetCanonColumn => self.canon_column = self.column,
+                Echo::MoveBackColumn => self.column = self.column.saturating_sub(1),
+            }
+        }
+        self.arrivals[1] += 1;
+    }
+
+    // ---- Slave reads ----
 
     /// Whether the slave has data to read now (in canonical mode a complete line is needed).
     pub fn readable(&self) -> bool {
@@ -768,17 +1087,19 @@ impl Tty {
     }
 
     /// One slave read: at most one line in canonical mode, returning 0 at EOF. Returns None when
-    /// there is no data.
+    /// there is no data. The room it makes lets waiting input in ([`Tty::take_signals`]).
     pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if self.canonical() {
+        let n = if self.canonical() {
             let line = self.lines.front_mut()?;
-            let n = buf.len().min(line.len());
-            buf[..n].copy_from_slice(&line[..n]);
-            line.drain(..n);
-            if line.is_empty() {
+            let n = buf.len().min(line.data.len());
+            buf[..n].copy_from_slice(&line.data[..n]);
+            line.data.drain(..n);
+            // The VEOF ending a line goes with the last of its data when the buffer has room for
+            // it too (Linux's `canon_copy_from_read_buf`); otherwise the next read returns 0
+            if line.data.is_empty() && (!line.eof || n < buf.len()) {
                 self.lines.pop_front();
             }
-            Some(n)
+            n
         } else {
             if self.raw.is_empty() {
                 return None;
@@ -787,14 +1108,18 @@ impl Tty {
             for (d, s) in buf.iter_mut().zip(self.raw.drain(..n)) {
                 *d = s;
             }
-            Some(n)
-        }
+            n
+        };
+        self.process_input();
+        Some(n)
     }
+
+    // ---- Output: slave writes ----
 
     /// How many more bytes the output queue can take: none while output is stopped (Linux's
     /// `pty_write_room`).
     pub fn output_room(&self) -> usize {
-        if self.held_from.is_some() {
+        if self.stopped {
             return 0;
         }
         OUTPUT_MAX.saturating_sub(self.output.len())
@@ -803,25 +1128,78 @@ impl Tty {
     /// A slave write: goes through output processing into the output queue.
     pub fn write_output(&mut self, data: &[u8]) {
         for &c in data {
-            self.put_output(c);
+            self.output_char(c);
         }
         self.arrivals[1] += 1;
     }
 
-    fn put_output(&mut self, c: u8) {
-        let t = &self.termios;
-        if t.oflag & OPOST != 0 {
-            if c == b'\n' && t.oflag & ONLCR != 0 {
-                self.output.extend(b"\r\n");
-                return;
+    /// One byte of output (Linux's `do_output_char`), following the cursor column: with OPOST, NL
+    /// becomes CR NL (ONLCR) and returns the carriage (ONLRET), CR is dropped at column 0 (ONOCR)
+    /// or becomes NL (OCRNL), tabs expand to spaces (XTABS), and other printable characters go
+    /// upper case (OLCUC); a UTF-8 continuation byte (IUTF8) takes no column, a control character
+    /// none. Without OPOST it goes out as it is.
+    fn output_char(&mut self, mut c: u8) {
+        let t = self.termios;
+        if !t.o(OPOST) {
+            self.output.push_back(c);
+            return;
+        }
+        match c {
+            b'\n' => {
+                if t.o(ONLRET) {
+                    self.column = 0;
+                }
+                if t.o(ONLCR) {
+                    self.column = 0;
+                    self.canon_column = 0;
+                    self.output.extend(b"\r\n");
+                    return;
+                }
+                self.canon_column = self.column;
             }
-            if c == b'\r' && t.oflag & OCRNL != 0 {
-                self.output.push_back(b'\n');
-                return;
+            b'\r' => {
+                if t.o(ONOCR) && self.column == 0 {
+                    return;
+                }
+                if t.o(OCRNL) {
+                    c = b'\n';
+                    if t.o(ONLRET) {
+                        self.column = 0;
+                        self.canon_column = 0;
+                    }
+                } else {
+                    self.column = 0;
+                    self.canon_column = 0;
+                }
             }
+            b'\t' => {
+                let spaces = 8 - self.column % 8;
+                self.column += spaces;
+                if t.oflag & TABDLY == XTABS {
+                    self.output.extend(std::iter::repeat_n(b' ', spaces));
+                    return;
+                }
+            }
+            b'\x08' => self.column = self.column.saturating_sub(1),
+            _ if !is_ctrl(c) => {
+                if t.o(OLCUC) {
+                    c = to_upper(c);
+                }
+                if !self.continuation(c) {
+                    self.column += 1;
+                }
+            }
+            _ => {}
         }
         self.output.push_back(c);
     }
+
+    /// Whether `c` is a UTF-8 continuation byte, which IUTF8 treats as part of the character before.
+    fn continuation(&self, c: u8) -> bool {
+        self.termios.i(IUTF8) && c & 0xc0 == 0x80
+    }
+
+    // ---- Master reads ----
 
     /// The status byte one master read returns in packet mode; takes it.
     pub fn take_pktstatus(&mut self) -> Option<u8> {
@@ -834,22 +1212,25 @@ impl Tty {
 
     /// Whether the master has output to read.
     pub fn has_output(&self) -> bool {
-        self.visible() > 0
+        !self.output.is_empty()
     }
 
     /// One master read: takes output.
     pub fn take_output(&mut self, max: usize) -> Vec<u8> {
-        let n = max.min(self.visible());
-        if let Some(v) = self.held_from.as_mut() {
-            *v = (*v).min(self.output.len()) - n;
-        }
+        let n = max.min(self.output.len());
         self.output.drain(..n).collect()
     }
 
-    /// Changes termios. The address bit stays (Linux's `tty_set_termios`), and a PTY is always 8
-    /// bits, without parity, with the receiver enabled (`pty_set_termios`). When canonical mode is
-    /// switched on or off, input already queued is moved between the two queues.
-    pub fn set_termios(&mut self, mut t: Termios) {
+    // ---- ioctl helpers ----
+
+    /// Changes termios; returns the signals generated by input it lets in. The address bit stays
+    /// (Linux's `tty_set_termios`), and a PTY is always 8 bits, without parity, with the receiver
+    /// enabled (`pty_set_termios`). As Linux's `n_tty_set_termios` does: switching ICANON or EXTPROC
+    /// ends LNEXT and an ECHOPRT erase, and input already queued changes queue: from canonical
+    /// mode the lines become raw data, a VEOF in it a NUL; into canonical mode all of it becomes
+    /// one line, readable at once, with a final NUL taken as its VEOF. Clearing IXON restarts
+    /// output that ^S stopped.
+    pub fn set_termios(&mut self, mut t: Termios) -> Vec<Signal> {
         t.cflag ^= (t.cflag ^ self.termios.cflag) & ADDRB;
         t.cflag = t.cflag & !(CSIZE | PARENB) | CS8 | CREAD;
         // In packet mode report ^S/^Q flow control being switched, and with EXTPROC report that
@@ -864,33 +1245,65 @@ impl Tty {
         if extproc {
             self.report(pkt::IOCTL, 0);
         }
-        let was = self.canonical();
+        let (old, was) = (self.termios, self.canonical());
         self.termios = t;
+        if (old.lflag ^ t.lflag) & (ICANON | EXTPROC) != 0 {
+            self.lnext = false;
+            self.erasing = false;
+        }
         match (was, self.canonical()) {
             (true, false) => {
-                let lines: Vec<u8> = self.lines.drain(..).flatten().collect();
-                self.raw.extend(lines);
+                for line in std::mem::take(&mut self.lines) {
+                    self.raw.extend(line.data);
+                    if line.eof {
+                        self.raw.push_back(0);
+                    }
+                }
                 self.raw.extend(self.editing.drain(..));
             }
-            (false, true) => self.editing.extend(self.raw.drain(..)),
+            (false, true) if !self.raw.is_empty() => {
+                let mut data: Vec<u8> = self.raw.drain(..).collect();
+                let eof = data.last() == Some(&0);
+                if eof {
+                    data.pop();
+                }
+                self.lines.push_back(Line { data, eof });
+            }
             _ => {}
         }
+        if old.i(IXON) && !t.i(IXON) {
+            self.start();
+        }
+        self.process_input();
+        self.take_signals()
     }
 
-    /// Flushes the input queue (TCIFLUSH, when generating signals).
+    /// Flushes the line discipline's input (TCIFLUSH, TCSETSF, signal characters; Linux's
+    /// `n_tty_flush_buffer`) and an open ECHOPRT erase. Input not taken by the line discipline yet
+    /// stays ([`Tty::discard_unprocessed`]).
     pub fn flush_input(&mut self) {
         self.editing.clear();
         self.lines.clear();
         self.raw.clear();
-        self.lnext = false;
+        self.erasing = false;
     }
 
-    /// Flushes the output queue (TCOFLUSH).
+    /// Discards master writes not taken by the line discipline yet (TCIFLUSH on the slave, TCOFLUSH
+    /// on the master: Linux's `tty_buffer_flush` of the slave's flip buffer).
+    pub fn discard_unprocessed(&mut self) {
+        self.unprocessed.clear();
+    }
+
+    /// TCOFLUSH on the slave (Linux's `pty_flush_buffer`): drops only the output the master side
+    /// has not taken yet ([`PASSED_ON`]).
     pub fn flush_output(&mut self) {
+        self.output.truncate(PASSED_ON);
+    }
+
+    /// TCIFLUSH on the master, a hangup of the master side and signal characters: all output the
+    /// master has not read.
+    pub fn clear_output(&mut self) {
         self.output.clear();
-        if let Some(v) = self.held_from.as_mut() {
-            *v = 0;
-        }
     }
 
     /// In packet mode, reports a flush on the slave side (Linux's `n_tty_packet_mode_flush` for
@@ -920,36 +1333,42 @@ impl Tty {
 
     /// Stops the slave's output (^S, Linux's `__stop_tty`; `pty_stop` reports STOP).
     fn stop(&mut self) {
-        if self.held_from.is_none() {
-            self.held_from = Some(self.output.len());
+        if !self.stopped {
+            self.stopped = true;
             self.report(pkt::STOP, pkt::START);
         }
     }
 
-    /// Restarts the slave's output (^Q, IXANY, when generating signals; Linux's `start_tty`,
-    /// `pty_start` reports START): output stopped by TCOOFF is left alone.
+    /// Restarts the slave's output (^Q, IXANY, signal characters, clearing IXON; Linux's
+    /// `__start_tty`, `pty_start` reports START) and writes the echoes that waited; output stopped
+    /// by TCOOFF is left alone.
     fn start(&mut self) {
-        if !self.tco_stopped && self.held_from.take().is_some() {
+        if self.stopped && !self.tco_stopped {
+            self.stopped = false;
             self.report(pkt::START, pkt::STOP);
+            self.commit_echoes();
         }
     }
 
-    /// TCIOFF and TCION on the slave send the STOP or START character to the master, and TIOCSTI
-    /// on the master puts a byte in its input: readable by the master regardless of stopped
-    /// output, ahead of the held echoes (Linux's `tty_send_xchar`).
+    /// TCIOFF and TCION on the slave send the STOP or START character to the master (Linux's
+    /// `tty_send_xchar`): output stopped by ^S restarts for that one character and stops again
+    /// (reported in packet mode); while TCOOFF holds it the character is lost.
     pub fn send_xchar(&mut self, c: u8) {
-        let at = self.visible();
-        self.output.insert(at, c);
-        if let Some(v) = self.held_from.as_mut() {
-            *v = at + 1;
+        if self.tco_stopped {
+            return;
         }
+        if self.stopped {
+            self.report(pkt::STOP, pkt::START);
+        }
+        self.output.push_back(c);
         self.arrivals[1] += 1;
     }
 
-    /// The number of bytes the master can read now ([`Tty::held_from`]).
-    fn visible(&self) -> usize {
-        self.held_from
-            .map_or(self.output.len(), |v| v.min(self.output.len()))
+    /// TIOCSTI on the master: the byte is added to what the master reads (Linux's `tiocsti` feeds
+    /// the master's own line discipline).
+    pub fn inject_output(&mut self, c: u8) {
+        self.output.push_back(c);
+        self.arrivals[1] += 1;
     }
 
     /// In packet mode, records status `set` and removes `clear`, which makes the master's readers
@@ -961,10 +1380,12 @@ impl Tty {
         }
     }
 
-    /// The number of readable bytes in the input queue (FIONREAD).
+    // ---- Accessors ----
+
+    /// The number of readable bytes in the input queue (FIONREAD), without the VEOF ending a line.
     pub fn input_len(&self) -> usize {
         if self.canonical() {
-            self.lines.iter().map(Vec::len).sum()
+            self.lines.iter().map(|l| l.data.len()).sum()
         } else {
             self.raw.len()
         }
@@ -975,9 +1396,10 @@ impl Tty {
         self.output.len()
     }
 
-    /// Whether in canonical mode (ICANON).
+    /// Whether input is read line by line: canonical mode (ICANON) without EXTPROC, which hands
+    /// line editing to the master and makes input readable at once.
     pub fn canonical(&self) -> bool {
-        self.termios.l(ICANON)
+        self.termios.l(ICANON) && !self.termios.l(EXTPROC)
     }
 
     /// Whether a file opened after this side's `born`-th vhangup (on the master when `master`) has
@@ -1105,9 +1527,35 @@ pub(crate) fn wall_ns() -> i64 {
         .unwrap_or(0)
 }
 
-/// The control characters echoed as `^X`: the C0 control characters except TAB and NL, and DEL.
+/// A control character (the kernel's `iscntrl`): C0 and DEL. ECHOCTL shows them as `^X`, tab
+/// excepted, and output processing gives them no column.
 fn is_ctrl(c: u8) -> bool {
-    (c < 0x20 && c != b'\t' && c != b'\n') || c == 0x7f
+    c < 0x20 || c == 0x7f
+}
+
+/// The kernel's `isalnum` (`lib/ctype.c`, Latin-1): digits, letters, and Latin-1 letters except
+/// the multiplication and division signs.
+fn is_alnum(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, 0xc0..=0xd6 | 0xd8..=0xf6 | 0xf8..=0xff)
+}
+
+/// The kernel's `tolower` (IUCLC): Latin-1 upper case letters too.
+fn to_lower(c: u8) -> u8 {
+    if c.is_ascii_uppercase() || matches!(c, 0xc0..=0xd6 | 0xd8..=0xde) {
+        c + 0x20
+    } else {
+        c
+    }
+}
+
+/// The kernel's `toupper` (OLCUC): Latin-1 lower case letters too, ß and ÿ included (which it
+/// maps to 0xbf and 0xdf).
+fn to_upper(c: u8) -> u8 {
+    if c.is_ascii_lowercase() || matches!(c, 0xdf..=0xf6 | 0xf8..=0xff) {
+        c - 0x20
+    } else {
+        c
+    }
 }
 
 #[cfg(test)]
@@ -1205,10 +1653,78 @@ mod tests {
         t.write_output(b"a\nb");
         assert_eq!(t.take_output(16), b"a\r\nb");
         t.write_input(b"\x13");
-        t.write_output(b"x");
-        assert!(!t.has_output() && t.take_output(16).is_empty());
+        assert_eq!(t.output_room(), 0);
+        t.write_input(b"x");
+        assert!(!t.has_output());
         t.write_input(b"\x11");
         assert_eq!(t.take_output(16), b"x");
+    }
+
+    /// Output processing follows the cursor column: tabs expand to the next multiple of 8
+    /// (XTABS), CR at column 0 is dropped (ONOCR), and erasing a tab moves back to where it
+    /// started, counting from the column the line started at (the prompt).
+    #[test]
+    fn output_and_tab_erase_follow_the_column() {
+        let mut t = Tty::new(0);
+        let mut tio = t.termios;
+        tio.oflag |= XTABS | ONOCR;
+        t.set_termios(tio);
+        t.write_output(b"ab\tc\n\r$ ");
+        assert_eq!(t.take_output(64), b"ab      c\r\n$ ");
+        tio.oflag &= !XTABS;
+        t.set_termios(tio);
+        t.write_input(b"x\t\x7f\x7f\t\x7f");
+        // The line starts at column 2: the tab after x took 5 columns, the one at the start 6
+        assert_eq!(
+            t.take_output(64),
+            b"x\t\x08\x08\x08\x08\x08\x08 \x08\t\x08\x08\x08\x08\x08\x08"
+        );
+    }
+
+    /// Echo and erase rules of n_tty: ECHOCTL shows a newline taken literally as `^J`, ECHOPRT
+    /// shows erased characters between `\` and `/`, VWERASE stops at punctuation, and without
+    /// ECHOE an erase echoes the erase character.
+    #[test]
+    fn echoes_follow_linux() {
+        let mut t = Tty::new(0);
+        t.write_input(b"a\x16\nb\n");
+        assert_eq!(t.take_output(64), b"a^\x08^Jb\r\n");
+        assert_eq!(read_all(&mut t), b"a\nb\n");
+        let mut tio = t.termios;
+        tio.lflag |= ECHOPRT;
+        t.set_termios(tio);
+        t.write_input(b"abc\x7f\x7fd\n");
+        assert_eq!(t.take_output(64), b"abc\\cb/d\r\n");
+        read_all(&mut t);
+        tio.lflag &= !(ECHOPRT | ECHOE);
+        t.set_termios(tio);
+        t.write_input(b"x.yz\x17\x7f\n");
+        assert_eq!(read_all(&mut t), b"x\n");
+        assert_eq!(t.take_output(64), b"x.yz\x08 \x08\x08 \x08^?\r\n");
+    }
+
+    /// Master writes beyond the line discipline's room wait, and are taken (signal characters
+    /// included) as the slave reads; a signal character drops the output not read yet and the
+    /// echoes of the same batch, while TCOFLUSH keeps what the master side has taken.
+    #[test]
+    fn input_waits_for_room_and_signals_flush_like_linux() {
+        let mut t = Tty::new(0);
+        let mut raw = t.termios;
+        raw.lflag &= !(ICANON | ECHO);
+        t.set_termios(raw);
+        let mut data = vec![b'A'; INPUT_MAX - 1];
+        data.push(3);
+        assert!(t.write_input(&data).is_empty());
+        let mut buf = vec![0u8; INPUT_MAX];
+        assert_eq!(t.read(&mut buf), Some(INPUT_MAX - 1));
+        assert_eq!(t.take_signals(), vec![Signal::INT]);
+        let mut t = Tty::new(0);
+        t.write_output(b"unread");
+        assert_eq!(t.write_input(b"abc\x03"), vec![Signal::INT]);
+        assert_eq!(t.take_output(64), b"^C");
+        t.write_output(&vec![b'x'; PASSED_ON + 10]);
+        t.flush_output();
+        assert_eq!(t.output_len(), PASSED_ON);
     }
 
     #[test]
@@ -1244,13 +1760,17 @@ mod tests {
         t.write_input(b"\x11");
         assert!(t.output_room() > 0);
         assert_eq!(t.take_output(16), b"x");
-        // ^Q cannot restart output stopped by TCOOFF, TCOON is needed; characters sent by TCIOFF
-        // are not held by the stop
+        // A character sent by TCIOFF passes output stopped by ^S, but is lost under TCOOFF; ^Q
+        // cannot restart output stopped by TCOOFF, TCOON is needed
+        t.write_input(b"\x13");
+        t.send_xchar(0x13);
+        assert_eq!(t.take_output(16), b"\x13");
+        t.write_input(b"\x11");
         t.stop_output();
         t.write_input(b"\x11");
         assert_eq!(t.output_room(), 0);
         t.send_xchar(0x13);
-        assert_eq!(t.take_output(16), b"\x13");
+        assert!(!t.has_output());
         t.start_output();
         assert!(t.output_room() > 0);
     }

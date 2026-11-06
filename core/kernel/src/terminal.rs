@@ -322,7 +322,7 @@ fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
     };
     let (eof, canonical) = {
         let t = tty.borrow();
-        if t.readable() {
+        if t.input_pending() {
             return None;
         }
         (t.termios.cc[crate::tty::cc::VEOF], t.canonical())

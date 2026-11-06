@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files; Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files; Starnix's syscall tests and PTY scenarios, skipped only where they cannot be compared)
 
 ## Responsibilities
 
@@ -122,7 +122,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   base64-encoded, unpacked by the guest's busybox into `/tmp/difftest-files/<dir>` before the case
   runs on either side; it counts towards the 128 KB. `line-discipline` uses it for Starnix's PTY
   scenarios and trace generator (`tests/diff/line-discipline`, BSD-licensed, copied unchanged with
-  its source commit in a README) and skips the scenarios appine fails, by group.
+  its source commit in a README) and runs all 83 of them.
 - Lanes (`-j`, default 4 on macOS, 1 elsewhere): each lane uses its own store clone (APFS clone or
   reflink copy), cases go slowest first by recorded time, and each lane prints its report in one
   write; failures are copied to `failed/`.
