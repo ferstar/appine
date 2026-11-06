@@ -2429,6 +2429,13 @@ pub(super) fn sendfile(
     ) {
         return Err(Errno::EINVAL);
     }
+    // Into anything but a pipe Linux goes through do_splice_direct, which refuses O_APPEND
+    {
+        let out = output.borrow();
+        if out.flags & oflags::O_APPEND != 0 && !matches!(out.kind, FileKind::Pipe(_)) {
+            return Err(Errno::EINVAL);
+        }
+    }
     let mut off = match offset {
         0 => None,
         addr => Some(u64::try_from(i64::from_le_bytes(get(cx, addr)?)).map_err(|_| Errno::EINVAL)?),

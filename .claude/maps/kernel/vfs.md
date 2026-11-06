@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners, lock ranges, linkat)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners, lock ranges, linkat, sendfile)
 
 ## Responsibilities
 
@@ -311,7 +311,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   without the BKL; they fall back to chunked copies for `O_APPEND` output, the same inode, a
   sealed output file, tmpfs output, or host `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`.
   `copy_file_range` rejects nonzero flags (`EINVAL`) and `O_APPEND` output (`EBADF`); `sendfile`
-  appends to `O_APPEND` output instead of returning `EINVAL`. `splice`, `tee` and
+  rejects `O_APPEND` output other than a pipe (`EINVAL`, as `do_splice_direct`). `splice`, `tee` and
   `vmsplice` copy through buffers (one side of `splice` must be a pipe; data leaves the pipe only
   after the write succeeds).
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
@@ -607,8 +607,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **File position races:** lseek and `O_APPEND` writes change the position without the
   `pos_busy` lock, so a concurrent unlocked read or write on the same open file can overwrite the
   new position (Linux takes `f_pos_lock` in lseek too).
-- **`sendfile` to an `O_APPEND` file appends** instead of returning `EINVAL` as Linux's
-  `do_splice_direct` does (splice and copy_file_range check this).
 - **umount ignores mappings and executables:** a mount whose files are only mapped, being executed
   or held by mqueue fds is not busy, so `umount2` succeeds where Linux returns `EBUSY` (and a tmpfs
   instance can then be reclaimed while still mapped).

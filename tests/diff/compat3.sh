@@ -3,7 +3,7 @@
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
-# CLONE_PARENT exit signals; timers of exited threads
+# CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1120,3 +1120,34 @@ int main(void)
 C
 gcc -O1 -pthread -o deadtimer deadtimer.c && ./deadtimer
 rm -f deadtimer deadtimer.c
+
+# sendfile into an O_APPEND file is EINVAL (into a pipe it is fine)
+cat > sendappend.c <<'C'
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/sendfile.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int in = open("sa.in", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    write(in, "hello", 5);
+    int out = open("sa.out", O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    off_t off = 0;
+    long r = sendfile(out, in, &off, 5);
+    printf("sendfile into an O_APPEND file: %s\n", r < 0 ? strerror(errno) : "copied");
+    int p[2];
+    pipe(p);
+    fcntl(p[1], F_SETFL, O_APPEND);
+    off = 0;
+    r = sendfile(p[1], in, &off, 5);
+    printf("sendfile into an O_APPEND pipe: %ld\n", r);
+    unlink("sa.in");
+    unlink("sa.out");
+    return 0;
+}
+C
+gcc -O1 -o sendappend sendappend.c && ./sendappend
+rm -f sendappend sendappend.c
