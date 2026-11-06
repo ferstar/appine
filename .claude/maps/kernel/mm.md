@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` honoured at fork and kept by fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer added, 5 claims checked by 1 verifier)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` at fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer; mremap with an old length of 0)
 
 ## Responsibilities
 
@@ -251,6 +251,13 @@ signals may still be delivered).
   free space above, and the new end at or below `mmap_top`; the grown part becomes a separate VMA
   with the same lock, dump and fork flags. A move re-points the same host memory and moves the
   page-table entries with it.
+- `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
+  address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
+  unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`. A shared file mapping
+  maps the file again from the address's offset for the new length; shared anonymous memory and
+  System V segments get a VMA on the same host memory, which may run past the source VMA to the
+  end of the region and past that has no contents (`SIGBUS`). A segment's copy is a new attach
+  base, so it counts as one more attachment and shmdt at its address detaches it.
 - `madvise` flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/`KEEPONFORK`, `DONTFORK`/`DOFORK`)
   needs the range fully mapped, splits the VMAs at its ends and sets the flag. Whether the range is
   locked (`MADV_DONTNEED` is `EINVAL`) or all private anonymous (`MADV_FREE` and `MADV_WIPEONFORK`

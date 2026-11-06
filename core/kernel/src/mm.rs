@@ -1366,11 +1366,14 @@ impl Mm {
         fixed: Option<u64>,
         file: Option<i32>,
     ) -> Result<u64, Errno> {
-        let old_len = page_up(old_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
+        let old_len = page_up(old_len).ok_or(Errno::EINVAL)?;
         let new_len = page_up(new_len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let old_end = old.checked_add(old_len).ok_or(Errno::EINVAL)?;
         if !old.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
+        }
+        if old_len == 0 {
+            return self.duplicate(old, new_len, may_move, fixed);
         }
         // Linux requires the old range to be in one VMA; adjacent VMAs are not merged here (for
         // example after growing in place), so the range only has to be fully covered by contiguous
@@ -1422,6 +1425,65 @@ impl Mm {
         let e = extension(self)?.unwrap();
         self.move_range(old, old_len, dst)?;
         self.insert_vma(dst + old_len, e)?;
+        Ok(dst)
+    }
+
+    /// mremap with an old length of 0, which Linux keeps for DOSEMU's "duplicate shm area": the same
+    /// shared memory or file, from `old`'s offset for `new_len` bytes, mapped again at a new address
+    /// while the original stays. In 6.1's order: no mapping at `old` is EFAULT; a `MREMAP_FIXED`
+    /// target is validated and unmapped first; a private mapping is EINVAL (6.1 refuses to
+    /// duplicate one); and without `may_move` it is ENOMEM, since nothing grows in place.
+    fn duplicate(
+        &mut self,
+        old: u64,
+        new_len: u64,
+        may_move: bool,
+        fixed: Option<u64>,
+    ) -> Result<u64, Errno> {
+        let (s, v) = self
+            .vmas
+            .range(..=old)
+            .next_back()
+            .filter(|&(&s, v)| old < s + v.len)
+            .map(|(&s, v)| (s, v.clone()))
+            .ok_or(Errno::EFAULT)?;
+        if let Some(dst) = fixed {
+            if !dst.is_multiple_of(PAGE_SIZE)
+                || dst.checked_add(new_len).is_none_or(|e| e > 1 << VA_BITS)
+                || dst < old && old < dst + new_len
+            {
+                return Err(Errno::EINVAL);
+            }
+            self.munmap(dst, new_len)?;
+        }
+        if v.backing != Backing::Shared {
+            return Err(Errno::EINVAL);
+        }
+        let dst = match fixed {
+            Some(d) => d,
+            None if may_move => self.find_free(new_len).ok_or(Errno::ENOMEM)?,
+            None => return Err(Errno::ENOMEM),
+        };
+        let offset = old - s;
+        let copy = if v.file.is_some() {
+            self.extension(&v, offset, new_len, None)?
+        } else {
+            // Shared anonymous memory or a System V segment: the same host memory, which may go on
+            // past this VMA when the mapping was split. Past the end of that memory the copy has
+            // none, so accesses there get SIGBUS, as past the end of a shmem object
+            let host = v.host.as_ptr().wrapping_add(offset as usize);
+            let end = v.region.base.as_ptr() as usize + v.region.len;
+            let avail = end.saturating_sub(host as usize) as u64;
+            let mut c = v.clone();
+            c.len = new_len;
+            c.host = NonNull::new(host).ok_or(Errno::EFAULT)?;
+            c.file_len = avail.min(new_len);
+            c.growsdown = false;
+            // A segment counts one more attachment, as Linux's vm_ops open does for the copy
+            c.shm = v.shm.map(|(id, _)| (id, dst));
+            c
+        };
+        self.insert_vma(dst, copy)?;
         Ok(dst)
     }
 

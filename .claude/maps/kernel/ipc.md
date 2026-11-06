@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/ipc.md` for the paired decision history (not yet created).
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments)
 
 ## Responsibilities
 
@@ -147,7 +149,8 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   permission, then `Mm::attach_shm`, which tags the VMA with the `ShmKey` and its base. shmdt needs
   a shm VMA starting at the address, and updates the segment in the namespace recorded at attach
   time if it still exists.
-- `nattch` is computed: distinct attach bases per distinct address space, over all tasks.
+- `nattch` is computed: distinct attach bases per distinct address space, over all tasks; an
+  mremap duplicate (old length 0) of a segment is its own base, so it counts, as on Linux.
 - shmctl IPC_RMID sets `SHM_DEST`, makes the key private and removes the segment only when nothing
   is attached; otherwise `reap_shm` removes destroyed segments with no attachments, in every
   namespace, and it runs only from shmget, shmdt and shmctl (any command). shmat does not check
