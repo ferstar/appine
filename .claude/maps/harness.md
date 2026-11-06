@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all; flags refuse values; SIGKILL timeouts for Starnix's tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all; flags refuse values; SIGKILL timeouts for Starnix's tests; tarballs chosen by version)
 
 ## Responsibilities
 
@@ -95,7 +95,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Guest programs (`tests/guest`): assembly built with the host `cc` (`-nostdlib -static`), C with
   `musl-gcc -static -O2 -Werror -pthread`, both natively on the aarch64 host; most run as host
   paths, a few are copied into the store.
-- `rootfs_programs` imports the lexically newest Alpine tarball under `target/rootfs/` (or
+- `rootfs_programs` imports the newest Alpine tarball by version under `target/rootfs/` (or
   `APPINE_ROOTFS_TARBALL`) into one shared store per test process; groups cover busybox and files,
   core dumps and the kernel log, shell semantics and job control, procfs/sysfs/net, the PTY
   (interactive shell, ^C/^Z, vi), limits, OOM and cgroups, the Tier 1 code cache, the `Machine` API
@@ -254,8 +254,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   own `cargo build` writes `target/release` while it runs `target/linux-arm64`, with no fallback.
 - **Tests can pass vacuously.** The low-ports test returns from the whole test (skipping all four
   cases) when its first bind fails; without a rootfs only the first test prints the skip and the rest
-  pass silently; the tarball (and the survey's) is chosen by the lexically greatest name, so 3.3
-  would beat 3.24.
+  pass silently. (The rootfs tests, difftest, LTP and the survey choose the newest Alpine tarball
+  by version: `version_key`, `sort -V`.)
 - **Killing `appine-run` skips the guest's shutdown.** Without signal handlers, `timeout` or ^C
   (with `--no-pty`) skip the inittab shutdown and the final store sync (losing the 5 ms deferred
   commit window) and, in PTY mode, leave the host terminal raw.

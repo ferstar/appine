@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version)
 
 ## Responsibilities
 
@@ -95,8 +95,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
   `build.zig.zon` hashes), so the cargo build needs no network.
 - Android libraries: `androidx.core` and Material Components 1.14.0 (which brings AppCompat,
   androidx.activity, CoordinatorLayout and the Error Prone annotations).
-- Assets: the newest Alpine minirootfs tarball (as `rootfs.tgz`, since AAPT would unpack `.gz`),
-  `doas.apk`, generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
+- Assets: the newest Alpine minirootfs tarball by version (as `rootfs.tgz`, since AAPT would
+  unpack `.gz`), the newest `doas.apk` (both by `byVersion`, the numbers in the name), generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
   `BuildConfig` carries the Alpine branch.
 - Notices (`NoticesTask`): appine's notice, then the terminal's components with their license
   texts from `android/licenses/` (Ghostty, uucode with the Unicode and Hoehrmann licenses, simdutf,
@@ -171,9 +171,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 ## Confirmed bugs / technical debt
 
 - **Panics outside the kernel's wrapped calls abort the app** (see the list above).
-- The release build is signed with the debug key and not minified; the Alpine tarball is picked by
-  the lexically greatest file name (3.9 sorts after 3.10), with the checksum checked only in
-  `scripts/fetch-rootfs`.
+- The release build is signed with the debug key and not minified; the Alpine tarball's checksum is
+  checked only in `scripts/fetch-rootfs`.
 - Local references are never deleted in loops that build arrays (harmless with ART's large table
   on API 29+); a failed string conversion with no pending exception makes void calls return
   silently (unreachable from the non-null Kotlin signatures).

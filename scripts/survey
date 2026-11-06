@@ -89,7 +89,7 @@ proxy() {
 }
 
 if [ ! -d "$store" ]; then
-    tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
+    tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | sort -V | tail -n 1)
     [ -n "$tarball" ] || {
         echo "survey: no minirootfs; run scripts/fetch-rootfs" >&2
         exit 1

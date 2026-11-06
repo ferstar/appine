@@ -2088,8 +2088,28 @@ fn find_tarball() -> Option<PathBuf> {
             name.starts_with("alpine-minirootfs-") && name.ends_with("-aarch64.tar.gz")
         })
         .collect();
-    found.sort();
+    // The newest by version (3.24 after 3.3), not by name
+    found.sort_by_key(|p| version_key(&p.file_name().unwrap().to_string_lossy()));
     found.pop()
+}
+
+#[test]
+fn tarballs_are_chosen_by_version() {
+    let mut names = [
+        "alpine-minirootfs-3.3.0-aarch64.tar.gz",
+        "alpine-minirootfs-3.24.3-aarch64.tar.gz",
+        "alpine-minirootfs-3.9.1-aarch64.tar.gz",
+    ];
+    names.sort_by_key(|n| version_key(n));
+    assert_eq!(names[2], "alpine-minirootfs-3.24.3-aarch64.tar.gz");
+}
+
+/// The numbers in a file name, compared in order (`alpine-minirootfs-3.24.3-aarch64.tar.gz` gives
+/// 3, 24, 3, 64).
+fn version_key(name: &str) -> Vec<u64> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse().ok())
+        .collect()
 }
 
 /// Builds tests/guest/<name>.c statically with musl-gcc; returns None without musl-gcc.

@@ -14,10 +14,17 @@ plugins {
 /** Repository root: the Cargo workspace and the rootfs from `scripts/fetch-rootfs` are here. */
 val repoRoot: Directory = rootProject.layout.projectDirectory.dir("..")
 
+/** Orders file names by the numbers in them, so that 3.10 comes after 3.9 and r10 after r9. */
+val byVersion: Comparator<File> = Comparator { a, b ->
+    val numbers = { f: File -> Regex("""\d+""").findAll(f.name).map { it.value.toLong() }.toList() }
+    val (x, y) = numbers(a) to numbers(b)
+    x.zip(y).map { (p, q) -> p.compareTo(q) }.firstOrNull { it != 0 } ?: x.size.compareTo(y.size)
+}
+
 /** Alpine minirootfs: the tarball `scripts/fetch-rootfs` downloaded and verified. */
 val rootfsTarball: File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(Regex("alpine-minirootfs-.*-aarch64\\.tar\\.gz")) }
-    ?.maxByOrNull { it.name }
+    ?.maxWithOrNull(byVersion)
 
 /**
  * The doas package bundled with the app (downloaded by `scripts/fetch-rootfs`), installed offline
@@ -25,7 +32,7 @@ val rootfsTarball: File? = repoRoot.dir("target/rootfs").asFile
  */
 val doasPackage: File? = repoRoot.dir("target/rootfs").asFile
     .listFiles { f -> f.name.matches(Regex("doas-.*\\.apk")) }
-    ?.maxByOrNull { it.name }
+    ?.maxWithOrNull(byVersion)
 
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball

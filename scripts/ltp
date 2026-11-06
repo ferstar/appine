@@ -86,7 +86,7 @@ shift $((OPTIND - 1))
 pattern=${1:-[^[:space:]]+}
 
 ltp=$(ls "$out"/ltp-*.tar 2>/dev/null | tail -n 1)
-rootfs=$(ls "$root"/target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | tail -n 1)
+rootfs=$(ls "$root"/target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | sort -V | tail -n 1)
 if [ -z "$ltp" ] || [ -z "$rootfs" ]; then
     echo "ltp: run scripts/build-ltp and scripts/fetch-rootfs first" >&2
     exit 1
