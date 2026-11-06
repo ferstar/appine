@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread)
 
 ## Responsibilities
 
@@ -147,7 +147,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
-  empty, `fd/` is empty, `cwd`/`root`/`ns` are `ENOENT`.
+  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`. A main thread that has exited while
+  other threads run is shown the same way, as Linux's zombie leader: `task/` still lists it,
+  `task/<pid>` and the process directory report Z with its name (kept in the group, as for
+  zombies) and its own CPU time for `task/<pid>/stat`, and `Threads`/`num_threads` and `task/`'s
+  link count include it; the process directory no longer falls back to another thread.
 
 ### System-wide files and `/proc/sys`
 
@@ -383,14 +387,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
   sockets only in `SCM_RIGHTS` messages show 0.
-- **An exited thread-group leader vanishes from `task/`:** once the main thread calls `exit` while
-  other threads run, and for every unreaped zombie, `/proc/<pid>/task/<pid>` is `ENOENT` and
-  `task/` stops listing it, and `/proc/<pid>` shows another live thread's state, cwd, root, mounts,
-  fds, maps and command line, where Linux 6.1 keeps the leader as a zombie until the group is
-  reaped (`Z` in `stat`/`status`, empty `cmdline`/`maps`/`fd/`, `ENOENT` for `cwd`/`exe`/`root`,
-  `EINVAL` for `mounts`); tools that wait for a thread to become a zombie through
-  `task/<tid>/stat`, `ps -L`/`top -H`, and code checking whether the main thread is still alive see
-  something else (see the matching `kernel/process` item).
 - **Read-only proc files cannot be opened for writing even with `CAP_DAC_OVERRIDE`:** every
   write-mode open of a node that is not writable is `EACCES` before capabilities are considered,
   where Linux 6.1 lets root open ordinary `/proc` files (not `/proc/sys` or sysfs) with `O_WRONLY`,

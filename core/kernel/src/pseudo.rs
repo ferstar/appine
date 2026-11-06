@@ -927,7 +927,6 @@ impl<'a> View<'a> {
         threads
             .iter()
             .find(|&&t| t == pid)
-            .or(threads.first())
             .and_then(|t| self.k.tasks.get(t).cloned())
     }
 
@@ -1027,7 +1026,11 @@ impl<'a> View<'a> {
         match (self.group(pid), tid) {
             (None, _) => false,
             (Some(_), None) => true,
-            (Some(g), Some(t)) => g.borrow().threads.contains(&t),
+            // An exited main thread stays, as a zombie, until the process is reaped
+            (Some(g), Some(t)) => {
+                let g = g.borrow();
+                g.threads.contains(&t) || (t == g.tgid && g.leader_exit.is_some())
+            }
         }
     }
 
@@ -1377,10 +1380,15 @@ impl Pseudo for View<'_> {
             // As with root and cwd, the reader must be able to see that process (Linux's
             // proc_pid_readlink and proc_pid_get_link both check proc_fd_access_allowed first).
             // After the program file is deleted it gets ` (deleted)`, as with fds
-            Entry(pid, _, self::Entry::Exe) => {
+            Entry(pid, tid, self::Entry::Exe) => {
                 let g = self.group(*pid).ok_or(Errno::ENOENT)?;
                 if !self.may_read(*pid) {
                     return Err(Errno::EACCES);
+                }
+                // The program is the thread's address space's: an exited thread (the main thread
+                // of a process living on, a zombie) has none
+                if self.task(*pid, *tid).is_none() {
+                    return Err(Errno::ENOENT);
                 }
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
                 let path = exe.path.to_vec();
@@ -1488,12 +1496,13 @@ impl Pseudo for View<'_> {
             // renamed, deleted or replaced. A deleted one's object in the store is deleted too,
             // so it is opened through the recorded host file (OpenExe). Without a store (host
             // files for development) it is followed by the path read back
-            PseudoNode::Entry(pid, _, Entry::Exe) => {
+            PseudoNode::Entry(pid, tid, Entry::Exe) => {
                 let g = self.group(*pid)?;
                 if !self.may_read(*pid) {
                     return Some(Err(Errno::EACCES));
                 }
-                let Some(exe) = g.borrow().exe.clone() else {
+                let exe = g.borrow().exe.clone();
+                let Some(exe) = exe.filter(|_| self.task(*pid, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
                 let (m, ino) = exe.node?;
@@ -1656,7 +1665,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         PseudoNode::Entry(pid, None, Entry::Task) => {
             2 + ps
                 .group(*pid)
-                .map_or(0, |g| g.borrow().threads.len() as u32)
+                .map_or(0, |g| thread_count(&g.borrow()) as u32)
         }
         _ if kind == mode::S_IFDIR => 2,
         _ => 1,
@@ -1872,8 +1881,14 @@ pub(crate) fn readdir(
         }
         Entry(pid, None, self::Entry::Task) => {
             if let Some(g) = ps.group(*pid) {
-                let threads = g.borrow().threads.clone();
-                nodes.extend(threads.into_iter().map(|t| Pid(*pid, Some(t))));
+                let g = g.borrow();
+                let zombie = g.leader_exit.is_some().then_some(g.tgid);
+                nodes.extend(
+                    zombie
+                        .into_iter()
+                        .chain(g.threads.iter().copied())
+                        .map(|t| Pid(*pid, Some(t))),
+                );
             }
         }
         _ => return Err(Errno::ENOTDIR),
@@ -2252,7 +2267,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     let (vsize, rss) = mem_of(task.as_deref());
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
-                self::Entry::Comm => format!("{}\n", comm_str(task.as_deref(), *pid)),
+                self::Entry::Comm => {
+                    let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
+                    format!("{}\n", comm_of(&g.borrow(), task.as_deref(), *pid, *tid))
+                }
                 // The thread's child processes not yet reaped, each followed by a space, with no
                 // newline (Linux's children_seq_show)
                 self::Entry::Children => {
@@ -2372,11 +2390,13 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
     let g = g.borrow();
     let task = ps.task(pid, tid);
     let nice = task.as_ref().map_or(0, |t| t.nice.get());
-    let (state, _) = state_of(ps, &g, tid);
+    let (state, _) = state_of(ps, &g, pid, tid);
     let (tty_nr, tpgid) = ctty_info(ns, &g);
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
-    let cpu = match (tid, &task) {
-        (Some(_), Some(t)) => t.cpu(),
+    let cpu = match (tid, &task, g.leader_exit) {
+        (Some(_), Some(t), _) => t.cpu(),
+        // The exited main thread's own time
+        (Some(t), None, Some((_, cpu))) if t == g.tgid => cpu,
         _ => g.cpu(ps.k),
     };
     let (vsize, rss) = mem_of(task.as_deref());
@@ -2394,7 +2414,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
         s,
         "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {} 18446744073709551615",
         v(tid.unwrap_or(pid)),
-        comm_str(task.as_deref(), pid),
+        comm_of(&g, task.as_deref(), pid, tid),
         state,
         v(g.ppid),
         v(g.pgid),
@@ -2407,7 +2427,7 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
         ticks(g.child_cpu.sys_ns),
         20 + nice,
         nice,
-        g.threads.len().max(1),
+        thread_count(&g).max(1),
         ps.with_boot_offset(g.start_ticks * (1_000_000_000 / HZ)) / (1_000_000_000 / HZ),
         vsize,
         rss,
@@ -2439,7 +2459,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
-    let (state, state_name) = state_of(ps, &g, tid);
+    let (state, state_name) = state_of(ps, &g, pid, tid);
     let (vsize, rss) = mem_of(task.as_deref());
     let (sigign, sigcgt) = sig_dispositions(&g);
     let (umask, fdsize) = task.as_ref().map_or((0o022, 0), |t| {
@@ -2451,7 +2471,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         .as_ref()
         .map_or((0, 0), |t| (t.pending.borrow().set(), t.sigmask.get()));
     let mut s = String::new();
-    let comm = comm_str(task.as_deref(), pid);
+    let comm = comm_of(&g, task.as_deref(), pid, tid);
     writeln!(s, "Name:\t{comm}").unwrap();
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
@@ -2526,7 +2546,7 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
         writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
-    writeln!(s, "Threads:\t{}", g.threads.len().max(1)).unwrap();
+    writeln!(s, "Threads:\t{}", thread_count(&g).max(1)).unwrap();
     let limit = g.rlimits[crate::process::RLIMIT_SIGPENDING as usize].0;
     writeln!(s, "SigQ:\t{}/{limit}", crate::signal::queued(ps.k, &g)).unwrap();
     writeln!(
@@ -2573,12 +2593,14 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
 
 /// The process state letter and name: Z zombie, t in a ptrace-stop, T stopped, S waiting in the
 /// kernel, and R otherwise (running guest code or handling a syscall).
-fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static str) {
-    if g.zombie.is_some() {
+fn state_of(ps: &View<'_>, g: &ThreadGroup, pid: Tid, tid: Option<Tid>) -> (char, &'static str) {
+    // The whole process, or its main thread once that has exited (Linux keeps it as a zombie
+    // task, and the process directory shows it)
+    if g.zombie.is_some() || (tid.unwrap_or(pid) == g.tgid && g.leader_exit.is_some()) {
         return ('Z', "zombie");
     }
     // Stopped in a ptrace-stop (also under PTRACE_LISTEN, as on Linux)
-    if let Some(t) = ps.task(g.tgid, tid)
+    if let Some(t) = ps.task(pid, tid)
         && t.trace.borrow().stop.is_some()
     {
         return ('t', "tracing stop");
@@ -2586,14 +2608,31 @@ fn state_of(ps: &View<'_>, g: &ThreadGroup, tid: Option<Tid>) -> (char, &'static
     if g.stopped {
         return ('T', "stopped");
     }
-    // As on Linux, the process's state is the main thread's (the representative thread's once
-    // the main thread has exited): waiting in the kernel is S, and everything else (running
-    // guest code, handling a syscall, just created and not yet run, woken but not yet running)
-    // is R
-    if ps.task(g.tgid, tid).is_some_and(|t| t.asleep()) {
+    // As on Linux, the state is the thread's (the main thread's for the process directory):
+    // waiting in the kernel is S, and everything else (running guest code, handling a syscall,
+    // just created and not yet run, woken but not yet running) is R
+    if ps.task(pid, tid).is_some_and(|t| t.asleep()) {
         ('S', "sleeping")
     } else {
         ('R', "running")
+    }
+}
+
+/// The threads of a process, counting an exited main thread until the process is reaped (Linux's
+/// `nr_threads`).
+fn thread_count(g: &ThreadGroup) -> usize {
+    g.threads.len() + usize::from(g.leader_exit.is_some())
+}
+
+/// The name of the thread viewed (the main thread for the process directory): an exited main
+/// thread keeps its name, as Linux's zombie task does.
+fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> String {
+    match (task, g.leader_exit) {
+        (None, Some((comm, _))) if tid.unwrap_or(pid) == g.tgid => {
+            let n = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+            String::from_utf8_lossy(&comm[..n]).into_owned()
+        }
+        _ => comm_str(task, pid),
     }
 }
 

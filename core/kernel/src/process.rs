@@ -320,6 +320,11 @@ pub(crate) struct ThreadGroup {
     pub leader_status: ExitStatus,
     /// How it ended, once all threads have exited and it waits for the parent to reap it.
     pub zombie: Option<ExitStatus>,
+    /// The main thread has exited (while other threads run on, or with the whole process): its
+    /// name and own CPU time, so that procfs shows it as a zombie thread until the process is
+    /// reaped, as Linux keeps the leader as a zombie task. None while it runs, after a non-main
+    /// thread's execve took its place, and for the virtual init, which never had one.
+    pub leader_exit: Option<([u8; 16], CpuTime)>,
     /// The signal sent to the parent on exit (the low 8 bits of clone, usually SIGCHLD), 0 meaning
     /// none.
     pub exit_signal: i32,
@@ -431,6 +436,7 @@ impl ThreadGroup {
             exiting: None,
             leader_status: ExitStatus::Exited(0),
             zombie: None,
+            leader_exit: None,
             exit_signal: Signal::CHLD.number(),
             ctty: None,
             tty_old_pgrp: None,

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread)
 
 ## Responsibilities
 
@@ -165,7 +165,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   (its CPU time and max RSS added to the waiter's children totals), then stop and continue reports,
   then tracees; nothing matching is `ECHILD`; otherwise the waiter blocks on `CHILD` and restarts
   if interrupted.
-- An exited leader keeps its tgid registered until the group is reaped.
+- An exited leader keeps its tgid registered until the group is reaped. Its task leaves the task
+  table like any thread, but the group records its name and own CPU time (`leader_exit`, cleared
+  when a non-main thread's execve takes the tgid), and procfs shows it as a zombie thread until
+  the group is reaped, as Linux keeps the leader as a zombie task.
 
 ### execve
 
@@ -282,8 +285,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `/proc/<pid>/stat` shows S while a thread waits and R once its event is signalled, before it
   re-takes the BKL (like `try_to_wake_up`). A thread woken by host-fd readiness or a timeout reads S
   until it re-takes the BKL; fast-path sleeps read R as soon as they return; a thread in
-  `Cx::unlocked` reads S only while its event is unsignalled. The process line uses the thread whose
-  tid is the pid if it is still alive, else the first remaining thread; group zombie (Z), that
+  `Cx::unlocked` reads S only while its event is unsignalled. The process line uses the main
+  thread, Z once it has exited (even while other threads run, as on Linux); group zombie (Z), the
   thread's ptrace stop (t) and group stop (T) take precedence.
 - Pipes wake like Linux: a write wakes readers only if the pipe was empty; a read wakes writers only
   when enough space for the writer's request appears or `PIPE_BUF` is crossed.
@@ -472,10 +475,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **`kcmp(KCMP_IO)` always compares equal:** threads have an I/O context (`Task::ioprio`, shared
   under `CLONE_IO`), but kcmp does not compare it, so two threads with different contexts compare
   as the same, unlike Linux.
-- **An exited group leader is dropped at once:** thread exit removes the leader from the task table
-  and the group's thread list like any other thread, while Linux 6.1 keeps it as a zombie task
-  until the whole group exits, so per-thread views lose it early (see the matching
-  `kernel/procfs` item).
 - **The ELF loader disagrees with Linux on unusual program headers:** an executable with no
   `PT_LOAD` segment, or whose program header table lies outside every loaded segment and has no
   `PT_PHDR`, fails execve with `ENOEXEC`, where Linux 6.1 execs it (with `AT_PHDR` 0) and the new

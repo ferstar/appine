@@ -864,6 +864,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         let cpu = task.cpu_self();
         k.cpu += cpu;
         group.borrow_mut().cpu += cpu;
+        // The main thread: procfs goes on showing it as a zombie thread (ThreadGroup::leader_exit)
+        if tid == tgid {
+            group.borrow_mut().leader_exit = Some((task.comm.get(), cpu));
+        }
         let mut st = task.state.borrow_mut();
         // The process's last thread: sample the peak resident memory once before exiting
         if group.borrow().threads.len() == 1 {

@@ -1,7 +1,8 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
-# recorded sysctls; process signals taken by another thread; blocking connect
+# recorded sysctls; process signals taken by another thread; blocking connect; an exited main
+# thread
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -780,3 +781,122 @@ int main(void)
 C
 gcc -O1 -o connwait connwait.c && ./connwait
 rm -f connwait connwait.c
+
+# The main thread exits while another runs on (pthread_exit): it stays as a zombie thread until the
+# process is reaped, so task/ still lists it with state Z and its name, the process directory shows
+# it (Z, both threads counted, an empty cmdline and fd/, no cwd or exe)
+cat > leaderzombie.c <<'C'
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static pid_t pid;
+
+static char *slurp(const char *path, int *n)
+{
+    static char buf[4096];
+    int fd = open(path, O_RDONLY);
+    *n = -1;
+    if (fd < 0)
+        return NULL;
+    *n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    buf[*n > 0 ? *n : 0] = 0;
+    return buf;
+}
+
+/* The state letter and the thread count of a stat file */
+static void stat_of(const char *what, const char *path)
+{
+    int n;
+    char *s = slurp(path, &n);
+    if (!s) {
+        printf("%s: %s\n", what, strerror(errno));
+        return;
+    }
+    char *p = strrchr(s, ')');
+    char state;
+    long threads = 0;
+    sscanf(p + 2, "%c", &state);
+    /* field 20 is num_threads: the 18th space after the ')' precedes it */
+    for (int i = 0; i < 18 && p; i++)
+        p = strchr(p + 1, ' ');
+    if (p)
+        threads = strtol(p + 1, NULL, 10);
+    char comm[32] = "";
+    sscanf(strchr(s, '(') + 1, "%31[^)]", comm);
+    printf("%s: state %c, name %s, threads %ld\n", what, state, comm, threads);
+}
+
+static void *other(void *arg)
+{
+    (void)arg;
+    usleep(200000);
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/%d/task", pid);
+    DIR *d = opendir(path);
+    struct dirent *e;
+    int mine = 0, main_ = 0, others = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        long t = strtol(e->d_name, NULL, 10);
+        if (t == pid)
+            main_++;
+        else if (t == syscall(SYS_gettid))
+            mine++;
+        else
+            others++;
+    }
+    closedir(d);
+    printf("task/ lists the main thread %d, this thread %d, others %d\n", main_, mine, others);
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", pid, pid);
+    stat_of("task/<main>/stat", path);
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    stat_of("process stat", path);
+    int n;
+    snprintf(path, sizeof path, "/proc/%d/status", pid);
+    char *s = slurp(path, &n);
+    char *st = strstr(s, "State:"), *th = strstr(s, "Threads:");
+    sscanf(st, "%255[^\n]", line);
+    printf("status %s", line);
+    sscanf(th, "%255[^\n]", line);
+    printf(", %s\n", line);
+    snprintf(path, sizeof path, "/proc/%d/cmdline", pid);
+    slurp(path, &n);
+    printf("cmdline: %d bytes\n", n);
+    snprintf(path, sizeof path, "/proc/%d/fd", pid);
+    d = opendir(path);
+    int fds = 0;
+    while (d && (e = readdir(d)))
+        fds += e->d_name[0] != '.';
+    if (d)
+        closedir(d);
+    printf("fd/: %d entries\n", fds);
+    snprintf(path, sizeof path, "/proc/%d/exe", pid);
+    printf("exe: %s\n", readlink(path, line, sizeof line) < 0 ? strerror(errno) : "a link");
+    snprintf(path, sizeof path, "/proc/%d/cwd", pid);
+    printf("cwd: %s\n", readlink(path, line, sizeof line) < 0 ? strerror(errno) : "a link");
+    fflush(stdout);
+    exit(0);
+}
+
+int main(void)
+{
+    pid = getpid();
+    prctl(PR_SET_NAME, "zmain");
+    pthread_t t;
+    pthread_create(&t, NULL, other, NULL);
+    pthread_exit(NULL);
+}
+C
+gcc -O1 -pthread -o leaderzombie leaderzombie.c && ./leaderzombie
+rm -f leaderzombie leaderzombie.c
