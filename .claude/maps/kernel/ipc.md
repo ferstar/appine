@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock)
 
 ## Responsibilities
 
@@ -196,7 +196,8 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   (`SIGEV_NONE`).
 - mq_timedreceive: the buffer must hold `msgsize`; the front message is taken; an empty queue is
   `EAGAIN`, `ETIMEDOUT` or `EINTR`, else the receiver waits, counted in `receivers`. Timeouts are
-  absolute `CLOCK_REALTIME`, converted once to a host deadline.
+  absolute `CLOCK_REALTIME` (`itimer::Expiry` on the realtime base), so they move with the host's
+  wall clock.
 - Senders, receivers and poll/epoll wait on the queue object; both directions wake it.
 - mq_notify validates the sigevent before the fd; NULL cancels the caller's own registration;
   `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. While the registrant's process is

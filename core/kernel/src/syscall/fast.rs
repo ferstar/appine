@@ -39,7 +39,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use appine_engine::{Cpu, PAGE_SIZE, prot};
 
@@ -50,6 +50,7 @@ use super::fs::{
 use super::{PATH_MAX, SysResult};
 use crate::errno::Errno;
 use crate::futex::{Enqueued, Key};
+use crate::itimer::Expiry;
 use crate::kernel::{Shared, Tid};
 use crate::task::{Task, TaskState};
 use crate::vfs::store::{Ino, Stat};
@@ -318,7 +319,7 @@ fn futex(
         addr => {
             let t = read_timespec(cpu, addr)?;
             Some(if cmd == FUTEX_WAIT {
-                Instant::now() + t
+                Expiry::after(t)
             } else {
                 let (clock, offset) = if op & FUTEX_CLOCK_REALTIME != 0 {
                     (CLOCK_REALTIME, 0)
@@ -326,7 +327,7 @@ fn futex(
                     (CLOCK_MONOTONIC, monotonic)
                 };
                 let t = super::misc::to_host_clock(offset, t);
-                super::misc::deadline_from_clock(clock, t).ok()?
+                Expiry::new(clock, t, true).ok()?
             })
         }
     };
@@ -359,7 +360,7 @@ fn futex(
 }
 
 fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> Option<SysResult> {
-    let deadline = Instant::now() + read_timespec(cpu, req)?;
+    let deadline = Expiry::after(read_timespec(cpu, req)?);
     sleep_until(task, deadline, true)
 }
 
@@ -379,19 +380,19 @@ fn clock_nanosleep(
     }
     let t = read_timespec(cpu, req)?;
     if flags & TIMER_ABSTIME == 0 {
-        return sleep_until(task, Instant::now() + t, true);
+        return sleep_until(task, Expiry::new(clock, t, false).ok()?, true);
     }
     // An absolute time: the BKL path converts the same arguments again, which simply goes on
     // sleeping
     let t = super::misc::to_host_clock(offset, t);
-    let deadline = super::misc::deadline_from_clock(clock, t).ok()?;
+    let deadline = Expiry::new(clock, t, true).ok()?;
     sleep_until(task, deadline, false)
 }
 
 /// Sleeps until `deadline`. When woken (most likely by a signal) the BKL path goes on sleeping;
 /// with `relative` the deadline is recorded in [`TaskState::fast_sleep`]: the BKL path does not
 /// recompute it from now, and also uses it for the time remaining when interrupted by a signal.
-fn sleep_until(task: &Task, deadline: Instant, relative: bool) -> Option<SysResult> {
+fn sleep_until(task: &Task, deadline: Expiry, relative: bool) -> Option<SysResult> {
     if !sleep(task, Some(deadline)) {
         return Some(Ok(0));
     }
@@ -405,16 +406,16 @@ fn sleep_until(task: &Task, deadline: Instant, relative: bool) -> Option<SysResu
 /// signalled (futex wake, signal, being ended). While sleeping it does not count as running guest
 /// code: a thread that unmaps memory need not wait for it (Mm::sync), and it is marked again on
 /// returning to the run loop. Returns true when the event was signalled (or a host signal
-/// interrupted the wait).
-fn sleep(task: &Task, deadline: Option<Instant>) -> bool {
+/// interrupted the wait); a jump of the deadline's clock signals it too ([`crate::itimer::clock_jumped`]),
+/// and the locked path then looks at the deadline again.
+fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
     const POLLIN: i16 = 1;
     task.sync.in_guest.store(false, Ordering::SeqCst);
     task.sleeping.store(true, Ordering::Relaxed);
     let woke = loop {
-        let now = Instant::now();
         let timeout = match deadline {
-            Some(d) if now >= d => break false,
-            Some(d) => Some(d - now),
+            Some(d) if d.passed() => break false,
+            Some(d) => Some(d.remaining()),
             None => None,
         };
         let mut fds = [(task.event.fd(), POLLIN, 0)];

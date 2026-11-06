@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use super::misc::deadline_in_ns;
+use super::misc::expiry_in_ns;
 use super::{SysResult, get, put};
 use crate::errno::Errno;
-use crate::itimer::{Clock, PosixTimer};
+use crate::itimer::{Clock, Expiry, PosixTimer};
 use crate::kernel::Cx;
 use crate::process::Signal;
 
@@ -151,8 +151,9 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
     if value.is_zero() {
         t.deadline = None;
     } else {
-        let at = match (t.clock, abs) {
-            (Clock::Wall(clock), true) => Some(deadline_in_ns(cx, clock, value)?),
+        let at = match t.clock {
+            Clock::Wall(clock) if abs => Some(expiry_in_ns(cx, clock, value)?),
+            Clock::Wall(clock) => Some(Expiry::new(clock, value, false)?),
             _ => None,
         };
         t.arm(cx.kr(), value, at, abs);

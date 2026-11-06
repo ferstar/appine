@@ -188,7 +188,7 @@ pub(crate) struct TaskState {
     /// that was woken before sleeping long enough and handed over to the locked path. The locked
     /// path goes on sleeping until it, and when interrupted by a signal also computes what remains
     /// from it.
-    pub fast_sleep: Option<std::time::Instant>,
+    pub fast_sleep: Option<crate::itimer::Expiry>,
 }
 
 impl Task {

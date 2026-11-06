@@ -14,11 +14,17 @@
 //! - `RLIMIT_CPU`: when CPU time exceeds the soft limit, SIGXCPU is sent and the soft limit is
 //!   pushed back by one second (as on Linux, so once a second afterwards); exceeding the hard limit
 //!   sends SIGKILL. Checked every 10 ms, like the CPU-time timers.
-//! - POSIX timers count by the wall clock (the host's monotonic clock) or by process or thread CPU
-//!   time, and send an `SI_TIMER` signal on expiry (to the given thread with `SIGEV_THREAD_ID`).
-//!   While the previous signal has not been taken yet no new one is sent; only the overrun count
-//!   is recorded in that pending signal.
+//! - POSIX timers count by a wall clock ([`Expiry`]) or by process or thread CPU time, and send an
+//!   `SI_TIMER` signal on expiry (to the given thread with `SIGEV_THREAD_ID`). While the previous
+//!   signal has not been taken yet no new one is sent; only the overrun count is recorded in that
+//!   pending signal.
+//!
+//! Wall-clock deadlines ([`Expiry`]) sit on the base Linux keeps their hrtimer on: the monotonic
+//! clock, or the realtime or boottime clock, which jump against it when the host's wall clock is
+//! set and run on while the device sleeps. The timer thread watches the host for those jumps and
+//! then wakes every thread ([`clock_jumped`]), and every wait looks at its deadline again.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bug::Trap;
@@ -26,6 +32,132 @@ use crate::cell::RefCell;
 use crate::kernel::{Kernel, Tid};
 use crate::process::{RLIMIT_CPU, Signal, ThreadGroup};
 use crate::signal::{self, InfoFields, Pending, SigInfo, code};
+
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_BOOTTIME: i32 = 7;
+const CLOCK_REALTIME_ALARM: i32 = 8;
+const CLOCK_BOOTTIME_ALARM: i32 = 9;
+const CLOCK_TAI: i32 = 11;
+
+/// When a wall-clock wait or timer expires, on the base Linux keeps its hrtimer on
+/// (`__hrtimer_init`, `clockid_to_hrtimer_base`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    /// An instant of the host's monotonic clock: `CLOCK_MONOTONIC`, and relative `CLOCK_REALTIME`
+    /// times, which Linux moves to the monotonic base.
+    Mono(Instant),
+    /// A time on a host clock that can jump against the monotonic one: `CLOCK_REALTIME` (absolute
+    /// times), `CLOCK_BOOTTIME` (which goes on counting while the device sleeps) and `CLOCK_TAI`.
+    /// It is compared with that clock whenever it is looked at.
+    On(i32, Duration),
+}
+
+impl Expiry {
+    /// `d` from now on the monotonic clock.
+    pub fn after(d: Duration) -> Expiry {
+        Expiry::Mono(Instant::now() + d)
+    }
+
+    /// A timer or sleep on host clock `clock` (already out of any time namespace) for `value`,
+    /// absolute or relative to now. Alarm clocks count as their ordinary counterparts (nothing
+    /// wakes the device here).
+    pub fn new(clock: i32, value: Duration, abs: bool) -> Result<Expiry, crate::errno::Errno> {
+        let base = match clock {
+            CLOCK_REALTIME | CLOCK_REALTIME_ALARM if abs => CLOCK_REALTIME,
+            CLOCK_REALTIME | CLOCK_REALTIME_ALARM => return Ok(Expiry::after(value)),
+            CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => CLOCK_BOOTTIME,
+            CLOCK_TAI => CLOCK_TAI,
+            _ if !abs => return Ok(Expiry::after(value)),
+            // CLOCK_MONOTONIC and anything else counting with it
+            c => {
+                let now = clock_now(c).ok_or(crate::errno::Errno::EINVAL)?;
+                return Ok(Expiry::Mono(shift(Instant::now(), value, now)));
+            }
+        };
+        let now = clock_now(base).ok_or(crate::errno::Errno::EINVAL)?;
+        Ok(Expiry::On(base, if abs { value } else { now + value }))
+    }
+
+    /// The instant of the monotonic clock it falls on as the clocks stand now: what a wait uses as
+    /// its timeout. A time already past becomes an instant in the past.
+    pub fn instant(self) -> Instant {
+        match self {
+            Expiry::Mono(i) => i,
+            Expiry::On(clock, at) => match clock_now(clock) {
+                Some(now) => shift(Instant::now(), at, now),
+                None => Instant::now(),
+            },
+        }
+    }
+
+    /// How far it has passed; None while it is still ahead.
+    pub fn late(self) -> Option<Duration> {
+        match self {
+            Expiry::Mono(i) => Instant::now().checked_duration_since(i),
+            Expiry::On(clock, at) => clock_now(clock).and_then(|now| now.checked_sub(at)),
+        }
+    }
+
+    /// Whether it has passed.
+    pub fn passed(self) -> bool {
+        self.late().is_some()
+    }
+
+    /// How long until it; 0 once passed.
+    pub fn remaining(self) -> Duration {
+        match self {
+            Expiry::Mono(i) => i.saturating_duration_since(Instant::now()),
+            Expiry::On(clock, at) => {
+                clock_now(clock).map_or(Duration::ZERO, |now| at.saturating_sub(now))
+            }
+        }
+    }
+
+    /// `d` later, on the same base.
+    pub fn add(self, d: Duration) -> Expiry {
+        match self {
+            Expiry::Mono(i) => Expiry::Mono(i + d),
+            Expiry::On(clock, at) => Expiry::On(clock, at + d),
+        }
+    }
+}
+
+/// The current time of host clock `clock`.
+fn clock_now(clock: i32) -> Option<Duration> {
+    let (sec, nsec) = appine_hal::clock_gettime(clock).ok()?;
+    Some(Duration::new(sec.max(0) as u64, nsec as u32))
+}
+
+/// The instant `at` falls on when the clock reads `now` at instant `base`; a time too early for an
+/// instant to represent becomes `base`.
+fn shift(base: Instant, at: Duration, now: Duration) -> Instant {
+    match at.checked_sub(now) {
+        Some(ahead) => base + ahead,
+        None => base.checked_sub(now - at).unwrap_or(base),
+    }
+}
+
+/// Counts the jumps of the host's wall clock seen so far ([`clock_jumped`]); `TFD_TIMER_CANCEL_ON_SET`
+/// timerfds compare it with the count when they were set. One count for the whole host process:
+/// a jump is the same for every kernel in it.
+static CLOCK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The number of wall-clock jumps seen so far.
+pub(crate) fn clock_epoch() -> u64 {
+    CLOCK_EPOCH.load(Ordering::SeqCst)
+}
+
+/// The host's wall clock was set, or the device resumed from sleep (the timer thread's
+/// [`appine_hal::ClockWatch`] saw it): the realtime and boottime clocks have jumped against the
+/// monotonic one. Every waiting thread is woken so that it turns its deadline into an instant
+/// again ([`Expiry::instant`]), including futex waiters and sleepers without the BKL, which wait
+/// on nothing but their own event; `TFD_TIMER_CANCEL_ON_SET` timerfds now read `ECANCELED`.
+pub(crate) fn clock_jumped(k: &Kernel) {
+    CLOCK_EPOCH.fetch_add(1, Ordering::SeqCst);
+    for t in k.tasks.values() {
+        t.event.signal();
+    }
+}
 
 /// A process's `ITIMER_REAL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,9 +213,8 @@ const CPU_TICK: Duration = Duration::from_millis(10);
 /// What a POSIX timer counts by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Clock {
-    /// The wall clock (`CLOCK_REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`), counted by the host's
-    /// monotonic clock, with deadlines as [`Deadline::At`]. Carries the matching host clock id,
-    /// used to convert absolute times when setting.
+    /// A wall clock (`CLOCK_REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`), with deadlines as
+    /// [`Deadline::At`] on the clock's base ([`Expiry`]). Carries the matching host clock id.
     Wall(i32),
     /// CPU time used by the process, with deadlines as [`Deadline::Cpu`].
     Process(Tid),
@@ -94,7 +225,7 @@ pub(crate) enum Clock {
 /// A POSIX timer's next expiry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Deadline {
-    At(Instant),
+    At(Expiry),
     /// CPU nanoseconds.
     Cpu(u64),
 }
@@ -118,18 +249,18 @@ impl PosixTimer {
     /// How long until the next expiry; None when not armed.
     pub fn remaining(&self, k: &Kernel) -> Option<Duration> {
         match self.deadline? {
-            Deadline::At(d) => Some(d.saturating_duration_since(Instant::now())),
+            Deadline::At(d) => Some(d.remaining()),
             Deadline::Cpu(d) => Some(Duration::from_nanos(
                 d.saturating_sub(self.cpu_now(k).unwrap_or(0)),
             )),
         }
     }
 
-    /// Expires `value` from now (with `abs`, `value` is an absolute CPU-clock value; for the wall
-    /// clock the caller converts absolute times into `at`).
-    pub fn arm(&mut self, k: &Kernel, value: Duration, at: Option<Instant>, abs: bool) {
+    /// Expires `value` from now (with `abs`, `value` is an absolute CPU-clock value; for a wall
+    /// clock the caller gives the expiry as `at`).
+    pub fn arm(&mut self, k: &Kernel, value: Duration, at: Option<Expiry>, abs: bool) {
         self.deadline = match self.cpu_now(k) {
-            None => Some(Deadline::At(at.unwrap_or_else(|| Instant::now() + value))),
+            None => Some(Deadline::At(at.unwrap_or_else(|| Expiry::after(value)))),
             Some(now) => {
                 let v = value.as_nanos() as u64;
                 Some(Deadline::Cpu(if abs { v } else { now + v }))
@@ -139,9 +270,9 @@ impl PosixTimer {
 
     /// If expired, returns the number of missed periods (not counting this one, capped at INT_MAX
     /// as on Linux) and re-arms.
-    fn fire(&mut self, k: &Kernel, now: Instant) -> Option<u32> {
+    fn fire(&mut self, k: &Kernel) -> Option<u32> {
         let (late, deadline) = match (self.deadline?, self.cpu_now(k)) {
-            (Deadline::At(d), _) if d <= now => (now.duration_since(d), Deadline::At(d)),
+            (Deadline::At(d), _) => (d.late()?, Deadline::At(d)),
             (Deadline::Cpu(d), Some(cpu)) if d <= cpu => {
                 (Duration::from_nanos(cpu - d), Deadline::Cpu(d))
             }
@@ -156,13 +287,13 @@ impl PosixTimer {
         let periods = late.as_nanos() / self.interval.as_nanos();
         let step_ns = (self.interval.as_nanos() * (periods + 1)).min(u64::MAX as u128) as u64;
         self.deadline = Some(match deadline {
-            Deadline::At(d) => Deadline::At(d + Duration::from_nanos(step_ns)),
+            Deadline::At(d) => Deadline::At(d.add(Duration::from_nanos(step_ns))),
             Deadline::Cpu(d) => Deadline::Cpu(d.saturating_add(step_ns)),
         });
         Some(periods.min(i32::MAX as u128) as u32)
     }
 
-    /// The clock's current value: None for the wall clock (compare with `Instant::now()` directly).
+    /// The clock's current value: None for a wall clock (the expiry compares itself).
     fn cpu_now(&self, k: &Kernel) -> Option<u64> {
         match self.clock {
             Clock::Wall(_) => None,
@@ -249,7 +380,7 @@ fn expire_group(
     let mut timers = std::mem::take(&mut g.posix_timers);
     drop(g);
     for (&id, t) in timers.iter_mut() {
-        if let Some(missed) = t.fire(k, now)
+        if let Some(missed) = t.fire(k)
             && let Some((sig, tid)) = t.signal
         {
             let info = SigInfo {
@@ -267,7 +398,10 @@ fn expire_group(
             }
         }
         match t.deadline {
-            Some(Deadline::At(d)) => next = Some(next.map_or(d, |n| n.min(d))),
+            Some(Deadline::At(d)) => {
+                let d = d.instant();
+                next = Some(next.map_or(d, |n| n.min(d)));
+            }
             Some(Deadline::Cpu(_)) => {
                 let tick = now + CPU_TICK;
                 next = Some(next.map_or(tick, |n| n.min(tick)));

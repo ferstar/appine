@@ -1359,6 +1359,70 @@ pub fn clock_gettime(clock: i32) -> Result<(i64, i64), i32> {
     Ok(timespec_pair(&ts))
 }
 
+/// Watches the host's wall clock for jumps against the monotonic clock: a timerfd on
+/// `CLOCK_REALTIME` armed far in the future with `TFD_TIMER_CANCEL_ON_SET`, which Linux cancels
+/// (the fd turns readable and reads `ECANCELED`) whenever the wall clock is set and when the device
+/// resumes from sleep (`timerfd_resume`): the two moments the realtime and boottime clocks jump.
+pub struct ClockWatch {
+    fd: i32,
+}
+
+impl ClockWatch {
+    /// None where timerfds are unavailable (other hosts, or a refusing seccomp policy); jumps then
+    /// go unnoticed.
+    pub fn new() -> Option<ClockWatch> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let fd = unsafe {
+                libc::timerfd_create(libc::CLOCK_REALTIME, libc::O_NONBLOCK | libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                return None;
+            }
+            let watch = ClockWatch { fd };
+            watch.arm().then_some(watch)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        None
+    }
+
+    /// Arms the timer at a time that never comes (2^40 seconds, which the kernel saturates).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn arm(&self) -> bool {
+        const TFD_TIMER_ABSTIME: i32 = 1;
+        const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
+        let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+        spec.it_value.tv_sec = 1 << 40;
+        let flags = TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET;
+        unsafe { libc::timerfd_settime(self.fd, flags, &spec, std::ptr::null_mut()) == 0 }
+    }
+
+    /// The fd to poll for readability.
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// Whether the clock jumped since the last call; the watch is armed again after a jump.
+    pub fn take(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mut buf = [0u8; 8];
+            let r = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if r < 0 && last_errno() == libc::ECANCELED {
+                self.arm();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Drop for ClockWatch {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
 /// The resolution of a host clock: (seconds, nanoseconds).
 pub fn clock_getres(clock: i32) -> Result<(i64, i64), i32> {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };

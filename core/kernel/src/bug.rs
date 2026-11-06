@@ -377,7 +377,10 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 ///    the BKL must have been taken again, otherwise the host process is terminated: an `Rc`
 ///    dropped by the outer frames would change its count at the same time as other threads;
 /// 9. the calling thread's next no-BKL system call (`syscall::fast`) panics;
-/// 10. panic the next time this process waits on a futex, after registering as a waiter.
+/// 10. panic the next time this process waits on a futex, after registering as a waiter;
+/// 11. act as if the host's wall clock had jumped ([`crate::itimer::clock_jumped`]: every waiting
+///     thread is woken, `TFD_TIMER_CANCEL_ON_SET` timerfds are cancelled), which a test cannot
+///     cause by setting the host's clock.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -425,6 +428,7 @@ pub(crate) fn test_hook(
         }
         9 => arm(Trap::Fast, cx.tid()),
         10 => arm(Trap::FutexWait, cx.tgid()),
+        11 => crate::itimer::clock_jumped(cx.kr()),
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)

@@ -804,7 +804,7 @@ impl Waits {
         match (&f.kind, host) {
             (_, Some(fd)) => self.host.push((fd, wanted, 0)),
             (FileKind::TimerFd(t), None) => {
-                if let Some(d) = t.borrow().deadline {
+                if let Some(d) = t.borrow().deadline.map(crate::itimer::Expiry::instant) {
                     self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
                 }
             }
@@ -841,7 +841,7 @@ impl Waits {
             self.signalfd |= matches!(f.kind, FileKind::SignalFd(_));
             match &f.kind {
                 FileKind::TimerFd(t) => {
-                    if let Some(d) = t.borrow().deadline {
+                    if let Some(d) = t.borrow().deadline.map(crate::itimer::Expiry::instant) {
                         self.timer = Some(self.timer.map_or(d, |e| e.min(d)));
                     }
                 }
@@ -1275,7 +1275,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         }
         FileKind::TimerFd(t) => {
             let mut t = t.borrow_mut();
-            t.update(Instant::now());
+            t.update();
             (
                 if t.expirations > 0 {
                     POLLIN | POLLRDNORM
@@ -1420,7 +1420,7 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> 
         }
         FileKind::TimerFd(t) => {
             let mut t = t.borrow_mut();
-            t.update(Instant::now());
+            t.update();
             [t.fired, 0]
         }
         FileKind::Inotify(i) => [i.borrow().queued(), 0],

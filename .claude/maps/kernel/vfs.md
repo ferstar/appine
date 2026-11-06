@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; set-id chown as in 6.2; native AIO; module references; loop devices; readv/writev by file kind)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; unshared fd tables keep POSIX locks; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clock bases)
 
 ## Responsibilities
 
@@ -457,9 +457,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - eventfd: counter or semaphore mode; writing `u64::MAX` is `EINVAL`; overflow blocks; every
   read/write wakes the object (the syscalls live in `kernel/poll`).
-- timerfd: realtime, monotonic, boottime and the alarm clocks; absolute times are converted once
-  at settime; settime resets the expiration count; `TFD_TIMER_CANCEL_ON_SET` is accepted but never
-  yields `ECANCELED`.
+- timerfd: realtime, monotonic, boottime and the alarm clocks; expirations are kept on the clock's
+  base (`itimer::Expiry`: relative realtime and monotonic on the host's monotonic clock, absolute
+  realtime on its realtime clock, boottime on its boottime clock); settime resets the expiration
+  count. `TFD_TIMER_CANCEL_ON_SET` on an absolute realtime timer records the wall-clock jump count:
+  after a jump (the host's clock set, or the device resuming) the timer counts one expiration and
+  the next read is `ECANCELED` (the count dropped, the timer still armed).
 
 ### inotify
 
@@ -651,7 +654,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Fidelity gaps:** statx never reports btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`; no
   `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
   fallocate writes zeros; with tmpfs's size accounting a sparse file can fill an instance: LTP
-  fallocate04, fallocate05, openat02); `TFD_TIMER_CANCEL_ON_SET` never cancels; `RLIMIT_NOFILE`
+  fallocate04, fallocate05, openat02); `RLIMIT_NOFILE`
   set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
   access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
   emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not

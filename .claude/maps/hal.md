@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug; `ClockWatch`)
 
 ## Responsibilities
 
@@ -41,6 +41,10 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `Edges` — a host epoll with `EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET` on one fd; `take()` returns
   read/write edge booleans (several arrivals between calls fold into one); `ENOSYS` on non-Linux.
 - `Watch` — a level-triggered host epoll over many fds (raw ICMP taps), with an errors-only mode.
+- `ClockWatch` — a timerfd on the host's `CLOCK_REALTIME`, armed at 2^40 s with
+  `TFD_TIMER_ABSTIME|TFD_TIMER_CANCEL_ON_SET`; Linux cancels it when the wall clock is set and when
+  the device resumes (`timerfd_resume`); `take()` reads `ECANCELED`, re-arms and reports a jump.
+  None on non-Linux hosts.
 - `RawMode` — `cfmakeraw` guard restoring the terminal on drop.
 - `Received` (recvmsg result: length, raw address ≤ 128 bytes, control bytes, flags), `Interface`
   (name, index, flags, MTU, MAC, addresses with prefix lengths), `Route` (family, destination,
@@ -57,7 +61,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
   `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `lseek`, `copy_file`, `fsync`,
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
-- Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `gettid`, `set_thread_name`,
+- Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
   `clock_getres`, `adjtimex_query`, `RawMode`, `sigwinch_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,

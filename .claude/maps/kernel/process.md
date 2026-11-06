@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: guest timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; the timer thread sends DNS stub answers; root files and module references corrected)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: guest timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines on their clock bases)
 
 ## Responsibilities
 
@@ -68,7 +68,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `loader::Executable`, `ExeCache` (32 opened executables), `Args`, `Prepared` (the hand-off
   between the locked and unlocked exec phases), `Image`; `process::ExeFile` (the process's
   `exe_file`).
-- `itimer::ITimer`, `CpuTimer`, `PosixTimer`; `loadavg::LoadAvg`; `inittab::Entry`, `Power`.
+- `itimer::ITimer`, `CpuTimer`, `PosixTimer`; `itimer::Expiry` — a wall-clock deadline on Linux's
+  hrtimer base: `Mono(Instant)` (monotonic, and relative realtime) or `On(host clock, time)`
+  (absolute realtime and TAI, boottime), compared with that clock whenever looked at; the global
+  wall-clock jump count (`clock_epoch`); `loadavg::LoadAvg`; `inittab::Entry`, `Power`.
 - `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
   `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups;
   held in credentials), `PidNs` (parent, level, owner, global↔local tables, reaper, dead; held per
@@ -255,7 +258,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - A guest thread never blocks in a host syscall: every wait is one host `poll()` on the thread's own
   event (eventfd, or a pipe on other hosts) plus the host fds it waits on, with the deadline as
-  timeout.
+  timeout. Wall-clock deadlines (sleeps, futex and mqueue timeouts, timers) are `Expiry` values
+  turned into an instant at each wait and checked with their own clock, so a wait woken after the
+  realtime or boottime clock jumped (the host's clock set, or the device resuming) waits again
+  for the right time; relative `CLOCK_BOOTTIME` sleeps count the time the device slept.
 - `block_for`: register the waiter (unless its interest is empty), release the BKL, poll, re-take
   the BKL, clear the event, deregister. Host `EINTR` counts as a wake. Callers re-check their
   condition, deadline and interruption.
@@ -299,12 +305,16 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### Timer thread
 
-- One host thread ("timers") loops: take the BKL; expire interval timers, POSIX timers and CPU-time
-  limits; run the OOM check, the translator code-view release, load-average sampling, deferred
+- One host thread ("timers") loops: take the BKL; if its host `ClockWatch` reports a wall-clock
+  jump, run `clock_jumped` (bump the jump count, signal every task's event: BKL waiters, futex
+  waiters and no-BKL sleepers alike look at their deadlines again); expire interval timers, POSIX
+  timers and CPU-time limits; run the OOM check, the translator code-view release, load-average sampling, deferred
   store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks, DNS stub answers (`kernel/net`) and raw
   ICMP taps; then wait (BKL released) until the earliest deadline or its event. It listens on
   `OTHER` (or all channels while `O_ASYNC` files or exclusive gates exist).
 - Setting a timer writes the deadline into the thread group and signals the timer thread's event.
+  POSIX timers on wall clocks keep an `Expiry`, so absolute realtime and boottime timers fire by
+  their own clock; the watch's fd is in the timer thread's poll.
 - `ITIMER_REAL` uses wall time; `ITIMER_VIRTUAL`/`PROF` and process CPU-time timers use host thread
   CPU clocks. Armed CPU timers or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the soft
   `RLIMIT_CPU` sends `SIGXCPU` and raises the soft limit by 1 s; over the hard limit `SIGKILL`.

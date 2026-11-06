@@ -795,8 +795,14 @@ impl Drop for Machine {
 /// which process is at fault, so an error turns that feature off.
 fn timers(shared: Arc<Shared>) {
     let event = shared.timers.clone();
+    // Jumps of the host's wall clock (set, or the device resuming): wall-clock deadlines on the
+    // realtime and boottime bases move, so every waiter must look again
+    let watch = appine_hal::ClockWatch::new();
     let mut k = shared.lock();
     while !k.shutting_down {
+        if watch.as_ref().is_some_and(appine_hal::ClockWatch::take) {
+            crate::itimer::clock_jumped(&k);
+        }
         let mut next = crate::itimer::expire(&k);
         match crate::bug::catch(|| crate::oom::check(&mut k, &shared)) {
             Some(Some(check)) => next = Some(next.map_or(check, |n| n.min(check))),
@@ -864,6 +870,9 @@ fn timers(shared: Arc<Shared>) {
         match crate::bug::catch(|| crate::rawicmp::check_taps(&mut k)) {
             Some(fds) => host.extend(fds),
             None => crate::bug::report(format_args!("kernel panic in the raw ICMP sockets")),
+        }
+        if let Some(w) = &watch {
+            host.push((w.fd(), 1, 0));
         }
         // Setting a timer is not a change on an open file; every change needs watching only while
         // signal-driven I/O or exclusive gates exist

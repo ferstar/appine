@@ -83,6 +83,8 @@ impl Errno {
     pub const EIDRM: Errno = Errno(43);
     /// The file handle is stale.
     pub const ESTALE: Errno = Errno(116);
+    /// Operation canceled (a `TFD_TIMER_CANCEL_ON_SET` timerfd after the wall clock jumped).
+    pub const ECANCELED: Errno = Errno(125);
     /// No such attribute (xattr).
     pub const ENODATA: Errno = Errno(61);
     /// Unimplemented syscall.

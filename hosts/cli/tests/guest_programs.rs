@@ -215,6 +215,39 @@ fn bugs_kill_only_the_guest_process() {
 }
 
 #[test]
+fn clock_jumps_wake_wall_clock_waiters() {
+    // A jump of the host's wall clock (simulated with a test hook of debug builds): timerfds with
+    // TFD_TIMER_CANCEL_ON_SET read ECANCELED, and waits on wall-clock deadlines look at them again
+    // and still end on time
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("clockjump") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .env("APPINE_TEST_HOOKS", "1")
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "tier {tier}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stdout(&out).ends_with("all ok\n"),
+            "tier {tier}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn host_calls_survive_kernel_bugs() {
     // A kernel-layer panic while the host calls a Machine method (simulated by a test hook): only
     // that call fails, a call on a console also hangs up that console, and the Machine stays usable

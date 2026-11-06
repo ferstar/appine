@@ -1,15 +1,17 @@
 //! timerfd: timerfd_create, timerfd_settime, timerfd_gettime, and reads from it.
 //!
-//! Expiration times are recorded on the host's monotonic clock, and reads and poll compute the
-//! number of expirations already passed; waiting threads use the earliest expiration time as
-//! their timeout ([`super::poll`]). Absolute times are converted using the timer's clock when set.
-//! `TFD_TIMER_CANCEL_ON_SET` is accepted but has no effect: the guest cannot change the host's
-//! time.
+//! Expiration times are kept on the clock's base ([`crate::itimer::Expiry`]: relative realtime and
+//! monotonic times on the host's monotonic clock, absolute realtime times on its realtime clock,
+//! boottime on its boottime clock), and reads and poll compute the number of expirations already
+//! passed; waiting threads use the earliest expiration time as their timeout ([`super::poll`]).
+//! `TFD_TIMER_CANCEL_ON_SET` on an absolute realtime timer counts a jump of the host's wall clock
+//! (set, or the device resuming from sleep) as an expiration that reads as `ECANCELED`; the guest
+//! itself cannot set the clock.
 
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::misc::deadline_in_ns;
+use super::misc::expiry_in_ns;
 use super::{SysResult, get, put};
 use crate::cell::RefCell;
 use crate::errno::Errno;
@@ -42,6 +44,7 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
     let t = TimerFd {
         clock,
         deadline: None,
+        cancel: None,
         interval: Duration::ZERO,
         expirations: 0,
         fired: 0,
@@ -77,18 +80,22 @@ pub(super) fn timerfd_settime(
     t.interval = interval;
     t.expirations = 0;
     t.settime_flags = flags;
+    // An alarm clock reads the same as its ordinary counterpart
+    let clock = match t.clock {
+        CLOCK_REALTIME_ALARM => CLOCK_REALTIME,
+        CLOCK_BOOTTIME_ALARM => CLOCK_BOOTTIME,
+        c => c,
+    };
+    let abs = flags & TFD_TIMER_ABSTIME != 0;
+    // timerfd_setup_cancel: only an absolute realtime timer can be cancelled by a clock jump
+    t.cancel = (clock == CLOCK_REALTIME && abs && flags & TFD_TIMER_CANCEL_ON_SET != 0)
+        .then(|| (crate::itimer::clock_epoch(), false));
     t.deadline = if value.is_zero() {
         None
-    } else if flags & TFD_TIMER_ABSTIME != 0 {
-        // An alarm clock reads the same as its ordinary counterpart
-        let clock = match t.clock {
-            CLOCK_REALTIME_ALARM => CLOCK_REALTIME,
-            CLOCK_BOOTTIME_ALARM => CLOCK_BOOTTIME,
-            c => c,
-        };
-        Some(deadline_in_ns(cx, clock, value)?)
+    } else if abs {
+        Some(expiry_in_ns(cx, clock, value)?)
     } else {
-        Some(Instant::now() + value)
+        Some(crate::itimer::Expiry::new(clock, value, false)?)
     };
     // Other threads may be waiting on it with the old expiration time (epoll_wait, read)
     request_wake_object(wake::of(&timer));
@@ -119,7 +126,7 @@ fn timer_of(cx: &Cx<'_>, fd: i32) -> Result<Rc<RefCell<TimerFd>>, Errno> {
 /// `struct itimerspec`: the interval and how long until the next expiration (both 0 when not
 /// armed).
 fn current(t: &mut TimerFd) -> [u8; 32] {
-    let left = t.remaining(Instant::now());
+    let left = t.remaining();
     let mut b = [0u8; 32];
     for (o, d) in [(0, t.interval), (16, left)] {
         b[o..o + 8].copy_from_slice(&(d.as_secs() as i64).to_le_bytes());
@@ -128,7 +135,9 @@ fn current(t: &mut TimerFd) -> [u8; 32] {
     b
 }
 
-/// Reads the number of expirations (8 bytes), waiting if none has happened yet.
+/// Reads the number of expirations (8 bytes), waiting if none has happened yet; after a wall-clock
+/// jump a `TFD_TIMER_CANCEL_ON_SET` timer reads `ECANCELED` once instead (and its count is
+/// dropped).
 pub(super) fn read(
     cx: &mut Cx<'_>,
     timer: &Rc<RefCell<TimerFd>>,
@@ -141,7 +150,11 @@ pub(super) fn read(
     loop {
         let deadline = {
             let mut t = timer.borrow_mut();
-            t.update(Instant::now());
+            t.update();
+            if t.take_cancel() {
+                t.expirations = 0;
+                return Err(Errno::ECANCELED);
+            }
             if t.expirations > 0 {
                 buf[..8].copy_from_slice(&std::mem::take(&mut t.expirations).to_le_bytes());
                 return Ok(8);
@@ -154,6 +167,7 @@ pub(super) fn read(
         if cx.interrupted() {
             return Err(Errno::ERESTARTSYS);
         }
+        let deadline = deadline.map(crate::itimer::Expiry::instant);
         cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(timer)])?;
     }
 }

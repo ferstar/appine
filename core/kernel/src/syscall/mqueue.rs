@@ -15,7 +15,6 @@
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use super::{SysResult, get, put, read_timespec};
 use crate::cell::RefCell;
@@ -473,14 +472,19 @@ pub(super) fn mq_timedsend(
         if flags & oflags::O_NONBLOCK != 0 {
             return Err(Errno::EAGAIN);
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(crate::itimer::Expiry::passed) {
             return Err(Errno::ETIMEDOUT);
         }
         if cx.interrupted() {
             return Err(Errno::EINTR);
         }
         // Taking a message requests a wake for this queue
-        cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)])?;
+        cx.wait_objects(
+            deadline.map(crate::itimer::Expiry::instant),
+            &mut [],
+            wake::FILE,
+            &[wake::of(&q)],
+        )?;
     }
     let notify = {
         let mut q = q.borrow_mut();
@@ -572,7 +576,7 @@ pub(super) fn mq_timedreceive(
         if flags & oflags::O_NONBLOCK != 0 {
             return Err(Errno::EAGAIN);
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(crate::itimer::Expiry::passed) {
             return Err(Errno::ETIMEDOUT);
         }
         if cx.interrupted() {
@@ -580,7 +584,12 @@ pub(super) fn mq_timedreceive(
         }
         q.borrow_mut().receivers += 1;
         // A message arriving requests a wake for this queue
-        let r = cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(&q)]);
+        let r = cx.wait_objects(
+            deadline.map(crate::itimer::Expiry::instant),
+            &mut [],
+            wake::FILE,
+            &[wake::of(&q)],
+        );
         q.borrow_mut().receivers -= 1;
         r?;
     };
@@ -592,13 +601,14 @@ pub(super) fn mq_timedreceive(
     Ok(data.len() as u64)
 }
 
-/// Absolute timeout (`CLOCK_REALTIME`); 0 means wait forever.
-fn deadline(cx: &Cx<'_>, timeout: u64) -> Result<Option<Instant>, Errno> {
+/// Absolute timeout (`CLOCK_REALTIME`, so it moves when the wall clock is set); 0 means wait
+/// forever.
+fn deadline(cx: &Cx<'_>, timeout: u64) -> Result<Option<crate::itimer::Expiry>, Errno> {
     if timeout == 0 {
         return Ok(None);
     }
     let t = read_timespec(cx, timeout)?;
-    super::misc::deadline_from_clock(0, t).map(Some)
+    crate::itimer::Expiry::new(0, t, true).map(Some)
 }
 
 pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {

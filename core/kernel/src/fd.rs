@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::cell::RefCell;
 use crate::errno::Errno;
@@ -390,10 +390,15 @@ impl Pidfd {
 
 /// timerfd state.
 pub struct TimerFd {
-    /// The clock (`CLOCK_REALTIME` and so on): absolute times are converted with it when set.
+    /// The clock (`CLOCK_REALTIME` and so on).
     pub clock: i32,
-    /// The time of the next expiration (host monotonic clock); None means not armed.
-    pub deadline: Option<Instant>,
+    /// The next expiration, on the clock's base; None means not armed.
+    pub deadline: Option<crate::itimer::Expiry>,
+    /// `TFD_TIMER_CANCEL_ON_SET` on an absolute realtime timer (Linux's `might_cancel`): the
+    /// wall-clock jump count when set ([`crate::itimer::clock_epoch`]), and whether a jump since
+    /// has been counted as an expiration and not yet read (`moffs == KTIME_MAX`): the next read is
+    /// then `ECANCELED`.
+    pub cancel: Option<(u64, bool)>,
     /// The interval to rearm with after expiring; 0 means firing only once.
     pub interval: Duration,
     /// Expirations that have happened and not been read yet.
@@ -406,15 +411,15 @@ pub struct TimerFd {
 
 impl TimerFd {
     /// How long until the next expiration, 0 when not armed (timerfd_gettime's `it_value`).
-    pub fn remaining(&mut self, now: Instant) -> Duration {
-        self.update(now);
+    pub fn remaining(&mut self) -> Duration {
+        self.update();
         self.deadline
-            .map_or(Duration::ZERO, |d| d.saturating_duration_since(now))
+            .map_or(Duration::ZERO, crate::itimer::Expiry::remaining)
     }
 
     /// The timerfd-specific lines in `/proc/<pid>/fdinfo`.
     pub fn fdinfo(&mut self) -> String {
-        let left = self.remaining(Instant::now());
+        let left = self.remaining();
         format!(
             "clockid: {}\nticks: {}\nsettime flags: 0{:o}\nit_value: ({}, {})\nit_interval: ({}, {})\n",
             self.clock,
@@ -427,9 +432,19 @@ impl TimerFd {
         )
     }
 
-    /// Adds the expirations before `now` to `expirations`.
-    pub fn update(&mut self, now: Instant) {
-        let Some(d) = self.deadline.filter(|&d| d <= now) else {
+    /// Adds the expirations that have passed to `expirations`, and a wall-clock jump of a
+    /// `TFD_TIMER_CANCEL_ON_SET` timer as one more (`timerfd_clock_was_set`).
+    pub fn update(&mut self) {
+        if let Some((epoch, pending)) = &mut self.cancel {
+            let now = crate::itimer::clock_epoch();
+            if !*pending && *epoch != now {
+                *epoch = now;
+                *pending = true;
+                self.expirations += 1;
+                self.fired += 1;
+            }
+        }
+        let Some((d, late)) = self.deadline.and_then(|d| Some((d, d.late()?))) else {
             return;
         };
         self.fired += 1;
@@ -437,9 +452,21 @@ impl TimerFd {
             self.expirations += 1;
             self.deadline = None;
         } else {
-            let n = ((now - d).as_nanos() / self.interval.as_nanos()) as u64 + 1;
+            let n = (late.as_nanos() / self.interval.as_nanos()) as u64 + 1;
             self.expirations += n;
-            self.deadline = Some(d + self.interval * n as u32);
+            let step = Duration::from_nanos((self.interval.as_nanos() * u128::from(n)) as u64);
+            self.deadline = Some(d.add(step));
+        }
+    }
+
+    /// Takes a pending cancellation (`timerfd_canceled`): true once after a wall-clock jump.
+    pub fn take_cancel(&mut self) -> bool {
+        match &mut self.cancel {
+            Some((_, pending)) if *pending => {
+                *pending = false;
+                true
+            }
+            _ => false,
         }
     }
 }

@@ -6,7 +6,7 @@ use super::{IO_CHUNK, SysResult, get, put, read_timespec, write_pair};
 use crate::cred::{cap, secbit};
 use crate::errno::Errno;
 use crate::futex::{Enqueued, Key};
-use crate::itimer::{CpuTimer, ITimer};
+use crate::itimer::{CpuTimer, Expiry, ITimer};
 use crate::kernel::{Cx, wake};
 use crate::klog;
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
@@ -94,14 +94,14 @@ pub(super) fn futex(
                 addr => {
                     let t = read_timespec(cx, addr)?;
                     Some(if cmd == FUTEX_WAIT {
-                        early.unwrap_or_else(|| Instant::now() + t)
+                        early.unwrap_or_else(|| Expiry::after(t))
                     } else {
                         let clock = if op & FUTEX_CLOCK_REALTIME != 0 {
                             CLOCK_REALTIME
                         } else {
                             CLOCK_MONOTONIC
                         };
-                        deadline_in_ns(cx, clock, t)?
+                        expiry_in_ns(cx, clock, t)?
                     })
                 }
             };
@@ -142,7 +142,7 @@ pub(super) fn futex(
 fn futex_wait(
     cx: &mut Cx<'_>,
     (uaddr, val, bitset): (u64, u32, u32),
-    deadline: Option<Instant>,
+    deadline: Option<Expiry>,
 ) -> SysResult {
     let key = futex_key(cx, uaddr)?;
     let shared = cx.shared;
@@ -162,7 +162,7 @@ fn futex_wait(
             waiting.leave();
             return Ok(0);
         }
-        let err = if deadline.is_some_and(|d| Instant::now() >= d) {
+        let err = if deadline.is_some_and(Expiry::passed) {
             Some(Errno::ETIMEDOUT)
         } else if cx.interrupted() {
             Some(match deadline {
@@ -170,7 +170,7 @@ fn futex_wait(
                 None => Errno::ERESTARTSYS,
             })
         } else {
-            cx.wait_alone(deadline).err()
+            cx.wait_alone(deadline.map(Expiry::instant)).err()
         };
         if let Some(e) = err {
             // It used to be removed only after releasing the futex lock: if a no-BKL wake
@@ -216,7 +216,7 @@ pub(super) fn futex_waitv(
     let deadline = match timeout {
         0 => None,
         _ if clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME => return Err(Errno::EINVAL),
-        addr => Some(deadline_in_ns(cx, clock, read_timespec(cx, addr)?)?),
+        addr => Some(expiry_in_ns(cx, clock, read_timespec(cx, addr)?)?),
     };
     // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 __reserved; }
     let mut keys = Vec::with_capacity(nr as usize);
@@ -256,12 +256,12 @@ pub(super) fn futex_waitv(
         if let Some(i) = woken {
             break Ok(i as u64);
         }
-        let err = if deadline.is_some_and(|d| Instant::now() >= d) {
+        let err = if deadline.is_some_and(Expiry::passed) {
             Some(Errno::ETIMEDOUT)
         } else if cx.interrupted() {
             Some(Errno::ERESTARTSYS)
         } else {
-            cx.wait_alone(deadline).err()
+            cx.wait_alone(deadline.map(Expiry::instant)).err()
         };
         if let Some(e) = err {
             break Err(e);
@@ -286,7 +286,7 @@ fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
     let early = cx.t.fast_sleep.take();
     let t = read_timespec(cx, req)?;
-    sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem)
+    sleep_rest(cx, early.unwrap_or_else(|| Expiry::after(t)), rem)
 }
 
 pub(super) fn clock_nanosleep(
@@ -313,18 +313,24 @@ pub(super) fn clock_nanosleep(
             now + t.as_nanos() as u64
         };
         while cpu_clock(cx, clock).unwrap()? < target {
-            if sleep_until(cx, Instant::now() + Duration::from_millis(10)).is_err() {
+            if sleep_until(cx, Expiry::after(Duration::from_millis(10))).is_err() {
                 return Err(Errno::ERESTARTNOHAND);
             }
         }
         return Ok(0);
     }
+    // A relative sleep counts on the clock's base: CLOCK_BOOTTIME's goes on while the device
+    // sleeps, CLOCK_REALTIME's moves to the monotonic base (Expiry::new)
     if flags & TIMER_ABSTIME == 0 {
         appine_hal::clock_gettime(clock).map_err(Errno)?;
-        return sleep_rest(cx, early.unwrap_or_else(|| Instant::now() + t), rem);
+        let deadline = match early {
+            Some(d) => d,
+            None => Expiry::new(clock, t, false)?,
+        };
+        return sleep_rest(cx, deadline, rem);
     }
     // An absolute time: re-executing with the same arguments simply continues the sleep
-    match sleep_until(cx, deadline_in_ns(cx, clock, t)?) {
+    match sleep_until(cx, expiry_in_ns(cx, clock, t)?) {
         Ok(()) => Ok(0),
         Err(_) => Err(Errno::ERESTARTNOHAND),
     }
@@ -333,7 +339,7 @@ pub(super) fn clock_nanosleep(
 /// Sleeps until `deadline`. When interrupted by a signal, writes the remaining time to `rem` (if
 /// not 0) and records the deadline: when no handler interrupts (for example a stop followed by a
 /// continue), restart_syscall goes on sleeping instead of sleeping the original duration again.
-fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
+fn sleep_rest(cx: &mut Cx<'_>, deadline: Expiry, rem: u64) -> SysResult {
     match sleep_until(cx, deadline) {
         Ok(()) => Ok(0),
         Err(left) => {
@@ -346,15 +352,16 @@ fn sleep_rest(cx: &mut Cx<'_>, deadline: Instant, rem: u64) -> SysResult {
     }
 }
 
-/// Sleeps until `deadline`; returns the remaining time when interrupted by a signal.
-fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
+/// Sleeps until `deadline`; returns the remaining time when interrupted by a signal. Each pass
+/// turns the deadline into an instant again, so a jump of its clock (which wakes every waiter)
+/// moves the wait with it.
+fn sleep_until(cx: &mut Cx<'_>, deadline: Expiry) -> Result<(), Duration> {
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        if deadline.passed() {
             return Ok(());
         }
-        if cx.interrupted() || cx.wait(Some(deadline), &mut []).is_err() {
-            return Err(deadline - now);
+        if cx.interrupted() || cx.wait(Some(deadline.instant()), &mut []).is_err() {
+            return Err(deadline.remaining());
         }
     }
 }
@@ -363,14 +370,14 @@ fn sleep_until(cx: &mut Cx<'_>, deadline: Instant) -> Result<(), Duration> {
 /// `restart_block`).
 pub(crate) enum Restart {
     /// nanosleep, clock_nanosleep: the deadline and the address of `rem`.
-    Sleep { deadline: Instant, rem: u64 },
+    Sleep { deadline: Expiry, rem: u64 },
     /// A futex wait with a timeout (`futex_wait_restart`): goes on waiting with the original
     /// arguments until the original deadline.
     Futex {
         uaddr: u64,
         val: u32,
         bitset: u32,
-        deadline: Instant,
+        deadline: Expiry,
     },
 }
 
@@ -1267,11 +1274,11 @@ pub(super) fn getrandom(cx: &mut Cx<'_>, buf: u64, len: usize, flags: u32) -> Sy
 
 // ---- Time namespace offsets ----
 
-/// Converts the absolute time `abs` on clock `clock` in the time namespace into a wait deadline:
-/// first subtracts the offset (Linux's `timens_ktime_to_host`; times before the offset count as
-/// already past), then computes on the host's clock.
-pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Instant, Errno> {
-    deadline_from_clock(clock, to_host_clock(cx.time_offset(clock), abs))
+/// The expiry of the absolute time `abs` on clock `clock` in the time namespace: first subtracts
+/// the offset (Linux's `timens_ktime_to_host`; times before the offset count as already past),
+/// then puts it on the clock's base ([`Expiry::new`]).
+pub(super) fn expiry_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<Expiry, Errno> {
+    Expiry::new(clock, to_host_clock(cx.time_offset(clock), abs), true)
 }
 
 /// What time `abs`, which includes offset `offset`, is on the host clock: the offset subtracted,
@@ -1279,19 +1286,6 @@ pub(super) fn deadline_in_ns(cx: &Cx<'_>, clock: i32, abs: Duration) -> Result<I
 pub(super) fn to_host_clock(offset: i64, abs: Duration) -> Duration {
     let ns = abs.as_nanos() as i128 - offset as i128;
     Duration::from_nanos(ns.clamp(0, u64::MAX as i128) as u64)
-}
-
-/// Converts an absolute time on `clock` into a wait deadline. A time already past becomes an
-/// instant in the past: periodic timers count missed periods from it. A time too early for the
-/// monotonic clock to represent becomes now.
-pub(super) fn deadline_from_clock(clock: i32, abs: Duration) -> Result<Instant, Errno> {
-    let (sec, nsec) = appine_hal::clock_gettime(clock).map_err(Errno)?;
-    let now = Duration::new(sec.max(0) as u64, nsec as u32);
-    let base = Instant::now();
-    Ok(match abs.checked_sub(now) {
-        Some(ahead) => base + ahead,
-        None => base.checked_sub(now - abs).unwrap_or(base),
-    })
 }
 
 /// A host clock reading (sec, nsec) plus the time namespace offset `offset` (in nanoseconds).
