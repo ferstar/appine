@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs)
 
 ## Responsibilities
 
@@ -135,8 +135,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   fault ends a stream write's data there and fails a message with `EFAULT`.
 - Limits: at most 1 MiB per call, 1024 iovecs (`EMSGSIZE`), 4096 bytes of send control data;
   recvfrom and recvmsg with `MSG_WAITALL` (not `MSG_PEEK`) on an internet stream go on past 1 MiB
-  piece by piece, writing each piece out at its offset until one comes up short;
-  recvmsg sums the guest's iovec lengths before clamping (unchecked); setsockopt values are cut to
+  piece by piece, writing each piece out at its offset until one comes up short; msghdr iovecs are
+  read as Linux's `import_iovec` does (a negative length anywhere `EINVAL`, then an iovec reaching
+  past 2^48 `EFAULT`, the total cut to `MAX_RW_COUNT`); setsockopt values are cut to
   256 bytes (longer ones then fail on the host) and getsockopt asks the host for at most 256.
 - Host sendmsg/recvmsg run under the BKL (nonblocking); only waits release it.
   There is no BKL-free fast path for sockets.
@@ -321,9 +322,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   written, so a bad address pointer returns an error with the fd left open; `EMFILE` is reported
   after the connection was taken from the queue and closed. Accepted inet sockets also lose the
   listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`.
-- **recvmsg iovec lengths are summed unchecked:** two large `iov_len` values overflow the sum (a
-  panic in debug builds, a wrong short read in release); Linux rejects negative lengths with
-  `EINVAL`.
 - **Netlink dumps are not resumable:** address, route and rule dumps are one datagram per family
   and link dumps use 8 KiB chunks; a reader with a smaller buffer gets `MSG_TRUNC` and loses the
   rest (Linux continues the dump on the next recv).

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; bugs from Starnix's tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners and lock ranges)
 
 ## Responsibilities
 
@@ -262,9 +262,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `OpenFile` keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`
   and `O_LARGEFILE` from open (so `F_GETFL` never shows `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given
   at open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
-  when `O_ASYNC` turns on, with no `O_NOATIME` ownership check). `F_SETOWN_EX`/`F_GETOWN_EX`
-  translate pids through the caller's pid namespace (owners are stored as global ids); plain
-  `F_SETOWN`/`F_GETOWN` do not. `F_SETSIG`, pipe size and seals are also handled in fcntl.
+  when `O_ASYNC` turns on, with no `O_NOATIME` ownership check). `F_SETOWN`/`F_GETOWN`,
+  `F_SETOWN_EX`/`F_GETOWN_EX` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` and
+  `FIOGETOWN`/`SIOCGPGRP` translate pids through the caller's pid namespace (owners are stored as
+  global ids; in a child pid namespace a pid unknown there is stored as a number that matches
+  nothing, and an owner no longer in it reads back as 0); `F_SETOWN(INT_MIN)` is `EINVAL`.
+  `F_SETSIG`, pipe size and seals are also handled in fcntl.
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
 
@@ -396,7 +399,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   or when the open file goes.
 - POSIX locks belong to the fd table and are released by any close of the file in that table
   (close, close_range, dup2 replacement, close-on-exec, seccomp addfd); OFD locks belong to the
-  open file; the two kinds share one table and conflict with each other. Ranges split and merge;
+  open file; the two kinds share one table and conflict with each other. Ranges follow
+  `flock64_to_posix_lock`: a start past `OFFSET_MAX` is `EOVERFLOW` and below 0 `EINVAL`; a
+  positive length may end at `OFFSET_MAX` (`EOVERFLOW` past it), 0 means to the end and beyond,
+  and a negative one covers the bytes before the start (`EINVAL` below 0). Ranges split and merge;
   `F_SETLKW` detects deadlocks for POSIX requests only (`EDEADLK`; the wait chain may pass through
   OFD waiters, which Linux excludes) and waits on the lock wake channel. Files without a store
   inode (anonymous pipes, sockets, PTYs, synthetic files, eventfds) silently succeed and
@@ -603,9 +609,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **File position races:** lseek and `O_APPEND` writes change the position without the
   `pos_busy` lock, so a concurrent unlocked read or write on the same open file can overwrite the
   new position (Linux takes `f_pos_lock` in lseek too).
-- **`F_SETOWN`/`F_GETOWN` ignore pid namespaces:** pids are stored and returned untranslated, so
-  inside a nested pid namespace `SIGIO` goes to the wrong process; `F_SETOWN` with `INT_MIN`
-  overflows the negation (a panic in debug builds) instead of `EINVAL`.
 - **`sendfile` to an `O_APPEND` file appends** instead of returning `EINVAL` as Linux's
   `do_splice_direct` does (splice and copy_file_range check this).
 - **umount ignores mappings and executables:** a mount whose files are only mapped, being executed
@@ -701,11 +704,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **open(2) does not validate `O_TMPFILE`:** openat skips the `O_TMPFILE` checks openat2 makes, so
   `O_TMPFILE` with `O_CREAT` is `EISDIR` instead of `EINVAL`, and a read-only `O_TMPFILE` open
   succeeds as a plain open of the directory instead of `EINVAL`.
-- **Lock ranges can overflow:** a negative `l_len` is added before the start is checked, so an
-  `l_start` that already makes the start negative together with a very negative `l_len`
-  (`INT64_MIN` for both) wraps and locks a nonsense range in release builds (a panic in debug
-  builds) instead of `EINVAL`; a range ending exactly at the largest offset is `EOVERFLOW` where
-  Linux accepts it.
 - **`MFD_NOEXEC_SEAL` is accepted but not enforced:** memfd_create takes 6.3's
   `MFD_NOEXEC_SEAL`/`MFD_EXEC` and F_ADD_SEALS takes `F_SEAL_EXEC` (6.1 rejects all three with
   `EINVAL`), but chmod never checks the seal, so a memfd its creator sealed non-executable can be

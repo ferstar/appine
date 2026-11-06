@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations)
 
 ## Responsibilities
 
@@ -46,8 +46,10 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - `Perm` — `ipc_perm`: key, uid/gid, cuid/cgid, mode (permission bits plus `SHM_DEST` and
   `SHM_LOCKED`), seq.
 - `Tunables` — `msgmax`, `msgmnb`, `msgmni`, `sem` (semmsl, semmns, semopm, semmni), `shmmax`,
-  `shmall`, `shmmni`, with Linux's defaults; `limits` holds the fixed `SEMVMX` and `SEMAEM` (32767)
-  and `SHMMIN` (1).
+  `shmall`, `shmmni`, with Linux's defaults; writes take non-negative integers, at most `INT_MAX`
+  for Linux's int sysctls (`msgmax`, `msgmnb`, the `sem` values) and IPCMNI for the `*mni` values,
+  any u64 for `shmmax` and `shmall` (unsigned longs on Linux); `limits` holds the fixed `SEMVMX`
+  and `SEMAEM` (32767) and `SHMMIN` (1).
 - `MsgQueue` / `Msg` — the messages, capacity `qbytes`, `cbytes`, times, last sender and receiver.
 - `SemSet` / `SemOp` — values, last pids, `ncnt`/`zcnt`, times; one `sembuf`.
 - `ShmSeg` — `SharedMemory` host backing, size, times, creator and last pid; the attach count is
@@ -113,7 +115,8 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 
 ### SysV message queues
 
-- msgsnd: size up to `msgmax` (`EINVAL`) and `mtype >= 1`; the text is copied in; the message fits
+- msgsnd: size up to `msgmax` (`EINVAL`) and `mtype >= 1`; the text is copied into a buffer
+  allocated fallibly (`ENOMEM` when the host cannot); the message fits
   when `cbytes + len <= qbytes` and the count is below `qbytes`; otherwise `IPC_NOWAIT` is
   `EAGAIN`, else the caller waits.
 - msgrcv: `mtype` 0 takes the first message, a positive one the first of that type (with
@@ -126,9 +129,10 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 
 ### Semaphores
 
-- semget: nsems at most `semmsl` and nonzero for a new set; an existing set with fewer semaphores
-  is `EINVAL`. `semmns` is only reported (IPC_INFO, SEM_INFO, the sysctl), never enforced.
-- semtimedop: nsops 1 to `semopm` (`E2BIG` above); a semaphore number out of range is `EFBIG`;
+- semget: nsems at most `semmsl` and nonzero for a new set (allocated fallibly, `ENOMEM`); an
+  existing set with fewer semaphores is `EINVAL`. `semmns` is only reported (IPC_INFO, SEM_INFO, the sysctl), never enforced.
+- semtimedop: nsops (an unsigned int, as in Linux's prototype) 1 to `semopm` (`E2BIG` above),
+  read into a fallibly allocated buffer; a semaphore number out of range is `EFBIG`;
   write permission if any op is nonzero, else read. `SemSet::apply` works on copies of the values
   and undo adjustments and commits only if every op succeeds (`ERANGE` above `SEMVMX`, or when an
   adjustment leaves ±`SEMAEM`); a blocking op leaves everything unchanged, and its `ncnt` or `zcnt`
@@ -264,11 +268,6 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
   adjustments of every thread in the process (Linux applies a shared undo list only when its last
   sharer leaves, and threads share one only with `CLONE_SYSVSEM`).
-- **Huge IPC sysctls let syscalls make huge host allocations:** `msgmax`, `msgmnb`, `shmmax`,
-  `shmall` and the `sem` values (except semmni) accept any u64, and msgsnd allocates `size` bytes
-  and semtimedop `nsops * 6` (unchecked) before anything else, so after a privileged writer raises
-  them any process in that namespace can abort the app with one call (Linux bounds them to the int
-  range). Writing them needs kernel uid 0, or `CAP_DAC_OVERRIDE` where uid and gid 0 are mapped.
 - **`/proc/sysvipc` leaks global pids:** the listings print stored global pids without translating
   them into the reader's pid namespace (the `*_STAT` syscalls do translate), and the shm listing
   masks the mode with `0o1777`, hiding `SHM_LOCKED`.

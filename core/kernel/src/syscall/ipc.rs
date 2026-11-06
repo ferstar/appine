@@ -87,7 +87,7 @@ pub(super) fn msgsnd(cx: &mut Cx<'_>, id: i32, msgp: u64, size: u64, flags: i32)
     if mtype < 1 {
         return Err(Errno::EINVAL);
     }
-    let mut text = vec![0u8; len];
+    let mut text = crate::ipc::zeroed(len)?;
     cx.mm().read(UserSlice::new(msgp + 8, len), &mut text)?;
     let cred = cx.cred();
     let tgid = cx.tgid();
@@ -280,7 +280,7 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
                 if n == 0 {
                     Err(Errno::EINVAL)
                 } else {
-                    Ok(SemSet::new(n))
+                    SemSet::new(n)
                 }
             },
         )
@@ -439,6 +439,8 @@ pub(super) fn semtimedop(
     nsops: u64,
     timeout: u64,
 ) -> SysResult {
+    // An unsigned int in Linux's prototype
+    let nsops = nsops as u32;
     if nsops < 1 || id < 0 {
         return Err(Errno::EINVAL);
     }
@@ -446,7 +448,7 @@ pub(super) fn semtimedop(
     if n as u64 > cx.ipc().tunables.sem[2] {
         return Err(Errno::E2BIG);
     }
-    let mut raw = vec![0u8; n * 6];
+    let mut raw = crate::ipc::zeroed(n * 6)?;
     cx.mm().read(UserSlice::new(sops, raw.len()), &mut raw)?;
     let ops: Vec<SemOp> = raw
         .chunks(6)

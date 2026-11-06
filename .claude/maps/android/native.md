@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing)
 
 ## Responsibilities
 
@@ -170,8 +170,7 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 ## Confirmed bugs / technical debt
 
-- **Panics outside the kernel's wrapped calls abort the app** (see the list above); for example
-  `setRoutes`' route parsing slices bytes without an ASCII check.
+- **Panics outside the kernel's wrapped calls abort the app** (see the list above).
 - The release build is signed with the debug key and not minified; the Alpine tarball is picked by
   the lexically greatest file name (3.9 sorts after 3.10), with the checksum checked only in
   `scripts/fetch-rootfs`.

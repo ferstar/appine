@@ -379,13 +379,26 @@ pub(super) fn mlock(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32, lock: bool
     if flags & !MLOCK_ONFAULT != 0 {
         return Err(Errno::EINVAL);
     }
+    // Linux's do_mlock and munlock: the length is page-aligned with wrapping arithmetic; after the
+    // RLIMIT_MEMLOCK check, a range that wraps past the end of the address space is EINVAL and an
+    // empty one succeeds
     let start = addr & !(PAGE_SIZE - 1);
-    let span = (addr.saturating_add(len)).next_multiple_of(PAGE_SIZE) - start;
+    let span = len
+        .wrapping_add(addr & (PAGE_SIZE - 1))
+        .wrapping_add(PAGE_SIZE - 1)
+        & !(PAGE_SIZE - 1);
     if lock {
         let already = cx.mm().locked_in(start, span);
         check_memlock(cx, span - already)?;
     }
-    cx.mm_mut().set_locked(addr, len, lock)?;
+    let end = start.wrapping_add(span);
+    if end < start {
+        return Err(Errno::EINVAL);
+    }
+    if end == start {
+        return Ok(0);
+    }
+    cx.mm_mut().set_locked(start, span, lock)?;
     if lock && flags & MLOCK_ONFAULT == 0 {
         cx.mm().populate(start, span);
     }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; epoll refuses loop devices; eventfd readv; bugs from Starnix's tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; epoll refuses loop devices; eventfd readv; bugs from Starnix's tests; `F_SETOWN` owners)
 
 ## Responsibilities
 
@@ -175,8 +175,7 @@ signal delivery (`kernel/signal`).
 - **Signal-driven I/O can signal any process:** no credentials are recorded at `F_SETOWN*` and
   nothing like Linux's `sigio_perm` runs at delivery, so an unprivileged user can set a pipe's
   owner to a root process, `F_SETSIG(SIGKILL)` (or leave the default `SIGIO`, which terminates),
-  turn on `O_ASYNC` and kill it with one write. Unknown owners are accepted without `ESRCH`;
-  `F_SETOWN` ignores pid namespaces and overflows on `INT_MIN`.
+  turn on `O_ASYNC` and kill it with one write. Unknown owners are accepted without `ESRCH`.
 - **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
   sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
   bit on a closed fd just above that can be ignored where Linux returns `EBADF`.

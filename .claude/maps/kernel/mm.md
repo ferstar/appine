@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths)
 
 ## Responsibilities
 
@@ -279,6 +279,9 @@ signals may still be delivered).
   System V segments get a VMA on the same host memory, which may run past the source VMA to the
   end of the region and past that has no contents (`SIGBUS`). A segment's copy is a new attach
   base, so it counts as one more attachment and shmdt at its address detaches it.
+- `mlock`/`mlock2`/`munlock` follow `do_mlock`: the length plus the offset in the page is
+  page-aligned with wrapping arithmetic; after mlock's `RLIMIT_MEMLOCK` check (skipped with
+  `CAP_IPC_LOCK`) a range that wraps past the end is `EINVAL` and an empty one succeeds.
 - `madvise` flag advice (`DONTDUMP`/`DODUMP`, `WIPEONFORK`/`KEEPONFORK`, `DONTFORK`/`DOFORK`)
   needs the range fully mapped, splits the VMAs at its ends and sets the flag. Whether the range is
   locked (`MADV_DONTNEED` is `EINVAL`) or all private anonymous (`MADV_FREE` and `MADV_WIPEONFORK`
@@ -568,8 +571,6 @@ signals may still be delivered).
   entries are removed and other threads are quiesced, so a concurrent guest access to the dropped
   tail takes a host `SIGBUS` — the guest process is killed as an internal error (or the app aborts
   when the fault guard is off) instead of receiving a catchable `SIGBUS`.
-- **`mlock` arithmetic overflow:** the span is computed before validation, so a length near
-  `u64::MAX` overflows; builds with overflow checks (tests, CI) abort the host process.
 - **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before
   validating the destination and keeps the splits on `EINVAL`; a move that hits the limit after its
   entries were moved drops VMAs and leaves stale entries at the destination.

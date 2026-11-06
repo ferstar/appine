@@ -1382,19 +1382,8 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             record_lock(cx, &file, cmd, arg)
         }
-        F_SETOWN => {
-            let pid = arg as i32;
-            file.borrow_mut().owner = if pid < 0 {
-                (F_OWNER_PGRP, -pid)
-            } else {
-                (F_OWNER_PID, pid)
-            };
-            Ok(0)
-        }
-        F_GETOWN => {
-            let (ty, pid) = file.borrow().owner;
-            Ok(if ty == F_OWNER_PGRP { -pid } else { pid } as i64 as u64)
-        }
+        F_SETOWN => set_owner(cx, &file, arg as i32).map(|()| 0),
+        F_GETOWN => Ok(get_owner(cx, &file) as i64 as u64),
         F_SETOWN_EX => {
             let b: [u8; 8] = get(cx, arg)?;
             let ty = i32::from_le_bytes(b[..4].try_into().unwrap());
@@ -1477,6 +1466,27 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     }
 }
 
+/// `F_SETOWN` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` (Linux's `f_setown`): a negative
+/// number is a process group, `INT_MIN` (which has no negation) is `EINVAL`, and the number is in
+/// the caller's pid namespace.
+fn set_owner(cx: &Cx<'_>, file: &FileRef, pid: i32) -> Result<(), Errno> {
+    let owner = match pid.checked_neg() {
+        None => return Err(Errno::EINVAL),
+        Some(g) if pid < 0 => (F_OWNER_PGRP, cx.pid_in(g)),
+        Some(_) => (F_OWNER_PID, cx.pid_in(pid)),
+    };
+    file.borrow_mut().owner = owner;
+    Ok(())
+}
+
+/// `F_GETOWN`, `FIOGETOWN`, `SIOCGPGRP`: the owner in the caller's pid namespace, a process group
+/// negated.
+fn get_owner(cx: &Cx<'_>, file: &FileRef) -> Tid {
+    let (ty, pid) = file.borrow().owner;
+    let pid = cx.pid_out(pid);
+    if ty == F_OWNER_PGRP { -pid } else { pid }
+}
+
 /// fcntl's record-lock commands ([`crate::locks`]): `arg` points at a `struct flock`.
 fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult {
     let mut b: [u8; 32] = get(cx, arg)?;
@@ -1521,24 +1531,38 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
             },
             _ => return Err(Errno::EINVAL),
         };
-        let start = i64::try_from(base)
-            .ok()
-            .and_then(|b| b.checked_add(l_start))
-            .ok_or(Errno::EOVERFLOW)?;
-        // An l_len of 0 means to the end of the file and beyond, a negative one
-        // [start + l_len, start)
-        let (start, end) = match l_len {
-            0 => (start, i64::MAX),
-            n if n > 0 => (start, start.checked_add(n).ok_or(Errno::EOVERFLOW)?),
-            n => (start + n, start),
-        };
+        // Linux's flock64_to_posix_lock, in its order: the start may not pass OFFSET_MAX
+        // (EOVERFLOW) or be negative (EINVAL); an l_len of 0 means to the end of the file and
+        // beyond, a positive one may end at OFFSET_MAX at most (EOVERFLOW), a negative one is
+        // [start + l_len, start) and may not begin below 0 (EINVAL)
+        let base = i64::try_from(base).map_err(|_| Errno::EOVERFLOW)?;
+        if l_start > i64::MAX - base {
+            return Err(Errno::EOVERFLOW);
+        }
+        let start = base + l_start;
         if start < 0 {
             return Err(Errno::EINVAL);
         }
-        let end = if end == i64::MAX {
+        // The last byte, inclusive
+        let (start, last) = match l_len {
+            0 => (start, i64::MAX),
+            n if n > 0 => {
+                if n - 1 > i64::MAX - start {
+                    return Err(Errno::EOVERFLOW);
+                }
+                (start, start + (n - 1))
+            }
+            n => {
+                if start + n < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                (start + n, start - 1)
+            }
+        };
+        let end = if last == i64::MAX {
             u64::MAX
         } else {
-            end as u64
+            last as u64 + 1
         };
         (ino, start as u64, end)
     };
@@ -1736,16 +1760,9 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         {
             if matches!(request, FIOSETOWN | SIOCSPGRP) {
                 let pid = i32::from_le_bytes(get(cx, arg)?);
-                file.borrow_mut().owner = if pid < 0 {
-                    (F_OWNER_PGRP, cx.pid_in(pid.saturating_neg()))
-                } else {
-                    (F_OWNER_PID, cx.pid_in(pid))
-                };
-                return Ok(0);
+                return set_owner(cx, &file, pid).map(|()| 0);
             }
-            let (ty, pid) = file.borrow().owner;
-            let pid = cx.pid_out(pid);
-            let pid = if ty == F_OWNER_PGRP { -pid } else { pid };
+            let pid = get_owner(cx, &file);
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         _ => {}

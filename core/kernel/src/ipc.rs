@@ -72,8 +72,9 @@ impl Tunables {
         })
     }
 
-    /// Writes `/proc/sys/kernel/<name>`: EINVAL when the value is not a non-negative integer, or
-    /// when a `*mni` exceeds IPCMNI.
+    /// Writes `/proc/sys/kernel/<name>`: EINVAL when the value is not a non-negative integer, when
+    /// a `*mni` exceeds IPCMNI, or when one of Linux's int sysctls (`msgmax`, `msgmnb`, `sem`)
+    /// exceeds `INT_MAX` (`shmmax` and `shmall` are unsigned longs there too).
     pub fn write(&mut self, name: &[u8], data: &[u8]) -> Result<(), Errno> {
         let text = std::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
         let nums: Vec<u64> = text
@@ -92,15 +93,24 @@ impl Tunables {
                 Err(Errno::EINVAL)
             }
         };
+        // msgsnd, semget and semtimedop allocate by these, so they must not go beyond what Linux
+        // allows either
+        let int = |v: u64| {
+            if v <= i32::MAX as u64 {
+                Ok(v)
+            } else {
+                Err(Errno::EINVAL)
+            }
+        };
         match name {
-            b"msgmax" => self.msgmax = one()?,
-            b"msgmnb" => self.msgmnb = one()?,
+            b"msgmax" => self.msgmax = int(one()?)?,
+            b"msgmnb" => self.msgmnb = int(one()?)?,
             b"msgmni" => self.msgmni = mni(one()?)?,
             b"sem" => {
                 let [a, b, c, d] = nums[..] else {
                     return Err(Errno::EINVAL);
                 };
-                self.sem = [a, b, c, mni(d)?];
+                self.sem = [int(a)?, int(b)?, int(c)?, mni(d)?];
             }
             b"shmmax" => self.shmmax = one()?,
             b"shmall" => self.shmall = one()?,
@@ -423,15 +433,16 @@ pub(crate) struct SemSet {
 }
 
 impl SemSet {
-    pub fn new(n: usize) -> SemSet {
-        SemSet {
-            vals: vec![0; n],
-            pids: vec![0; n],
-            ncnt: vec![0; n],
-            zcnt: vec![0; n],
+    /// ENOMEM when the host cannot allocate `n` semaphores.
+    pub fn new(n: usize) -> Result<SemSet, Errno> {
+        Ok(SemSet {
+            vals: zeroed(n)?,
+            pids: zeroed(n)?,
+            ncnt: zeroed(n)?,
+            zcnt: zeroed(n)?,
             otime: 0,
             ctime: now(),
-        }
+        })
     }
 
     /// Tries to complete all operations atomically (`perform_atomic_semop`): returns `Ok(None)`
@@ -675,6 +686,15 @@ pub(crate) fn now() -> i64 {
     appine_hal::clock_gettime(0).map_or(0, |(s, _)| s)
 }
 
+/// `n` zeros, or ENOMEM when the host cannot allocate them: sizes the guest chooses (up to the
+/// IPC limits) must fail the call as on Linux, not abort the app as a failed `vec!` does.
+pub(crate) fn zeroed<T: Clone + Default>(n: usize) -> Result<Vec<T>, Errno> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| Errno::ENOMEM)?;
+    v.resize(n, T::default());
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,14 +764,7 @@ mod tests {
         let root = Cred::root();
         let id = ipc
             .sem
-            .get_or_create(
-                IPC_PRIVATE,
-                0o600,
-                &root,
-                4,
-                |_| Ok(()),
-                || Ok(SemSet::new(2)),
-            )
+            .get_or_create(IPC_PRIVATE, 0o600, &root, 4, |_| Ok(()), || SemSet::new(2))
             .unwrap();
         let mut undo = Vec::new();
         let set = &mut ipc.sem.get_mut(id).unwrap().1;
@@ -782,5 +795,22 @@ mod tests {
         ipc.undo.insert((10, id), undo);
         ipc.exit(10);
         assert_eq!(ipc.sem.get(id).unwrap().1.vals, vec![0, 0]);
+    }
+
+    #[test]
+    fn int_sysctls_stop_at_int_max() {
+        let mut t = Tunables::default();
+        assert_eq!(t.write(b"msgmax", b"2147483647\n"), Ok(()));
+        assert_eq!(t.msgmax, i32::MAX as u64);
+        assert_eq!(t.write(b"msgmax", b"2147483648\n"), Err(Errno::EINVAL));
+        assert_eq!(
+            t.write(b"msgmnb", b"18446744073709551615"),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(t.write(b"sem", b"1 1 2147483648 1"), Err(Errno::EINVAL));
+        assert_eq!(t.write(b"sem", b"2147483647 2 3 4"), Ok(()));
+        assert_eq!(t.sem, [i32::MAX as u64, 2, 3, 4]);
+        // Unsigned longs on Linux too
+        assert_eq!(t.write(b"shmmax", b"18446744073709551615"), Ok(()));
     }
 }

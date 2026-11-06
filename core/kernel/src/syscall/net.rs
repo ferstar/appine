@@ -1616,13 +1616,27 @@ fn read_msghdr(cx: &Cx<'_>, msg: u64) -> Result<MsgHdr, Errno> {
     if iovlen > 1024 {
         return Err(Errno::EMSGSIZE);
     }
+    // As Linux's import_iovec: a negative length (as ssize_t) anywhere is EINVAL; then each iovec
+    // must lie below arm64's TASK_SIZE_MAX (access_ok, EFAULT), and the total is cut to
+    // MAX_RW_COUNT by shortening the iovec that reaches it
+    const MAX_RW_COUNT: u64 = 0x7fff_f000;
+    const TASK_SIZE_MAX: u64 = 1 << 48;
     let mut iovecs = Vec::with_capacity(iovlen);
     for i in 0..iovlen as u64 {
         let v: [u8; 16] = get(cx, iov.wrapping_add(i * 16))?;
-        iovecs.push((
-            u64::from_le_bytes(v[..8].try_into().unwrap()),
-            u64::from_le_bytes(v[8..].try_into().unwrap()) as usize,
-        ));
+        let len = u64::from_le_bytes(v[8..].try_into().unwrap());
+        if (len as i64) < 0 {
+            return Err(Errno::EINVAL);
+        }
+        iovecs.push((u64::from_le_bytes(v[..8].try_into().unwrap()), len as usize));
+    }
+    let mut total = 0;
+    for (base, len) in &mut iovecs {
+        if *len as u64 > TASK_SIZE_MAX || *base > TASK_SIZE_MAX - *len as u64 {
+            return Err(Errno::EFAULT);
+        }
+        *len = (*len as u64).min(MAX_RW_COUNT - total) as usize;
+        total += *len as u64;
     }
     Ok(MsgHdr {
         name,
