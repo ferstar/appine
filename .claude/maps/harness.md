@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files; Starnix's syscall tests and PTY scenarios, skipped only where they cannot be compared)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all)
 
 ## Responsibilities
 
@@ -230,6 +230,13 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   rustup installs a listed component the image lacks on every `cargo` call, and the container is
   removed after each run, so it downloads it again every time. CI installs all listed components
   through `rustup toolchain install`.
+- Cases with `--privileged` act on the development VM itself: a test that sets the clock succeeds
+  natively and moves the VM's clock until its time sync corrects it (Starnix's
+  `timerfd_mutable_test` and `time_test` call settimeofday), so such tests must stay out of cases.
+- busybox's `timeout` sends only `SIGTERM`: a test that ignores it, or a child that keeps the
+  output pipe open, makes `$(timeout …)` wait forever on either side. `timeout -s KILL` with the
+  output written to a file avoids both. Output that goes through `grep` inside the guest is
+  block-buffered, so a running case's `.appine` file shows no progress.
 
 ## Confirmed bugs / technical debt
 
@@ -263,6 +270,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The `starnix-*` cases pass vacuously without the built tests:** CI does not build them
   (`build-starnix-tests` needs the network and about four minutes), so there they only print that
   the tests are missing.
+- **A hung Starnix test stalls its whole case:** the `starnix-*` cases capture each test with
+  `$(timeout 60 …)`, so a test that ignores `SIGTERM` or leaves a child holding its output keeps
+  the case, and the difftest lane, waiting with no limit (two futex tests and one exit test did this
+  on the native side, and the appine side stalled too, when all programs were run once).
 - **compat2's "after the thread exits" check races:** it tests whether `/proc/<tid>` of a
   non-leader thread still exists right after Python's `join()`, which returns before the kernel has necessarily
   reaped the thread; native usually prints True, and appine printed False once in a full parallel
@@ -275,6 +286,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Should partial LTP runs merge into `results.txt` as the durations do?
 - Should CI build Starnix's tests (with a cache keyed by the pinned commit) so the `starnix-*`
   cases run there, and which of the other 79 built test programs should get cases next?
+  (`docs/starnix.md` has the outcome of running them all once.)
 
 ## To verify
 
