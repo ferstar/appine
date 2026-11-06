@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`)
 
 ## Responsibilities
 
@@ -120,9 +120,13 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - recv: AF_UNIX and raw ICMP go to their own code; queued stub and netlink answers come first;
   `MSG_ERRQUEUE` never waits; the host gets the flags minus `MSG_DONTWAIT`/`MSG_WAITALL`; source
   addresses are unmapped, translated and nat-reversed; control data is returned verbatim;
-  `EAGAIN` waits (`SO_RCVTIMEO`, `ERESTARTSYS` on signals). `MSG_WAITALL` loops only while the
-  host has data and returns a partial result when it runs dry; with `MSG_PEEK` each pass peeks the
-  head of the queue again, filling the buffer with repeated copies.
+  `EAGAIN` waits (`SO_RCVTIMEO`, `ERESTARTSYS` on signals). `MSG_WAITALL` on a stream reads until
+  the length is complete, waiting between pieces; nonblocking, the timeout, a signal (even under
+  `SA_RESTART`), end of file or a host error ends it with what was read, as Linux's
+  `tcp_recvmsg` returns what it copied. `MSG_PEEK|MSG_WAITALL` peeks from the head each time and
+  waits with the host socket's `SO_RCVLOWAT` raised to the length (restored afterwards); when the
+  host fd was ready but the peek did not grow (end of file, a receive buffer that can never hold
+  the length) it returns what is there instead of spinning.
 - read, write, readv and writev on a socket are one recvmsg or sendmsg over all the iovecs with no
   address, control data or flags (Linux's `sock_read_iter`/`sock_write_iter`): a datagram or
   seqpacket record is one message whatever the iovecs or the length, a read of nothing returns 0
@@ -130,6 +134,8 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   socket); a stream socket's write goes on in 1 MiB pieces until all is sent or one is short. A
   fault ends a stream write's data there and fails a message with `EFAULT`.
 - Limits: at most 1 MiB per call, 1024 iovecs (`EMSGSIZE`), 4096 bytes of send control data;
+  recvfrom and recvmsg with `MSG_WAITALL` (not `MSG_PEEK`) on an internet stream go on past 1 MiB
+  piece by piece, writing each piece out at its offset until one comes up short;
   recvmsg sums the guest's iovec lengths before clamping (unchecked); setsockopt values are cut to
   256 bytes (longer ones then fail on the host) and getsockopt asks the host for at most 256.
 - Host sendmsg/recvmsg run under the BKL (nonblocking); only waits release it.
@@ -300,13 +306,14 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - The portmap key has no address, so binds of one guest port share one host port and the host
   decides their conflicts, except that IPv6-only binds in new namespaces get their own.
 - The raw ICMP id rewrite assumes one echo id per raw socket (the last one sent).
+- A `MSG_PEEK|MSG_WAITALL` wait changes the host socket's `SO_RCVLOWAT` while the BKL is released,
+  so another thread polling the same socket meanwhile sees the raised low-water mark.
 
 ## Confirmed bugs / technical debt
 
-- **`MSG_PEEK|MSG_WAITALL` returns duplicated data** on stream sockets: each pass peeks the queue
-  head again into the next part of the buffer, so 10 queued bytes and a 100-byte read return the
-  same 10 bytes ten times. Without `MSG_PEEK`, `MSG_WAITALL` returns short reads instead of
-  waiting, and requests above 1 MiB come back short.
+- **An error after part of a `MSG_WAITALL` read is lost:** the partial count is returned, but the
+  host has already taken the error (a reset, say), so the next read sees end of file where Linux
+  reports the error then.
 - **Blocking connect ignores `SO_SNDTIMEO` and is never restarted:** it waits without a deadline,
   returns `EINTR` even under `SA_RESTART`, and a retried connect then fails with `EALREADY` where
   Linux keeps waiting (and times out with `EINPROGRESS`).

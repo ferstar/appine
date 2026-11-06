@@ -1325,12 +1325,54 @@ pub(super) fn recvfrom(
     let (sock, nonblock) = socket_of(cx, fd)?;
     let m = recv(cx, &sock, nonblock, len, 0, flags)?;
     cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
+    let more = recv_rest(
+        cx,
+        &sock,
+        nonblock,
+        m.data.len(),
+        len,
+        flags,
+        |cx, off, d| cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d),
+    );
     write_addr(cx, addr, addrlen, &m.addr)?;
-    Ok(if flags & MSG_TRUNC != 0 {
+    Ok((if flags & MSG_TRUNC != 0 {
         m.len
     } else {
         m.data.len()
-    } as u64)
+    } + more) as u64)
+}
+
+/// recvfrom and recvmsg with `MSG_WAITALL` (without `MSG_PEEK`) on an internet stream socket: one
+/// [`recv`] takes at most [`MSG_MAX`], so a longer request goes on piece by piece, each written out
+/// by `put` at its offset, until it is complete or a piece comes up short (end of file, a signal,
+/// the timeout, an error), as Linux's tcp_recvmsg returns what it copied. `first` is the length the
+/// first piece gave; returns how much more was received.
+fn recv_rest(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    first: usize,
+    total: usize,
+    flags: u32,
+    mut put: impl FnMut(&mut Cx<'_>, usize, &[u8]) -> Result<(), Errno>,
+) -> usize {
+    let stream = matches!(&*sock.borrow(), Socket::Inet(s) if s.ty == SOCK_STREAM);
+    if !stream || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL {
+        return 0;
+    }
+    let mut got = first;
+    let mut last = first;
+    while last == MSG_MAX && got < total {
+        let Ok(m) = recv(cx, sock, nonblock, total - got, 0, flags) else {
+            break;
+        };
+        if put(cx, got, &m.data).is_err() {
+            break;
+        }
+        last = m.data.len();
+        got += last;
+    }
+    got - first
 }
 
 /// sendmmsg: sendmsg one by one. Returns the error when the first one fails, otherwise the number
@@ -1421,17 +1463,16 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } = read_msghdr(cx, msg)?;
     let total: usize = iovecs.iter().map(|v| v.1).sum();
     let m = recv(cx, &sock, nonblock, total, controllen.min(4096), flags)?;
-    // Scatter the data over the iovecs in order
-    let mut off = 0;
-    for (base, len) in iovecs {
-        let n = len.min(m.data.len() - off);
-        if n == 0 {
-            break;
-        }
-        cx.mm()
-            .write(UserSlice::new(base, n), &m.data[off..off + n])?;
-        off += n;
-    }
+    scatter(cx, &iovecs, 0, &m.data)?;
+    let more = recv_rest(
+        cx,
+        &sock,
+        nonblock,
+        m.data.len(),
+        total,
+        flags,
+        |cx, off, d| scatter(cx, &iovecs, off, d),
+    );
     // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
@@ -1450,11 +1491,32 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         msg + 48,
         (m.flags | flags & MSG_CMSG_CLOEXEC).to_le_bytes(),
     )?;
-    Ok(if flags & MSG_TRUNC != 0 {
+    Ok((if flags & MSG_TRUNC != 0 {
         m.len
     } else {
         m.data.len()
-    } as u64)
+    } + more) as u64)
+}
+
+/// Writes `data` over the iovecs in order, starting `off` bytes into them.
+fn scatter(cx: &mut Cx<'_>, iovecs: &[(u64, usize)], off: usize, data: &[u8]) -> Result<(), Errno> {
+    let mut skip = off;
+    let mut done = 0;
+    for &(base, len) in iovecs {
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let n = (len - skip).min(data.len() - done);
+        if n == 0 {
+            break;
+        }
+        cx.mm()
+            .write(UserSlice::new(base + skip as u64, n), &data[done..done + n])?;
+        done += n;
+        skip = 0;
+    }
+    Ok(())
 }
 
 /// read, readv, write and writev on a socket (Linux's `sock_read_iter` and `sock_write_iter`): a
@@ -2020,9 +2082,16 @@ pub(crate) fn recv(
     let mut got = 0;
     // Peeked data will be read again later, and the error queue is not received traffic
     let counted = flags & (MSG_PEEK | MSG_ERRQUEUE) == 0;
+    // MSG_WAITALL on a stream waits until `max` bytes are there, as Linux's tcp_recvmsg does: a
+    // read takes them piece by piece, a peek looks at the head of the queue again each time
+    let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM;
+    let peek = flags & MSG_PEEK != 0;
+    // The last wait for more data to peek ended because the host fd was ready
+    let mut peek_ready = false;
     loop {
         let host_flags = flags & !(MSG_DONTWAIT | MSG_WAITALL);
-        match appine_hal::net::recvmsg(host_fd, &mut buf[got..], control_len, host_flags as i32) {
+        let into = if peek { &mut buf[..] } else { &mut buf[got..] };
+        match appine_hal::net::recvmsg(host_fd, into, control_len, host_flags as i32) {
             Ok(r) => {
                 // The peer is recorded (InetSocket::vconn): datagrams not from it are dropped
                 // (peeked ones must be taken off too)
@@ -2035,10 +2104,26 @@ pub(crate) fn recv(
                     }
                     continue;
                 }
-                let wait_all = flags & MSG_WAITALL != 0 && ty == SOCK_STREAM;
-                got += r.len.min(buf.len() - got);
-                if wait_all && r.len > 0 && got < max {
-                    continue;
+                if peek {
+                    let grew = r.len > got;
+                    got = r.len.min(max);
+                    // Wait for more unless the host fd was ready and nothing came (end of file,
+                    // or a receive buffer too small to ever hold `max`): return what is there
+                    // rather than spin
+                    if wait_all
+                        && r.len > 0
+                        && got < max
+                        && (grew || !peek_ready)
+                        && let Ok(ready) = wait_peek(cx, sock, host_fd, max, nonblock, deadline)
+                    {
+                        peek_ready = ready;
+                        continue;
+                    }
+                } else {
+                    got += r.len.min(buf.len() - got);
+                    if wait_all && r.len > 0 && got < max {
+                        continue;
+                    }
                 }
                 buf.truncate(got);
                 let len = if ty == SOCK_STREAM { got } else { r.len };
@@ -2108,20 +2193,16 @@ pub(crate) fn recv(
                 {
                     return Ok(m);
                 }
-                if got > 0 {
-                    buf.truncate(got);
-                    if counted {
-                        account(cx, sock, true, got, &[]);
-                    }
-                    return Ok(Message {
-                        len: got,
-                        data: buf,
-                        addr: Vec::new(),
-                        control: Vec::new(),
-                        flags: 0,
-                    });
+                // MSG_WAITALL with part of the data read: wait for the rest; nonblocking, a signal,
+                // the timeout or an error ends it with what was read (Linux's tcp_recvmsg returns
+                // what it copied and leaves the signal to be handled)
+                if got == 0 {
+                    wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+                } else if wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)
+                    .is_err()
+                {
+                    break;
                 }
-                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
             }
             Err(e) if !retried && tap.is_some() && crate::rawicmp::from_icmp(e) => {
                 if let Some(t) = &tap {
@@ -2129,9 +2210,56 @@ pub(crate) fn recv(
                 }
                 retried = true;
             }
+            // An error after part of a MSG_WAITALL read: return the part (the host has taken the
+            // error, so the next read sees end of file where Linux would report it)
+            Err(_) if got > 0 => break,
             Err(e) => return Err(Errno(e)),
         }
     }
+    // Part of a MSG_WAITALL read
+    buf.truncate(got);
+    if counted {
+        account(cx, sock, true, got, &[]);
+    }
+    Ok(Message {
+        len: got,
+        data: buf,
+        addr: Vec::new(),
+        control: Vec::new(),
+        flags: 0,
+    })
+}
+
+/// Waits for a MSG_PEEK|MSG_WAITALL peek to have `want` bytes to look at: the host socket's
+/// `SO_RCVLOWAT` is raised for the wait, as the host fd is readable as soon as anything is queued.
+/// Returns whether the host fd was ready (rather than a wake-up for another reason).
+fn wait_peek(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    fd: i32,
+    want: usize,
+    nonblock: bool,
+    deadline: Option<Instant>,
+) -> Result<bool, Errno> {
+    const SO_RCVLOWAT: i32 = 18;
+    if nonblock {
+        return Err(Errno::EAGAIN);
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(Errno::EAGAIN);
+    }
+    if cx.interrupted() {
+        return Err(Errno::ERESTARTSYS);
+    }
+    let old = appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, 4);
+    let want = i32::try_from(want).unwrap_or(i32::MAX);
+    let _ = appine_hal::net::setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &want.to_le_bytes());
+    let mut pfd = [(fd, POLLIN, 0)];
+    let r = cx.wait_objects(deadline, &mut pfd, wake::FILE, &[wake::of(sock)]);
+    if let Ok(old) = old {
+        let _ = appine_hal::net::setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &old);
+    }
+    r.map(|()| pfd[0].2 != 0)
 }
 
 /// Receiving on a raw ICMP socket: the messages are in its own queue in the aggregation point
