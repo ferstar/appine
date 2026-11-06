@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs; blocking connect)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs; blocking connect; listen events)
 
 ## Responsibilities
 
@@ -202,7 +202,8 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   (`local_map`, `peer_map`, and the host→guest table, which lingers 10 s after release); connect
   and sendto to a local address with a mapped port use the host port.
 - Listen events: every non-loopback listen (comm, guest port, host port), deduplicated per
-  (port, host port), at most 32 queued, drained by `Machine::take_listens`.
+  (port, host port), at most 32 queued, drained by `Machine::take_listens`; a listen dropped by a
+  full queue is not marked reported, so its next listen is queued.
 - Traffic: payload bytes and packets of initial-namespace sockets, per interface chosen from the
   socket's local address (wildcards resolved per call), packets estimated from the MSS for
   streams; `Protocols` feed `/proc/net/snmp` and `netstat` (IP/UDP/ICMP IPv4 only, TCP both,
@@ -339,8 +340,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **New-namespace loopback statistics leak the host's:** sysfs `lo/statistics/*` in a new network
   namespace reads the initial namespace's loopback counters, while `/proc/net/dev` and netlink show
   zeros there.
-- **Listen events can be lost:** the "already reported" set is marked before the 32-event queue
-  check and never cleared, so a listen dropped by a full queue is never reported.
 - **Netlink requests are not validated as Linux validates them:** `NETLINK_GET_STRICT_CHK` is
   accepted and ignored (no header checks, no header-based dump filtering), attributes of the wrong
   size are skipped instead of rejected with `ERANGE`, and a single IPv6 `RTM_GETADDR` is

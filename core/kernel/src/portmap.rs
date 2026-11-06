@@ -135,9 +135,10 @@ impl PortMap {
     }
 
     /// Records a listen on a non-loopback address: queues an event the first time a (guest port,
-    /// host port) appears.
+    /// host port) appears. Only a queued one counts as reported, so a listen dropped by a full
+    /// queue is reported when it happens again.
     pub fn listened(&mut self, comm: String, port: u16, host_port: u16) {
-        if self.reported.insert((port, host_port)) && self.events.len() < MAX_EVENTS {
+        if self.events.len() < MAX_EVENTS && self.reported.insert((port, host_port)) {
             self.events.push_back(ListenEvent {
                 comm,
                 port,
@@ -652,6 +653,14 @@ mod tests {
         assert_eq!(e.len(), 2);
         assert_eq!(e[1].host_port, 20022);
         assert!(m.take_listens().is_empty());
+        // A listen the full queue dropped is reported the next time
+        for p in 0..MAX_EVENTS as u16 {
+            m.listened("x".into(), 1000 + p, 1000 + p);
+        }
+        m.listened("late".into(), 80, 10080);
+        assert_eq!(m.take_listens().len(), MAX_EVENTS);
+        m.listened("late".into(), 80, 10080);
+        assert_eq!(m.take_listens()[0].comm, "late");
         assert!(m.maps(22) && !m.maps(0) && !m.maps(1024));
         m.offset = 0;
         assert!(!m.maps(22));
