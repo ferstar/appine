@@ -225,7 +225,7 @@ static void insert(uint32_t insn, const struct native_desc *desc)
     struct buf b = {(uint32_t *)((char *)code + rw_delta), 0}; /* stubs have no relative branches */
     generate(&b, insn, desc);
     if (b.n > MAX_STUB_WORDS)
-        abort(); /* the upper-bound estimate was wrong: an engine bug */
+        appine_guard_fail(); /* the upper-bound estimate was wrong: an engine bug */
     sync_code((void *)code, (void *)(code + b.n), rw_delta);
     used_words += b.n;
     table[i] = (struct slot){insn, (native_fn)(uintptr_t)code};

@@ -827,7 +827,7 @@ static void emit_to_refill(struct xlate *x, uint64_t pc, unsigned bytes, bool wr
 static void emit_refill_stub(struct xlate *x, const struct stub *s)
 {
     if (s->bytes > 1u << REFILL_REASON_SHIFT || s->fail >> (REFILL_RESUME_SHIFT - REFILL_REASON_SHIFT))
-        abort(); /* the info word cannot hold it: an engine bug */
+        appine_guard_fail(); /* the info word cannot hold it: an engine bug */
     emit(x, enc_adr(T1, 8));
     emit_to_routine(x, s->write ? TO_REFILL_WRITE : TO_REFILL_READ);
     intptr_t resume = s->resume - here(x);
@@ -2341,7 +2341,8 @@ static bool translate_insn_body(struct xlate *x, uint32_t insn, uint64_t pc)
                 emit(x, enc_ldr_x(T2, CTX, off));
                 x->t2_group = i;
             } else if (x->t2_group != i) {
-                abort(); /* plan_group ensures nothing used T2 before a member not marked reload */
+                appine_guard_fail(); /* plan_group ensures nothing used T2 before a member not
+                                      * marked reload */
             }
             emit_member(x, &m, g->off[g->next++]);
             x->st->insns_grouped++;
@@ -3275,7 +3276,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     /* A wrong upper-bound estimate is an engine bug: stop before writing out of bounds */
     if (x->nstubs > MAX_STUBS || x->nfixups > MAX_FIXUPS ||
         x->n + (size_t)x->nstubs * MAX_STUB_WORDS > MAX_BLOCK_WORDS)
-        abort();
+        appine_guard_fail();
     for (unsigned i = 0; i < x->nstubs; i++)
         x->stubs[i].sites = 0;
     for (unsigned k = 0; k < x->nfixups; k++) {
@@ -3307,7 +3308,7 @@ static bool prepare(struct appine_dbt_thread *t, struct appine_cpu *c, uint64_t 
     }
 
     if (x->nrelocs > MAX_RELOCS)
-        abort();
+        appine_guard_fail();
     template_store(pc, guest, nguest, key, x, &before, p->links, p->nlinks);
     p->nguest = nguest;
     p->host = x->buf;

@@ -220,6 +220,41 @@ void appine_guard_drop(void)
         g->nlocks--;
 }
 
+_Noreturn void appine_guard_fail(void)
+{
+    struct guard *g = current();
+    if (g && g->armed) {
+        g->armed = 0;
+        g->fault = (struct appine_host_fault){
+            .signo = SIGABRT,
+            .code = 0,
+            .addr = 0,
+            .pc = (uint64_t)(uintptr_t)__builtin_return_address(0),
+        };
+        siglongjmp(g->env, 1);
+    }
+    abort();
+}
+
+/* For the engine's unit test: a run whose function fails an internal check returns
+ * APPINE_EXIT_HOST_FAULT with SIGABRT recorded; returns that signal (-1 when the run returned
+ * otherwise). Only with the guard installed: without it the check aborts the process */
+static enum appine_exit fail_check(void *ctx, struct appine_cpu *cpu)
+{
+    (void)ctx;
+    (void)cpu;
+    appine_guard_fail();
+}
+
+int appine_guard_selftest(void)
+{
+    if (appine_guard_run(fail_check, NULL, NULL) != APPINE_EXIT_HOST_FAULT)
+        return -1;
+    struct appine_host_fault f;
+    appine_host_fault_last(&f);
+    return f.signo;
+}
+
 /* After jumping back from the handler: restore the host's FPCR, release the locks still held,
  * and unblock this signal (it is blocked while the handler runs, and siglongjmp does not restore
  * the signal mask) */

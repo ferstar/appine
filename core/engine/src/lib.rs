@@ -996,4 +996,20 @@ mod tests {
     fn layout_matches_c() {
         assert!(super::layout_matches());
     }
+
+    /// A failed internal check (an engine bug found without a host fault) under the guard ends
+    /// the run as a host fault with SIGABRT, so only the guest process is ended, instead of
+    /// aborting the app.
+    #[test]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        target_arch = "aarch64"
+    ))]
+    fn failed_internal_checks_end_only_the_run() {
+        unsafe extern "C" {
+            fn appine_guard_selftest() -> i32;
+        }
+        super::install_fault_guard();
+        assert_eq!(unsafe { appine_guard_selftest() }, libc::SIGABRT);
+    }
 }

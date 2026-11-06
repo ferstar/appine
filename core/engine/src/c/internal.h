@@ -257,6 +257,11 @@ void appine_guard_hold(void *lock, bool rw);
 /* About to release the most recently registered lock */
 void appine_guard_drop(void);
 
+/* An internal check failed (an engine bug found without a host fault): under an armed guard the
+ * run ends as after a host fault, recorded as SIGABRT at the caller, so only the guest process is
+ * ended; otherwise abort() as before. Must not be called while holding an unregistered lock */
+_Noreturn void appine_guard_fail(void);
+
 /* ---- CPU features (features.c) ---- */
 
 /* Whether the guest feature set contains all bits in hwcap */

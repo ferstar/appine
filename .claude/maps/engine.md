@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; corrected which template locks the guard misses)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; which template locks the guard misses; failed internal checks under the guard)
 
 ## Responsibilities
 
@@ -77,7 +77,8 @@ Tier 1, only CPUID advertised).
   `layout_matches`.
 - **C-internal** (used across engine files): `appine_interp_step`/`appine_interp_exec`,
   `appine_native_exec`, `appine_simd_dp_decode`, `appine_atomic_exec`, `appine_id_register`,
-  `appine_guard_run`/`hold`/`drop`, `appine_map_code`.
+  `appine_guard_run`/`hold`/`drop`/`fail`, `appine_map_code`; `appine_guard_selftest` for the unit
+  test.
 
 ## Data flow / lifecycle
 
@@ -386,8 +387,11 @@ Tier 1, only CPUID advertised).
   is the opt-in perf map (`APPINE_PERF_MAP`), which writes `/tmp/perf-<pid>.map` from `install`.
 - Guest state is not reconstructed from the host context; after a host fault the kernel kills the
   guest process, the Tier 1 instance is poisoned, and the template arena is cleared.
-- `abort()` on internal overflow checks (native stub length, refill info word, stub/fixup/block
-  words, relocations, a group slot mismatch) is not a fault the guard catches.
+- Internal overflow checks (native stub length, refill info word, stub/fixup/block words,
+  relocations, a group slot mismatch) call `appine_guard_fail`: under an armed guard the run ends
+  as after a host fault, recorded as `SIGABRT` with the caller's address (the instance is poisoned
+  as for any host fault); with no guard armed (debug builds, unguarded calls) it aborts as before.
+  The checks run during translation and stub generation, where only registered locks are held.
 
 ## Dependencies (inbound / outbound)
 
@@ -462,8 +466,6 @@ Tier 1, only CPUID advertised).
 - **Stale `Kicker` after a panic in thread exit:** if the kernel's `exit()` panics before the
   thread leaves the address space's users (including the exit test hook), a later shootdown kicks a
   freed `Cpu`; if that state was unmapped rather than pooled, the app crashes (kernel-side path).
-- **Internal `abort()` checks bypass the fault guard:** overflow and group-slot assertions during
-  translation or native-stub generation kill the whole app instead of one guest process.
 - **Locks taken inside guarded code are not all registered:** the template arena lock, the shard
   locks `template_clear` takes all at once (the per-bucket `template_lock` is registered) and the
   perf-map lock are not released on host-fault recovery, so a fault while holding one
