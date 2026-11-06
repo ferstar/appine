@@ -3,7 +3,7 @@
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
-# CLONE_PARENT exit signals
+# CLONE_PARENT exit signals; timers of exited threads
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1053,3 +1053,70 @@ int main(void)
 C
 gcc -O1 -o cloneparent cloneparent.c && ./cloneparent
 rm -f cloneparent cloneparent.c
+
+# A SIGEV_THREAD_ID timer whose thread has exited sends nothing (not to the process)
+cat > deadtimer.c <<'C'
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+/* The kernel's struct sigevent */
+struct ksigevent {
+    long value;
+    int signo, notify;
+    int tid, pad[11];
+};
+
+static volatile pid_t tid;
+static int go[2];
+
+static void *thread(void *arg)
+{
+    (void)arg;
+    tid = syscall(SYS_gettid);
+    char x;
+    read(go[0], &x, 1);
+    return NULL;
+}
+
+int main(void)
+{
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &s, NULL);
+    pipe(go);
+    pthread_t t;
+    pthread_create(&t, NULL, thread, NULL);
+    while (!tid)
+        usleep(1000);
+    struct ksigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.signo = SIGUSR1;
+    ev.notify = 4; /* SIGEV_THREAD_ID */
+    ev.tid = tid;
+    int id = -1;
+    long r = syscall(SYS_timer_create, CLOCK_MONOTONIC, &ev, &id);
+    printf("timer_create for the thread: %ld\n", r);
+    /* The thread exits, and is gone from the kernel too */
+    write(go[1], "x", 1);
+    pthread_join(t, NULL);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d", tid);
+    for (int i = 0; i < 300 && access(path, F_OK) == 0; i++)
+        usleep(10000);
+    struct itimerspec its = {{0, 0}, {0, 50000000}};
+    syscall(SYS_timer_settime, id, 0, &its, NULL);
+    struct timespec ts = {0, 300000000};
+    printf("signal after the thread exited: %s\n",
+           sigtimedwait(&s, NULL, &ts) == SIGUSR1 ? "delivered" : "none");
+    return 0;
+}
+C
+gcc -O1 -pthread -o deadtimer deadtimer.c && ./deadtimer
+rm -f deadtimer deadtimer.c

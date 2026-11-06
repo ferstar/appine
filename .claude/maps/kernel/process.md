@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals; thread-directed timers)
 
 ## Responsibilities
 
@@ -323,7 +323,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `ITIMER_REAL` uses wall time; `ITIMER_VIRTUAL`/`PROF` and process CPU-time timers use host thread
   CPU clocks. Armed CPU timers or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the soft
   `RLIMIT_CPU` sends `SIGXCPU` and raises the soft limit by 1 s; over the hard limit `SIGKILL`.
-- A POSIX timer whose previous signal is still pending counts an overrun instead.
+- A POSIX timer whose previous signal is still pending counts an overrun instead. A
+  `SIGEV_THREAD_ID` timer signals its thread only while that thread lives in the process; after it
+  exits the signal is dropped, as on Linux.
 - When every thread is waiting, the periodic checks (OOM, code views, load average) stop until a
   thread next enters guest code; armed timers still wake it. Changing `RLIMIT_CPU` does not wake
   the timer thread; the new limit takes effect at its next pass.
@@ -450,9 +452,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
   so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
   for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-wait` case skips them).
-- **POSIX timers aimed at a dead thread signal the process:** `SIGEV_THREAD_ID` timers whose thread
-  exited send to the whole process (Linux drops the signal), and after tid reuse can hit a thread of
-  an unrelated process.
 - **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`) leaves the earlier
   credential, mount and pid-for-children changes in place. A pidfd `setns` combining
   `CLONE_NEWNS` with other types while the fs is shared switches the mount namespace of every fs

@@ -418,8 +418,15 @@ fn expire_group(
         }
     }
     for (tid, sig, info, cpu) in timer_fired {
-        match tid.and_then(|t| k.tasks.get(&t)) {
-            Some(task) => signal::send_to_task(k, task, sig, info),
+        match tid {
+            // SIGEV_THREAD_ID: to that thread while it lives in this process; once it has exited
+            // the signal is dropped, as Linux's posix_timer_event finds no task (never the whole
+            // process, nor a thread that took over its number)
+            Some(t) => {
+                if let Some(task) = k.tasks.get(&t).filter(|task| task.tgid == tgid) {
+                    signal::send_to_task(k, task, sig, info);
+                }
+            }
             None if cpu => signal::send_cpu_timer(k, tgid, sig, info),
             None => signal::send_to_group(k, tgid, sig, info),
         }
