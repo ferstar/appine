@@ -1796,7 +1796,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         if request == tty::TIOCGPTPEER {
             return tty::open_peer(cx, &t, side, mnt, arg as u32);
         }
-        return tty::ioctl(cx, &t, side, request, arg);
+        let readable = file.borrow().readable();
+        return tty::ioctl(cx, &t, side, readable, request, arg);
     }
     let sock = match &file.borrow().kind {
         FileKind::Socket(s) => Some(s.clone()),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY` on a master; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; the line discipline follows n_tty (all 83 recorded scenarios); `/dev/tty` identity)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY` on a master; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; the line discipline follows n_tty (all 83 recorded scenarios); `/dev/tty` identity; taking a controlling terminal)
 
 ## Responsibilities
 
@@ -74,7 +74,8 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   `TIOCGPTPEER` (opens the slave through the master's mount, keeping access mode, `O_APPEND`,
   `O_NONBLOCK`, honouring `O_CLOEXEC`; on a slave or hung master `EIO`).
 - Slave open: no live entry `ENOENT`; locked or no master `EIO`; without `O_NOCTTY` a session
-  leader without a controlling terminal acquires an unowned terminal (section 5).
+  leader without a controlling terminal acquires an unowned terminal when the open has read
+  access (section 5).
 - `/dev/tty` and `/dev/console` both open the caller's controlling terminal as a slave end
   (`ENXIO` without one) and never acquire one.
 
@@ -163,9 +164,12 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 ### Job control
 
 - Acquire: the console's session leader gets the console at spawn; a session leader opening an
-  unowned slave without `O_NOCTTY` acquires it (`session`, `fg` = its group); `TIOCSCTTY` returns
-  0 if already the ctty, `EPERM` for non-leaders or callers with a ctty, and steals a terminal from
-  another session only with argument 1 (clearing that session's links).
+  unowned slave with read access and without `O_NOCTTY` acquires it (`session`, `fg` = its group);
+  `TIOCSCTTY` (Linux's `tiocsctty`) returns 0 if already the ctty, `EPERM` for non-leaders or
+  callers with a ctty, steals a terminal from another session only with argument 1 and
+  `CAP_SYS_ADMIN` (clearing that session's links), and otherwise needs read access to the fd or
+  `CAP_SYS_ADMIN` (`EPERM`). `CAP_SYS_ADMIN` counts only in the initial user namespace, so a
+  sandbox's root cannot steal the terminal it was started on.
 - Foreground: `TIOCSPGRP` needs the caller's ctty (`ENOTTY`), passes the background check (an
   orphaned caller's `EIO` is returned as is), then `EINVAL` for negative values, translates
   through the pid namespace, `EPERM` unless a group with that id exists in the caller's session
@@ -276,11 +280,6 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 ## Confirmed bugs / technical debt
 
-- **`TIOCSCTTY` steals terminals without privilege:** argument 1 takes a terminal from another
-  session with no `CAP_SYS_ADMIN` check, and neither it nor acquisition on open requires read
-  access; a process that calls `setsid` and holds even a write-only fd (group tty has write access
-  on console terminals) becomes the terminal's session and foreground, then reads the victim's
-  input through `/dev/tty` and receives its `^C`/`^Z`.
 - **Echo can grow output without limit:** echoes and `send_xchar` ignore the output limit, so a
   master that never reads while the slave reads input lets the output queue grow unbounded
   (Linux drops echoes when full); one write can also overshoot by `ONLCR` expansion.

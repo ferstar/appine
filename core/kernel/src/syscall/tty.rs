@@ -123,7 +123,11 @@ pub(crate) fn open_slave(
             return Err(Errno::EIO);
         }
     }
-    if flags & oflags::O_NOCTTY == 0 {
+    // As Linux's tty_open_proc_set_tty, only an open with read access makes it the controlling
+    // terminal: write access alone (group tty has it) must not bring reopening it through /dev/tty
+    // or its signals
+    let readable = matches!(flags & oflags::O_ACCMODE, oflags::O_RDONLY | oflags::O_RDWR);
+    if flags & oflags::O_NOCTTY == 0 && readable {
         let mut g = cx.t.group.borrow_mut();
         if g.sid == g.tgid && g.ctty.is_none() && tty.borrow().session.is_none() {
             let mut t = tty.borrow_mut();
@@ -475,6 +479,7 @@ pub(crate) fn ioctl(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
     (master, born): (bool, u32),
+    readable: bool,
     request: u32,
     arg: u64,
 ) -> SysResult {
@@ -734,12 +739,18 @@ pub(crate) fn ioctl(
             if sid != tgid || has_ctty {
                 return Err(Errno::EPERM);
             }
-            // Already the controlling terminal of another session: it can be taken over only with
-            // arg 1 (root). Unlike Linux, the caller's CAP_SYS_ADMIN is not checked
-            if let Some(other) = tty.borrow().session {
-                if arg != 1 {
-                    return Err(Errno::EPERM);
-                }
+            // Linux's tiocsctty: the controlling terminal of another session can be taken over
+            // only with arg 1 and CAP_SYS_ADMIN (in the initial user namespace, so not by a
+            // sandbox's root), and without read access only with CAP_SYS_ADMIN
+            let admin = cx.cred().capable(cap::SYS_ADMIN);
+            let other = tty.borrow().session;
+            if other.is_some() && (arg != 1 || !admin) {
+                return Err(Errno::EPERM);
+            }
+            if !readable && !admin {
+                return Err(Errno::EPERM);
+            }
+            if let Some(other) = other {
                 for g in cx.kr().groups.values() {
                     let mut g = g.borrow_mut();
                     if g.sid == other {

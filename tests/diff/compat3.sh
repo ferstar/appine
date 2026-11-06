@@ -1,5 +1,6 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
-# not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types
+# not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
+# taking a controlling terminal
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -325,3 +326,98 @@ int main(void)
 C
 gcc -O1 -o edges edges.c && ./edges
 rm -f edges edges.c
+
+# Taking a controlling terminal: TIOCSCTTY takes one from another session only with argument 1
+# and CAP_SYS_ADMIN, and needs read access to the fd without CAP_SYS_ADMIN; opening a slave
+# without O_NOCTTY makes it the controlling terminal only with read access. The tests drop
+# CAP_SYS_ADMIN (docker's root has none)
+cat > ctty.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+
+static void show(const char *what, long r)
+{
+    if (r < 0)
+        printf("%s: %s\n", what, strerror(errno));
+    else
+        printf("%s: %ld\n", what, r);
+}
+
+static void drop_sys_admin(void)
+{
+    /* capget/capset's version 3 header and data (CAP_SYS_ADMIN is bit 21) */
+    struct { uint32_t version; int pid; } h = {0x20080522, 0};
+    struct { uint32_t effective, permitted, inheritable; } d[2];
+    syscall(SYS_capget, &h, d);
+    d[0].effective &= ~(1u << 21);
+    syscall(SYS_capset, &h, d);
+}
+
+static char *new_pty(int *master)
+{
+    *master = posix_openpt(O_RDWR | O_NOCTTY);
+    grantpt(*master);
+    unlockpt(*master);
+    return ptsname(*master);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    int m1, m2, done[2];
+    char *name = strdup(new_pty(&m1));
+    pipe(done);
+    /* The victim's session owns the first terminal */
+    pid_t victim = fork();
+    if (victim == 0) {
+        setsid();
+        int fd = open(name, O_RDWR);
+        printf("victim got it: %d\n", tcgetsid(fd) == getpid());
+        char x;
+        read(done[0], &x, 1);
+        printf("victim still has it: %d\n", tcgetsid(fd) == getpid());
+        _exit(0);
+    }
+    usleep(100000);
+    pid_t pid = fork();
+    if (pid == 0) {
+        drop_sys_admin();
+        setsid();
+        int fd = open(name, O_RDWR | O_NOCTTY);
+        show("TIOCSCTTY 0 on another session's terminal", ioctl(fd, TIOCSCTTY, 0));
+        show("TIOCSCTTY 1 without CAP_SYS_ADMIN", ioctl(fd, TIOCSCTTY, 1));
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    write(done[1], "x", 1);
+    waitpid(victim, NULL, 0);
+
+    char *name2 = strdup(new_pty(&m2));
+    pid = fork();
+    if (pid == 0) {
+        drop_sys_admin();
+        setsid();
+        int w = open(name2, O_WRONLY);
+        show("after a write-only open, /dev/tty", open("/dev/tty", O_RDWR) >= 0 ? 0 : -1);
+        show("TIOCSCTTY on a write-only fd", ioctl(w, TIOCSCTTY, 0));
+        int r = open(name2, O_RDONLY);
+        show("after a read-only open, /dev/tty", open("/dev/tty", O_RDWR) >= 0 ? 0 : -1);
+        close(r);
+        _exit(0);
+    }
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+C
+gcc -O1 -o ctty ctty.c && ./ctty
+rm -f ctty ctty.c
