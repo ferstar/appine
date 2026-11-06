@@ -4,7 +4,7 @@
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
 # CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files; thread
-# names as bytes
+# names as bytes; RssAnon, RssFile and RssShmem
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1197,3 +1197,72 @@ int main(void)
 C
 gcc -O1 -D_GNU_SOURCE -o rawcomm rawcomm.c && ./rawcomm
 rm -f rawcomm rawcomm.c
+
+# status splits VmRSS into RssAnon, RssFile and RssShmem: touching 8 MB of private anonymous
+# memory, 4 MB of shared anonymous memory and reading 4 MB of a mapped file grow each (rounded to
+# MB; the totals themselves differ between kernels)
+cat > rsssplit.c <<'C'
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+struct rss { long vm, anon, file, shmem; };
+
+static struct rss now(void)
+{
+    char buf[8192];
+    int fd = open("/proc/self/status", O_RDONLY), n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    buf[n] = 0;
+    struct rss r = {-1, -1, -1, -1};
+    char *p;
+    if ((p = strstr(buf, "VmRSS:")))
+        r.vm = strtol(p + 6, NULL, 10);
+    if ((p = strstr(buf, "RssAnon:")))
+        r.anon = strtol(p + 8, NULL, 10);
+    if ((p = strstr(buf, "RssFile:")))
+        r.file = strtol(p + 8, NULL, 10);
+    if ((p = strstr(buf, "RssShmem:")))
+        r.shmem = strtol(p + 9, NULL, 10);
+    return r;
+}
+
+static long mb(long kb) { return (kb + 512) / 1024; }
+
+int main(void)
+{
+    const size_t M = 1 << 20;
+    int fd = open("rss.file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char *junk = malloc(4 * M);
+    memset(junk, 1, 4 * M);
+    write(fd, junk, 4 * M);
+    free(junk);
+    struct rss a = now();
+    printf("VmRSS is the sum: %d\n", a.vm == a.anon + a.file + a.shmem);
+    char *p = mmap(NULL, 8 * M, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memset(p, 1, 8 * M);
+    struct rss b = now();
+    printf("after 8 MB anonymous: anon +%ld MB, file +%ld, shmem +%ld\n", mb(b.anon - a.anon),
+           mb(b.file - a.file), mb(b.shmem - a.shmem));
+    char *q = mmap(NULL, 4 * M, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    memset(q, 1, 4 * M);
+    struct rss c = now();
+    printf("after 4 MB shared: anon +%ld MB, file +%ld, shmem +%ld\n", mb(c.anon - b.anon),
+           mb(c.file - b.file), mb(c.shmem - b.shmem));
+    char *f = mmap(NULL, 4 * M, PROT_READ, MAP_PRIVATE, fd, 0);
+    volatile long sum = 0;
+    for (size_t i = 0; i < 4 * M; i += 4096)
+        sum += f[i];
+    struct rss d = now();
+    printf("after reading a 4 MB file: anon +%ld MB, file +%ld, shmem +%ld\n", mb(d.anon - c.anon),
+           mb(d.file - c.file), mb(d.shmem - c.shmem));
+    printf("VmRSS is the sum: %d\n", d.vm == d.anon + d.file + d.shmem);
+    unlink("rss.file");
+    return 0;
+}
+C
+gcc -O1 -o rsssplit rsssplit.c && ./rsssplit
+rm -f rsssplit rsssplit.c

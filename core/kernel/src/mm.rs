@@ -2959,6 +2959,45 @@ impl Mm {
         if fresh { plan.fixed } else { plan.estimate() }
     }
 
+    /// Resident pages split as Linux's RssAnon, RssFile and RssShmem (`/proc/<pid>/status`):
+    /// private anonymous memory, borrowed pages and private file mappings that have been written
+    /// count as anonymous, shared anonymous memory, SysV shm and memfds as shmem, other file
+    /// mappings as file. Measured the way [`Mm::resident_pages`] measures, with no mincore
+    /// merging across VMAs.
+    pub fn resident_split(&self) -> (u64, u64, u64) {
+        let (mut anon, mut file, mut shmem) = (self.cow.borrow().borrowed.len() as u64, 0, 0);
+        let now = std::time::Instant::now();
+        let mincore = |host: usize, len: u64| {
+            appine_hal::resident_pages(host as *const u8, len as usize) as u64
+        };
+        for (&s, v) in &self.vmas {
+            let pages = match (v.backing, v.file_id) {
+                (Backing::Anonymous, _) if !v.written.get() => continue,
+                (Backing::Anonymous, _) if v.len > EAGER_MAX => self
+                    .touched_windows(s)
+                    .into_iter()
+                    .map(|(lo, hi)| mincore(Self::own_page(s, v, lo).as_ptr() as usize, hi - lo))
+                    .sum(),
+                (Backing::PrivateFile, Some(id)) | (Backing::Shared, Some(id))
+                    if !(v.backing == Backing::PrivateFile && v.written.get()) =>
+                {
+                    FileResidency::get((id.0, id.1, id.2, v.len), now, || {
+                        appine_hal::resident_pages(v.host.as_ptr(), v.len as usize) as u64
+                    })
+                }
+                _ => mincore(v.host.as_ptr() as usize, v.len),
+            };
+            match v.backing {
+                Backing::Anonymous => anon += pages,
+                Backing::PrivateFile if v.written.get() => anon += pages,
+                Backing::PrivateFile => file += pages,
+                Backing::Shared if shmem_like(v) => shmem += pages,
+                Backing::Shared => file += pages,
+            }
+        }
+        (anon, file, shmem)
+    }
+
     /// What [`Mm::resident_pages`] measures: pages known without mincore, and the host ranges to
     /// mincore.
     fn rss_plan(&self) -> RssPlan {
@@ -3020,12 +3059,11 @@ impl Mm {
                 } else {
                     match v.backing {
                         Backing::Shared => {
-                            let anon = offset.is_none()
-                                || v.shm.is_some()
-                                || v.name.as_deref().is_some_and(|n| {
-                                    n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")
-                                });
-                            let bit = if anon { ANON_SHARED } else { MAPPED_SHARED };
+                            let bit = if shmem_like(v) {
+                                ANON_SHARED
+                            } else {
+                                MAPPED_SHARED
+                            };
                             if filter & bit != 0 { v.len } else { 0 }
                         }
                         Backing::Anonymous if filter & ANON_PRIVATE != 0 && v.written.get() => {
@@ -4244,6 +4282,17 @@ pub struct Region {
 }
 
 /// One sample of resident memory ([`Mm::rss_plan`]).
+/// A shared mapping of anonymous memory (shared anonymous, SysV shm, memfd, a deleted file):
+/// Linux's shmem, as core dumps' `ANON_SHARED` and status's RssShmem count it.
+fn shmem_like(v: &Vma) -> bool {
+    v.backing == Backing::Shared
+        && (v.file_id.is_none()
+            || v.shm.is_some()
+            || v.name
+                .as_deref()
+                .is_some_and(|n| n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")))
+}
+
 struct RssPlan {
     /// 4K pages known without mincore: borrowed pages and cached file mappings.
     fixed: u64,

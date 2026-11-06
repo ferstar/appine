@@ -2471,7 +2471,10 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
     let g = g.borrow();
     let task = ps.task(pid, tid);
     let (state, state_name) = state_of(ps, &g, pid, tid);
-    let (vsize, rss) = mem_of(task.as_deref());
+    // The size only: the resident pages are measured below, split by kind
+    let vsize = task
+        .as_ref()
+        .map_or(0, |t| t.res.borrow().mm.borrow().size());
     let (sigign, sigcgt) = sig_dispositions(&g);
     let (umask, fdsize) = task.as_ref().map_or((0o022, 0), |t| {
         let res = t.res.borrow();
@@ -2555,8 +2558,21 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
             .as_ref()
             .map_or(0, |t| t.res.borrow().mm.borrow().locked_bytes());
         writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
+        // VmRSS is the sum of the three kinds, as on Linux
+        let (anon, file, shmem) = task
+            .as_ref()
+            .map_or((0, 0, 0), |t| t.res.borrow().mm.borrow().resident_split());
+        let rss = anon + file + shmem;
         let hwm = g.maxrss_kb.max(rss * 4);
         writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
+        writeln!(
+            s,
+            "RssAnon:\t{:>8} kB\nRssFile:\t{:>8} kB\nRssShmem:\t{:>8} kB",
+            anon * 4,
+            file * 4,
+            shmem * 4
+        )
+        .unwrap();
         // Grows-down mappings are the stack (Linux's stack_vm); data and code are not told
         // apart; no swap
         let stack = task

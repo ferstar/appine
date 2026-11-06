@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`; names as bytes)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`; names as bytes; the RSS split)
 
 ## Responsibilities
 
@@ -128,8 +128,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   thread's or the group's CPU times depending on the view; `tty_nr` from the controlling terminal.
 - `status`: ids translated into the reader's user namespace, `NStgid`/`NSpid`/`NSpgid`/`NSsid`
   from the instance's namespace down, capabilities, `NoNewPrivs`, `Seccomp`, signal masks; memory
-  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmStk` the grows-down
-  mappings, exe/lib/PTE/swap 0; omitted with no live task); `FDSize` rounded to 64;
+  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
+  `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
+  exe/lib/PTE/swap 0; omitted with no live task); `FDSize` rounded to 64;
   `Cpus_allowed_list` lists every guest CPU. `maps` and `smaps` escape a newline in a mapped
   file's path as `\012` (Linux's `seq_file_path`).
   `statm` is `size rss 0 0 0 rss 0`.
@@ -411,8 +412,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   where Linux 6.1 shows real values only to readers passing the ptrace-read check (others see 1/1
   for code and 0 elsewhere), so debuggers and profilers reading the layout get zeros and any user
   learns other processes' argument and environment addresses.
-- **`status` lacks `RssAnon`/`RssFile`/`RssShmem`:** memory monitors and runtimes that split
-  resident memory by type from `/proc/<pid>/status` find no such lines.
 - **A reaped process's held directory behaves like a live or missing one:** through a kept
   `/proc/<pid>` fd, lookups give `ENOENT` (Linux `ESRCH`), listing still succeeds (Linux
   `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as

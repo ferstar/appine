@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork; the RSS split)
 
 ## Responsibilities
 
@@ -429,6 +429,11 @@ signals may still be delivered).
   readahead fills the page cache around touched pages) and a borrowed page only when the owner's
   host page is resident. `resident_pages` counts every borrowed page. Reserved VMAs never count.
 - `stack_bytes` (VmStk) sums the grows-down VMAs.
+- `resident_split` (status's `RssAnon`/`RssFile`/`RssShmem`) measures each VMA as
+  `resident_pages` does and sorts it: private anonymous memory, borrowed pages and written private
+  file mappings as anonymous (all of a written file mapping, where Linux counts only its copied
+  pages), shared anonymous memory, SysV shm, memfds and deleted files as shmem (`shmem_like`, also
+  used by core dumps' `ANON_SHARED`), other file mappings as file.
 - `resident_pages` (VmRSS, statm, cgroup, OOM victim choice) skips never-written private anonymous
   VMAs, measures private anonymous VMAs over 1 MB only over windows with entries, and uses the 1 s
   file-residency cache for unwritten private file mappings and all shared mappings. `resident_in`
