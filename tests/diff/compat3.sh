@@ -4,7 +4,8 @@
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
 # CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files; thread
-# names as bytes; RssAnon, RssFile and RssShmem; AF_UNIX reads of nothing and shutdown
+# names as bytes; RssAnon, RssFile and RssShmem; AF_UNIX reads of nothing and shutdown; robust
+# mutexes on copy-on-write pages
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1328,3 +1329,75 @@ int main(void)
 C
 gcc -O1 -o unixzero unixzero.c && ./unixzero
 rm -f unixzero unixzero.c
+
+# A thread that dies holding a robust mutex whose page is still shared copy-on-write with a forked
+# child: the lock still gets FUTEX_OWNER_DIED, so the next locker sees EOWNERDEAD
+cat > robustcow.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+/* In private anonymous memory, which fork lends copy-on-write (a data segment is copied) */
+static pthread_mutex_t *m;
+static int locked[2], die[2];
+static volatile pid_t holder_tid;
+
+static void *holder(void *arg)
+{
+    (void)arg;
+    holder_tid = syscall(SYS_gettid);
+    pthread_mutex_lock(m);
+    write(locked[1], "l", 1);
+    char x;
+    read(die[0], &x, 1);
+    /* Exits holding the lock, without libc's own robust-list cleanup in pthread_exit, so the
+     * kernel walks the robust list */
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+int main(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+    /* musl hands only process-shared robust mutexes to the kernel's robust list */
+    pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+    m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pthread_mutex_init(m, &a);
+    pipe(locked);
+    pipe(die);
+    pthread_t t;
+    pthread_create(&t, NULL, holder, NULL);
+    char x;
+    read(locked[0], &x, 1);
+    /* The child keeps the pages shared until the holder has died */
+    pid_t c = fork();
+    if (c == 0) {
+        usleep(500000);
+        _exit(0);
+    }
+    write(die[1], "d", 1);
+    /* pthread_join would wait for libc's own exit path: wait for the thread to be gone instead */
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d", holder_tid);
+    for (int i = 0; i < 300 && access(path, F_OK) == 0; i++)
+        usleep(10000);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 2;
+    int r = pthread_mutex_timedlock(m, &ts);
+    printf("lock after the holder died: %s\n", r == EOWNERDEAD ? "EOWNERDEAD" : strerror(r));
+    waitpid(c, NULL, 0);
+    return 0;
+}
+C
+gcc -O1 -pthread -o robustcow robustcow.c && ./robustcow
+rm -f robustcow robustcow.c

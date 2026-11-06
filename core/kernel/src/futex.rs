@@ -213,8 +213,18 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     if !addr.is_multiple_of(4) {
         return;
     }
-    let Some(host) = mm.translate(addr, prot::READ | prot::WRITE) else {
-        return;
+    // A copy-on-write page not written since fork, or one without an entry yet, is made writable
+    // first, as for any kernel write (Mm::write)
+    let need = prot::READ | prot::WRITE;
+    let host = match mm.translate(addr, need) {
+        Some(host) => host,
+        None if mm.cow_break(addr) || mm.fault_in(addr, need) => {
+            let Some(host) = mm.translate(addr, need) else {
+                return;
+            };
+            host
+        }
+        None => return,
     };
     // SAFETY: 4-byte-aligned, writable guest memory; the host memory is held by the address space
     let lock = unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) };

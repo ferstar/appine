@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork; the RSS split)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork; the RSS split; robust futexes on CoW pages)
 
 ## Responsibilities
 
@@ -586,9 +586,6 @@ signals may still be delivered).
   large shared reservation can fail with `ENOMEM`.
 - **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
   to Linux and the function's own description of the bit.
-- **Robust futex death skips CoW pages:** `owner_died` looks up the lock word with `translate`,
-  which fails on read-only CoW entries, so a thread dying with a robust lock on a page not written
-  since fork never sets `FUTEX_OWNER_DIED` or wakes waiters.
 - **Latent CoW leak:** if `return_loans` ever ran while the owner was mutably borrowed, the page
   would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
   loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,

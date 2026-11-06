@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals; thread-directed timers)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals; thread-directed timers; robust futexes on CoW pages)
 
 ## Responsibilities
 
@@ -304,7 +304,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Wait: compare and enqueue under the futex lock, then wait alone (no channels); dequeued means
   woken; timeouts are `ETIMEDOUT`; interruptions restart (with a restart block when timed).
 - Wake removes up to n matching waiters in FIFO order and signals their events directly. The robust
-  list and `clear_child_tid` at thread exit also wake waiters.
+  list and `clear_child_tid` at thread exit also wake waiters; a robust lock word on a
+  copy-on-write page (not written since fork) or a page without an entry is made writable first
+  (`cow_break`, `fault_in`), as Linux faults it in.
 - Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
   share one queue without lost wakeups.
 
