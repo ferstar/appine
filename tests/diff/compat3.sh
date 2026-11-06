@@ -1,6 +1,6 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
-# taking a controlling terminal; kill with a thread id; memfd owners
+# taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -515,3 +515,61 @@ int main(void)
 C
 gcc -O1 -o memfdown memfdown.c && ./memfdown
 rm -f memfdown memfdown.c
+
+# A file whose last name is gone gets no new one: linking it through /proc/self/fd/N is ENOENT (a
+# live one links), a memfd is EXDEV; linkat with AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH (ENOENT;
+# docker's root has none)
+cat > relink.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void show(const char *what, long r)
+{
+    if (r < 0)
+        printf("%s: %s\n", what, strerror(errno));
+    else
+        printf("%s: %ld\n", what, r);
+    fflush(stdout);
+}
+
+int main(void)
+{
+    char p[64];
+    int fd = open("lk.a", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    write(fd, "x", 1);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    show("link a live file through /proc/self/fd", linkat(AT_FDCWD, p, AT_FDCWD, "lk.b", AT_SYMLINK_FOLLOW));
+    unlink("lk.a");
+    unlink("lk.b");
+    show("link an unlinked file through /proc/self/fd", linkat(AT_FDCWD, p, AT_FDCWD, "lk.c", AT_SYMLINK_FOLLOW));
+    show("lk.c exists", access("lk.c", F_OK));
+    int m = memfd_create("m", 0);
+    snprintf(p, sizeof p, "/proc/self/fd/%d", m);
+    show("link a memfd through /proc/self/fd", linkat(AT_FDCWD, p, AT_FDCWD, "lk.d", AT_SYMLINK_FOLLOW));
+    int live = open("lk.e", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fork() == 0) {
+        /* capget/capset's version 3 header and data (CAP_DAC_READ_SEARCH is bit 2) */
+        struct { uint32_t version; int pid; } h = {0x20080522, 0};
+        struct { uint32_t effective, permitted, inheritable; } d[2];
+        syscall(SYS_capget, &h, d);
+        d[0].effective &= ~(1u << 2);
+        syscall(SYS_capset, &h, d);
+        show("AT_EMPTY_PATH without CAP_DAC_READ_SEARCH", linkat(live, "", AT_FDCWD, "lk.f", AT_EMPTY_PATH));
+        _exit(0);
+    }
+    wait(NULL);
+    unlink("lk.e");
+    unlink("lk.f");
+    return 0;
+}
+C
+gcc -O1 -o relink relink.c && ./relink
+rm -f relink relink.c

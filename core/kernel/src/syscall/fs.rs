@@ -4670,8 +4670,13 @@ pub(super) fn linkat(
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
     }
-    let oldpath = read_path(cx, oldpath)?;
+    // Linux 6.1's do_linkat: linking an fd by AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH, or anyone
+    // could give a name to a file passed to it
     let cred = cx.cred();
+    if flags & AT_EMPTY_PATH != 0 && !cred.capable(cap::DAC_READ_SEARCH) {
+        return Err(Errno::ENOENT);
+    }
+    let oldpath = read_path(cx, oldpath)?;
     let src = lookup_at_or_fd(
         cx,
         &cred,
@@ -4683,6 +4688,21 @@ pub(super) fn linkat(
     let newpath = read_path(cx, newpath)?;
     let start = start_dir(cx, newdirfd, &newpath)?;
     let vfs = cx.vfs()?;
+    // A deleted regular file reached through /proc/<pid>/fd/N is the open file itself
+    // (follow_fd); Linux finds its dentry on the mount it was opened through, so the link is EXDEV
+    // into another mount and refused as unlinked (ENOENT, below) in the same one
+    let src = match src {
+        Node::Pseudo(_, PseudoNode::OpenFd(pid, fd)) => {
+            let file = cx.view(&vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
+            let f = file.borrow();
+            match &f.kind {
+                // A memfd is on no mount of the caller's (Linux's internal shm mount): EXDEV
+                FileKind::Regular { ino, .. } if !f.pseudo => Node::Store(f.mnt, *ino),
+                _ => Node::Pseudo(f.mnt, PseudoNode::OpenFd(pid, fd)),
+            }
+        }
+        src => src,
+    };
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &newpath)?;
     if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
         return Err(Errno::EEXIST);
@@ -4706,7 +4726,8 @@ pub(super) fn linkat(
     // permission): without being the owner or having CAP_FOWNER, only readable and writable
     // regular files can be linked, and not setuid ones or executable setgid ones
     if cx.kr().protected_hardlinks {
-        let st = vfs.store().stat(src)?;
+        // The database row: a deleted file's object may already be gone
+        let st = vfs.store().attrs(src)?;
         let setgid_exec = mode::S_ISGID | 0o010;
         let safe = st.mode & mode::S_IFMT == mode::S_IFREG
             && st.mode & mode::S_ISUID == 0

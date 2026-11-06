@@ -937,8 +937,14 @@ impl Store {
     /// Adds a hard link to an existing non-directory inode.
     pub fn link(&self, parent: Ino, name: &[u8], ino: Ino) -> Result<(), Errno> {
         self.transaction(|s| {
-            if s.stat_row(ino)?.is_dir() {
+            let row = s.stat_row(ino)?;
+            if row.is_dir() {
                 return Err(Errno::EPERM);
+            }
+            // Linux's vfs_link: an inode whose last name is gone (a deleted file still open, a
+            // memfd) gets no new one; its object is doomed and would be deleted under the new name
+            if row.nlink == 0 {
+                return Err(Errno::ENOENT);
             }
             s.add_dentry(parent, name, ino)?;
             s.db()
@@ -2896,6 +2902,8 @@ mod tests {
         file.write_all(b"data").unwrap();
         let st = s.stat_open(anon, &file).unwrap();
         assert_eq!((st.nlink, st.size, st.uid, st.gid), (0, 4, 1000, 1001));
+        // An inode without names gets none again (its object is gone)
+        assert_eq!(s.link(ROOT, b"anon", anon), Err(Errno::ENOENT));
         s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
         // The timer thread commits when it is due; without the commit, opening the store below
         // would wait until the timeout

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners and lock ranges)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners, lock ranges, linkat)
 
 ## Responsibilities
 
@@ -355,11 +355,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `RLIMIT_FSIZE`, leases; ftruncate `EINVAL` unless writable and regular, `EBADF` on `O_PATH`.
 - mknodat: regular, char, block, FIFO, socket (directory `EPERM`); devices need `CAP_MKNOD` and
   pass the device filter (whiteouts exempt). renameat2: `RENAME_NOREPLACE`, `RENAME_EXCHANGE`
-  (`RENAME_WHITEOUT` `EINVAL`); `EXDEV` before the `.`/`..` checks. linkat: `EXDEV` for synthetic
-  nodes or different mounts, then `protected_hardlinks`, then directory write permission;
-  `AT_EMPTY_PATH` needs no capability, a magic link followed with `AT_SYMLINK_FOLLOW` reaches the
-  same store node, and a source whose link count is already 0 is accepted (no `EMLINK` limit
-  either).
+  (`RENAME_WHITEOUT` `EINVAL`); `EXDEV` before the `.`/`..` checks. linkat: `AT_EMPTY_PATH`
+  without `CAP_DAC_READ_SEARCH` is `ENOENT` (6.1's `do_linkat`); `EXDEV` for synthetic nodes or
+  different mounts, then `protected_hardlinks` (judged on the database row), then directory write
+  permission; a magic link followed with `AT_SYMLINK_FOLLOW` reaches the same store node, a deleted
+  file's link the store node on the mount it was opened through, and a memfd's nothing (`EXDEV`);
+  a source whose link count is 0 is `ENOENT` (the store refuses it); there is no `EMLINK` limit.
 - getdents64 takes the listing (with `.` and `..`) on the first call and refreshes it only on a
   seek to 0; `d_off` is index+1. chdir/fchdir/chroot check search only on store directories.
   umask lives in the fs context.
@@ -599,11 +600,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   other users' open files and follow the links to their nodes, reaching files in directories it
   cannot search, and reopen their pipes with no permission check (Linux denies with `EACCES`).
   See the matching `kernel/procfs` item.
-- **Relinking unlinked files creates dangling names:** `linkat` accepts an nlink-0 source (through
-  `AT_EMPTY_PATH`, which also lacks Linux's `CAP_DAC_READ_SEARCH` check, or `/proc/self/fd/N`
-  with `AT_SYMLINK_FOLLOW`); the inode stays doomed, so after commit the reaper deletes its object
-  and the new name points at nothing (Linux returns `ENOENT`). A stale inotify delete-self entry can
-  then fire for later watches. See the matching `kernel/store` item.
 - **`system.*` xattrs are unprotected:** any user who can resolve a file can set or remove its
   `system.*` attributes, including POSIX ACL names, which are stored raw and never enforced (Linux
   requires the owner or `CAP_FOWNER` and validates ACLs); root in a user namespace cannot set file

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes)
 
 ## Responsibilities
 
@@ -93,7 +93,8 @@ provider and rootfs installation UI (`android`).
 ### Namespace operations
 
 - Every operation is atomic. Hardlinks are several dentries for one inode (directories cannot be
-  linked, `EPERM`).
+  linked, `EPERM`; an inode with link count 0 cannot get a name again, `ENOENT`, as its object is
+  doomed).
 - Errors: `EEXIST` (name taken, no-replace rename, `XATTR_CREATE`), `ENOTDIR`, `ENOENT` (missing name,
   creating inside a deleted directory), `EISDIR` (unlink of a directory), `EBUSY` (rmdir of root),
   `ENOTEMPTY`, `EINVAL` (moving a directory under itself), `ENODATA` (missing xattr); SQLite errors
@@ -257,13 +258,6 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **`linkat(AT_EMPTY_PATH)` re-links unlinked files:** `link` accepts an nlink-0 source; while the
-  object still exists (deferred transaction or reaper not yet run) the link succeeds and nlink goes
-  back to 1, but the inode stays doomed, so the object is deleted after commit and the new name
-  points to nothing (boot cleanup never removes it). Linux returns `ENOENT` (and requires
-  `CAP_DAC_READ_SEARCH` for `AT_EMPTY_PATH`, which is not checked); with `protected_hardlinks=0`
-  even reaped files and memfds link into dangling names. `/proc/self/fd/N` links of unlinked files
-  fail with `EXDEV` instead of `ENOENT`.
 - **Storage leaks:** objects created inside a rolled-back savepoint (e.g. a failed import) are
   dropped from the uncommitted range by the next commit and stay on disk until their number is
   reused by a regular file (forever if reused by another kind); the shared `lock` header is not
