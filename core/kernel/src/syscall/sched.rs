@@ -32,8 +32,21 @@ const SCHED_RR: i32 = 2;
 const SCHED_BATCH: i32 = 3;
 const SCHED_IDLE: i32 = 5;
 const SCHED_DEADLINE: i32 = 6;
-const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+pub(super) const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 1;
+/// Keep the current policy, or the current parameters (nice, priority, deadline), and set only the
+/// rest (uclampset uses both).
+const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+/// Set the minimum or maximum utilization clamp (Linux built with uclamp, as Android and
+/// distribution kernels are): only recorded.
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+/// Every flag of Linux 6.1 (`SCHED_FLAG_ALL`), including the deadline ones `SCHED_FLAG_RECLAIM` and
+/// `SCHED_FLAG_DL_OVERRUN`, accepted and not used.
+const SCHED_FLAG_ALL: u64 = 0x7f;
+/// The utilization scale (`SCHED_CAPACITY_SCALE`).
+const UCLAMP_MAX: u32 = 1024;
 
 /// Sizes of `struct sched_attr`: the first version, and the version supported here (with
 /// util_min/util_max).
@@ -408,32 +421,80 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     }
     let word = |off: usize| u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     let long = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
-    let policy = word(4) as i32;
+    let mut policy = word(4) as i32;
     let sched_flags = long(8);
-    let nice = word(16) as i32;
-    let priority = word(20) as i32;
+    // sched_copy_attr: the clamps need the structure that has them; nice is cut to -20..19
+    let clamps = sched_flags & (SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_UTIL_CLAMP_MAX);
+    if clamps != 0 && size < SCHED_ATTR_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut nice = (word(16) as i32).clamp(-20, 19);
+    let mut priority = word(20) as i32;
+    let mut dl = (long(24), long(32), long(40));
     if policy < 0 {
         return Err(Errno::EINVAL);
     }
     let task = target(cx, pid)?;
-    if sched_flags & !SCHED_FLAG_RESET_ON_FORK != 0 {
+    // SCHED_FLAG_KEEP_POLICY keeps the policy and its reset-on-fork; SCHED_FLAG_KEEP_PARAMS takes
+    // the current parameters (get_params)
+    let (cur_policy, cur_priority) = task.as_ref().map_or((SCHED_OTHER, 0), |t| t.sched.get());
+    let keep_policy = sched_flags & SCHED_FLAG_KEEP_POLICY != 0;
+    if keep_policy {
+        policy = cur_policy & !SCHED_RESET_ON_FORK;
+    }
+    if sched_flags & SCHED_FLAG_KEEP_PARAMS != 0
+        && let Some(t) = &task
+    {
+        nice = t.nice.get();
+        priority = cur_priority;
+        dl = t.deadline.get();
+    }
+    if sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // uclamp_validate: each at most 1024, or -1 for the default; the minimum not above the maximum
+    let (util_min, util_max) = (word(48), word(52));
+    let given = |flag: u64, v: u32| (sched_flags & flag != 0 && v != u32::MAX).then_some(v);
+    let (min, max) = (
+        given(SCHED_FLAG_UTIL_CLAMP_MIN, util_min),
+        given(SCHED_FLAG_UTIL_CLAMP_MAX, util_max),
+    );
+    if min.is_some_and(|v| v > UCLAMP_MAX)
+        || max.is_some_and(|v| v > UCLAMP_MAX)
+        || min.zip(max).is_some_and(|(lo, hi)| lo > hi)
+    {
         return Err(Errno::EINVAL);
     }
     if policy == SCHED_DEADLINE {
-        let (runtime, deadline, period) = (long(24), long(32), long(40));
-        return set_deadline(cx, task.as_ref(), priority, (runtime, deadline, period));
-    }
-    let reset = if sched_flags & SCHED_FLAG_RESET_ON_FORK != 0 {
-        SCHED_RESET_ON_FORK
+        set_deadline(cx, task.as_ref(), priority, dl)?;
     } else {
-        0
-    };
-    set_policy(cx, task.as_ref(), policy | reset, priority)?;
-    if !matches!(policy, SCHED_FIFO | SCHED_RR)
+        let reset = if keep_policy {
+            cur_policy & SCHED_RESET_ON_FORK
+        } else if sched_flags & SCHED_FLAG_RESET_ON_FORK != 0 {
+            SCHED_RESET_ON_FORK
+        } else {
+            0
+        };
+        set_policy(cx, task.as_ref(), policy | reset, priority)?;
+        if !matches!(policy, SCHED_FIFO | SCHED_RR)
+            && let Some(t) = &task
+        {
+            let tid = t.tid.get();
+            setpriority(cx, PRIO_PROCESS, tid, nice)?;
+        }
+    }
+    // __setscheduler_uclamp: -1 goes back to the default
+    if clamps != 0
         && let Some(t) = &task
     {
-        let tid = t.tid.get();
-        setpriority(cx, PRIO_PROCESS, tid, nice)?;
+        let (mut lo, mut hi) = t.uclamp.get();
+        if sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN != 0 {
+            lo = min.unwrap_or(0);
+        }
+        if sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX != 0 {
+            hi = max.unwrap_or(UCLAMP_MAX);
+        }
+        t.uclamp.set((lo, hi));
     }
     Ok(0)
 }
@@ -525,8 +586,9 @@ pub(super) fn sched_getattr(
         b[32..40].copy_from_slice(&deadline.to_le_bytes());
         b[40..48].copy_from_slice(&period.to_le_bytes());
     }
-    // util_max defaults to 1024 (SCHED_CAPACITY_SCALE)
-    b[52..56].copy_from_slice(&1024u32.to_le_bytes());
+    let (util_min, util_max) = task.as_ref().map_or((0, UCLAMP_MAX), |t| t.uclamp.get());
+    b[48..52].copy_from_slice(&util_min.to_le_bytes());
+    b[52..56].copy_from_slice(&util_max.to_le_bytes());
     cx.mm()
         .write(crate::uaccess::UserSlice::new(attr, n), &b[..n])
         .map(|()| 0)

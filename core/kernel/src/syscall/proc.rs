@@ -477,6 +477,14 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     task.nice.set(nice);
     *task.ioprio.borrow_mut() = super::sched::inherit_ioprio(&cx.task.ioprio.borrow(), flags);
     task.deadline.set(cx.task.deadline.get());
+    // uclamp_fork: copied, back to the defaults with SCHED_RESET_ON_FORK
+    task.uclamp.set(
+        if cx.task.sched.get().0 & super::sched::SCHED_RESET_ON_FORK != 0 {
+            (0, 1024)
+        } else {
+            cx.task.uclamp.get()
+        },
+    );
     let slack = cx.task.timerslack.get().0;
     task.timerslack.set((slack, slack));
     // The seccomp mode and filter chain are inherited as on Linux

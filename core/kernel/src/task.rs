@@ -106,6 +106,8 @@ pub(crate) struct Task {
     pub ioprio: RefCell<Option<Rc<Cell<u16>>>>,
     /// (runtime, deadline, period) of `SCHED_DEADLINE`, in nanoseconds.
     pub deadline: Cell<(u64, u64, u64)>,
+    /// The utilization clamps requested with sched_setattr (min, max, out of 1024): only recorded.
+    pub uclamp: Cell<(u32, u32)>,
     /// The timer slack of `PR_SET_TIMERSLACK` and its default (nanoseconds): only recorded. For a
     /// new thread both are the parent thread's current slack; setting it to 0 restores the default.
     pub timerslack: Cell<(u64, u64)>,
@@ -225,6 +227,7 @@ impl Task {
             sched: Cell::new((0, 0)),
             ioprio: RefCell::new(None),
             deadline: Cell::new((0, 0, 0)),
+            uclamp: Cell::new((0, 1024)),
             timerslack: Cell::new((50_000, 50_000)),
             affinity: Cell::new(u64::MAX),
             robust_list: Cell::new((0, 0)),

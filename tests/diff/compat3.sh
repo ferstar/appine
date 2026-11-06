@@ -2,7 +2,7 @@
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
-# thread; /proc/vmstat; RLIMIT_MSGQUEUE
+# thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -909,3 +909,50 @@ done
 
 # RLIMIT_MSGQUEUE starts at Linux's MQ_BYTES_MAX
 python3 -c 'import resource; print("RLIMIT_MSGQUEUE", resource.getrlimit(resource.RLIMIT_MSGQUEUE))'
+
+# sched_setattr's flags: SCHED_FLAG_KEEP_POLICY and KEEP_PARAMS keep what they say, the utilization
+# clamps are checked (at most 1024, minimum not above maximum, -1 resets, the structure must hold
+# them) and read back by sched_getattr; unknown flags are EINVAL
+cat > schedattr.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+struct attr {
+    uint32_t size, policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t priority;
+    uint64_t runtime, deadline, period;
+    uint32_t util_min, util_max;
+};
+
+static void set(const char *what, uint64_t flags, int nice, uint32_t lo, uint32_t hi, uint32_t size)
+{
+    struct attr a = {.size = size, .policy = 0, .flags = flags, .nice = nice, .util_min = lo, .util_max = hi};
+    long r = syscall(SYS_sched_setattr, 0, &a, 0);
+    struct attr g;
+    memset(&g, 0, sizeof g);
+    syscall(SYS_sched_getattr, 0, &g, sizeof g, 0);
+    printf("%s: %s; now policy %u nice %d clamps %u..%u\n", what, r < 0 ? strerror(errno) : "0",
+           g.policy, g.nice, g.util_min, g.util_max);
+}
+
+int main(void)
+{
+    set("keep policy and params, clamps 100..800", 0x08 | 0x10 | 0x20 | 0x40, 7, 100, 800, sizeof(struct attr));
+    set("keep the policy, nice 5", 0x08, 5, 0, 0, sizeof(struct attr));
+    set("clamps 900..100", 0x18 | 0x60, 0, 900, 100, sizeof(struct attr));
+    set("clamp min 2000", 0x18 | 0x20, 0, 2000, 0, sizeof(struct attr));
+    set("clamp min -1 resets it", 0x18 | 0x20, 0, UINT32_MAX, 0, sizeof(struct attr));
+    set("clamps with the first structure", 0x18 | 0x20, 0, 10, 0, 48);
+    set("unknown flag", 0x80, 0, 0, 0, sizeof(struct attr));
+    return 0;
+}
+C
+gcc -O1 -o schedattr schedattr.c && ./schedattr
+rm -f schedattr schedattr.c

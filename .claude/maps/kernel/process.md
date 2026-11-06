@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags)
 
 ## Responsibilities
 
@@ -353,7 +353,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - nice, CPU affinity and I/O priority are per thread and applied to the host thread; raising
   priority floors at host nice -4 (never above Android's display threads); `SCHED_IDLE` maps to host
   nice 19; real-time policies are only recorded; a real-time I/O class becomes best-effort on the
-  host.
+  host. `sched_setattr` takes Linux 6.1's flags: `SCHED_FLAG_KEEP_POLICY`/`KEEP_PARAMS` keep the
+  current policy or parameters, the utilization clamps are validated as `uclamp_validate` does
+  and only recorded per thread (copied at clone, reset by `SCHED_RESET_ON_FORK`, read back by
+  `sched_getattr`), and the deadline flags are accepted unused.
 - Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` returns at once.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
@@ -482,12 +485,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   image then runs or faults; conversely, segments whose file offset and address disagree within the
   page are loaded by copying, where Linux kills the process with `SIGSEGV` after the point of no
   return. Only hand-made ELFs and unusual linker-script output are affected.
-- **`sched_setattr` accepts only `SCHED_FLAG_RESET_ON_FORK`:** the keep flags
-  (`SCHED_FLAG_KEEP_POLICY`, `SCHED_FLAG_KEEP_PARAMS`), the utilization-clamp flags and the
-  deadline flags are `EINVAL`, where Linux 6.1 accepts the keep flags always and the clamp flags
-  when built with uclamp (as Android kernels are), so `uclampset` and runtimes that set uclamp
-  hints, or change only the nice value through `sched_setattr`, fail even though `sched_getattr`
-  reports clamp values.
 
 ## Open questions
 
