@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces; DNS stub queries resolved on host threads, removed the blocking bug)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; read and write on sockets as one message)
 
 ## Responsibilities
 
@@ -123,6 +123,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `EAGAIN` waits (`SO_RCVTIMEO`, `ERESTARTSYS` on signals). `MSG_WAITALL` loops only while the
   host has data and returns a partial result when it runs dry; with `MSG_PEEK` each pass peeks the
   head of the queue again, filling the buffer with repeated copies.
+- read, write, readv and writev on a socket are one recvmsg or sendmsg over all the iovecs with no
+  address, control data or flags (Linux's `sock_read_iter`/`sock_write_iter`): a datagram or
+  seqpacket record is one message whatever the iovecs or the length, a read of nothing returns 0
+  at once, and a write of nothing sends an empty datagram (a writev of nothing does not reach the
+  socket); a stream socket's write goes on in 1 MiB pieces until all is sent or one is short. A
+  fault ends a stream write's data there and fails a message with `EFAULT`.
 - Limits: at most 1 MiB per call, 1024 iovecs (`EMSGSIZE`), 4096 bytes of send control data;
   recvmsg sums the guest's iovec lengths before clamping (unchecked); setsockopt values are cut to
   256 bytes (longer ones then fail on the host) and getsockopt asks the host for at most 256.

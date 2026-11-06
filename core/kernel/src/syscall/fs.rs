@@ -2179,8 +2179,12 @@ fn pipe_wait_data(
     }
 }
 
-/// readv, writev and their positional variants: handle each iovec in order, stopping at an
-/// incomplete one. With `offset` None the file position is used and advanced.
+/// readv, writev and their positional variants. Pipes, terminals and sockets (and eventfd reads)
+/// do one read or write over all the iovecs, as Linux's `read_iter` and `write_iter` see them
+/// ([`stream_vectored`]); everything else handles each iovec in order and stops at an incomplete
+/// one, which is also what Linux does for files with only `read` or `write` (eventfd writes,
+/// timerfd, signalfd, inotify, `/dev/kmsg` reads). With `offset` None the file position is used
+/// and advanced.
 pub(super) fn vectored(
     cx: &mut Cx<'_>,
     fd: i32,
@@ -2213,8 +2217,23 @@ pub(super) fn vectored(
         }
         return kmsg_write(cx, &file, &data).map(|n| n as u64);
     }
+    let vecs = iovecs(cx, iov, count)?;
+    // Nothing to transfer returns 0 after the offset and mode checks without reaching the file
+    // (Linux's do_iter_read and do_iter_write; a plain write of 0 bytes does reach it, so it sends
+    // an empty datagram where this does not)
+    if vecs.iter().all(|v| v.1 == 0) {
+        let f = file.borrow();
+        positional(&f, offset)?;
+        if !(if write { f.writable() } else { f.readable() }) {
+            return Err(Errno::EBADF);
+        }
+        return Ok(0);
+    }
+    if let Some(r) = stream_vectored(cx, &file, &vecs, offset, write) {
+        return r;
+    }
     let mut total = 0;
-    for (base, len) in iovecs(cx, iov, count)? {
+    for (base, len) in vecs {
         let at = offset.map(|o| o + total);
         let r = if write {
             write_file(cx, &file, base, len, at)
@@ -2233,6 +2252,115 @@ pub(super) fn vectored(
         }
     }
     Ok(total)
+}
+
+/// readv and writev on files whose Linux operations are `read_iter`/`write_iter` and that have no
+/// positions: one read or write over all the iovecs, so a datagram is one message, a pipe or
+/// terminal read returns what was ready instead of waiting again once an iovec is full, a pipe
+/// write up to `PIPE_BUF` stays atomic, and an eventfd value read may span iovecs. None for the
+/// other files, which go iovec by iovec.
+fn stream_vectored(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    vecs: &[(u64, usize)],
+    offset: Option<u64>,
+    write: bool,
+) -> Option<SysResult> {
+    let path = match positional(&file.borrow(), offset) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(match path {
+        IoPath::Socket(s) => {
+            let nonblock = file.borrow().nonblocking();
+            super::net::rw(cx, &s, nonblock, vecs, write)
+        }
+        IoPath::Pipe(_) | IoPath::Pty(..) if write => write_gathered(cx, file, vecs),
+        IoPath::Pipe(_) | IoPath::Pty(..) | IoPath::EventFd(_) if !write => {
+            read_scattered(cx, file, vecs)
+        }
+        _ => return None,
+    })
+}
+
+/// readv on a pipe, terminal or eventfd: one read of up to [`IO_CHUNK`] bytes, scattered over the
+/// iovecs in order. As on Linux, when copying out faults after data was taken, the part copied is
+/// returned (the rest is lost).
+fn read_scattered(cx: &mut Cx<'_>, file: &FileRef, vecs: &[(u64, usize)]) -> SysResult {
+    if !file.borrow().readable() {
+        return Err(Errno::EBADF);
+    }
+    let total: usize = vecs.iter().map(|v| v.1).sum();
+    if total == 0 {
+        return Ok(0);
+    }
+    let mut buf = vec![0u8; total.min(IO_CHUNK)];
+    let k = read_bytes(cx, file, &mut buf, None)?;
+    note_read(cx, file, k);
+    let mut done = 0;
+    for &(base, len) in vecs {
+        let n = len.min(k - done);
+        if n == 0 {
+            break;
+        }
+        if let Err(e) = cx.mm().write(UserSlice::new(base, n), &buf[done..done + n]) {
+            if done == 0 {
+                return Err(e);
+            }
+            break;
+        }
+        done += n;
+    }
+    Ok(done as u64)
+}
+
+/// writev on a pipe or terminal: the iovecs written as one stream, in pieces of up to
+/// [`IO_CHUNK`] bytes that cross iovec boundaries, stopping at a short write; a fault ends the
+/// data there, and what came before it is still written.
+fn write_gathered(cx: &mut Cx<'_>, file: &FileRef, vecs: &[(u64, usize)]) -> SysResult {
+    if !file.borrow().writable() {
+        return Err(Errno::EBADF);
+    }
+    let mut rest = vecs.iter().copied();
+    let mut cur = None;
+    let mut done = 0;
+    let mut chunk = Vec::with_capacity(IO_CHUNK.min(vecs.iter().map(|v| v.1).sum()));
+    loop {
+        chunk.clear();
+        let mut fault = None;
+        while chunk.len() < IO_CHUNK {
+            let Some((base, len)) = cur.take().or_else(|| rest.next()) else {
+                break;
+            };
+            let n = len.min(IO_CHUNK - chunk.len());
+            let start = chunk.len();
+            chunk.resize(start + n, 0);
+            if let Err(e) = cx.mm().read(UserSlice::new(base, n), &mut chunk[start..]) {
+                chunk.truncate(start);
+                fault = Some(e);
+                break;
+            }
+            if n < len {
+                cur = Some((base.wrapping_add(n as u64), len - n));
+            }
+        }
+        if chunk.is_empty() {
+            return match fault {
+                Some(e) if done == 0 => Err(e),
+                _ => Ok(done as u64),
+            };
+        }
+        match write_bytes(cx, file, &chunk, None) {
+            Ok(k) => {
+                done += k;
+                if k < chunk.len() || fault.is_some() {
+                    return Ok(done as u64);
+                }
+            }
+            Err(_) if done > 0 => return Ok(done as u64),
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Reads an iovec array.
@@ -2507,6 +2635,14 @@ pub(super) fn read_file(
     len: usize,
     offset: Option<u64>,
 ) -> SysResult {
+    // A socket receives one message of up to the whole length (super::net::rw). The borrow must
+    // end before: receiving may wait with the BKL released
+    let sock = socket(&file.borrow());
+    if let Some(s) = sock {
+        positional(&file.borrow(), offset)?;
+        let nonblock = file.borrow().nonblocking();
+        return super::net::rw(cx, &s, nonblock, &[(buf, len)], false);
+    }
     // Each read of a terminal or pipe returns only data already ready and must not block again
     // to fill the buffer; /dev/zero and /dev/urandom fill it in one read as on Linux
     // (`dd bs=256M` reads whole blocks)
@@ -2528,13 +2664,7 @@ pub(super) fn read_file(
             Err(_) if done > 0 => break,
             Err(e) => return Err(e),
         };
-        if k > 0 {
-            file.borrow_mut().reads += 1;
-            // Signal-driven I/O is checked by the timer thread (check_fasync): just wake it
-            if file.borrow().flags & oflags::O_ASYNC != 0 {
-                crate::kernel::signal_later(&cx.shared.timers);
-            }
-        }
+        note_read(cx, file, k);
         if let Err(e) = cx.mm().write(
             UserSlice::new(buf.wrapping_add(done as u64), k),
             &chunk[..k],
@@ -2554,6 +2684,25 @@ pub(super) fn read_file(
     Ok(done as u64)
 }
 
+/// Bookkeeping after a read that took `k` bytes: counted for signal-driven I/O, which the timer
+/// thread checks (`check_fasync`), so it is only woken.
+fn note_read(cx: &Cx<'_>, file: &FileRef, k: usize) {
+    if k > 0 {
+        file.borrow_mut().reads += 1;
+        if file.borrow().flags & oflags::O_ASYNC != 0 {
+            crate::kernel::signal_later(&cx.shared.timers);
+        }
+    }
+}
+
+/// The socket of an open file.
+fn socket(f: &OpenFile) -> Option<SocketRef> {
+    match &f.kind {
+        FileKind::Socket(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Writes a guest buffer into an open file (write, pwrite, writev).
 pub(super) fn write_file(
     cx: &mut Cx<'_>,
@@ -2570,6 +2719,13 @@ pub(super) fn write_file(
     // write(2) does not skip zero-length writes: /dev/kmsg therefore logs an empty record
     if len == 0 && matches!(file.borrow().kind, FileKind::Device { kmsg: Some(_), .. }) {
         return kmsg_write(cx, file, &[]).map(|n| n as u64);
+    }
+    // A socket sends the whole buffer as one message, or a stream until it has all gone
+    // (super::net::rw)
+    let sock = socket(&file.borrow());
+    if let Some(s) = sock {
+        let nonblock = file.borrow().nonblocking();
+        return super::net::rw(cx, &s, nonblock, &[(buf, len)], true);
     }
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; chown of set-id files as in 6.2; native AIO; module references; loop devices and block-device opens)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; set-id chown as in 6.2; native AIO; module references; loop devices; readv/writev by file kind)
 
 ## Responsibilities
 
@@ -309,6 +309,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `vmsplice` copy through buffers (one side of `splice` must be a pipe; data leaves the pipe only
   after the write succeeds).
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
+- readv and writev follow Linux's `read_iter`/`write_iter` split: pipes, terminals and sockets
+  (and eventfd reads) do one read or write over all the iovecs (one read of up to 64 KiB scattered
+  in order; writes in 64 KiB pieces across iovec boundaries until one is short; sockets through
+  `kernel/net`), so a pipe readv returns what was there instead of waiting again and small pipe
+  writes stay atomic. Everything else goes iovec by iovec and stops at an incomplete one, as Linux
+  does for files with only `read`/`write` (eventfd writes, timerfd, signalfd, inotify, `/dev/kmsg`
+  reads). A total of 0 returns 0 after the offset and mode checks without reaching the file.
 
 ### Metadata and namespace syscalls
 

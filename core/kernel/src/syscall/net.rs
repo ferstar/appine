@@ -1457,6 +1457,83 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     } as u64)
 }
 
+/// read, readv, write and writev on a socket (Linux's `sock_read_iter` and `sock_write_iter`): a
+/// recvmsg or sendmsg without an address, control data or flags over all the iovecs, so a
+/// datagram is one message whatever the iovecs or the buffer size. A stream socket is written
+/// until everything has gone (a blocking write writes it all, as Linux's TCP and AF_UNIX streams
+/// do), in pieces of at most [`MSG_MAX`]; a read of nothing returns 0 at once.
+pub(super) fn rw(
+    cx: &mut Cx<'_>,
+    sock: &SocketRef,
+    nonblock: bool,
+    iovecs: &[(u64, usize)],
+    write: bool,
+) -> SysResult {
+    if !write {
+        let total: usize = iovecs.iter().map(|v| v.1).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let m = recv(cx, sock, nonblock, total, 0, 0)?;
+        let mut off = 0;
+        for &(base, len) in iovecs {
+            let n = len.min(m.data.len() - off);
+            if n == 0 {
+                break;
+            }
+            cx.mm()
+                .write(UserSlice::new(base, n), &m.data[off..off + n])?;
+            off += n;
+        }
+        return Ok(m.data.len() as u64);
+    }
+    let stream = match &*sock.borrow() {
+        Socket::Inet(s) => s.ty == SOCK_STREAM,
+        Socket::Unix(u) => u.ty == SOCK_STREAM,
+        Socket::Netlink(_) => false,
+    };
+    // The iovecs not yet gathered, and the bytes sent so far. A fault ends a stream's data there
+    // and what came before it is still sent, as TCP's copy does; a message with a fault is not
+    // sent at all (EFAULT)
+    let mut rest = iovecs.iter().copied();
+    let mut cur = None;
+    let mut done = 0;
+    loop {
+        let mut data = Vec::new();
+        let mut fault = None;
+        while data.len() < MSG_MAX {
+            let Some((base, len)) = cur.take().or_else(|| rest.next()) else {
+                break;
+            };
+            let n = len.min(MSG_MAX - data.len());
+            let start = data.len();
+            data.resize(start + n, 0);
+            if let Err(e) = cx.mm().read(UserSlice::new(base, n), &mut data[start..]) {
+                data.truncate(start);
+                fault = Some(e);
+                break;
+            }
+            if n < len {
+                cur = Some((base.wrapping_add(n as u64), len - n));
+            }
+        }
+        if let Some(e) = fault.filter(|_| data.is_empty() || !stream) {
+            return if done > 0 { Ok(done as u64) } else { Err(e) };
+        }
+        let last = fault.is_some() || (cur.is_none() && rest.len() == 0);
+        match send(cx, sock, nonblock, &data, &[], &[], 0) {
+            Ok(n) => {
+                done += n;
+                if !stream || last || n < data.len() {
+                    return Ok(done as u64);
+                }
+            }
+            Err(_) if done > 0 => return Ok(done as u64),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
     match &mut *sock.borrow_mut() {
