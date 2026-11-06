@@ -2267,15 +2267,18 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         Entry(pid, tid, e) => {
             let task = ps.task(*pid, *tid);
             match e {
-                self::Entry::Stat => pid_stat(ps, &ns, *pid, *tid)?,
-                self::Entry::Status => pid_status(ps, &ns, *pid, *tid)?,
+                // These carry the thread's name as its bytes, which need not be UTF-8
+                self::Entry::Stat => return pid_stat(ps, &ns, *pid, *tid),
+                self::Entry::Status => return pid_status(ps, &ns, *pid, *tid),
                 self::Entry::Statm => {
                     let (vsize, rss) = mem_of(task.as_deref());
                     format!("{} {rss} 0 0 0 {rss} 0\n", vsize / 4096)
                 }
                 self::Entry::Comm => {
                     let g = ps.group(*pid).ok_or(Errno::ENOENT)?;
-                    format!("{}\n", comm_of(&g.borrow(), task.as_deref(), *pid, *tid))
+                    let mut name = comm_of(&g.borrow(), task.as_deref(), *pid, *tid);
+                    name.push(b'\n');
+                    return Ok(name);
                 }
                 // The thread's child processes not yet reaped, each followed by a space, with no
                 // newline (Linux's children_seq_show)
@@ -2391,7 +2394,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
 
 // ---- Per-process files ----
 
-fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
+fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
@@ -2415,12 +2418,13 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
         let mm = res.mm.borrow();
         (mm.args, mm.env)
     });
+    // The name as raw bytes, as Linux's proc_task_name without escaping
+    let mut out = format!("{} (", v(tid.unwrap_or(pid))).into_bytes();
+    out.extend(comm_of(&g, task.as_deref(), pid, tid));
     let mut s = String::new();
     write!(
         s,
-        "{} ({}) {} {} {} {} {} {} 4194304 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {} 18446744073709551615",
-        v(tid.unwrap_or(pid)),
-        comm_of(&g, task.as_deref(), pid, tid),
+        ") {} {} {} {} {} {} 4194304 0 0 0 0 {} {} {} {} {} {} {} 0 {} {} {} 18446744073709551615",
         state,
         v(g.ppid),
         v(g.pgid),
@@ -2445,7 +2449,8 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Str
         g.exit_signal, args.0, args.1, env.0, env.1
     )
     .unwrap();
-    Ok(s)
+    out.extend(s.into_bytes());
+    Ok(out)
 }
 
 /// The controlling terminal's device number and foreground process group (its number in pid
@@ -2461,7 +2466,7 @@ fn ctty_info(ns: &PidNs, g: &ThreadGroup) -> (u64, i64) {
     }
 }
 
-fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<String, Errno> {
+fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec<u8>, Errno> {
     let g = ps.group(pid).ok_or(Errno::ENOENT)?;
     let g = g.borrow();
     let task = ps.task(pid, tid);
@@ -2476,9 +2481,18 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
     let (pending, blocked) = task
         .as_ref()
         .map_or((0, 0), |t| (t.pending.borrow().set(), t.sigmask.get()));
+    // The name as its bytes with only a newline and a backslash escaped (Linux's
+    // proc_task_name with seq_escape_str(.., "\n\\"))
+    let mut out = b"Name:\t".to_vec();
+    for b in comm_of(&g, task.as_deref(), pid, tid) {
+        match b {
+            b'\n' => out.extend(b"\\n"),
+            b'\\' => out.extend(b"\\\\"),
+            b => out.push(b),
+        }
+    }
+    out.push(b'\n');
     let mut s = String::new();
-    let comm = comm_of(&g, task.as_deref(), pid, tid);
-    writeln!(s, "Name:\t{comm}").unwrap();
     writeln!(s, "Umask:\t{umask:04o}").unwrap();
     writeln!(s, "State:\t{state} ({state_name})").unwrap();
     let v = |p: Tid| ns.vnr(p).unwrap_or(0);
@@ -2594,7 +2608,8 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         "voluntary_ctxt_switches:\t{vol}\nnonvoluntary_ctxt_switches:\t{nonvol}"
     )
     .unwrap();
-    Ok(s)
+    out.extend(s.into_bytes());
+    Ok(out)
 }
 
 /// The process state letter and name: Z zombie, t in a ptrace-stop, T stopped, S waiting in the
@@ -2632,14 +2647,14 @@ fn thread_count(g: &ThreadGroup) -> usize {
 
 /// The name of the thread viewed (the main thread for the process directory): an exited main
 /// thread keeps its name, as Linux's zombie task does.
-fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> String {
-    match (task, g.leader_exit) {
-        (None, Some((comm, _))) if tid.unwrap_or(pid) == g.tgid => {
-            let n = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-            String::from_utf8_lossy(&comm[..n]).into_owned()
-        }
-        _ => comm_str(task, pid),
-    }
+fn comm_of(g: &ThreadGroup, task: Option<&Task>, pid: Tid, tid: Option<Tid>) -> Vec<u8> {
+    let comm = match (task, g.leader_exit) {
+        (Some(t), _) => t.comm.get(),
+        (None, Some((comm, _))) if tid.unwrap_or(pid) == g.tgid => comm,
+        _ => return comm_str(None, pid).into_bytes(),
+    };
+    let n = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    comm[..n].to_vec()
 }
 
 /// An address space's (total size, resident pages).

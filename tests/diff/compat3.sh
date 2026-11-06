@@ -3,7 +3,8 @@
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
-# CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files
+# CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files; thread
+# names as bytes
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1151,3 +1152,48 @@ int main(void)
 C
 gcc -O1 -o sendappend sendappend.c && ./sendappend
 rm -f sendappend sendappend.c
+
+# Thread names are bytes: comm and stat give them as set (here cut by the 15-byte limit in the
+# middle of a UTF-8 character), status escapes only a newline and a backslash
+cat > rawcomm.c <<'C'
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
+static void hex(const char *what, const char *path, int field)
+{
+    char buf[4096];
+    int fd = open(path, O_RDONLY), n = read(fd, buf, sizeof buf);
+    close(fd);
+    char *p = buf, *end = buf + n;
+    if (field == 1) { /* stat: between the parentheses */
+        p = memchr(buf, '(', n) + 1;
+        end = memrchr(buf, ')', n);
+    } else if (field == 2) { /* status: the Name line */
+        p = buf + 6;
+        end = memchr(buf, '\n', n);
+    } else {
+        end = buf + n - 1;
+    }
+    printf("%s:", what);
+    for (; p < end; p++)
+        printf(" %02x", (unsigned char)*p);
+    printf("\n");
+}
+
+int main(void)
+{
+    const char *names[] = {"a\xe4\xb8\xad\xe6\x96\x87\xe5\x90\x8d\xe5\xad\x97\xe6\x98\xaf\xe9\x95\xbf", "a\nb\\c"};
+    for (int i = 0; i < 2; i++) {
+        prctl(PR_SET_NAME, names[i]);
+        hex("comm", "/proc/self/comm", 0);
+        hex("stat", "/proc/self/stat", 1);
+        hex("status", "/proc/self/status", 2);
+    }
+    return 0;
+}
+C
+gcc -O1 -D_GNU_SOURCE -o rawcomm rawcomm.c && ./rawcomm
+rm -f rawcomm rawcomm.c

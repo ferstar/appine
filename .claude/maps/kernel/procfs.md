@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`; names as bytes)
 
 ## Responsibilities
 
@@ -134,7 +134,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   file's path as `\012` (Linux's `seq_file_path`).
   `statm` is `size rss 0 0 0 rss 0`.
 - `cmdline`/`environ` copy the argument and environment ranges of the current mm (empty over
-  1 MiB or when unreadable); `comm` is read-only; `limits` lists the rlimits.
+  1 MiB or when unreadable); `comm` is read-only; `limits` lists the rlimits. The thread name is
+  bytes, not text: `comm` and `stat` give it as set, `status` escapes only a newline and a
+  backslash (Linux's `proc_task_name`).
 - `fd/` lists the fds of the group leader's table (also under `task/<tid>`, even for a thread with
   its own table); `fd/N` links show the
   path stored at open with ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags`
@@ -409,10 +411,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   where Linux 6.1 shows real values only to readers passing the ptrace-read check (others see 1/1
   for code and 0 elsewhere), so debuggers and profilers reading the layout get zeros and any user
   learns other processes' argument and environment addresses.
-- **Non-UTF-8 thread names are rewritten:** `comm`, `stat` and `status` replace invalid UTF-8 in the
-  thread name with U+FFFD, so a name cut mid-character by the 15-byte limit, or any non-UTF-8
-  `PR_SET_NAME`, reads back differently from what was set (Linux prints the raw bytes) and
-  `pgrep`/`pidof` or self-checks fail to match.
 - **`status` lacks `RssAnon`/`RssFile`/`RssShmem`:** memory monitors and runtimes that split
   resident memory by type from `/proc/<pid>/status` find no such lines.
 - **A reaped process's held directory behaves like a live or missing one:** through a kept
