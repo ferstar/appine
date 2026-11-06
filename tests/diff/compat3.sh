@@ -4,7 +4,7 @@
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
 # CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files; thread
-# names as bytes; RssAnon, RssFile and RssShmem
+# names as bytes; RssAnon, RssFile and RssShmem; AF_UNIX reads of nothing and shutdown
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1266,3 +1266,65 @@ int main(void)
 C
 gcc -O1 -o rsssplit rsssplit.c && ./rsssplit
 rm -f rsssplit rsssplit.c
+
+# AF_UNIX streams: a read of nothing returns 0 at once when something is queued and takes the
+# first message's files (EAGAIN on an empty queue); shutdown works on unconnected and listening
+# sockets
+cat > unixzero.c <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static void show(const char *what, long r)
+{
+    printf("%s: %s\n", what, r < 0 ? strerror(errno) : r == 0 ? "0" : "more");
+}
+
+int main(void)
+{
+    int sv[2];
+    char buf[16];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    show("read of nothing, empty queue", recv(sv[0], buf, 0, MSG_DONTWAIT));
+    send(sv[1], "hello", 5, 0);
+    show("read of nothing, data queued", recv(sv[0], buf, 0, MSG_DONTWAIT));
+    long n = recv(sv[0], buf, sizeof buf, MSG_DONTWAIT);
+    printf("then: %.*s\n", (int)n, buf);
+
+    /* One byte with an fd */
+    char c = 'x';
+    struct iovec iov = {&c, 1};
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b};
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_RIGHTS;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    int one = 1;
+    memcpy(CMSG_DATA(h), &one, sizeof one);
+    sendmsg(sv[1], &m, 0);
+    struct iovec none = {buf, 0};
+    struct msghdr r = {.msg_iov = &none, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b};
+    n = recvmsg(sv[0], &r, MSG_DONTWAIT);
+    printf("read of nothing with a file queued: %ld, files: %d\n", n,
+           r.msg_controllen > 0 && CMSG_FIRSTHDR(&r) && CMSG_FIRSTHDR(&r)->cmsg_type == SCM_RIGHTS);
+    struct msghdr r2 = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.b, .msg_controllen = sizeof u.b};
+    n = recvmsg(sv[0], &r2, MSG_DONTWAIT);
+    printf("then: %ld byte, files: %d\n", n, r2.msg_controllen > 0);
+
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    show("shutdown of an unconnected socket", shutdown(s, SHUT_RDWR));
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    strcpy(a.sun_path + 1, "appine-unixzero");
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    bind(l, (struct sockaddr *)&a, sizeof a);
+    listen(l, 1);
+    show("shutdown of a listening socket", shutdown(l, SHUT_RD));
+    return 0;
+}
+C
+gcc -O1 -o unixzero unixzero.c && ./unixzero
+rm -f unixzero unixzero.c

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: socket timeouts share the inet parser)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets)
 
 ## Responsibilities
 
@@ -90,8 +90,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   name (2 bytes for unnamed clients); waits bounded by `SO_RCVTIMEO`.
 - Datagram connect: `AF_UNSPEC` disconnects; otherwise the target must be a datagram socket
   (`EPROTOTYPE`); no check that the target is connected elsewhere.
-- shutdown: `how` outside 0..2 `EINVAL`; unconnected or listening stream sockets `ENOTCONN`;
-  `SHUT_RD` closes the own receive channel (the peer's writes get `EPIPE`), `SHUT_WR` marks the
+- shutdown: `how` outside 0..2 `EINVAL`; on unconnected and listening sockets the flags are only
+  recorded (Linux 6.1 returns 0 there too); `SHUT_RD` closes the own receive channel (the peer's writes get `EPIPE`), `SHUT_WR` marks the
   send channel EOF (the peer reads EOF and polls `POLLIN|POLLRDHUP`, `POLLHUP` once both are shut);
   on datagram sockets the flags are local.
 - close: wakes waiters; the peer's receive side gets EOF and the own receive queue (with its
@@ -110,7 +110,9 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   this way); a target connected to another socket `EPERM`; over the capacity `EMSGSIZE`; blocks
   for room (bytes only, no queue-length limit).
 - Stream receive merges packets in order, stopping after the first packet with files and before a
-  packet whose credentials differ (even without `SO_PASSCRED`); `MSG_PEEK` clones files;
+  packet whose credentials differ (even without `SO_PASSCRED`); a read of nothing returns 0 at
+  once when something is queued, taking the first message's files (blocking or `EAGAIN` on an
+  empty queue, as on Linux); `MSG_PEEK` clones files;
   `MSG_WAITALL` loops until full, files, EOF or an error/timeout. Packet receive pops one packet and
   truncates (`MSG_TRUNC` set; with the `MSG_TRUNC` flag the full length is returned).
 - Delivery: `SCM_CREDENTIALS` first when `SO_PASSCRED` is set (pid and ids translated into the
@@ -186,11 +188,6 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   credentials even without `SO_PASSCRED` (Linux merges), while `MSG_WAITALL` joins data from
   different writers across iterations and reports the first one's credentials even with
   `SO_PASSCRED`. A zero-byte stream send carrying files still queues the files.
-- **Zero-length `recv` blocks:** `recv`/`recvfrom`/`recvmsg` with a 0-byte buffer on a stream
-  socket block (or `EAGAIN`) even when data is queued, unless at EOF; Linux returns 0 at once (and
-  passes attached fds). `read(2)` with length 0 is fine.
-- **`shutdown` refuses unconnected sockets:** `ENOTCONN` for unconnected or listening stream
-  sockets, where Linux 6.1 returns 0.
 - **`SO_PEERCRED` without a peer:** listeners return pid 0 and uid/gid 65534 instead of their own
   credentials (Linux records them at every listen), and unconnected sockets return 65534 where
   Linux returns -1; re-listen neither refreshes credentials nor wakes connectors blocked on a

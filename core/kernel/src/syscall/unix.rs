@@ -507,7 +507,11 @@ pub(super) fn recv(
             let mut c = rx.borrow_mut();
             let room = max - part.as_ref().map_or(0, |p| p.data.len());
             let got = if ty == SOCK_STREAM {
-                Some(c.read_stream(room, peek)).filter(|r| !r.data.is_empty() || !r.fds.is_empty())
+                // A read of nothing returns 0 at once when something is queued, taking the first
+                // message's files (Linux's unix_stream_read_generic with size 0)
+                let queued = !c.packets.is_empty();
+                Some(c.read_stream(room, peek))
+                    .filter(|r| !r.data.is_empty() || !r.fds.is_empty() || (room == 0 && queued))
             } else {
                 c.read_packet(room, peek)
             };
@@ -695,11 +699,9 @@ pub(super) fn sockname(u: &UnixSocket, peer: bool) -> Result<Vec<u8>, Errno> {
 }
 
 pub(super) fn shutdown(u: &mut UnixSocket, how: i32) -> Result<(), Errno> {
+    // Linux 6.1's unix_shutdown records the flags on any socket, connected or not
     if !(0..=2).contains(&how) {
         return Err(Errno::EINVAL);
-    }
-    if matches!(u.link, Link::None | Link::Listening { .. }) && u.ty != SOCK_DGRAM {
-        return Err(Errno::ENOTCONN);
     }
     u.shutdown(how);
     Ok(())

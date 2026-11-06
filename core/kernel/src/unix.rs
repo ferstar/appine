@@ -489,6 +489,20 @@ impl Channel {
         let mut i = 0;
         while let Some(p) = self.packets.get_mut(i) {
             let room = max - data.len();
+            // A read of nothing still takes the first message's files and leaves its data, as
+            // Linux detaches them before looking at the length
+            if max == 0 && i == 0 && cred.is_none() {
+                cred = Some(p.cred);
+                if peek {
+                    fds.extend(p.fds.iter().cloned());
+                } else {
+                    fds.append(&mut p.fds);
+                    if p.remaining() == 0 {
+                        self.packets.pop_front();
+                    }
+                }
+                break;
+            }
             // A message with only open files and no data is read out even when there is no room
             if (room == 0 && p.remaining() > 0) || cred.is_some_and(|c| c != p.cred) {
                 break;
