@@ -1,6 +1,6 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
-# taking a controlling terminal
+# taking a controlling terminal; kill with a thread id
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -421,3 +421,58 @@ int main(void)
 C
 gcc -O1 -o ctty ctty.c && ./ctty
 rm -f ctty ctty.c
+
+# kill with a thread's id signals that thread's process (Linux's kill_pid_info), as kill -0 does
+# for checking it exists; tgkill with a wrong thread group is ESRCH
+cat > killtid.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static volatile pid_t tid;
+static volatile int got;
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+    got++;
+}
+
+static void *thread(void *arg)
+{
+    (void)arg;
+    tid = syscall(SYS_gettid);
+    for (;;)
+        pause();
+    return NULL;
+}
+
+int main(void)
+{
+    signal(SIGUSR1, on_usr1);
+    pthread_t t;
+    pthread_create(&t, NULL, thread, NULL);
+    while (!tid)
+        usleep(1000);
+    printf("kill(tid, 0): %d\n", kill(tid, 0));
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &s, NULL);
+    printf("kill(tid, SIGUSR1): %d\n", kill(tid, SIGUSR1));
+    for (int i = 0; i < 200 && !got; i++)
+        usleep(10000);
+    printf("a thread handled it: %d\n", got);
+    errno = 0;
+    printf("tgkill with another group: %ld %s\n", syscall(SYS_tgkill, getppid(), tid, 0),
+           strerror(errno));
+    return 0;
+}
+C
+gcc -O1 -pthread -o killtid killtid.c && ./killtid
+rm -f killtid killtid.c

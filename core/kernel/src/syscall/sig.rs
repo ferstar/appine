@@ -45,9 +45,16 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         }
         return Ok(0);
     }
-    // Live target thread groups: pid > 0 is one process, 0 is this process group, -1 is every
-    // process except init and ourselves (those visible in our pid namespace with ids above 1),
-    // < -1 is process group -pid
+    // Live target thread groups: pid > 0 is one process (a thread's id names its process, as in
+    // Linux's kill_pid_info), 0 is this process group, -1 is every process except init and
+    // ourselves (those visible in our pid namespace with ids above 1), < -1 is process group -pid
+    let process = {
+        let k = cx.kr();
+        match k.tasks.get(&pid) {
+            Some(t) if !k.groups.contains_key(&pid) => t.tgid,
+            _ => pid,
+        }
+    };
     let ns = cx.pid_ns();
     let targets: Vec<Tid> = cx
         .kr()
@@ -56,7 +63,7 @@ pub(super) fn kill(cx: &mut Cx<'_>, pid: i32, sig: i32) -> SysResult {
         .filter_map(|g| {
             let g = g.borrow();
             let hit = match pid {
-                p if p > 0 => g.tgid == p,
+                p if p > 0 => g.tgid == process,
                 0 => g.pgid == my_pgid,
                 -1 => g.tgid != me && ns.vnr(g.tgid).is_some_and(|v| v > 1),
                 p => g.pgid == -p,

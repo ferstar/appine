@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id)
 
 ## Responsibilities
 
@@ -158,8 +158,8 @@ procfs.
 - `rt_sigsuspend` uses `saved_sigmask` and returns `ERESTARTNOHAND`; `rt_sigtimedwait` returns only
   signals from its set (`EINTR` for others); `rt_sigpending` reports pending ∩ blocked.
 - `sigaltstack`: `SS_DISABLE`, `SS_ONSTACK` reporting, `SS_AUTODISARM`.
-- `tkill`/`tgkill` use `SI_TKILL`. `kill(pid > 0)` matches thread-group ids only, while
-  `rt_sigqueueinfo` accepts any thread's tid for its process.
+- `tkill`/`tgkill` use `SI_TKILL`. `kill(pid > 0)` and `rt_sigqueueinfo` accept any thread's tid
+  and signal its process (Linux's `kill_pid_info`).
 - signalfd: reads dequeue matching signals of the calling thread and its group, in the Linux
   `signalfd_siginfo` layout; readiness also follows the calling thread.
 
@@ -310,8 +310,6 @@ procfs.
   blocks it (or exits) before dequeuing it, no other eligible thread is woken (Linux retargets
   shared pending signals). `CLD_STOPPED` is also reported as soon as the first thread starts a group
   stop, while siblings may still be running.
-- **`kill(tid)` is `ESRCH`:** `kill` matches only thread-group ids, so `kill` and `kill -0` on a
-  non-leader thread's id fail where Linux signals its process.
 - **Coalesced standard signals report the last sender:** a second send overwrites the pending
   siginfo (Linux keeps the first), e.g. `SIGCHLD` from several children reports the last; a unit test
   pins the current behaviour.
