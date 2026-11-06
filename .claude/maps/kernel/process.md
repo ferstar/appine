@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`)
 
 ## Responsibilities
 
@@ -44,7 +44,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie`, `exit_signal`, own and children's CPU time and
-  max RSS, `child_subreaper`, rlimits, credentials, pid namespace, timers.
+  max RSS, `child_subreaper`, rlimits (Linux's defaults; `RLIMIT_MSGQUEUE` starts at 819200 but is
+  not enforced), credentials, pid namespace, timers.
 - `ExitStatus` — exited with a code or killed by a signal; encoded for wait.
 - `CpuTime` — total and system nanoseconds from the host thread CPU clock.
 - `task::pool` — pooled host threads (at most 8 idle, kept 5 s).
@@ -487,10 +488,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   when built with uclamp (as Android kernels are), so `uclampset` and runtimes that set uclamp
   hints, or change only the nice value through `sched_setattr`, fail even though `sched_getattr`
   reports clamp values.
-- **`RLIMIT_MSGQUEUE` defaults to unlimited:** processes report `RLIM_INFINITY` for both limits
-  where Linux 6.1 starts at 819200 bytes, so `ulimit -q` and programs that size POSIX message
-  queues from the limit see a different value (the limit is not enforced either; see
-  `kernel/ipc`).
 
 ## Open questions
 

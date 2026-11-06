@@ -268,6 +268,8 @@ pub(crate) const RLIMIT_NOFILE: u32 = 7;
 pub(crate) const RLIMIT_MEMLOCK: u32 = 8;
 /// `RLIMIT_SIGPENDING`.
 pub(crate) const RLIMIT_SIGPENDING: u32 = 11;
+/// Bytes of POSIX message queues a user may have (Linux's `MQ_BYTES_MAX`, 819200 by default).
+pub(crate) const RLIMIT_MSGQUEUE: u32 = 12;
 /// `RLIMIT_NICE`: the lowest nice value reachable without `CAP_SYS_NICE`, recorded as 20 - nice.
 pub(crate) const RLIMIT_NICE: u32 = 13;
 /// `RLIMIT_RTPRIO`.
@@ -531,6 +533,8 @@ fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     // Linux computes it from the memory size (max_threads / 2); this is the value for 4 GB of
     // memory
     r[RLIMIT_SIGPENDING as usize] = (16384, 16384);
+    // MQ_BYTES_MAX, as on Linux (only reported: the limit is not enforced, see kernel/ipc)
+    r[RLIMIT_MSGQUEUE as usize] = (819200, 819200);
     r[RLIMIT_NICE as usize] = (0, 0);
     r[RLIMIT_RTPRIO as usize] = (0, 0);
     r
