@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: stale source comments fixed; removed the remarks about them)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests)
 
 ## Responsibilities
 
@@ -329,10 +329,15 @@ procfs.
   reads as an older kernel (harmless while tag-bit exposure is unimplemented).
 - **Core name `%d` prints 0:** it expands the inverse of the dumpable flag; Linux prints the dumpable
   value (1).
+- **`MADV_DONTNEED` wipes the vDSO:** the vDSO is a private anonymous copy, so discarding it (alone
+  or inside a larger range) zeroes it and the next vDSO clock call or signal return through
+  `__kernel_rt_sigreturn` raises `SIGILL`, where Linux refills the vDSO from the kernel image.
 - **Minor divergences:** `core_pattern` access follows file DAC with `CAP_DAC_OVERRIDE` instead of
   Linux's euid-only sysctl rule; `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits
-  Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full.
+  Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full;
+  `process_vm_readv`/`writev` with a non-empty local vector but no remote bytes look up the pid and
+  check access (`ESRCH`, `EPERM`) where Linux 6.1 returns 0 first.
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests)
 
 ## Responsibilities
 
@@ -364,7 +364,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `/sys/class/net` follows the reader rather than the mounter's network namespace; procfs mount
   options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
   standard files are absent; `kernel/pid_max` writes are ignored; `processes` in `/proc/stat`
-  excludes threads; `Cpus_allowed_list` ignores task affinity.
+  excludes threads; `Cpus_allowed_list` ignores task affinity; `fd/<n>` links are 0777 instead
+  of encoding the open mode (0500, 0300, 0700, 0 for `O_PATH`); `st_blksize` is 4096 instead of
+  1024; cgroup directories are always 0755, ignoring the mkdir mode, so a private 0700 cgroup is
+  searchable by everyone.
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.
@@ -372,6 +375,61 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
   sockets only in `SCM_RIGHTS` messages show 0.
+- **An exited thread-group leader vanishes from `task/`:** once the main thread calls `exit` while
+  other threads run, and for every unreaped zombie, `/proc/<pid>/task/<pid>` is `ENOENT` and
+  `task/` stops listing it, and `/proc/<pid>` shows another live thread's state, cwd, root, mounts,
+  fds, maps and command line, where Linux 6.1 keeps the leader as a zombie until the group is
+  reaped (`Z` in `stat`/`status`, empty `cmdline`/`maps`/`fd/`, `ENOENT` for `cwd`/`exe`/`root`,
+  `EINVAL` for `mounts`); tools that wait for a thread to become a zombie through
+  `task/<tid>/stat`, `ps -L`/`top -H`, and code checking whether the main thread is still alive see
+  something else (see the matching `kernel/process` item).
+- **Read-only proc files cannot be opened for writing even with `CAP_DAC_OVERRIDE`:** every
+  write-mode open of a node that is not writable is `EACCES` before capabilities are considered,
+  where Linux 6.1 lets root open ordinary `/proc` files (not `/proc/sys` or sysfs) with `O_WRONLY`,
+  `O_RDWR` or `O_TRUNC` and fails only the write (`EIO` for `/proc/kmsg`); C++ `std::fstream` with
+  its default mode or `fopen(..., "r+")` on `/proc/cpuinfo` or `/proc/self/status` fails outright
+  as root, and a root `/proc/kmsg` reader opening it read-write gets no descriptor.
+- **`/proc/sys` permissions follow ordinary DAC:** a non-root writer with `CAP_DAC_OVERRIDE` can
+  open every writable sysctl (`core_pattern`, `hostname`, `pid_max`, `net.*`), whereas Linux 6.1
+  decides by euid 0 / egid 0 alone and ignores capabilities; and a non-root process with
+  `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access; `user.*` likewise
+  keys on `CAP_SYS_RESOURCE`), so network daemons that drop root but keep `CAP_NET_ADMIN` get
+  `EACCES`.
+- **Some sysctls are read-only even for root:** `kernel.tainted`, `kernel.overflowuid`/`overflowgid`
+  and `vm.overcommit_memory` are 0444 and opening them for writing is `EACCES`, where Linux 6.1 has
+  them 0644 (`tainted` writes needing `CAP_SYS_ADMIN`), so `sysctl -w vm.overcommit_memory=1` in
+  setup scripts (Redis images, kubelet's kernel tunables) fails.
+- **Many common sysctls are missing:** besides those listed as absent above, `vm.drop_caches`,
+  `vm.dirty_*`, `vm.page-cluster`, `vm.watermark_scale_factor`, `vm.mmap_rnd_bits`/
+  `mmap_rnd_compat_bits`, `kernel.randomize_va_space`, `kernel.sysrq`, `kernel.panic_on_oops`,
+  `kernel.modprobe`, `kernel.modules_disabled`, `kernel.core_pipe_limit`, `kernel.hung_task_*`,
+  `kernel.sched_rt_*`, `kernel.sched_schedstats`, the other `kernel.perf_*` files,
+  `fs.suid_dumpable` and `debug.exception-trace` are `ENOENT`, so `sysctl -p` setups, benchmark
+  scripts writing `drop_caches`, kubelet setting `panic_on_oops` and checkers reading
+  `randomize_va_space` fail or report errors.
+- **`/proc/vmstat`, `/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** procps
+  `vmstat`, memory monitors and low-memory daemons (systemd-oomd and oomd need PSI's
+  `/proc/pressure/memory` and its poll triggers) and symbol lookups (perf, bpftrace) find nothing.
+- **`stat` address fields ignore the ptrace check:** `/proc/<pid>/stat` reports the code, stack,
+  data and brk addresses as 0 for everyone and the argument and environment addresses to everyone,
+  where Linux 6.1 shows real values only to readers passing the ptrace-read check (others see 1/1
+  for code and 0 elsewhere), so debuggers and profilers reading the layout get zeros and any user
+  learns other processes' argument and environment addresses.
+- **Non-UTF-8 thread names are rewritten:** `comm`, `stat` and `status` replace invalid UTF-8 in the
+  thread name with U+FFFD, so a name cut mid-character by the 15-byte limit, or any non-UTF-8
+  `PR_SET_NAME`, reads back differently from what was set (Linux prints the raw bytes) and
+  `pgrep`/`pidof` or self-checks fail to match.
+- **`status` lacks `RssAnon`/`RssFile`/`RssShmem`:** memory monitors and runtimes that split
+  resident memory by type from `/proc/<pid>/status` find no such lines.
+- **A reaped process's held directory behaves like a live or missing one:** through a kept
+  `/proc/<pid>` fd, lookups give `ENOENT` (Linux `ESRCH`), listing still succeeds (Linux
+  `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as
+  the fd is resolved by number, it shows the new process once the pid is reused, defeating monitors
+  that hold `/proc/<pid>` fds to avoid pid-reuse races.
+- **Writes through a removed cgroup's open files give the wrong result:** after rmdir,
+  `cgroup.procs`, `cgroup.freeze` and value files fail with `ENOENT` and `cgroup.kill` succeeds
+  silently, where Linux 6.1 fails every write with `ENODEV`, which container managers treat as
+  "cgroup gone".
 
 ## Open questions
 
@@ -390,3 +448,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Whether reopening a deleted file through `/proc/<pid>/fd/N` (the open-file node) checks
   permission (pipes do not).
 - Field-by-field fdinfo layouts against Linux (eventfd ids, timerfd formatting).
+- The Linux 6.1 behaviour behind the items found by Starnix's syscall tests (a zombie leader's
+  files, `proc_sys_permission`, write opens of read-only proc files, `ENODEV` from removed cgroups)
+  was observed on a native 6.8 kernel and attributed to 6.1 from knowledge of the kernel.

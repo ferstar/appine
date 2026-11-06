@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; epoll refuses loop devices; eventfd readv spans iovecs)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; epoll refuses loop devices; eventfd readv; bugs from Starnix's tests)
 
 ## Responsibilities
 
@@ -194,6 +194,12 @@ signal delivery (`kernel/signal`).
   partial count.
 - **Readiness details differ:** a pipe write end without readers reports `POLLERR` but not
   `POLLOUT`; ppoll leaves revents unwritten when interrupted; an epoll fd reports only `POLLIN`.
+- **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
+  `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
+  buffers partly used, poll and epoll report a pipe writable earlier than Linux.
+- **epoll_wait does not check the event buffer up front:** an events pointer outside the user
+  address space is only noticed when events are copied out, so with nothing ready epoll_wait
+  returns 0 or sleeps where Linux fails at once with `EFAULT`.
 - **`O_ASYNC` on every file kind:** regular files, eventfds, timerfds and message queues accept
   it, so a regular file with `O_ASYNC` raises `SIGIO` after every read.
 - **Per-scan cost:** every scan holds the BKL and makes one zero-timeout host poll per host fd (and

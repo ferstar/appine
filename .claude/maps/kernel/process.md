@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: guest timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines on their clock bases)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests)
 
 ## Responsibilities
 
@@ -461,19 +461,42 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **Minor futex deviations:** `FUTEX_CLOCK_REALTIME` is accepted with any operation, unknown high op
   bits are masked off instead of `ENOSYS`, and `FUTEX_WAKE` with a count ≤ 0 wakes none or all
   instead of one; WAKE_OP and PI operations are `ENOSYS`.
+- **Futex waiters on replaced private memory are never woken:** private futexes are keyed by the
+  page's host memory rather than by address space and address, so threads waiting on a private
+  page that is then replaced at the same address (a `MAP_FIXED` mmap, or munmap and mmap again)
+  miss a later `FUTEX_WAKE` at that address and sleep until a signal or timeout, where Linux wakes
+  them; programs that recycle memory with `MAP_FIXED` while threads still wait in it hang.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.
 - **`kcmp(KCMP_IO)` always compares equal:** threads have an I/O context (`Task::ioprio`, shared
   under `CLONE_IO`), but kcmp does not compare it, so two threads with different contexts compare
   as the same, unlike Linux.
+- **An exited group leader is dropped at once:** thread exit removes the leader from the task table
+  and the group's thread list like any other thread, while Linux 6.1 keeps it as a zombie task
+  until the whole group exits, so per-thread views lose it early (see the matching
+  `kernel/procfs` item).
+- **The ELF loader disagrees with Linux on unusual program headers:** an executable with no
+  `PT_LOAD` segment, or whose program header table lies outside every loaded segment and has no
+  `PT_PHDR`, fails execve with `ENOEXEC`, where Linux 6.1 execs it (with `AT_PHDR` 0) and the new
+  image then runs or faults; conversely, segments whose file offset and address disagree within the
+  page are loaded by copying, where Linux kills the process with `SIGSEGV` after the point of no
+  return. Only hand-made ELFs and unusual linker-script output are affected.
+- **`sched_setattr` accepts only `SCHED_FLAG_RESET_ON_FORK`:** the keep flags
+  (`SCHED_FLAG_KEEP_POLICY`, `SCHED_FLAG_KEEP_PARAMS`), the utilization-clamp flags and the
+  deadline flags are `EINVAL`, where Linux 6.1 accepts the keep flags always and the clamp flags
+  when built with uclamp (as Android kernels are), so `uclampset` and runtimes that set uclamp
+  hints, or change only the nice value through `sched_setattr`, fail even though `sched_getattr`
+  reports clamp values.
+- **`RLIMIT_MSGQUEUE` defaults to unlimited:** processes report `RLIM_INFINITY` for both limits
+  where Linux 6.1 starts at 819200 bytes, so `ulimit -q` and programs that size POSIX message
+  queues from the limit see a different value (the limit is not enforced either; see
+  `kernel/ipc`).
 
 ## Open questions
 
 - Is the missing ASLR (fixed program, interpreter and vDSO bases) deliberate?
 - Is it intended that Android always shuts down as poweroff (runlevel 6 entries never run)?
-- When the group leader has exited but other threads run, should `/proc/<pid>/stat` show the leader
-  (Linux) rather than another thread?
 - Should `sched_yield` yield the host thread?
 
 ## To verify
@@ -481,5 +504,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - The Linux 6.1 comparisons above that rest on kernel behaviour rather than repository source
   (`eligible_child` and `copy_process` exit signals, `deny_write_access` on scripts and
   interpreters, argument limits under secure exec, `send_sigqueue` for dead threads,
-  `new_idmap_permitted`, `zap_pid_ns_processes`) were checked from knowledge of the kernel, not
-  against its source.
+  `new_idmap_permitted`, `zap_pid_ns_processes`, `load_elf_binary` without `PT_LOAD`, the keep and
+  uclamp flags of `sched_setattr`, `INIT_RLIMITS`) were checked from knowledge of the kernel, not
+  against its source; the items found by Starnix's syscall tests were also observed on a native
+  6.8 kernel.

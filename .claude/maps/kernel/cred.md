@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/cred.md` for the paired decision history.
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
+>
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks)
 
 ## Responsibilities
 
@@ -228,7 +230,8 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   container (container root running strace or gdb) makes setuid and file-capability programs lose
   their gains, where Linux would grant them.
 - **The vDSO bypass covers every clock.** Linux's vDSO falls back to a real (filtered) syscall for
-  CPU-time clocks and invalid ids; here filters restricting clock ids (Chromium's) never fire, and
+  CPU-time clocks, the alarm clocks (`CLOCK_REALTIME_ALARM`, `CLOCK_BOOTTIME_ALARM`) and invalid
+  ids; here filters restricting clock ids (Chromium's) never fire, and
   a guest can jump to the vDSO's `svc` to skip its own filter for these three syscalls.
 - **seccomp logging is incomplete.** Logged actions reach only appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged

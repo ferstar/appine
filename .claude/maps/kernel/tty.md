@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty and `TIOCNOTTY` there is `ENOTTY`; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; the line discipline follows n_tty, checked against all 83 recorded scenarios)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY` on a master; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; the line discipline follows n_tty (all 83 recorded scenarios); `/dev/tty` identity)
 
 ## Responsibilities
 
@@ -298,6 +298,10 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   and `SIGCONT` to the foreground group; Linux sends only `SIGHUP` there.
 - **Console input after the session ended is queued silently** instead of failing with `EIO` as
   `write_console`'s comment promises.
+- **`/dev/tty` cannot be told apart from the slave it opens:** the descriptor is a plain slave end,
+  so fstat reports the pts device (136:N, with the devpts inode and owner) instead of 5:0 (5:1 for
+  `/dev/console`); programs that recognise the controlling-terminal device by its number see a
+  different device than on Linux.
 - **Fidelity gaps:** `IMAXBEL`, break handling, `HUPCL` and `VDISCARD` are not implemented;
   `TIOCEXCL` is a no-op; `TIOCGETD` is always 0; flow-control characters are not looked ahead in
   input waiting for room. The line-discipline rules themselves match all 83 recorded scenarios of

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: socket timeouts of at least `KTIME_MAX` mean none; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; read and write on sockets as one message)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests)
 
 ## Responsibilities
 
@@ -337,6 +337,21 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   zeros there.
 - **Listen events can be lost:** the "already reported" set is marked before the 32-event queue
   check and never cleared, so a listen dropped by a full queue is never reported.
+- **Netlink requests are not validated as Linux validates them:** `NETLINK_GET_STRICT_CHK` is
+  accepted and ignored (no header checks, no header-based dump filtering), attributes of the wrong
+  size are skipped instead of rejected with `ERANGE`, and a single IPv6 `RTM_GETADDR` is
+  `EOPNOTSUPP` without Linux's header checks (`EINVAL` for a short body); malformed or mis-typed
+  requests, such as a route dump carrying an `ifinfomsg` or an `ip route get` with a short
+  `RTA_FLOW`, are answered with data where Linux returns an error.
+- **Single `RTM_GETNEIGH` requests always answer `ENOENT`:** the header and address are never
+  checked, so a bad state or type, a missing or wrong-size `NDA_DST` (`EINVAL`), an unknown family
+  (`EAFNOSUPPORT`) and an unknown interface index (`ENODEV`) are all reported as "not found", and
+  `ip neigh get` with a wrong device or address family prints a misleading error.
+- **Unsupported rtnetlink change requests skip the capability check:** only link, address and route
+  changes check `CAP_NET_ADMIN`; other change messages (`RTM_NEWRULE`, `RTM_NEWNEIGH`, qdiscs,
+  nexthops and the like) answer `EOPNOTSUPP` even to unprivileged callers, where Linux answers
+  `EPERM` first, so an unprivileged `ip rule add` reports "Operation not supported" instead of
+  "Operation not permitted".
 
 ## Open questions
 

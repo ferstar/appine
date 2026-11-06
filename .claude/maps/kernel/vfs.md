@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; unshared fd tables keep POSIX locks; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clock bases; partial copies to faulting buffers)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; bugs from Starnix's tests)
 
 ## Responsibilities
 
@@ -190,9 +190,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (`size=`/`nr_inodes=`/`inode32|64` per `shmem_reconfigure`).
 - Propagation flags are validated (one type, plus `MS_REC`/`MS_SILENT`) and have no effect;
   everything behaves as private.
-- `MS_MOVE`, `pivot_root` (6.1 order, `chroot_fs_refs` for tasks whose root or cwd was the old
-  root in the same namespace), `chroot` (`CAP_SYS_CHROOT` in the caller's user namespace and
-  search permission).
+- `MS_MOVE`, `pivot_root` (6.1's checks after resolving both paths, `chroot_fs_refs` for tasks
+  whose root or cwd was the old root in the same namespace), `chroot` (`CAP_SYS_CHROOT` in the
+  caller's user namespace and search permission).
 - `open_tree` (without `OPEN_TREE_CLONE`: an `O_PATH` fd; with it: `CAP_SYS_ADMIN`, a detached
   clone in a new anonymous namespace held by the fd), `move_mount` (shares `move_tree` with
   `MS_MOVE`; attaching a clone moves its mounts into the caller's namespace;
@@ -284,8 +284,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   PTYs, `EISDIR`/`EROFS`/`EACCES` for writes the filesystem does not allow; content is generated
   at open.
 - Every non-`O_PATH` store open records an inotify `Opened` (directory, name, close mask), whether
-  or not watches exist; `O_TMPFILE` is not implemented (it reaches the directory branch and gets
-  `EISDIR`).
+  or not watches exist; `O_TMPFILE` is not implemented: openat2 rejects invalid combinations as
+  Linux does, but open/openat reach the directory branch (`EISDIR`, or a plain read-only open of
+  the directory without write access).
 
 ### Data I/O on regular files
 
@@ -319,8 +320,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Copying to and from the guest buffer grows a grows-down mapping below it first (`kernel/mm`). A
   read whose buffer faults partway returns the bytes copied before the faulting page (`EFAULT` when
   none were), as Linux's `copy_to_user` does: a regular file's position moves only past what was
-  copied, while data from other files (a pipe, a terminal) is already consumed. A faulting write
-  buffer still fails before anything is written.
+  copied, while data from other files (a pipe, a terminal) is already consumed (Linux leaves a
+  pipe buffer whose copy came up short in the pipe). A faulting write buffer still fails before
+  anything is written, except that a pipe writev writes the iovecs before the faulting one.
 
 ### Metadata and namespace syscalls
 
@@ -663,7 +665,65 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
   access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
   emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
-  sync it (Linux's write path does).
+  sync it (Linux's write path does); `O_NOTIFICATION_PIPE` is `EINVAL` from pipe2 (Linux 6.1
+  creates a notification pipe or, without watch queues, fails with `ENOPKG`); vmsplice copies the
+  data at the call where Linux queues references to the user pages, so changes the writer makes
+  to the buffer before the reader reads are not seen.
+- **splice, tee and vmsplice block by the wrong flags:** `SPLICE_F_NONBLOCK` and a pipe end's
+  `O_NONBLOCK` only stop the wait for data in an input pipe; writing into an output pipe follows
+  that pipe end's own `O_NONBLOCK`, reading a socket follows the socket's, and tee ignores
+  `O_NONBLOCK` on both pipes, so a nonblocking splice or tee into a full pipe, or from an empty
+  socket, sleeps (possibly forever) where Linux returns `EAGAIN`; vmsplice honours the pipe's
+  `O_NONBLOCK` and, when reading, ignores `SPLICE_F_NONBLOCK`, the reverse of Linux. tee also
+  takes the source data before waiting for room and returns 0 at source EOF without looking at the
+  destination, so after sleeping on a full pipe it writes data a reader has since consumed, and a
+  full or reader-less destination gives 0 instead of `EAGAIN`/`EPIPE`.
+- **splice-family argument checks differ:** splice looks up its fds before returning 0 for a zero
+  length (Linux returns 0 first, even for bad fds and flags) and an offset on a socket or other
+  unseekable non-pipe is `ESPIPE` instead of `EINVAL`; vmsplice is `EBADF` on a non-pipe before an
+  empty request returns 0 or a bad iovec is `EFAULT`, a zero-length vmsplice into a pipe without
+  readers raises `SIGPIPE` and fails with `EPIPE` instead of returning 0, and on a FIFO opened
+  read-write vmsplice reads where Linux writes; unknown splice, tee and vmsplice flags are accepted
+  (Linux: `EINVAL`).
+- **splice into a file stops quietly at `RLIMIT_FSIZE`:** a splice from a pipe into a regular file
+  that the limit cuts short returns the short count without `SIGXFSZ`, where Linux's splice loop
+  tries the next write at the limit and raises `SIGXFSZ` (fatal by default) while still returning
+  the count; programs see the signal one call later.
+- **Pipe I/O with faulting buffers ignores Linux's per-buffer rules:** a pipe read, readv or
+  read-side vmsplice whose buffer faults consumes the data it took, where Linux leaves a pipe
+  buffer whose copy came up short in the pipe; a writev whose later iovec faults still writes what
+  precedes the fault, where Linux commits only whole copied pages (a sub-page writev fails with
+  `EFAULT` and writes nothing); and a write or vmsplice whose buffer faults after its first page
+  fails with `EFAULT` instead of returning the pages copied.
+- **getdents64 copies all or nothing:** a buffer that runs into an unmapped page fails with
+  `EFAULT` even when whole entries fit before it, where Linux returns the entries written before
+  the fault.
+- **open(2) does not validate `O_TMPFILE`:** openat skips the `O_TMPFILE` checks openat2 makes, so
+  `O_TMPFILE` with `O_CREAT` is `EISDIR` instead of `EINVAL`, and a read-only `O_TMPFILE` open
+  succeeds as a plain open of the directory instead of `EINVAL`.
+- **Lock ranges can overflow:** a negative `l_len` is added before the start is checked, so an
+  `l_start` that already makes the start negative together with a very negative `l_len`
+  (`INT64_MIN` for both) wraps and locks a nonsense range in release builds (a panic in debug
+  builds) instead of `EINVAL`; a range ending exactly at the largest offset is `EOVERFLOW` where
+  Linux accepts it.
+- **`MFD_NOEXEC_SEAL` is accepted but not enforced:** memfd_create takes 6.3's
+  `MFD_NOEXEC_SEAL`/`MFD_EXEC` and F_ADD_SEALS takes `F_SEAL_EXEC` (6.1 rejects all three with
+  `EINVAL`), but chmod never checks the seal, so a memfd its creator sealed non-executable can be
+  made executable again.
+- **Alarm timerfds need no capability:** timerfd_create and timerfd_settime accept
+  `CLOCK_REALTIME_ALARM`/`CLOCK_BOOTTIME_ALARM` without `CAP_WAKE_ALARM`, where Linux returns
+  `EPERM`, so programs that probe alarm clocks to learn whether they may wake the system are told
+  they can.
+- **Remounting read-only ignores open writers:** a remount to read-only (bind or not) succeeds while
+  files on the mount are open for writing, where Linux returns `EBUSY`, and those fds keep writing
+  afterwards because only opens check the flag, so a mount made read-only (before shutdown, or a
+  sandbox's remount-ro) can still change.
+- **pivot_root resolves both paths before checking them:** a non-directory `new_root` with a missing
+  `put_old` is `ENOENT` instead of `ENOTDIR`.
+- **mountinfo loses the root of a bind whose source was removed:** the fourth column shows `/` once
+  the bound directory is deleted, where Linux shows its old path followed by `//deleted`, so tools
+  reading bind sources from mountinfo (findmnt, container runtimes) see a bind of the whole
+  filesystem.
 
 ## Open questions
 
@@ -689,3 +749,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `aio_rw_done`'s `EINTR`, the ring head on a failed copy, `IOCB_APPEND` and the sync flags, `nr`
   charged to `aio-nr` since 4.12) comes from upstream knowledge: no Linux source is in the
   repository.
+- The Linux 6.1 behaviour behind the items found by Starnix's syscall tests (splice's
+  `SPLICE_F_NONBLOCK` conversion and per-page pipe copies, remount `EBUSY` with writers,
+  `O_NOTIFICATION_PIPE`) was observed on a native 6.8 kernel and attributed to 6.1 from knowledge
+  of the kernel.
