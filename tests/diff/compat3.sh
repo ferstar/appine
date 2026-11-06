@@ -2,7 +2,7 @@
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
-# thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags
+# thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -956,3 +956,43 @@ int main(void)
 C
 gcc -O1 -o schedattr schedattr.c && ./schedattr
 rm -f schedattr schedattr.c
+
+# membarrier registrations are kept by a forked child (until execve)
+cat > membarrier.c <<'C'
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/* The commands of <linux/membarrier.h> (not installed here) */
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED (1 << 3)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1 << 4)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE (1 << 5)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE (1 << 6)
+
+static const char *mb(int cmd)
+{
+    return syscall(SYS_membarrier, cmd, 0, 0) < 0 ? strerror(errno) : "0";
+}
+
+int main(void)
+{
+    printf("register private expedited: %s\n", mb(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED));
+    printf("register private expedited sync core: %s\n",
+           mb(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE));
+    fflush(stdout);
+    if (fork() == 0) {
+        printf("child private expedited: %s\n", mb(MEMBARRIER_CMD_PRIVATE_EXPEDITED));
+        printf("child private expedited sync core: %s\n",
+               mb(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE));
+        fflush(stdout);
+        _exit(0);
+    }
+    wait(NULL);
+    return 0;
+}
+C
+gcc -O1 -o membarrier membarrier.c && ./membarrier
+rm -f membarrier membarrier.c

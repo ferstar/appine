@@ -2347,6 +2347,9 @@ impl Mm {
         child.vdso = self.vdso;
         child.args = self.args;
         child.env = self.env;
+        // membarrier registrations last until execve (a new Mm), as Linux copies the mm's
+        // membarrier_state at fork
+        child.membarrier = self.membarrier;
         child.auxv = self.auxv.clone();
         child.exe = self.exe;
         child.dbt_regs = self.dbt_regs;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork)
 
 ## Responsibilities
 
@@ -350,6 +350,8 @@ signals may still be delivered).
   prot, merging adjacent ones the way Linux `vma_merge` would; `ENOMEM` when one exceeds RAM plus
   swap; a limit of 0 disables it; mode 2's strict accounting is not emulated).
   `fork` cannot fail after lending starts.
+- The child keeps the parent's membarrier registrations (Linux copies `membarrier_state`); execve
+  starts a fresh `Mm` without them.
 - Each child VMA with contents of its own gets a new `anon` identity, shared by the pieces of one
   Linux VMA (Linux's `anon_vma_fork`), so it no longer joins its neighbours while the parent's
   pieces still do: an anonymous VMA when it has been writable, a private file VMA when a page of
@@ -607,10 +609,6 @@ signals may still be delivered).
   `READ_IMPLIES_EXEC` set (`setarch --read-implies-exec`, legacy programs that expect readable data
   to be executable) mmap and mprotect with `PROT_READ` do not add `PROT_EXEC` and jumping into such
   memory faults, where Linux 6.1 adds execute permission except on noexec mounts.
-- **membarrier registrations are lost across fork:** a child of a process that registered for
-  private expedited barriers (plain or `SYNC_CORE`) gets `EPERM` from those barriers until it
-  registers again, where Linux keeps the registration until execve; forked workers of programs
-  using membarrier-based userspace RCU (liburcu) or similar runtimes can fail or abort.
 - **mlock never fails on inaccessible ranges:** `mlock`/`mlock2` over a range that includes a
   `PROT_NONE` mapping succeeds and keeps populating the mappings after it, where Linux 6.1 locks the
   whole range but stops populating at the `PROT_NONE` mapping and returns `ENOMEM`.
