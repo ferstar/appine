@@ -401,7 +401,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_paste<'l>(
 
 /// Encodes a mouse event at pixel (`x`, `y`) of the grid; empty when the program does not take
 /// it, null when encoding failed. `action`: 0 press, 1 release, 2 motion; `button`: 0 none,
-/// 1 left, 4 and 5 the wheel.
+/// 1 left, 2 right, 3 middle, 4 and 5 the wheel.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouse<'l>(

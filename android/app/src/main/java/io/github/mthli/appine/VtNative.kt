@@ -52,8 +52,10 @@ internal object VtNative {
 
     /**
      * Encodes a mouse event at pixel ([x], [y]) of the grid in the program's tracking mode and
-     * format: [action] 0 press, 1 release, 2 motion; [button] 0 none, 1 left, 4 and 5 the wheel;
-     * [mods] as for [key]. Empty when the program does not take it, null when it fails.
+     * format: [action] 0 press, 1 release, 2 motion; [button] 0 none, 1 left, 2 right, 3 middle,
+     * 4 and 5 the wheel; [mods] as for [key]; [pressed] whether a button is held after this event.
+     * Empty when the program does not take it (motion is sent once per cell, and only as its
+     * tracking mode asks), null when it fails.
      */
     @JvmStatic external fun mouse(tab: Long, action: Int, button: Int, mods: Int, x: Float, y: Float, pressed: Boolean): ByteArray?
 

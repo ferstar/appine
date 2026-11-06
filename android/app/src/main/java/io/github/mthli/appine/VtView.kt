@@ -29,6 +29,7 @@ import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
@@ -43,6 +44,7 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -189,12 +191,27 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var scrollRemainder = 0f
     private var scaleRemainder = 1f
 
-    // Selection drags: by the long-pressed word, or by a handle
+    // Selection drags: by the long-pressed word, or by a handle; in mouse mode a long press held
+    // on may instead become a drag for the program
     private var drag = DRAG_NONE
     private var dragOffsetX = 0f
     private var dragOffsetY = 0f
     private var dragCellX = -1
     private var dragCellY = -1
+
+    /** Where a long press in mouse mode was: the program's drag starts there if the finger moves on. */
+    private var pressX = 0f
+    private var pressY = 0f
+
+    /** The button of a mouse (not a finger) held down for a program tracking the mouse, or 0. */
+    private var mouseButton = 0
+
+    /** The last tap's lift, to tell the second tap of a double tap. */
+    private var lastTapTime = 0L
+    private var lastTapX = 0f
+    private var lastTapY = 0f
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private val doubleTapSlop = ViewConfiguration.get(context).scaledDoubleTapSlop
 
     /** Rows the viewport scrolls by while a drag is held above (-1) or below (1) the grid. */
     private var autoscroll = 0
@@ -1121,6 +1138,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // A mouse's buttons and drags go to a program tracking it as they are, from the press on
+        val press = event.actionMasked == MotionEvent.ACTION_DOWN && mouseTracking && drag == DRAG_NONE
+        if (tab != 0L && event.isFromSource(InputDevice.SOURCE_MOUSE) && (press || mouseButton != 0)) {
+            mouseButtons(event)
+            return true
+        }
         // A handle drag owns the whole gesture
         if (event.actionMasked == MotionEvent.ACTION_DOWN && tab != 0L) {
             val handle = handleAt(event.x, event.y)
@@ -1138,20 +1161,98 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         scaler.onTouchEvent(event)
         if (!scaler.isInProgress) gestures.onTouchEvent(event)
-        // After a long press selected a word, moving on extends the selection
-        if (drag == DRAG_WORD) {
-            when (event.actionMasked) {
+        when (drag) {
+            // After a long press selected a word, moving on extends the selection
+            DRAG_WORD -> when (event.actionMasked) {
                 MotionEvent.ACTION_MOVE -> dragTo(event.x, event.y)
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endDrag()
+            }
+            // A long press in mouse mode: moving on drags for the program, lifting keeps the word
+            DRAG_PRESS -> when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> if (hypot(event.x - pressX, event.y - pressY) > touchSlop) startMouseDrag(event)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endPress()
+            }
+            DRAG_MOUSE -> when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_LEFT, 0, event.x, event.y, true))
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    drag = DRAG_NONE
+                    send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, event.x, event.y, false))
+                }
             }
         }
         return true
     }
 
+    /**
+     * A mouse (or touchpad) button pressed, dragged and released, for a program tracking the
+     * mouse; the first button pressed is the one reported until it is released.
+     */
+    private fun mouseButtons(e: MotionEvent) {
+        val mods = VtKeys.mods(e.metaState)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (selected || menu != null) clearSelection()
+                requestFocus()
+                mouseButton = when {
+                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
+                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
+                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
+                }
+                send(VtNative.mouse(tab, MOUSE_PRESS, mouseButton, mods, e.x, e.y, true))
+            }
+            MotionEvent.ACTION_MOVE -> if (mouseButton != 0) {
+                send(VtNative.mouse(tab, MOUSE_MOTION, mouseButton, mods, e.x, e.y, true))
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (mouseButton != 0) {
+                send(VtNative.mouse(tab, MOUSE_RELEASE, mouseButton, mods, e.x, e.y, false))
+                mouseButton = 0
+            }
+        }
+    }
+
+    /** The finger moved on after a long press in mouse mode: the program gets a left-button drag. */
+    private fun startMouseDrag(e: MotionEvent) {
+        if (selected) clearSelection()
+        drag = DRAG_MOUSE
+        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, pressX, pressY, true))
+        send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_LEFT, 0, e.x, e.y, true))
+    }
+
+    /** Lifted after a long press in mouse mode without moving: the word's menu, as without mouse mode. */
+    private fun endPress() {
+        if (selected) {
+            endDrag()
+            return
+        }
+        drag = DRAG_NONE
+        menuX = pressX
+        menuY = pressY
+        showMenu()
+    }
+
+    /** Taps without a delay: a double tap's first tap acts at once, its second selects the word. */
     private val gestures = GestureDetector(
         context,
-        object : GestureDetector.SimpleOnGestureListener() {
+        object : GestureDetector.OnGestureListener {
+            override fun onDown(e: MotionEvent) = true
+
+            override fun onShowPress(e: MotionEvent) = Unit
+
             override fun onSingleTapUp(e: MotionEvent): Boolean {
+                val second = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
+                    hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
+                // A third tap starts over
+                lastTapTime = if (second) 0L else e.eventTime
+                lastTapX = e.x
+                lastTapY = e.y
+                // In mouse mode both taps are clicks, for the program's own double click
+                if (second && !mouseTracking && tab != 0L && VtNative.selectWord(tab, cellX(e.x), cellY(e.y))) {
+                    selected = true
+                    menuX = -1f
+                    menuPending = true
+                    invalidate()
+                    return true
+                }
                 if (selected || menu != null) {
                     clearSelection()
                     return true
@@ -1176,7 +1277,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             override fun onLongPress(e: MotionEvent) {
                 if (tab == 0L || scaler.isInProgress) return
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                if (VtNative.selectWord(tab, cellX(e.x), cellY(e.y))) {
+                val word = VtNative.selectWord(tab, cellX(e.x), cellY(e.y))
+                if (mouseTracking) {
+                    // Whether this selects the word or drags for the program waits for the finger
+                    selected = word
+                    startDrag(DRAG_PRESS, e.x, e.y)
+                    pressX = e.x
+                    pressY = e.y
+                    invalidate()
+                } else if (word) {
                     selected = true
                     startDrag(DRAG_WORD, e.x, e.y)
                     invalidate()
@@ -1189,6 +1298,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     showMenu()
                 }
             }
+
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float) = false
         },
     )
 
@@ -1206,13 +1317,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         },
     )
 
-    /** A mouse wheel (or touchpad scroll) scrolls like a drag. */
+    /**
+     * A mouse wheel (or touchpad scroll) scrolls like a drag; a mouse moving with no button held
+     * goes to a program tracking all motion (mode 1003).
+     */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER) && event.actionMasked == MotionEvent.ACTION_SCROLL) {
-            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
-            if (v != 0f) {
-                scrollBy(if (v > 0) -WHEEL_ROWS else WHEEL_ROWS, event.x, event.y)
-                return true
+        if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_SCROLL -> {
+                    val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+                    if (v != 0f) {
+                        scrollBy(if (v > 0) -WHEEL_ROWS else WHEEL_ROWS, event.x, event.y)
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_HOVER_MOVE -> if (mouseTracking) {
+                    send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_NONE, VtKeys.mods(event.metaState), event.x, event.y, false))
+                    return true
+                }
             }
         }
         return super.onGenericMotionEvent(event)
@@ -1286,7 +1408,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         // VtNative.mouse
         const val MOUSE_PRESS = 0
         const val MOUSE_RELEASE = 1
+        const val MOUSE_MOTION = 2
+        const val MOUSE_NONE = 0
         const val MOUSE_LEFT = 1
+        const val MOUSE_RIGHT = 2
+        const val MOUSE_MIDDLE = 3
         const val MOUSE_WHEEL_UP = 4
         const val MOUSE_WHEEL_DOWN = 5
 
@@ -1297,6 +1423,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val DRAG_WORD = 1
         const val DRAG_START = 2
         const val DRAG_END = 3
+        const val DRAG_PRESS = 4
+        const val DRAG_MOUSE = 5
         const val AUTOSCROLL_MS = 50L
 
         const val MENU_COPY = 1

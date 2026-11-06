@@ -148,6 +148,11 @@ typedef struct AppineVt {
   // again until it ends (or HOLD_LIMIT_NS passes)
   bool held;
   int64_t held_since;
+  // The cell of the last mouse event reported, to report motion once per cell rather than for
+  // every pixel a drag or hover moves: the encoder's own deduplication forgets the cell whenever
+  // its options are set, which appine_vt_mouse does for every event
+  int mouse_x;
+  int mouse_y;
 } AppineVt;
 
 // ---- Effects (called inside ghostty_terminal_vt_write, under vt.rs's lock) ----
@@ -242,6 +247,8 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   }
   // Cell sizes are only known to libghostty-vt through resize (size reports, images)
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
+  vt->mouse_x = -1;
+  vt->mouse_y = -1;
 
   // The value itself is the userdata (since 1.4; it was read through *(void **)value before)
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_USERDATA, vt);
@@ -593,9 +600,19 @@ int appine_vt_paste(AppineVt *vt, const uint8_t *data, size_t len, bool allow_un
 
 // Encodes a mouse event at pixel (x, y) of the grid for the program, in its tracking mode and
 // format; returns the length, 0 when the program does not take it (no tracking, or a motion it
-// did not ask for), -1 when it does not fit. button 0 is none (motion), 1 left, 4 and 5 the wheel.
+// did not ask for), -1 when it does not fit. action 0 press, 1 release, 2 motion; button 0 none
+// (motion with no button held), 1 left, 2 right, 3 middle, 4 and 5 the wheel.
 ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, float x, float y,
                           bool pressed, char *out, size_t cap) {
+  // The cell as the encoder takes it (clamped to the grid); SGR-Pixels reports every pixel
+  int cx = x < 0 ? 0 : (int)(x / (float)vt->cell_width);
+  int cy = y < 0 ? 0 : (int)(y / (float)vt->cell_height);
+  if (cx >= vt->cols) cx = vt->cols - 1;
+  if (cy >= vt->height) cy = vt->height - 1;
+  if (action == GHOSTTY_MOUSE_ACTION_MOTION && cx == vt->mouse_x && cy == vt->mouse_y &&
+      !mode_on(vt, GHOSTTY_MODE_SGR_PIXELS_MOUSE)) {
+    return 0;
+  }
   ghostty_mouse_encoder_setopt_from_terminal(vt->mouse, vt->term);
   GhosttyMouseEncoderSize size = GHOSTTY_INIT_SIZED(GhosttyMouseEncoderSize);
   size.screen_width = (uint32_t)vt->cols * vt->cell_width;
@@ -616,6 +633,10 @@ ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, f
   if (ghostty_mouse_encoder_encode(vt->mouse, vt->mouse_event, out, cap, &len) !=
       GHOSTTY_SUCCESS) {
     return -1;
+  }
+  if (len > 0) {
+    vt->mouse_x = cx;
+    vt->mouse_y = cy;
   }
   return (ptrdiff_t)len;
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; the tab bar, extra keys and themes reworked; last, closing tabs animated in the tab row)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; tab bar, extra keys and themes reworked; closing tabs animated; last, mouse drags, hover and double-tap selection)
 
 ## Responsibilities
 
@@ -274,14 +274,27 @@ libghostty-vt with Zig (`android/native`).
 
 - A tap ends a selection or its menu; otherwise it opens the IME and, when the program tracks the
   mouse, also sends a left click (press and release at the tap's pixel position, in the program's
-  format).
+  format). Taps act at once: `VtView` tells a double tap itself (the second tap's press within the
+  system's double-tap timeout and slop of the first's lift), so without mouse tracking the second
+  tap selects the word under it (with the menu), and with it both taps are clicks, for the
+  program's own double click; a third tap counts as a first.
 - A vertical drag, or a mouse wheel (3 rows a notch), scrolls by whole rows: wheel events when the
   program tracks the mouse, arrow keys on the alternate screen with alternate scroll (1007, on by
   default), else the viewport.
 - A long press selects the word under it (`ghostty_terminal_select_word`, installed as the
   terminal's selection) and keeps it as the anchor: moving on extends the selection from the far
   side of the word to the cell under the finger. On blank cells it selects nothing and shows a menu
-  with Paste and Select all only. Long press selects even when the program tracks the mouse.
+  with Paste and Select all only. When the program tracks the mouse, the long press selects the
+  same way, but what it becomes waits for the finger: lifted, it keeps the word (or the Paste
+  menu); moved on past the touch slop, the selection is dropped and the program gets a left-button
+  drag instead (press at the long-pressed point, motion while moving, release where the finger
+  lifts).
+- A mouse or touchpad (not a finger) pressed while the program tracks the mouse goes to it as it
+  is: the first button pressed (left, right or middle; a touchpad tap is left) with modifiers,
+  motion while it is held and its release, bypassing the gestures. Hover (no button) is sent as
+  motion too. Which of these the program gets is the encoder's choice by its mode (1000 none of
+  the motion, 1002 motion with a button held, 1003 all), and vt.c reports motion once per cell
+  (except in SGR-Pixels format).
 - The two handles (start below the first cell, end below the last, when in the viewport) drag the
   selection's ends; the other end is the anchor, kept as tracked grid references so output does not
   move it. The finger keeps its offset from the dragged cell; held above or below the grid, the
@@ -329,6 +342,12 @@ libghostty-vt with Zig (`android/native`).
 
 ## Invariants and gotchas
 
+- libghostty-vt's mouse encoder forgets its last reported cell (its motion deduplication)
+  whenever `setopt_from_terminal` or the size option is set, which `appine_vt_mouse` does for
+  every event; so vt.c keeps the last cell itself, updated only when an event was encoded.
+- `GestureDetector` with a double-tap listener (any `SimpleOnGestureListener`) gives the second
+  tap of a double tap to that listener: `onSingleTapUp` never sees it and a drag starting there
+  does not scroll. `VtView` therefore uses a plain `OnGestureListener`.
 - The console opens lazily, so restored tabs that were never shown have no console and no shell.
 - `openConsole`, `spawn`, `resize` and `closeConsole` run on the main thread and take the kernel's
   BKL; input is written on each tab's own thread, so a program that stops reading blocks only its
@@ -423,9 +442,9 @@ libghostty-vt with Zig (`android/native`).
 
 ## Confirmed bugs / technical debt
 
-- **The terminal lacks** the bell, mouse drags and motion for programs (only clicks and the wheel
-  are sent), double- and triple-tap or rectangular selection, and handles that flip at the screen
-  edges (a selection starting at column 0 has its start handle mostly off-screen).
+- **The terminal lacks** the bell, triple-tap (line) or rectangular selection, and handles that
+  flip at the screen edges (a selection starting at column 0 has its start handle mostly
+  off-screen).
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels): `MainActivity` handles `density` itself and
   builds its views once in `onCreate`, so the new sizes apply only once the activity is created
