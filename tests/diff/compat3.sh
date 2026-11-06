@@ -2,7 +2,8 @@
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
-# thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork
+# thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
+# CLONE_PARENT exit signals
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -996,3 +997,59 @@ int main(void)
 C
 gcc -O1 -o membarrier membarrier.c && ./membarrier
 rm -f membarrier membarrier.c
+
+# A CLONE_PARENT child (clone3 requires exit signal 0 for it) signals the parent it shares with
+# its creator as its creator does: with SIGCHLD here
+cat > cloneparent.c <<'C'
+#define _GNU_SOURCE
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+struct clone_args {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid,
+        set_tid_size, cgroup;
+};
+
+int main(void)
+{
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &s, NULL);
+    int p[2];
+    pipe(p);
+    pid_t forked = fork();
+    if (forked == 0) {
+        struct clone_args a;
+        memset(&a, 0, sizeof a);
+        a.flags = CLONE_PARENT;
+        long c = syscall(SYS_clone3, &a, sizeof a);
+        if (c == 0)
+            _exit(7);
+        write(p[1], &c, sizeof c);
+        usleep(300000);
+        _exit(0);
+    }
+    long clone_child;
+    read(p[0], &clone_child, sizeof clone_child);
+    struct timespec ts = {2, 0};
+    siginfo_t si;
+    int sig = sigtimedwait(&s, &si, &ts);
+    printf("first SIGCHLD: %s, from %s\n", sig == SIGCHLD ? "yes" : "no",
+           si.si_pid == clone_child ? "the clone3 child" : si.si_pid == forked ? "the forked child" : "?");
+    int st;
+    printf("plain waitpid reaps the clone3 child: %d, status %d\n",
+           waitpid(clone_child, &st, 0) == clone_child, WEXITSTATUS(st));
+    waitpid(forked, &st, 0);
+    return 0;
+}
+C
+gcc -O1 -o cloneparent cloneparent.c && ./cloneparent
+rm -f cloneparent cloneparent.c

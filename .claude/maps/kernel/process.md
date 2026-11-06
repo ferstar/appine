@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals)
 
 ## Responsibilities
 
@@ -119,7 +119,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   chosen. Host-launched processes (`Machine::spawn`) are a trusted path and skip these limits.
 - The child's address space is shared (CLONE_VM) or forked (`kernel/mm`); fds and fs are shared or
   copied. A new process gets `ppid` and `parent_thread` from the caller (or the caller's parent with
-  CLONE_PARENT). A fresh CPU state copies the parent's registers with x0 = 0, the new stack and TLS.
+  CLONE_PARENT, which also gives it the caller's process's exit signal, as Linux's
+  `copy_process` does). A fresh CPU state copies the parent's registers with x0 = 0, the new stack and TLS.
 - Registration: the pid is registered (in every pid-namespace level), the parent/child tid and pidfd
   are written, then `task::start` queues the host thread and inserts the task into the group, the
   address space's users and the kernel's task table. A failure releases the pid and the pidfd.
@@ -449,8 +450,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
   so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
   for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-wait` case skips them).
-- **`CLONE_PARENT` children keep the requested `exit_signal`:** Linux uses the caller leader's; a
-  `clone3(CLONE_PARENT)` child (exit signal 0) therefore never signals its real parent.
 - **POSIX timers aimed at a dead thread signal the process:** `SIGEV_THREAD_ID` timers whose thread
   exited send to the whole process (Linux drops the signal), and after tid reuse can hit a thread of
   an unrelated process.

@@ -382,7 +382,13 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.coredump_filter = parent.coredump_filter;
         g.ctty = parent.ctty.clone();
         g.exe = parent.exe.clone();
-        g.exit_signal = args.exit_signal;
+        // As in Linux's copy_process, a CLONE_PARENT child signals the parent it shares with the
+        // caller as the caller's process does (clone3 even requires an exit signal of 0 for it)
+        g.exit_signal = if flags & CLONE_PARENT != 0 {
+            parent.exit_signal
+        } else {
+            args.exit_signal
+        };
         g.pid_ns = pid_ns.clone();
         g.cgroup = dst;
         g.frozen = frozen;
