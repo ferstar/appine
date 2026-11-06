@@ -132,6 +132,8 @@ impl Errno {
     pub const ECONNREFUSED: Errno = Errno(111);
     /// Host unreachable.
     pub const EHOSTUNREACH: Errno = Errno(113);
+    /// A connection is already in progress.
+    pub const EALREADY: Errno = Errno(114);
     /// Connection in progress.
     pub const EINPROGRESS: Errno = Errno(115);
 

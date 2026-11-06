@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs; blocking connect)
 
 ## Responsibilities
 
@@ -98,10 +98,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   nat, namespace translation and the filter chains (`kernel/netns`); a TCP reject returns its
   errno, a drop connects to a blackhole listener, no listener in the target namespace is
   `ECONNREFUSED`; then implicit bind, portmap destination mapping and the host connect.
-  Nonblocking returns the host's `EINPROGRESS`; blocking waits for `POLLOUT` with the BKL
-  released (no `SO_SNDTIMEO` deadline, `EINTR` on a signal, never restarted; a repeated connect
-  then gets the host's `EALREADY`), then reads `SO_ERROR` and connects again so the host reports
-  `EISCONN`. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
+  Nonblocking returns the host's `EINPROGRESS`; blocking (also when the host answers `EALREADY`
+  to a connect made again while one is in progress) waits for `POLLOUT` with the BKL released, as
+  Linux's `__inet_stream_connect`: `SO_SNDTIMEO` bounds the wait (then `EINPROGRESS`, or `EALREADY`
+  for the repeated connect, and the connection goes on), and a signal gives `ERESTARTSYS`
+  (restarted under `SA_RESTART`, the restarted call waiting again) or `EINTR` when there is a
+  timeout; then it reads `SO_ERROR` and connects again so the host reports `EISCONN`. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
 - accept4: bad flags `EINVAL`; host accept with waits bounded by the listener's `SO_RCVTIMEO`
   (`EAGAIN` on timeout); the new socket inherits protocol, local port map, namespace state,
   mark and the claimed original destination (but not the kernel-layer timeouts); the peer address
@@ -315,9 +317,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **An error after part of a `MSG_WAITALL` read is lost:** the partial count is returned, but the
   host has already taken the error (a reset, say), so the next read sees end of file where Linux
   reports the error then.
-- **Blocking connect ignores `SO_SNDTIMEO` and is never restarted:** it waits without a deadline,
-  returns `EINTR` even under `SA_RESTART`, and a retried connect then fails with `EALREADY` where
-  Linux keeps waiting (and times out with `EINPROGRESS`).
 - **accept4 leaks fds and drops connections:** the fd is installed before the peer address is
   written, so a bad address pointer returns an error with the fd left open; `EMFILE` is reported
   after the connection was taken from the queue and closed. Accepted inet sockets also lose the

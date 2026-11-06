@@ -700,19 +700,37 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             return Ok(0);
         }
         Err(e) if e == Errno::EINPROGRESS.0 && !nonblock => {}
+        // A blocking connect made again while the first is still in progress (restarted after a
+        // signal, or from another thread) waits for it too (Linux's SS_CONNECTING case)
+        Err(e) if e == Errno::EALREADY.0 && !nonblock => {}
         Err(e) => return Err(Errno(e)),
     }
-    // Blocking connect: wait for the connection to complete, then fetch its result
+    // Blocking connect: wait for the connection to complete, then fetch its result. As in Linux's
+    // __inet_stream_connect, SO_SNDTIMEO bounds the wait (then the error is EINPROGRESS, or
+    // EALREADY for a connect made again, and the connection goes on), and a signal restarts the
+    // call (ERESTARTSYS), or ends it with EINTR when there is a timeout
+    let timeout = match &*sock.borrow() {
+        Socket::Inet(s) => s.sndtimeo,
+        _ => None,
+    };
+    let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         let mut pfd = [(host_fd, POLLOUT, 0)];
         appine_hal::poll(&mut pfd, Some(Duration::ZERO)).map_err(Errno)?;
         if pfd[0].2 != 0 {
             break;
         }
-        if cx.interrupted() {
-            return Err(Errno::EINTR);
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Errno(r.unwrap_err()));
         }
-        cx.wait_objects(None, &mut pfd, wake::FILE, &[wake::of(&sock)])?;
+        if cx.interrupted() {
+            return Err(if timeout.is_some() {
+                Errno::EINTR
+            } else {
+                Errno::ERESTARTSYS
+            });
+        }
+        cx.wait_objects(deadline, &mut pfd, wake::FILE, &[wake::of(&sock)])?;
     }
     let err = appine_hal::net::getsockopt(host_fd, SOL_SOCKET, SO_ERROR, 4).map_err(Errno)?;
     match i32::from_le_bytes(err[..4].try_into().unwrap()) {

@@ -1,7 +1,7 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
-# recorded sysctls; process signals taken by another thread
+# recorded sysctls; process signals taken by another thread; blocking connect
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -698,3 +698,85 @@ int main(void)
 C
 gcc -O1 -pthread -o retarget retarget.c && ./retarget
 rm -f retarget retarget.c
+
+# A blocking connect that cannot complete (the listener's accept queue is full, so its SYNs are
+# dropped): SO_SNDTIMEO ends it with EINPROGRESS and a second connect with EALREADY; a signal
+# whose handler has SA_RESTART restarts it, and it completes once the handler has made room; with
+# SO_SNDTIMEO set the same signal makes it EINTR
+cat > connwait.c <<'C'
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static int lfd;
+static volatile int handled;
+static struct sockaddr_in addr;
+
+static void on_alarm(int sig)
+{
+    (void)sig;
+    handled++;
+    int c = accept(lfd, NULL, NULL);
+    if (c >= 0)
+        close(c);
+}
+
+static void show(const char *what, int r)
+{
+    printf("%s: %s\n", what, r < 0 ? strerror(errno) : "0");
+}
+
+static int with_timeout(int ms)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct timeval tv = {ms / 1000, ms % 1000 * 1000};
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    return s;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    lfd = socket(AF_INET, SOCK_STREAM, 0);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof addr;
+    bind(lfd, (struct sockaddr *)&addr, sizeof addr);
+    listen(lfd, 0);
+    getsockname(lfd, (struct sockaddr *)&addr, &len);
+    /* One connection fills the accept queue of a backlog of 0 */
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    show("first connect", connect(c1, (struct sockaddr *)&addr, sizeof addr));
+
+    int s = with_timeout(300);
+    show("connect with SO_SNDTIMEO", connect(s, (struct sockaddr *)&addr, sizeof addr));
+    show("connect again", connect(s, (struct sockaddr *)&addr, sizeof addr));
+    close(s);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = {{0, 0}, {0, 200000}};
+    setitimer(ITIMER_REAL, &it, NULL);
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    show("connect restarted after a SA_RESTART handler", connect(t, (struct sockaddr *)&addr, sizeof addr));
+    printf("handled: %d\n", handled);
+
+    /* t's connection now fills the queue */
+    int u = with_timeout(5000);
+    setitimer(ITIMER_REAL, &it, NULL);
+    show("connect with SO_SNDTIMEO and a SA_RESTART signal", connect(u, (struct sockaddr *)&addr, sizeof addr));
+    return 0;
+}
+C
+gcc -O1 -o connwait connwait.c && ./connwait
+rm -f connwait connwait.c
