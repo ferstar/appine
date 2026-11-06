@@ -24,6 +24,33 @@ fn hello_world() {
 }
 
 #[test]
+fn options_without_a_value_refuse_one() {
+    // `--pty=0` used to turn the PTY on: an inline value on a flag is a usage error (2), while an
+    // option with a value still takes it inline (a missing program is 127)
+    let appine_run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    for flag in [
+        "--pty=0",
+        "--no-pty=1",
+        "--stats=no",
+        "--init=0",
+        "--always-map-low-ports=0",
+        "--help=1",
+        "--version=1",
+    ] {
+        assert_eq!(appine_run(&[flag, "/nonexistent"]), Some(2), "{flag}");
+    }
+    assert_eq!(appine_run(&["--tier=7", "/nonexistent"]), Some(2));
+    assert_eq!(appine_run(&["--tier=0", "/nonexistent"]), Some(127));
+}
+
+#[test]
 fn exit_code_is_propagated() {
     for (tier, out) in run("exit42", &[]) {
         assert_eq!(out.status.code(), Some(42), "tier {tier}");

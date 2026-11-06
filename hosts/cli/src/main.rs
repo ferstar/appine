@@ -77,6 +77,21 @@ fn main() -> ExitCode {
             Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(OsString::from(v))),
             _ => (arg.clone(), None),
         };
+        // Options without a value refuse one, as getopt_long does: `--pty=0` must not turn the
+        // PTY on
+        let flag = matches!(
+            name.as_str(),
+            "-h" | "--help"
+                | "--version"
+                | "--stats"
+                | "--init"
+                | "--always-map-low-ports"
+                | "--pty"
+                | "--no-pty"
+        );
+        if flag && inline.is_some() {
+            return usage_error();
+        }
         let mut value = || {
             inline
                 .clone()

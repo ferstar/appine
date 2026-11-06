@@ -1659,7 +1659,7 @@ rm -f chown.py
 # /proc lists only processes: it looks like the process's directory seen through that thread
 # (status and comm are the thread's), and goes away when the thread exits
 cat > tids.py <<'PY'
-import ctypes, os, threading
+import ctypes, os, threading, time
 
 libc = ctypes.CDLL(None, use_errno=True)
 PR_SET_NAME = 15
@@ -1715,6 +1715,12 @@ check("fd lists the same fds:",
       lambda: sorted(os.listdir(d + "/fd")) == sorted(os.listdir("/proc/%d/fd" % pid)))
 done.set()
 t.join()
+# join returns before the kernel has necessarily reaped the thread, on Linux as here: wait for
+# /proc/<tid> to go (at most 5 s) rather than compare a race
+for _ in range(500):
+    if not os.path.exists(d):
+        break
+    time.sleep(0.01)
 print("after the thread exits:", os.path.exists(d))
 PY
 python3 tids.py

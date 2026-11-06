@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all; flags refuse values; SIGKILL timeouts for Starnix's tests)
 
 ## Responsibilities
 
@@ -67,8 +67,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ### `appine-run`
 
-- Options stop at the first non-option, `--` or a non-UTF-8 argument. argv is the program and its
-  arguments as given; the environment is only the `--env` values.
+- Options stop at the first non-option, `--` or a non-UTF-8 argument; an option with a value takes
+  it as the next argument or after `=`, and a flag given a value (`--pty=0`) is a usage error.
+  argv is the program and its arguments as given; the environment is only the `--env` values.
 - Without `--rootfs` the program is a host file and the guest has no filesystem (dynamically linked
   programs fail to load); with `--rootfs` the path is resolved in the store.
 - A PTY is used by default when fds 0 and 1 are both terminals (then the host terminal goes raw and
@@ -144,7 +145,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - difftest installs the newest tarball into its store at `/usr/lib/starnix-tests` whenever the
   tarball's `VERSION` differs from the installed one, and then exports the image again.
 - The `starnix-*` cases list a binary's tests and run each in its own process under
-  `timeout 60` (a crash or hang does not take the rest with it), printing `<test> ok|failed|
+  `timeout -s KILL 60` with its output in a file (a crash or hang, a test ignoring `SIGTERM` or a
+  child keeping the output open does not take the rest with it), printing `<test> ok|failed|
   skipped|exit <code>`, with core files off and the shell's crash reports filtered out. Tests that
   cannot be compared are skipped through a negative gtest filter, with the reason beside them: in
   `starnix-mmap` two that fail on the native kernel itself (VMA merging of file mappings),
@@ -254,8 +256,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   cases) when its first bind fails; without a rootfs only the first test prints the skip and the rest
   pass silently; the tarball (and the survey's) is chosen by the lexically greatest name, so 3.3
   would beat 3.24.
-- **`appine-run` drops inline flag values** (`--pty=0` turns the PTY on, `--stats=no` turns stats
-  on).
 - **Killing `appine-run` skips the guest's shutdown.** Without signal handlers, `timeout` or ^C
   (with `--no-pty`) skip the inittab shutdown and the final store sync (losing the 5 ms deferred
   commit window) and, in PTY mode, leave the host terminal raw.
@@ -270,15 +270,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The `starnix-*` cases pass vacuously without the built tests:** CI does not build them
   (`build-starnix-tests` needs the network and about four minutes), so there they only print that
   the tests are missing.
-- **A hung Starnix test stalls its whole case:** the `starnix-*` cases capture each test with
-  `$(timeout 60 …)`, so a test that ignores `SIGTERM` or leaves a child holding its output keeps
-  the case, and the difftest lane, waiting with no limit (two futex tests and one exit test did this
-  on the native side, and the appine side stalled too, when all programs were run once).
-- **compat2's "after the thread exits" check races:** it tests whether `/proc/<tid>` of a
-  non-leader thread still exists right after Python's `join()`, which returns before the kernel has necessarily
-  reaped the thread; native usually prints True, and appine printed False once in a full parallel
-  run (it passes on its own).
-
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
