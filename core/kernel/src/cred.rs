@@ -44,6 +44,7 @@ pub(crate) mod cap {
     pub const NET_RAW: u32 = 13;
     pub const IPC_LOCK: u32 = 14;
     pub const IPC_OWNER: u32 = 15;
+    pub const SYS_RAWIO: u32 = 17;
     pub const SYS_CHROOT: u32 = 18;
     pub const SYS_PTRACE: u32 = 19;
     pub const SYS_ADMIN: u32 = 21;

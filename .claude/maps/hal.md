@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug; `ClockWatch`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug; `ClockWatch`; `has_private_pages`)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 - Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `map_file`,
   `map_file_read_only`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
-  `touched_pages`, `cachestat`.
+  `touched_pages`, `has_private_pages`, `cachestat`.
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `statvfs`,
   `fd_limit`, `raise_fd_limit`, `host_cpus`, `cpu_sysfs`, `thread_cpu_clock`,
   `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`.
@@ -90,9 +90,11 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   only shared read-only ones are read-only), rounding the offset down to the host page (16K on some
   devices) and the length up; `map_file_read_only` serves shared read-only mappings.
 - `discard` is `MADV_DONTNEED`; residency comes from `mincore` (`resident_pages`, `page_residency`)
-  or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched),
-  all in 4K units (pages within one 16K host page share a result, so `resident_pages` may count 4K
-  pages just outside the range); `cachestat` maps the file in chunks to count cached pages.
+  or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched;
+  `has_private_pages`, whether a private file mapping has a page present without the file bit or
+  swapped, a copy written since it was mapped), all in 4K units (pages within one 16K host page
+  share a result, so `resident_pages` may count 4K pages just outside the range); `cachestat` maps
+  the file in chunks to count cached pages.
 - `memory_usage` reads `/proc/self/status`; `host_meminfo` copies host `/proc/meminfo` (falling
   back to `sysinfo`); long-lived fds for `/proc/self/status` and pagemap are kept in `OnceLock`s.
 

@@ -146,8 +146,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - The `starnix-*` cases list a binary's tests and run each in its own process under
   `timeout 60` (a crash or hang does not take the rest with it), printing `<test> ok|failed|
   skipped|exit <code>`, with core files off and the shell's crash reports filtered out. Tests that
-  differ from Linux are skipped through a negative gtest filter, grouped by reason, each group a
-  bug item in a kernel map. Without the tarball the cases print that it is missing and pass.
+  cannot be compared are skipped through a negative gtest filter, with the reason beside them: in
+  `starnix-mmap` two that fail on the native kernel itself (VMA merging of file mappings),
+  in `starnix-wait` the `__WCLONE`/`__WALL` bug of the kernel/process map. Without the tarball the
+  cases print that it is missing and pass.
 
 ### LTP
 

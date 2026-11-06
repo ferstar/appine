@@ -255,10 +255,7 @@ pub fn page_residency(ptr: *const u8, len: usize) -> Vec<bool> {
 /// swapped out (zram on Android) as "absent" too.
 pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
     use std::os::unix::fs::FileExt;
-    static PAGEMAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
-    let pagemap = PAGEMAP
-        .get_or_init(|| std::fs::File::open("/proc/self/pagemap").ok())
-        .as_ref()?;
+    let pagemap = pagemap()?;
     let page = page_size();
     let first = ptr as usize / page;
     let last = (ptr as usize + len).div_ceil(page);
@@ -274,6 +271,35 @@ pub fn touched_pages(ptr: *const u8, len: usize) -> Option<Vec<bool>> {
             .map(|i| touched((ptr as usize + i * 4096) / page))
             .collect(),
     )
+}
+
+/// Whether any host page of `[ptr, ptr + len)` in a private file mapping holds a private copy
+/// (written since it was mapped, so no longer the file's page): `/proc/self/pagemap` shows it
+/// present without the "file page" bit, or swapped. Returns None when pagemap cannot be read.
+pub fn has_private_pages(ptr: *const u8, len: usize) -> Option<bool> {
+    use std::os::unix::fs::FileExt;
+    if len == 0 {
+        return Some(false);
+    }
+    let pagemap = pagemap()?;
+    let page = page_size();
+    let first = ptr as usize / page;
+    let last = (ptr as usize + len).div_ceil(page);
+    let mut raw = vec![0u8; (last - first) * 8];
+    pagemap.read_exact_at(&mut raw, first as u64 * 8).ok()?;
+    Some(raw.chunks_exact(8).any(|e| {
+        let entry = u64::from_le_bytes(e.try_into().unwrap());
+        let (present, swapped, file) = (entry >> 63 & 1, entry >> 62 & 1, entry >> 61 & 1);
+        present == 1 && file == 0 || swapped == 1
+    }))
+}
+
+/// `/proc/self/pagemap`, opened once.
+fn pagemap() -> Option<&'static std::fs::File> {
+    static PAGEMAP: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    PAGEMAP
+        .get_or_init(|| std::fs::File::open("/proc/self/pagemap").ok())
+        .as_ref()
 }
 
 /// Host page size.

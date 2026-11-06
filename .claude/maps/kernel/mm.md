@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` at fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer; mremap with an old length of 0; Starnix test gaps)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` at fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer; mremap with an old length of 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, kernel stack growth, `mmap_min_addr`, smaps Rss)
 
 ## Responsibilities
 
@@ -55,7 +55,11 @@ dumps and the host abstraction layer (`core/hal`).
   `VM_MAYWRITE`/`VM_MAYEXEC`), `Arc<HostRegion>` plus host pointer, `name`/`ino` for maps,
   `file_len` (bytes before EOF), `file_id`/`content` (file identity and version), a dup'd fd for
   shared file mappings, `shm`, and flags `cow`, `locked`, `written` (sticky), `growsdown`,
-  `dontdump`, `wipeonfork`, `dontfork`, `noreserve`.
+  `dontdump`, `wipeonfork`, `dontfork`, `noreserve`, and `anon`, the identity of the anon_vma it
+  would have on Linux (0 until a fork).
+- `same_vma` — whether two adjacent VMAs are one VMA on Linux: same contents source (anonymous
+  private, or the same file at contiguous offsets; shared anonymous never), backing, prot, lock,
+  may_write, growsdown, dump and fork flags, `anon` and name.
 - `Backing` — `Anonymous` (private anonymous), `PrivateFile` (private file mapping), `Shared`
   (shared file, shared anonymous, `/dev/zero` or SysV shm).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
@@ -132,7 +136,7 @@ dumps and the host abstraction layer (`core/hal`).
 
 ## Public entry points
 
-- **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `munmap`, `mprotect`, `mremap` (including
+- **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `munmap`, `protect` (mprotect), `mremap` (including
   `MREMAP_DONTUNMAP` via `mremap_dontunmap`), `remap_file_pages` (emulated as a shared fixed
   mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`, `mlockall`/`munlockall`, `mincore`.
   `brk` calls `Mm::brk` directly.
@@ -142,7 +146,8 @@ dumps and the host abstraction layer (`core/hal`).
 - **Fault path** (task run loop): `cow_break`, `fault_in`, `fault_past_eof`, `Cx::grow_stack`
   (→ `grow_down`), `is_mapped`.
 - **Stack growth from the kernel**: `Cx::grow_stack_to` at syscall entry; `Cx::grow_stack` before
-  building a signal frame.
+  building a signal frame; `grow_for` through `Cx::read_user`, `Cx::write_user`,
+  `Cx::write_user_partial` and `/proc/<pid>/mem`.
 - **Kernel access to guest memory**: `read`, `write` (breaks CoW per page), `translate` (does not
   break CoW), `read_cstr`, `write_kernel`, `write_force` (ptrace and `/proc/<pid>/mem` writes),
   `check_mapped`, `populate`.
@@ -152,6 +157,7 @@ dumps and the host abstraction layer (`core/hal`).
   `shared_file_ranges` (msync), `content_version`.
 - **SysV shm**: `SharedMemory::new`, `attach_shm`, `detach_shm`, `shm_attachments`.
 - **Introspection**: `regions`, `resident_in`, `cow_shared`, `residency`, `pagemap`, `size`,
+  `stack_bytes` (VmStk),
   `resident_pages`, `peak_resident_pages`, `locked_bytes`, `locked_in`, `dump_regions`, `dump_page`.
 - **BKL hooks**: `defer_unmaps` when the BKL is taken; `release_unmapped`, then `spare::refill`
   when it is released.
@@ -169,7 +175,10 @@ dumps and the host abstraction layer (`core/hal`).
   plus the stack guard gap, clamped between 1 GB + 8 MB and 5/6 of the address space. An unlimited
   stack still gives a top-down layout with the largest gap.
 - `STACK_TOP` is `1 << 47`. A position-independent main program loads at `0x5555_5555_0000`.
-  Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), with a floor of `0x10000`.
+  Non-fixed `mmap` allocates top-down from `mmap_top` (`find_free`), skipping the guard gap
+  (`stack_guard_gap`, 256 pages) below every grows-down VMA, with a floor of `vm.mmap_min_addr`
+  (`MMAP_MIN_ADDR`, 32768 as on distribution and GKI arm64 kernels; at least one page). The sysctl
+  is global and writable with `CAP_SYS_RAWIO`.
 - `map_stack` maps the arguments and auxv plus 128 KB at the top of one host region of
   `max(min(page-aligned RLIMIT_STACK, 8 MB), mapped length)`, leaving the rest below as reserved
   growth room.
@@ -178,10 +187,13 @@ dumps and the host abstraction layer (`core/hal`).
 
 - Lengths round up to a page; zero is `EINVAL`.
 - `MAP_FIXED` / `MAP_FIXED_NOREPLACE`: the address must be aligned and the end at most `1 << 48`;
-  there is no lower bound. `NOREPLACE` on an occupied range is `EEXIST`; otherwise the old range is
-  unmapped first, before host allocation and the map-count check.
-- A hint is rounded down to a page and used only if it is at least `0x10000`, ends at or below
-  `mmap_top`, and is free.
+  below `vm.mmap_min_addr` it is `EPERM` without `CAP_SYS_RAWIO` (checked by the syscall, after
+  the file's `EBADF`/`EINVAL`; also for a `MREMAP_FIXED` target). `NOREPLACE` on an occupied range
+  is `EEXIST`; otherwise the old range is unmapped first, before host allocation and the map-count
+  check.
+- A hint is rounded down to a page and raised to `vm.mmap_min_addr` (Linux's `round_hint_to_min`),
+  and used if it ends at or below `mmap_top`, is free, and stays clear of the guard gap below a
+  grows-down VMA above it.
 - Host backing by kind:
   - private anonymous `PROT_NONE` → a `reserved` `HostRegion` (no host address space);
   - other private anonymous → the `recycled` pool, else a new host anonymous mapping;
@@ -239,18 +251,27 @@ signals may still be delivered).
 
 ### munmap, mprotect, mremap
 
-- VMAs are only ever split (`split_at` adjusts file offsets and host pointers), never merged.
+- VMAs are only ever split (`split_at` adjusts file offsets and host pointers), never merged;
+  `same_vma` tells which pieces Linux would have as one VMA.
 - `munmap` moves removed host regions to the `graveyard`, sets `dirty`, and records executable
   ranges in `code_ranges`.
-- `mprotect` requires the range to be fully mapped (`ENOMEM`) and the `may_write`/`may_exec`
-  permissions (`EACCES`). A `cow` VMA is copied (`unshare`, which sets `dirty`) before it becomes
+- `mprotect` (`protect`, Linux's `do_mprotect_pkey`): a length of 0 succeeds at once and an
+  overflowing one is `ENOMEM`. The VMAs from the first one ending above the address are changed in
+  turn; a gap (`ENOMEM`) or a VMA refusing the permissions (`may_write`/`may_exec`, `EACCES`) stops
+  it with the VMAs before it already changed. With `PROT_GROWSDOWN` the range starts at the start
+  of the Linux VMA holding that first VMA, which must grow down (`EINVAL`; `ENOMEM` if it starts at
+  or above the end), so it reaches the parts the mapping grew by; `PROT_GROWSUP`, alone or with it,
+  is `EINVAL`. A `cow` VMA is copied (`unshare`, which sets `dirty`) before it becomes
   writable, and a `reserved` region gets real host memory (`back_reserved`) before it becomes
   accessible. Otherwise only a permission downgrade sets `dirty`; a range containing fork CoW pages
   gets an immediate `shootdown` either way.
-- `mremap` may span several contiguous VMAs. Growing in place needs the old end to be a VMA end,
-  free space above, and the new end at or below `mmap_top`; the grown part becomes a separate VMA
-  with the same lock, dump and fork flags. A move re-points the same host memory and moves the
-  page-table entries with it.
+- `mremap` follows Linux's order: no mapping at the old address is `EFAULT`; a `MREMAP_FIXED`
+  target is validated (`EINVAL`) and unmapped and a shrunk tail unmapped; then the rest of the old
+  range must lie in one Linux VMA (`EFAULT`, `same_vma`, as Linux before 6.17). Shrinking without
+  a target only unmaps the tail; `MREMAP_DONTUNMAP` applies the one-VMA rule first. Growing in
+  place needs the old end to be a VMA end, free space above, and the new end at or below
+  `mmap_top`; the grown part becomes a separate VMA with the same lock, dump, fork and `anon`
+  flags. A move re-points the same host memory and moves the page-table entries with it.
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
   address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
   unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`. A shared file mapping
@@ -265,16 +286,19 @@ signals may still be delivered).
 
 ### Stack and heap growth
 
-- `grow_down` refuses pages below `0x10000` and addresses already mapped. It applies when the
+- `grow_down` refuses pages below `vm.mmap_min_addr` and addresses already mapped. It applies when the
   nearest VMA at or above the address is `growsdown`. It refuses if the single nearest VMA below is
   non-growsdown, accessible and closer than 256 pages (`stack_guard_gap`; a `PROT_NONE` or
   growsdown neighbour is not looked past), or if the new stack size exceeds the current
   `RLIMIT_STACK`. Otherwise it extends into the reserved room below, or maps a new chunk reserving
   `clamp(size, grow, limit − size)` below it (exactly the growth if that host allocation fails), so
-  the VMA count grows only logarithmically.
-- The kernel grows the stack itself in only two places: at syscall entry when SP is below the stack
-  (arm64 has no red zone), and before writing a signal frame. Other kernel accesses below SP, and
-  `/proc/<pid>/mem` accesses, never grow it.
+  the VMA count grows only logarithmically; the chunk takes the flags of the VMA above it.
+- The kernel grows a stack itself at syscall entry when SP is below the main stack (arm64 has no
+  red zone), before writing a signal frame, and when a kernel access to unmapped memory fails
+  (`grow_for`, as Linux's fault handler does): the shared syscall helpers (`get`/`put`), read,
+  write and readv buffers and waitid go through `Cx::read_user`/`write_user`, and
+  `/proc/<pid>/mem` accesses grow within the accessor's `RLIMIT_STACK`. Other direct `Mm::read`/
+  `write` callers do not grow it.
 - `MAP_GROWSDOWN` is honoured only for private anonymous mappings (including private `/dev/zero`);
   `MAP_SHARED | MAP_ANONYMOUS` with it is `EINVAL`, and file or shared `/dev/zero` mappings ignore
   it. An mmap'd growsdown VMA has no reserved room, so its first growth maps a new chunk.
@@ -322,6 +346,10 @@ signals may still be delivered).
   writable non-`MAP_NORESERVE` VMAs the child gets, by guest prot, merging adjacent ones the way
   Linux `vma_merge` would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it).
   `fork` cannot fail after lending starts.
+- Each child VMA with contents of its own gets a new `anon` identity, shared by the pieces of one
+  Linux VMA (Linux's `anon_vma_fork`), so it no longer joins its neighbours while the parent's
+  pieces still do: an anonymous VMA when it has been writable, a private file VMA when a page of
+  its host region holds a private copy (host pagemap: present without the file bit, or swapped).
 - Per VMA (`MADV_DONTFORK` VMAs are skipped; the child's VMAs keep `dontdump` and `wipeonfork`):
   - shared mappings, reservations and read-only private file mappings share the parent's region;
     read-only private file VMAs are marked `cow` on both sides;
@@ -388,11 +416,13 @@ signals may still be delivered).
 
 - `regions` labels each VMA (file name, else `[stack]` for the VMA containing `start_stack` and the
   contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[heap]` inside
-  `[brk_start, brk)`) and joins adjacent entries for display when both are private anonymous or the
-  same file at contiguous offsets, and prot, shared, locked, may_write, the dump and fork flags and
-  name all match (may_exec is not compared). Shared anonymous entries are never joined.
-- Residency always comes from host `mincore` on host pointers, never from guest addresses. Borrowed
-  pages always count as resident; reserved VMAs never do.
+  `[brk_start, brk)`) and joins adjacent pieces of one Linux VMA (`same_vma`, plus the same label;
+  may_exec is not compared). procfs escapes a newline in a file name as `\012`.
+- Residency comes from host pointers, never from guest addresses: host `mincore`, except that
+  `resident_in` (smaps) counts file mappings by host pagemap presence (falling back to `mincore`;
+  readahead fills the page cache around touched pages) and a borrowed page only when the owner's
+  host page is resident. `resident_pages` counts every borrowed page. Reserved VMAs never count.
+- `stack_bytes` (VmStk) sums the grows-down VMAs.
 - `resident_pages` (VmRSS, statm, cgroup, OOM victim choice) skips never-written private anonymous
   VMAs, measures private anonymous VMAs over 1 MB only over windows with entries, and uses the 1 s
   file-residency cache for unwritten private file mappings and all shared mappings. `resident_in`
@@ -504,8 +534,10 @@ signals may still be delivered).
   its CPU state is destroyed.
 - The host's `vm.max_map_count` is shared by the whole app process, so the guest limit is enforced
   per address space.
-- VMAs never merge; adjacent anonymous VMAs are separate host mappings and are only joined for
-  display and for fork's commit estimate.
+- VMAs never merge; adjacent anonymous VMAs are separate host mappings and are only joined (as
+  `same_vma`) for display, mremap's one-VMA rule, `PROT_GROWSDOWN`, fork's `anon` identities and
+  (by its own rule) fork's commit estimate. Code creating a VMA that continues another (stack
+  chunks, mremap growth) must copy the flags `same_vma` compares.
 - Guest pages are always 4 KB (`AT_PAGESZ` 4096) whatever the host page size.
 - Every guest mapping except a never-accessible `PROT_NONE` reservation is a host mapping of the
   same size, and all guest processes live in the one app process. On hosts with a 39-bit user
@@ -538,8 +570,6 @@ signals may still be delivered).
   when the fault guard is off) instead of receiving a catchable `SIGBUS`.
 - **`mlock` arithmetic overflow:** the span is computed before validation, so a length near
   `u64::MAX` overflows; builds with overflow checks (tests, CI) abort the host process.
-- **`MAP_FIXED` below `0x10000` is accepted:** Linux returns `EPERM` for callers without
-  `CAP_SYS_RAWIO`.
 - **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before
   validating the destination and keeps the splits on `EINVAL`; a move that hits the limit after its
   entries were moved drops VMAs and leaves stale entries at the destination.
@@ -566,21 +596,11 @@ signals may still be delivered).
   and ties go to the lowest tgid (Linux 6.1 compares raw scores and lets a later equal one win). A
   victim that outlived its second is skipped only until another is recorded; picked again, it is
   only waited for, so the killer stalls another second without killing.
-- **Gaps found by Starnix's mmap tests** (the `starnix-mmap` differential case skips them, grouped
-  the same way):
-  - `MAP_GROWSDOWN`: an mmap hint inside a growsdown mapping's guard gap is taken; kernel accesses
-    below the mapping (a `write` from that memory, for example) fail instead of growing it; a read
-    below it after mprotect does not fault; VmStk is not kept.
-  - mprotect accepts `PROT_GROWSDOWN` on a mapping that does not grow down (Linux: `EINVAL`), and
-    when a later VMA refuses (`EACCES`) it changes nothing, where Linux has already changed the
-    earlier ones.
-  - Because VMAs never merge (D7), `/proc/<pid>/maps` shows pieces Linux would show as one, and
-    mremap with `MREMAP_FIXED` or `MREMAP_DONTUNMAP` accepts a range spanning several mappings,
-    which Linux before 6.17 refuses with `EFAULT`.
-  - smaps counts the Rss of `PROT_NONE` and copy-on-write pages differently around fork (a page
-    that holds data but is `PROT_NONE` reads 0 kB; a child's view counts lent pages of the whole
-    region).
-  - `/proc/<pid>/maps` prints a newline in a file name as is; Linux escapes it as `\012`.
+- **Linux VMA boundaries are approximated:** anonymous memory that has been writable counts as
+  having an anon_vma although Linux creates one only at the first write fault, and anonymous pieces
+  join regardless of Linux's page offsets (a VMA moved by mremap joins its new neighbours), so
+  `/proc/<pid>/maps` and mremap's one-VMA rule can still differ in such cases; `shmat` below
+  `vm.mmap_min_addr` is not refused.
 
 ## Open questions
 

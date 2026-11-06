@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; unshared fd tables keep POSIX locks; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clock bases)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; unshared fd tables keep POSIX locks; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clock bases; partial copies to faulting buffers)
 
 ## Responsibilities
 
@@ -316,6 +316,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   writes stay atomic. Everything else goes iovec by iovec and stops at an incomplete one, as Linux
   does for files with only `read`/`write` (eventfd writes, timerfd, signalfd, inotify, `/dev/kmsg`
   reads). A total of 0 returns 0 after the offset and mode checks without reaching the file.
+- Copying to and from the guest buffer grows a grows-down mapping below it first (`kernel/mm`). A
+  read whose buffer faults partway returns the bytes copied before the faulting page (`EFAULT` when
+  none were), as Linux's `copy_to_user` does: a regular file's position moves only past what was
+  copied, while data from other files (a pipe, a terminal) is already consumed. A faulting write
+  buffer still fails before anything is written.
 
 ### Metadata and namespace syscalls
 

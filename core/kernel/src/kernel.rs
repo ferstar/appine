@@ -44,6 +44,7 @@ use crate::mm::Mm;
 use crate::process::{CpuTime, ExitStatus, ThreadGroup, Tier};
 use crate::task::{Task, TaskState};
 use crate::tty::Tty;
+use crate::uaccess::UserSlice;
 use crate::vfs::store::Ino;
 use crate::vfs::{Node, Vfs};
 
@@ -952,8 +953,66 @@ impl<'a> Cx<'a> {
     /// to reach the page containing it, to a size of at most the current `RLIMIT_STACK`
     /// ([`Mm::grow_down`]).
     pub fn grow_stack(&self, addr: u64) -> bool {
-        let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
+        let limit = self.stack_limit();
         self.mm_mut().grow_down(addr, limit)
+    }
+
+    /// Reads guest memory as the kernel does (`copy_from_user`, [`Mm::read`]); an unmapped address
+    /// below a grows-down mapping grows it first, as Linux's fault handler does for kernel accesses
+    /// ([`Mm::grow_for`]).
+    pub fn read_user(&self, src: UserSlice, dst: &mut [u8]) -> Result<(), Errno> {
+        let r = self.mm().read(src, dst);
+        if r.is_err() && self.grow_for(src) {
+            return self.mm().read(src, dst);
+        }
+        r
+    }
+
+    /// Writes guest memory as the kernel does (`copy_to_user`, [`Mm::write`]), growing grows-down
+    /// mappings like [`Cx::read_user`].
+    pub fn write_user(&self, dst: UserSlice, data: &[u8]) -> Result<(), Errno> {
+        let r = self.mm().write(dst, data);
+        if r.is_err() && self.grow_for(dst) {
+            return self.mm().write(dst, data);
+        }
+        r
+    }
+
+    /// Writes `data` to guest memory at `addr` and returns how much was written: like Linux's
+    /// copy_to_user, it stops at the first page that cannot be written ([`Cx::write_user`]), and
+    /// what came before it stays written.
+    pub fn write_user_partial(&self, addr: u64, data: &[u8]) -> usize {
+        if self
+            .write_user(UserSlice::new(addr, data.len()), data)
+            .is_ok()
+        {
+            return data.len();
+        }
+        let mm = self.mm();
+        let mut done = 0;
+        while done < data.len() {
+            let at = addr.wrapping_add(done as u64);
+            let n = ((appine_engine::PAGE_SIZE - at % appine_engine::PAGE_SIZE) as usize)
+                .min(data.len() - done);
+            if mm
+                .write(UserSlice::new(at, n), &data[done..done + n])
+                .is_err()
+            {
+                break;
+            }
+            done += n;
+        }
+        done
+    }
+
+    /// The current `RLIMIT_STACK`, which bounds every growth of a grows-down mapping.
+    pub fn stack_limit(&self) -> u64 {
+        self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0
+    }
+
+    fn grow_for(&self, range: UserSlice) -> bool {
+        let limit = self.stack_limit();
+        self.mm_mut().grow_for(range.addr, range.len, limit)
     }
 
     /// Syscall entry: when SP is already below the bottom of the main thread's stack (the program
@@ -965,7 +1024,7 @@ impl<'a> Cx<'a> {
         if sp >= self.mm().stack_low() {
             return;
         }
-        let limit = self.t.group.borrow().rlimits[crate::process::RLIMIT_STACK as usize].0;
+        let limit = self.stack_limit();
         // Other threads' stacks are in the mmap area, much farther from the main thread's stack:
         // no need to check
         if crate::loader::STACK_TOP - sp <= limit {

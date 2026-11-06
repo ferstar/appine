@@ -1264,7 +1264,7 @@ pub(super) fn waitid(
                 .encode(Signal::CHLD),
             None => [0; 128],
         };
-        cx.mm().write(UserSlice::new(infop, 128), &info)?;
+        cx.write_user(UserSlice::new(infop, 128), &info)?;
     }
     if rusage != 0 {
         let usage = found.map_or(process::Rusage::default(), |f| f.2);

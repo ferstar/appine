@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps)
 
 ## Responsibilities
 
@@ -128,8 +128,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   thread's or the group's CPU times depending on the view; `tty_nr` from the controlling terminal.
 - `status`: ids translated into the reader's user namespace, `NStgid`/`NSpid`/`NSpgid`/`NSsid`
   from the instance's namespace down, capabilities, `NoNewPrivs`, `Seccomp`, signal masks; memory
-  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, stack/exe/lib/PTE/swap
-  0; omitted with no live task); `FDSize` rounded to 64; `Cpus_allowed_list` lists every guest CPU.
+  lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmStk` the grows-down
+  mappings, exe/lib/PTE/swap 0; omitted with no live task); `FDSize` rounded to 64;
+  `Cpus_allowed_list` lists every guest CPU. `maps` and `smaps` escape a newline in a mapped
+  file's path as `\012` (Linux's `seq_file_path`).
   `statm` is `size rss 0 0 0 rss 0`.
 - `cmdline`/`environ` copy the argument and environment ranges of the current mm (empty over
   1 MiB or when unreadable); `comm` is read-only; `limits` lists the rlimits.
@@ -167,10 +169,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `domainname` per UTS namespace (one trailing newline stripped, over 64 bytes `EINVAL`);
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
   `conf/all/forwarding`; `NetConf` directories per interface); everything else kernel-wide
-  (`max_map_count`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`, `pipe-max-size`,
-  `core_pattern`, `core_uses_pid`, `protected_symlinks`/`hardlinks`, `printk*`, `panic`,
-  `user/max_*_namespaces`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
-  `actions_logged` need `CAP_SYS_ADMIN` in the initial namespace).
+  (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`,
+  `pipe-max-size`, `core_pattern`, `core_uses_pid`, `protected_symlinks`/`hardlinks`, `printk*`,
+  `panic`, `user/max_*_namespaces`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
+  `actions_logged` need `CAP_SYS_ADMIN` in the initial namespace, `mmap_min_addr`
+  `CAP_SYS_RAWIO`).
 - Several writable sysctls are recorded without effect (`kernel.panic`, `user.max_*`, every
   `NetSysctl` entry, `ping_group_range`, `somaxconn`, `ip_local_port_range`; of the port sysctls
   only `ip_unprivileged_port_start` is used, by bind); `kernel/pid_max` accepts writes and ignores

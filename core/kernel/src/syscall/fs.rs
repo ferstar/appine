@@ -2303,13 +2303,14 @@ fn read_scattered(cx: &mut Cx<'_>, file: &FileRef, vecs: &[(u64, usize)]) -> Sys
         if n == 0 {
             break;
         }
-        if let Err(e) = cx.mm().write(UserSlice::new(base, n), &buf[done..done + n]) {
-            if done == 0 {
-                return Err(e);
-            }
+        let copied = cx.write_user_partial(base, &buf[done..done + n]);
+        done += copied;
+        if copied < n {
             break;
         }
-        done += n;
+    }
+    if done == 0 && k > 0 {
+        return Err(Errno::EFAULT);
     }
     Ok(done as u64)
 }
@@ -2335,7 +2336,7 @@ fn write_gathered(cx: &mut Cx<'_>, file: &FileRef, vecs: &[(u64, usize)]) -> Sys
             let n = len.min(IO_CHUNK - chunk.len());
             let start = chunk.len();
             chunk.resize(start + n, 0);
-            if let Err(e) = cx.mm().read(UserSlice::new(base, n), &mut chunk[start..]) {
+            if let Err(e) = cx.read_user(UserSlice::new(base, n), &mut chunk[start..]) {
                 chunk.truncate(start);
                 fault = Some(e);
                 break;
@@ -2665,18 +2666,20 @@ pub(super) fn read_file(
             Err(e) => return Err(e),
         };
         note_read(cx, file, k);
-        if let Err(e) = cx.mm().write(
-            UserSlice::new(buf.wrapping_add(done as u64), k),
-            &chunk[..k],
-        ) {
-            // The data has already been consumed: as on Linux, return the partial length when
-            // part of it was copied
+        // As on Linux, a fault partway returns the bytes copied before it (and EFAULT when there
+        // are none); a regular file is read up to there. Data from other files has already been
+        // consumed
+        let copied = cx.write_user_partial(buf.wrapping_add(done as u64), &chunk[..k]);
+        done += copied;
+        if copied < k {
+            if offset.is_none() && matches!(file.borrow().kind, FileKind::Regular { .. }) {
+                file.borrow_mut().pos -= (k - copied) as u64;
+            }
             if done == 0 {
-                return Err(e);
+                return Err(Errno::EFAULT);
             }
             break;
         }
-        done += k;
         if k < n || !fill {
             break;
         }
@@ -2731,7 +2734,7 @@ pub(super) fn write_file(
     let mut done = 0;
     while done < len {
         let n = (len - done).min(IO_CHUNK);
-        let copied = cx.mm().read(
+        let copied = cx.read_user(
             UserSlice::new(buf.wrapping_add(done as u64), n),
             &mut chunk[..n],
         );
@@ -2825,7 +2828,7 @@ pub(super) fn read_bytes(
         IoPath::Loop(dev) => super::loopdev::read(cx, file, &dev, buf, offset),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
-            let n = pseudo::read_mem(mm, buf, pos)?;
+            let n = pseudo::read_mem(mm, buf, pos, cx.stack_limit())?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }
@@ -3103,7 +3106,7 @@ pub(super) fn write_bytes(
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let sync = cx.task.sync.clone();
-            let n = pseudo::write_mem(mm, data, pos, &sync)?;
+            let n = pseudo::write_mem(mm, data, pos, &sync, cx.stack_limit())?;
             if offset.is_none() {
                 file.borrow_mut().pos = pos.wrapping_add(n as u64);
             }

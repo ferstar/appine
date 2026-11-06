@@ -15,7 +15,10 @@ use crate::vfs::dev::Device;
 use crate::vfs::ms;
 
 const PROT_MASK: u32 = prot::READ | prot::WRITE | prot::EXEC;
-/// `PROT_GROWSDOWN`, `PROT_GROWSUP`: meaningful only for stacks, and ignored as on Linux.
+/// `PROT_GROWSDOWN`, `PROT_GROWSUP`: mmap ignores them as Linux does; mprotect with
+/// `PROT_GROWSDOWN` extends the range to the bottom of a grows-down mapping ([`Mm::protect`]).
+///
+/// [`Mm::protect`]: crate::mm::Mm::protect
 const PROT_GROWS: u32 = 0x0100_0000 | 0x0200_0000;
 /// Mapping type bits: `MAP_SHARED`, `MAP_PRIVATE`, `MAP_SHARED_VALIDATE`.
 const MAP_TYPE: u32 = 0x0f;
@@ -91,14 +94,22 @@ pub(super) fn mmap(
     // The path and inode shown for a file mapping in /proc/<pid>/maps
     let mut label = None;
     let mut deny_exec = false;
+    let low =
+        flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
+        if low && len != 0 {
+            return Err(Errno::EPERM);
+        }
         None
     } else {
         let file = cx.fds().get(fd)?;
-        // Linux checks the fd first (EBADF), then the length (EINVAL), and the file's permissions
-        // (EACCES) last
+        // Linux checks the fd first (EBADF), then the length (EINVAL), the address (EPERM), and
+        // the file's permissions (EACCES) last
         if len == 0 {
             return Err(Errno::EINVAL);
+        }
+        if low {
+            return Err(Errno::EPERM);
         }
         let f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
@@ -227,6 +238,9 @@ fn remap(
         return Err(Errno::EINVAL);
     }
     let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
+    if fixed.is_some_and(|a| below_min_addr(cx, a)) {
+        return Err(Errno::EPERM);
+    }
     if flags & MREMAP_DONTUNMAP != 0 {
         let (new, refill) = cx.mm_mut().mremap_dontunmap(old, old_len, fixed)?;
         // Map the store file again at the old address of a private file mapping; if it cannot be
@@ -299,12 +313,19 @@ pub(super) fn remap_file_pages(
 }
 
 pub(super) fn mprotect(cx: &mut Cx<'_>, addr: u64, len: u64, prot: u32) -> SysResult {
-    if prot & !(PROT_MASK | PROT_GROWS) != 0 {
+    if prot & !(PROT_MASK | PROT_GROWS) != 0 || prot & PROT_GROWS == PROT_GROWS {
         return Err(Errno::EINVAL);
     }
     cx.mm_mut()
-        .mprotect(addr, len, prot & PROT_MASK)
+        .protect(addr, len, prot & PROT_MASK, prot & PROT_GROWS)
         .map(|()| 0)
+}
+
+/// Whether mapping at `addr` is refused: below `vm.mmap_min_addr` without `CAP_SYS_RAWIO`
+/// (Linux's cap_mmap_addr, EPERM).
+fn below_min_addr(cx: &Cx<'_>, addr: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    addr < crate::mm::MMAP_MIN_ADDR.load(Ordering::Relaxed) && !cx.cred().capable(cap::SYS_RAWIO)
 }
 
 pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysResult {

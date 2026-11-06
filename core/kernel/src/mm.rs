@@ -75,8 +75,18 @@ pub mod flags {
 const MIN_GAP: u64 = STACK_SIZE + (1 << 30);
 /// Upper bound of that gap, the same as Linux's `MAX_GAP`.
 const MAX_GAP: u64 = STACK_TOP / 6 * 5;
-/// Lowest allocatable address, the same as Linux's default mmap_min_addr.
-const MMAP_MIN: u64 = 0x10000;
+/// `/proc/sys/vm/mmap_min_addr` (Linux's `dac_mmap_min_addr`): mapping below it needs
+/// `CAP_SYS_RAWIO` (checked by the syscalls), and addresses the kernel picks, mmap hints and stack
+/// growth stay above it. 32768 as in the arm64 kernels of distributions and Android's GKI.
+pub(crate) static MMAP_MIN_ADDR: AtomicU64 = AtomicU64::new(32768);
+
+/// The lowest address the kernel maps on its own or a stack grows to: [`MMAP_MIN_ADDR`] rounded
+/// up to a page, and at least one page (Linux's get_unmapped_area).
+fn mmap_min() -> u64 {
+    page_up(MMAP_MIN_ADDR.load(Ordering::Relaxed))
+        .unwrap_or(1 << VA_BITS)
+        .max(PAGE_SIZE)
+}
 /// Minimum gap between a grows-down mapping and the mapping below it (Linux's `stack_guard_gap`,
 /// 256 pages).
 const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
@@ -84,6 +94,9 @@ const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
 /// mapping, and the host's mapping count (also 65530 on Android) is shared by the whole app
 /// process.
 pub(crate) static MAX_MAP_COUNT: AtomicUsize = AtomicUsize::new(65530);
+
+/// The next [`Vma::anon`] identity handed out at fork.
+static ANON_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// Host address space reserved when the heap (brk) first grows: later growth only lengthens the
 /// same VMA. The untouched part takes no memory (`MAP_NORESERVE`); growth beyond it is mapped
@@ -199,6 +212,11 @@ struct Vma {
     dontfork: bool,
     /// `MAP_NORESERVE`: not counted in the commit ([`Mm::commit_too_big`]).
     noreserve: bool,
+    /// The anon_vma this mapping would have on Linux, as far as it decides which VMAs are one
+    /// ([`same_vma`]): 0 until a fork, after which each child VMA with contents of its own gets
+    /// its own, shared by the pieces that were one VMA in the parent. On Linux such child VMAs no
+    /// longer merge with their neighbours, while the parent's still do.
+    anon: u64,
 }
 
 impl Vma {
@@ -206,6 +224,27 @@ impl Vma {
     fn reserved(&self) -> bool {
         self.region.reserved
     }
+}
+
+/// Whether VMA `b`, starting where `a` ends, is part of the same VMA on Linux. Linux merges
+/// adjacent VMAs with the same flags and the same source of contents, while here every mapping
+/// keeps its own host memory and VMAs are only ever split (the kernel/mm map's D7), so the pieces
+/// of one Linux VMA are joined wherever Linux's VMA boundaries show: `/proc/<pid>/maps`
+/// ([`Mm::regions`]), mremap's rule that the old range lies in one VMA, and mprotect with
+/// `PROT_GROWSDOWN`. Shared anonymous mappings are each their own shmem file and never merge.
+fn same_vma(a: &Vma, b: &Vma) -> bool {
+    let contents = match (a.file_id, b.file_id) {
+        (None, None) => a.backing != Backing::Shared,
+        (Some((_, _, offset)), Some((_, _, next))) => a.ino == b.ino && offset + a.len == next,
+        _ => false,
+    };
+    contents
+        && a.backing == b.backing
+        && (a.prot, a.locked, a.may_write) == (b.prot, b.locked, b.may_write)
+        && (a.growsdown, a.dontdump) == (b.growsdown, b.dontdump)
+        && (a.wipeonfork, a.dontfork) == (b.wipeonfork, b.dontfork)
+        && a.anon == b.anon
+        && a.name == b.name
 }
 
 /// The address space of a guest process.
@@ -784,7 +823,7 @@ impl Mm {
     /// with the stack.
     pub fn grow_down(&mut self, addr: u64, limit: u64) -> bool {
         let page = addr & !(PAGE_SIZE - 1);
-        if page < MMAP_MIN || self.is_mapped(addr) {
+        if page < mmap_min() || self.is_mapped(addr) {
             return false;
         }
         let Some((&above, v)) = self.vmas.range(addr..).next() else {
@@ -793,7 +832,7 @@ impl Mm {
         if !v.growsdown {
             return false;
         }
-        let (prot, locked) = (v.prot, v.locked);
+        let prot = v.prot;
         if let Some((&s, below)) = self.vmas.range(..page).next_back()
             && !below.growsdown
             && below.prot != 0
@@ -818,7 +857,7 @@ impl Mm {
             self.extend_down(above, grow)
         } else {
             let reserve = size.clamp(grow, limit - size);
-            self.new_stack_chunk(page, grow, reserve, prot, locked)
+            self.new_stack_chunk(page, grow, reserve, above)
         };
         if grown && above == self.stack_low {
             self.stack_low = page;
@@ -849,17 +888,12 @@ impl Mm {
         true
     }
 
-    /// Maps a new VMA of `grow` bytes at `page`, just below the grows-down VMA above it. It
-    /// allocates `reserve` bytes of host memory and puts the VMA at the top, leaving the rest below
-    /// for later growth in place; if that cannot be allocated, only `grow` bytes.
-    fn new_stack_chunk(
-        &mut self,
-        page: u64,
-        grow: u64,
-        reserve: u64,
-        prot: u32,
-        locked: bool,
-    ) -> bool {
+    /// Maps a new VMA of `grow` bytes at `page`, just below grows-down VMA `above`, with the same
+    /// flags (on Linux the same VMA grows). It allocates `reserve` bytes of host memory and puts
+    /// the VMA at the top, leaving the rest below for later growth in place; if that cannot be
+    /// allocated, only `grow` bytes.
+    fn new_stack_chunk(&mut self, page: u64, grow: u64, reserve: u64, above: u64) -> bool {
+        let template = self.vmas[&above].clone();
         let Ok((region, base)) =
             Self::new_anonymous(reserve, false).or_else(|_| Self::new_anonymous(grow, false))
         else {
@@ -867,17 +901,43 @@ impl Mm {
         };
         // SAFETY: this host memory is at least grow bytes
         let host = unsafe { NonNull::new_unchecked(base.as_ptr().add(region.len - grow as usize)) };
-        let anon = Backing::Anonymous;
+        let (prot, backing) = (template.prot, Backing::Anonymous);
         if self
-            .insert(page, grow, grow, prot, anon, true, region, host)
+            .insert(page, grow, grow, prot, backing, true, region, host)
             .is_err()
         {
             return false;
         }
         let v = self.vmas.get_mut(&page).unwrap();
         v.growsdown = true;
-        v.locked = locked;
+        v.locked = template.locked;
+        v.dontdump = template.dontdump;
+        v.wipeonfork = template.wipeonfork;
+        v.dontfork = template.dontfork;
+        v.anon = template.anon;
         true
+    }
+
+    /// Before the kernel gives up on an access to `[addr, addr + len)`: grows the grows-down
+    /// mappings above the unmapped pages in it ([`Mm::grow_down`]), as Linux's fault handler does
+    /// when a kernel access (copy_to_user, a `/proc/<pid>/mem` access) faults below a stack. Stops
+    /// at the first page that cannot be grown into; returns whether anything grew.
+    pub fn grow_for(&mut self, addr: u64, len: usize, limit: u64) -> bool {
+        let end = addr.saturating_add(len as u64);
+        let (mut page, mut grew) = (addr & !(PAGE_SIZE - 1), false);
+        while page < end {
+            if let Some((&s, v)) = self.vmas.range(..=page).next_back()
+                && page < s + v.len
+            {
+                page = s + v.len;
+                continue;
+            }
+            if !self.grow_down(page, limit) {
+                break;
+            }
+            grew = true;
+        }
+        grew
     }
 
     /// Whether a guest address falls in some mapping (telling SEGV_MAPERR from SEGV_ACCERR).
@@ -1142,11 +1202,12 @@ impl Mm {
             }
             addr
         } else {
-            let hint = addr & !(PAGE_SIZE - 1);
-            if hint >= MMAP_MIN
-                && hint.checked_add(len).is_some_and(|e| e <= self.mmap_top)
-                && self.is_free(hint, len)
-            {
+            // As with Linux's round_hint_to_min, a hint below mmap_min_addr is raised to it
+            let hint = match addr & !(PAGE_SIZE - 1) {
+                0 => 0,
+                h => h.max(mmap_min()),
+            };
+            if hint != 0 && self.hint_fits(hint, len) {
                 hint
             } else {
                 self.find_free(len).ok_or(Errno::ENOMEM)?
@@ -1305,8 +1366,11 @@ impl Mm {
         if !old.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
-        self.check_mapped(old, len).map_err(|_| Errno::EFAULT)?;
-        let end = old + len;
+        let end = old.checked_add(len).ok_or(Errno::EINVAL)?;
+        // Linux's vma_to_resize: the range must lie in one VMA ([`same_vma`])
+        if !self.in_one_vma(old, end) {
+            return Err(Errno::EFAULT);
+        }
         let dst = match fixed {
             Some(d) => d,
             None => self.find_free(len).ok_or(Errno::ENOMEM)?,
@@ -1375,19 +1439,21 @@ impl Mm {
         if old_len == 0 {
             return self.duplicate(old, new_len, may_move, fixed);
         }
-        // Linux requires the old range to be in one VMA; adjacent VMAs are not merged here (for
-        // example after growing in place), so the range only has to be fully covered by contiguous
-        // VMAs
-        self.check_mapped(old, old_len).map_err(|_| Errno::EFAULT)?;
-        let (&s, v) = self.vmas.range(..old_end).next_back().unwrap();
-        let vma_end = s + v.len;
-        let template = v.clone();
+        // In Linux's order: a mapping at old (EFAULT), the target (EINVAL, then unmapped), the
+        // shrunk tail unmapped, and only then the rule that the rest of the old range lies in one
+        // VMA (EFAULT; adjacent VMAs are not merged here, so it is checked against the VMAs Linux
+        // would have, [`same_vma`]). Shrinking in place only unmaps the tail
+        if !self.is_mapped(old) {
+            return Err(Errno::EFAULT);
+        }
         let grow = new_len.saturating_sub(old_len);
-        // The extension follows the old range, at offset old_end - s in the VMA
+        // The extension follows the old range, at its offset in the VMA holding the last page
         let extension = |mm: &Mm| -> Result<Option<Vma>, Errno> {
-            (grow > 0)
-                .then(|| mm.extension(&template, old_end - s, grow, file))
-                .transpose()
+            if grow == 0 {
+                return Ok(None);
+            }
+            let (&s, v) = mm.vmas.range(..old_end).next_back().unwrap();
+            mm.extension(v, old_end - s, grow, file).map(Some)
         };
         if let Some(dst) = fixed {
             if !dst.is_multiple_of(PAGE_SIZE)
@@ -1396,12 +1462,16 @@ impl Mm {
             {
                 return Err(Errno::EINVAL);
             }
-            let ext = extension(self)?;
             self.munmap(dst, new_len)?;
             if new_len < old_len {
                 self.munmap(old + new_len, old_len - new_len)?;
             }
-            self.move_range(old, old_len.min(new_len), dst)?;
+            let kept = old_len.min(new_len);
+            if !self.in_one_vma(old, old + kept) {
+                return Err(Errno::EFAULT);
+            }
+            let ext = extension(self)?;
+            self.move_range(old, kept, dst)?;
             if let Some(e) = ext {
                 self.insert_vma(dst + old_len, e)?;
             }
@@ -1413,6 +1483,14 @@ impl Mm {
             }
             return Ok(old);
         }
+        if !self.in_one_vma(old, old_end) {
+            return Err(Errno::EFAULT);
+        }
+        let vma_end = self
+            .vmas
+            .range(..old_end)
+            .next_back()
+            .map_or(0, |(&s, v)| s + v.len);
         if old_end == vma_end && old_end + grow <= self.mmap_top && self.is_free(old_end, grow) {
             let e = extension(self)?.unwrap();
             self.insert_vma(old_end, e)?;
@@ -1563,6 +1641,7 @@ impl Mm {
             wipeonfork: template.wipeonfork,
             dontfork: template.dontfork,
             noreserve: template.noreserve,
+            anon: template.anon,
         })
     }
 
@@ -1802,40 +1881,77 @@ impl Mm {
         bases.len()
     }
 
-    /// Implements mprotect(2): the range must be fully mapped.
+    /// mprotect(2) without `PROT_GROWSDOWN` or `PROT_GROWSUP` ([`Mm::protect`]).
+    #[cfg(test)]
     pub fn mprotect(&mut self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        let len = page_up(len).ok_or(Errno::EINVAL)?;
-        if !addr.is_multiple_of(PAGE_SIZE) || addr.checked_add(len).is_none() {
+        self.protect(addr, len, prot, 0)
+    }
+
+    /// Implements mprotect(2) as Linux's do_mprotect_pkey does. The VMAs from the one holding
+    /// `addr` are changed in turn, and an error at one leaves those before it changed: a gap is
+    /// ENOMEM, a permission the VMA may never have (`may_write`, `may_exec`) EACCES. With
+    /// `PROT_GROWSDOWN` in `grows` the range starts instead at the start of the Linux VMA
+    /// ([`same_vma`]) it begins in, which must grow down (EINVAL); arm64 has no grows-up mappings,
+    /// so `PROT_GROWSUP` is always EINVAL once the range is found.
+    pub fn protect(&mut self, addr: u64, len: u64, prot: u32, grows: u32) -> Result<(), Errno> {
+        const PROT_GROWSDOWN: u32 = 0x0100_0000;
+        if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
         }
-        let end = addr + len;
-        // The range must be covered by VMAs without gaps: first the one spanning addr, then each
-        // following one in turn
-        let (mut cursor, mut writable, mut executable) = (addr, true, true);
-        if let Some((&s, v)) = self
+        if len == 0 {
+            return Ok(());
+        }
+        let end = page_up(len)
+            .and_then(|l| addr.checked_add(l))
+            .ok_or(Errno::ENOMEM)?;
+        // The first VMA ending above addr
+        let (first, v) = self
             .vmas
-            .range(..addr)
+            .range(..=addr)
             .next_back()
             .filter(|&(&s, v)| s + v.len > addr)
-        {
-            cursor = s + v.len;
-            writable = v.may_write;
-            executable = v.may_exec;
-        }
-        for (&s, v) in self.vmas.range(addr..end) {
-            if s > cursor {
+            .or_else(|| self.vmas.range(addr..).next())
+            .map(|(&s, v)| (s, v))
+            .ok_or(Errno::ENOMEM)?;
+        let (mut start, mut from) = (addr, first);
+        if grows & PROT_GROWSDOWN != 0 {
+            if first >= end {
                 return Err(Errno::ENOMEM);
             }
-            cursor = cursor.max(s + v.len);
-            writable &= v.may_write;
-            executable &= v.may_exec;
-        }
-        if cursor < end {
+            if !v.growsdown {
+                return Err(Errno::EINVAL);
+            }
+            start = self.vma_start(first);
+            from = start;
+        } else if first > addr {
             return Err(Errno::ENOMEM);
+        } else if grows != 0 {
+            return Err(Errno::EINVAL);
         }
-        if prot & prot::WRITE != 0 && !writable || prot & prot::EXEC != 0 && !executable {
-            return Err(Errno::EACCES);
+        let (mut stop, mut error) = (start, None);
+        for (&s, v) in self.vmas.range(from..end) {
+            if s > stop {
+                error = Some(Errno::ENOMEM);
+                break;
+            }
+            if prot & prot::WRITE != 0 && !v.may_write || prot & prot::EXEC != 0 && !v.may_exec {
+                error = Some(Errno::EACCES);
+                break;
+            }
+            stop = s + v.len;
         }
+        let stop = stop.min(end);
+        if error.is_none() && stop < end {
+            error = Some(Errno::ENOMEM);
+        }
+        if stop > start {
+            self.set_protection(start, stop, prot)?;
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    /// Gives `[addr, end)`, which is fully mapped, permissions `prot`.
+    fn set_protection(&mut self, addr: u64, end: u64, prot: u32) -> Result<(), Errno> {
         self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
@@ -2264,6 +2380,34 @@ impl Mm {
             .map(|(&s, _)| s)
             .collect();
         let mut carved = Self::carve(&self.vmas, &pieces)?;
+        // As Linux's anon_vma_fork, every child VMA with contents of its own (an anon_vma: a page
+        // written since mapped) gets its own anon_vma: the pieces of one VMA keep sharing it, but
+        // no longer join their neighbours. Anonymous memory that has been writable counts as
+        // written; a private file mapping only once a page of the mapping holds a private copy
+        // (the anon_vma belongs to the whole mapping when it is split, so all its pieces count)
+        let mut anon = HashMap::new();
+        let mut private = HashMap::new();
+        let mut prev: Option<(u64, &Vma, u64)> = None;
+        for (&s, v) in &self.vmas {
+            let own = match v.backing {
+                Backing::Shared => false,
+                Backing::Anonymous => v.written.get(),
+                Backing::PrivateFile => {
+                    v.written.get()
+                        && *private.entry(Arc::as_ptr(&v.region)).or_insert_with(|| {
+                            let r = &v.region;
+                            appine_hal::has_private_pages(r.base.as_ptr(), r.len).unwrap_or(true)
+                        })
+                }
+            };
+            let id = match prev {
+                _ if !own => 0,
+                Some((end, p, id)) if end == s && id != 0 && same_vma(p, v) => id,
+                _ => ANON_IDS.fetch_add(1, Ordering::Relaxed),
+            };
+            anon.insert(s, id);
+            prev = Some((s + v.len, v, id));
+        }
         // Written private anonymous mappings are copy-on-write: map the child's own (all-zero)
         // host memory first, then lend to it
         let mut cow = Vec::new();
@@ -2341,6 +2485,7 @@ impl Mm {
             c.noreserve = v.noreserve;
             c.dontdump = v.dontdump;
             c.wipeonfork = v.wipeonfork;
+            c.anon = anon[&start];
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
@@ -2538,13 +2683,14 @@ impl Mm {
     // ---- Introspection ----
 
     /// All mappings, in address order; the stack, heap and vDSO are named the way Linux names
-    /// them. Adjacent anonymous mappings with the same permissions (or contiguous parts of the
-    /// same file) are joined into one entry as on Linux: every anonymous mmap is separate host
-    /// memory, VMAs cannot be merged, and python has hundreds after running for a while.
+    /// them. The pieces of one Linux VMA ([`same_vma`]) are joined into one entry: every anonymous
+    /// mmap is separate host memory, VMAs cannot be merged, and python has hundreds after running
+    /// for a while.
     pub fn regions(&self) -> Vec<Region> {
         let stack = self.stack_range();
         let mut out: Vec<Region> = Vec::new();
-        let regions = self.vmas.iter().map(|(&s, v)| {
+        let mut last: Option<&Vma> = None;
+        for (&s, v) in &self.vmas {
             let special: Option<&[u8]> = if stack.is_some_and(|(lo, hi)| (lo..hi).contains(&s)) {
                 Some(b"[stack]")
             } else if s == self.vdso {
@@ -2554,44 +2700,63 @@ impl Mm {
             } else {
                 None
             };
-            Region {
-                start: s,
-                end: s + v.len,
-                prot: v.prot,
-                shared: v.backing == Backing::Shared,
-                name: v.name.clone().or_else(|| special.map(Rc::from)),
-                file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
-                locked: v.locked,
-                may_write: v.may_write,
-                may_exec: v.may_exec,
-                dontdump: v.dontdump,
-                wipeonfork: v.wipeonfork,
-                dontfork: v.dontfork,
-            }
-        });
-        for r in regions {
-            if let Some(last) = out.last_mut() {
-                let joins = match (last.file, r.file) {
-                    (None, None) => !last.shared && !r.shared,
-                    (Some((off, ino)), Some((next, next_ino))) => {
-                        ino == next_ino && off + (last.end - last.start) == next
-                    }
-                    _ => false,
-                };
-                if joins
-                    && last.end == r.start
-                    && (last.prot, last.shared, last.locked) == (r.prot, r.shared, r.locked)
-                    && (last.may_write, last.dontdump) == (r.may_write, r.dontdump)
-                    && (last.wipeonfork, last.dontfork) == (r.wipeonfork, r.dontfork)
-                    && last.name == r.name
-                {
-                    last.end = r.end;
-                    continue;
+            let name = v.name.clone().or_else(|| special.map(Rc::from));
+            match (out.last_mut(), last) {
+                (Some(r), Some(l)) if r.end == s && same_vma(l, v) && r.name == name => {
+                    r.end = s + v.len;
                 }
+                _ => out.push(Region {
+                    start: s,
+                    end: s + v.len,
+                    prot: v.prot,
+                    shared: v.backing == Backing::Shared,
+                    name,
+                    file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
+                    locked: v.locked,
+                    may_write: v.may_write,
+                    may_exec: v.may_exec,
+                    dontdump: v.dontdump,
+                    wipeonfork: v.wipeonfork,
+                    dontfork: v.dontfork,
+                }),
             }
-            out.push(r);
+            last = Some(v);
         }
         out
+    }
+
+    /// Whether `[addr, end)` lies inside one Linux VMA ([`same_vma`]): the pieces from the one
+    /// holding `addr` onwards are contiguous and one VMA on Linux.
+    fn in_one_vma(&self, addr: u64, end: u64) -> bool {
+        let Some((&s, v)) = self.vmas.range(..=addr).next_back() else {
+            return false;
+        };
+        let (mut last, mut reach) = (v, s + v.len);
+        if addr >= reach {
+            return false;
+        }
+        for (&s, v) in self.vmas.range(reach..) {
+            if reach >= end {
+                break;
+            }
+            if s != reach || !same_vma(last, v) {
+                return false;
+            }
+            (last, reach) = (v, s + v.len);
+        }
+        reach >= end
+    }
+
+    /// The start of the Linux VMA ([`same_vma`]) holding piece `start`.
+    fn vma_start(&self, start: u64) -> u64 {
+        let (mut low, mut above) = (start, &self.vmas[&start]);
+        for (&s, v) in self.vmas.range(..start).rev() {
+            if s + v.len != low || !same_vma(v, above) {
+                break;
+            }
+            (low, above) = (s, v);
+        }
+        low
     }
 
     /// The range labelled `[stack]` in `/proc/<pid>/maps`: as on Linux, the mapping containing
@@ -2614,11 +2779,16 @@ impl Mm {
         Some((low, s + v.len))
     }
 
-    /// The resident 4K pages in `[addr, addr + len)`, counting borrowed pages as resident (smaps,
-    /// the OOM killer's log). The same as counting [`Mm::residency`], but large on-demand
-    /// anonymous mappings are measured only over the spans that may have contents
-    /// ([`Mm::touched_windows`]), without allocating a per-page array for a mapping of several
-    /// TB.
+    /// The resident 4K pages in `[addr, addr + len)` (smaps, the OOM killer's log). Linux counts
+    /// the pages in the process's page table:
+    /// - anonymous memory is counted by host residency, large on-demand mappings only over the
+    ///   spans that may have contents ([`Mm::touched_windows`]), without allocating a per-page
+    ///   array for a mapping of several TB;
+    /// - a borrowed page counts when the owner's host page is resident (fork lends every page of a
+    ///   small mapping, touched or not);
+    /// - file mappings count the pages the host has mapped (pagemap), not those in the host page
+    ///   cache, which readahead fills around every page touched; by residency if pagemap cannot be
+    ///   read.
     pub fn resident_in(&self, addr: u64, len: u64) -> u64 {
         let end = addr.saturating_add(len);
         let first = self
@@ -2640,12 +2810,36 @@ impl Mm {
             for (lo, hi) in ranges {
                 let (lo, hi) = (lo.max(from), hi.min(to));
                 if lo < hi {
-                    let host = Self::own_page(s, v, lo);
-                    total += appine_hal::resident_pages(host.as_ptr(), (hi - lo) as usize) as u64;
+                    let (host, n) = (Self::own_page(s, v, lo).as_ptr(), (hi - lo) as usize);
+                    let mapped = (v.file_id.is_some())
+                        .then(|| appine_hal::touched_pages(host, n))
+                        .flatten();
+                    total += match mapped {
+                        Some(pages) => pages.iter().filter(|&&p| p).count() as u64,
+                        None => appine_hal::resident_pages(host, n) as u64,
+                    };
                 }
             }
         }
-        total + self.cow.borrow().borrowed.range(addr..end).count() as u64
+        // Borrowed pages, in runs of contiguous host pages
+        let cow = self.cow.borrow();
+        let mut run: Option<(*const u8, usize)> = None;
+        for b in cow.borrowed.range(addr..end).map(|(_, b)| b.host.as_ptr()) {
+            run = match run {
+                Some((start, n)) if start.wrapping_add(n) == b => {
+                    Some((start, n + PAGE_SIZE as usize))
+                }
+                Some((start, n)) => {
+                    total += appine_hal::resident_pages(start, n) as u64;
+                    Some((b, PAGE_SIZE as usize))
+                }
+                None => Some((b, PAGE_SIZE as usize)),
+            };
+        }
+        if let Some((start, n)) = run {
+            total += appine_hal::resident_pages(start, n) as u64;
+        }
+        total
     }
 
     /// Pages in `[addr, end)` shared with other address spaces (lent or borrowed for
@@ -2720,6 +2914,16 @@ impl Mm {
     /// Total size of the mappings (bytes).
     pub fn size(&self) -> u64 {
         self.vmas.values().map(|v| v.len).sum()
+    }
+
+    /// Bytes in grows-down mappings: the main stack and `MAP_GROWSDOWN` ones (Linux's `stack_vm`,
+    /// VmStk).
+    pub fn stack_bytes(&self) -> u64 {
+        self.vmas
+            .values()
+            .filter(|v| v.growsdown)
+            .map(|v| v.len)
+            .sum()
     }
 
     /// Resident 4K pages in host memory. Anonymous mappings never written are skipped: reading them
@@ -2916,7 +3120,22 @@ impl Mm {
             .is_none_or(|(&s, v)| s + v.len <= start)
     }
 
-    /// Finds a free range of length `len`, top down.
+    /// Whether an mmap hint can be used as it is: the range is free, below the top of the mmap area,
+    /// and clear of the guard gap below a grows-down mapping above it (Linux's `vm_start_gap`).
+    fn hint_fits(&self, hint: u64, len: u64) -> bool {
+        let Some(end) = hint.checked_add(len).filter(|&e| e <= self.mmap_top) else {
+            return false;
+        };
+        self.is_free(hint, len)
+            && self
+                .vmas
+                .range(end..)
+                .next()
+                .is_none_or(|(&s, v)| !v.growsdown || s - end >= STACK_GUARD_GAP)
+    }
+
+    /// Finds a free range of length `len`, top down, leaving the guard gap below grows-down
+    /// mappings free as Linux's `vm_unmapped_area` does.
     pub fn find_free(&self, len: u64) -> Option<u64> {
         let mut top = self.mmap_top;
         for (&s, v) in self.vmas.range(..self.mmap_top).rev() {
@@ -2924,9 +3143,14 @@ impl Mm {
             if end <= top && top - end >= len {
                 return Some(top - len);
             }
-            top = top.min(s);
+            let low = if v.growsdown {
+                s.saturating_sub(STACK_GUARD_GAP)
+            } else {
+                s
+            };
+            top = top.min(low);
         }
-        (top >= MMAP_MIN + len).then(|| top - len)
+        (top >= mmap_min().saturating_add(len)).then(|| top - len)
     }
 
     /// Host memory for a new private anonymous mapping: a `PROT_NONE` one is only a reservation
@@ -3053,6 +3277,7 @@ impl Mm {
                 wipeonfork: false,
                 dontfork: false,
                 noreserve: false,
+                anon: 0,
             },
         );
         Ok(())
@@ -4821,7 +5046,7 @@ mod tests {
         assert!(std::mem::take(&mut mm.dirty));
         assert_eq!(mm.graveyard.len(), 1);
         // Almost the whole address space is unmapped: succeeds at once and does nothing
-        mm.munmap(MMAP_MIN, a - MMAP_MIN).unwrap();
+        mm.munmap(mmap_min(), a - mmap_min()).unwrap();
         assert!(!mm.dirty);
         assert_eq!(mm.vmas.len(), 2);
         assert!(mm.mmu().translate(a + PAGE_SIZE, 0).is_none());
@@ -5252,6 +5477,99 @@ mod tests {
         assert!(child.grow_down(guard_end - 2 * PAGE_SIZE, u64::MAX));
     }
 
+    fn prot_at(mm: &Mm, addr: u64) -> u32 {
+        mm.vmas.range(..=addr).next_back().unwrap().1.prot
+    }
+
+    /// Around a grows-down mapping as on Linux: a kernel access below it grows it; mprotect with
+    /// `PROT_GROWSDOWN` reaches down to the bottom of the mapping it grew into and stops at a part
+    /// with other permissions, and is EINVAL on a mapping that does not grow down; a hint in the
+    /// guard gap below it is not taken.
+    #[test]
+    fn growsdown_mappings_behave_as_one_vma() {
+        const PROT_GROWSDOWN: u32 = 0x0100_0000;
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let low = 0x4000_0000 + 1024 * PAGE_SIZE;
+        mm.mmap(low, 2 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.set_growsdown(low);
+        assert!(mm.grow_for(low - 3 * PAGE_SIZE, 8, u64::MAX));
+        assert!(!mm.grow_for(low - 3 * PAGE_SIZE, 8, u64::MAX));
+        mm.mprotect(low - 2 * PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        mm.protect(low, PAGE_SIZE, prot::READ, PROT_GROWSDOWN)
+            .unwrap();
+        let prots: Vec<u32> = (-3..2)
+            .map(|i: i64| prot_at(&mm, low.wrapping_add_signed(i * PAGE_SIZE as i64)))
+            .collect();
+        let r = prot::READ;
+        assert_eq!(prots, [RW, r, r, r, RW]);
+        let other = mm.mmap(0x1000_0000, PAGE_SIZE, RW, fixed, None).unwrap();
+        assert_eq!(
+            mm.protect(other, PAGE_SIZE, r, PROT_GROWSDOWN),
+            Err(Errno::EINVAL)
+        );
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let hint = low - 3 * PAGE_SIZE - 16 * PAGE_SIZE;
+        assert_ne!(mm.mmap(hint, PAGE_SIZE, RW, anon, None), Ok(hint));
+    }
+
+    /// mprotect changes the VMAs in turn and stops at the first one that refuses, leaving the ones
+    /// before it changed, as Linux does.
+    #[test]
+    fn mprotect_keeps_what_it_changed_before_an_error() {
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let a = 0x100000;
+        for i in 0..3 {
+            mm.mmap(a + i * PAGE_SIZE, PAGE_SIZE, 0, fixed, None)
+                .unwrap();
+        }
+        mm.deny_write(a + PAGE_SIZE, PAGE_SIZE);
+        assert_eq!(mm.mprotect(a, 3 * PAGE_SIZE, RW), Err(Errno::EACCES));
+        assert_eq!(
+            [0, 1, 2].map(|i| prot_at(&mm, a + i * PAGE_SIZE)),
+            [RW, 0, 0]
+        );
+        mm.munmap(a + PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(
+            mm.mprotect(a, 3 * PAGE_SIZE, prot::READ),
+            Err(Errno::ENOMEM)
+        );
+        assert_eq!(
+            [0, 2].map(|i| prot_at(&mm, a + i * PAGE_SIZE)),
+            [prot::READ, 0]
+        );
+    }
+
+    /// After fork the child's VMAs with contents of their own no longer join their neighbours in
+    /// maps (on Linux each has its own anon_vma), while the parent's pieces join again.
+    #[test]
+    fn forked_mappings_stay_apart_in_the_child() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 3 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        parent
+            .borrow_mut()
+            .mprotect(a + PAGE_SIZE, PAGE_SIZE, prot::READ)
+            .unwrap();
+        let child = parent.borrow_mut().fork().unwrap();
+        let entries = |mm: &Rc<RefCell<Mm>>| {
+            mm.borrow_mut()
+                .mprotect(a + PAGE_SIZE, PAGE_SIZE, RW)
+                .unwrap();
+            let r = mm.borrow().regions();
+            r.iter()
+                .filter(|r| r.start >= a && r.end <= a + 3 * PAGE_SIZE)
+                .count()
+        };
+        assert_eq!(entries(&parent), 1);
+        assert_eq!(entries(&child), 3);
+    }
+
     #[test]
     fn stack_grows_in_place_until_its_reservation_runs_out() {
         let mut mm = Mm::new();
@@ -5384,13 +5702,30 @@ mod tests {
             Ok(c)
         );
         assert!(!mm.is_mapped(c + PAGE_SIZE));
-        // A range not fully mapped
+        // A range not fully mapped: shrinking only unmaps the tail (Linux looks up only the
+        // mapping at the old address), growing needs the old range in one VMA
+        assert_eq!(
+            mm.mremap(c, 2 * PAGE_SIZE, 3 * PAGE_SIZE, true, None, None),
+            Err(Errno::EFAULT)
+        );
         assert_eq!(
             mm.mremap(c, 2 * PAGE_SIZE, PAGE_SIZE, true, None, None),
-            Err(Errno::EFAULT)
+            Ok(c)
         );
         assert_eq!(mm.check_mapped(c, 2 * PAGE_SIZE), Err(Errno::ENOMEM));
         assert_eq!(mm.check_mapped(c, PAGE_SIZE), Ok(()));
+        // Two mappings Linux would not merge (different permissions) cannot be moved as one
+        let d = mm.mmap(0x400000, 2 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.mprotect(d, PAGE_SIZE, prot::READ).unwrap();
+        assert_eq!(
+            mm.mremap(d, 2 * PAGE_SIZE, 2 * PAGE_SIZE, true, Some(0x800000), None),
+            Err(Errno::EFAULT)
+        );
+        mm.mprotect(d, PAGE_SIZE, RW).unwrap();
+        assert_eq!(
+            mm.mremap(d, 2 * PAGE_SIZE, 2 * PAGE_SIZE, true, Some(0x800000), None),
+            Ok(0x800000)
+        );
     }
 
     #[test]

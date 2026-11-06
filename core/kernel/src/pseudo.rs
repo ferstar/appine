@@ -278,7 +278,7 @@ const PROC_NET: [&[u8]; 18] = [
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 90] = [
+const STATIC: [&[u8]; 91] = [
     b"sys/",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
@@ -363,6 +363,7 @@ const STATIC: [&[u8]; 90] = [
     b"sys/user/max_uts_namespaces",
     b"sys/vm/",
     b"sys/vm/max_map_count",
+    b"sys/vm/mmap_min_addr",
     b"sys/vm/overcommit_memory",
     b"sys/vm/overcommit_ratio",
     b"sysvipc/",
@@ -1850,6 +1851,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/inotify/max_user_instances"
                     | b"sys/fs/inotify/max_user_watches"
                     | b"sys/vm/max_map_count"
+                    | b"sys/vm/mmap_min_addr"
                     | b"sys/net/core/somaxconn"
                     | b"sys/net/ipv4/ip_forward"
                     | b"sys/net/ipv4/ip_local_port_range"
@@ -2019,6 +2021,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!(
                     "{}\n",
                     crate::mm::MAX_MAP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                )
+            }
+            b"sys/vm/mmap_min_addr" => {
+                format!(
+                    "{}\n",
+                    crate::mm::MMAP_MIN_ADDR.load(std::sync::atomic::Ordering::Relaxed)
                 )
             }
             b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
@@ -2337,8 +2345,12 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<S
         writeln!(s, "VmLck:\t{:>8} kB\nVmPin:\t{:>8} kB", locked / 1024, 0).unwrap();
         let hwm = g.maxrss_kb.max(rss * 4);
         writeln!(s, "VmHWM:\t{hwm:>8} kB\nVmRSS:\t{:>8} kB", rss * 4).unwrap();
-        // Data, stack and code are not told apart; no swap
-        writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", 0).unwrap();
+        // Grows-down mappings are the stack (Linux's stack_vm); data and code are not told
+        // apart; no swap
+        let stack = task
+            .as_ref()
+            .map_or(0, |t| t.res.borrow().mm.borrow().stack_bytes());
+        writeln!(s, "VmData:\t{kb:>8} kB\nVmStk:\t{:>8} kB", stack / 1024).unwrap();
         writeln!(s, "VmExe:\t{:>8} kB\nVmLib:\t{:>8} kB", 0, 0).unwrap();
         writeln!(s, "VmPTE:\t{:>8} kB\nVmSwap:\t{:>8} kB", 0, 0).unwrap();
     }
@@ -2666,8 +2678,8 @@ fn vm_flags(r: &Region) -> String {
     s
 }
 
-/// One line of maps. As on Linux, lines without a name also end in a space, and the name starts
-/// at column 74.
+/// One line of maps. As on Linux, lines without a name also end in a space, the name starts at
+/// column 74, and a newline in a file's path is escaped as `\012` (seq_file_path).
 fn map_line(store: &Store, r: &Region) -> String {
     let perms = format!(
         "{}{}{}{}",
@@ -2689,7 +2701,17 @@ fn map_line(store: &Store, r: &Region) -> String {
     match &r.name {
         Some(name) => {
             let name = match r.file {
-                Some((_, ino)) => mark_deleted(store, ino, name.to_vec()),
+                Some((_, ino)) => {
+                    let path = mark_deleted(store, ino, name.to_vec());
+                    let mut escaped = Vec::with_capacity(path.len());
+                    for b in path {
+                        match b {
+                            b'\n' => escaped.extend_from_slice(b"\\012"),
+                            b => escaped.push(b),
+                        }
+                    }
+                    escaped
+                }
                 None => name.to_vec(),
             };
             format!("{line:<73}{}\n", String::from_utf8_lossy(&name))
@@ -2746,25 +2768,28 @@ pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::M
 
 /// Reads `/proc/<pid>/mem` (`mm` is the address space at open; once it is released reads get
 /// EOF): the position is the address. Reads page by page and stops at a page that cannot be read;
-/// when not a single byte was read, it is EIO (Linux's `mem_rw`).
+/// when not a single byte was read, it is EIO (Linux's `mem_rw`). As Linux's access_remote_vm,
+/// a page below a grows-down mapping grows it first, within the reader's `RLIMIT_STACK`
+/// (`limit`).
 pub(crate) fn read_mem(
     mm: Option<Rc<RefCell<crate::mm::Mm>>>,
     buf: &mut [u8],
     pos: u64,
+    limit: u64,
 ) -> Result<usize, Errno> {
     let Some(mm) = mm else {
         return Ok(0);
     };
-    let mm = mm.borrow();
     let mut done = 0;
     while done < buf.len() {
         let Some(addr) = pos.checked_add(done as u64) else {
             break;
         };
         let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(buf.len() - done);
-        if mm
-            .read(UserSlice::new(addr, n), &mut buf[done..done + n])
-            .is_err()
+        let mut read =
+            |mm: &crate::mm::Mm| mm.read(UserSlice::new(addr, n), &mut buf[done..done + n]);
+        if read(&mm.borrow()).is_err()
+            && !(mm.borrow_mut().grow_for(addr, n, limit) && read(&mm.borrow()).is_ok())
         {
             break;
         }
@@ -2777,7 +2802,8 @@ pub(crate) fn read_mem(
 }
 
 /// Writes `/proc/<pid>/mem`: a forced write like PTRACE_POKETEXT ([`Mm::write_force`]), page by
-/// page, stopping at a page that cannot be written. `current` is the writing thread.
+/// page, stopping at a page that cannot be written; grows grows-down mappings as [`read_mem`]
+/// does. `current` is the writing thread.
 ///
 /// [`Mm::write_force`]: crate::mm::Mm::write_force
 pub(crate) fn write_mem(
@@ -2785,6 +2811,7 @@ pub(crate) fn write_mem(
     data: &[u8],
     pos: u64,
     current: &Arc<crate::task::TaskSync>,
+    limit: u64,
 ) -> Result<usize, Errno> {
     let Some(mm) = mm else {
         return Ok(0);
@@ -2796,9 +2823,9 @@ pub(crate) fn write_mem(
             break;
         };
         let n = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(data.len() - done);
-        if mm
-            .write_force(addr, &data[done..done + n], current)
-            .is_err()
+        let page = &data[done..done + n];
+        if mm.write_force(addr, page, current).is_err()
+            && !(mm.grow_for(addr, n, limit) && mm.write_force(addr, page, current).is_ok())
         {
             break;
         }
@@ -3604,6 +3631,17 @@ pub(crate) fn write(
             ns.uts.domainname.borrow_mut()
         };
         *slot = name.to_vec();
+    }
+    // mmap_min_addr_handler: writing needs CAP_SYS_RAWIO
+    if let PseudoNode::Static(b"sys/vm/mmap_min_addr") = node {
+        if !cred.capable(cap::SYS_RAWIO) {
+            return Err(Errno::EPERM);
+        }
+        let n: u64 = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or(Errno::EINVAL)?;
+        crate::mm::MMAP_MIN_ADDR.store(n, std::sync::atomic::Ordering::Relaxed);
     }
     if let PseudoNode::Static(b"sys/vm/max_map_count") = node {
         let n: usize = std::str::from_utf8(data)

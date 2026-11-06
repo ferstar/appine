@@ -661,7 +661,7 @@ fn read_timespec(cx: &Cx<'_>, addr: u64) -> Result<std::time::Duration, Errno> {
 /// Reads a fixed-length byte array from guest memory.
 fn get<const N: usize>(cx: &Cx<'_>, addr: u64) -> Result<[u8; N], Errno> {
     let mut b = [0u8; N];
-    cx.mm().read(UserSlice::new(addr, N), &mut b)?;
+    cx.read_user(UserSlice::new(addr, N), &mut b)?;
     Ok(b)
 }
 
@@ -690,5 +690,5 @@ fn write_pair(cx: &Cx<'_>, addr: u64, a: i64, b: i64) -> Result<(), Errno> {
 
 /// Writes an integer type to guest memory.
 fn put<const N: usize>(cx: &Cx<'_>, addr: u64, bytes: [u8; N]) -> Result<(), Errno> {
-    cx.mm().write(UserSlice::new(addr, N), &bytes)
+    cx.write_user(UserSlice::new(addr, N), &bytes)
 }
