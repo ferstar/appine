@@ -768,11 +768,14 @@ fn notify_info(signo: Signal, si_code: i32, pid: Tid, uid: u32) -> [u8; 128] {
 pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     {
         let mut t = task.trace.borrow_mut();
-        let (stop, regs, reported) = (t.stop, t.regs.take(), t.reported);
+        let (stop, regs, reported, syscallno) = (t.stop, t.regs.take(), t.reported, t.syscallno);
         *t = Trace::default();
         if stop.is_some() {
             t.stop = stop;
             t.regs = regs;
+            // A thread detached at a syscall-entry or seccomp stop goes on with its syscall,
+            // whose number the stop returns (without this it became 0, io_setup)
+            t.syscallno = syscallno;
             t.resume = sig.or(reported.then_some(0));
         }
     }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id; retargeting process signals)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id; retargeting process signals; detaching at syscall stops)
 
 ## Responsibilities
 
@@ -202,7 +202,9 @@ procfs.
   `LISTEN` and `INTERRUPT` need `SEIZE`.
 - Syscall stops (`PTRACE_SYSCALL`): x7 is 0 at entry and 1 at exit (restored afterwards); the
   tracer may change the number through `NT_ARM_SYSTEM_CALL` (-1 skips the call); seccomp runs after
-  the entry stop; the no-BKL fast path is off while tracing syscalls or stepping.
+  the entry stop; the no-BKL fast path is off while tracing syscalls or stepping. Detaching (or the
+  tracer exiting) at an entry or seccomp stop keeps the syscall number, so the call goes on as
+  made.
 - Event stops: fork, vfork, clone, exec (message: former tid), exit (message: wait status),
   vfork-done, seccomp. `CLONE_PTRACE` forces and `CLONE_UNTRACED` prevents tracing of children.
   A non-seized tracee exec without `TRACEEXEC` gets `SIGTRAP`.

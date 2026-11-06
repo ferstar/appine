@@ -1338,3 +1338,68 @@ int main(void)
 }
 C
 gcc -O1 -o implicit implicit.c && ./implicit
+
+# Detaching from a thread stopped at a syscall's entry lets it run that syscall: here a write of
+# 3 bytes and a getppid
+cat > detachentry.c <<'C'
+#include <elf.h>
+#include <stdio.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/* Stops the child at the entry of syscall `nr` and detaches there */
+static void detach_at(pid_t child, unsigned long nr)
+{
+    int st;
+    ptrace(PTRACE_SEIZE, child, 0, 0);
+    ptrace(PTRACE_INTERRUPT, child, 0, 0);
+    waitpid(child, &st, __WALL);
+    for (int i = 0; i < 100; i++) {
+        ptrace(PTRACE_SYSCALL, child, 0, 0);
+        waitpid(child, &st, __WALL);
+        unsigned long long r[34];
+        struct iovec io = {r, sizeof r};
+        ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &io);
+        if (r[8] == nr && r[7] == 0)
+            break;
+    }
+    ptrace(PTRACE_DETACH, child, 0, 0);
+}
+
+int main(void)
+{
+    int go[2], out[2];
+    pipe(go);
+    pipe(out);
+    pid_t child = fork();
+    if (child == 0) {
+        char x;
+        read(go[0], &x, 1);
+        long w = write(out[1], "abc", 3);
+        long p = getppid();
+        char line[64];
+        int n = snprintf(line, sizeof line, "write %ld, getppid is the parent: %d\n", w, p == getppid());
+        write(out[1], line, n);
+        _exit(0);
+    }
+    /* The child waits in read until the parent, its tracer, has seized it; a helper then lets it
+     * go, and the first syscall after the read is the write */
+    if (fork() == 0) {
+        usleep(200000);
+        write(go[1], "g", 1);
+        _exit(0);
+    }
+    detach_at(child, 64);
+    int st;
+    waitpid(child, &st, 0);
+    wait(&st);
+    char buf[128];
+    int n = read(out[0], buf, sizeof buf - 1);
+    buf[n > 0 ? n : 0] = 0;
+    printf("%s", buf);
+    return 0;
+}
+C
+gcc -O1 -o detachentry detachentry.c && ./detachentry
