@@ -2,7 +2,7 @@
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
 # recorded sysctls; process signals taken by another thread; blocking connect; an exited main
-# thread
+# thread; /proc/vmstat
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -900,3 +900,9 @@ int main(void)
 C
 gcc -O1 -pthread -o leaderzombie leaderzombie.c && ./leaderzombie
 rm -f leaderzombie leaderzombie.c
+
+# /proc/vmstat exists with the counters procps' vmstat reads (the values are the host kernel's on
+# the native side)
+for k in nr_free_pages nr_anon_pages nr_file_pages pgpgin pgpgout pswpin pswpout pgfault pgmajfault; do
+    echo "vmstat $k: $(grep -c "^$k [0-9][0-9]*\$" /proc/vmstat)"
+done

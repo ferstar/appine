@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`)
 
 ## Responsibilities
 
@@ -38,7 +38,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   procfs (`Global`, `SelfLink`, `ThreadSelf`, `Static`, `Pid`, `Entry`, `Net`, `Fd`, `OpenFd`,
   `OpenExe`, `FdInfo`, `Ns`, `NetConf`, `NetSysctl`), sysfs (`SysRoot`, `Sys`, `SysCpu`, `SysNet`,
   `SysBrif`, `SysBlock`), `Cgroup`, `NsFile(kind, id)`, mqueue nodes.
-- `Global`/`GLOBALS` (12 top-level files), `Entry`/`ENTRIES` (32 per-process entries),
+- `Global`/`GLOBALS` (13 top-level files), `Entry`/`ENTRIES` (32 per-process entries),
   `TASK_ENTRIES` (27 per-thread entries), `NsKind`, `STATIC` (90 fixed `/proc/sys` and
   `/proc/sysvipc` paths), `SYS_STATIC` and the sysfs file tables, `PROC_NET` (18 files).
 - `View` — a read-only view of the kernel for one reader thread, taken under the BKL; implements
@@ -156,7 +156,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 ### System-wide files and `/proc/sys`
 
 - `meminfo`: 16 fields copied from the host's `/proc/meminfo` (falling back to host `sysinfo`), not
-  clamped to cgroup limits. `sysinfo(2)` takes memory from the host but uptime (with the time
+  clamped to cgroup limits. `vmstat`: the host's file when the app may read it, else the page
+  counts meminfo gives (free, slab, anon, mapped, file, dirty, shmem) and the event counters
+  procps reads at 0. `sysinfo(2)` takes memory from the host but uptime (with the time
   namespace offset), loads and the process count from the guest.
 - `cpuinfo`: one block per guest CPU with the guest-visible hwcaps and MIDR, BogoMIPS 100.
   `stat`: guest threads' CPU time (plus exited threads') with idle derived from uptime, split
@@ -399,9 +401,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access; `user.*` likewise
   keys on `CAP_SYS_RESOURCE`), so network daemons that drop root but keep `CAP_NET_ADMIN` get
   `EACCES`.
-- **`/proc/vmstat`, `/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** procps
-  `vmstat`, memory monitors and low-memory daemons (systemd-oomd and oomd need PSI's
-  `/proc/pressure/memory` and its poll triggers) and symbol lookups (perf, bpftrace) find nothing.
+- **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
+  (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
+  and symbol lookups (perf, bpftrace) find nothing.
 - **`stat` address fields ignore the ptrace check:** `/proc/<pid>/stat` reports the code, stack,
   data and brk addresses as 0 for everyone and the argument and environment addresses to everyone,
   where Linux 6.1 shows real values only to readers passing the ptrace-read check (others see 1/1

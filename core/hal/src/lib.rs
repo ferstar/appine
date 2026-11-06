@@ -841,6 +841,20 @@ pub struct MemInfo {
     pub sreclaimable: u64,
 }
 
+/// The host's `/proc/vmstat`, when the host lets the app read it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn host_vmstat() -> Option<String> {
+    std::fs::read_to_string("/proc/vmstat")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// The host's `/proc/vmstat`: not available.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn host_vmstat() -> Option<String> {
+    None
+}
+
 /// The host's memory state, read from `/proc/meminfo`. When it cannot be read (the host does not
 /// allow it), only the few fields sysinfo can give, with the available amount estimated as free
 /// plus buffers.

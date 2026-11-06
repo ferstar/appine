@@ -51,12 +51,14 @@ pub(crate) enum Global {
     Net,
     /// cgroup controllers ([`crate::cgroup`]).
     Cgroups,
+    /// Memory counters, the host's when it can be read.
+    Vmstat,
     /// syslog reading ([`crate::klog`]): the contents are not generated at open but taken at read
     /// time.
     Kmsg,
 }
 
-const GLOBALS: [(&[u8], Global); 12] = [
+const GLOBALS: [(&[u8], Global); 13] = [
     (b"cpuinfo", Global::Cpuinfo),
     (b"meminfo", Global::Meminfo),
     (b"stat", Global::Stat),
@@ -69,6 +71,7 @@ const GLOBALS: [(&[u8], Global); 12] = [
     (b"net", Global::Net),
     (b"cgroups", Global::Cgroups),
     (b"kmsg", Global::Kmsg),
+    (b"vmstat", Global::Vmstat),
 ];
 
 /// Entries under `/proc/<pid>`.
@@ -2056,6 +2059,9 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         Global(g) => match g {
             self::Global::Cpuinfo => cpuinfo(),
             self::Global::Meminfo => meminfo(),
+            self::Global::Vmstat => {
+                vmstat(appine_hal::host_vmstat(), &appine_hal::host_meminfo())
+            }
             self::Global::Stat => global_stat(ps),
             // Truncated to hundredths of a second, as in Linux's uptime_proc_show (rounding would
             // write x.996 seconds as the next second, more than sysinfo reports right after)
@@ -3311,6 +3317,41 @@ fn meminfo() -> String {
     s
 }
 
+/// `/proc/vmstat`: like `meminfo`, the host's figures (as a container sees its host's) when the
+/// host lets the app read them; otherwise the page counts `meminfo` gives and the event counters
+/// at 0, in Linux's order, so procps' vmstat and memory monitors still find the file.
+fn vmstat(host: Option<String>, m: &appine_hal::MemInfo) -> String {
+    if let Some(text) = host {
+        return text;
+    }
+    let pages = |bytes: u64| bytes / 4096;
+    let mut s = String::new();
+    for (name, value) in [
+        ("nr_free_pages", pages(m.free)),
+        ("nr_slab_reclaimable", pages(m.sreclaimable)),
+        (
+            "nr_slab_unreclaimable",
+            pages(m.slab.saturating_sub(m.sreclaimable)),
+        ),
+        ("nr_anon_pages", pages(m.anon_pages)),
+        ("nr_mapped", pages(m.mapped)),
+        ("nr_file_pages", pages(m.cached + m.buffers + m.swap_cached)),
+        ("nr_dirty", pages(m.dirty)),
+        ("nr_writeback", 0),
+        ("nr_shmem", pages(m.shmem)),
+        ("pgpgin", 0),
+        ("pgpgout", 0),
+        ("pswpin", 0),
+        ("pswpout", 0),
+        ("pgfault", 0),
+        ("pgmajfault", 0),
+        ("oom_kill", 0),
+    ] {
+        writeln!(s, "{name} {value}").unwrap();
+    }
+    s
+}
+
 fn global_stat(ps: &View<'_>) -> String {
     let n = cpus() as u64;
     let up = ticks(uptime_ns());
@@ -4345,6 +4386,30 @@ mod tests {
 
     /// Number-taking /proc files: up to a NUL, only the first 12 bytes, base 0, beyond 32 bits is
     /// ERANGE.
+    #[test]
+    fn vmstat_without_the_host_file() {
+        let m = appine_hal::MemInfo {
+            free: 8192 * 4096,
+            slab: 30 * 4096,
+            sreclaimable: 10 * 4096,
+            ..Default::default()
+        };
+        let text = vmstat(None, &m);
+        assert!(text.starts_with("nr_free_pages 8192\n"));
+        assert!(text.contains("\nnr_slab_unreclaimable 20\n"));
+        for key in [
+            "pgpgin",
+            "pgpgout",
+            "pswpin",
+            "pswpout",
+            "pgfault",
+            "pgmajfault",
+        ] {
+            assert!(text.contains(&format!("\n{key} 0\n")), "{key}");
+        }
+        assert_eq!(vmstat(Some("pgpgin 5\n".into()), &m), "pgpgin 5\n");
+    }
+
     #[test]
     fn proc_numbers() {
         let num = |d: &[u8], signed| kstrto(proc_number(d)?, signed);
