@@ -1382,8 +1382,9 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             record_lock(cx, &file, cmd, arg)
         }
-        F_SETOWN => set_owner(cx, &file, arg as i32).map(|()| 0),
-        F_GETOWN => Ok(get_owner(cx, &file) as i64 as u64),
+        // The dispatcher translates F_SETOWN's argument and F_GETOWN's result (pid_args)
+        F_SETOWN => set_owner(&file, arg as i32).map(|()| 0),
+        F_GETOWN => Ok(get_owner(&file) as i64 as u64),
         F_SETOWN_EX => {
             let b: [u8; 8] = get(cx, arg)?;
             let ty = i32::from_le_bytes(b[..4].try_into().unwrap());
@@ -1466,24 +1467,22 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     }
 }
 
-/// `F_SETOWN` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` (Linux's `f_setown`): a negative
-/// number is a process group, `INT_MIN` (which has no negation) is `EINVAL`, and the number is in
-/// the caller's pid namespace.
-fn set_owner(cx: &Cx<'_>, file: &FileRef, pid: i32) -> Result<(), Errno> {
+/// `F_SETOWN` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` (Linux's `f_setown`): `pid` is
+/// already a global number, a negative one a process group; `INT_MIN`, which has no negation, is
+/// `EINVAL`.
+fn set_owner(file: &FileRef, pid: i32) -> Result<(), Errno> {
     let owner = match pid.checked_neg() {
         None => return Err(Errno::EINVAL),
-        Some(g) if pid < 0 => (F_OWNER_PGRP, cx.pid_in(g)),
-        Some(_) => (F_OWNER_PID, cx.pid_in(pid)),
+        Some(g) if pid < 0 => (F_OWNER_PGRP, g),
+        Some(_) => (F_OWNER_PID, pid),
     };
     file.borrow_mut().owner = owner;
     Ok(())
 }
 
-/// `F_GETOWN`, `FIOGETOWN`, `SIOCGPGRP`: the owner in the caller's pid namespace, a process group
-/// negated.
-fn get_owner(cx: &Cx<'_>, file: &FileRef) -> Tid {
+/// `F_GETOWN`, `FIOGETOWN`, `SIOCGPGRP`: the owner as a global number, a process group negated.
+fn get_owner(file: &FileRef) -> Tid {
     let (ty, pid) = file.borrow().owner;
-    let pid = cx.pid_out(pid);
     if ty == F_OWNER_PGRP { -pid } else { pid }
 }
 
@@ -1758,11 +1757,18 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         FIOSETOWN | SIOCSPGRP | FIOGETOWN | SIOCGPGRP
             if matches!(file.borrow().kind, FileKind::Socket(_)) =>
         {
+            // The number is in memory, so translated here, as the dispatcher does for F_SETOWN
             if matches!(request, FIOSETOWN | SIOCSPGRP) {
-                let pid = i32::from_le_bytes(get(cx, arg)?);
-                return set_owner(cx, &file, pid).map(|()| 0);
+                let pid = match i32::from_le_bytes(get(cx, arg)?) {
+                    p if p > 0 => cx.pid_in(p),
+                    p if p < 0 && p != i32::MIN => -cx.pid_in(-p),
+                    p => p,
+                };
+                return set_owner(&file, pid).map(|()| 0);
             }
-            let pid = get_owner(cx, &file);
+            let pid = get_owner(&file);
+            let local = cx.pid_out(pid.abs());
+            let pid = if pid < 0 { -local } else { local };
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
         _ => {}

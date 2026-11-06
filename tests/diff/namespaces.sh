@@ -399,6 +399,23 @@ echo "unshare exits with $?"
 busybox unshare -p -f --mount-proc strace -f -qq -e trace=exit_group,kill sh -c 'sh -c "exit 3"; kill -0 $$; echo "inner exit $?"'
 # task/1/children of process 1 has the inner IDs (the two background sleeps and cat itself)
 busybox unshare -p -f --mount-proc sh -c 'sleep 100 & sleep 100 & echo "children of 1: $(cat /proc/1/task/1/children)."; kill 2 3'
+# Owners of signal-driven I/O are numbers in the caller's pid namespace: F_SETOWN/F_GETOWN (whose
+# number is in the syscall's arguments) and the socket ioctls FIOSETOWN/FIOGETOWN and
+# SIOCSPGRP/SIOCGPGRP (whose number is in memory)
+busybox unshare -p -f --mount-proc python3 -c '
+import fcntl, os, socket, struct
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+fcntl.fcntl(s, fcntl.F_SETOWN, os.getpid())
+print("pid", os.getpid(), "F_GETOWN", fcntl.fcntl(s, fcntl.F_GETOWN))
+fcntl.ioctl(s, 0x8901, struct.pack("i", os.getpid()))
+print("FIOGETOWN", struct.unpack("i", fcntl.ioctl(s, 0x8903, b"\0" * 4))[0])
+os.setpgid(0, 0)
+fcntl.ioctl(s, 0x8902, struct.pack("i", -os.getpid()))
+print("SIOCGPGRP", struct.unpack("i", fcntl.ioctl(s, 0x8904, b"\0" * 4))[0])
+# F_GETOWN would return -1, which Python takes for an error
+fcntl.fcntl(s, fcntl.F_SETOWN, -1)
+print("F_SETOWN -1, then SIOCGPGRP", struct.unpack("i", fcntl.ioctl(s, 0x8904, b"\0" * 4))[0])
+'
 # Process 1 exits while a deeper tree still runs (1 → sh → two sleeps): everything inside is
 # killed, the orphans left by the killed sh are reaped, and unshare sees process 1 end (Linux's
 # zap_pid_ns_processes)

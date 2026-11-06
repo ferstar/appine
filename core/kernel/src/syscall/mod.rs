@@ -625,6 +625,10 @@ fn pid_args(ns: &crate::pidns::PidNs, nr: u64, a: &mut [u64; 6]) {
     for &i in idx {
         a[i] = global(a[i]);
     }
+    // fcntl(F_SETOWN): -1 is process group 1 there, not every process as for kill
+    if nr == 25 && a[1] == 8 && a[2] as i32 == -1 {
+        a[2] = (-ns.find(1).unwrap_or(NO_PID)) as u32 as u64;
+    }
 }
 
 /// execve succeeded (`old_tid` is the tid before): when traced, reports the exec

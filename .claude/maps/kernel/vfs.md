@@ -264,9 +264,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   at open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
   when `O_ASYNC` turns on, with no `O_NOATIME` ownership check). `F_SETOWN`/`F_GETOWN`,
   `F_SETOWN_EX`/`F_GETOWN_EX` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` and
-  `FIOGETOWN`/`SIOCGPGRP` translate pids through the caller's pid namespace (owners are stored as
-  global ids; in a child pid namespace a pid unknown there is stored as a number that matches
-  nothing, and an owner no longer in it reads back as 0); `F_SETOWN(INT_MIN)` is `EINVAL`.
+  `FIOGETOWN`/`SIOCGPGRP` translate pids through the caller's pid namespace (the dispatcher's
+  `pid_args` does it for `F_SETOWN`'s argument, -1 included as process group 1, and `F_GETOWN`'s
+  result; the others translate their own); owners are stored as global ids; in a child pid
+  namespace a pid unknown there is stored as a number that matches nothing, and an owner no longer
+  in it reads back as 0; `F_SETOWN(INT_MIN)` is `EINVAL`.
   `F_SETSIG`, pipe size and seals are also handled in fcntl.
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
