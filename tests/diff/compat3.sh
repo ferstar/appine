@@ -1,6 +1,7 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
-# taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files
+# taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
+# recorded sysctls
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -573,3 +574,28 @@ int main(void)
 C
 gcc -O1 -o relink relink.c && ./relink
 rm -f relink relink.c
+
+# Sysctls appine only records exist with Linux's modes (values come from the host's kernel on the
+# native side, so only their form is compared)
+cd /proc/sys
+for f in debug/exception-trace fs/overflowgid fs/overflowuid fs/suid_dumpable \
+    kernel/core_pipe_limit kernel/hung_task_all_cpu_backtrace kernel/hung_task_check_count \
+    kernel/hung_task_check_interval_secs kernel/hung_task_panic kernel/hung_task_timeout_secs \
+    kernel/hung_task_warnings kernel/kptr_restrict kernel/modprobe kernel/modules_disabled \
+    kernel/overflowgid kernel/overflowuid kernel/panic_on_oops kernel/perf_cpu_time_max_percent \
+    kernel/perf_event_max_contexts_per_stack kernel/perf_event_max_sample_rate \
+    kernel/perf_event_max_stack kernel/perf_event_mlock_kb kernel/perf_event_paranoid \
+    kernel/randomize_va_space kernel/sched_rt_period_us kernel/sched_rt_runtime_us \
+    kernel/sched_schedstats kernel/sysrq kernel/tainted vm/dirty_background_bytes \
+    vm/dirty_background_ratio vm/dirty_bytes vm/dirty_expire_centisecs vm/dirty_ratio \
+    vm/dirty_writeback_centisecs vm/drop_caches vm/mmap_rnd_bits vm/mmap_rnd_compat_bits \
+    vm/overcommit_memory vm/overcommit_ratio vm/page-cluster vm/swappiness \
+    vm/watermark_scale_factor; do
+    mode=$(stat -c %a $f)
+    case $mode in
+    [46]*) case $(cat $f) in '' | *[!0-9-]*) form=text ;; *) form=number ;; esac ;;
+    *) form=- ;;
+    esac
+    echo "$f $mode $form"
+done
+cd /tmp

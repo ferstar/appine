@@ -278,8 +278,10 @@ const PROC_NET: [&[u8]; 18] = [
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 91] = [
+const STATIC: [&[u8]; 128] = [
     b"sys/",
+    b"sys/debug/",
+    b"sys/debug/exception-trace",
     b"sys/fs/",
     b"sys/fs/aio-max-nr",
     b"sys/fs/aio-nr",
@@ -303,13 +305,24 @@ const STATIC: [&[u8]; 91] = [
     b"sys/fs/pipe-user-pages-soft",
     b"sys/fs/protected_hardlinks",
     b"sys/fs/protected_symlinks",
+    b"sys/fs/suid_dumpable",
     b"sys/kernel/",
     b"sys/kernel/cap_last_cap",
     b"sys/kernel/core_pattern",
+    b"sys/kernel/core_pipe_limit",
     b"sys/kernel/core_uses_pid",
     b"sys/kernel/dmesg_restrict",
     b"sys/kernel/domainname",
     b"sys/kernel/hostname",
+    b"sys/kernel/hung_task_all_cpu_backtrace",
+    b"sys/kernel/hung_task_check_count",
+    b"sys/kernel/hung_task_check_interval_secs",
+    b"sys/kernel/hung_task_panic",
+    b"sys/kernel/hung_task_timeout_secs",
+    b"sys/kernel/hung_task_warnings",
+    b"sys/kernel/kptr_restrict",
+    b"sys/kernel/modprobe",
+    b"sys/kernel/modules_disabled",
     b"sys/kernel/msgmax",
     b"sys/kernel/msgmnb",
     b"sys/kernel/msgmni",
@@ -320,6 +333,13 @@ const STATIC: [&[u8]; 91] = [
     b"sys/kernel/overflowgid",
     b"sys/kernel/overflowuid",
     b"sys/kernel/panic",
+    b"sys/kernel/panic_on_oops",
+    b"sys/kernel/perf_cpu_time_max_percent",
+    b"sys/kernel/perf_event_max_contexts_per_stack",
+    b"sys/kernel/perf_event_max_sample_rate",
+    b"sys/kernel/perf_event_max_stack",
+    b"sys/kernel/perf_event_mlock_kb",
+    b"sys/kernel/perf_event_paranoid",
     b"sys/kernel/pid_max",
     b"sys/kernel/printk",
     b"sys/kernel/printk_devkmsg",
@@ -328,7 +348,11 @@ const STATIC: [&[u8]; 91] = [
     b"sys/kernel/random/entropy_avail",
     b"sys/kernel/random/poolsize",
     b"sys/kernel/random/uuid",
+    b"sys/kernel/randomize_va_space",
     b"sys/kernel/sched_rr_timeslice_ms",
+    b"sys/kernel/sched_rt_period_us",
+    b"sys/kernel/sched_rt_runtime_us",
+    b"sys/kernel/sched_schedstats",
     b"sys/kernel/seccomp/",
     b"sys/kernel/seccomp/actions_avail",
     b"sys/kernel/seccomp/actions_logged",
@@ -336,6 +360,7 @@ const STATIC: [&[u8]; 91] = [
     b"sys/kernel/shmall",
     b"sys/kernel/shmmax",
     b"sys/kernel/shmmni",
+    b"sys/kernel/sysrq",
     b"sys/kernel/tainted",
     b"sys/kernel/threads-max",
     b"sys/kernel/unprivileged_bpf_disabled",
@@ -362,15 +387,149 @@ const STATIC: [&[u8]; 91] = [
     b"sys/user/max_user_namespaces",
     b"sys/user/max_uts_namespaces",
     b"sys/vm/",
+    b"sys/vm/dirty_background_bytes",
+    b"sys/vm/dirty_background_ratio",
+    b"sys/vm/dirty_bytes",
+    b"sys/vm/dirty_expire_centisecs",
+    b"sys/vm/dirty_ratio",
+    b"sys/vm/dirty_writeback_centisecs",
+    b"sys/vm/drop_caches",
     b"sys/vm/max_map_count",
     b"sys/vm/mmap_min_addr",
+    b"sys/vm/mmap_rnd_bits",
+    b"sys/vm/mmap_rnd_compat_bits",
     b"sys/vm/overcommit_memory",
     b"sys/vm/overcommit_ratio",
+    b"sys/vm/page-cluster",
+    b"sys/vm/swappiness",
+    b"sys/vm/watermark_scale_factor",
     b"sysvipc/",
     b"sysvipc/msg",
     b"sysvipc/sem",
     b"sysvipc/shm",
 ];
+
+/// The sysctls procfs only records, so that `sysctl -p` setups, benchmark scripts and checkers find
+/// them: (path relative to `/proc`, mode, default, lowest and highest value accepted), the range
+/// being that of Linux 6.1's handler (any int for `proc_dointvec`). A write keeps the value in
+/// `Kernel::sysctls` and changes nothing else; `kernel.randomize_va_space` starts at 0 because
+/// appine places mappings at fixed addresses.
+pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
+    const INT_MIN: i64 = i32::MIN as i64;
+    const INT_MAX: i64 = i32::MAX as i64;
+    // LONG_MAX / HZ for the hung-task times (HZ 250, as on distribution arm64 kernels)
+    const HUNG_MAX: i64 = i64::MAX / 250;
+    [
+        (b"sys/debug/exception-trace", 0o644, 1, INT_MIN, INT_MAX),
+        (b"sys/fs/overflowgid", 0o644, 65534, 0, 65535),
+        (b"sys/fs/overflowuid", 0o644, 65534, 0, 65535),
+        (b"sys/fs/suid_dumpable", 0o644, 0, 0, 2),
+        (b"sys/kernel/core_pipe_limit", 0o644, 0, INT_MIN, INT_MAX),
+        (b"sys/kernel/hung_task_all_cpu_backtrace", 0o644, 0, 0, 1),
+        (
+            b"sys/kernel/hung_task_check_count",
+            0o644,
+            4194304,
+            0,
+            4194304,
+        ),
+        (
+            b"sys/kernel/hung_task_check_interval_secs",
+            0o644,
+            0,
+            0,
+            HUNG_MAX,
+        ),
+        (b"sys/kernel/hung_task_panic", 0o644, 0, 0, 1),
+        (
+            b"sys/kernel/hung_task_timeout_secs",
+            0o644,
+            120,
+            0,
+            HUNG_MAX,
+        ),
+        (b"sys/kernel/hung_task_warnings", 0o644, 10, -1, INT_MAX),
+        // Writing also needs CAP_SYS_ADMIN (proc_dointvec_minmax_sysadmin)
+        (b"sys/kernel/kptr_restrict", 0o644, 0, 0, 2),
+        // Only the change from 0 to 1 can be written
+        (b"sys/kernel/modules_disabled", 0o644, 0, 1, 1),
+        (b"sys/kernel/overflowgid", 0o644, 65534, 0, 65535),
+        (b"sys/kernel/overflowuid", 0o644, 65534, 0, 65535),
+        (b"sys/kernel/panic_on_oops", 0o644, 0, INT_MIN, INT_MAX),
+        (b"sys/kernel/perf_cpu_time_max_percent", 0o644, 25, 0, 100),
+        (
+            b"sys/kernel/perf_event_max_contexts_per_stack",
+            0o644,
+            8,
+            0,
+            65535,
+        ),
+        (
+            b"sys/kernel/perf_event_max_sample_rate",
+            0o644,
+            100000,
+            1,
+            INT_MAX,
+        ),
+        (
+            b"sys/kernel/perf_event_max_stack",
+            0o644,
+            127,
+            0,
+            640 * 1024,
+        ),
+        (
+            b"sys/kernel/perf_event_mlock_kb",
+            0o644,
+            516,
+            INT_MIN,
+            INT_MAX,
+        ),
+        (
+            b"sys/kernel/perf_event_paranoid",
+            0o644,
+            2,
+            INT_MIN,
+            INT_MAX,
+        ),
+        (b"sys/kernel/randomize_va_space", 0o644, 0, INT_MIN, INT_MAX),
+        (b"sys/kernel/sched_rt_period_us", 0o644, 1000000, 1, INT_MAX),
+        (
+            b"sys/kernel/sched_rt_runtime_us",
+            0o644,
+            950000,
+            -1,
+            INT_MAX,
+        ),
+        (b"sys/kernel/sched_schedstats", 0o644, 0, 0, 1),
+        (b"sys/kernel/sysrq", 0o644, 1, INT_MIN, INT_MAX),
+        (b"sys/vm/dirty_background_bytes", 0o644, 0, 1, i64::MAX),
+        (b"sys/vm/dirty_background_ratio", 0o644, 10, 0, 100),
+        (b"sys/vm/dirty_bytes", 0o644, 0, 8192, i64::MAX),
+        (b"sys/vm/dirty_expire_centisecs", 0o644, 3000, 0, INT_MAX),
+        (b"sys/vm/dirty_ratio", 0o644, 20, 0, 100),
+        (
+            b"sys/vm/dirty_writeback_centisecs",
+            0o644,
+            500,
+            INT_MIN,
+            INT_MAX,
+        ),
+        // Write-only; nothing to drop, as the host keeps the page cache
+        (b"sys/vm/drop_caches", 0o200, 0, 1, 4),
+        (b"sys/vm/mmap_rnd_bits", 0o600, 18, 18, 33),
+        (b"sys/vm/mmap_rnd_compat_bits", 0o600, 11, 11, 16),
+        (b"sys/vm/overcommit_ratio", 0o644, 50, INT_MIN, INT_MAX),
+        (b"sys/vm/page-cluster", 0o644, 3, 0, 31),
+        (b"sys/vm/swappiness", 0o644, 60, 0, 200),
+        (b"sys/vm/watermark_scale_factor", 0o644, 10, 1, 3000),
+    ]
+};
+
+/// The [`RECORDED`] entry of a path.
+fn recorded(path: &[u8]) -> Option<&'static (&'static [u8], u32, i64, i64, i64)> {
+    RECORDED.iter().find(|e| e.0 == path)
+}
 
 /// The fixed directories and files under `/sys` (paths relative to `/sys`, directories ending in
 /// `/`). CPU topology: busybox's `nproc --all`, lscpu and glibc's get_nprocs read them, and each
@@ -1469,6 +1628,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         (_, PseudoNode::NetSysctl(path)) => {
             u32::from(crate::netconf::sysctl(path.as_bytes(), true).map_or(0o444, |e| e.2))
         }
+        (_, PseudoNode::Static(p)) if recorded(p).is_some() => recorded(p).map_or(0o444, |e| e.1),
         (_, n) if writable(n) => 0o644,
         (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
         (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
@@ -1857,8 +2017,12 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/net/ipv4/ip_local_port_range"
                     | b"sys/net/ipv4/ip_unprivileged_port_start"
                     | b"sys/net/ipv4/ping_group_range"
+                    | b"sys/kernel/tainted"
+                    | b"sys/kernel/modprobe"
+                    | b"sys/vm/overcommit_memory"
             )
-    ) || matches!(node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"))
+    ) || matches!(node, PseudoNode::Static(p)
+        if p.starts_with(b"sys/user/max_") || recorded(p).is_some())
 }
 
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
@@ -1866,6 +2030,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
 pub(crate) fn unreadable(node: &PseudoNode) -> bool {
     matches!(node, PseudoNode::Cgroup(_, name)
         if crate::cgroup::file_mode(name).is_some_and(|m| m & 0o444 == 0))
+        || matches!(node, PseudoNode::Static(b"sys/vm/drop_caches"))
 }
 
 /// The contents generated when a procfs file is opened.
@@ -2015,7 +2180,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             b"sysvipc/msg" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"msg", &ps.reader()),
             b"sysvipc/sem" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"sem", &ps.reader()),
             b"sysvipc/shm" => ipc::proc_listing(ps.k, ps.ns().ipc.id, b"shm", &ps.reader()),
-            b"sys/kernel/tainted" => "0\n".to_owned(),
+            b"sys/kernel/tainted" => format!("{}\n", ps.k.tainted),
+            b"sys/kernel/modprobe" => format!("{}\n", String::from_utf8_lossy(&ps.k.modprobe)),
+            // Write-only (reading is EINVAL, `unreadable`)
+            b"sys/vm/drop_caches" => String::new(),
             b"sys/kernel/threads-max" => format!("{}\n", ps.k.threads_max),
             b"sys/vm/max_map_count" => {
                 format!(
@@ -2029,19 +2197,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     crate::mm::MMAP_MIN_ADDR.load(std::sync::atomic::Ordering::Relaxed)
                 )
             }
-            b"sys/vm/overcommit_ratio" => "50\n".to_owned(),
             b"sys/kernel/ngroups_max" => "65536\n".to_owned(),
             b"sys/kernel/ns_last_pid" => format!("{}\n", ps.last_pid()),
             b"sys/kernel/seccomp/actions_avail" => crate::seccomp::actions_avail(),
             b"sys/kernel/seccomp/actions_logged" => crate::seccomp::actions_logged(ps.k),
             b"sys/kernel/osrelease" => "6.1.0-appine\n".to_owned(),
             b"sys/kernel/ostype" => "Linux\n".to_owned(),
-            // The ID unmapped user and group IDs are shown as (Linux's default; bubblewrap reads
-            // it at startup). Cannot be changed
-            b"sys/kernel/overflowuid"
-            | b"sys/kernel/overflowgid"
-            | b"sys/fs/overflowuid"
-            | b"sys/fs/overflowgid" => "65534\n".to_owned(),
             b"sys/kernel/pid_max" => "4194304\n".to_owned(),
             b"sys/kernel/dmesg_restrict" => format!("{}\n", ps.k.dmesg_restrict as u8),
             b"sys/kernel/panic" => format!("{}\n", ps.k.panic),
@@ -2068,7 +2229,18 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             b"sys/kernel/random/uuid" => format!("{}\n", random_uuid()),
             b"sys/kernel/version" => "#1 SMP PREEMPT appine\n".to_owned(),
-            b"sys/vm/overcommit_memory" => "0\n".to_owned(),
+            b"sys/vm/overcommit_memory" => {
+                format!(
+                    "{}\n",
+                    crate::mm::OVERCOMMIT_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+                )
+            }
+            // The ID unmapped user and group IDs are shown as (Linux's default, 65534; bubblewrap
+            // reads it at startup) and the other recorded sysctls
+            p if recorded(p).is_some() => {
+                let (path, _, default, ..) = *recorded(p).unwrap();
+                format!("{}\n", ps.k.sysctls.get(path).copied().unwrap_or(default))
+            }
             _ => return Err(Errno::EISDIR),
         },
         Entry(pid, tid, e) => {
@@ -3797,6 +3969,39 @@ pub(crate) fn write(
         }
         PseudoNode::Static(b"sys/fs/protected_symlinks") => {
             k.protected_symlinks = int_in(0..=1)? == 1
+        }
+        // overcommit_policy_handler: 0 to 2; 1 turns off fork's commit check (crate::mm)
+        PseudoNode::Static(b"sys/vm/overcommit_memory") => {
+            let v = int_in(0..=2)? as u8;
+            crate::mm::OVERCOMMIT_MEMORY.store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+        // proc_taint: needs CAP_SYS_ADMIN, and the flags written (of the 19 defined) are added
+        // to those already set, never cleared
+        PseudoNode::Static(b"sys/kernel/tainted") => {
+            if !cred.capable(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            let v: u64 = std::str::from_utf8(data)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or(Errno::EINVAL)?;
+            k.tainted |= v & ((1 << 19) - 1);
+        }
+        // proc_dostring: up to a newline, cut to KMOD_PATH_LEN - 1 bytes
+        PseudoNode::Static(b"sys/kernel/modprobe") => {
+            let end = data
+                .iter()
+                .position(|&b| b == b'\n' || b == 0)
+                .unwrap_or(data.len());
+            k.modprobe = data[..end.min(255)].to_vec();
+        }
+        PseudoNode::Static(p) if recorded(p).is_some() => {
+            let (path, _, _, lo, hi) = *recorded(p).unwrap();
+            if path == b"sys/kernel/kptr_restrict" && !cred.capable(cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            let v = int_in(lo..=hi)?;
+            k.sysctls.insert(path, v);
         }
         PseudoNode::Static(b"sys/fs/protected_hardlinks") => {
             k.protected_hardlinks = int_in(0..=1)? == 1;

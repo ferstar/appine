@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`)
 
 ## Responsibilities
 
@@ -345,9 +345,10 @@ signals may still be delivered).
 
 ### fork and copy-on-write
 
-- The caller quiesces the parent, then `fork` checks commit (`commit_too_big`: counts private
-  writable non-`MAP_NORESERVE` VMAs the child gets, by guest prot, merging adjacent ones the way
-  Linux `vma_merge` would; `ENOMEM` when one exceeds RAM plus swap; a limit of 0 disables it).
+- The caller quiesces the parent, then `fork` checks commit unless `vm.overcommit_memory` is 1
+  (`commit_too_big`: counts private writable non-`MAP_NORESERVE` VMAs the child gets, by guest
+  prot, merging adjacent ones the way Linux `vma_merge` would; `ENOMEM` when one exceeds RAM plus
+  swap; a limit of 0 disables it; mode 2's strict accounting is not emulated).
   `fork` cannot fail after lending starts.
 - Each child VMA with contents of its own gets a new `anon` identity, shared by the pieces of one
   Linux VMA (Linux's `anon_vma_fork`), so it no longer joins its neighbours while the parent's

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls)
 
 ## Responsibilities
 
@@ -82,8 +82,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Inode numbers hash the node (low bit set); roots are 1; nodes under a pid mix in the thread
   group's serial, so a reused pid gets new inodes; nsfs files use the namespace id. Inodes are
   stable within one run, not across runs.
-- Modes: directories 0555 (0755 on sysfs and cgroup), symlinks 0777, `mem` 0600, writable files
-  0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are 0555,
+- Modes: directories 0555 (0755 on sysfs and cgroup), symlinks 0777, `mem` 0600, recorded
+  sysctls Linux's (`vm.drop_caches` 0200, `vm.mmap_rnd_bits` 0600), other writable files 0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are 0555,
   `environ` 0444, `comm` and `projid_map` read-only); cgroup files use their own table modes,
   `NetSysctl` files theirs, devpts nodes the terminal's mode and `ptmxmode`. Owners: per-process
   entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the process's
@@ -163,8 +163,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   list; `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
   `self`.
 - Absent: `swaps`, `partitions`, `devices`, `locks`, `sys/fs/file-nr`,
-  `protected_regular`/`protected_fifos`, `kptr_restrict`, `perf_event_paranoid`, Yama,
-  `vm.swappiness`.
+  `protected_regular`/`protected_fifos`, Yama.
 - Sysctl scoping: SysV IPC limits and `fs/mqueue/*` per the writer's IPC namespace; `hostname`/
   `domainname` per UTS namespace (one trailing newline stripped, over 64 bytes `EINVAL`);
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
@@ -177,9 +176,18 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Several writable sysctls are recorded without effect (`kernel.panic`, `user.max_*`, every
   `NetSysctl` entry, `ping_group_range`, `somaxconn`, `ip_local_port_range`; of the port sysctls
   only `ip_unprivileged_port_start` is used, by bind); `kernel/pid_max` accepts writes and ignores
-  them. Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`,
-  `pid_max` 4194304, `overcommit_*`, `overflowuid`/`gid`; `random/uuid` is fresh per read,
-  `boot_id` fixed per boot, the entropy values 256.
+  them. The `RECORDED` table adds 40 more with Linux 6.1's modes, defaults and accepted ranges
+  (`overflowuid`/`gid`, `vm.dirty_*`, `drop_caches`, `swappiness`, `overcommit_ratio`,
+  `page-cluster`, `watermark_scale_factor`, `mmap_rnd_*bits`, `kernel.sysrq`,
+  `randomize_va_space` (default 0: nothing is randomized), `kptr_restrict` (writes need
+  `CAP_SYS_ADMIN`), `perf_*`, `hung_task_*`, `sched_rt_*`, `sched_schedstats`, `panic_on_oops`,
+  `core_pipe_limit`, `modules_disabled` (only 1 can be written), `fs.suid_dumpable`,
+  `debug.exception-trace`), kept kernel-wide in `Kernel::sysctls`; `drop_caches` is write-only
+  (reads `EINVAL`). `kernel.modprobe` keeps a string, `kernel.tainted` only gains flags (of the 19
+  defined; writes need `CAP_SYS_ADMIN`), and `vm.overcommit_memory` (0 to 2) is used: 1 turns off
+  fork's commit check (`kernel/mm`). Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`,
+  `pid_max` 4194304; `random/uuid` is fresh per read, `boot_id` fixed per boot, the entropy values
+  256.
 - Write permission is plain DAC against root-owned files (0644 when writable) with no
   per-namespace grants, so `CAP_DAC_OVERRIDE` counts only where root is mapped in the writer's
   user namespace, and `user/max_*` is one kernel-wide table (Linux 6.1 keeps it per user
@@ -395,18 +403,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access; `user.*` likewise
   keys on `CAP_SYS_RESOURCE`), so network daemons that drop root but keep `CAP_NET_ADMIN` get
   `EACCES`.
-- **Some sysctls are read-only even for root:** `kernel.tainted`, `kernel.overflowuid`/`overflowgid`
-  and `vm.overcommit_memory` are 0444 and opening them for writing is `EACCES`, where Linux 6.1 has
-  them 0644 (`tainted` writes needing `CAP_SYS_ADMIN`), so `sysctl -w vm.overcommit_memory=1` in
-  setup scripts (Redis images, kubelet's kernel tunables) fails.
-- **Many common sysctls are missing:** besides those listed as absent above, `vm.drop_caches`,
-  `vm.dirty_*`, `vm.page-cluster`, `vm.watermark_scale_factor`, `vm.mmap_rnd_bits`/
-  `mmap_rnd_compat_bits`, `kernel.randomize_va_space`, `kernel.sysrq`, `kernel.panic_on_oops`,
-  `kernel.modprobe`, `kernel.modules_disabled`, `kernel.core_pipe_limit`, `kernel.hung_task_*`,
-  `kernel.sched_rt_*`, `kernel.sched_schedstats`, the other `kernel.perf_*` files,
-  `fs.suid_dumpable` and `debug.exception-trace` are `ENOENT`, so `sysctl -p` setups, benchmark
-  scripts writing `drop_caches`, kubelet setting `panic_on_oops` and checkers reading
-  `randomize_va_space` fail or report errors.
 - **`/proc/vmstat`, `/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** procps
   `vmstat`, memory monitors and low-memory daemons (systemd-oomd and oomd need PSI's
   `/proc/pressure/memory` and its poll triggers) and symbol lookups (perf, bpftrace) find nothing.

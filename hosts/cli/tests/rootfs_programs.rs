@@ -335,6 +335,33 @@ fn kernel_log_is_empty_and_keeps_console_levels() {
 }
 
 #[test]
+fn recorded_sysctls_keep_what_is_written() {
+    // Sysctls appine only records take what Linux 6.1's handlers take and read it back:
+    // swappiness 0 to 200, drop_caches write-only, overcommit_memory 0 to 2, tainted only adds
+    // flags (of the 19 defined), modules_disabled only goes to 1, modprobe a string;
+    // randomize_va_space starts at 0, as nothing is randomized
+    let script = "cd /proc/sys; \
+        stat -c '%a %n' vm/drop_caches vm/mmap_rnd_bits kernel/tainted vm/overcommit_memory; \
+        cat vm/swappiness kernel/overflowuid kernel/modprobe kernel/randomize_va_space; \
+        echo 10 > vm/swappiness; echo 300 > vm/swappiness 2>/dev/null || echo rejected; \
+        cat vm/swappiness; echo 3 > vm/drop_caches; cat vm/drop_caches 2>/dev/null || echo unread; \
+        echo 1 > vm/overcommit_memory; cat vm/overcommit_memory; echo 0 > vm/overcommit_memory; \
+        echo 2101249 > kernel/tainted; echo 1 > kernel/tainted; cat kernel/tainted; \
+        echo 0 > kernel/modules_disabled 2>/dev/null || echo rejected; \
+        echo /bin/true > kernel/modprobe; sysctl -n kernel.modprobe";
+    for (tier, out) in run(&["/bin/sh", "-c", script]) {
+        assert_eq!(
+            stdout(&out),
+            "200 vm/drop_caches\n600 vm/mmap_rnd_bits\n644 kernel/tainted\n\
+             644 vm/overcommit_memory\n60\n65534\n/sbin/modprobe\n0\nrejected\n10\nunread\n1\n\
+             4097\nrejected\n/bin/true\n",
+            "tier {tier}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn kmsg_records_reach_dmesg() {
     // Records written to /dev/kmsg can be read by dmesg (busybox's dmesg uses syslog(2)'s
     // read-all), and one without a trailing newline only once the next one arrives;

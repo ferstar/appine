@@ -307,6 +307,14 @@ pub(crate) struct Kernel {
     /// The written `/proc/sys/user/max_*_namespaces` values (by name; only recorded, not actually
     /// enforced).
     pub max_namespaces: BTreeMap<Vec<u8>, u64>,
+    /// The written values of the sysctls procfs only records (`crate::pseudo::RECORDED`, by path);
+    /// a missing one still has its default.
+    pub sysctls: BTreeMap<&'static [u8], i64>,
+    /// `/proc/sys/kernel/modprobe` (only recorded: there are no modules).
+    pub modprobe: Vec<u8>,
+    /// `/proc/sys/kernel/tainted`: the taint flags written by privileged processes (appine itself
+    /// taints nothing).
+    pub tainted: u64,
     /// All inotify watches. Open files must report `IN_CLOSE_*` when destroyed, so it is shared
     /// through Rc.
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
@@ -402,6 +410,9 @@ impl Kernel {
             aio_nr: 0,
             aio_max_nr: 65536,
             max_namespaces: BTreeMap::new(),
+            sysctls: BTreeMap::new(),
+            modprobe: b"/sbin/modprobe".to_vec(),
+            tainted: 0,
             inotify: Rc::default(),
             file_maps: Default::default(),
         }

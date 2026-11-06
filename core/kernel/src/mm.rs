@@ -41,7 +41,7 @@ use std::mem::ManuallyDrop;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use appine_engine::{MapError, Mmu, PAGE_SIZE, VA_BITS, prot};
@@ -79,6 +79,9 @@ const MAX_GAP: u64 = STACK_TOP / 6 * 5;
 /// `CAP_SYS_RAWIO` (checked by the syscalls), and addresses the kernel picks, mmap hints and stack
 /// growth stay above it. 32768 as in the arm64 kernels of distributions and Android's GKI.
 pub(crate) static MMAP_MIN_ADDR: AtomicU64 = AtomicU64::new(32768);
+/// `/proc/sys/vm/overcommit_memory`: 1 (always overcommit) turns off fork's commit check
+/// ([`Mm::commit_too_big`]); 0 and 2 keep it (2's strict accounting is not emulated).
+pub(crate) static OVERCOMMIT_MEMORY: AtomicU8 = AtomicU8::new(0);
 
 /// The lowest address the kernel maps on its own or a stack grows to: [`MMAP_MIN_ADDR`] rounded
 /// up to a page, and at least one page (Linux's get_unmapped_area).
@@ -2330,7 +2333,9 @@ impl Mm {
     /// host memory with the child. The caller first stops the other threads of the same address
     /// space outside guest code ([`Mm::quiesce`]).
     pub fn fork(&mut self) -> Result<Rc<RefCell<Mm>>, Errno> {
-        if self.commit_too_big(appine_hal::ram_and_swap()) {
+        if OVERCOMMIT_MEMORY.load(Ordering::Relaxed) != 1
+            && self.commit_too_big(appine_hal::ram_and_swap())
+        {
             return Err(Errno::ENOMEM);
         }
         let shared = Mm::new().into_shared();
