@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: boot cleanup no longer hands its own numbers to the reaper, removed that bug; browse writes refuse the root directory as `top`)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners)
 
 ## Responsibilities
 
@@ -106,8 +106,9 @@ provider and rootfs installation UI (`android`).
   the highest surviving row (and numbers of rolled-back inserts) are reused.
 - tmpfs trees are detached directories (their own parent) recorded in `detached_roots`; their files
   are ordinary objects.
-- `create_anonymous` (memfd) creates an nlink-0 row owned by root and an object that is unlinked at
-  once, so only the returned fd holds the data.
+- `create_anonymous` (memfd) creates an nlink-0 row owned by the given ids (`memfd_create` passes
+  the caller's fsuid and fsgid) and an object that is unlinked at once, so only the returned fd
+  holds the data.
 
 ### Transactions and deferred commits
 
@@ -263,8 +264,6 @@ provider and rootfs installation UI (`android`).
   `CAP_DAC_READ_SEARCH` for `AT_EMPTY_PATH`, which is not checked); with `protected_hardlinks=0`
   even reaped files and memfds link into dangling names. `/proc/self/fd/N` links of unlinked files
   fail with `EXDEV` instead of `ENOENT`.
-- **memfds are owned by root:** `create_anonymous` hard-codes uid/gid 0 and `memfd_create` never sets
-  the caller as owner, so `fstat` shows root and a non-root creator's `fchmod` fails with `EPERM`.
 - **Storage leaks:** objects created inside a rolled-back savepoint (e.g. a failed import) are
   dropped from the uncommitted range by the next commit and stay on disk until their number is
   reused by a regular file (forever if reused by another kind); the shared `lock` header is not

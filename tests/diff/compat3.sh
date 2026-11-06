@@ -1,6 +1,6 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
-# taking a controlling terminal; kill with a thread id
+# taking a controlling terminal; kill with a thread id; memfd owners
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -476,3 +476,42 @@ int main(void)
 C
 gcc -O1 -pthread -o killtid killtid.c && ./killtid
 rm -f killtid killtid.c
+
+# A memfd belongs to its creator's filesystem ids, so a non-root creator can fchmod it
+cat > memfdown.c <<'C'
+#define _GNU_SOURCE
+#include <grp.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void show(const char *who)
+{
+    int fd = memfd_create("x", 0);
+    struct stat st;
+    fstat(fd, &st);
+    printf("%s: owner %u:%u mode %o", who, st.st_uid, st.st_gid, st.st_mode & 07777);
+    int r = fchmod(fd, 0600);
+    fstat(fd, &st);
+    printf(", fchmod 0600 %d, mode %o\n", r, st.st_mode & 07777);
+    fflush(stdout);
+}
+
+int main(void)
+{
+    show("root");
+    if (fork() == 0) {
+        setgroups(0, NULL);
+        setresgid(1001, 1001, 1001);
+        setresuid(1000, 1000, 1000);
+        show("user 1000:1001");
+        _exit(0);
+    }
+    wait(NULL);
+    return 0;
+}
+C
+gcc -O1 -o memfdown memfdown.c && ./memfdown
+rm -f memfdown memfdown.c

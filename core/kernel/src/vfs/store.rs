@@ -875,10 +875,10 @@ impl Store {
 
     /// Creates a regular file without a name (memfd_create): its link count is 0 and its object is
     /// deleted from the start, so the data goes away once it is closed; the inode is cleaned up
-    /// the next time the store is opened.
-    pub fn create_anonymous(&self, perm: u32) -> Result<(Ino, File), Errno> {
+    /// the next time the store is opened. The owner is the creator's (filesystem) ids.
+    pub fn create_anonymous(&self, perm: u32, uid: u32, gid: u32) -> Result<(Ino, File), Errno> {
         self.transaction(|s| {
-            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), 0, 0, 0, 0)?;
+            let ino = s.new_inode(mode::S_IFREG | (perm & 0o7777), uid, gid, 0, 0)?;
             let file = s.new_object(ino)?;
             s.remove_object(ino)?;
             Ok((ino, file))
@@ -2892,10 +2892,10 @@ mod tests {
         s.remove_xattr(f, b"user.b").unwrap();
         assert_eq!(s.remove_xattr(f, b"user.b"), Err(Errno::ENODATA));
 
-        let (anon, mut file) = s.create_anonymous(0o777).unwrap();
+        let (anon, mut file) = s.create_anonymous(0o777, 1000, 1001).unwrap();
         file.write_all(b"data").unwrap();
         let st = s.stat_open(anon, &file).unwrap();
-        assert_eq!((st.nlink, st.size), (0, 4));
+        assert_eq!((st.nlink, st.size, st.uid, st.gid), (0, 4, 1000, 1001));
         s.set_xattr(anon, b"user.x", b"1", false, false).unwrap();
         // The timer thread commits when it is due; without the commit, opening the store below
         // would wait until the timeout

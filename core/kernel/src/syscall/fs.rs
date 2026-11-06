@@ -1324,10 +1324,13 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
         }
     })?;
     let noexec = flags & MFD_NOEXEC_SEAL != 0;
-    let (ino, file) = cx
-        .vfs()?
-        .store()
-        .create_anonymous(if noexec { 0o666 } else { 0o777 })?;
+    // As shmem_get_inode with no directory: owned by the creator's filesystem ids
+    let cred = cx.cred();
+    let (ino, file) = cx.vfs()?.store().create_anonymous(
+        if noexec { 0o666 } else { 0o777 },
+        cred.fsuid,
+        cred.fsgid,
+    )?;
     let seals = match (flags & MFD_ALLOW_SEALING != 0, noexec) {
         (_, true) => F_SEAL_EXEC,
         (true, false) => 0,
