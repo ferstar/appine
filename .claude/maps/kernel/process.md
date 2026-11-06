@@ -441,7 +441,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   CPU state (a crash if it was unmapped), and a vfork parent waits forever for completion.
 - **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
   so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
-  for `__WCLONE` waiters.
+  for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-wait` case skips them).
 - **`CLONE_PARENT` children keep the requested `exit_signal`:** Linux uses the caller leader's; a
   `clone3(CLONE_PARENT)` child (exit signal 0) therefore never signals its real parent.
 - **POSIX timers aimed at a dead thread signal the process:** `SIGEV_THREAD_ID` timers whose thread

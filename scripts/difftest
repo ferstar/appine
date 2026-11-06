@@ -26,6 +26,10 @@
 # gzipped tar in base64 (neither side has the work tree, and the store stays as it is), so they
 # count towards the 128 KB limit.
 #
+# The starnix-* cases run Fuchsia Starnix's syscall tests (gtest programs), one process per test,
+# once scripts/build-starnix-tests has built them; without them they only print that they are
+# missing.
+#
 # Both sides' outputs are written to target/difftest/<name>.native and .appine and overwritten on
 # the next run; on a mismatch a copy is also saved as
 # target/difftest/failed/<time>-t<tier>-<name>.*, which can still be inspected after a rerun.
@@ -121,6 +125,21 @@ if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
     echo "difftest: $store lacks some of: $packages" >&2
     echo "difftest: install them with apk add, or delete $store to create it again" >&2
     exit 1
+fi
+
+# Fuchsia Starnix's syscall tests, once built (scripts/build-starnix-tests): installed into the store
+# at /usr/lib/starnix-tests whenever the built version differs from the installed one, which also
+# exports the image again; the starnix-* cases run them
+starnix=$(ls target/starnix-tests/starnix-tests-*.tar 2>/dev/null | tail -n 1)
+if [ -n "$starnix" ]; then
+    want=$(tar xOf "$starnix" ./VERSION)
+    have=$(appine --rootfs "$store" -- /bin/cat /usr/lib/starnix-tests/VERSION 2>/dev/null || true)
+    if [ "$want" != "$have" ]; then
+        echo "installing $starnix into $store"
+        linux "$run --rootfs $store -- /bin/sh -c 'rm -rf /usr/lib/starnix-tests &&
+            mkdir -p /usr/lib/starnix-tests && tar xf - -C /usr/lib/starnix-tests' <$starnix"
+        rebuild=1
+    fi
 fi
 
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` at fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer; mremap with an old length of 0)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `MADV_WIPEONFORK`/`MADV_DONTFORK` at fork and mremap growth, madvise judging only overlapping VMAs; the OOM killer; mremap with an old length of 0; Starnix test gaps)
 
 ## Responsibilities
 
@@ -566,6 +566,21 @@ signals may still be delivered).
   and ties go to the lowest tgid (Linux 6.1 compares raw scores and lets a later equal one win). A
   victim that outlived its second is skipped only until another is recorded; picked again, it is
   only waited for, so the killer stalls another second without killing.
+- **Gaps found by Starnix's mmap tests** (the `starnix-mmap` differential case skips them, grouped
+  the same way):
+  - `MAP_GROWSDOWN`: an mmap hint inside a growsdown mapping's guard gap is taken; kernel accesses
+    below the mapping (a `write` from that memory, for example) fail instead of growing it; a read
+    below it after mprotect does not fault; VmStk is not kept.
+  - mprotect accepts `PROT_GROWSDOWN` on a mapping that does not grow down (Linux: `EINVAL`), and
+    when a later VMA refuses (`EACCES`) it changes nothing, where Linux has already changed the
+    earlier ones.
+  - Because VMAs never merge (D7), `/proc/<pid>/maps` shows pieces Linux would show as one, and
+    mremap with `MREMAP_FIXED` or `MREMAP_DONTUNMAP` accepts a range spanning several mappings,
+    which Linux before 6.17 refuses with `EFAULT`.
+  - smaps counts the Rss of `PROT_NONE` and copy-on-write pages differently around fork (a page
+    that holds data but is `PROT_NONE` reads 0 kB; a child's view counts lent pages of the whole
+    region).
+  - `/proc/<pid>/maps` prints a newline in a file name as is; Linux escapes it as `\012`.
 
 ## Open questions
 

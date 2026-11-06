@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files; Starnix's syscall tests)
 
 ## Responsibilities
 
@@ -16,15 +16,17 @@
 - the cargo integration tests that drive it (`guest_programs`, `rootfs_programs`,
   `bench_programs`) and the guest test programs (`tests/guest`);
 - the benchmark runner `appine-bench` (`tests/bench`);
-- the differential tests (`scripts/difftest`, `tests/diff`), the LTP build and runner
+- the differential tests (`scripts/difftest`, `tests/diff`), including Fuchsia Starnix's syscall
+  tests (`scripts/build-starnix-tests`, `tests/starnix`), the LTP build and runner
   (`scripts/build-ltp`, `scripts/ltp`), the workload survey (`scripts/survey`, `tests/survey`) and
   the power-loss test (`tests/crash`);
 - the development container (`scripts/dev`, `scripts/dev.Dockerfile`) and CI
   (`.github/workflows/ci.yml`).
 
 Root: `hosts/cli/`, `tests/guest/`, `tests/bench/`, `tests/diff/`, `tests/survey/`,
-`tests/crash/`, `scripts/dev`, `scripts/dev.Dockerfile`, `scripts/difftest`, `scripts/build-ltp`,
-`scripts/ltp`, `scripts/survey`, `.github/workflows/`.
+`tests/crash/`, `tests/starnix/`, `scripts/dev`, `scripts/dev.Dockerfile`, `scripts/difftest`,
+`scripts/build-ltp`, `scripts/ltp`, `scripts/build-starnix-tests`, `scripts/survey`,
+`.github/workflows/`.
 
 Outside the module: the instruction-level lockstep tests (`engine`); unit tests inside each crate;
 the kernel's `run`, boot and console bridge (`kernel/process`, `kernel/tty`); bug reporting and
@@ -56,7 +58,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - `cargo test --workspace` (the three integration test files build only on aarch64 Linux).
 - `appine-bench [--runs N] [--quick] [--skip-tier0] [--only NAME] [--stats]`.
 - `scripts/dev <command>`; `scripts/difftest [-t tier] [-r] [-s store] [-j n] [case…]`;
-  `scripts/build-ltp`; `scripts/ltp [-a] [-j n] [-t tier] [regex]`;
+  `scripts/build-ltp`; `scripts/ltp [-a] [-j n] [-t tier] [regex]`; `scripts/build-starnix-tests`;
   `scripts/survey [-t tier] [-s store] [-n image] [names…]`;
   `tests/crash/crash.sh <appine|native> <power|kill> [runs] [bin]` (as root in the VM).
 - CI on every push and pull request.
@@ -127,6 +129,25 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - A case name without `tests/diff/<name>.sh` is a failure, and so is every requested case that no
   lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
   from another directory works.
+
+### Starnix's syscall tests
+
+- `build-starnix-tests` fetches a pinned Fuchsia commit (a sparse checkout of
+  `src/starnix/tests/syscalls/cpp` and the small libraries it uses: fit, stdcompat, fbl's
+  `unique_fd`, files, fxl strings, utf-utils) and a pinned googletest (sha256), and in `alpine:3.24`
+  builds every `*_test.cc` with clang, statically against musl, stripped, into
+  `target/starnix-tests/starnix-tests-<commit>.tar` (`bin/`, `BUILT.txt`, `SKIPPED.txt` with each
+  failure's first error, `VERSION`, both licences). The sources are used unchanged;
+  `tests/starnix/compat` supplies glibc's `TEMP_FAILURE_RETRY` (forced include), a `<linux/prctl.h>`
+  that defers to musl's `<sys/prctl.h>`, and Android's copy of `<linux/bpf.h>`. At 86962cb, 81
+  tests build and 12 do not (glibc-only interfaces, Fuchsia-only devices).
+- difftest installs the newest tarball into its store at `/usr/lib/starnix-tests` whenever the
+  tarball's `VERSION` differs from the installed one, and then exports the image again.
+- The `starnix-*` cases list a binary's tests and run each in its own process under
+  `timeout 60` (a crash or hang does not take the rest with it), printing `<test> ok|failed|
+  skipped|exit <code>`, with core files off and the shell's crash reports filtered out. Tests that
+  differ from Linux are skipped through a negative gtest filter, grouped by reason, each group a
+  bug item in a kernel map. Without the tarball the cases print that it is missing and pass.
 
 ### LTP
 
@@ -237,6 +258,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
   `apk add` leaves a store the next run uses as is.
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
+- **The `starnix-*` cases pass vacuously without the built tests:** CI does not build them
+  (`build-starnix-tests` needs the network and about four minutes), so there they only print that
+  the tests are missing.
 - **compat2's "after the thread exits" check races:** it tests whether `/proc/<tid>` of a
   non-leader thread still exists right after Python's `join()`, which returns before the kernel has necessarily
   reaped the thread; native usually prints True, and appine printed False once in a full parallel
@@ -247,6 +271,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
 - Is native macOS a supported host for `appine-run` itself?
 - Should partial LTP runs merge into `results.txt` as the durations do?
+- Should CI build Starnix's tests (with a cache keyed by the pinned commit) so the `starnix-*`
+  cases run there, and which of the other 79 built test programs should get cases next?
 
 ## To verify
 
