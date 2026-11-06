@@ -375,7 +375,8 @@ const STATIC: [&[u8]; 90] = [
 /// `/`). CPU topology: busybox's `nproc --all`, lscpu and glibc's get_nprocs read them, and each
 /// `cpu<n>` is a [`PseudoNode::SysCpu`]; network interfaces (btop reads the traffic counters),
 /// each interface a [`PseudoNode::SysNet`].
-const SYS_STATIC: [&[u8]; 11] = [
+const SYS_STATIC: [&[u8]; 12] = [
+    b"block/",
     b"class/",
     b"class/net/",
     b"devices/",
@@ -391,6 +392,38 @@ const SYS_STATIC: [&[u8]; 11] = [
 
 /// `/sys/class/net`: the interfaces are under it.
 const SYS_NET_DIR: &[u8] = b"class/net/";
+
+/// `/sys/block`: the loop devices are under it.
+const SYS_BLOCK_DIR: &[u8] = b"block/";
+
+/// The directories and files under `/sys/block/loop<n>` (paths relative to the device directory),
+/// with values from [`crate::syscall::Loops::sysfs_read`]; `loop/` exists only while the device is
+/// bound. On Linux the device directories are symlinks into `/sys/devices/virtual/block`; here
+/// they are directories, as for `/sys/class/net`.
+const BLOCK_FILES: [&[u8]; 22] = [
+    b"dev",
+    b"removable",
+    b"ro",
+    b"size",
+    b"loop/",
+    b"loop/autoclear",
+    b"loop/backing_file",
+    b"loop/dio",
+    b"loop/offset",
+    b"loop/partscan",
+    b"loop/sizelimit",
+    b"queue/",
+    b"queue/dma_alignment",
+    b"queue/hw_sector_size",
+    b"queue/logical_block_size",
+    b"queue/max_sectors_kb",
+    b"queue/minimum_io_size",
+    b"queue/optimal_io_size",
+    b"queue/physical_block_size",
+    b"queue/read_ahead_kb",
+    b"queue/rotational",
+    b"queue/rq_affinity",
+];
 
 /// The directories and files under `/sys/class/net/<interface>` (paths relative to the interface
 /// directory), with values from [`net_file`]. On Linux the interface directories are symlinks into
@@ -612,6 +645,9 @@ pub(crate) enum PseudoNode {
     /// `/sys/class/net/<bridge>/brif/<port>`: a link to `../../<port>/brport` (the interface
     /// indexes of the bridge and the port).
     SysBrif(u32, u32),
+    /// `/sys/block/loop<n>` (empty path), or a directory or file under it (paths from
+    /// [`BLOCK_FILES`]).
+    SysBlock(u32, &'static [u8]),
     /// A cgroup directory (empty name), or a file in it (names from [`crate::cgroup::FILES`]): the
     /// cgroup id and the file name.
     Cgroup(u64, &'static [u8]),
@@ -869,6 +905,10 @@ impl Pseudo for View<'_> {
                 .or_else(|| tree_parent(&PORT_FILES, path))
                 .map_or(SysNet(*n, b""), |p| SysNet(*n, p)),
             SysBrif(n, _) => SysNet(*n, b"brif/"),
+            SysBlock(_, b"") => Sys(SYS_BLOCK_DIR),
+            SysBlock(n, path) => {
+                tree_parent(&BLOCK_FILES, path).map_or(SysBlock(*n, b""), |p| SysBlock(*n, p))
+            }
             Cgroup(id, _) => Cgroup(*id, b""),
             NetConf(v6, _, b"") => Static(if *v6 { NET_CONF6 } else { NET_CONF4 }),
             NetSysctl(path) => {
@@ -919,6 +959,8 @@ impl Pseudo for View<'_> {
             NetConf(_, _, name) => name.to_vec(),
             NetSysctl(path) => tree_name(path.as_bytes()).to_vec(),
             SysNet(_, path) => tree_name(path).to_vec(),
+            SysBlock(n, b"") => format!("loop{n}").into_bytes(),
+            SysBlock(_, path) => tree_name(path).to_vec(),
             SysBrif(_, p) => self
                 .interface(*p)
                 .map_or_else(|| p.to_string(), |i| i.name)
@@ -1015,6 +1057,15 @@ impl Pseudo for View<'_> {
                         .find(|i| i.name.as_bytes() == name)
                         .map(|i| SysNet(i.index, b""));
                 }
+                if *path == SYS_BLOCK_DIR {
+                    let n = name.strip_prefix(b"loop").and_then(parse_num)?;
+                    let n = u32::try_from(n).ok()?;
+                    return self
+                        .k
+                        .loops
+                        .sysfs_exists(n, b"")
+                        .then_some(SysBlock(n, b""));
+                }
                 let n = name.strip_prefix(b"cpu").and_then(parse_num)?;
                 let n = u32::try_from(n).ok().filter(|&n| (n as usize) < cpus())?;
                 (*path == SYS_CPU_DIR).then_some(SysCpu(n, b""))
@@ -1038,6 +1089,9 @@ impl Pseudo for View<'_> {
                 .into_iter()
                 .find(|v| v.master == Some(*n) && v.name == name)
                 .map(|v| SysBrif(*n, v.index)),
+            SysBlock(n, path) => tree_lookup(&BLOCK_FILES, path, name)
+                .filter(|p| self.k.loops.sysfs_exists(*n, p))
+                .map(|p| SysBlock(*n, p)),
             SysNet(n, path) => tree_lookup(&NET_FILES, path, name)
                 .filter(|_| self.interface(*n).is_some())
                 .or_else(|| {
@@ -1088,7 +1142,9 @@ impl Pseudo for View<'_> {
             PtsRoot(_) | ProcRoot | Pid(..) | SysRoot | MqRoot(_) => mode::S_IFDIR,
             Mq(..) => mode::S_IFREG,
             Static(p) | Sys(p) if p.ends_with(b"/") => mode::S_IFDIR,
-            SysCpu(_, p) | SysNet(_, p) if p.is_empty() || p.ends_with(b"/") => mode::S_IFDIR,
+            SysCpu(_, p) | SysNet(_, p) | SysBlock(_, p) if p.is_empty() || p.ends_with(b"/") => {
+                mode::S_IFDIR
+            }
             Cgroup(_, b"") => mode::S_IFDIR,
             NetSysctl(_) => mode::S_IFREG,
             NetConf(_, dir, name) => {
@@ -1471,7 +1527,8 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         | PseudoNode::Sys(_)
         | PseudoNode::SysCpu(..)
         | PseudoNode::SysNet(..)
-        | PseudoNode::SysBrif(..) => Fs::Sys,
+        | PseudoNode::SysBrif(..)
+        | PseudoNode::SysBlock(..) => Fs::Sys,
         PseudoNode::Cgroup(..) => Fs::Cgroup,
         PseudoNode::NsFile(..) => Fs::Nsfs,
         PseudoNode::MqRoot(_) | PseudoNode::Mq(..) => Fs::Mqueue,
@@ -1592,7 +1649,15 @@ pub(crate) fn readdir(
                         .map(|i| SysNet(i.index, b"")),
                 );
             }
+            if *path == SYS_BLOCK_DIR {
+                nodes.extend(ps.k.loops.numbers().into_iter().map(|n| SysBlock(n, b"")));
+            }
         }
+        SysBlock(n, path) => nodes.extend(
+            tree_children(&BLOCK_FILES, path)
+                .filter(|p| ps.k.loops.sysfs_exists(*n, p))
+                .map(|p| SysBlock(*n, p)),
+        ),
         SysNet(n, b"brif/") => nodes.extend(
             crate::netdev::views(&ps.ns().net)
                 .into_iter()
@@ -2105,6 +2170,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,
         SysNet(n, path) => net_file(ps.k, &ps.ns().net, *n, path)?,
+        SysBlock(n, path) => ps.k.loops.sysfs_read(*n, path).ok_or(Errno::EISDIR)?,
         NetConf(v6, dir, name) => {
             crate::netdev::conf_read(&ps.ns().net, *v6, *dir, name)?
         }

@@ -206,6 +206,8 @@ pub(crate) struct Kernel {
     pub unix_inflight: Vec<Weak<RefCell<crate::unix::Channel>>>,
     /// Named pipes (FIFOs) currently open: all opens of one inode share one pipe object.
     pub fifos: BTreeMap<Ino, Weak<RefCell<crate::pipe::Pipe>>>,
+    /// The loop devices (`syscall::loopdev`).
+    pub loops: crate::syscall::Loops,
     /// memfd seals (F_ADD_SEALS), keyed by inode; files not in here cannot be sealed.
     pub seals: BTreeMap<Ino, u32>,
     /// `/proc/sys/kernel/core_pattern`, `core_uses_pid` (`crate::coredump`).
@@ -354,6 +356,7 @@ impl Kernel {
             unix: Default::default(),
             unix_inflight: Vec::new(),
             fifos: BTreeMap::new(),
+            loops: crate::syscall::Loops::new(),
             seals: BTreeMap::new(),
             core_pattern: b"core".to_vec(),
             core_uses_pid: false,

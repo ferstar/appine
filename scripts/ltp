@@ -49,11 +49,15 @@ if [ "${1:-}" = --one ]; then
     # 20 times, system calls that always fail (the bpf ones) would be retried for 33 seconds. Race
     # tests that run for a set duration (inotify09, timerfd_settime02 and so on, fuzzy sync) run
     # only a tenth of it: they look for races in Linux itself, and one alone used to take 1–2
-    # minutes
+    # minutes. Tests that need a device get a loop device over a file in /tmp, as on Linux;
+    # appine has no disk filesystems, so the device's filesystem is tmpfs (LTP then skips mkfs
+    # and mounts a tmpfs instead, as Starnix runs LTP), and tests that need a particular one
+    # report TCONF
     timeout 900 "$run" --tier "$tier" --rootfs "$store" \
         --env PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         --env LTPROOT=/opt/ltp --env TMPDIR=/tmp --env LTP_TIMEOUT_MUL=5 --env LTP_RUNTIME_MUL=0.1 \
         --env LTP_COLORIZE_OUTPUT=0 --env KCONFIG_PATH=/opt/ltp/appine.config \
+        --env LTP_DEV_FS_TYPE=tmpfs \
         -- /bin/sh -c "cd /tmp && exec $*" </dev/null >"$log" 2>&1
     code=$?
     case $code in
@@ -107,6 +111,8 @@ CONFIG_MULTIUSER=y
 CONFIG_FILE_LOCKING=y
 CONFIG_PROC_FS=y
 CONFIG_EXT4_FS=y
+CONFIG_BLOCK=y
+CONFIG_BLK_DEV_LOOP=y
 CONFIG_UNIX=y
 CONFIG_INET=y
 CONFIG_IPV6=y

@@ -1074,12 +1074,18 @@ fn open_store(
                         Device::Kmsg => Some(open_kmsg(cx, accmode)?),
                         _ => None,
                     };
-                    FileKind::Device { ino, dev, kmsg }
+                    FileKind::Device {
+                        ino,
+                        dev,
+                        kmsg,
+                        block: None,
+                    }
                 }
             },
         },
+        mode::S_IFBLK => super::loopdev::open(cx, ino, st.rdev, flags)?,
         mode::S_IFIFO => open_fifo(cx, ino, flags)?,
-        // Block devices and socket files cannot be opened (socket files use connect)
+        // Socket files cannot be opened (they use connect)
         _ => return Err(Errno::ENXIO),
     })
 }
@@ -1782,6 +1788,15 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
     if let Some(s) = sock {
         return super::net::ioctl(cx, &s, request, arg);
     }
+    let device = match &file.borrow().kind {
+        FileKind::Device { dev, .. } => Some(*dev),
+        _ => None,
+    };
+    match device {
+        Some(Device::Loop) => return super::loopdev::ioctl(cx, &file, request, arg),
+        Some(Device::LoopControl) => return super::loopdev::control_ioctl(cx, request, arg),
+        _ => {}
+    }
     let host_fd = match &file.borrow().kind {
         FileKind::Host(fd) => *fd,
         FileKind::Pipe(end) if request == FIONREAD => {
@@ -1874,6 +1889,8 @@ enum IoPath {
     Kmsg,
     /// `/proc/kmsg`: syslog's read.
     ProcKmsg(Rc<RefCell<crate::klog::Klog>>),
+    /// A loop device: read and written through its backing file (`syscall::loopdev`).
+    Loop(crate::syscall::loopdev::LoopRef),
     /// Everything else (files in the store, devices, other synthetic files, and files with no
     /// read or write operation): never waits for data. Regular files are read and written with
     /// the BKL released ([`unlocked_io`]), except `O_APPEND` writes; the rest is done directly
@@ -2498,7 +2515,7 @@ pub(super) fn read_file(
         FileKind::Regular { .. }
             | FileKind::Proc { klog: None, .. }
             | FileKind::Device {
-                dev: Device::Zero | Device::Full | Device::Random,
+                dev: Device::Zero | Device::Full | Device::Random | Device::Loop,
                 ..
             }
     );
@@ -2609,7 +2626,7 @@ fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
 
 /// Does one read from an open file into a host buffer. With `offset` None the file position is
 /// used and advanced.
-fn read_bytes(
+pub(super) fn read_bytes(
     cx: &mut Cx<'_>,
     file: &FileRef,
     buf: &mut [u8],
@@ -2649,6 +2666,7 @@ fn read_bytes(
         }
         IoPath::Kmsg => kmsg_read(cx, file, nonblock, buf),
         IoPath::ProcKmsg(log) => proc_kmsg_read(cx, &log, nonblock, buf),
+        IoPath::Loop(dev) => super::loopdev::read(cx, file, &dev, buf, offset),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let n = pseudo::read_mem(mm, buf, pos)?;
@@ -2854,6 +2872,8 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
                 buf.len()
             }
             Device::Kmsg => return Err(Errno::EBADF),
+            // No read operation (loop devices are read through IoPath::Loop)
+            Device::LoopControl | Device::Loop => return Err(Errno::EINVAL),
         },
         // Namespaces (nsfs) cannot be read
         FileKind::Proc {
@@ -2893,7 +2913,7 @@ fn local_read(f: &mut OpenFile, buf: &mut [u8], offset: Option<u64>) -> Result<u
 
 /// Does one write to an open file. With `offset` None the file position is used and advanced,
 /// and with `O_APPEND` it first moves to the end of the file.
-fn write_bytes(
+pub(super) fn write_bytes(
     cx: &mut Cx<'_>,
     file: &FileRef,
     data: &[u8],
@@ -2923,6 +2943,7 @@ fn write_bytes(
         IoPath::Kmsg => kmsg_write(cx, file, data),
         // Opened read-only (no proc_write)
         IoPath::ProcKmsg(_) => Err(Errno::EBADF),
+        IoPath::Loop(dev) => super::loopdev::write(cx, file, &dev, data, offset),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
             let sync = cx.task.sync.clone();
@@ -3128,6 +3149,8 @@ fn local_write(f: &mut OpenFile, data: &[u8], offset: Option<u64>) -> Result<usi
         }
         FileKind::Device { dev, .. } => match dev {
             Device::Full => Err(Errno::ENOSPC),
+            // No write operation (loop devices are written through IoPath::Loop)
+            Device::LoopControl | Device::Loop => Err(Errno::EINVAL),
             _ => Ok(data.len()),
         },
         // Writable procfs files: the content was already handled by pseudo::write
@@ -3150,7 +3173,12 @@ fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
     // pread and pwrite of /dev/kmsg and /proc/kmsg ignore the offset, like read and write
     let seekable = matches!(
         path,
-        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Kmsg | IoPath::ProcKmsg(_)
+        IoPath::Local
+            | IoPath::Pagemap(_)
+            | IoPath::Mem(_)
+            | IoPath::Kmsg
+            | IoPath::ProcKmsg(_)
+            | IoPath::Loop(_)
     );
     if offset.is_some() && !seekable && f.flags & oflags::O_PATH == 0 {
         return Err(Errno::ESPIPE);
@@ -3163,7 +3191,7 @@ fn positional(f: &OpenFile, offset: Option<u64>) -> Result<IoPath, Errno> {
 pub(super) fn seekable(f: &OpenFile) -> bool {
     matches!(
         io_path(f),
-        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_)
+        IoPath::Local | IoPath::Pagemap(_) | IoPath::Mem(_) | IoPath::Loop(_)
     )
 }
 
@@ -3187,6 +3215,9 @@ fn io_path(f: &OpenFile) -> IoPath {
             ..
         } => IoPath::Mem(mm.as_ref().and_then(std::rc::Weak::upgrade)),
         FileKind::Device { kmsg: Some(_), .. } => IoPath::Kmsg,
+        FileKind::Device {
+            block: Some(open), ..
+        } => IoPath::Loop(open.dev.clone()),
         FileKind::Proc {
             klog: Some(log), ..
         } => IoPath::ProcKmsg(log.clone()),
@@ -3355,6 +3386,9 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
             };
             return Ok(0);
         }
+        FileKind::Device {
+            block: Some(open), ..
+        } => return super::loopdev::seek(&open.dev, pos, offset, whence),
         // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
         FileKind::Device { .. } => return Ok(0),
         FileKind::Directory { entries, .. } => {
@@ -3487,11 +3521,26 @@ pub(super) fn cachestat(cx: &mut Cx<'_>, fd: i32, range: u64, out: u64, flags: u
 /// the deferred write transaction is committed and then the WAL is awaited on disk
 /// ([`durable`]). The BKL is released while flushing.
 pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
-    let file = cx.fds().get(fd)?;
+    let mut file = cx.fds().get(fd)?;
+    if file.borrow().flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    // A loop device flushes by syncing its backing file, which may be another loop device
+    loop {
+        let next = match &file.borrow().kind {
+            FileKind::Device {
+                block: Some(open), ..
+            } => match super::loopdev::flush_target(&open.dev) {
+                Some(backing) => backing,
+                None => return Ok(0),
+            },
+            _ => break,
+        };
+        file = next;
+    }
     let host = {
         let f = file.borrow();
         match &f.kind {
-            _ if f.flags & oflags::O_PATH != 0 => return Err(Errno::EBADF),
             // Only regular files and directories can be synced (host fds are left to the host)
             FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
             FileKind::Directory { .. } => None,
@@ -3960,7 +4009,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     }
 }
 
-fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
+pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
     let f = file.borrow();
     let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
         let st = Stat {

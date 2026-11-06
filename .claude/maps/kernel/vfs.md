@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; chown of set-id files as in 6.2; native AIO added, 5 claims checked by 1 verifier; module references)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` kept from open; unshared fd tables keep POSIX locks; chown of set-id files as in 6.2; native AIO; module references; loop devices and block-device opens)
 
 ## Responsibilities
 
@@ -20,14 +20,15 @@ inode store and the synthetic filesystems). It provides:
   `pread`/`pwrite` without the BKL), `sendfile`/`copy_file_range`/`splice`;
 - namespace and metadata syscalls (stat family, statfs, chmod/chown/utimensat/truncate/access,
   mkdir/mknod/unlink/rename/link/symlink, getdents64, getcwd/chdir) and extended attributes;
-- in-memory pipes and FIFOs, advisory locks (`flock`, POSIX, OFD) and leases, character-device
-  nodes and their in-process implementations, eventfd/timerfd objects;
+- in-memory pipes and FIFOs, advisory locks (`flock`, POSIX, OFD) and leases, device nodes and
+  their in-process implementations (character devices and loop devices, the only block devices),
+  eventfd/timerfd objects;
 - inotify, including replaying changes made by the Android Files app;
 - native AIO (`io_setup` to `io_pgetevents`), with I/O done at submit and pending polls.
 
 Root: `core/kernel/src/vfs/mod.rs`, `vfs/dev.rs`, `fd.rs`, `pipe.rs`, `locks.rs`,
 `syscall/fs.rs`, `syscall/mount.rs`, `syscall/xattr.rs`, `syscall/lease.rs`,
-`syscall/inotify.rs`, `syscall/timerfd.rs`, `syscall/aio.rs`.
+`syscall/inotify.rs`, `syscall/timerfd.rs`, `syscall/aio.rs`, `syscall/loopdev.rs`.
 
 Outside the module: the store's own semantics (`kernel/store`), procfs/sysfs/cgroup2/devpts
 content (`kernel/procfs`), terminals (`kernel/tty`), sockets (`kernel/net`, `kernel/unix`),
@@ -66,7 +67,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   inode in a weak map.
 - `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, byte ranges, waiters),
   `FlockHolder`, `Lease`.
-- `Device` — Null, Zero, Full, Random, Kmsg (tty, ptmx and pts are routed separately).
+- `Device` — Null, Zero, Full, Random, Kmsg, LoopControl, Loop (tty, ptmx and pts are routed
+  separately); a Loop open file also carries its `LoopOpen` (the device and whether it was opened
+  `O_EXCL`), whose drop is the device's release.
+- `Loops` (`Kernel::loops`, devices by number plus a disk-sequence counter) and `Loop` — backing
+  open file (`None` when unbound), offset, size limit, size in bytes, flags, name, logical and soft
+  block sizes, `BLKROSET` and disk read-only state, read-ahead, opener count and exclusive claim.
 - `EventFd`, `TimerFd`.
 - `Inotify`, `Event`, `Registry` (one per kernel, watches keyed by store inode), `Opened`.
 - `AioContext` — one io_setup context: its capacity `nr`, completed `io_event`s, pending polls and
@@ -84,14 +90,16 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `pipe2`,
   `lseek`, `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
   `copy_file_range`, `splice`/`tee`/`vmsplice`, `ftruncate`, `fallocate`, `memfd_create`,
-  `timerfd_*`; ioctls `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`/`FIONREAD`, random ioctls.
+  `timerfd_*`; ioctls `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`/`FIONREAD`, random ioctls, the
+  block and loop ioctls on loop devices and the `LOOP_CTL_*` ioctls on `/dev/loop-control`.
 - **Metadata**: `newfstatat`/`fstat`/`statx`, `statfs`/`fstatfs`, `fchmod*`, `fchown*`,
   `utimensat`, `truncate`, `faccessat`/`faccessat2`, `umask`, `mkdirat`, `mknodat`, `unlinkat`,
   `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `getdents64`, `getcwd`, `chdir`/`fchdir`,
   xattr calls.
 - **Locks**: `flock`, fcntl lock commands, `F_SETLEASE`/`F_GETLEASE`; `locks::closed`,
   `lease::break_leases`.
-- **Devices**: `dev::ensure_dev_nodes` (store `/dev`), `dev::populate` (boot `/dev` tmpfs).
+- **Devices**: `dev::ensure_dev_nodes` (store `/dev`), `dev::populate` (boot `/dev` tmpfs);
+  `Loops::numbers`, `sysfs_exists` and `sysfs_read` (the `/sys/block` view for `kernel/procfs`).
 - **inotify**: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, read; hooks `active`,
   `path_event`, `file_event`, `dir_event`, `cookie`, `opened`, `renamed`, `deleted`,
   `watched_parent`; `host_change`.
@@ -270,7 +278,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   BPF device filter; `O_NOATIME` by a non-owner without `CAP_FOWNER` `EPERM`; write on ro
   `EROFS`; writing a file some task is executing `ETXTBSY`; break leases; `O_TRUNC` removes
   set-id bits and truncates. Then dispatch by type: regular files open the host object, character
-  devices by device number (section 11), FIFOs the shared pipe, block devices and sockets `ENXIO`.
+  devices by device number (see Devices), block devices as loop devices (major 7; others `ENXIO`),
+  FIFOs the shared pipe, sockets `ENXIO`.
 - Pseudo nodes: permission from the synthetic stat, ptrace checks for process files, nodev for
   PTYs, `EISDIR`/`EROFS`/`EACCES` for writes the filesystem does not allow; content is generated
   at open.
@@ -387,14 +396,55 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 ### Devices
 
 - `dev::populate` creates in the boot `/dev` tmpfs, and `ensure_dev_nodes` in the store's `/dev`:
-  `null`, `zero`, `full`, `random`, `urandom`, `kmsg`, `tty`, `console`, `ptmx`, the `fd`/`stdin`/
-  `stdout`/`stderr` links and the `pts`/`shm`/`mqueue` directories.
+  `null`, `zero`, `full`, `random`, `urandom`, `kmsg`, `tty`, `console`, `ptmx`, `loop-control`
+  and `loop0`–`loop7` (0660, group `disk`, gid 6), the `fd`/`stdin`/`stdout`/`stderr` links and the
+  `pts`/`shm`/`mqueue` directories.
 - Opening dispatches by device number for any node anywhere (unless nodev): 5:0 and 5:1 the
   caller's controlling terminal, 5:2 the ptmx of the devpts next to the node, major 136 a boot
-  devpts slave, 1:3/5/7/8/9/11 `Device`, anything else `ENXIO`.
+  devpts slave, 1:3/5/7/8/9/11 `Device`, 10:237 loop-control; block 7:N the loop device N (created
+  if missing, like Linux's legacy autoload); anything else `ENXIO`.
 - `/dev/zero`, `/dev/full` and the random devices fill the whole buffer per read; randomness
   comes from the host `/dev/urandom` and never blocks (entropy count fixed at 256; the random
   ioctls follow 6.1's `random_ioctl`).
+
+### Loop devices
+
+- Follow 6.1's `drivers/block/loop.c` and the block-device parts of `block/fops.c` and
+  `block/ioctl.c`. Eight devices exist from boot; loop-control's `LOOP_CTL_ADD` (a number, or the
+  lowest unused for a negative one; `EEXIST`), `LOOP_CTL_REMOVE` (`EINVAL` negative, `ENODEV`
+  missing, `EBUSY` bound or open) and `LOOP_CTL_GET_FREE` (lowest unbound, else a new device) also
+  create or delete `/dev/loop<N>` in the boot `/dev`; other requests are `ENOSYS`. Read and write
+  on loop-control are `EINVAL`.
+- Open counts an opener; `O_EXCL` claims the device (`EBUSY` while another open holds it); the
+  first opener sets the soft block size (largest power of two up to a page dividing the size).
+- `LOOP_SET_FD`/`LOOP_CONFIGURE` bind an unbound device (`EBUSY` otherwise, or when another open
+  holds the claim) to a regular file or a bound loop device that does not lead back to it
+  (`EBADF` for itself or `O_PATH`, `EINVAL` otherwise); configure flags outside
+  RO/AUTOCLEAR/PARTSCAN/DIRECT_IO, bad block sizes and any encryption are `EINVAL`, offsets over
+  `i64::MAX` `EOVERFLOW`. The device is read-only when the file or the device's own open file is
+  not writable; direct I/O is always dropped; partscan is kept but nothing is scanned. Size is the
+  file length past the offset, capped by the size limit, in whole sectors, fixed until
+  `LOOP_SET_CAPACITY` or a `LOOP_SET_STATUS` that changes offset or limit.
+- `LOOP_CLR_FD` with other openers only sets autoclear; otherwise it unbinds at once (6.1; later
+  kernels defer it to the close). The last opener's release unbinds an autoclear device. Unbinding
+  resets offset, limit, size, flags, name and block size but keeps the disk read-only state, as
+  Linux does.
+- Status: `LOOP_SET_STATUS(64)` needs write mode or `CAP_SYS_ADMIN` (`EPERM`), may set and clear
+  autoclear and only set partscan; `LOOP_GET_STATUS(64)` reports the backing file's device, inode
+  and rdev as stat shows them (`EOVERFLOW` when the old structure cannot hold them).
+  `LOOP_CHANGE_FD` swaps the file of a read-only device for one of the same size.
+  `LOOP_SET_DIRECT_IO` is `EINVAL` to enable; `LOOP_SET_BLOCK_SIZE` takes 512 to 4096.
+- I/O: reads past the end return 0 (an unbound device has size 0), zeros past a shrunk backing
+  file; writes on a read-only device are `EPERM`, at or past the end `ENOSPC` (`O_APPEND`
+  ignored). Data goes through the backing open file's own read and write paths at the device
+  offset (regular files without the BKL), with no cache in between; backing errors are `EIO`.
+  lseek accepts only SET/CUR/END within the size; fsync syncs the backing file of a bound writable
+  device; epoll refuses the device (`EPERM`); poll reports it ready.
+- Block ioctls: sizes, logical/physical/minimum block size, read-only get/set (`BLKROSET` needs
+  `CAP_SYS_ADMIN`), read-ahead, `BLKBSZSET`, `BLKZEROOUT` (writes zeros), `BLKFLSBUF`,
+  `BLKSECTGET`, `BLKROTATIONAL`, `BLKGETDISKSEQ`; `BLKDISCARD` is `EOPNOTSUPP` (no discard),
+  `HDIO_GETGEO` `ENOTTY`, `BLKRRPART` and `BLKPG` `EINVAL` (no partitions) or `EACCES`; anything
+  else `EINVAL`, as the loop driver answers.
 
 ### eventfd and timerfd
 
@@ -469,7 +519,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - The syscall dispatcher; `kernel/process` (clone/unshare/setns, execve's fd-table handling and
   mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver, AIO release at execve
   and exit); `kernel/mm` (mmap `PROT_EXEC` on noexec); `kernel/procfs` (mountinfo, fd links,
-  fdinfo, sysctls for pipes, leases, inotify, AIO and `protected_*`); `kernel/unix` (AF_UNIX bind
+  fdinfo, sysctls for pipes, leases, inotify, AIO and `protected_*`, the `/sys/block` view of the
+  loop devices); `kernel/unix` (AF_UNIX bind
   creating store nodes); `kernel/poll` (poll/epoll reading open files, eventfd syscalls);
   `kernel/ipc` (queue fds, `mq_dev`); the machine (boot, `store_changed` for inotify); core dumps.
 
@@ -505,6 +556,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - AIO contexts belong to the thread group, not the address space, so a `CLONE_VM` child cannot use
   its parent's contexts (Linux keeps them per mm). The capacity check runs before I/O that may
   release the BKL, so concurrent submitters can exceed `nr`.
+- A bound loop device holds its backing open file, and a loop over a loop holds the lower device's
+  open file, so the lower device keeps that opener until the upper one is unbound. Loop I/O takes
+  the backing file out of the device before reading or writing it (the BKL may be released), and
+  the device's file position has no lock, as block devices have none in Linux.
+- A loop device's opener count lives in its `LoopOpen`, dropped with the open file: anything that
+  keeps an open file alive (a dup, a fork, an SCM_RIGHTS message, a loop binding) keeps the device
+  open, and autoclear runs only when the last such reference goes.
 
 ## Confirmed bugs / technical debt
 
@@ -561,10 +619,34 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **`aio-nr` counts twice `nr`:** each context charges and reports `2 * nr`, as Linux did before
   4.12; 6.1 charges `nr`, so only half as many events fit under `aio-max-nr` and `aio-nr` reads
   double.
-- **Fidelity gaps:** statx never reports btime, `stx_mnt_id` or attributes; no
+- **`copy_file_range` checks differ from 6.1's `generic_copy_file_checks`:** a directory is `EBADF`
+  instead of `EISDIR` and a pipe `EBADF` instead of `EINVAL`; overlapping ranges in one file are
+  copied instead of `EINVAL`; a length that overflows the offset is `EINVAL` instead of
+  `EOVERFLOW`, and a range past the largest file size `EINVAL` instead of `EFBIG` (LTP
+  copy_file_range02, which also expects `EPERM` on an immutable file).
+- **Setgid survives creation in a setgid directory:** a file created with `S_ISGID` and group
+  execute in a setgid directory by a caller outside the directory's group and without
+  `CAP_FSETID` keeps the bit; Linux strips it (CVE-2018-13405; since 6.0 also through umask and
+  ACLs), so such a user can make setgid files of a group it is not in (LTP creat09).
+- **getdents64 lists a removed directory:** an open directory that has been rmdir'ed still lists
+  entries; Linux returns `ENOENT` for a dead directory (LTP getdents02).
+- **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are not supported on store or tmpfs
+  files, while 6.1's tmpfs supports append-only, immutable, nodump and noatime (LTP unlink09,
+  copy_file_range02).
+- **atime ignores the guest's settings:** a regular file's atime is its host object's, so reads
+  update it by the host's rules whatever `O_NOATIME` or the mount's `noatime`, `nodiratime` and
+  `strictatime` say, and directories never get an atime of their own (LTP open12, mount03).
+- **Loop device gaps:** no partitions (partscan is only a flag); no discard, and `fallocate` on the
+  device is `ENODEV` (Linux punches or zeroes); mmap of a loop device is `ENODEV` (Linux maps
+  block devices); `O_DIRECT` alignment is not enforced; zone, tracing and persistent-reservation
+  ioctls are `EINVAL` where Linux answers `ENOTTY` or `EOPNOTSUPP`; `BLKGETDISKSEQ` advances
+  only when a device is created or bound, not when it is unbound.
+- **Fidelity gaps:** statx never reports btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`; no
   `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
-  fallocate writes zeros); `TFD_TIMER_CANCEL_ON_SET` never cancels; `RLIMIT_NOFILE` set by prlimit
-  applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared; propagation is not
+  fallocate writes zeros; with tmpfs's size accounting a sparse file can fill an instance: LTP
+  fallocate04, fallocate05, openat02); `TFD_TIMER_CANCEL_ON_SET` never cancels; `RLIMIT_NOFILE`
+  set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
+  access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
   emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
   sync it (Linux's write path does).
 

@@ -97,7 +97,7 @@ pub enum FileKind {
     Path(Node),
     /// One end of a pipe.
     Pipe(PipeEnd),
-    /// A character device (`/dev/null` and so on); `ino` is the device node in the store.
+    /// A device (`/dev/null`, a loop device and so on); `ino` is the device node in the store.
     Device {
         /// The inode.
         ino: Ino,
@@ -105,6 +105,8 @@ pub enum FileKind {
         dev: Device,
         /// The read position and write rate limit of `/dev/kmsg` (only for [`Device::Kmsg`]).
         kmsg: Option<Box<crate::klog::KmsgFile>>,
+        /// The loop device and this open of it (only for [`Device::Loop`]).
+        block: Option<crate::syscall::LoopOpen>,
     },
     /// The master or slave side of a PTY.
     Pty(PtyEnd),

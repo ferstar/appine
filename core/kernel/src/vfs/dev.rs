@@ -1,16 +1,17 @@
-//! Character devices (the kernel/vfs map).
+//! Device nodes (the kernel/vfs map).
 //!
 //! At boot a tmpfs is mounted on `/dev` and the standard device nodes are created in it with
 //! Linux's device numbers ([`populate`], the equivalent of Linux's devtmpfs); opening a device
 //! node finds the implementation here by device number, and nodes with the same numbers that the
-//! guest creates with mknod behave the same. The store's `/dev` directory is its mount point and
+//! guest creates with mknod behave the same. The only block devices are the loop devices
+//! (`syscall::loopdev`). The store's `/dev` directory is its mount point and
 //! gets the same nodes too ([`ensure_dev_nodes`]; they are what is seen after `/dev` is
 //! unmounted).
 
 use crate::errno::Errno;
 use crate::vfs::store::{Ino, ROOT, Store, mode};
 
-/// Character devices implemented in-process.
+/// Devices implemented in-process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
     /// `/dev/null`: reads return EOF, writes are all discarded.
@@ -23,10 +24,16 @@ pub enum Device {
     Random,
     /// `/dev/kmsg`: the kernel log ([`crate::klog`]); each open file has its own read position.
     Kmsg,
+    /// `/dev/loop-control`: adds, removes and finds loop devices (`syscall::loopdev`).
+    LoopControl,
+    /// A loop device, a block device (`syscall::loopdev`; the device itself is in the open
+    /// file's `block`).
+    Loop,
 }
 
 impl Device {
-    /// Looks up by device number; ENXIO for devices that are not implemented.
+    /// Looks up a character device by device number; ENXIO for devices that are not
+    /// implemented.
     pub fn from_rdev(rdev_value: u64) -> Result<Device, Errno> {
         match rdev_value {
             v if v == rdev(1, 3) => Ok(Device::Null),
@@ -34,6 +41,7 @@ impl Device {
             v if v == rdev(1, 7) => Ok(Device::Full),
             v if v == rdev(1, 8) || v == rdev(1, 9) => Ok(Device::Random),
             v if v == rdev(1, 11) => Ok(Device::Kmsg),
+            LOOP_CONTROL => Ok(Device::LoopControl),
             _ => Err(Errno::ENXIO),
         }
     }
@@ -44,18 +52,29 @@ pub const fn rdev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
-/// The standard nodes in `/dev`: name, device number, permissions. Terminal devices (tty,
-/// console, ptmx) are connected to PTYs by the syscall layer by device number.
-const NODES: [(&[u8], u64, u32); 9] = [
-    (b"null", rdev(1, 3), 0o666),
-    (b"zero", rdev(1, 5), 0o666),
-    (b"full", rdev(1, 7), 0o666),
-    (b"random", rdev(1, 8), 0o666),
-    (b"urandom", rdev(1, 9), 0o666),
-    (b"kmsg", rdev(1, 11), 0o644),
-    (b"tty", rdev(5, 0), 0o666),
-    (b"console", rdev(5, 1), 0o600),
-    (b"ptmx", rdev(5, 2), 0o666),
+/// The block major of loop devices.
+pub const LOOP_MAJOR: u32 = 7;
+/// `/dev/loop-control`'s device number (misc 10:237).
+pub const LOOP_CONTROL: u64 = rdev(10, 237);
+/// The loop devices that exist from boot (`CONFIG_BLK_DEV_LOOP_MIN_COUNT`), `loop0` to `loop7`.
+pub const LOOP_MIN_COUNT: u32 = 8;
+/// The `disk` group (6 in Alpine and Debian), which owns the loop nodes as udev's and mdev's
+/// rules set them.
+pub const DISK_GID: u32 = 6;
+
+/// The standard character nodes in `/dev`: name, device number, permissions, group. Terminal
+/// devices (tty, console, ptmx) are connected to PTYs by the syscall layer by device number.
+const NODES: [(&[u8], u64, u32, u32); 10] = [
+    (b"null", rdev(1, 3), 0o666, 0),
+    (b"zero", rdev(1, 5), 0o666, 0),
+    (b"full", rdev(1, 7), 0o666, 0),
+    (b"random", rdev(1, 8), 0o666, 0),
+    (b"urandom", rdev(1, 9), 0o666, 0),
+    (b"kmsg", rdev(1, 11), 0o644, 0),
+    (b"tty", rdev(5, 0), 0o666, 0),
+    (b"console", rdev(5, 1), 0o600, 0),
+    (b"ptmx", rdev(5, 2), 0o666, 0),
+    (b"loop-control", LOOP_CONTROL, 0o660, DISK_GID),
 ];
 
 /// The standard symlinks in `/dev`, all pointing into procfs.
@@ -92,14 +111,28 @@ pub fn ensure_dev_nodes(store: &Store) -> Result<(), Errno> {
 }
 
 /// Creates the standard device nodes, symlinks and directories in directory `dev` (the tmpfs
-/// mounted on `/dev` at boot, and the store's `/dev`). Existing entries with the same names are
-/// left alone.
+/// mounted on `/dev` at boot, and the store's `/dev`), with the boot loop devices' nodes.
+/// Existing entries with the same names are left alone.
 pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
     store.transaction(|s| {
         let missing = |name: &[u8]| -> Result<bool, Errno> { Ok(s.lookup(dev, name)?.is_none()) };
-        for (name, rdev_value, perm) in NODES {
+        for (name, rdev_value, perm, gid) in NODES {
             if missing(name)? {
-                s.mknod(dev, name, mode::S_IFCHR | perm, rdev_value, 0, 0)?;
+                s.mknod(dev, name, mode::S_IFCHR | perm, rdev_value, 0, gid)?;
+            }
+        }
+        for n in 0..LOOP_MIN_COUNT {
+            let name = format!("loop{n}");
+            if missing(name.as_bytes())? {
+                let node = rdev(LOOP_MAJOR, n);
+                s.mknod(
+                    dev,
+                    name.as_bytes(),
+                    mode::S_IFBLK | 0o660,
+                    node,
+                    0,
+                    DISK_GID,
+                )?;
             }
         }
         for (name, target) in LINKS {
@@ -116,7 +149,7 @@ pub fn populate(store: &Store, dev: Ino) -> Result<(), Errno> {
     })
 }
 
-/// The device for a device node's inode.
+/// The character device for a device node's inode.
 pub fn open(store: &Store, ino: Ino) -> Result<Device, Errno> {
     Device::from_rdev(store.stat(ino)?.rdev)
 }

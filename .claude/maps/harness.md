@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification: rust-analyzer added to the toolchain file and the dev image; components must match)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs)
 
 ## Responsibilities
 
@@ -128,7 +128,12 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   does not build with musl, into `target/ltp/ltp-<ver>.tar`.
 - `ltp` uses a store on the `appine-ltp` volume when `/ltp` exists (inside `scripts/dev`), else
   `target/ltp/store` (`LTP_STORE` overrides), built once with LTP unpacked; a kernel config listing
-  appine's features is written and passed as `KCONFIG_PATH`.
+  appine's features (loop devices included) is written and passed as `KCONFIG_PATH`.
+- Tests that need a device get one of appine's loop devices over a file in their `/tmp` directory,
+  and `LTP_DEV_FS_TYPE=tmpfs` makes LTP skip mkfs and mount a tmpfs there instead (appine has no
+  disk filesystems), as Starnix runs LTP; tests that need a particular disk filesystem report
+  TCONF, and some (remounting the device to find files again, mounting a read-only device, mount
+  errors of a block device) fail on Linux's tmpfs too.
 - Tests from `runtest/syscalls` matching the regex (minus `sigtimedwait01`, `sigwaitinfo01` unless
   `-a`) run 8 at a time, slowest first, each in a fresh `appine-run` under `timeout 900` with
   `LTP_TIMEOUT_MUL=5`, `LTP_RUNTIME_MUL=0.1`; exit 0 PASS, 32 CONF, 124 TIMEOUT, else FAIL, and any
@@ -183,6 +188,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   while the native side starts fresh.
 - Durations are recorded only by parallel difftest runs (`-j 1`, as in CI, never updates them);
   a partial LTP run writes a `results.txt` holding only that subset (durations are merged).
+- The native side of a case using loop devices (`loop`) shares the host's devices: it takes
+  whatever loop-control hands out, makes its own node for it (a new device has no node in the
+  container's `/dev`), prints no device numbers, and waits for an autoclear device to be unbound
+  (kernels after 6.1 unbind after the last close, not at once). Disk read-only state survives
+  unbinding on Linux, so the case leaves its device bound writable last.
 - A case that counts processes must not count its own pipeline: `ls /proc | grep -c` sees `grep`
   only when it started before `ls` read `/proc`, which differs run to run on either side (the
   `bwrap` case failed this way in CI); a shell glob (`set -- /proc/[0-9]*; echo $#`) starts no
@@ -221,6 +231,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
   `apk add` leaves a store the next run uses as is.
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
+- **compat2's "after the thread exits" check races:** it tests whether `/proc/<tid>` of a
+  non-leader thread still exists right after Python's `join()`, which returns before the kernel has necessarily
+  reaped the thread; native usually prints True, and appine printed False once in a full parallel
+  run (it passes on its own).
 
 ## Open questions
 

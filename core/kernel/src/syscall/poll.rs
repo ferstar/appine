@@ -542,7 +542,11 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
             | FileKind::Directory { .. }
             | FileKind::Proc { klog: None, .. }
             | FileKind::Device {
-                dev: Device::Null | Device::Zero | Device::Full,
+                dev: Device::Null
+                    | Device::Zero
+                    | Device::Full
+                    | Device::Loop
+                    | Device::LoopControl,
                 ..
             }
     ) {

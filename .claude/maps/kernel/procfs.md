@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices)
 
 ## Responsibilities
 
@@ -14,7 +14,8 @@ stored:
 
 - procfs: the per-process and per-thread trees, system-wide files, `/proc/sys` (sysctls, many
   scoped by namespace) and `/proc/<pid>/net`;
-- sysfs: CPU topology (partly copied from the host), `/sys/class/net`, the cgroup mount point;
+- sysfs: CPU topology (partly copied from the host), `/sys/class/net`, `/sys/block` (loop
+  devices), the cgroup mount point;
 - devpts as a filesystem (instances, nodes, owners and modes) and nsfs nodes;
 - the node views of the mqueue filesystem;
 - cgroup v2: the cgroup tree, its interface files, membership and migration, and the limits that
@@ -36,7 +37,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `PseudoNode` — every synthetic node: devpts (`PtsRoot(dev)`, `Pts(dev, n)`, `PtsPtmx(dev)`),
   procfs (`Global`, `SelfLink`, `ThreadSelf`, `Static`, `Pid`, `Entry`, `Net`, `Fd`, `OpenFd`,
   `OpenExe`, `FdInfo`, `Ns`, `NetConf`, `NetSysctl`), sysfs (`SysRoot`, `Sys`, `SysCpu`, `SysNet`,
-  `SysBrif`), `Cgroup`, `NsFile(kind, id)`, mqueue nodes.
+  `SysBrif`, `SysBlock`), `Cgroup`, `NsFile(kind, id)`, mqueue nodes.
 - `Global`/`GLOBALS` (12 top-level files), `Entry`/`ENTRIES` (32 per-process entries),
   `TASK_ENTRIES` (27 per-thread entries), `NsKind`, `STATIC` (90 fixed `/proc/sys` and
   `/proc/sysvipc` paths), `SYS_STATIC` and the sysfs file tables, `PROC_NET` (18 files).
@@ -188,12 +189,18 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 ### sysfs
 
-- Tree: `class/net/`, `devices/system/cpu/` (`online`, `possible`, `present`, `offline`, one
+- Tree: `block/`, `class/net/`, `devices/system/cpu/` (`online`, `possible`, `present`, `offline`, one
   `cpu<n>/` per guest CPU with synthesized `topology/` — each CPU its own core, one package — and
   `regs/identification/`), `cache/` and `cpufreq/` files copied from the host when the host lets
   the app read them (CPU numbers translated, missing files absent), and the empty `fs/cgroup/`
-  mount point. No `kernel/`, `module/`, `block/`, `bus/`, `firmware/`, `power/`, NUMA nodes,
+  mount point. No `kernel/`, `module/`, `dev/`, `bus/`, `firmware/`, `power/`, NUMA nodes,
   other classes or `uevent` files.
+- `/sys/block/loop<n>/` exists for every loop device (`kernel/vfs`): `dev`, `removable`, `ro`,
+  `size` (sectors), `queue/` (logical, physical, minimum and hardware sector sizes, optimal I/O 0,
+  `dma_alignment` 511, `rotational`, `read_ahead_kb`, `max_sectors_kb`, `rq_affinity`), and while
+  the device is bound `loop/` (`backing_file` as the backing open file's display path, `offset`,
+  `sizelimit`, `autoclear`, `partscan`, `dio`). The values come from `Loops::sysfs_read`; device
+  directories are directories rather than symlinks into `/sys/devices/virtual/block`.
 - The guest CPU count is a snapshot of the host process's affinity at kernel creation (capped at
   64); the same count drives sysfs, `/proc/cpuinfo`, `/proc/stat`, `status`, `sched_getaffinity`
   and cgroup `cpuset`; guest CPU i is host CPU `host_cpus()[i]`.
@@ -297,7 +304,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
-  `loadavg`, the VFS (`mounts_in`, `reach`, `path_of`, devpts options).
+  `loadavg`, the VFS (`mounts_in`, `reach`, `path_of`, devpts options, the loop devices'
+  `Loops`).
 - Host: `appine_hal` (`host_meminfo`, `host_cpus`, `cpu_sysfs`, `clock_gettime`, `fill_random`,
   `thread_ctxt_switches`, routes, `tx_queue_len`); the engine (`guest_hwcap*`, `guest_midr`).
 
@@ -354,6 +362,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
   standard files are absent; `kernel/pid_max` writes are ignored; `processes` in `/proc/stat`
   excludes threads; `Cpus_allowed_list` ignores task affinity.
+- **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
+  (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
+  filesystem has no block device behind it at all.
 - **Socket owners in `/proc/net/*` can differ from Linux:** the uid column is the fsuid of the
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and

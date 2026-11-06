@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6 clamps `nfds`, counts only events in the sets and reports `POLLNVAL` in all three; module references)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6 clamps `nfds`, counts only events in the sets and reports `POLLNVAL` in all three; module references; epoll refuses loop devices)
 
 ## Responsibilities
 
@@ -98,8 +98,8 @@ signal delivery (`kernel/signal`).
 
 - `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`).
 - `epoll_ctl` checks: epfd (`EBADF`, `EINVAL` if not an epoll); target (`EBADF`, `O_PATH`
-  `EBADF`); self `EINVAL`; regular files, directories, synthetic files and
-  `/dev/null|zero|full` `EPERM`; on ADD loops or depth over 4 `ELOOP`; `EPOLLEXCLUSIVE` only on ADD,
+  `EBADF`); self `EINVAL`; regular files, directories, synthetic files,
+  `/dev/null|zero|full`, loop devices and `/dev/loop-control` `EPERM`; on ADD loops or depth over 4 `ELOOP`; `EPOLLEXCLUSIVE` only on ADD,
   not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`). Interests are keyed by (fd, open file);
   ADD `EEXIST`, MOD replaces (re-arms; MOD of an exclusive interest `EINVAL`), DEL, missing
   `ENOENT`. Every call prunes dead interests and wakes the epoll's waiters.
