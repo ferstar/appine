@@ -303,7 +303,11 @@ def root_inside():
         os.dup2(w, 1)
         os.execv("/bin/sh", ["sh", "-c", "id -u; grep CapEff /proc/self/status"])
     os.close(w)
-    print("exec", os.read(r, 100).split())
+    # Read to the end: the two commands write separately, so one read may see only the first
+    out = b""
+    while chunk := os.read(r, 100):
+        out += chunk
+    print("exec", out.split())
     os.waitpid(pid, 0)
     # From this user namespace one cannot go back to the parent one
     print("setns to the parent", call(libc.setns, init_user, CLONE_NEWUSER))
