@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-06 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: rust-analyzer in the toolchain file and the dev image; LTP's test devices are loop devices running tmpfs; difftest cases can carry files)
 
 ## Responsibilities
 
@@ -40,7 +40,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   shared `CFLAGS` and `build()`.
 - `Interactive` (in `rootfs_programs.rs`) — a child `appine-run` with `expect`/`send`/`exit` and a
   30 s deadline, for PTY tests.
-- File formats: difftest's per-case directives `# docker-run-options:` and `# appine-options:`;
+- File formats: difftest's per-case directives `# docker-run-options:`, `# appine-options:` and
+  `# difftest-files:`;
   outputs `target/difftest/<case>.{native,appine,appine.err}`, failure copies under `failed/`,
   timings `durations-t<tier>.txt`; LTP's `results.txt` lines `<name> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP>
   <code> <secs>`, `logs/<name>.log` (and `.prev.log`), `durations.txt`; survey's
@@ -115,6 +116,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   case's appine options; an `exit N` line is appended to each output. A case passes when the two
   outputs are byte-identical and `appine-run`'s own stderr has no `appine: internal error` line;
   scripts normalise varying output themselves. A script over 128 KB is rejected.
+- `# difftest-files: <dir>` ships `tests/diff/<dir>` with the script: a ustar archive, gzipped and
+  base64-encoded, unpacked by the guest's busybox into `/tmp/difftest-files/<dir>` before the case
+  runs on either side; it counts towards the 128 KB. `line-discipline` uses it for Starnix's PTY
+  scenarios and trace generator (`tests/diff/line-discipline`, BSD-licensed, copied unchanged with
+  its source commit in a README) and skips the scenarios appine fails, by group.
 - Lanes (`-j`, default 4 on macOS, 1 elsewhere): each lane uses its own store clone (APFS clone or
   reflink copy), cases go slowest first by recorded time, and each lane prints its report in one
   write; failures are copied to `failed/`.

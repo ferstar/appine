@@ -20,7 +20,11 @@
 # only the first time or with -r; after changing the store, pass -r. The options on a test case's
 # `# docker-run-options: …` line are added to its container (such as CAP_SYS_ADMIN for mount), and
 # those on the `# appine-options: …` line to appine-run (such as --always-map-low-ports for
-# lowports: the container can bind low ports, so without it the mapping is not exercised).
+# lowports: the container can bind low ports, so without it the mapping is not exercised). A case
+# with a `# difftest-files: <dir>` line gets the files of tests/diff/<dir> on both sides, unpacked
+# into /tmp/difftest-files/<dir> before the script runs: they travel inside the script itself as a
+# gzipped tar in base64 (neither side has the work tree, and the store stays as it is), so they
+# count towards the 128 KB limit.
 #
 # Both sides' outputs are written to target/difftest/<name>.native and .appine and overwritten on
 # the next run; on a mismatch a copy is also saved as
@@ -143,7 +147,21 @@ run_group() {
         echo "FAIL $name: there is no tests/diff/$name.sh"
         return 1
     fi
-    script="exec 2>&1; $(cat "tests/diff/$name.sh")"
+    files=$(sed -n 's/^# difftest-files: //p' "tests/diff/$name.sh")
+    unpack=""
+    if [ -n "$files" ]; then
+        if [ ! -d "tests/diff/$files" ]; then
+            echo "FAIL $name: there is no tests/diff/$files for its difftest-files line"
+            return 1
+        fi
+        # ustar and no macOS metadata, so bsdtar and GNU tar make the same kind of archive for
+        # busybox's tar
+        blob=$(cd "tests/diff/$files" && COPYFILE_DISABLE=1 tar --format ustar -cf - . |
+            gzip -9n | base64 | tr -d '\n')
+        dir=/tmp/difftest-files/$files
+        unpack="rm -rf $dir && mkdir -p $dir && echo $blob | base64 -d | tar -xzof - -C $dir && "
+    fi
+    script="exec 2>&1; $unpack$(cat "tests/diff/$name.sh")"
     # The whole script is handed over as one argument of sh -c, and Linux does not allow a single
     # argument over 128 KB (MAX_ARG_STRLEN): beyond that neither side can execute it (E2BIG), the
     # outputs match, and it would count as passed

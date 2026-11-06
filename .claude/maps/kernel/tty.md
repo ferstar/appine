@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty and `TIOCNOTTY` there is `ENOTTY`; `TIOCSTI` needs the controlling terminal or `CAP_SYS_ADMIN`, and on a master feeds its reads)
+> Maintained: 2026-11-06 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID` on a master need no ctty and `TIOCNOTTY` there is `ENOTTY`; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; gaps found by recorded scenarios)
 
 ## Responsibilities
 
@@ -237,8 +237,10 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   slave `POLLIN` ignores `VMIN`, and a nonblocking read with fewer than `VMIN` bytes queued returns
   `EAGAIN`, so level-triggered loops spin; a zero-length master write (or a blocked writer
   retrying) produces EPOLLET edges with no data.
-- **Switching to canonical mode hides pending input:** raw data becomes the editing line and is
-  unreadable until a line end (Linux pushes it as a readable line); `lnext` survives the switch.
+- **Switching modes loses pending input state:** switching to canonical mode turns raw data into
+  the editing line, unreadable until a line end (Linux pushes it as a readable line), and `lnext`
+  survives the switch; switching from canonical to raw drops the empty-line marker of a pending
+  EOF, which Linux delivers as a NUL byte (`line1\n\0partial`).
 - **`EXTPROC` does not disable local editing**, unlike Linux.
 - **Background jobs are not stopped for some ioctls:** `TCFLSH`, `TCXONC`, `TCSBRK`/`TCSBRKP` and
   `TIOCSETD` skip the background check, so `tcflush`, `tcflow` and `tcdrain` from a background job
@@ -250,11 +252,20 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   and `SIGCONT` to the foreground group; Linux sends only `SIGHUP` there.
 - **Console input after the session ended is queued silently** instead of failing with `EIO` as
   `write_console`'s comment promises.
-- **Fidelity gaps:** `IUCLC`, `IMAXBEL`, `ECHOPRT`, `PARMRK`, break handling, `HUPCL`,
+- **`TCOFLUSH` on a slave drops output:** output already written by the slave is discarded, while
+  Linux's PTY has already passed it to the master, so nothing is lost there (`tcflush` and
+  `TCIOFLUSH` alike).
+- **Packet mode lacks status bytes:** the master never reads `TIOCPKT_FLUSHREAD`/`FLUSHWRITE` after
+  a signal character or a flush, nor `TIOCPKT_STOP`/`START`/`NOSTOP`/`DOSTOP` when `IXON`
+  stops or restarts output or changes the stop characters, so `rlogind`-style servers miss them.
+- **Fidelity gaps:** `IUCLC`, `ISTRIP`, `IMAXBEL`, `ECHOPRT`, `PARMRK`, break handling, `HUPCL`,
   `ONOCR`/`ONLRET`/`OLCUC`, tab expansion and `VDISCARD` are not implemented; erase echo differs
   (without `ECHOE` the erased character is echoed; tabs erase one column; `VWERASE` splits on
-  whitespace); `VREPRINT` and `ECHOK` emit a newline even with `ECHO` off; `TIOCEXCL` is a no-op;
-  `TIOCGETD` is always 0.
+  whitespace; erasing a control character without `ECHOCTL` echoes a backspace where Linux echoes
+  nothing); with `ECHOCTL`, `VEOL`/`VEOL2` and newlines taken literally (after `VLNEXT`, or in
+  non-canonical mode) echo as themselves where Linux echoes `^X`; `VREPRINT` and `ECHOK` emit a
+  newline even with `ECHO` off; `TIOCEXCL` is a no-op; `TIOCGETD` is always 0. The differential
+  case `line-discipline` skips the recorded scenarios of each gap, grouped by cause.
 
 ## Open questions
 
@@ -267,5 +278,6 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 - Linux 6.1's `TIOCOUTQ` and `TIOCSBRK`/`TIOCCBRK` results on ptys (believed 0 and success; here
   the output queue length and `ENOTTY`).
 - The comparisons with Linux in this map come from knowledge of `n_tty.c`, `tty_io.c`,
-  `tty_jobctrl.c` and `pty.c`, not from a source checkout; the differential test `pty` covers the
-  common paths natively.
+  `tty_jobctrl.c` and `pty.c`, not from a source checkout; the differential tests `pty` and
+  `line-discipline` (Starnix's 83 recorded scenarios, the passing ones compared natively) cover the
+  common paths and the line-discipline items above.
