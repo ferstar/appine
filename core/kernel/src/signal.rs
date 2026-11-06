@@ -568,7 +568,10 @@ fn send_group(k: &Kernel, tgid: Tid, sig: Signal, info: SigInfo, running: bool) 
         let room = sig.is_realtime() && queue_room(k, &group.borrow());
         group.borrow_mut().pending.add(sig, info, room);
     }
-    let unmasked = |t: &&Rc<Task>| t.sigmask.get() & sig.bit() == 0;
+    // Linux's wants_signal: a thread that blocks the signal, or sits in a ptrace stop, does not
+    // take it; another one is chosen
+    let unmasked =
+        |t: &&Rc<Task>| t.sigmask.get() & sig.bit() == 0 && t.trace.borrow().stop.is_none();
     let target = if running {
         // When several threads are running, take turns, roughly sharing by CPU time
         static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -985,6 +988,12 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
     if !handled && let Some(saved) = cx.task.saved_sigmask.take() {
         cx.task.sigmask.set(saved);
     }
+    // Signals sent to the process that this thread now blocks (sigprocmask, a handler's mask, a
+    // restored mask) and has not taken: another thread must take them
+    let blocked = cx.t.group.borrow().pending.set() & cx.task.sigmask.get();
+    if blocked != 0 {
+        retarget(cx.kr(), &cx.t.group, Some(cx.tid()), blocked);
+    }
     // PTRACE_SINGLESTEP entered a handler: as on arm64 Linux (tracehook_signal_handler after
     // user_fastforward_single_step), stop at the handler's first instruction before executing it
     if handled
@@ -1002,6 +1011,31 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
         cpu.state_mut().x[8] = super::syscall::NR_RESTART_SYSCALL;
     }
     Flow::Continue
+}
+
+/// Signals in `set` are pending for the whole process `group` but the thread `except` will not
+/// take them (it blocks them, or is exiting): wakes a thread that does not block each, as Linux's
+/// `retarget_shared_pending` does, so they do not wait for the thread chosen when they were sent.
+pub(crate) fn retarget(
+    k: &Kernel,
+    group: &RefCell<ThreadGroup>,
+    except: Option<Tid>,
+    mut set: u64,
+) {
+    let threads = group.borrow().threads.clone();
+    for tid in threads {
+        if set == 0 {
+            break;
+        }
+        let Some(t) = k.tasks.get(&tid).filter(|_| Some(tid) != except) else {
+            continue;
+        };
+        let takes = set & !t.sigmask.get();
+        if takes != 0 {
+            wake(t);
+            set &= !takes;
+        }
+    }
 }
 
 /// While the thread group is stopped, waits here until SIGCONT or until killed. A thread that

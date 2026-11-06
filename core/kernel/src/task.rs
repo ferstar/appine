@@ -905,6 +905,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         crate::process::hand_thread_children(&k, &group, tid, to);
         let ruid = group.borrow().cred.ruid;
         crate::process::send_pdeath(&k, signals, tgid, ruid);
+        // Signals sent to the process may have been meant for this thread: wake one that takes
+        // them (Linux's exit_signals)
+        let pending = group.borrow().pending.set();
+        crate::signal::retarget(&k, &group, None, pending);
     }
     // When a later step fails: if other threads remain, end this process; otherwise it has
     // already ended, so only report

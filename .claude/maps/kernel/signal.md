@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id; retargeting process signals)
 
 ## Responsibilities
 
@@ -86,9 +86,12 @@ procfs.
   signals still set the pending bit but lose the siginfo; `tkill`/`tgkill` of a real-time signal,
   and the queue syscalls with a non-`SI_USER` siginfo, return `EAGAIN`.
 - Waking: a thread-directed signal wakes its thread if unblocked; a process-directed one wakes the
-  first thread (leader first) that has it unblocked (CPU-timer signals rotate among running
-  threads); if every thread blocks it, only a `SIGNAL` wake is requested. Waking kicks the CPU and
-  signals the thread's event (`kernel/process`).
+  first thread (leader first) that has it unblocked and is not in a ptrace stop (CPU-timer signals
+  rotate among running threads); if no thread qualifies, only a `SIGNAL` wake is requested. Waking
+  kicks the CPU and signals the thread's event (`kernel/process`).
+- Retargeting (Linux's `retarget_shared_pending`): at the end of `deliver`, process-directed
+  signals still pending that the thread now blocks wake a thread that does not; a thread leaving
+  a live process does the same for every process-directed signal pending.
 - Permissions: `may_signal` (same user or `CAP_KILL`); `kill` handles `-1` (all except init and
   self), `0` and negative process groups; pid 1 is handled by `kernel/process` (power requests).
 
@@ -306,10 +309,9 @@ procfs.
   `SIGSEGV` directly, so no `SIGSEGV` handler (on an altstack) gets a chance, no core file is
   written and tracers see no stop or exit event (Linux forces a deliverable `SIGSEGV`). A stack
   overflow inside a handler is the common way to hit this.
-- **Process-directed signals can stall:** if the thread chosen to take a process-directed signal
-  blocks it (or exits) before dequeuing it, no other eligible thread is woken (Linux retargets
-  shared pending signals). `CLD_STOPPED` is also reported as soon as the first thread starts a group
-  stop, while siblings may still be running.
+- **`CLD_STOPPED` is reported early:** the parent is notified as soon as the first thread starts a
+  group stop, while siblings may still be running (Linux notifies once the last thread has
+  stopped).
 - **Coalesced standard signals report the last sender:** a second send overwrites the pending
   siginfo (Linux keeps the first), e.g. `SIGCHLD` from several children reports the last; a unit test
   pins the current behaviour.

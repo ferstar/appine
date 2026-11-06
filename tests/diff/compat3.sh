@@ -1,7 +1,7 @@
 # The sequel to compat2.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MSG_WAITALL and MSG_PEEK on TCP; arguments at the edges of their types;
 # taking a controlling terminal; kill with a thread id; memfd owners; linking unlinked files;
-# recorded sysctls
+# recorded sysctls; process signals taken by another thread
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -599,3 +599,102 @@ for f in debug/exception-trace fs/overflowgid fs/overflowuid fs/suid_dumpable \
     echo "$f $mode $form"
 done
 cd /tmp
+
+# A signal sent to the process while the thread that would take it is about to block it (stopped
+# by a tracer at the entry of rt_sigprocmask) is taken by another thread that does not block it
+# (Linux's retarget_shared_pending; Linux picks the other thread at once, appine when the first one
+# blocks it)
+cat > retarget.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <elf.h>
+
+static volatile pid_t handler_tid;
+static pid_t worker_tid;
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+    handler_tid = syscall(SYS_gettid);
+}
+
+static void *worker(void *arg)
+{
+    (void)arg;
+    worker_tid = syscall(SYS_gettid);
+    for (;;)
+        pause();
+    return NULL;
+}
+
+/* The tracer: stops the parent's main thread at the entry of rt_sigprocmask, sends SIGUSR1 to the
+ * process, and lets it go on */
+static void tracer(pid_t main_tid, int go)
+{
+    if (ptrace(PTRACE_SEIZE, main_tid, 0, 0) < 0 || ptrace(PTRACE_INTERRUPT, main_tid, 0, 0) < 0)
+        _exit(2);
+    int st;
+    waitpid(main_tid, &st, __WALL);
+    ptrace(PTRACE_SYSCALL, main_tid, 0, 0);
+    write(go, "g", 1);
+    for (int i = 0; i < 1000; i++) {
+        waitpid(main_tid, &st, __WALL);
+        struct user_regs_struct { unsigned long long regs[31], sp, pc, pstate; } r;
+        struct iovec io = {&r, sizeof r};
+        ptrace(PTRACE_GETREGSET, main_tid, NT_PRSTATUS, &io);
+        /* x7 is 0 at a syscall's entry; 135 is rt_sigprocmask */
+        if (r.regs[8] == 135 && r.regs[7] == 0) {
+            kill(main_tid, SIGUSR1);
+            ptrace(PTRACE_DETACH, main_tid, 0, 0);
+            _exit(0);
+        }
+        ptrace(PTRACE_SYSCALL, main_tid, 0, 0);
+    }
+    _exit(3);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    signal(SIGUSR1, on_usr1);
+    pthread_t t;
+    pthread_create(&t, NULL, worker, NULL);
+    while (!worker_tid)
+        usleep(1000);
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    int p[2];
+    pipe(p);
+    pid_t me = getpid();
+    pid_t c = fork();
+    if (c == 0)
+        tracer(me, p[1]);
+    char x;
+    read(p[0], &x, 1);
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &s, NULL);
+    for (int i = 0; i < 300 && !handler_tid; i++) {
+        struct timespec ts = {0, 10000000};
+        nanosleep(&ts, NULL);
+    }
+    int st;
+    waitpid(c, &st, 0);
+    printf("tracer exit %d; taken by %s\n", WEXITSTATUS(st),
+           handler_tid == worker_tid ? "the worker" : handler_tid ? "the main thread" : "nobody");
+    return 0;
+}
+C
+gcc -O1 -pthread -o retarget retarget.c && ./retarget
+rm -f retarget retarget.c
