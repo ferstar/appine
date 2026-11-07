@@ -277,6 +277,15 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   GhosttyTerminalModeConfig graphemes = {.mode = GHOSTTY_MODE_GRAPHEME_CLUSTER, .value = true};
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &graphemes);
+  // Images and registered glyphs are never drawn (frames carry cells only), so neither protocol is
+  // advertised: libghostty-vt's 10 MB default would answer a Kitty graphics query with OK and
+  // a Glyph Protocol query with support, and programs such as yazi or chafa would send images that
+  // never appear instead of falling back to text. A limit of 0 turns the Kitty protocol off
+  // entirely (queries unanswered, as in a terminal without it); a full reset keeps the limit
+  uint64_t kitty_limit = 0;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &kitty_limit);
+  bool glyphs = false;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyphs);
   return vt;
 }
 

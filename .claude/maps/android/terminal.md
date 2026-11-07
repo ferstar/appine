@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; last, unwired libghostty-vt features)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics last)
 
 ## Responsibilities
 
@@ -207,7 +207,9 @@ libghostty-vt with Zig (`android/native`).
 - A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
   and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
   opens a console of the grid's size and spawns the login; `VtNative.create` makes the terminal
-  (scrollback 10,000 lines; grapheme clustering, mode 2027, on by default as in Ghostty); restored
+  (scrollback 10,000 lines; grapheme clustering, mode 2027, on by default as in Ghostty; Kitty
+  graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is advertised and
+  programs that probe fall back to text); restored
   text and queued messages are printed into it; then the pump, the waiter and the writer start.
   If spawning fails, the reason is printed, the console is closed and the tab counts as ended
   (127).
@@ -467,6 +469,10 @@ libghostty-vt with Zig (`android/native`).
   address (older code passing `&ptr` crashes in the reply callback).
 - Without a DA reply, programs that probe for it (vim, tmux) wait for a timeout, so `vt.c` answers
   DA1/DA2 (VT220) and XTVERSION ("appine") and reports a dark colour scheme.
+- libghostty-vt as a library turns Kitty graphics on with a 10 MB store and the Glyph Protocol on,
+  answering `OK` and `fmt=glyf` to their queries, though frames carry no images and the C API
+  gives no access to registered glyphs; vt.c turns both off at create. A full reset keeps the
+  storage limit (the alternate screen takes the primary's), so they stay off.
 - With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
   emoji sequences; they can turn mode 2027 off.
 - Grid references from libghostty-vt are valid only until the terminal changes, so every selection
@@ -508,12 +514,6 @@ libghostty-vt with Zig (`android/native`).
   flip at the screen edges (a selection starting at column 0 has its start handle mostly
   off-screen). libghostty-vt has the two selections (`ghostty_terminal_select_line`, a
   selection's `rectangle` flag).
-- **Kitty graphics and the Glyph Protocol are advertised but never drawn**: libghostty-vt turns
-  both on by default (Kitty images in a 10 MB store, sent inline; the Glyph Protocol's APC) and
-  vt.c turns neither off, so a program that probes gets a positive reply (`OK` to a Kitty query,
-  `fmt=glyf` to a Glyph Protocol support query) and may then send images or register icon glyphs
-  that never appear: the frame format carries no images, and the C API gives no access to
-  registered glyphs.
 - **libghostty-vt features not wired**: no callbacks for OSC 52 clipboard writes, OSC 9/777
   notifications, OSC 9;4 progress, OSC 7501 program status, OSC 7 working directories or OSC 133
   prompts (the last two also need shell integration, which Ghostty ships for bash, zsh, fish,
@@ -574,5 +574,6 @@ libghostty-vt with Zig (`android/native`).
   Gboard in English. Flings and the scroll bar were tried there with adb swipes only (viewport and
   alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger.
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
-  `kitten icat`) show in the terminal; the positive replies were read from libghostty-vt's source
-  and tests, not seen on a device.
+  `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
+  also after a full reset and on the alternate screen, was checked on a macOS build of
+  libghostty-vt 1.4.0, not on a device.
