@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets last)
 
 ## Responsibilities
 
@@ -232,7 +232,10 @@ structure (`kernel/procfs`); host sockets (`hal`).
   wildcard listener is probed as IPv6, so IPv4 DNAT rules never match it.
 - One host thread (`forward`, no BKL) owns dups of the selected host sockets: it accepts up to 64
   connections per round, opens a nonblocking connection to the target, and copies both ways with
-  64 KiB buffers, propagating half-close with `SHUT_WR`; errors close both ends. UDP uses one relay
+  64 KiB buffers, propagating half-close with `SHUT_WR`; errors close both ends, and so does a side
+  that reports an error or hangs up after its end of file before it was shut for writing (a reset
+  half-closed side). A listener that polls readable while its first accept fails with anything but
+  `EAGAIN` (out of fds, shut down) is left out of the poll for 1 s; a failing poll waits 100 ms. UDP uses one relay
   socket per client address (120 s idle), replies sent from the held port.
 - Real client address: for IPv4, non-loopback TCP clients and IPv4 targets the relay binds a
   127.254.x.y address with the client's port and records it, so accept, getpeername and
@@ -293,10 +296,8 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - **Dual-stack listeners are not forwarded:** an AF_INET6 wildcard listener in the initial
   namespace is probed as IPv6, so IPv4 DNAT rules never match it and outside IPv4 clients reach the
   listener itself (older docker-proxy setups lose the real client address).
-- **Forwarder robustness:** a failing `poll` or a listener that stays readable while `accept`
-  fails (EMFILE, a shut-down listener) busy-spins the thread; a half-closed connection that later
-  gets reset spins until upstream writes; there are no connection or relay limits and no connect
-  timeout; UDP relays are cut when the rule changes.
+- **Forwarder limits:** there are no connection or relay limits and no connect timeout; UDP relays
+  are cut when the rule changes.
 - **Forwarded peers revert to 127.254.x.y:** the real-client record is removed when the forwarder
   closes the connection, so a container still holding the socket (CLOSE_WAIT) sees the raw
   address in getpeername.

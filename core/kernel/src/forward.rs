@@ -29,8 +29,10 @@ const POLLIN: i16 = 0x1;
 const POLLOUT: i16 = 0x4;
 const POLLERR: i16 = 0x8;
 const POLLHUP: i16 = 0x10;
+const EINTR: i32 = 4;
 const EAGAIN: i32 = 11;
 const EINPROGRESS: i32 = 115;
+const ECONNRESET: i32 = 104;
 const SOL_SOCKET: i32 = 1;
 const SO_ERROR: i32 = 4;
 const SOCK_STREAM: i32 = 1;
@@ -40,6 +42,12 @@ const SHUT_WR: i32 = 1;
 const BUFFER: usize = 64 * 1024;
 /// How long a UDP forwarding socket may stay idle before it is closed (docker-proxy: 90 seconds).
 const UDP_IDLE: Duration = Duration::from_secs(120);
+/// How long a listening socket that is readable while accept fails (out of fds, shut down) is left
+/// out of the poll, so the thread does not spin on it.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+/// How long the thread waits after poll itself fails (too many fds, out of memory) before trying
+/// again.
+const POLL_BACKOFF: Duration = Duration::from_millis(100);
 
 // ---- Forwarding thread ----
 
@@ -202,6 +210,8 @@ fn run(shared: &Shared) {
     let mut ports: HashMap<u64, (i32, Target)> = HashMap::new();
     let mut conns: Vec<Conn> = Vec::new();
     let mut relays: Vec<Relay> = Vec::new();
+    // Ports whose accept failed while they polled readable, and until when they are left out
+    let mut stalled: HashMap<u64, Instant> = HashMap::new();
     loop {
         // Take the ports handed over; close those no longer forwarded, and their UDP
         // forwarding sockets too
@@ -236,11 +246,14 @@ fn run(shared: &Shared) {
             }
             keep
         });
-        // What to wait for: the event, every port, both sides of every connection, every UDP
-        // forwarding socket
+        let now = Instant::now();
+        stalled.retain(|id, until| ports.contains_key(id) && *until > now);
+        // What to wait for: the event, every port (but stalled ones), both sides of every
+        // connection, every UDP forwarding socket
         let mut fds: Vec<(i32, i16, i16)> = vec![(event.fd(), POLLIN, 0)];
         let order: Vec<(u64, i32, bool)> = ports
             .iter()
+            .filter(|(id, _)| !stalled.contains_key(id))
             .map(|(id, (fd, t))| (*id, *fd, t.udp))
             .collect();
         fds.extend(order.iter().map(|&(_, fd, _)| (fd, POLLIN, 0)));
@@ -269,9 +282,22 @@ fn run(shared: &Shared) {
         fds.extend(relays.iter().map(|r| (r.fd, POLLIN, 0)));
         // Connections accepted and forwarding sockets opened below are not in this round
         let (polled_conns, polled_relays) = (conns.len(), relays.len());
-        let timeout = (!relays.is_empty()).then_some(Duration::from_secs(5));
-        if appine_hal::poll(&mut fds, timeout).is_err() {
-            continue;
+        let idle = (!relays.is_empty()).then_some(Duration::from_secs(5));
+        let resume = stalled
+            .values()
+            .min()
+            .map(|t| t.saturating_duration_since(now));
+        let timeout = match (idle, resume) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match appine_hal::poll(&mut fds, timeout) {
+            Ok(_) => {}
+            Err(EINTR) => continue,
+            Err(_) => {
+                std::thread::sleep(POLL_BACKOFF);
+                continue;
+            }
         }
         let mut at = 1;
         // Ports: accept connections, receive datagrams
@@ -287,9 +313,16 @@ fn run(shared: &Shared) {
                 continue;
             }
             // Accept at most 64 at a time so the other connections do not starve
-            for _ in 0..64 {
-                let Ok((client, from)) = appine_hal::net::accept(fd) else {
-                    break;
+            for n in 0..64 {
+                let (client, from) = match appine_hal::net::accept(fd) {
+                    Ok(c) => c,
+                    // Readable but nothing taken: out of fds, or a listener shut down (readable
+                    // for good); leave it out of the poll for a while
+                    Err(e) if n == 0 && e != EAGAIN => {
+                        stalled.insert(id, Instant::now() + ACCEPT_BACKOFF);
+                        break;
+                    }
+                    Err(_) => break,
                 };
                 match open(target, outside_client(&from)) {
                     Ok((upstream, ready, outside)) => conns.push(Conn {
@@ -359,6 +392,24 @@ fn step(c: &mut Conn, cr: i16, ur: i16) -> Result<(), i32> {
         match i32::from_le_bytes(err[..4].try_into().unwrap()) {
             0 => c.ready = true,
             e => return Err(e),
+        }
+    }
+    // A side that reports an error, or hangs up after its end of file while it may still be written
+    // to, was reset: nothing more goes through it. Neither direction is polled for input after end
+    // of file, so a reset of a half-closed side would otherwise show at every poll
+    for (fd, r, eof, shut) in [
+        (c.client, cr, c.client_eof, c.client_shut),
+        (c.upstream, ur, c.up_eof, c.up_shut),
+    ] {
+        if r & POLLERR != 0 {
+            let err = appine_hal::net::getsockopt(fd, SOL_SOCKET, SO_ERROR, 4)?;
+            match i32::from_le_bytes(err[..4].try_into().unwrap()) {
+                0 => {}
+                e => return Err(e),
+            }
+        }
+        if r & POLLHUP != 0 && eof && !shut {
+            return Err(ECONNRESET);
         }
     }
     if cr & (POLLIN | POLLHUP | POLLERR) != 0 && !c.client_eof {
@@ -702,6 +753,78 @@ mod tests {
         assert_eq!(outside_client(&loopback(4000)), None);
         appine_hal::net::close(server);
         appine_hal::net::close(held);
+    }
+
+    /// CPU time (clock ticks) of the forwarding threads of this process, on Linux hosts.
+    fn forward_ticks() -> Option<u64> {
+        let mut total = 0;
+        for task in std::fs::read_dir("/proc/self/task").ok()? {
+            let stat = std::fs::read_to_string(task.ok()?.path().join("stat")).ok()?;
+            let (name, rest) = stat.split_once(") ")?;
+            if name.ends_with("(forward") {
+                let f: Vec<&str> = rest.split(' ').collect();
+                total += f[11].parse::<u64>().ok()? + f[12].parse::<u64>().ok()?;
+            }
+        }
+        Some(total)
+    }
+
+    /// A connection whose client half-closed and then reset is closed toward the destination at
+    /// once, and a listening socket that stays readable while accept fails (shut down) is left
+    /// out of the poll for a while: neither makes the thread spin.
+    #[test]
+    fn resets_and_dead_listeners_do_not_spin() {
+        let server = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(server, &loopback(0)).unwrap();
+        appine_hal::net::listen(server, 8).unwrap();
+        let held = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        appine_hal::net::bind(held, &loopback(0)).unwrap();
+        appine_hal::net::listen(held, 8).unwrap();
+        let f = Forwarder::default();
+        let _h = f
+            .add(
+                held,
+                Target {
+                    udp: false,
+                    addr: loopback(port(server)),
+                    source: None,
+                },
+            )
+            .unwrap();
+        let c = appine_hal::net::socket(AF_INET, SOCK_STREAM, 0).unwrap();
+        let _ = appine_hal::net::connect(c, &loopback(port(held)));
+        wait(server, POLLIN);
+        let (s, _) = appine_hal::net::accept(server).unwrap();
+        wait(c, POLLOUT);
+        appine_hal::net::sendmsg(c, b"x", &[], &[], 0).unwrap();
+        appine_hal::net::shutdown(c, SHUT_WR).unwrap();
+        let mut buf = [0u8; 16];
+        wait(s, POLLIN);
+        assert_eq!(appine_hal::read(s, &mut buf), Ok(1));
+        wait(s, POLLIN);
+        assert_eq!(appine_hal::read(s, &mut buf), Ok(0));
+        let idle = |what: &str| {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(before) = forward_ticks() {
+                std::thread::sleep(Duration::from_millis(500));
+                let used = forward_ticks().unwrap() - before;
+                assert!(
+                    used < 10,
+                    "{what}: the forwarding threads used {used} ticks in 0.5 s"
+                );
+            }
+        };
+        // The client resets (SO_LINGER with a zero timeout) after its half-close
+        let linger = [1i32.to_le_bytes(), 0i32.to_le_bytes()].concat();
+        appine_hal::net::setsockopt(c, SOL_SOCKET, 13, &linger).unwrap();
+        appine_hal::net::close(c);
+        idle("reset");
+        // A listener shut down for reading polls readable for good while accept fails
+        appine_hal::net::shutdown(held, 0).unwrap();
+        idle("shut-down listener");
+        for fd in [server, held, s] {
+            appine_hal::net::close(fd);
+        }
     }
 
     /// UDP: datagrams go to the destination, and replies go back to the source from the
