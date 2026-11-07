@@ -245,6 +245,9 @@ pub(crate) struct Kernel {
     pub pipe_max_size: usize,
     /// `/proc/sys/fs/nr_open`: the fd ceiling (`RLIMIT_NOFILE` cannot exceed it).
     pub nr_open: usize,
+    /// `/proc/sys/fs/mount-max`: the most mounts one mount namespace may hold (Linux's
+    /// `sysctl_mount_max`); adding more is `ENOSPC`.
+    pub mount_max: usize,
     /// `/proc/sys/kernel/threads-max`: the upper bound on the number of threads existing at once;
     /// it applies to root too.
     pub threads_max: usize,
@@ -385,6 +388,7 @@ impl Kernel {
             kills: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
+            mount_max: 100_000,
             threads_max: crate::process::default_threads_max(),
             oom: Default::default(),
             code_groups: Default::default(),

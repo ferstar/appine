@@ -53,9 +53,7 @@ SKIP="$SKIP:$M.MountNamespaceSlavesNewUserNamespace:$M.PrivateMasterUnslaves:$M.
 SKIP="$SKIP:$M.RecursiveBindPropagation:$M.SetMountPropagationOfStackedMounts"
 SKIP="$SKIP:$M.SetPropagationRecursive:$M.SlaveMaster:$M.UmountIgnoresPeersWithChildren"
 SKIP="$SKIP:$M.UmountPropagatedSubtreeFromPrivilegedNS:$M.UmountReparentsCoveredMounts"
-# kernel/vfs: no mount limit, and recursive binds stall the kernel (FailedBindDoesNotBreakPropagation
-# doubles the mounts until Appine freezes; SIGKILL cannot stop it)
-SKIP="$SKIP:$M.Max*:$M.MountMax:$M.FailedBindDoesNotBreakPropagation"
+SKIP="$SKIP:$M.MaxMounts:$M.MaxMountsWithSlave:$M.FailedBindDoesNotBreakPropagation"
 # No overlayfs (kernel/vfs: other filesystem types are ENODEV); sysfs has no /sys/kernel
 # (kernel/procfs)
 SKIP="$SKIP:$M.LockedMountStopsOverlayLowerdir:$M.LockedMountStopsOverlayUpperdir"

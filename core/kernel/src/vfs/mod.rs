@@ -1241,6 +1241,55 @@ impl Vfs {
         root: &Node,
         dir: &Node,
     ) -> Result<(Vec<u8>, bool), Errno> {
+        let mounts = self.mounts.borrow();
+        self.reach_in(ps, root, dir, |id| {
+            mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .find(|m| m.id == id)
+        })
+    }
+
+    /// Attached mounts in mount namespace `ns`, in mount order, each with its mount point's path
+    /// from `root` when reachable from it (mountinfo). Mounts are looked up by id through an
+    /// index built once: a scan of the table at each step up made listing a large table
+    /// quadratic (65,000 mounts took 17 s under the BKL, and busybox's umount reads the list).
+    pub(crate) fn mounts_from(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        ns: u64,
+    ) -> Vec<(Mount, Option<Vec<u8>>)> {
+        let mounts = self.mounts.borrow();
+        let by_id: std::collections::HashMap<MountId, &Mount> = mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .map(|m| (m.id, m))
+            .collect();
+        mounts
+            .list
+            .iter()
+            .filter(|m| m.ns == ns)
+            .map(|m| {
+                let path = match self.reach_in(ps, root, &m.root, |id| by_id.get(&id).copied()) {
+                    Ok((path, true)) => Some(path),
+                    _ => None,
+                };
+                (m.clone(), path)
+            })
+            .collect()
+    }
+
+    /// [`reach`](Self::reach), looking mounts (attached or detached) up by id through `find`.
+    fn reach_in<'m>(
+        &self,
+        ps: &dyn Pseudo,
+        root: &Node,
+        dir: &Node,
+        find: impl Fn(MountId) -> Option<&'m Mount>,
+    ) -> Result<(Vec<u8>, bool), Errno> {
         let mut names = Vec::new();
         let mut cur = dir.clone();
         let mut reached = true;
@@ -1248,8 +1297,10 @@ impl Vfs {
             if cur == *root {
                 break;
             }
-            if let Some((point, at)) = self.root_point(&cur) {
-                match at {
+            let mount = find(cur.mnt()).filter(|m| m.root == cur);
+            // The root of a mount with a mount point (detached ones have none)
+            if let Some(point) = mount.and_then(|m| m.point.clone()) {
+                match mount.and_then(|m| m.at.clone()) {
                     // Mounted on a file: through the directory and name recorded at mount
                     // time
                     Some((dir, name)) => {
@@ -1261,7 +1312,7 @@ impl Vfs {
                 continue;
             }
             // The root of the mount tree, or the root of a detached mount
-            if self.is_mount_root(&cur) {
+            if mount.is_some() {
                 reached = false;
                 break;
             }
@@ -1435,10 +1486,21 @@ impl Vfs {
         self.mounts.borrow().list.clone()
     }
 
-    /// Attached mounts in mount namespace `ns`, in mount order (mountinfo).
-    pub(crate) fn mounts_in(&self, ns: u64) -> Vec<Mount> {
+    /// Attached mounts in mount namespace `ns`, in mount order.
+    #[cfg(test)]
+    fn mounts_in(&self, ns: u64) -> Vec<Mount> {
         let mounts = self.mounts.borrow();
         mounts.list.iter().filter(|m| m.ns == ns).cloned().collect()
+    }
+
+    /// How many mounts mount namespace `ns` holds (for `fs.mount-max`).
+    pub(crate) fn count_in(&self, ns: u64) -> usize {
+        self.mounts
+            .borrow()
+            .list
+            .iter()
+            .filter(|m| m.ns == ns)
+            .count()
     }
 
     /// The boot mount namespace.
@@ -1603,20 +1665,7 @@ impl Vfs {
     /// Mount `id` and the mounts below it (level by level downwards, mount_setattr's
     /// `AT_RECURSIVE`).
     pub(crate) fn subtree(&self, id: MountId) -> Vec<MountId> {
-        let mounts = self.mounts.borrow();
-        let mut out = vec![id];
-        let mut i = 0;
-        while let Some(&parent) = out.get(i) {
-            out.extend(
-                mounts
-                    .list
-                    .iter()
-                    .filter(|m| m.parent() == Some(parent) && m.id != parent)
-                    .map(|m| m.id),
-            );
-            i += 1;
-        }
-        out
+        tree_of(&self.mounts.borrow().list, id)
     }
 
     /// The root directory of mount namespace `ns` (the root of the mount tree's root, or the
@@ -1997,6 +2046,57 @@ impl Vfs {
         mounts.proc_ns.get(&m.dev).cloned()
     }
 
+    /// Adds copies of mounts below mount `to` at once (Linux's `copy_tree`, for recursive binds and
+    /// open_tree): `plan` lists the mounts to copy, each after its parent, with the index in `plan`
+    /// of its parent's copy (None for `to` itself). Each copy is mounted at the same place in its
+    /// parent's copy, with the same filesystem, root, flags, device, source and pin, in the
+    /// namespace of `to`. Done in one pass, so that copying n mounts costs O(n).
+    pub(crate) fn add_copies(&self, to: MountId, plan: &[(Option<usize>, &Mount)]) {
+        if plan.is_empty() {
+            return;
+        }
+        let mut mounts = self.mounts.borrow_mut();
+        let ns = mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .find(|m| m.id == to)
+            .map_or(INIT_MNT_NS, |m| m.ns);
+        let mut ids: Vec<MountId> = Vec::with_capacity(plan.len());
+        for (parent, c) in plan {
+            let parent = parent.map_or(to, |i| ids[i]);
+            // The plan has no mount without a point; one would leave its children to its parent
+            let Some(point) = &c.point else {
+                ids.push(parent);
+                continue;
+            };
+            let id = mounts.next;
+            mounts.next += 1;
+            let point = point.clone().in_mount(parent);
+            let at =
+                c.at.clone()
+                    .map(|(dir, name)| (dir.in_mount(parent), name))
+                    .filter(|_| matches!(point, Node::Store(..)));
+            mounts.list.push(Mount {
+                id,
+                ns,
+                fs: c.fs,
+                root: c.root.clone().in_mount(id),
+                point: Some(point),
+                at,
+                root_at: c.root_at.clone(),
+                flags: c.flags & ms::PER_MOUNT,
+                dev: c.dev,
+                source: c.source.clone(),
+                expiring: false,
+                pin: c.pin.clone(),
+            });
+            ids.push(id);
+        }
+        drop(mounts);
+        self.mounts_changed();
+    }
+
     /// Device number of the mqueue instance of IPC namespace `ns` (reported by nodes in the
     /// mqueue filesystem and by fds from mq_open): [`MQUEUE_DEV`] for the boot namespace,
     /// others allocated on first use.
@@ -2037,15 +2137,8 @@ impl Vfs {
     /// mounted on another mount any more, and each one's root has no parent.
     pub(crate) fn remove_mount(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
-        let mut gone = vec![id];
-        let mut i = 0;
-        // After MS_MOVE or pivot_root a mount is not necessarily inside a mount mounted before
-        // it; search level by level
-        while let Some(&parent) = gone.get(i) {
-            let inside = mounts.list.iter().filter(|m| m.parent() == Some(parent));
-            gone.extend(inside.map(|m| m.id).collect::<Vec<_>>());
-            i += 1;
-        }
+        let gone: std::collections::HashSet<MountId> =
+            tree_of(&mounts.list, id).into_iter().collect();
         let list = std::mem::take(&mut mounts.list);
         let (out, keep): (Vec<_>, Vec<_>) = list.into_iter().partition(|m| gone.contains(&m.id));
         mounts.list = keep;
@@ -2315,6 +2408,27 @@ fn split(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
     path.split(|&b| b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
         .map(<[u8]>::to_vec)
+}
+
+/// Mount `id` and the mounts below it in `list`, level by level downwards. After MS_MOVE or
+/// pivot_root a mount is not necessarily inside a mount mounted before it, so the levels come from
+/// an index by parent built once: a scan of the list per mount made unmounting a large tree (a
+/// recursive bind doubled up to `fs.mount-max`) quadratic, holding the BKL for tens of seconds.
+fn tree_of(list: &[Mount], id: MountId) -> Vec<MountId> {
+    let mut children: std::collections::HashMap<MountId, Vec<MountId>> =
+        std::collections::HashMap::new();
+    for m in list {
+        if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+            children.entry(parent).or_default().push(m.id);
+        }
+    }
+    let mut out = vec![id];
+    let mut i = 0;
+    while let Some(&parent) = out.get(i) {
+        out.extend(children.get(&parent).into_iter().flatten());
+        i += 1;
+    }
+    out
 }
 
 /// Mount `m` is mounted on `name` (inode `ino`) in store directory `dir`.

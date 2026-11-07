@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; module references; `/sys/block`; mm fields in maps and status; sysctls; `/proc/vmstat`; names as bytes; the exited main thread; Starnix's test findings, zombies' files last)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; module references; `/sys/block`; mm fields in maps and status; sysctls; `/proc/vmstat`; names as bytes; the exited main thread; Starnix's test findings, zombies' files; `fs.mount-max` last)
 
 ## Responsibilities
 
@@ -179,6 +179,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
   `conf/all/forwarding`; `NetConf` directories per interface); everything else kernel-wide
   (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`,
+  `mount-max` (1 to `INT_MAX`; the mount limit of kernel/vfs),
   `pipe-max-size`, `core_pattern`, `core_uses_pid`, `protected_symlinks`/`hardlinks`, `printk*`,
   `panic`, `user/max_*_namespaces`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
   `actions_logged` need `CAP_SYS_ADMIN` in the initial namespace, `mmap_min_addr`
@@ -325,7 +326,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
-  `loadavg`, the VFS (`mounts_in`, `reach`, `path_of`, devpts options, the loop devices'
+  `loadavg`, the VFS (`mounts_from`, `reach`, `path_of`, devpts options, the loop devices'
   `Loops`).
 - Host: `appine_hal` (`host_meminfo`, `host_cpus`, `cpu_sysfs`, `clock_gettime`, `fill_random`,
   `thread_ctxt_switches`, routes, `tx_queue_len`); the engine (`guest_hwcap*`, `guest_midr`).

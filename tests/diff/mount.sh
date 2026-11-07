@@ -1,7 +1,8 @@
 # docker-run-options: --cap-add SYS_ADMIN --security-opt apparmor=unconfined
 # mount and umount: procfs, sysfs, devpts and cgroup2 mounted on other directories, bind mounts
 # of directories inside them, `..` and getcwd through mount points, mountinfo listed by the
-# process's root directory, unmounting, and errors like EBUSY. The native side is a docker
+# process's root directory, unmounting, errors like EBUSY, and the fs.mount-max limit. The
+# native side is a docker
 # container with CAP_SYS_ADMIN whose /sys is read-only and whose /proc/sys has a separate
 # read-only bind, so only the new mounts are compared, and superblock options are not (a new
 # devpts instance defaults to mode=600 on Linux)
@@ -283,3 +284,16 @@ for n in null zero full random urandom tty ptmx pts/ptmx; do
 done
 python3 -c 'import os; m, s = os.openpty(); print("openpty:", os.ttyname(s).startswith("/dev/pts/"))'
 head -c 8 /dev/urandom | wc -c
+# fs.mount-max (Linux's count_mounts): each recursive bind of a tree onto a directory inside it
+# doubles the mounts in the namespace, until adding them would pass the limit (ENOSPC). The limit
+# is only read: it is global, and on the native side it is the development VM's (0 is refused
+# either way, as below the minimum here and read-only /proc/sys there)
+echo "mount-max: $(cat /proc/sys/fs/mount-max)"
+echo 0 2>/dev/null > /proc/sys/fs/mount-max || echo "mount-max 0: refused"
+unshare -m sh -c '
+mkdir -p /tmp/rb && mount -t tmpfs none /tmp/rb && mount --make-private /tmp/rb
+i=0
+while mkdir /tmp/rb/d$i && mount --rbind /tmp/rb /tmp/rb/d$i 2>/tmp/rb.err; do i=$((i + 1)); done
+echo "recursive binds before the limit: $i ($(sed "s/.*: //" /tmp/rb.err))"
+umount -l /tmp/rb'
+rm -f /tmp/rb.err

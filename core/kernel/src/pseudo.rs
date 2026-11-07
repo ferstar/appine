@@ -281,7 +281,7 @@ const PROC_NET: [&[u8]; 18] = [
 /// `/proc`, directories ending in `/`). Those under `sys/net` follow the reader's network namespace
 /// (as on Linux), and the directories under `ipv4/conf` and `ipv6/conf` are
 /// [`PseudoNode::NetConf`].
-const STATIC: [&[u8]; 128] = [
+const STATIC: [&[u8]; 129] = [
     b"sys/",
     b"sys/debug/",
     b"sys/debug/exception-trace",
@@ -294,6 +294,7 @@ const STATIC: [&[u8]; 128] = [
     b"sys/fs/inotify/max_user_instances",
     b"sys/fs/inotify/max_user_watches",
     b"sys/fs/lease-break-time",
+    b"sys/fs/mount-max",
     b"sys/fs/mqueue/",
     b"sys/fs/mqueue/msg_default",
     b"sys/fs/mqueue/msg_max",
@@ -2023,6 +2024,7 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
                     | b"sys/fs/mqueue/msgsize_default"
                     | b"sys/fs/mqueue/msgsize_max"
                     | b"sys/fs/mqueue/queues_max"
+                    | b"sys/fs/mount-max"
                     | b"sys/fs/nr_open"
                     | b"sys/fs/pipe-max-size"
                     | b"sys/fs/inotify/max_queued_events"
@@ -2156,6 +2158,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!("{}\n", ps.k.inotify.borrow().max_watches)
             }
             b"sys/fs/nr_open" => format!("{}\n", ps.k.nr_open),
+            b"sys/fs/mount-max" => format!("{}\n", ps.k.mount_max),
             b"sys/fs/pipe-max-size" => format!("{}\n", ps.k.pipe_max_size),
             b"sys/fs/pipe-user-pages-hard" => "0\n".to_owned(),
             b"sys/fs/pipe-user-pages-soft" => "16384\n".to_owned(),
@@ -3091,13 +3094,9 @@ pub(crate) fn write_mem(
 /// listed (after chroot the mounts outside are invisible, the root filesystem included). Mount ids
 /// match fdinfo's `mnt_id`, and device numbers match stat's `st_dev`.
 fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
-    let visible = |node: &Node| match ps.vfs.reach(ps, root, node) {
-        Ok((path, true)) => Some(path),
-        _ => None,
-    };
     let mut out = Vec::new();
-    for m in ps.vfs.mounts_in(ns) {
-        let Some(point) = visible(&m.root) else {
+    for (m, point) in ps.vfs.mounts_from(ps, root, ns) {
+        let Some(point) = point else {
             continue;
         };
         MountLine {
@@ -4004,6 +4003,14 @@ pub(crate) fn write(
         k.lease_break_time = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
+            .ok_or(Errno::EINVAL)?;
+    }
+    // At least 1, at most INT_MAX (proc_dointvec_minmax with SYSCTL_ONE)
+    if let PseudoNode::Static(b"sys/fs/mount-max") = node {
+        k.mount_max = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|n| (1..=i32::MAX as usize).contains(n))
             .ok_or(Errno::EINVAL)?;
     }
     // The fd table's capacity is fixed: nr_open can be lowered but cannot exceed it

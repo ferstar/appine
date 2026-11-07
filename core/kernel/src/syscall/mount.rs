@@ -13,7 +13,7 @@
 //! that mounted it (`syscall::mqueue`).
 //! Other filesystems are ENODEV, the same as ones not built into the kernel.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::fs::{AT_FDCWD, lookup_at, start_dir};
@@ -189,6 +189,7 @@ fn new_mount(
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
+        room_for(cx, &vfs, target.mnt(), 1)?;
         vfs.new_tmpfs((target, at), flags, source, params)?;
         cx.shared.fast_changed();
         return Ok(0);
@@ -206,6 +207,7 @@ fn new_mount(
         ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
     };
+    room_for(cx, &vfs, target.mnt(), 1)?;
     let id = vfs.add_mount(
         fs,
         root,
@@ -278,9 +280,11 @@ fn bind(
     check_mnt(cx, &vfs, src.mnt())?;
     check_mnt(cx, &vfs, target.mnt())?;
     let m = vfs.mount(src.mnt()).ok_or(Errno::EINVAL)?;
-    // Note the mounts inside the source before mounting: if the target is inside the source, the
-    // new mount is not copied into itself
+    // Plan the copies of the mounts inside the source before mounting: if the target is inside the
+    // source, the new mount is not copied into itself
     let inside = if recursive { vfs.mounts() } else { Vec::new() };
+    let plan = plan_copies(&vfs, &view, &inside, &src);
+    room_for(cx, &vfs, target.mnt(), 1 + plan.len())?;
     let id = vfs.add_mount(
         m.fs,
         src.clone(),
@@ -292,7 +296,7 @@ fn bind(
     if !dir {
         vfs.set_root_at(id, found);
     }
-    copy_submounts(&vfs, &view, &inside, &src, id);
+    vfs.add_copies(id, &plan);
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -599,8 +603,9 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
         } else {
             Vec::new()
         };
+        let plan = plan_copies(&vfs, &view, &inside, &node);
         let id = vfs.clone_mount(&node, found.filter(|_| !dir), ns.id)?;
-        copy_submounts(&vfs, &view, &inside, &node, id);
+        vfs.add_copies(id, &plan);
         let file = crate::fd::OpenFile::new(crate::fd::FileKind::Path(node.in_mount(id)), o_path);
         file.borrow_mut().tree = Some(ns);
         cx.shared.fast_changed();
@@ -955,31 +960,67 @@ fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
 
 // ---- Shared helpers ----
 
-/// Mounts the mounts below `root` in the mount `root` is in (those in `snapshot`) the same way
-/// into mount `to` (Linux's `copy_tree`).
-fn copy_submounts(vfs: &Vfs, ps: &dyn Pseudo, snapshot: &[Mount], root: &Node, to: MountId) {
-    for c in snapshot.iter().filter(|c| c.parent() == Some(root.mnt())) {
-        let Some(point) = &c.point else {
-            continue;
-        };
-        // A mount on a file searches upwards from the directory it was mounted through
-        let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
-        if point != root && !vfs.is_under(ps, from, root) {
-            continue;
+/// The mounts below `root` in the mount `root` is in (those in `snapshot`), to be copied the same
+/// way into a new mount (Linux's `copy_tree`; [`Vfs::add_copies`] adds them): each after its
+/// parent, in the order recursion would visit them, with the index of its parent in the plan
+/// (None for a mount directly in the new one). The mounts are indexed by parent first, so planning
+/// n copies is O(n); a scan of the whole snapshot per mount made a recursive bind of a tree onto
+/// itself quadratic, and each such bind holds the BKL.
+fn plan_copies<'a>(
+    vfs: &Vfs,
+    ps: &dyn Pseudo,
+    snapshot: &'a [Mount],
+    root: &Node,
+) -> Vec<(Option<usize>, &'a Mount)> {
+    let mut children: HashMap<MountId, Vec<&Mount>> = HashMap::new();
+    for m in snapshot {
+        if let Some(parent) = m.parent() {
+            children.entry(parent).or_default().push(m);
         }
-        let at = c.at.clone().map(|(dir, name)| (dir.in_mount(to), name));
-        let id = vfs.add_mount(
-            c.fs,
-            c.root.clone(),
-            (point.clone().in_mount(to), at),
-            c.flags,
-            c.source.clone(),
-            Some(c.dev),
-        );
-        vfs.set_root_at(id, c.root_at.clone());
-        vfs.update_mount(id, |m| m.pin = c.pin.clone());
-        copy_submounts(vfs, ps, snapshot, &c.root, id);
     }
+    // The children of mount `of` to copy: those with a point, mounted under `root` (a mount on a
+    // file searches upwards from the directory it was mounted through)
+    let below = |of: MountId, root: &Node| -> Vec<&'a Mount> {
+        children
+            .get(&of)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|c| {
+                c.point.as_ref().is_some_and(|point| {
+                    let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
+                    point == root || vfs.is_under(ps, from, root)
+                })
+            })
+            .collect()
+    };
+    let mut plan = Vec::new();
+    let mut stack: Vec<(Option<usize>, &Mount)> = below(root.mnt(), root)
+        .into_iter()
+        .rev()
+        .map(|c| (None, c))
+        .collect();
+    while let Some((parent, c)) = stack.pop() {
+        let index = plan.len();
+        plan.push((parent, c));
+        stack.extend(
+            below(c.id, &c.root)
+                .into_iter()
+                .rev()
+                .map(|g| (Some(index), g)),
+        );
+    }
+    plan
+}
+
+/// Linux's `count_mounts`: adding `n` mounts to the namespace of mount `parent` must leave it
+/// within `fs.mount-max`, otherwise ENOSPC.
+fn room_for(cx: &Cx<'_>, vfs: &Vfs, parent: MountId, n: usize) -> Result<(), Errno> {
+    let have = vfs.mount_ns(parent).map_or(0, |ns| vfs.count_in(ns));
+    if have + n > cx.kr().mount_max {
+        return Err(Errno::ENOSPC);
+    }
+    Ok(())
 }
 
 /// Moves the mount rooted at `src` onto `target` (Linux's `do_move_mount`, shared by `MS_MOVE` and
@@ -1007,6 +1048,8 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     }
     may_mount_on(&target)?;
     if anon {
+        let size = vfs.mount_ns(id).map_or(0, |ns| vfs.count_in(ns));
+        room_for(cx, &vfs, target.mnt(), size)?;
         vfs.attach_tree(id, (target, at), cx.mnt_ns());
     } else {
         if vfs.is_under(&view, &target, src) {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC` from open; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; Starnix's and gVisor's test findings, mounts and inotify last)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; test-suite findings; the mount limit and large mount tables last)
 
 ## Responsibilities
 
@@ -83,7 +83,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - **Resolution**: `Vfs::resolve`, `walk`, `walk_resolve(…, follow, flags)`, `resolve_parent`,
   `resolve_parent_with`, `found_path`, `path_of`, `reach`; `Cached::stat` (fast path).
-- **Mounts**: `Vfs::open` (boot mounts), `mounts`/`mounts_in`, `copy_ns`, `anon_ns`,
+- **Mounts**: `Vfs::open` (boot mounts), `mounts`/`mounts_from`, `copy_ns`, `anon_ns`,
   `clone_mount`, `attach_tree`, `subtree`, `collect`, `readonly`, `mount_flags`, `dev_of`,
   `fs_of`, `tmpfs_*`; syscalls `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`,
   `move_mount`, `mount_setattr` (`fsopen`/`fsconfig`/`fsmount`/`fspick` have no handler: ENOSYS).
@@ -146,7 +146,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `NO_XDEV`'s "root taken" rule is approximated).
 - Back to paths: `reach` climbs through mount points (or the recorded dentry for mounts on files)
   and stops as unreachable at a namespace-tree root, a detached root, or a tmpfs root; a deleted
-  directory is `ENOENT`. `getcwd` prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed
+  directory is `ENOENT`. mountinfo's `mounts_from` does the same for every mount, looking mounts up
+  through an index by id built once. `getcwd` prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed
   live against the reader's root; an fd's display path is computed once at open, with
   ` (deleted)` appended later when nlink is 0.
 - `Cached` (fast-path stat without the BKL) is used only when the root is in the root
@@ -160,6 +161,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - One global table holds every namespace's mounts; each `Mount` records its namespace. Ids are
   never reused; the list order is the mountinfo order.
+- A namespace holds at most `fs.mount-max` mounts (`Kernel::mount_max`, default 100000, as Linux's
+  `count_mounts`): a new mount, a bind with the submounts it copies, or attaching a detached tree
+  that would pass it is `ENOSPC`. Detached trees in anonymous namespaces are not limited.
 - Boot (`Vfs::open`): when it is the store's only user, the store clears its `/dev/shm` and
   `/run` (not `/tmp`). Mounts, in order: `/` (id 1, store, no mount point — Linux's invisible
   rootfs), `/proc` (2), `/dev` tmpfs (7, `mode=755`, nosuid and relatime only — neither nodev nor
@@ -182,7 +186,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mqueue needs `CAP_SYS_ADMIN` over the IPC namespace. A new mount belongs to the namespace of the
   mount its point is in.
 - Bind: the new mount sees the source node with the source mount's filesystem, flags, device and
-  source; `MS_REC` snapshots and copies submounts (`copy_submounts`); binding a namespace file
+  source; `MS_REC` copies the submounts under the source from one snapshot, in one pass over a
+  child index (`plan_copies`, then `Vfs::add_copies` in one borrow); binding a namespace file
   creates an nsfs mount that pins the namespace (a mount-namespace file must be newer than the
   caller's namespace).
 - Remount needs the exact mount root; flags change on this mount only (atime bits are kept if
@@ -566,6 +571,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- The mount table is a list, and a namespace may hold 100000 mounts: anything that visits many
+  mounts indexes them once (by parent in `plan_copies` and `tree_of`, by id in `mounts_from`),
+  since a scan of the table per mount holds the BKL for tens of seconds at that size.
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   the same mount; the process root itself is never lifted (as in Linux, a mount on `/` is not seen
   by absolute lookups).
@@ -727,12 +735,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
   kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
   root.
-- **No mount limit, and recursive binds stall the kernel:** there is no `fs.mount-max`, so a
-  loop of recursive binds of a tree onto itself never gets Linux's `ENOSPC`; each step doubles the
-  mounts and the time one bind holds the BKL (about four times longer per step: 0.05, 0.2, 0.7,
-  3 s…), during which every guest process waits and `SIGKILL` takes no effect. Any user able to
-  `unshare -Urm` can freeze the whole Appine kernel this way (gVisor's
-  `FailedBindDoesNotBreakPropagation` does it while looking for the limit).
 - **Mounts copied into a less privileged namespace are not locked:** a mount namespace created
   together with, or owned by, a new user namespace does not lock the mounts it inherits, so its
   root can unmount them or use one as pivot_root's `new_root`, where Linux 6.1 refuses with
