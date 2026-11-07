@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; last, API level 30 for the app and cargo-ndk)
 
 ## Responsibilities
 
@@ -80,7 +80,7 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 ### Build
 
-- cargo-ndk builds `arm64-v8a` for API 29, always in release, into `target/android`; debug variants
+- cargo-ndk builds `arm64-v8a` for API 30, always in release, into `target/android`; debug variants
   add the `test-hooks` and `borrow-check` features.
 - On an Android target, `build.rs` runs `zig build -Demit-lib-vt` (baseline CPU, ReleaseFast) on
   the Ghostty 1.4.0 source in `target/ghostty` (or `APPINE_GHOSTTY_SRC`) into `OUT_DIR`, with the
@@ -107,7 +107,7 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
   JetBrains annotations, Guava's listenablefuture, Material Components, Error Prone annotations,
   JSpecify), or the task fails. The component texts and
   versions are copies kept by hand and change with the Ghostty version.
-- SDK: min 29, compile and target 37; uncompressed native libraries (`useLegacyPackaging = false`)
+- SDK: min 30, compile and target 37; uncompressed native libraries (`useLegacyPackaging = false`)
   so 16 KB-aligned `LOAD` segments (NDK 29's default) map directly from the APK.
 - Warnings fail: every Kotlin compilation (the app and the instrumentation tests, local builds
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
@@ -175,8 +175,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - The release build is signed with the debug key and not minified; the Alpine tarball's checksum is
   checked only in `scripts/fetch-rootfs`.
 - Local references are never deleted in loops that build arrays (harmless with ART's large table
-  on API 29+); a failed string conversion with no pending exception makes void calls return
-  silently (unreachable from the non-null Kotlin signatures).
+  on every supported version); a failed string conversion with no pending exception makes void
+  calls return silently (unreachable from the non-null Kotlin signatures).
 - `scripts/fetch-ghostty` checks only the pinned sha256; the release's minisign signature is to be
   checked by hand once when upgrading, before pinning the new sha256.
 

@@ -63,7 +63,7 @@ The default distribution is Alpine; settings can switch it to Debian 13 ([androi
 | Page size | From Android 15, apps must be compatible with 16 KB page kernels | The page size presented to the guest must be decoupled from the host page size |
 | Host address space | The common GKI configuration is 4K pages + 39-bit VA, giving user space only about 512 GB | A large contiguous address range cannot be reserved for each guest process |
 
-The minimum system version is **minSdk 29 (Android 10)**: `android_res_nsend`, which the DNS stub relies on, is available from API 29.
+The minimum system version is **minSdk 30 (Android 11)**: the Files app provider adds close callbacks to the fds it hands out with `ParcelFileDescriptor.wrap`, and the service tells why the previous run ended from `ApplicationExitInfo`, both available from API 30 (`android_res_nsend`, which the DNS stub relies on, from API 29).
 
 ## 3. Overall architecture
 

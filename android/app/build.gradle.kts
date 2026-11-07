@@ -47,7 +47,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.mthli.appine"
-        minSdk = 29
+        minSdk = 30
         targetSdk = 37
         versionCode = 1
         versionName = "0.0.0"
@@ -138,7 +138,7 @@ abstract class CargoNdkTask : DefaultTask() {
             workingDir = root
             executable = cargo
             args(
-                "ndk", "-t", "arm64-v8a", "--platform", "29",
+                "ndk", "-t", "arm64-v8a", "--platform", "30",
                 "-o", outputDir.get().asFile.path,
                 "build", "--release", "-p", "appine-android",
             )

@@ -469,9 +469,8 @@ libghostty-vt with Zig (`android/native`).
 ## To verify
 
 - Which IMEs on real devices deliver Enter as text; the cutout insets and the keys following the
-  IME on real devices, other IMEs and Android 10 (where androidx emulates the IME animation);
-  tried only with Gboard on a Pixel 4a API 34 emulator and the outer display of a Pixel 10 Pro
-  Fold API 37 emulator (landscape both ways).
+  IME on real devices and other IMEs; tried only with Gboard on a Pixel 4a API 34 emulator and the
+  outer display of a Pixel 10 Pro Fold API 37 emulator (landscape both ways).
 - The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
   foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing and
   switching animations upright only, slowed down).

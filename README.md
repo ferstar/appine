@@ -122,7 +122,7 @@ login shell on an in-process terminal. It needs the Android SDK with NDK 29.0.14
 ```sh
 scripts/fetch-rootfs
 cd android
-./gradlew installDebug                 # on a connected arm64 device or emulator (Android 10+)
+./gradlew installDebug                 # on a connected arm64 device or emulator (Android 11+)
 ./gradlew connectedDebugAndroidTest    # instrumentation tests, on the same kind of device
 ```
 
