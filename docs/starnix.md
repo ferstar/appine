@@ -42,8 +42,9 @@ in the module maps, not here.
   - The failures came down to about 45 unrecorded causes, now in the maps of kernel/process, mm,
     signal, net, tty, cred, poll, procfs and vfs, plus causes the maps had already recorded
     (propagation, PI futexes, absent proc files, the vvar page, the decided `ENOSYS` syscalls).
-  - The biggest single causes: a thread-group leader that exits before its threads vanishes from
-    `/proc/<pid>/task` (35 tests), and missing or misjudged sysctls (about 170).
+  - The biggest single causes were a thread-group leader that exits before its threads vanishing
+    from `/proc/<pid>/task` (35 tests) and missing or misjudged sysctls (about 170). Both are
+    fixed, with seven smaller causes (see "Taken so far"); the run has not been repeated since.
   - Excluded:
     - behaviour newer than 6.1 (the io_uring sysctls of 6.6, a setresuid test that needs 6.3);
     - docker's environment (the `RLIMIT_NOFILE` hard limit, `/proc/2`, input devices);
@@ -72,10 +73,20 @@ in the module maps, not here.
 | e03c0cc | Linux's VMA boundaries, `PROT_GROWSDOWN` and stack growth (the gaps `mmap_test` showed) |
 | 8dc166b | The line discipline follows n_tty |
 | 4e64e74 | The full run's deviations recorded in nine maps |
+| 09188ec | Record-lock ranges at the edges of `off_t`, among other arguments at the edges of their types |
+| 42d2ffe | The common sysctls; root can write the read-only ones |
+| 79a60cf | An exited main thread stays in `task/` as a zombie until the process is reaped |
+| 60921b2 | `/proc/vmstat` |
+| 97b1d62 | `RLIMIT_MSGQUEUE` starts at 819200 bytes |
+| bc44b65, e43c40c | `sched_setattr`'s keep and clamp flags |
+| cbf7267 | membarrier registrations survive fork |
+| 6591eb6 | Thread names shown as their bytes |
+| 566da95 | `RssAnon`, `RssFile` and `RssShmem` in `status` |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
-absolute timers were converted to the host's monotonic clock when set.
+absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
+fix deviations the full run found.
 
 ## Not yet taken
 
@@ -83,18 +94,18 @@ Ordered by value for effort.
 
 | Idea | What Starnix does | For appine | Effort |
 |---|---|---|---|
-| Wire the other Starnix programs | Runs them in CI with expectation files | One case per group of programs, skipping by reason as `starnix-mmap` does | Small |
+| Wire the other Starnix programs | Runs them in CI with expectation files | Run them all again to see what the fixes since the full run changed, then one case per group of programs, skipping by reason as `starnix-mmap` does; CI does not build the tests yet (an open question in the harness map) | Small |
 | gVisor's tests | Runs prebuilt glibc binaries with a long expectation file | A pinned build script like `build-starnix-tests`, starting with about 25 programs | Medium |
 | Count unimplemented paths | `track_stub!` counts each call site and flag value; `not_found` counts `ENOENT` under `/proc`, `/sys`, `/dev` | Count the default arms of prctl, ioctl, fcntl, madvise and futex, and put the top entries in the bug report | Small |
 | BKL watchdog | A lockup detector that names threads stuck in one syscall | A thread that takes no BKL, records holder, syscall and pc after 10 s, and reports through the kernel log and the bug report | Small to medium |
-| Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | Hold the Android wake lock while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
+| Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
 | Store reflinks | — | `FICLONE` and whole-file `copy_file_range` share a store object until written; podman's and docker's vfs storage driver try `FICLONE` first | 600–1000 lines |
-| Small procfs and netlink files | Has `vmstat`, `swaps`, `locks`, `io`, `oom_score` (some as stubs) | Real `vmstat`, `oom_score` from the OOM killer's score, `swaps` header, `locks` from the lock table; `NETLINK_SOCK_DIAG` that answers `ENOENT` so `ss` falls back to `/proc` quietly | Small each |
+| Small procfs and netlink files | Has `vmstat`, `swaps`, `locks`, `io`, `oom_score` (some as stubs) | `oom_score` from the OOM killer's score, `swaps` header, `locks` from the lock table; `NETLINK_SOCK_DIAG` that answers `ENOENT` so `ss` falls back to `/proc` quietly | Small each |
 | vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
 | overlayfs | One lower layer only | Docker and podman need several; directories merged, other files given as the store nodes of either layer | 2–3k lines |
 | FUSE | INIT negotiation, about 25 opcodes, interrupts, no page cache | A new node kind, waiting on the daemon with the BKL released, private mappings of FUSE files; sshfs and rclone mount are the users | 3–5k lines |
 | `process_mrelease`, `process_madvise` | `process_mrelease` implemented for lmkd | Revisits the decision to wait for a user (round 139) | About 100 lines |
-| Guest crash lines | Keeps the last 64 fatal signals with throttling per program | One rate-limited kernel log line per fatal fault, like arm64's `exception-trace` | Small |
+| Guest crash lines | Keeps the last 64 fatal signals with throttling per program | `debug.exception-trace` is only recorded (42d2ffe). While it is non-zero, one rate-limited kernel log line per unhandled fault signal, as arm64's `arm64_show_signal` does | Small |
 
 ## Not worth taking
 
