@@ -258,6 +258,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     private val handleStart = themeDrawable(android.R.attr.textSelectHandleLeft)
     private val handleEnd = themeDrawable(android.R.attr.textSelectHandleRight)
+    /** How far around a handle a touch still takes it. */
+    private val handleSlop = (8 * resources.displayMetrics.density).toInt()
+    /** The handles' areas last kept out of the system's gestures. */
+    private var handleExclusion = emptyList<Rect>()
 
     private var menu: ActionMode? = null
 
@@ -1156,19 +1160,35 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         )
     }
 
-    /** Handles at the selection's ends (when they are in the viewport), as text fields have. */
+    /**
+     * Handles at the selection's ends (when they are in the viewport), as text fields have. With
+     * gesture navigation, a handle at the screen's edge is kept out of the back gesture, which a
+     * drag from there would otherwise start.
+     */
     private fun drawHandles(c: Canvas) {
-        if (!selected) return
-        handleBounds(true)?.let { b -> handleStart?.let { it.bounds = b; it.draw(c) } }
-        handleBounds(false)?.let { b -> handleEnd?.let { it.bounds = b; it.draw(c) } }
+        val excluded = mutableListOf<Rect>()
+        if (selected) {
+            for (start in booleanArrayOf(true, false)) {
+                val (d, b) = handle(start) ?: continue
+                d.bounds = b
+                d.draw(c)
+                excluded += Rect(b).apply { inset(-handleSlop, -handleSlop) }
+            }
+        }
+        if (excluded != handleExclusion) {
+            handleExclusion = excluded
+            systemGestureExclusionRects = excluded
+        }
     }
 
     /**
-     * Where a handle is drawn: below its end's cell, pointing at the cell's left edge (start) or
-     * right edge (end), as Android's own text handles do.
+     * The drawable of a handle and where it is drawn: below its end's cell, pointing at the cell's
+     * left edge (start) or right edge (end), as Android's own text handles do. A handle that would
+     * stick out of the view at the left (start) or right (end) edge is drawn mirrored, the other
+     * end's drawable on the other side of the same point, so a selection from the first column or
+     * to the last still has its handle on the screen.
      */
-    private fun handleBounds(start: Boolean): Rect? {
-        val d = (if (start) handleStart else handleEnd) ?: return null
+    private fun handle(start: Boolean): Pair<Drawable, Rect>? {
         val x = if (start) selStartX else selEndX
         val y = if (start) selStartY else selEndY
         if (x < 0 || y < 0 || x >= cols || y >= rows) return null
@@ -1177,19 +1197,28 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         } else {
             (x + if ((attrs[y * cols + x] shr 12) and 3 == WIDE) 2 else 1) * cellWidth
         }
-        val w = d.intrinsicWidth
-        val left = if (start) edge - w * 3 / 4 else edge - w / 4
+        val left = { d: Drawable, leftHandle: Boolean ->
+            // A left handle's point is at three quarters of its width, a right one's at a quarter
+            if (leftHandle) edge - d.intrinsicWidth * 3 / 4 else edge - d.intrinsicWidth / 4
+        }
+        val own = (if (start) handleStart else handleEnd) ?: return null
+        val other = if (start) handleEnd else handleStart
+        var d = own
+        var l = left(own, start)
+        if (other != null && (if (start) l < 0 else l + own.intrinsicWidth > width)) {
+            d = other
+            l = left(other, !start)
+        }
         val top = (y + 1) * cellHeight
-        return Rect(left, top, left + w, top + d.intrinsicHeight)
+        return d to Rect(l, top, l + d.intrinsicWidth, top + d.intrinsicHeight)
     }
 
     /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE. */
     private fun handleAt(x: Float, y: Float): Int {
         if (!selected) return DRAG_NONE
-        val slop = (8 * resources.displayMetrics.density).toInt()
         for (start in booleanArrayOf(false, true)) {
-            val b = handleBounds(start) ?: continue
-            b.inset(-slop, -slop)
+            val b = handle(start)?.second ?: continue
+            b.inset(-handleSlop, -handleSlop)
             if (b.contains(x.toInt(), y.toInt())) return if (start) DRAG_START else DRAG_END
         }
         return DRAG_NONE

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles at the edges last)
 
 ## Responsibilities
 
@@ -340,8 +340,11 @@ libghostty-vt with Zig (`android/native`).
   the motion, 1002 motion with a button held, 1003 all), and vt.c reports motion once per cell
   (except in SGR-Pixels format).
 - The two handles (start below the first cell, end below the last, when in the viewport) drag the
-  selection's ends; the other end is the anchor, kept as tracked grid references so output does not
-  move it. The finger keeps its offset from the dragged cell; held above or below the grid, the
+  selection's ends; the other end is the anchor, kept as tracked grid references so output does
+  not move it. A handle that would stick out of the view at the left edge (start) or right edge
+  (end) is drawn with the other handle's drawable, on the other side of the same point, so both
+  stay on the screen, and the handles' areas (with the touch slop) are excluded from the system's
+  back gesture while they are shown, so a drag from the edge moves the handle. The finger keeps its offset from the dragged cell; held above or below the grid, the
   viewport scrolls one row every 50 ms and the selection follows.
 - After a drag, a floating action mode (`TYPE_FLOATING`) offers Open link (when the long press
   that began the selection was on a link, also in mouse mode), Copy (with a selection), Paste
@@ -425,7 +428,8 @@ libghostty-vt with Zig (`android/native`).
   to scroll, cancelling the child's touch; the extra keys' scroll view intercepts only when it can
   scroll, and a held key asks its parents not to intercept.
 - Android honours at most 200 dp of back-gesture exclusion on each edge of a window; the tab
-  bar's 32 dp and the scrolling extra keys' 64 dp leave room under it.
+  bar's 32 dp, the scrolling extra keys' 64 dp and a selection handle at the edge leave room
+  under it.
 - The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
   and the grids inside the scroll view are measured without a width limit, so they are forced to
   measure again whenever the column width changes, the page not shown too (it keeps the flag until
@@ -510,9 +514,7 @@ libghostty-vt with Zig (`android/native`).
 
 ## Confirmed bugs / technical debt
 
-- **The terminal lacks** the bell, triple-tap (line) or rectangular selection, and handles that
-  flip at the screen edges (a selection starting at column 0 has its start handle mostly
-  off-screen). libghostty-vt has the two selections (`ghostty_terminal_select_line`, a
+- **The terminal lacks** the bell and triple-tap (line) or rectangular selection. libghostty-vt has the two selections (`ghostty_terminal_select_line`, a
   selection's `rectangle` flag).
 - **libghostty-vt features not wired**: no callbacks for OSC 52 clipboard writes, OSC 9/777
   notifications, OSC 9;4 progress, OSC 7501 program status, OSC 7 working directories or OSC 133
