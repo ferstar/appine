@@ -186,9 +186,6 @@ signal delivery (`kernel/signal`).
   wakes the timer thread or the epoll times out. Gate wakeups also ignore the interest's
   direction (spurious wakeups, and with mixed masks a matching waiter can miss an edge consumed by
   another) and rotate waiters instead of keeping Linux's order.
-- **Edge-triggered host sockets can stall:** without `HostEdges` (always on non-Linux hosts) a
-  program that drains with `recvmsg` until a short read can miss data that arrives before the next
-  scan, sleeping until an unrelated event.
 - **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
   claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
   partial count.

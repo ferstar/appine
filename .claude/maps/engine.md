@@ -470,7 +470,8 @@ Tier 1, only CPUID advertised).
   decrement, mis-pairing later releases (not reached today).
 - **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
   where Linux 6.1 delivers `SIGILL`.
-- **Unused API:** `Dbt::recheck` has no caller in the kernel.
+- **Test-only API:** `Dbt::recheck` is called only by the engine tests (`tests/dbt.rs`); the
+  kernel's exec path reaches the same check through instances taken from the pool.
 
 ## Open questions
 

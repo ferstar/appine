@@ -258,9 +258,11 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **Storage leaks:** objects created inside a rolled-back savepoint (e.g. a failed import) are
-  dropped from the uncommitted range by the next commit and stay on disk until their number is
-  reused by a regular file (forever if reused by another kind); the shared `lock` header is not
+- **Storage leaks:** objects created inside a rolled-back savepoint (an operation that fails after
+  creating a regular file) are dropped from the uncommitted range by the next commit and stay on
+  disk until their number is reused by a regular file (forever if reused by another kind); a failed
+  `import_rootfs` is not affected in practice, as the Android caller discards that new store
+  before a retry; the shared `lock` header is not
   ordered against the WAL, so after power loss a cleared range can be durable while the commit is
   not, leaking objects the same way.
 - **Import error reporting:** if adding the device skeleton fails after a successful import,
