@@ -66,6 +66,8 @@ impl Errno {
     pub const EMLINK: Errno = Errno(31);
     /// The pipe's read ends are all closed.
     pub const EPIPE: Errno = Errno(32);
+    /// Argument out of the function's domain (a socket timeout's microseconds).
+    pub const EDOM: Errno = Errno(33);
     /// Result out of range.
     pub const ERANGE: Errno = Errno(34);
     /// Would deadlock.

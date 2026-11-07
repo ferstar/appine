@@ -136,9 +136,7 @@ pub(crate) fn check(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     {
         return Some(next);
     }
-    let idle = all_sleeping(k);
-    shared.checks_idle.store(idle, Ordering::Relaxed);
-    if idle {
+    if shared.stop_checks(|| all_sleeping(k)) {
         k.oom.next = None;
         return None;
     }
@@ -452,8 +450,7 @@ pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instan
     if !idle || k.oom.code_views.is_some() {
         appine_engine::unmap_written_code();
     }
-    if idle {
-        shared.checks_idle.store(true, Ordering::Relaxed);
+    if idle && shared.stop_checks(|| all_sleeping(k)) {
         k.oom.code_views = None;
         return None;
     }
@@ -464,5 +461,5 @@ pub(crate) fn unmap_code_views(k: &mut Kernel, shared: &Shared) -> Option<Instan
 /// All guest threads are waiting in the kernel: memory will not grow any more, and the code cache
 /// will not be written either.
 fn all_sleeping(k: &Kernel) -> bool {
-    k.tasks.values().all(|t| t.sleeping.load(Ordering::Relaxed))
+    k.tasks.values().all(|t| t.sleeping.load(Ordering::SeqCst))
 }

@@ -626,6 +626,22 @@ impl Machine {
         }
     }
 
+    /// Sends signal `sig` to guest process `pid` from the host (with `SI_KERNEL`, as the kernel's
+    /// own signals): ESRCH when there is no such process, EINVAL for a bad signal number.
+    pub fn signal(&self, pid: u32, sig: i32) -> Result<(), Errno> {
+        let sig = Signal::new(sig).ok_or(Errno::EINVAL)?;
+        crate::bug::host_call("Machine::signal", || {
+            let k = self.shared.lock();
+            let pid = pid as crate::kernel::Tid;
+            if !k.groups.contains_key(&pid) {
+                return Err(Errno::ESRCH);
+            }
+            signal::send_to_group(&k, pid, sig, crate::signal::SigInfo::kernel());
+            Ok(())
+        })
+        .unwrap_or(Err(Errno::EIO))
+    }
+
     /// Ends every guest process and waits for every guest thread to exit.
     pub fn kill_all(&self) {
         crate::bug::host_call("Machine::kill_all", || {
@@ -939,17 +955,57 @@ pub fn run(
             .spawn(move || terminal::bridge(shared, term, id, pid as i32))
             .expect("cannot start the terminal thread")
     });
-    let status = if options.init {
-        // The program ending means shutdown; a guest request to reboot is also only a shutdown,
-        // ending appine-run
-        let power = machine.wait_or_power(pid).err();
-        machine.shutdown(power.unwrap_or(crate::Power::PowerOff), SHUTDOWN_TIMEOUT);
-        machine.wait(pid)
-    } else {
-        let status = machine.wait(pid);
-        machine.kill_all();
+    let done =
+        appine_hal::Event::new().map_err(|e| RunError::Io(io::Error::from_raw_os_error(e)))?;
+    let status = std::thread::scope(|scope| {
+        // Stop requests from the host (RunOptions::stop): the first signal goes to the program,
+        // a later one ends everything; either way the program's end comes back below
+        if let Some(stop) = options.stop {
+            let (machine, done) = (&machine, &done);
+            scope.spawn(move || {
+                // `timeout` and terminals signal the whole process group too, so the same request
+                // can arrive twice at once: only a signal at least a second after the one passed on
+                // ends everything
+                const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+                let mut asked: Option<std::time::Instant> = None;
+                loop {
+                    const POLLIN: i16 = 1;
+                    let mut fds = [(stop, POLLIN, 0), (done.fd(), POLLIN, 0)];
+                    if appine_hal::poll(&mut fds, None).is_err() {
+                        continue;
+                    }
+                    if fds[1].2 != 0 {
+                        return;
+                    }
+                    let mut sig = [0u8; 1];
+                    if appine_hal::read(stop, &mut sig) != Ok(1) {
+                        continue;
+                    }
+                    match asked {
+                        Some(at) if at.elapsed() >= AGAIN => machine.kill_all(),
+                        Some(_) => {}
+                        None => {
+                            asked = Some(std::time::Instant::now());
+                            let _ = machine.signal(pid, i32::from(sig[0]));
+                        }
+                    }
+                }
+            });
+        }
+        let status = if options.init {
+            // The program ending means shutdown; a guest request to reboot is also only a
+            // shutdown, ending appine-run
+            let power = machine.wait_or_power(pid).err();
+            machine.shutdown(power.unwrap_or(crate::Power::PowerOff), SHUTDOWN_TIMEOUT);
+            machine.wait(pid)
+        } else {
+            let status = machine.wait(pid);
+            machine.kill_all();
+            status
+        };
+        done.signal();
         status
-    };
+    });
     // The bridge thread exits only after writing out the remaining output
     if let Some(b) = bridge {
         let _ = b.join();

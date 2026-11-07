@@ -349,8 +349,15 @@ pub(crate) fn proc_cgroups(k: &Kernel) -> String {
     s
 }
 
-/// The contents of `<name>` in cgroup `id`; None when it is not one of its files.
-pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
+/// The contents of `<name>` in cgroup `id`; None when it is not one of its files. `vnr` turns a
+/// global id into the reader's (0 for one its pid namespace cannot see, as Linux's task_pid_vnr
+/// prints in `cgroup.procs` and `cgroup.threads`).
+pub(crate) fn file(
+    k: &Kernel,
+    id: u64,
+    name: &[u8],
+    vnr: &dyn Fn(crate::kernel::Tid) -> crate::kernel::Tid,
+) -> Option<String> {
     let g = k.cgroups.get(id)?;
     if !k.cgroups.files(id).any(|f| f == name) {
         return None;
@@ -382,12 +389,12 @@ pub(crate) fn file(k: &Kernel, id: u64, name: &[u8]) -> Option<String> {
         b"cgroup.subtree_control" if g.subtree_control == 0 => return Some(String::new()),
         b"cgroup.subtree_control" => names(g.subtree_control),
         b"cgroup.type" => "domain".to_owned(),
-        b"cgroup.procs" => list(procs()),
+        b"cgroup.procs" => list(procs().map(vnr)),
         b"cgroup.threads" => list(
             k.tasks
                 .iter()
                 .filter(|(_, t)| t.tgid != INIT && group_cgroup(k, t.tgid) == Some(id))
-                .map(|(&tid, _)| tid),
+                .map(|(&tid, _)| vnr(tid)),
         ),
         b"cgroup.events" => format!(
             "populated {}\nfrozen {}",
@@ -602,6 +609,11 @@ pub(crate) fn write(
     (id, name): (u64, &[u8]),
     data: &[u8],
 ) -> Result<(), Errno> {
+    // A file of a removed cgroup still open: every write is ENODEV (kernfs_get_active fails),
+    // which container managers take as "cgroup gone"
+    if k.cgroups.get(id).is_none() {
+        return Err(Errno::ENODEV);
+    }
     // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be
     // written, anything else is EPERM (nsdelegate). Appine's root looks like a container's root
     // and follows this too: writing its memory.max and the like would not change the OOM

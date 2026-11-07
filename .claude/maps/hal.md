@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug; `ClockWatch`; `has_private_pages`; `host_vmstat`)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random` uses the host's getrandom on Linux and Android; removed the `EMFILE` bug; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits, signal-handler errno and the stop pipe last)
 
 ## Responsibilities
 
@@ -23,7 +23,7 @@ and Linux (glibc), returning raw host errnos:
 - threads and time: tid, thread names, CPU clocks, affinity, nice, ioprio, clocks, a read-only
   `adjtimex`;
 - networking: nonblocking host sockets, interfaces, routes, source selection, DNS resolution;
-- terminal helpers for the CLI: raw mode and a `SIGWINCH` pipe.
+- terminal helpers for the CLI: raw mode, a `SIGWINCH` pipe and a stop-signal pipe.
 
 Root: `core/hal/src/lib.rs`, `core/hal/src/net.rs`.
 
@@ -63,7 +63,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
 - Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
-  `clock_getres`, `adjtimex_query`, `RawMode`, `sigwinch_notifier`.
+  `clock_getres`, `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
   `setsockopt`, `getsockopt`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
   `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`.
@@ -130,7 +130,10 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `clock_gettime`/`clock_getres` pass clock ids through; `adjtimex_query` makes the real read-only
   call on Linux and synthesizes an unsynchronized state elsewhere (Android).
 - CLI: `RawMode::enter` on stdin; `sigwinch_notifier` installs a handler writing one byte to a
-  nonblocking pipe (documented as callable once per process; the CLI calls it once).
+  nonblocking pipe, and `stop_notifier` handlers for SIGINT, SIGTERM and SIGHUP writing each
+  signal's number to another (each callable once per process; the CLI calls each once). Both
+  handlers keep the interrupted code's `errno`, and a failing `sigaction` closes the pipe (and
+  restores the stop signals already caught).
 
 ### Networking
 
@@ -148,9 +151,10 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   UDP socket and reads its local address; `tx_queue_len` reads sysfs.
 - `dns_query`: on Android `android_res_nsend` on the default network (linked against libandroid,
   API 29), up to 30 s, then cancel and `ETIMEDOUT`; the answer is returned whatever its rcode. On
-  other hosts up to three servers from `/etc/resolv.conf`, UDP with a 3 s wait and ID check, TCP
-  retry on truncation (length-prefixed), `EHOSTUNREACH` without servers; a failed server (including
-  an interrupted wait) moves on to the next.
+  other hosts up to three servers from `/etc/resolv.conf`, UDP with one 3 s deadline per server
+  (answers with another ID do not extend it) and ID check, TCP retry on truncation
+  (length-prefixed, one deadline), `EHOSTUNREACH` without servers; a failed server moves on to
+  the next. Waits on both go on after a host signal interrupts them (`poll_until`).
 
 ## Dependencies (inbound / outbound)
 
@@ -180,12 +184,6 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - **macOS no longer compiles.** `open_dir` uses `O_PATH` (not defined for Apple targets) without a
   `cfg` gate, and the kernel calls the Linux-only `copy_file`, fsync family and `msync` ungated, and
   CI builds only Linux and Android.
-- **A signal makes a DNS lookup fail.** Non-Android `dns_query` treats an `EINTR` from `poll` (the
-  CLI's `SIGWINCH` handler can cause one) as that server failing, possibly turning into SERVFAIL;
-  Android reports an interrupted wait as `ETIMEDOUT` after cancelling. Mismatched-ID datagrams also
-  restart the 3 s wait, so there is no overall deadline.
-- **The `SIGWINCH` handler does not preserve `errno`** (clobbered only when its write fails, for
-  example `EAGAIN` with a full pipe); a failing `sigaction` leaks both pipe fds.
 
 ## Open questions
 

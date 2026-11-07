@@ -475,8 +475,10 @@ pub(super) fn mq_timedsend(
         if deadline.is_some_and(crate::itimer::Expiry::passed) {
             return Err(Errno::ETIMEDOUT);
         }
+        // Restarted after a handler with SA_RESTART or a stop, as Linux's wq_sleep; the deadline is
+        // absolute, so a restart keeps it
         if cx.interrupted() {
-            return Err(Errno::EINTR);
+            return Err(Errno::ERESTARTSYS);
         }
         // Taking a message requests a wake for this queue
         cx.wait_objects(
@@ -579,8 +581,10 @@ pub(super) fn mq_timedreceive(
         if deadline.is_some_and(crate::itimer::Expiry::passed) {
             return Err(Errno::ETIMEDOUT);
         }
+        // Restarted after a handler with SA_RESTART or a stop, as Linux's wq_sleep; the deadline is
+        // absolute, so a restart keeps it
         if cx.interrupted() {
-            return Err(Errno::EINTR);
+            return Err(Errno::ERESTARTSYS);
         }
         q.borrow_mut().receivers += 1;
         // A message arriving requests a wake for this queue

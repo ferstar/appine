@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private file mappings; truncation order last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private files; truncation order; idle checks and shared NORESERVE last)
 
 ## Responsibilities
 
@@ -208,8 +208,8 @@ dumps and the host abstraction layer (`core/hal`).
 - On a 16 KB-page host, a file mapping covers the 16 KB-aligned host range around the target and
   points the VMA at the right 4 KB offset inside it.
 - Host commit accounting: private anonymous memory is requested as accounted only when the guest
-  mapping is writable and not `MAP_NORESERVE`; writable shared anonymous memory is accounted even
-  with `MAP_NORESERVE`; SysV shm is always accounted. The main stack, stack chunks, the heap
+  mapping is writable and not `MAP_NORESERVE`, and so is shared anonymous memory (Linux's
+  `shmem_acct_size` skips `VM_NORESERVE`); SysV shm is always accounted. The main stack, stack chunks, the heap
   reservation and fork's spare and carved pieces are always host `MAP_NORESERVE`.
 - `insert` enforces `vm.max_map_count` (default 65530, writable through procfs), builds page-table
   entries (section 3), and sets `locked` from `mlockall(MCL_FUTURE)`.
@@ -473,9 +473,12 @@ signals may still be delivered).
   its limit, and never more often than 20 times the measurement's own time. The root is measured
   first and cgroups stop at the first scope over its limit, so one scope is handled per round. A
   `memory.max` write forces an immediate round.
-- When every task is sleeping, `check` sets `checks_idle` and stops; every guest thread calls
-  `resume_checks` at the top of each run-loop iteration, which signals the timer thread if the flag
-  was set.
+- When every task is sleeping, `check` stops through `Shared::stop_checks`: it sets `checks_idle`
+  and then looks at the tasks again, clearing the flag and going on if one woke meanwhile. Every
+  guest thread clears its `sleeping` flag and then calls `resume_checks` at the top of each run-loop
+  iteration, which signals the timer thread if the flag was set; with all these accesses SeqCst a
+  waking thread is never missed (the code-view release and load-average sampling stop the same
+  way).
 - An over-limit round is skipped while `UNMAPPING` is nonzero or the last victim, picked under 1 s
   ago, still has threads; otherwise it records a `max` event and calls `out_of_memory`. Lowering a
   child's `memory.max` below its usage calls `out_of_memory` once at once, without a `max` event.
@@ -586,21 +589,12 @@ signals may still be delivered).
 - **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before
   validating the destination and keeps the splits on `EINVAL`; a move that hits the limit after its
   entries were moved drops VMAs and leaves stale entries at the destination.
-- **Shared anonymous `MAP_NORESERVE` is accounted:** contrary to its own comment and Linux, so a
-  large shared reservation can fail with `ENOMEM`.
 - **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
   to Linux and the function's own description of the bit.
 - **Latent CoW leak:** if `return_loans` ever ran while the owner was mutably borrowed, the page
   would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
   loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
   and the guard's comment cites a path (`recall`) that never reaches it.
-- **OOM checks can stop for about a second:** `check` (like the code-view release and load-average
-  sampling) reads "every task sleeping" and sets `checks_idle` in two steps, while a thread waking
-  from a no-BKL fast-path sleep clears its flag and tests `checks_idle` without the BKL, so the
-  waker can miss the store; checks then stay off until the next code-view round (up to 1 s), the
-  next engine exit of any thread or another timer event, and the relaxed atomics leave the outage
-  unbounded in theory on weak-memory hosts. A thread touching already-mapped memory without
-  syscalls makes no engine exit.
 - **OOM victim choice differs from Linux and can stall:** scores omit swap and page tables, so a
   mostly swapped-out process ranks low although the root counts VmSwap; negative scores clamp to 1
   and ties go to the lowest tgid (Linux 6.1 compares raw scores and lets a later equal one win). A

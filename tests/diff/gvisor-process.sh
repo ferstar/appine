@@ -5,13 +5,9 @@
 # queued real-time signals, alarm, ptrace and futexes. Run by tests/diff/gtest/run.sh, one process
 # per test. Tests that differ for a reason recorded in a map, or that cannot be compared, are
 # skipped, with the reason above them.
-# kernel/process: wait ignores __WCLONE and __WALL and exit_signal; waitid without WEXITED waits
-# forever on zombies
-SKIP="Waiters/WaitSpecificChildTest.CloneNoSIGCHLD/*:Waiters/WaitSpecificChildTest.ForkWCLONE/*"
-SKIP="$SKIP:WaitTest.WaitidNoWEXITED"
 # kernel/signal D5: no Yama (ptrace_scope reads 0, so these skip themselves on Appine)
 P=PtraceTest
-SKIP="$SKIP:$P.PrctlSetPtracer:$P.PrctlSetPtracerPersistsPastTraceeThreadExit"
+SKIP="$P.PrctlSetPtracer:$P.PrctlSetPtracerPersistsPastTraceeThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerPersistsPastLeaderExec:$P.PrctlSetPtracerDoesNotPersistPastNonLeaderExec"
 SKIP="$SKIP:$P.PrctlSetPtracerDoesNotPersistPastTracerThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNotAffectCurrentTracer"

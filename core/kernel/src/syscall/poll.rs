@@ -1071,6 +1071,19 @@ pub(crate) struct Fasync {
 /// listened only on the "other" channel, and would start checking this file only after waking
 /// up for something else.
 pub(super) fn register_fasync(cx: &mut Cx<'_>, file: &FileRef, fd: i32) {
+    // Only files whose Linux file operations have fasync ever raise SIGIO (pipes and FIFOs,
+    // sockets, terminals, inotify); the others keep the flag and stay silent (setfl): regular
+    // files, eventfds, timerfds, signalfds, epoll and message queues among them
+    if !matches!(
+        file.borrow().kind,
+        FileKind::Pipe(_)
+            | FileKind::Socket(_)
+            | FileKind::Pty(_)
+            | FileKind::Inotify(_)
+            | FileKind::Host(_)
+    ) {
+        return;
+    }
     let k = cx.k();
     k.fasync.retain(|e| e.file.strong_count() > 0);
     if k.fasync.iter().any(|e| e.file.as_ptr() == Rc::as_ptr(file)) {
@@ -1411,7 +1424,13 @@ fn arrivals_polled(f: &OpenFile) -> [u64; 2] {
 fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> [u64; 2] {
     let local = match &f.kind {
         FileKind::Epoll(ep) => [epoll_arrivals(&ep.borrow(), depth), 0],
-        FileKind::Pipe(end) if end.read => [end.pipe.borrow().writes, 0],
+        FileKind::Pipe(end) => {
+            let p = end.pipe.borrow();
+            [
+                if end.read { p.writes } else { 0 },
+                if end.write { p.room } else { 0 },
+            ]
+        }
         FileKind::Pty(end) => [end.tty.borrow().arrivals[end.master as usize], 0],
         FileKind::Socket(s) => super::net::arrivals(&s.borrow()),
         FileKind::EventFd(e) => {

@@ -200,6 +200,11 @@ pub struct RunOptions {
     /// ([`crate::Machine::shutdown`]) when the first process ends or the guest requests a
     /// shutdown, instead of ending all processes directly.
     pub init: bool,
+    /// A host fd from which each byte read is a signal the host process was asked to stop with
+    /// (`appine-run`'s handlers for SIGINT, SIGTERM and SIGHUP write them): the first is passed on
+    /// to the first process, one at least a second later ends every process. Either way the run then ends as usual,
+    /// with the shutdown, the final store sync and the host terminal restored.
+    pub stop: Option<i32>,
 }
 
 /// The result of a run.
@@ -984,9 +989,10 @@ pub(crate) fn send_pdeath(k: &Kernel, signals: Vec<(Tid, Signal)>, parent: Tid, 
     }
 }
 
-/// The session leader exits: the controlling terminal no longer belongs to this session, and the
-/// foreground process group gets SIGHUP and SIGCONT (Linux's `disassociate_ctty`). If the
-/// controlling terminal has already hung up, they go to the foreground process group at hangup:
+/// The session leader exits: the controlling terminal (always a PTY here) no longer belongs to this
+/// session, and the foreground process group gets SIGHUP (Linux's `disassociate_ctty`). If the
+/// controlling terminal has already hung up, SIGHUP and SIGCONT go to the foreground process group
+/// at hangup:
 /// when a tmux window is closed, a command started by `sh -c` is in the same process group as an
 /// sh that does not exec (dash), and when the group leader sh gets SIGHUP and exits, they get
 /// SIGHUP.
@@ -1019,9 +1025,10 @@ fn release_ctty(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
             g.ctty = None;
         }
     }
+    // Only SIGHUP: Linux's disassociate_ctty sends SIGCONT too only when giving up the terminal
+    // with TIOCNOTTY, or when it has already hung up (above)
     if let Some(fg) = fg {
         signal::send_to_pgrp(k, fg, Signal::HUP, SigInfo::kernel());
-        signal::send_to_pgrp(k, fg, Signal::CONT, SigInfo::kernel());
     }
 }
 

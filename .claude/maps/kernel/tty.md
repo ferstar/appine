@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: master-side `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY`; `TIOCSTI` rules; the line discipline follows n_tty, parts adapted from Starnix; `/dev/tty` identity; taking a controlling terminal; the console's end of file across mode switches)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: master-side `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY`; `TIOCSTI` rules; the line discipline follows n_tty; `/dev/tty` identity; taking a controlling terminal; the console's end of file; VMIN reads, background ioctls and leader exit last)
 
 ## Responsibilities
 
@@ -132,9 +132,9 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   returns 0 (EOF). Non-canonical: `VMIN`/`VTIME` (0/0 returns at once; 0/T times out from the
   start of the read; N/0 waits for `min(VMIN, len)` bytes; N/T arms one deadline at the first byte
   and never re-arms it, a total rather than Linux's inter-byte timer). With `EXTPROC` and
-  `ICANON` a read returns what has arrived, as with `VMIN` 1. Slave `POLLIN` is set for any queued
-  raw byte, whatever `VMIN`; a nonblocking read with fewer than `VMIN` bytes queued (and `VTIME` 0)
-  returns `EAGAIN`. A read makes room for waiting input, and sends the signals it generates.
+  `ICANON` a read returns what has arrived, as with `VMIN` 1. Slave `POLLIN` (`poll_readable`,
+  Linux's `input_available_p` for poll) needs `VMIN` bytes when `VTIME` is 0 and `VMIN` above 0,
+  otherwise any; a nonblocking read takes what has arrived even below `VMIN`. A read makes room for waiting input, and sends the signals it generates.
 - No data: `EIO` without a master, `EAGAIN` when nonblocking, otherwise wait on the terminal's
   wake object. The background check runs once before blocking (section 5). Reads update atime
   and writes mtime (seconds only, on 8-second boundaries).
@@ -182,15 +182,16 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   is the caller's ctty and another group is in the foreground; an ignored or blocked signal makes
   reads `EIO` and lets writes proceed; an orphaned group gets `EIO`; otherwise the signal goes to
   the caller's group and the call returns `ERESTARTSYS`. Callers: slave reads, slave writes with
-  `TOSTOP`, termios sets from the slave, `TIOCSPGRP` (not `TCFLSH`, `TCXONC`, `TCSBRK` or
-  `TIOCSETD`).
+  `TOSTOP`, termios sets, `TCFLSH`, `TCXONC`, `TCSBRK`/`TCSBRKP` and `TIOCSETD` from the slave
+  (Linux's `tty_check_change` callers), `TIOCSPGRP`.
 - Signals: line-discipline signals, `TIOCSTI`, `TCXONC` on the master, the host `feed` and
   `TIOCSIG` (INT, QUIT, TSTP only) go to the foreground group; `TIOCSWINSZ` from either side and
   the host `resize` send `SIGWINCH` to it only when the size changes.
 - Give up: `setsid` clears only the caller's link; `TIOCNOTTY` by a non-leader clears its own, by
   the leader clears the session's links and sends `SIGHUP` then `SIGCONT` to the foreground
-  group; a session leader's exit with its ctty sends both to the foreground group and clears the
-  session, without one it signals `tty_old_pgrp`.
+  group; a session leader's exit with its ctty (always a PTY) sends only `SIGHUP` to the
+  foreground group and clears the session, without one it sends both to `tty_old_pgrp`
+  (Linux's `disassociate_ctty`).
 
 ### Hangup
 
@@ -213,7 +214,7 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   forced, PARENB cleared; speeds recomputed and only recorded; the `W` forms do not drain, `F`
   forms flush slave input; signals from input the change lets in are sent),
   `TIOCGWINSZ`/`TIOCSWINSZ`, `TCFLSH`, `TCXONC` (slave: TCOOFF/TCOON; master: stops input; 2/3
-  send VSTOP/VSTART), `TCSBRK`/`TCSBRKP` (no-ops), `TIOCEXCL`/`TIOCNXCL` (no-ops),
+  send VSTOP/VSTART), `TCSBRK`/`TCSBRKP` (no-ops after the background check), `TIOCEXCL`/`TIOCNXCL` (no-ops),
   `TIOCSETD`/`TIOCGETD` (always 0), `FIONREAD` (slave: section 3; master: the output queue),
   `TIOCOUTQ`, `TIOCSTI`; unknown requests `ENOTTY`.
 - `TCFLSH` follows `pty_flush_buffer`: on the slave, TCIFLUSH discards the input (taken or not)
@@ -294,17 +295,10 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   master that never reads while the slave reads input lets the output queue grow unbounded
   (Linux drops echoes when full); one write can also overshoot by `ONLCR` expansion.
 - **Non-canonical reads differ:** `VTIME` with `VMIN>0` is a total instead of an inter-byte timer;
-  slave `POLLIN` ignores `VMIN`, and a nonblocking read with fewer than `VMIN` bytes queued returns
-  `EAGAIN`, so level-triggered loops spin; a zero-length master write (or a blocked writer
-  retrying) produces EPOLLET edges with no data.
-- **Background jobs are not stopped for some ioctls:** `TCFLSH`, `TCXONC`, `TCSBRK`/`TCSBRKP` and
-  `TIOCSETD` skip the background check, so `tcflush`, `tcflow` and `tcdrain` from a background job
-  get no `SIGTTOU`.
+  a zero-length master write (or a blocked writer retrying) produces EPOLLET edges with no data.
 - **`TIOCSPGRP` error codes:** `EPERM` instead of `ESRCH` for unknown groups, `ENOTTY` instead of
   `EINVAL` for negative values from a non-ctty caller, `EIO` instead of `ENOTTY` for orphaned
   callers.
-- **Leader exit sends an extra `SIGCONT`:** a session leader's exit with a PTY ctty sends `SIGHUP`
-  and `SIGCONT` to the foreground group; Linux sends only `SIGHUP` there.
 - **Console input after the session ended is queued silently** instead of failing with `EIO` as
   `write_console`'s comment promises.
 - **`/dev/tty` cannot be told apart from the slave it opens:** the descriptor is a plain slave end,

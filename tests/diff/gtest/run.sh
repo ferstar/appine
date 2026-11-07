@@ -53,3 +53,7 @@ for bin in "$@"; do
 # The shell's own crash reports are filtered out (where busybox prints them varies)
 done 2>&1 | grep -v -E '^(Segmentation fault|Aborted|Bus error|Illegal instruction|Killed)'
 rm -f gtest.out
+# Some gVisor fs tests change the mode of their test directory, /tmp itself: the native side's
+# container ends with the case, but Appine's store is reused by the next cases of the lane, which
+# expect the sticky, world-writable /tmp (protected_symlinks)
+chmod 1777 /tmp

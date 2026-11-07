@@ -257,12 +257,9 @@ pub(super) fn sigqueueinfo(
             }
         }
         None => {
-            let alive = cx
-                .kr()
-                .groups
-                .get(&tgid)
-                .is_some_and(|g| g.borrow().zombie.is_none() && tgid != INIT);
-            if !alive {
+            // A zombie that has not been reaped is still there, as for kill (send_to_group then
+            // does nothing)
+            if tgid == INIT || !cx.kr().groups.contains_key(&tgid) {
                 return Err(Errno::ESRCH);
             }
             if !may_kill(cx, &cred, sid, tgid, sig) {

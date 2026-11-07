@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; test-suite findings; namespace limits; panics in exit's first stage last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; deadlines; the exited main thread; rlimits; exit signals; robust futexes; test-suite findings; namespace limits; exit-stage panics; waits, pids, #! depth and appine-run stops last)
 
 ## Responsibilities
 
@@ -91,7 +91,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
   `signal_later`/`flush_signals`, `Shared::fast_changed`, `loader::prepare`/`load_prepared`.
 - **Host-facing** (`Machine`): `start_kernel` (creates PID 1 and the timer thread), `spawn`, `boot`,
-  `shutdown`, `take_power`, `wait_*`.
+  `shutdown`, `take_power`, `wait_*`, `signal` (a host signal to a guest process, `SI_KERNEL`);
+  `run` (`appine-run`), which with `RunOptions::stop` passes the first stop signal the host got on
+  to the program and ends every process at one arriving at least a second later, then finishes as
+  usual.
 - **procfs**: `threads-max`, `/proc/<pid>/task/<tid>/children`, `uid_map`/`gid_map`/`setgroups`,
   `timens_offsets`, `/proc/<pid>/ns/*`.
 
@@ -109,6 +112,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### clone
 
+- Global ids come from `alloc_tid`: the numbers after the last one, up to `PID_MAX - 1`, then from
+  300 again (Linux's `RESERVED_PIDS`); `PID_MAX` itself is never handed out, and `ns_last_pid`
+  writes move the start.
 - `clone` takes the low 32 bits of the flags (the pidfd shares the parent-tid slot); `clone3` checks
   the structure size (non-zero tail is `E2BIG`). There are no separate fork or vfork syscalls on
   aarch64.
@@ -168,10 +174,13 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   group is reaped immediately when the parent is the virtual init, gone, ignores `SIGCHLD` or has
   `SA_NOCLDWAIT`; otherwise it becomes a zombie and the parent gets `exit_signal`. Orphaned process
   groups get SIGHUP/SIGCONT. A `CHILD | WATCHED` wake follows.
-- `wait4`/`waitid` scan `children` (filtered by the target and `__WNOTHREAD`): a zombie is reaped
-  (its CPU time and max RSS added to the waiter's children totals), then stop and continue reports,
-  then tracees; nothing matching is `ECHILD`; otherwise the waiter blocks on `CHILD` and restarts
-  if interrupted.
+- `wait4`/`waitid` scan `children` (filtered by the target and `__WNOTHREAD`, and by exit signal as
+  Linux's `eligible_child`: without `__WALL`, only children reporting with `SIGCHLD`, or with
+  `__WCLONE` only the others; a child the caller traces always counts): a zombie is reaped (its CPU
+  time and max RSS added to the waiter's children totals), then stop and continue reports, then
+  tracees; nothing matching is `ECHILD`, and a zombie counts only for a wait that takes exits (so
+  waiting for stops and continues of children that have all exited is `ECHILD`); otherwise the
+  waiter blocks on `CHILD` and restarts if interrupted.
 - An exited leader keeps its tgid registered until the group is reaped. Its task leaves the task
   table like any thread, but the group records its name and own CPU time (`leader_exit`, cleared
   when a non-main thread's execve takes the tgid), and procfs shows it as a zombie thread until
@@ -186,7 +195,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `/proc/<pid>/exe`. It must be a regular executable file (`EACCES`), not on a noexec mount;
   nosuid is noted.
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
-  relative to the cwd; more than four nested levels is `ELOOP` (Linux 6.1 allows five).
+  relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`).
 - `ETXTBSY` if a writable open file refers to the final executable.
 - Credentials: setuid/setgid apply unless `no_new_privs`, nosuid, or the owner/group are unmapped;
   file capabilities come from the xattr. A secure exec clamps the stack limit to 8 MB (written back
@@ -335,7 +344,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `SIGEV_THREAD_ID` timer signals its thread only while that thread lives in the process; after it
   exits the signal is dropped, as on Linux.
 - When every thread is waiting, the periodic checks (OOM, code views, load average) stop until a
-  thread next enters guest code; armed timers still wake it. Changing `RLIMIT_CPU` does not wake
+  thread next enters guest code; armed timers still wake it. Stopping sets `checks_idle` and then
+  looks at the threads again (`Shared::stop_checks`), while a waking thread clears its `sleeping`
+  flag before reading `checks_idle` (`resume_checks`), all SeqCst, so a thread waking in between
+  either wakes the timer thread or is seen running. Changing `RLIMIT_CPU` does not wake
   the timer thread; the new limit takes effect at its next pass.
 
 ### PID 1
@@ -462,9 +474,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   credentials, the opener-namespace check and the `CAP_SETFCAP` check for mapping uid 0 are
   missing, so an unprivileged user can pass an opened map file to a setuid-root program and get an
   arbitrary mapping (the confused-deputy case Linux closed).
-- **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
-  so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
-  for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-process` case skips them).
 - **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`) leaves the earlier
   credential, mount and pid-for-children changes in place. A pidfd `setns` combining
   `CLONE_NEWNS` with other types while the fs is shared switches the mount namespace of every fs
@@ -473,8 +482,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   open for writing succeeds where Linux returns `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **Pid allocator edge cases:** the global allocator can hand out `PID_MAX` (above `pid_max` and
-  `choose_pid`'s range) and wraps to 2 instead of 300; `last_pid` reads 1 just after.
 - **Minor futex deviations:** `FUTEX_CLOCK_REALTIME` is accepted with any operation, unknown high op
   bits are masked off instead of `ENOSYS`, and `FUTEX_WAKE` with a count ≤ 0 wakes none or all
   instead of one; WAKE_OP and PI operations are `ENOSYS`.
@@ -501,13 +508,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   interpreter that is not an aarch64 ELF is `ENOEXEC` where Linux returns `ELIBBAD`. Only
   hand-made ELFs and unusual linker-script output are affected (gVisor's `exec_binary_test` builds
   its ELFs with the headers outside the only `PT_LOAD`, so most of it fails here).
-- **`#!` scripts nest one level less than Linux:** execve allows four nested interpreter scripts
-  (`MAX_INTERP_DEPTH`) and returns `ELOOP` for a fifth, where Linux 6.1's `exec_binprm`
-  (`depth > 5`) runs five scripts plus the final binary.
-- **`waitid` without `WEXITED` waits forever on zombies:** `find_event` counts zombie children as
-  waitable when only `WSTOPPED`/`WCONTINUED` are requested, so the call blocks (or returns 0 with
-  `WNOHANG`) where Linux 6.1 returns `ECHILD`; a loop that waits only for stops and continues
-  hangs once its children have exited.
 - **`sched_setattr` departs from `__sched_setscheduler` in four details:** `SCHED_RESET_ON_FORK`
   inside `sched_policy` is accepted (Linux: `EINVAL`, not a valid policy); the clamps are compared
   with each other only when both are given, not with the thread's current ones, so a minimum above

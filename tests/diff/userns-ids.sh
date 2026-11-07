@@ -5,7 +5,8 @@
 # when the target is in another namespace; so the SIGCHLD for a stop or continue is mapped once
 # more, the one for an exit is not), waitid's si_uid, the owners of SysV IPC (IPC_STAT, IPC_SET,
 # /proc/sysvipc), the uid in /proc/net/tcp and auxv's AT_UID. In the child's user namespace 0 is
-# 1000 outside and 100 is 0 outside
+# 1000 outside and 100 is 0 outside. Root of a user namespace may chmod a file whose owner is
+# mapped there even when its group is not (inode_owner_or_capable)
 python3 - <<'PY'
 import ctypes, errno, functools, os, signal, socket, struct, sys
 
@@ -252,3 +253,54 @@ int main(int argc, char **argv)
 }
 C
 gcc -o /tmp/sfilter /tmp/sfilter.c && su nobody -s /bin/sh -c /tmp/sfilter && /tmp/sfilter userns
+cat > /tmp/ownsmapped.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int put(const char *path, const char *s) {
+    int fd = open(path, O_WRONLY);
+    int r = fd >= 0 && write(fd, s, strlen(s)) == (ssize_t)strlen(s) ? 0 : -1;
+    close(fd);
+    return r;
+}
+
+int main(void) {
+    close(open("/tmp/owned", O_CREAT | O_WRONLY, 0644));
+    chown("/tmp/owned", 1000, 1234);
+    int go[2], ready[2];
+    pipe(go);
+    pipe(ready);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        if (unshare(CLONE_NEWUSER)) {
+            printf("unshare: %s\n", strerror(errno));
+            _exit(0);
+        }
+        write(ready[1], "r", 1);
+        read(go[0], &c, 1);
+        printf("chmod with the owner mapped, the group not: %s\n",
+               chmod("/tmp/owned", 0600) == 0 ? "ok" : strerror(errno));
+        _exit(0);
+    }
+    char c, path[64];
+    read(ready[0], &c, 1);
+    // Written by the parent, which has CAP_SETUID over the child's namespace
+    snprintf(path, sizeof path, "/proc/%d/uid_map", pid);
+    int u = put(path, "0 0 1\n1000 1000 1\n");
+    snprintf(path, sizeof path, "/proc/%d/gid_map", pid);
+    int g = put(path, "0 0 1\n");
+    printf("maps written: %s\n", u == 0 && g == 0 ? "yes" : "no");
+    write(go[1], "g", 1);
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+C
+gcc -o /tmp/ownsmapped /tmp/ownsmapped.c && /tmp/ownsmapped

@@ -460,7 +460,8 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
     // The system resolver retries and times out on its own; this only guards against it never
     // answering
     let mut pfd = [(fd, libc::POLLIN, 0)];
-    if !matches!(super::poll(&mut pfd, Some(Duration::from_secs(30))), Ok(1)) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    if !matches!(poll_until(&mut pfd, deadline), Ok(1)) {
         unsafe { android_res_cancel(fd) };
         return Err(libc::ETIMEDOUT);
     }
@@ -519,8 +520,10 @@ fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
         connect(fd, server)?;
         sendmsg(fd, query, &[], &[], 0)?;
         let mut buf = vec![0u8; 65536];
+        // One deadline for the query: datagrams with another ID do not start the wait again
+        let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
-            wait_fd(fd, libc::POLLIN, TIMEOUT)?;
+            wait_fd(fd, libc::POLLIN, deadline)?;
             let r = recvmsg(fd, &mut buf, 0, 0)?;
             // Accept only answers with the same ID as the query
             if r.len >= 12 && buf[..2] == query[..2] {
@@ -541,16 +544,17 @@ fn query_server(server: &[u8], query: &[u8]) -> Result<Vec<u8>, i32> {
 fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, i32> {
     let family = u16::from_ne_bytes([server[0], server[1]]) as i32;
     let fd = socket(family, libc::SOCK_STREAM, 0)?;
+    let deadline = std::time::Instant::now() + timeout;
     let result = (|| -> Result<Vec<u8>, i32> {
         match connect(fd, server) {
-            Err(libc::EINPROGRESS) => wait_fd(fd, libc::POLLOUT, timeout)?,
+            Err(libc::EINPROGRESS) => wait_fd(fd, libc::POLLOUT, deadline)?,
             r => r?,
         }
         let mut msg = (query.len() as u16).to_be_bytes().to_vec();
         msg.extend_from_slice(query);
         let mut sent = 0;
         while sent < msg.len() {
-            wait_fd(fd, libc::POLLOUT, timeout)?;
+            wait_fd(fd, libc::POLLOUT, deadline)?;
             sent += sendmsg(fd, &msg[sent..], &[], &[], 0)?;
         }
         let mut answer = Vec::new();
@@ -563,7 +567,7 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
                     return Ok(answer.split_off(2));
                 }
             }
-            wait_fd(fd, libc::POLLIN, timeout)?;
+            wait_fd(fd, libc::POLLIN, deadline)?;
             match recvmsg(fd, &mut buf, 0, 0)?.len {
                 0 => return Err(libc::ECONNRESET),
                 n => answer.extend_from_slice(&buf[..n]),
@@ -576,11 +580,23 @@ fn query_tcp(server: &[u8], query: &[u8], timeout: Duration) -> Result<Vec<u8>, 
 
 /// Waits for an fd to become ready; a timeout returns `ETIMEDOUT`.
 #[cfg(not(target_os = "android"))]
-fn wait_fd(fd: i32, events: i16, timeout: Duration) -> Result<(), i32> {
+fn wait_fd(fd: i32, events: i16, deadline: std::time::Instant) -> Result<(), i32> {
     let mut fds = [(fd, events, 0)];
-    match super::poll(&mut fds, Some(timeout))? {
+    match poll_until(&mut fds, deadline)? {
         0 => Err(libc::ETIMEDOUT),
         _ => Ok(()),
+    }
+}
+
+/// Polls until `deadline`, going on after a host signal interrupts the wait (the CLI's SIGWINCH
+/// handler, say): an EINTR is not the server failing to answer.
+fn poll_until(fds: &mut [(i32, i16, i16)], deadline: std::time::Instant) -> Result<usize, i32> {
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match super::poll(fds, Some(left)) {
+            Err(libc::EINTR) if !left.is_zero() => {}
+            r => return r,
+        }
     }
 }
 

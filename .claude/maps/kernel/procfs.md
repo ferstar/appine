@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; `/proc/vmstat`; names as bytes; test-suite findings, zombies' files; `user/max_*` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; `/proc/vmstat`; names as bytes; test-suite findings; `user/max_*`; fd access, numeric names, cgroup ids and zombies' files last)
 
 ## Responsibilities
 
@@ -76,9 +76,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   only processes: `/proc/<tid>` is its process's directory seen through that thread (`status`,
   `comm`, `cwd` and `fd/` are the thread's, `stat` adds up the group's CPU time, `task/` lists the
   group), and it disappears when the thread exits. `self`/`thread-self` are `ENOENT` for
-  readers not visible in the instance. Numeric names (pids, fds) are parsed as signed 64-bit
-  decimals of at most 10 characters without a leading zero, so a sign is accepted, and fd names
-  are then truncated to 32 bits.
+  readers not visible in the instance. Numeric names (pids, fds) are decimal digits only, at most
+  10 without a leading zero and at most `i32::MAX` (Linux's `name_to_int`): a sign or a larger
+  number names nothing.
 - Inode numbers hash the node (low bit set); roots are 1; nodes under a pid mix in the thread
   group's serial, so a reused pid gets new inodes; nsfs files use the namespace id. Inodes are
   stable within one run, not across runs.
@@ -97,7 +97,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Open (in `kernel/vfs`'s pseudo open): DAC against the synthetic stat; for `mem`, `auxv`,
   `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap` one ptrace check with real credentials
   and no read/attach distinction (`EACCES`), while the magic-link check (`may_read`) uses
-  filesystem credentials; `fd/` and `fdinfo/` have no ptrace check at all; devpts nodes on nodev
+  filesystem credentials, and also gates `fd/` and `fdinfo/` (listing and lookup in them, and
+  reading or following `fd/N`; `EACCES`), as Linux's `proc_fd_permission` and
+  `proc_fd_access_allowed` do; devpts nodes on nodev
   mounts `EACCES`, then the cgroup device filter; write modes on ro mounts `EROFS`, on
   non-writable nodes `EACCES`; creating names `EACCES`.
 - The content is generated once at open (`fresh`). The first read at offset 0 uses it; later reads
@@ -143,15 +145,16 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   path stored at open with ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags`
   (octal, with `O_CLOEXEC`), `mnt_id`, `ino` and per-kind lines (eventfd count, inotify watches,
   epoll `tfd:` lines, timerfd clock and times, signalfd mask, pidfd pids).
-- `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (a
-  zombie falls back to the initial namespace); `cgroup` is the path relative to the reader's
+- `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
+  thread has none: `EINVAL` at open, as `mounts_open_common`); `cgroup` is the path relative to the reader's
   cgroup-namespace root; `net/` uses the target's network namespace.
 - Writable: `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
-  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` list the
-  initial mount namespace. A main thread that has exited while
+  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` are `EINVAL`
+  to open and `mem`/`pagemap` `ESRCH` (they use the address space of the thread named, which has
+  none; native 6.8 answers the same). A main thread that has exited while
   other threads run is shown the same way, as Linux's zombie leader: `task/` still lists it,
   `task/<pid>` and the process directory report Z with its name (kept in the group, as for
   zombies) and its own CPU time for `task/<pid>/stat`, and `Threads`/`num_threads` and `task/`'s
@@ -276,7 +279,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   root `ENOENT`; a non-root destination with controllers enabled for children `EBUSY`; then the
   group moves and freezing is re-evaluated. Only the destination file's open permission is
   checked (no common-ancestor check as in Linux's `cgroup_procs_write_permission`). Reads of
-  `cgroup.procs`/`cgroup.threads` print global ids, untranslated. `cgroup.threads` only accepts
+  `cgroup.procs`/`cgroup.threads` print ids in the reader's pid namespace, 0 for ones it cannot see
+  (Linux's task_pid_vnr). Any write to a file of a removed cgroup is `ENODEV`. `cgroup.threads` only accepts
   moves within the same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain`.
 - `cgroup.subtree_control`: `+name`/`-name` tokens (`EINVAL`); enabling a controller not in
   `cgroup.controllers` `ENOENT`; enabling while the cgroup has processes `EBUSY` (except at the
@@ -351,20 +355,12 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   inside its cgroup namespace through an `O_PATH` directory fd, escaping its own cgroup's
   `pids.max`, `memory.max`, freezer and device programs (Linux 6.1 requires write permission on
   the target's `cgroup.procs` and the migration permission rules).
-- **`/proc/<pid>/fd` and `fdinfo` are open to everyone:** listing, readlink, following and fdinfo
-  skip the ptrace-read check (the directories are 0555, Linux 0500 plus the check), so any user
-  sees and follows other users' open files and positions; reopening a pipe through `fd/N` checks no
-  permission at all. See the matching `kernel/vfs` item.
 - **Delegated cgroups can capture other users' processes:** writing `cgroup.procs` checks only the
   destination file, so the owner of a cgroup (one created for them by a privileged process) can
   move any process, root's included, into it and then freeze or kill it through `cgroup.freeze` /
   `cgroup.kill` (Linux requires write access to the common ancestor's `cgroup.procs`).
-- **Numeric names alias:** fd names are truncated to 32 bits (`/proc/self/fd/4294967296` is fd 0)
-  and signs are accepted (`/proc/self/fd/+1`, `/proc/+1`), where Linux returns `ENOENT`.
 - **Per-thread fd views are wrong:** `task/<tid>/fd` and `fdinfo` show the group leader's table even
   when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
-- **`cgroup.procs`/`cgroup.threads` show global ids:** readers in a child pid namespace (a container
-  managing its own cgroups) see ids that do not exist for them; writes translate correctly.
 - **No change notifications:** synthetic files cannot be added to epoll (`EPERM`) and always poll
   ready, so mount table changes (`mountinfo`'s `POLLPRI`) and `cgroup.events` changes are never
   signalled; libmount monitors, systemd and containerd's OOM watching rely on them.
@@ -421,16 +417,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as
   the fd is resolved by number, it shows the new process once the pid is reused, defeating monitors
   that hold `/proc/<pid>` fds to avoid pid-reuse races.
-- **Writes through a removed cgroup's open files give the wrong result:** after rmdir,
-  `cgroup.procs`, `cgroup.freeze` and value files fail with `ENOENT` and `cgroup.kill` succeeds
-  silently, where Linux 6.1 fails every write with `ENODEV`, which container managers treat as
-  "cgroup gone".
-- **Zombies' address-space and mount files fall back to someone else's:** `mounts` and `mountinfo`
-  of a zombie, or of a main thread that exited while other threads run, list the initial mount
-  namespace's mounts, where Linux fails the open with `EINVAL` (no namespaces left); and an exited
-  main thread's `pagemap` reads its live thread group's address space, where Linux has none for it.
-  A reader that reads such a `pagemap` to EOF (Starnix's zombie test) runs through the whole 48-bit
-  range and is ended by the OOM killer.
 
 ## Open questions
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations; restarted mqueue waits last)
 
 ## Responsibilities
 
@@ -192,14 +192,16 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   (`QSIZE`, `NOTIFY`, `SIGNO`, `NOTIFY_PID`) and changed by chmod, chown and utimensat; write is
   `EINVAL`.
 - mq_timedsend: priority below 32768, length up to `msgsize` (`EMSGSIZE`); a full queue is `EAGAIN`
-  with `O_NONBLOCK`, `ETIMEDOUT` after the deadline, `EINTR` when interrupted (a signal, but also a
-  stop, freeze or ptrace trap), else the sender waits on the queue object. The message goes before
+  with `O_NONBLOCK`, `ETIMEDOUT` after the deadline, `ERESTARTSYS` when interrupted (restarted after
+  a handler with `SA_RESTART`, a stop, a freeze or a ptrace trap, keeping the absolute deadline;
+  `EINTR` otherwise), else the sender waits on the queue object. The message goes before
   the first one of lower priority. If the queue was empty and no receiver is blocked, the
   registration fires once: a signal with `SI_MESGQ` and the sender's pid and uid as the registrant
   sees them, a `NOTIFY_WOKENUP` cookie queued on the registrant's netlink socket, or nothing
   (`SIGEV_NONE`).
 - mq_timedreceive: the buffer must hold `msgsize`; the front message is taken; an empty queue is
-  `EAGAIN`, `ETIMEDOUT` or `EINTR`, else the receiver waits, counted in `receivers`. Timeouts are
+  `EAGAIN`, `ETIMEDOUT` or interrupted as mq_timedsend is, else the receiver waits, counted in
+  `receivers`. Timeouts are
   absolute `CLOCK_REALTIME` (`itimer::Expiry` on the realtime base), so they move with the host's
   wall clock.
 - Senders, receivers and poll/epoll wait on the queue object; both directions wake it.
@@ -279,9 +281,6 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   alone, so a reused tgid looks alive and would get the signal. Cancelling or replacing a
   `SIGEV_THREAD` registration sends no `NOTIFY_REMOVED` cookie, so musl's helper thread stays
   blocked in recv forever.
-- **Blocked mq_timedsend and mq_timedreceive are never restarted:** they return `EINTR` instead of
-  `ERESTARTSYS`, so `SA_RESTART` handlers see `EINTR` and even a handler-less `SIGSTOP`/`SIGCONT`
-  ends the wait (Linux restarts them).
 - **mqueue limits and root permissions are partly missing:** without an attr a queue gets
   `msg_default`/`msgsize_default` uncapped by `msg_max`/`msgsize_max`; `RLIMIT_MSGQUEUE` is not
   enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem

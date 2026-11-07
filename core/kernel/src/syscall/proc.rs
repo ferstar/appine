@@ -92,8 +92,9 @@ const AT_EMPTY_PATH: u32 = 0x1000;
 
 /// The maximum length of one argument (Linux's `MAX_ARG_STRLEN`).
 const MAX_ARG_STRLEN: usize = 32 * 4096;
-/// `#!` interpreters nest at most this many levels; as on Linux, more is ELOOP.
-const MAX_INTERP_DEPTH: usize = 4;
+/// `#!` interpreters nest at most this many levels (five scripts, then the binary, as Linux
+/// 6.1's `exec_binprm` allows); more is ELOOP.
+const MAX_INTERP_DEPTH: usize = 5;
 /// `#!` lines are read up to this many bytes (Linux's `BINPRM_BUF_SIZE`).
 const SHEBANG_MAX: usize = 256;
 
@@ -1192,6 +1193,16 @@ struct Wanted {
     continued: bool,
     consume: bool,
     own_thread: bool,
+    /// Which children by the signal they report their exit with (Linux's `eligible_child`): all
+    /// with `__WALL` (None); with `__WCLONE` only those reporting with another signal than
+    /// `SIGCHLD` (Some(true)); otherwise only those reporting with `SIGCHLD` (Some(false)). A
+    /// child the caller traces is always eligible.
+    clones: Option<bool>,
+}
+
+/// [`Wanted::clones`] from wait4's or waitid's options.
+fn clones(options: u32) -> Option<bool> {
+    (options & WALL == 0).then_some(options & WCLONE != 0)
 }
 
 /// A child state change found: the child (its number as the caller sees it), its state change,
@@ -1225,6 +1236,7 @@ pub(super) fn wait4(
         continued: options & WCONTINUED != 0,
         consume: true,
         own_thread: options & WNOTHREAD != 0,
+        clones: clones(options),
     };
     let Some((child, event, usage, _)) = wait_child(cx, who, options & WNOHANG != 0, want)? else {
         return Ok(0);
@@ -1280,6 +1292,7 @@ pub(super) fn waitid(
         continued: options & WCONTINUED != 0,
         consume: options & WNOWAIT == 0,
         own_thread: options & WNOTHREAD != 0,
+        clones: clones(options),
     };
     let nohang = options & WNOHANG != 0;
     let found = wait_child(cx, who, nohang || nonblock, want)?;
@@ -1358,7 +1371,6 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
         if want.own_thread && child.borrow().parent_thread != tid {
             continue;
         }
-        any = true;
         // The main thread is traced by the caller: stops and continues are reported as
         // ptrace-stops (below), and as on Linux not reported twice
         let traced = cx
@@ -1366,6 +1378,20 @@ fn find_event(cx: &mut Cx<'_>, who: Who, want: Wanted) -> Result<Option<Found>, 
             .tasks
             .get(&c)
             .is_some_and(|t| t.trace.borrow().tracer == Some(me));
+        let clone = child.borrow().exit_signal != Signal::CHLD.number();
+        if !traced && want.clones.is_some_and(|c| c != clone) {
+            continue;
+        }
+        // A zombie counts only for a wait that takes exits (Linux's wait_task_zombie returns
+        // before clearing notask_error): waiting only for stops and continues of children that
+        // have all exited is ECHILD
+        if !want.exited && {
+            let g = child.borrow();
+            g.zombie.is_some() && g.exit_tracer.is_none()
+        } {
+            continue;
+        }
+        any = true;
         let mut g = child.borrow_mut();
         // Exited but not yet collected by the tracer: only the tracer can see it (trace_exits
         // below), and the parent keeps waiting

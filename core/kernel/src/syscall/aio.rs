@@ -66,8 +66,8 @@ pub(super) fn io_setup(cx: &mut Cx<'_>, nr: u32, ctxp: u64) -> SysResult {
     if cur != 0 || nr == 0 || nr > 0x1000_0000 / 32 {
         return Err(Errno::EINVAL);
     }
-    // As on Linux, twice nr counts towards aio-nr
-    let cost = u64::from(nr) * 2;
+    // nr counts towards aio-nr (Linux before 4.12 counted twice nr)
+    let cost = u64::from(nr);
     if cx.kr().aio_nr + cost > cx.kr().aio_max_nr {
         return Err(Errno::EAGAIN);
     }
@@ -356,7 +356,7 @@ pub(crate) fn released(
     contexts: impl IntoIterator<Item = (u64, Rc<RefCell<AioContext>>)>,
 ) {
     for (_, c) in contexts {
-        k.aio_nr = k.aio_nr.saturating_sub(c.borrow().max as u64 * 2);
+        k.aio_nr = k.aio_nr.saturating_sub(c.borrow().max as u64);
     }
 }
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets; deviations found by gVisor's tests)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets; deviations found by gVisor's tests; SO_PASSCRED inherited at accept last)
 
 ## Responsibilities
 
@@ -86,8 +86,9 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   a server end is created in the client's namespace and queued; credentials are exchanged (client
   gets the listener's listen-time credentials). A full queue blocks (`EAGAIN` nonblocking or after
   `SO_SNDTIMEO`, `ERESTARTSYS` on signals) until an accept or the listener closing.
-- accept: not listening `EINVAL`; pops a pending end, wakes blocked connectors, returns the peer
-  name (2 bytes for unnamed clients); waits bounded by `SO_RCVTIMEO`.
+- accept: not listening `EINVAL`; pops a pending end, turns on its `SO_PASSCRED` when the
+  listener has it (`unix_sock_inherit_flags`), wakes blocked connectors, returns the peer name
+  (2 bytes for unnamed clients); waits bounded by `SO_RCVTIMEO`.
 - Datagram connect: `AF_UNSPEC` disconnects; otherwise the target must be a datagram socket
   (`EPROTOTYPE`); no check that the target is connected elsewhere.
 - shutdown: `how` outside 0..2 `EINVAL`; on unconnected and listening sockets the flags are only
@@ -205,7 +206,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   `SO_RCVLOWAT`, `SO_BROADCAST` and the like) are accepted by setsockopt and `ENOPROTOOPT` to
   getsockopt; buffer sizes are fixed at 212992, so `SO_SNDBUF`/`SO_RCVBUF` (and their `FORCE`
   forms) change nothing, a small send buffer does not make writes block and a larger one does
-  not unblock them. Timeout parsing is `kernel/net`'s (**Socket timeouts are parsed leniently**).
+  not unblock them.
 - **Datagram sends ignore the receiver's read shutdown:** after the receiving socket does
   `shutdown(SHUT_RD)`, datagrams to it are still queued and the send succeeds, where Linux 6.1
   fails them with `EPIPE` (without `SIGPIPE`), so senders never learn that the peer stopped
@@ -230,9 +231,6 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   NULL control buffer and a nonzero length fails outright. Linux keeps a stream message queued on
   a data fault, and for a bad control buffer drops the files and returns the data with
   `MSG_CTRUNC`.
-- **Accepted sockets don't inherit `SO_PASSCRED`:** Linux's `unix_accept` copies the listener's
-  `SO_PASSCRED` to the new socket; here it starts off, so servers that enable credential passing
-  on the listening socket get no `SCM_CREDENTIALS` on their connections.
 - **No sender address on connections:** recvfrom/recvmsg on stream and seqpacket sockets return an
   empty address, where Linux returns the sending socket's bound name as it is at receive time.
 - **Abstract names ignore the socket type:** Linux keys abstract names by name and socket type, so

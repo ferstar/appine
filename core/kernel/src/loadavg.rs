@@ -122,8 +122,10 @@ pub(crate) fn sample(k: &mut Kernel, shared: &Shared) -> Option<Instant> {
     }
     let running = running(k);
     let next = k.load.update(now, running);
-    if next.is_none() {
-        shared.checks_idle.store(true, Ordering::Relaxed);
+    // A thread that woke since it was counted keeps the sampler going
+    if next.is_none() && !shared.stop_checks(|| self::running(k) == 0) {
+        k.load.stopped = false;
+        return Some(k.load.due);
     }
     next
 }
@@ -159,7 +161,7 @@ pub(crate) fn sysinfo_loads(k: &Kernel) -> [u64; 3] {
 pub(crate) fn running(k: &Kernel) -> u64 {
     k.tasks
         .values()
-        .filter(|t| !t.sleeping.load(Ordering::Relaxed))
+        .filter(|t| !t.sleeping.load(Ordering::SeqCst))
         .count() as u64
 }
 

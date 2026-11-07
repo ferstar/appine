@@ -300,7 +300,9 @@ fn slave_read(
             } else {
                 let avail = t.raw_len();
                 let enough = avail >= vmin.min(buf.len()).max(1);
-                if avail > 0 && (enough || expired || vmin == 0) {
+                // A nonblocking read takes what is there even below VMIN (Linux's n_tty_read
+                // returns the bytes copied when it would otherwise wait)
+                if avail > 0 && (enough || expired || vmin == 0 || nonblock) {
                     let n = t.read(buf).unwrap_or(0);
                     drop(t);
                     return deliver(cx, n);
@@ -459,7 +461,7 @@ pub(crate) fn readiness(tty: &Tty, master: bool, born: u32) -> i16 {
             ev |= POLLHUP;
         }
     } else {
-        if tty.readable() {
+        if tty.poll_readable() {
             ev |= POLLIN | POLLRDNORM;
         }
         if tty.output_room() > 0 {
@@ -553,6 +555,11 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TCFLSH => {
+            // tcflush, tcflow, tcdrain and changing the line discipline from a background job
+            // get SIGTTOU like setting the termios (tty_check_change)
+            if !master {
+                check_background(cx, tty, Signal::TTOU)?;
+            }
             let (input, output) = match arg {
                 0 => (true, false),
                 1 => (false, true),
@@ -585,6 +592,9 @@ pub(crate) fn ioctl(
             Ok(0)
         }
         TCXONC => {
+            if !master {
+                check_background(cx, tty, Signal::TTOU)?;
+            }
             let mut signals = Vec::new();
             {
                 let mut t = tty.borrow_mut();
@@ -612,7 +622,13 @@ pub(crate) fn ioctl(
             request_wake_object(wake::of(tty));
             Ok(0)
         }
-        TCSBRK | TCSBRKP | TIOCEXCL | TIOCNXCL | TIOCSETD => Ok(0),
+        TCSBRK | TCSBRKP | TIOCSETD => {
+            if !master {
+                check_background(cx, tty, Signal::TTOU)?;
+            }
+            Ok(0)
+        }
+        TIOCEXCL | TIOCNXCL => Ok(0),
         TIOCGETD => put(cx, arg, 0i32.to_le_bytes()).map(|()| 0),
         FIONREAD => {
             let t = tty.borrow();

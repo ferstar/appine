@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; loop devices; eventfd readv; `F_SETOWN` owners; Starnix's and gVisor's test findings)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; loop devices; eventfd readv; `F_SETOWN` owners; Starnix's and gVisor's test findings; pipe write edges and fasync kinds last)
 
 ## Responsibilities
 
@@ -114,7 +114,9 @@ signal delivery (`kernel/signal`).
   reported bits; an interest fires only for bits not yet reported. Host fds with edge-triggered
   or exclusive interests (or in an edge-watched epoll) get a private edge-triggered host epoll
   (`HostEdges`) so each host arrival counts. While waiting, reported-and-still-ready bits are left
-  out (avoiding busy loops); drains and pipe arrivals wake edge waiters. Drains are counted for
+  out (avoiding busy loops); drains and pipe arrivals wake edge waiters. A pipe's read end counts
+  writes as arrivals and its write end the reads that made it writable again (`Pipe::room`, as
+  Linux's pipe_read wakes the writers of a full pipe). Drains are counted for
   read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they return
   `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector forms
   never count; tee's write-side entry reads the length argument instead of `fd_out`). On non-Linux
@@ -138,8 +140,9 @@ signal delivery (`kernel/signal`).
 
 ### Signal-driven I/O
 
-- Turning `O_ASYNC` on (`F_SETFL`, `FIOASYNC`) registers a `Fasync` entry for any file kind,
-  snapshotting the current events (already-ready events are not signalled) and waking the timer
+- Turning `O_ASYNC` on (`F_SETFL`, `FIOASYNC`) registers a `Fasync` entry only for the kinds whose
+  Linux file operations have fasync (pipes and FIFOs, sockets, terminals, inotify, host fds); other
+  kinds keep the flag and never raise `SIGIO`. Registering snapshots the current events (already-ready events are not signalled) and waking the timer
   thread.
 - The timer thread's `check_fasync` drops entries whose file is gone or no longer `O_ASYNC`,
   clears reported read/write bits when the counters moved (`drained`, `reads` — bumped by read-file
@@ -186,8 +189,7 @@ signal delivery (`kernel/signal`).
   another) and rotate waiters instead of keeping Linux's order.
 - **Edge-triggered host sockets can stall:** without `HostEdges` (always on non-Linux hosts) a
   program that drains with `recvmsg` until a short read can miss data that arrives before the next
-  scan, sleeping until an unrelated event; the pipe write end has no write-side counter, so
-  `writev`-until-short drains can miss `POLLOUT`.
+  scan, sleeping until an unrelated event.
 - **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
   claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
   partial count.
@@ -199,8 +201,6 @@ signal delivery (`kernel/signal`).
 - **epoll_wait does not check the event buffer up front:** an events pointer outside the user
   address space is only noticed when events are copied out, so with nothing ready epoll_wait
   returns 0 or sleeps where Linux fails at once with `EFAULT`.
-- **`O_ASYNC` on every file kind:** regular files, eventfds, timerfds and message queues accept
-  it, so a regular file with `O_ASYNC` raises `SIGIO` after every read.
 - **Per-scan cost:** every scan holds the BKL and makes one zero-timeout host poll per host fd (and
   computes readiness twice per file); epoll has no ready list.
 - **epoll_ctl reports errors in a different order:** epfd's type is checked before the target fd

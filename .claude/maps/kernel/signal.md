@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace; frames that cannot be written last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace; frames that cannot be written; sigqueue to zombies and core %d last)
 
 ## Responsibilities
 
@@ -167,7 +167,8 @@ procfs.
   signals from its set (`EINTR` for others); `rt_sigpending` reports pending ∩ blocked.
 - `sigaltstack`: `SS_DISABLE`, `SS_ONSTACK` reporting, `SS_AUTODISARM`.
 - `tkill`/`tgkill` use `SI_TKILL`. `kill(pid > 0)` and `rt_sigqueueinfo` accept any thread's tid
-  and signal its process (Linux's `kill_pid_info`).
+  and signal its process (Linux's `kill_pid_info`); both accept a zombie not yet reaped (nothing is
+  queued) and refuse pid 1 (`ESRCH` for `rt_sigqueueinfo`).
 - signalfd: reads dequeue matching signals of the calling thread and its group, in the Linux
   `signalfd_siginfo` layout; readiness also follows the calling thread.
 
@@ -235,7 +236,7 @@ procfs.
   supported (skipped with a debug log).
 - The dumping thread waits until the other threads have exited, each saving its registers.
 - The name expands `core_pattern` (`%%`, `%p`, `%P`, `%i`, `%I`, `%u`, `%g`, `%s`, `%t`, `%h`, `%e`,
-  `%E`, `%c`, `%d`); `core_uses_pid` appends `.pid` when the pattern has no pid. The file is
+  `%E`, `%c`, `%d` the dumpable mode, 1); `core_uses_pid` appends `.pid` when the pattern has no pid. The file is
   created relative to the cwd (any old file unlinked first) with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode
   0600. `core_pattern` itself (at most 127 bytes) is a root-owned 0644 file guarded only by the
   normal open-time permission check. `dumpable` is a flag (`PR_SET_DUMPABLE` 0 or 1; no
@@ -330,8 +331,6 @@ procfs.
   instructions.
 - **`rt_sigaction` echoes unknown flag bits:** Linux 5.11+ clears them, so `SA_UNSUPPORTED` probing
   reads as an older kernel (harmless while tag-bit exposure is unimplemented).
-- **Core name `%d` prints 0:** it expands the inverse of the dumpable flag; Linux prints the dumpable
-  value (1).
 - **`MADV_DONTNEED` wipes the vDSO:** the vDSO is a private anonymous copy, so discarding it (alone
   or inside a larger range) zeroes it and the next vDSO clock call or signal return through
   `__kernel_rt_sigreturn` raises `SIGILL`, where Linux refills the vDSO from the kernel image.
@@ -348,10 +347,6 @@ procfs.
   ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
   where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
   gdb or strace sees a duplicate stop.
-- **rt_sigqueueinfo to a zombie is `ESRCH`:** the process-directed queue syscall refuses a child
-  that has exited but not been reaped, while kill and pidfd_send_signal accept it as Linux does
-  (0), so `sigqueue()` to a child that just exited fails and `sigqueue(pid, 0, …)` liveness probes
-  disagree with `kill(pid, 0)`.
 - **Queued siginfo keeps only code, pid, uid and value:** rt_sigqueueinfo, rt_tgsigqueueinfo and
   pidfd_send_signal rebuild the caller's siginfo, dropping `si_errno` and every other union field,
   where Linux 6.1 delivers it as given (only `si_signo` forced); `PTRACE_SETSIGINFO` is not

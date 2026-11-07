@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix and gVisor cases with a shared runner; image export; CI split; the AppArmor gotcha last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix and gVisor cases; image export; CI split; the AppArmor gotcha; appine-run stop signals, the LTP store stamp and test skips last)
 
 ## Responsibilities
 
@@ -36,8 +36,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Key types
 
-- `RunOptions` (tier, rootfs, terminal, memory limit, low-port offset, always-map-low-ports, init)
-  and `Terminal` (input, output, size, resize pipe) — what `appine-run` passes to the kernel's
+- `RunOptions` (tier, rootfs, terminal, memory limit, low-port offset, always-map-low-ports, init,
+  stop pipe) and `Terminal` (input, output, size, resize pipe) — what `appine-run` passes to the kernel's
   `run`; `RunError`, `RunReport`, `ExitStatus`.
 - `appine_bench::Program` (`PROGRAMS`, five benchmark programs with rounds and workloads), the
   shared `CFLAGS` and `build()`.
@@ -85,8 +85,12 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   when known); 127 when the program is not found; 1 when the store cannot be opened or `--import`
   fails; 2 for usage errors; 126 for other errors (cannot load, no Tier 1 on this host, internal
   errors).
-- No host signal handlers besides `SIGWINCH`: `SIGTERM` (from `timeout`) or ^C with `--no-pty` kill
-  the host process outright.
+- `SIGINT`, `SIGTERM` and `SIGHUP` to `appine-run` (`timeout`, ^C with `--no-pty`, a closed
+  terminal) are caught (`appine_hal::stop_notifier`) and handed to the kernel's `run`
+  (`RunOptions::stop`): the first is sent on to the program, one at least a second later ends
+  every guest process (duplicates sent to the whole process group by `timeout` or a terminal
+  arrive together); the run then ends as usual, so the inittab shutdown, the final store sync and the host
+  terminal's restore still happen.
 - Release builds enable the `borrow-check` feature by default, so the release binaries used by
   difftest, LTP and the survey check that no borrow is held across a BKL release.
 - Environment knobs read by the kernel and engine: `APPINE_LOG`, `APPINE_STRACE` (also routes fast
@@ -107,6 +111,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   clone`. Most cases run under both tiers.
 - Without a store or `musl-gcc` the tests skip with a message, unless `APPINE_REQUIRE_ROOTFS=1` /
   `APPINE_REQUIRE_MUSL=1` (set in CI); bug-injection tests run only in debug builds.
+- Each rootfs test that skips without a store says so, not only the first; the low-ports test skips
+  only a case whose host port is taken. The rootfs tests, difftest, LTP and the survey choose the
+  newest Alpine tarball by version (`version_key`, `sort -V`).
 - `appine-bench` builds the benchmark programs, runs each natively, under Tier 0 (once) and Tier 1
   (minimum of N runs), fails if any output differs, and prints times, ratios and a geometric mean;
   it uses the `appine-run` next to its own executable.
@@ -186,8 +193,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 - `build-ltp` builds a pinned LTP release in `alpine:3.24`, directory by directory, skipping what
   does not build with musl, into `target/ltp/ltp-<ver>.tar`.
-- `ltp` uses a store on the `appine-ltp` volume when `/ltp` exists (inside `scripts/dev`), else
-  `target/ltp/store` (`LTP_STORE` overrides), built once with LTP unpacked; a kernel config listing
+- `ltp` builds `appine-run` into `target/linux-arm64` first (unless `APPINE_RUN` names one), and
+  uses a store on the `appine-ltp` volume when `/ltp` exists (inside `scripts/dev`), else
+  `target/ltp/store` (`LTP_STORE` overrides), made again with LTP unpacked whenever the stamp of
+  the LTP tarball and rootfs it records (names, sizes, times) changes; a kernel config listing
   Appine's features (loop devices included) is written and passed as `KCONFIG_PATH`.
 - Tests that need a device get one of Appine's loop devices over a file in their `/tmp` directory,
   and `LTP_DEV_FS_TYPE=tmpfs` makes LTP skip mkfs and mount a tmpfs there instead (Appine has no
@@ -296,18 +305,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `/opt`, `/home` and `/run`, while the Appine store keeps `/tmp` and `/root` between runs, so
   caches such as `/root/.cache` (Go, uv) exist only on the Appine side; cases clean `/tmp` by hand
   and nothing handles `$HOME` (one epoll case assumes an empty uv cache).
-- **`scripts/ltp` is stale and fragile outside its container.** Its store is never rebuilt when the
-  LTP tarball or rootfs changes, an existing binary is never rebuilt, and outside `scripts/dev` its
-  own `cargo build` writes `target/release` while it runs `target/linux-arm64`, with no fallback.
-- **Tests can pass vacuously.** The low-ports test returns from the whole test (skipping all four
-  cases) when its first bind fails; without a rootfs only the first test prints the skip and the rest
-  pass silently. (The rootfs tests, difftest, LTP and the survey choose the newest Alpine tarball
-  by version: `version_key`, `sort -V`.)
-- **Killing `appine-run` skips the guest's shutdown.** Without signal handlers, `timeout` or ^C
-  (with `--no-pty`) skip the inittab shutdown and the final store sync (losing the 5 ms deferred
-  commit window) and, in PTY mode, leave the host terminal raw.
 - **A forced PTY on a terminal with piped stdout is half set up.** Raw mode needs both fds to be
-  terminals, so the host keeps ISIG (^C/^Z signal `appine-run` itself), line-buffers input and
+  terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
+  stops `appine-run` itself), line-buffers input and
   echoes it while the guest echoes into the pipe; the size stays 24×80.
 - **The host window size uses Linux's `TIOCGWINSZ`** (0x5413), so on macOS the console stays 24×80
   and resizes are ignored.

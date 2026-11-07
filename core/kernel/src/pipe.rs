@@ -47,6 +47,11 @@ pub struct Pipe {
     /// Number of writes of data: as on Linux, every write makes the read end's `EPOLLET` fire
     /// again.
     pub writes: u64,
+    /// Number of reads that made the pipe writable again (at least `PIPE_BUF` free, where poll
+    /// reports `POLLOUT`): each makes the write end's `EPOLLET` fire again, as Linux's pipe_read
+    /// wakes the writers when it frees a full pipe, so a writer that wrote until a short count
+    /// learns of the room.
+    pub room: u64,
 }
 
 impl Pipe {
@@ -62,6 +67,7 @@ impl Pipe {
             writer_opens: 0,
             writer_need: 0,
             writes: 0,
+            room: 0,
         }))
     }
 
@@ -85,8 +91,11 @@ impl Pipe {
     /// used to be woken on every read.
     pub fn drained(&mut self, before: usize) -> bool {
         let now = self.space();
-        let wake = (before < PIPE_BUF && now >= PIPE_BUF)
-            || (self.writer_need != 0 && now >= self.writer_need);
+        let writable = before < PIPE_BUF && now >= PIPE_BUF;
+        if writable {
+            self.room += 1;
+        }
+        let wake = writable || (self.writer_need != 0 && now >= self.writer_need);
         if wake {
             self.writer_need = 0;
         }

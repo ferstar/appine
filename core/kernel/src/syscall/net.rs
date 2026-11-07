@@ -491,13 +491,17 @@ pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: 
         return Err(Errno::EINVAL);
     }
     let (sock, nonblock) = socket_of(cx, fd)?;
+    // As Linux's __sys_accept4_file: no free fd is EMFILE before a connection is taken, and the
+    // peer's address is written before the fd is installed, so a bad address drops the
+    // connection (do_accept) instead of leaving an fd the program never learns
+    cx.fds().free_slot(0)?;
     let (new, peer) = if is_unix(&sock) {
         unix::accept(cx, &sock, nonblock)?
     } else {
         accept_host(cx, &sock, nonblock)?
     };
-    let fd = install(cx, new, flags)?;
     write_addr(cx, addr, addrlen, &peer)?;
+    let fd = install(cx, new, flags)?;
     Ok(fd as u64)
 }
 
@@ -507,27 +511,30 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, timeout, net, local_map, vaddr, mark) = match &*sock.borrow() {
-        Socket::Inet(s) => (
-            s.fd,
-            s.family,
-            s.ty,
-            s.proto,
-            s.rcvtimeo,
-            s.net.clone(),
-            s.local_map,
-            s.vaddr,
-            s.mark(),
-        ),
-        Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
-        Socket::Unix(_) => unreachable!("handled by accept4"),
-    };
+    let (host_fd, family, ty, proto, (timeout, sndtimeo), net, local_map, vaddr, mark) =
+        match &*sock.borrow() {
+            Socket::Inet(s) => (
+                s.fd,
+                s.family,
+                s.ty,
+                s.proto,
+                (s.rcvtimeo, s.sndtimeo),
+                s.net.clone(),
+                s.local_map,
+                s.vaddr,
+                s.mark(),
+            ),
+            Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
+            Socket::Unix(_) => unreachable!("handled by accept4"),
+        };
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
         match appine_hal::net::accept(host_fd) {
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
+                // The listener's timeouts carry over (sk_clone_lock copies the whole sock)
+                (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
                 new.local_map = local_map;
                 new.net = net.clone();
                 // The accepted connection inherits the listener's SO_MARK (ir_mark in
@@ -1133,8 +1140,8 @@ pub(super) fn setsockopt(
     }
     match &mut *sock.borrow_mut() {
         Socket::Inet(s) => match (level, name) {
-            (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v),
-            (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v),
+            (SOL_SOCKET, SO_RCVTIMEO) => s.rcvtimeo = timeval(&v)?,
+            (SOL_SOCKET, SO_SNDTIMEO) => s.sndtimeo = timeval(&v)?,
             // In a new network namespace the host socket must use IPv4-mapped addresses: only
             // record it
             (IPPROTO_IPV6, IPV6_V6ONLY) if s.net.is_some() && s.family == AF_INET6 => {
@@ -1145,7 +1152,7 @@ pub(super) fn setsockopt(
         },
         // Other options (buffer sizes, multicast and so on) are all accepted but have no effect
         Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
-            s.rcvtimeo = timeval(&v)
+            s.rcvtimeo = timeval(&v)?
         }
         // SOL_NETLINK's NETLINK_CAP_ACK, NETLINK_EXT_ACK
         Socket::Netlink(s) if level == 270 && (name == 10 || name == 11) => {
@@ -1163,13 +1170,24 @@ pub(super) fn setsockopt(
     Ok(0)
 }
 
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO`: None means no timeout, as for 0 or a value at least
-/// `KTIME_MAX` long (Linux treats such values as `MAX_SCHEDULE_TIMEOUT`).
-pub(super) fn timeval(b: &[u8]) -> Option<Duration> {
-    let sec = i64::from_le_bytes(b.get(..8)?.try_into().ok()?);
-    let usec = i64::from_le_bytes(b.get(8..16)?.try_into().ok()?);
-    let d = Duration::from_secs(sec.max(0) as u64) + Duration::from_micros(usec.max(0) as u64);
-    (!d.is_zero() && d < super::KTIME_MAX).then_some(d)
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux 6.1's `sock_set_timeout`): a short buffer is EINVAL and
+/// microseconds outside `[0, 1000000)` EDOM; a negative time means not waiting at all (zero, so
+/// reads and writes fail with EAGAIN at once); None means no timeout, as for 0 or a value at
+/// least `KTIME_MAX` long (Linux treats such values as `MAX_SCHEDULE_TIMEOUT`).
+pub(super) fn timeval(b: &[u8]) -> Result<Option<Duration>, Errno> {
+    let (Some(sec), Some(usec)) = (b.get(..8), b.get(8..16)) else {
+        return Err(Errno::EINVAL);
+    };
+    let sec = i64::from_le_bytes(sec.try_into().unwrap());
+    let usec = i64::from_le_bytes(usec.try_into().unwrap());
+    if !(0..1_000_000).contains(&usec) {
+        return Err(Errno::EDOM);
+    }
+    if sec < 0 {
+        return Ok(Some(Duration::ZERO));
+    }
+    let d = Duration::from_secs(sec as u64) + Duration::from_micros(usec as u64);
+    Ok((!d.is_zero() && d < super::KTIME_MAX).then_some(d))
 }
 
 pub(super) fn getsockopt(

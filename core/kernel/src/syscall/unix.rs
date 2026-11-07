@@ -120,7 +120,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             let vfs = cx.vfs()?;
             let cred = cx.cred();
             let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
-            let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777 & !cx.umask(), false);
+            let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777, cx.umask(), false);
             let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;
             let ino = vfs
                 .store()
@@ -175,6 +175,10 @@ pub(super) fn accept(
             _ => Err(Errno::EINVAL),
         })?;
         if let Some(new) = new {
+            // The listener's SO_PASSCRED carries over (unix_sock_inherit_flags)
+            if with(sock, |u| u.passcred) {
+                with(&new, |u| u.passcred = true);
+            }
             // Connects waiting for room in the backlog can go on now
             request_wake_object(wake::of(&queue));
             let peer = with(&new, |u| u.peer_name()).unwrap_or_else(unnamed);
@@ -634,8 +638,8 @@ pub(super) fn setsockopt(
         .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
     match name {
         SO_PASSCRED => u.passcred = int != 0,
-        SO_RCVTIMEO => u.rcvtimeo = timeval(value),
-        SO_SNDTIMEO => u.sndtimeo = timeval(value),
+        SO_RCVTIMEO => u.rcvtimeo = timeval(value)?,
+        SO_SNDTIMEO => u.sndtimeo = timeval(value)?,
         // Buffer sizes, SO_REUSEADDR and so on: accepted but without effect
         _ => {}
     }

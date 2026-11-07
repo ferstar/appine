@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns last)
 
 ## Responsibilities
 
@@ -124,13 +124,14 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   allow with `CAP_DAC_READ_SEARCH` (no write) or `CAP_DAC_OVERRIDE`, non-directories allow with
   `CAP_DAC_READ_SEARCH` (read only) or `CAP_DAC_OVERRIDE` (no exec, or some exec bit set), all via
   `capable_wrt`; else `EACCES`. No ACLs, immutable or append flags.
-- `owns`: fsuid is the owner or `CAP_FOWNER` with respect to the inode (through `capable_wrt`, so
-  both the inode's uid and gid must be mapped). `may_delete`: write and search on the directory,
-  then for sticky directories the owner of file or directory or `CAP_FOWNER` (`EPERM`).
-  `new_owner` receives the mode with the umask already applied: uid fsuid; gid the directory's
-  when it is setgid (new directories inherit setgid), else fsgid; non-members without
-  `CAP_FSETID` lose `S_ISGID` on group-executable files. mkdir keeps all 0o7777 bits the caller
-  passes, setuid and setgid included. `for_access`: filesystem ids set to the real ids, effective capabilities
+- `owns`: fsuid is the owner, or `CAP_FOWNER` in the caller's namespace with the owner mapped there
+  (Linux's `inode_owner_or_capable`; the group need not be mapped). `may_delete`: write and search
+  on the directory, then for sticky directories the owner of file or directory or `CAP_FOWNER`
+  (`EPERM`). `new_owner` (Linux 6.1's `vfs_prepare_mode` and `inode_init_owner`) takes the mode
+  and the umask: uid fsuid; gid the directory's when it is setgid, else fsgid; in a setgid
+  directory a non-member without `CAP_FSETID` loses `S_ISGID` on a group-executable file before
+  the umask applies; a directory keeps only its permissions and the sticky bit and inherits the
+  setgid bit of a setgid parent. `for_access`: filesystem ids set to the real ids, effective capabilities
   to permitted only when the real uid is root in the namespace. `searches_all`: `CAP_DAC_READ_SEARCH`
   or `CAP_DAC_OVERRIDE` in the initial namespace (gates the no-BKL resolver).
 - `may_signal` (Linux `kill_ok_by_cred`): sender's real or effective uid equals the target's real
@@ -217,15 +218,9 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - **`PRIO_USER` uses an untranslated uid.** setpriority/getpriority match `who` against kernel uids
   without mapping it through the caller's user namespace, and do not skip processes invisible in
   the caller's pid namespace (ioprio translates both).
-- **New-file modes differ from Linux.** The umask is applied before the setgid strip (mode 02755
-  with umask 077 in a setgid directory gives 02700 where Linux gives 0700), and mkdir keeps
-  caller-supplied setuid/setgid bits (Linux keeps only permissions and the sticky bit).
 - **ptrace access checks diverge.** The capability subset test uses permitted capabilities even
   with filesystem credentials (Linux uses effective, so Appine is more permissive), and the
   `/proc/<pid>/mem`-class opens use real credentials where Linux uses filesystem ones.
-- **`owns` also requires the gid mapping.** Linux's `inode_owner_or_capable` needs only the uid
-  mapped, so namespace root gets `EPERM` for chmod, utimensat, `O_NOATIME` and similar on files
-  whose group is unmapped.
 - **The tracer's privilege is judged in the initial namespace.** A tracer privileged only inside a
   container (container root running strace or gdb) makes setuid and file-capability programs lose
   their gains, where Linux would grant them.

@@ -464,11 +464,17 @@ impl Kernel {
         }
     }
 
-    /// Allocates a tid not taken by a thread or a thread group (zombies included).
+    /// Allocates a tid not taken by a thread or a thread group (zombies included): the numbers
+    /// after the last one below `PID_MAX`, then from 300 again (Linux's `RESERVED_PIDS` in
+    /// `alloc_pid`).
     pub fn alloc_tid(&mut self) -> Result<Tid, Errno> {
         for _ in 0..PID_MAX {
-            let tid = self.next_tid;
-            self.next_tid = if tid >= PID_MAX { INIT + 1 } else { tid + 1 };
+            let tid = if self.next_tid >= PID_MAX {
+                crate::pidns::RESERVED_PIDS
+            } else {
+                self.next_tid
+            };
+            self.next_tid = tid + 1;
             if !self.tasks.contains_key(&tid) && !self.groups.contains_key(&tid) {
                 return Ok(tid);
             }
@@ -626,13 +632,10 @@ impl Kernel {
         self.next_tid - 1
     }
 
-    /// Writes `ns_last_pid`: allocation then starts from `pid + 1` (skipping those taken).
+    /// Writes `ns_last_pid`: allocation then starts from `pid + 1` (skipping those taken), or
+    /// from 300 after the largest number.
     pub fn set_last_pid(&mut self, pid: Tid) {
-        self.next_tid = if pid >= PID_MAX {
-            INIT + 1
-        } else {
-            (pid + 1).max(INIT + 1)
-        };
+        self.next_tid = (pid.saturating_add(1)).clamp(INIT + 1, PID_MAX);
     }
 
     /// The open files in all fd tables. An open file in several fd tables appears that many times.
@@ -821,13 +824,29 @@ impl Shared {
     }
 
     /// The thread is about to go on running guest code: wakes the timer thread if the periodic
-    /// checks are stopped. Does not need the BKL.
+    /// checks are stopped. Does not need the BKL. The thread has already cleared its `sleeping`
+    /// flag (SeqCst) before this SeqCst read, pairing with [`stop_checks`](Self::stop_checks).
     pub fn resume_checks(&self) {
-        if self.checks_idle.load(Ordering::Relaxed)
-            && self.checks_idle.swap(false, Ordering::Relaxed)
+        if self.checks_idle.load(Ordering::SeqCst) && self.checks_idle.swap(false, Ordering::SeqCst)
         {
             self.timers.signal();
         }
+    }
+
+    /// The timer thread saw every thread waiting and stops its periodic checks: sets
+    /// `checks_idle`, then looks at the threads again with `idle` and clears it when one has woken
+    /// meanwhile. Returns whether the checks stopped. With every `sleeping` store and load and both
+    /// sides' `checks_idle` accesses SeqCst, either a waking thread reads the flag set and wakes
+    /// the timer thread, or this second look sees it running; one look alone could miss a thread
+    /// that woke between the look and the store, stopping the OOM and load checks until something
+    /// else woke the timer thread.
+    pub fn stop_checks(&self, idle: impl Fn() -> bool) -> bool {
+        self.checks_idle.store(true, Ordering::SeqCst);
+        if idle() {
+            return true;
+        }
+        self.checks_idle.store(false, Ordering::SeqCst);
+        false
     }
 }
 
@@ -1243,7 +1262,7 @@ impl<'a> Cx<'a> {
         objects: Option<&[wake::Object]>,
     ) -> Result<(), Errno> {
         let k = self.k.take().expect("BKL is held");
-        self.task.sleeping.store(true, Ordering::Relaxed);
+        self.task.sleeping.store(true, Ordering::SeqCst);
         let relock = Relock(self);
         let cx = &mut *relock.0;
         let event = &cx.task.event;
@@ -1256,7 +1275,7 @@ impl<'a> Cx<'a> {
     /// object: it is `Send`, so it cannot capture `Rc`, `RefCell` or references to them.
     pub fn unlocked<R>(&mut self, f: impl FnOnce() -> R + Send) -> R {
         crate::cell::assert_none_held();
-        self.task.sleeping.store(true, Ordering::Relaxed);
+        self.task.sleeping.store(true, Ordering::SeqCst);
         drop(self.k.take());
         let _relock = Relock(self);
         f()
@@ -1277,7 +1296,7 @@ impl Drop for Relock<'_, '_> {
         if self.0.k.is_none() {
             self.0.k = Some(self.0.shared.lock());
         }
-        self.0.task.sleeping.store(false, Ordering::Relaxed);
+        self.0.task.sleeping.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1409,6 +1428,21 @@ pub(crate) fn signal_later(event: &Arc<Event>) {
 mod tests {
     use super::*;
     use crate::process::Tier;
+
+    /// Tids run up to `PID_MAX - 1`, never `PID_MAX`, and then start again from 300, as after a
+    /// write of `ns_last_pid`.
+    #[test]
+    fn tids_wrap_to_300_below_pid_max() {
+        let mut k = Kernel::new(Tier::Interpreter);
+        k.set_last_pid(PID_MAX - 2);
+        assert_eq!(k.alloc_tid(), Ok(PID_MAX - 1));
+        assert_eq!(k.last_pid(), PID_MAX - 1);
+        assert_eq!(k.alloc_tid(), Ok(crate::pidns::RESERVED_PIDS));
+        assert_eq!(k.last_pid(), crate::pidns::RESERVED_PIDS);
+        // Nothing took 300 (no task was created): after the largest number it is free again
+        k.set_last_pid(PID_MAX);
+        assert_eq!(k.alloc_tid(), Ok(crate::pidns::RESERVED_PIDS));
+    }
 
     /// Two kernels in one host process: wake-ups requested while A holds its lock are not taken by
     /// B releasing its lock in the meantime ([`PENDING`]). They used to be global; B's release

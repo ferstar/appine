@@ -1120,6 +1120,18 @@ impl Tty {
         }
     }
 
+    /// Whether poll reports the slave readable (Linux's `input_available_p` for poll): in
+    /// non-canonical mode with VTIME 0 and VMIN above 0, only once VMIN bytes have arrived, the
+    /// amount a blocking read waits for; otherwise as [`readable`](Self::readable).
+    pub fn poll_readable(&self) -> bool {
+        let (vmin, vtime) = (self.termios.cc[VMIN] as usize, self.termios.cc[VTIME]);
+        if self.canonical() || vtime != 0 || vmin == 0 {
+            self.readable()
+        } else {
+            self.raw.len() >= vmin
+        }
+    }
+
     /// The number of bytes that have arrived in non-canonical mode (for VMIN).
     pub fn raw_len(&self) -> usize {
         self.raw.len()

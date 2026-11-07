@@ -629,7 +629,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             Some(true) => continue,
             Some(false) => {}
             None => {
-                task.sleeping.store(false, Ordering::Relaxed);
+                task.sleeping.store(false, Ordering::SeqCst);
                 let nr = cpu.state().x[8];
                 let what = format_args!("kernel panic in syscall {nr} without the BKL");
                 crate::bug::kill(&shared.lock(), &task, cpu.state().pc, what);
@@ -654,7 +654,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             flow
         });
         let flow = entered.unwrap_or_else(|| {
-            task.sleeping.store(false, Ordering::Relaxed);
+            task.sleeping.store(false, Ordering::SeqCst);
             let what = match exit {
                 Exit::Svc { .. } => format!("kernel panic in syscall {}", cpu.state().x[8]),
                 _ => format!("kernel panic while handling {exit:?}"),

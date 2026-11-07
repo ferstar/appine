@@ -158,7 +158,8 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
                 .map(|e| String::from_utf8_lossy(&e.path).replace('/', "!"))
                 .unwrap_or_default(),
             b'c' => g.rlimits[RLIMIT_CORE as usize].0.to_string(),
-            b'd' => (!g.dumpable as u32).to_string(),
+            // The dumpable mode (Linux's get_dumpable: 1 for a process that may dump)
+            b'd' => (g.dumpable as u32).to_string(),
             // Unknown specifiers: output nothing, as on Linux
             _ => String::new(),
         };

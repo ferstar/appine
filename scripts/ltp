@@ -91,14 +91,25 @@ if [ -z "$ltp" ] || [ -z "$rootfs" ]; then
     echo "ltp: run scripts/build-ltp and scripts/fetch-rootfs first" >&2
     exit 1
 fi
-[ -x "$run" ] || (cd "$root" && cargo build --release -q -p appine-run)
+# Build the appine-run that is run (an existing one may be older than the source), into the target
+# directory it is run from (scripts/dev's, also outside the container); APPINE_RUN names one to
+# use as it is
+if [ -z "${APPINE_RUN:-}" ]; then
+    (cd "$root" && CARGO_TARGET_DIR=$root/target/linux-arm64 cargo build --release -q -p appine-run)
+fi
+if [ ! -x "$run" ]; then
+    echo "ltp: no appine-run at $run" >&2
+    exit 1
+fi
 
-# On the first run, create a store with LTP installed
-if [ ! -f "$store/.ltp" ]; then
+# A store with LTP installed, made again whenever the LTP tarball or the rootfs changes (the stamp
+# records their names, sizes and times)
+stamp=$(stat -c '%n %s %Y' "$ltp" "$rootfs")
+if [ "$(cat "$store/.ltp" 2>/dev/null)" != "$stamp" ]; then
     rm -rf "$store"
     "$run" --rootfs "$store" --import "$rootfs" >/dev/null
     "$run" --tier 1 --rootfs "$store" -- /bin/tar xf - -C / <"$ltp"
-    touch "$store/.ltp"
+    printf '%s\n' "$stamp" >"$store/.ltp"
 fi
 
 # Tests decide whether to run by the kernel configuration (.needs_kconfigs): list the features

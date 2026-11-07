@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks and lazy unmounts last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks, lazy unmounts; open flags and new-file modes last)
 
 ## Responsibilities
 
@@ -127,8 +127,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Symlinks (intermediate, or last with `follow`): over 40 is `ELOOP`; `protected_symlinks`
   (default on) applies to the last component of store links only (`EACCES`); `NO_SYMLINKS` or a
   nosymfollow mount is `ELOOP`. Magic links (`/proc/<pid>/fd/*`, `cwd`, `root`, `exe`, `ns/*`)
-  first run the procfs access check (`EACCES`; only for `cwd`, `root`, `exe` and `ns/*` — `fd/*`
-  has none), then `NO_MAGICLINKS` (`ELOOP`), `NO_XDEV` across mounts and scoped resolution
+  first run the procfs access check (`EACCES`; for `fd/*` too, whose directories also refuse
+  listing and lookup to readers failing it), then `NO_MAGICLINKS` (`ELOOP`), `NO_XDEV` across mounts and scoped resolution
   (`EXDEV`), and jump straight to the target node (a deleted regular file, pipe or socket jumps
   to the open file itself). Ordinary absolute
   targets restart at the root (`EXDEV` under `BENEATH`, or under `NO_XDEV` when the root has not
@@ -287,9 +287,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `locks::closed` (POSIX locks of this table on that file) and `unix::released`; the last
   reference's `Drop` wakes lock and host-socket waiters and reports `IN_CLOSE_*`.
 - `OpenFile` keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`
-  and `O_LARGEFILE` from open (so `F_GETFL` never shows `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given
+  and `O_LARGEFILE` from open, and with `O_PATH` only `O_PATH` (Linux's `build_open_how`) (so `F_GETFL` never shows `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given
   at open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
-  when `O_ASYNC` turns on, with no `O_NOATIME` ownership check). `F_SETOWN`/`F_GETOWN`,
+  when `O_ASYNC` turns on for a file kind that has fasync, with no `O_NOATIME` ownership check).
+  Access mode 3 (`O_WRONLY|O_RDWR`) needs read and write permission to open but makes the file
+  neither readable nor writable (ioctls only, Linux's `OPEN_FMODE`). `F_SETOWN`/`F_GETOWN`,
   `F_SETOWN_EX`/`F_GETOWN_EX` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` and
   `FIOGETOWN`/`SIOCGPGRP` translate pids through the caller's pid namespace (the dispatcher's
   `pid_args` does it for `F_SETOWN`'s argument, -1 included as process group 1, and `F_GETOWN`'s
@@ -303,13 +305,15 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 ### Opening
 
 - `open_path_with` (shared by openat, openat2 and `create_exclusive`): resolve; on create, check
-  `may_create` (search, `EEXIST`, `EROFS`, write+search) and create with `mode & ~umask` and
-  `new_owner` (setgid directories); a just-created file skips permission checks and truncation.
-- Store nodes (`open_store`): symlink `ELOOP`; directory with write access or `O_CREAT` `EISDIR`;
+  `may_create` (search, `EEXIST`, `EROFS`, write+search) and create with the mode `new_owner`
+  makes of the requested one and the umask (`kernel/cred`: setgid stripped before the umask, setgid
+  directories); a just-created file skips permission checks and truncation.
+- Store nodes (`open_store`): symlink `ELOOP`; directory with write access, `O_CREAT` or `O_TRUNC`
+  `EISDIR`;
   `O_TRUNC` on ro `EROFS`, else it adds `MAY_WRITE`; devices on nodev `EACCES`; permission; cgroup
   BPF device filter; `O_NOATIME` by a non-owner without `CAP_FOWNER` `EPERM`; write on ro
   `EROFS`; writing a file some task is executing `ETXTBSY`; break leases; `O_TRUNC` removes
-  set-id bits and truncates. Then dispatch by type: regular files open the host object, character
+  set-id bits and truncates, with `O_RDONLY` too (through a writable handle of its own). Then dispatch by type: regular files open the host object, character
   devices by device number (see Devices), block devices as loop devices (major 7; others `ENXIO`),
   FIFOs the shared pipe, sockets `ENXIO`.
 - Pseudo nodes: permission from the synthetic stat, ptrace checks for process files, nodev for
@@ -426,8 +430,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `EPERM` over the max, `EBUSY` below the buffered data).
 - FIFO open: one `Pipe` per inode; write-only nonblocking with no reader `ENXIO`; read-only
   nonblocking succeeds; read-write never waits; blocking one-ended opens wait until a peer is
-  present or has opened since (`ERESTARTSYS` on a signal); an access mode of 3 is treated as
-  read-write.
+  present or has opened since (`ERESTARTSYS` on a signal); an access mode of 3 is `EINVAL`
+  (Linux's fifo_open).
 - Writes: no readers `SIGPIPE`+`EPIPE` (or a short count); writes up to `PIPE_BUF` (4096) are
   atomic; larger writes are partial; nonblocking `EAGAIN`. Reads return 0 without writers.
   `FIONREAD` reports the buffered bytes.
@@ -553,7 +557,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `CLONE_VM` without `CLONE_THREAD`) starts with none; execve and the last thread's exit release
   them.
 - io_setup: `*ctxp` must be 0 and `nr` from 1 to `0x1000_0000 / 32` (`EINVAL`); each context
-  charges `2 * nr` to `aio-nr` against `aio-max-nr` (65536; `EAGAIN`).
+  charges `nr` to `aio-nr` against `aio-max-nr` (65536; `EAGAIN`).
 - io_submit, per iocb: `aio_reserved2` must be 0; the fd must exist (`EBADF`), and with
   `IOCB_FLAG_RESFD` the resfd must be an eventfd; reads need a readable file and writes a writable
   one (`EBADF`); unknown `aio_rw_flags` are `EOPNOTSUPP` and unknown opcodes `EINVAL`; a context
@@ -646,11 +650,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
   exec, as 6.1 does, while chown follows 6.2 and also clears it when the caller is outside the
   file's group without `CAP_FSETID`; since 6.2 Linux's writes do the same as its chown.
-- **`/proc/<pid>/fd` has no access check:** listing, readlink and following `fd/N` skip the
-  ptrace-read check that `cwd`, `root`, `exe` and `ns/*` do, so any process can see the paths of
-  other users' open files and follow the links to their nodes, reaching files in directories it
-  cannot search, and reopen their pipes with no permission check (Linux denies with `EACCES`).
-  See the matching `kernel/procfs` item.
 - **`system.*` xattrs are unprotected:** any user who can resolve a file can set or remove its
   `system.*` attributes, including POSIX ACL names, which are stored raw and never enforced (Linux
   requires the owner or `CAP_FOWNER` and validates ACLs); root in a user namespace cannot set file
@@ -683,18 +682,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **AIO results leak restart codes and can be lost:** an interrupted blocking read or write inside
   io_submit stores `-ERESTARTSYS` (-512) in `io_event.res` instead of `-EINTR`, and io_getevents
   drops the events it took when copying them out faults (Linux leaves them in the ring).
-- **`aio-nr` counts twice `nr`:** each context charges and reports `2 * nr`, as Linux did before
-  4.12; 6.1 charges `nr`, so only half as many events fit under `aio-max-nr` and `aio-nr` reads
-  double.
 - **`copy_file_range` checks differ from 6.1's `generic_copy_file_checks`:** a directory is `EBADF`
   instead of `EISDIR` and a pipe `EBADF` instead of `EINVAL`; overlapping ranges in one file are
   copied instead of `EINVAL`; a length that overflows the offset is `EINVAL` instead of
   `EOVERFLOW`, and a range past the largest file size `EINVAL` instead of `EFBIG` (LTP
   copy_file_range02, which also expects `EPERM` on an immutable file).
-- **Setgid survives creation in a setgid directory:** a file created with `S_ISGID` and group
-  execute in a setgid directory by a caller outside the directory's group and without
-  `CAP_FSETID` keeps the bit; Linux strips it (CVE-2018-13405; since 6.0 also through umask and
-  ACLs), so such a user can make setgid files of a group it is not in (LTP creat09).
 - **getdents64 lists a removed directory:** an open directory that has been rmdir'ed still lists
   entries; Linux returns `ENOENT` for a dead directory (LTP getdents02).
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are not supported on store or tmpfs
@@ -781,10 +773,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `F_GETFL` and returns `EBADF` otherwise; flock on one takes a real lock (Linux `EBADF`), so a
   path-only fd can hold or contend locks and block real openers; getdents64 on one is `ENOTDIR`
   instead of `EBADF`.
-- **open with `O_PATH` keeps other status flags:** openat does not drop everything but
-  `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` when `O_PATH` is given (Linux's `build_open_how`), so
-  `F_GETFL` on such an fd reports the access mode, `O_APPEND`, `O_NONBLOCK` and `O_SYNC`, and code
-  reading the access mode from `F_GETFL` thinks a path fd is writable.
 - **getdents64 accepts counts above `INT_MAX`:** a count of 2^31 or more is taken as a huge buffer,
   where Linux returns `EINVAL`.
 - **`SEEK_END` on directories is `EINVAL`:** every directory refuses it, where Linux allows it on
@@ -794,16 +782,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   walked while another thread mounts or renames is never `EAGAIN`, because the whole walk is
   atomic under the BKL; Linux returns it so callers retry. Safe, but callers never see the retry
   signal.
-- **`O_TRUNC` with `O_RDONLY` is only half a write:** open checks write permission, `ETXTBSY` and
-  leases for it but neither truncates the file nor refuses a directory, so `open(dir,
-  O_RDONLY|O_TRUNC)` succeeds and `open(file, O_RDONLY|O_TRUNC)` keeps the data, where Linux 6.1
-  returns `EISDIR` and truncates.
 - **`O_DIRECT` is never refused at open:** directories (and, from the code, tmpfs and synthetic
   files) open with `O_DIRECT` where Linux 6.1 returns `EINVAL`, so programs probing for direct
   I/O support (databases, `dd oflag=direct`, fio) are told it works.
-- **Access mode 3 opens read-write:** an fd opened with `O_WRONLY|O_RDWR` (the "ioctl-only" mode)
-  reads and writes regular files, FIFOs and devices, where Linux allows neither (`EBADF`); a tool
-  that opens a device that way only to issue ioctls can change its contents.
 - **renameat2 ignores `RENAME_NOREPLACE` for `.`/`..`:** such a destination is `EBUSY` even with
   the flag, where Linux 6.1 returns `EEXIST`.
 - **rename in synthetic filesystems is `EACCES` first:** renameat2 needs store directories before
@@ -818,8 +799,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - Is losing renames in `/proc/<pid>/fd/N` (path frozen at open) acceptable, given Linux computes
   `d_path` at readlink?
-- Is skipping search permission on synthetic directories intended (`/proc/<pid>/fd` is 0500 on
-  Linux)?
+- Is skipping search permission on synthetic directories intended (only `/proc/<pid>/fd` and
+  `fdinfo` gate access, by the ptrace-read check)?
 - Should `protected_regular`, `protected_fifos` and `O_TMPFILE` be implemented?
 - Should unused detached mounts, open_tree clones and tmpfs instances be reclaimed when the last fd
   closes rather than at the next `umount2` or task exit?

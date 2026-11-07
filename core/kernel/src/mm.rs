@@ -1256,8 +1256,9 @@ impl Mm {
         let mut cached = false;
         let (backing, may_write, region, host) = match file {
             None => {
-                let reserve =
-                    prot & prot::WRITE != 0 && (shared || flags & flags::MAP_NORESERVE == 0);
+                // MAP_NORESERVE skips accounting for shared anonymous memory too (Linux's
+                // shmem_acct_size checks VM_NORESERVE)
+                let reserve = prot & prot::WRITE != 0 && flags & flags::MAP_NORESERVE == 0;
                 // A grows-down mapping must grow downwards inside its host memory
                 // ([`Mm::extend_down`]), not just be reserved
                 let (region, host) = if shared || flags & flags::MAP_GROWSDOWN != 0 {

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; blocking connect; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; blocking connect; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order and timeout parsing last)
 
 ## Responsibilities
 
@@ -107,11 +107,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   for the repeated connect, and the connection goes on), and a signal gives `ERESTARTSYS`
   (restarted under `SA_RESTART`, the restarted call waiting again) or `EINTR` when there is a
   timeout; then it reads `SO_ERROR` and connects again so the host reports `EISCONN`. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
-- accept4: bad flags `EINVAL`; host accept with waits bounded by the listener's `SO_RCVTIMEO`
-  (`EAGAIN` on timeout); the new socket inherits protocol, local port map, namespace state,
-  mark and the claimed original destination (but not the kernel-layer timeouts); the peer address
-  is unmapped and translated; the fd is installed before the address is written back (a failed
-  write leaves it installed), and `EMFILE` comes after the connection was already taken.
+- accept4 (Linux's `__sys_accept4_file` order): bad flags `EINVAL`; no free fd `EMFILE` before a
+  connection is taken; host accept with waits bounded by the listener's `SO_RCVTIMEO` (`EAGAIN` on
+  timeout); the new socket inherits protocol, local port map, namespace state, mark, the claimed
+  original destination and the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`; the peer address is
+  unmapped, translated and written back before the fd is installed, so a fault drops the
+  connection and leaves no fd.
 
 ### Sending and receiving
 
@@ -154,9 +155,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ### Options and ioctls
 
-- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers; short buffers, negative times or times
-  of at least `KTIME_MAX` mean no timeout, the last read back as 0 like Linux's
-  `MAX_SCHEDULE_TIMEOUT`), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace
+- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers, Linux 6.1's `sock_set_timeout`: a short
+  buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a negative time zero (no waiting,
+  `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read back as 0 like Linux's
+  `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace
   owner; stored only, inherited by accepted sockets, fed to nftables, cleared when entering
   another namespace), `SO_TYPE` (`SOCK_RAW` for raw sockets), `SO_ERROR` (pending ICMP errors
   first),
@@ -332,10 +334,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **An error after part of a `MSG_WAITALL` read is lost:** the partial count is returned, but the
   host has already taken the error (a reset, say), so the next read sees end of file where Linux
   reports the error then.
-- **accept4 leaks fds and drops connections:** the fd is installed before the peer address is
-  written, so a bad address pointer returns an error with the fd left open; `EMFILE` is reported
-  after the connection was taken from the queue and closed. Accepted inet sockets also lose the
-  listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 - **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
   most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
   sizes later datagrams to the reader's buffer and continues the dump on the next recv.
@@ -376,11 +374,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `msg_name`, so a message addressed to another port or to multicast groups is handled as a kernel
   request, without `netlink_sendmsg`'s checks (`EINVAL` for a short or non-`AF_NETLINK` address,
   `EPERM` for sending to a group or port without `CAP_NET_ADMIN` on rtnetlink).
-- **Socket timeouts are parsed leniently:** `SO_RCVTIMEO`/`SO_SNDTIMEO` (inet, netlink and unix
-  sockets alike) accept any `tv_usec`, where Linux 6.1's `sock_set_timeout` returns `EDOM` outside
-  `[0, 1000000)`; a negative `tv_sec` and a short buffer mean no timeout, where Linux makes a
-  negative time 0 (reads and writes fail with `EAGAIN` at once) and a short buffer `EINVAL`. A
-  program that sets a negative timeout to mean "don't wait" blocks forever instead.
 - **A refused blocking connect leaves the host socket connecting:** after the wait the result
   comes from `SO_ERROR` without connecting the host socket again, so the guest's next connect on
   the same socket gets a spurious `ECONNABORTED`, where Linux has already reset the socket and

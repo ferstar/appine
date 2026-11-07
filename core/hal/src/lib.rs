@@ -1589,7 +1589,13 @@ pub fn sigwinch_notifier() -> Result<i32, i32> {
     sa.sa_sigaction = on_sigwinch as extern "C" fn(libc::c_int) as usize;
     sa.sa_flags = libc::SA_RESTART;
     if unsafe { libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) } < 0 {
-        return Err(last_errno());
+        let e = last_errno();
+        WINCH_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(e);
     }
     Ok(fds[0])
 }
@@ -1598,8 +1604,78 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
     let fd = WINCH_FD.load(std::sync::atomic::Ordering::Relaxed);
     if fd >= 0 {
         // Call only the async-signal-safe write; a full pipe means a notification is already
-        // waiting
+        // waiting. A failing write (EAGAIN) must not leave its errno to the interrupted code
+        let saved = errno_location();
+        // SAFETY: errno_location points at this thread's errno
+        let errno = unsafe { *saved };
         unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+        unsafe { *saved = errno };
+    }
+}
+
+/// This thread's errno.
+fn errno_location() -> *mut libc::c_int {
+    #[cfg(target_os = "android")]
+    // SAFETY: always valid for the calling thread
+    unsafe {
+        libc::__errno()
+    }
+    #[cfg(not(target_os = "android"))]
+    // SAFETY: always valid for the calling thread
+    unsafe {
+        libc::__errno_location()
+    }
+}
+
+static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// An fd (nonblocking) from which each byte read is the number of a SIGINT, SIGTERM or SIGHUP the
+/// host received (the CLI asks the guest to stop with them instead of dying at once); can be
+/// called only once. On failure nothing is left installed.
+pub fn stop_notifier() -> Result<i32, i32> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(last_errno());
+    }
+    for fd in fds {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+    }
+    STOP_FD.store(fds[1], std::sync::atomic::Ordering::Relaxed);
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_stop_signal as extern "C" fn(libc::c_int) as usize;
+    sa.sa_flags = libc::SA_RESTART;
+    let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+    for (i, &sig) in signals.iter().enumerate() {
+        if unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) } < 0 {
+            let e = last_errno();
+            let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
+            default.sa_sigaction = libc::SIG_DFL;
+            for &done in &signals[..i] {
+                unsafe { libc::sigaction(done, &default, std::ptr::null_mut()) };
+            }
+            STOP_FD.store(-1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(e);
+        }
+    }
+    Ok(fds[0])
+}
+
+extern "C" fn on_stop_signal(sig: libc::c_int) {
+    let fd = STOP_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        // Only the async-signal-safe write, keeping the interrupted code's errno
+        let saved = errno_location();
+        // SAFETY: errno_location points at this thread's errno
+        let errno = unsafe { *saved };
+        unsafe { libc::write(fd, [sig as u8].as_ptr().cast(), 1) };
+        unsafe { *saved = errno };
     }
 }
 

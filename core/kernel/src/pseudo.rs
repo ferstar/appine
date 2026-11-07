@@ -1162,6 +1162,13 @@ impl Pseudo for View<'_> {
 
     fn lookup(&self, mnt: MountId, dir: &PseudoNode, name: &[u8]) -> Result<PseudoNode, Errno> {
         use PseudoNode::*;
+        // fd and fdinfo of another process are open only to readers that pass the ptrace-read
+        // check (Linux's 0500 directories with proc_fd_permission, and proc_fd_access_allowed)
+        if let Entry(pid, _, self::Entry::Fd | self::Entry::FdInfo) = dir
+            && !self.may_read(*pid)
+        {
+            return Err(Errno::EACCES);
+        }
         // The pid in the name is a number in the mount's pid namespace
         let global = |name: &[u8]| {
             let n = Tid::try_from(parse_num(name)?).ok()?;
@@ -1411,6 +1418,9 @@ impl Pseudo for View<'_> {
             }
             Fd(pid, fd) => {
                 let file = self.open_file(*pid, *fd).ok_or(Errno::ENOENT)?;
+                if !self.may_read(*pid) {
+                    return Err(Errno::EACCES);
+                }
                 let f = file.borrow();
                 let name = describe(&f);
                 Ok(match &f.kind {
@@ -1517,6 +1527,7 @@ impl Pseudo for View<'_> {
                     Node::Store(m, ino)
                 }));
             }
+            PseudoNode::Fd(pid, _) if !self.may_read(*pid) => return Some(Err(Errno::EACCES)),
             _ => {}
         }
         self.follow_fd(mnt, node).map(Ok)
@@ -1567,11 +1578,19 @@ impl View<'_> {
     }
 }
 
+/// A number naming a pid or fd directory entry (Linux's `name_to_int`): decimal digits only, no
+/// sign and no leading zero; anything above `i32::MAX` names nothing (no pid or fd is that large,
+/// and it must not wrap to a small one).
 fn parse_num(name: &[u8]) -> Option<i64> {
-    if name.is_empty() || name.len() > 10 || (name.len() > 1 && name[0] == b'0') {
+    if name.is_empty()
+        || name.len() > 10
+        || (name.len() > 1 && name[0] == b'0')
+        || !name.iter().all(u8::is_ascii_digit)
+    {
         return None;
     }
-    std::str::from_utf8(name).ok()?.parse().ok()
+    let n: i64 = std::str::from_utf8(name).ok()?.parse().ok()?;
+    (n <= i64::from(i32::MAX)).then_some(n)
 }
 
 /// The target `/proc/<pid>/fd/<n>` shows: a path, or a description like `pipe:[ino]`.
@@ -1875,6 +1894,9 @@ pub(crate) fn readdir(
                 .map(|(_, e)| Entry(*pid, *tid, *e)),
         ),
         Entry(pid, _, e @ (self::Entry::Fd | self::Entry::FdInfo)) => {
+            if ps.group(*pid).is_some() && !ps.may_read(*pid) {
+                return Err(Errno::EACCES);
+            }
             if let Some(task) = ps.leader(*pid) {
                 let fds = task.res.borrow().fds.borrow().open_fds();
                 nodes.extend(fds.into_iter().map(|fd| match e {
@@ -2336,11 +2358,14 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                     return Ok(auxv.iter().flat_map(|w| w.to_le_bytes()).collect());
                 }
                 self::Entry::Mounts | self::Entry::MountInfo => {
-                    let (root, ns) = task.map_or((Node::ROOT, crate::vfs::INIT_MNT_NS), |t| {
+                    // An exited thread (a zombie, a main thread whose process lives on) has no
+                    // namespaces left: EINVAL at open (mounts_open_common)
+                    let t = task.ok_or(Errno::EINVAL)?;
+                    let (root, ns) = {
                         let res = t.res.borrow();
                         let fs = res.fs.borrow();
                         (fs.root.clone(), fs.mnt_ns.id)
-                    });
+                    };
                     return Ok(mounts(ps, &root, ns, *e == self::Entry::MountInfo));
                 }
                 self::Entry::OomScoreAdj => {
@@ -2390,7 +2415,13 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
         NetSysctl(path) => crate::netconf::sysctl_read(&ps.ns().net.devs.borrow().conf, path),
         // Write-only ones (cgroup.kill) are EINVAL to read
         Cgroup(_, b"") => return Err(Errno::EISDIR),
-        Cgroup(id, name) => crate::cgroup::file(ps.k, *id, name).ok_or(Errno::EINVAL)?,
+        Cgroup(id, name) => {
+            // Ids as the reader's pid namespace sees them (task_pid_vnr: current's, not the
+            // mount's)
+            let ns = ps.k.pid_ns_of(ps.tgid);
+            let vnr = |t| ns.vnr(t).unwrap_or(0);
+            crate::cgroup::file(ps.k, *id, name, &vnr).ok_or(Errno::EINVAL)?
+        }
         // A namespace is opened only for setns; nothing can be read
         NsFile(..) => String::new(),
         _ => return Err(Errno::EINVAL),
@@ -2991,14 +3022,16 @@ fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
 
 /// Reads `/proc/<pid>/pagemap`: 8 bytes per page; the position and length must both be
 /// multiples of 8.
-pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
+pub(crate) fn read_pagemap(k: &Kernel, tid: Tid, buf: &mut [u8], pos: u64) -> Result<usize, Errno> {
     if !pos.is_multiple_of(8) || !buf.len().is_multiple_of(8) {
         return Err(Errno::EINVAL);
     }
-    let task = group_of(k, pid)
-        .and_then(|g| g.borrow().threads.first().copied())
-        .and_then(|t| k.tasks.get(&t).cloned())
-        .ok_or(Errno::ESRCH)?;
+    // The thread exited after the open (which refuses one already gone, ESRCH): its address space
+    // is gone, end of file, rather than another thread's (a reader going to the end would walk
+    // all 48 bits)
+    let Some(task) = k.tasks.get(&tid).cloned() else {
+        return Ok(0);
+    };
     // The user address space is 48 bits
     let pages_total = 1u64 << (48 - 12);
     let first = pos / 8;
@@ -3008,16 +3041,6 @@ pub(crate) fn read_pagemap(k: &Kernel, pid: Tid, buf: &mut [u8], pos: u64) -> Re
         buf[i * 8..i * 8 + 8].copy_from_slice(&e.to_le_bytes());
     }
     Ok(n * 8)
-}
-
-/// The address space of process `pid`.
-pub(crate) fn process_mm(k: &Kernel, pid: Tid) -> Result<Rc<RefCell<crate::mm::Mm>>, Errno> {
-    let task = group_of(k, pid)
-        .and_then(|g| g.borrow().threads.first().copied())
-        .and_then(|t| k.tasks.get(&t).cloned())
-        .ok_or(Errno::ESRCH)?;
-    let mm = task.res.borrow().mm.clone();
-    Ok(mm)
 }
 
 /// Reads `/proc/<pid>/mem` (`mm` is the address space at open; once it is released reads get

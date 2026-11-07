@@ -510,9 +510,12 @@ impl Cred {
         Ok(secure)
     }
 
-    /// Is the file's owner, or has `CAP_FOWNER` (chmod, setting timestamps and so on).
+    /// Is the file's owner, or has `CAP_FOWNER` with the owner mapped in our namespace (chmod,
+    /// setting timestamps and so on: Linux's `inode_owner_or_capable`, which unlike
+    /// [`capable_wrt`](Self::capable_wrt) does not need the group mapped).
     pub fn owns(&self, st: &Stat) -> bool {
-        self.fsuid == st.uid || self.capable_wrt(st, cap::FOWNER)
+        self.fsuid == st.uid
+            || self.capable_here(cap::FOWNER) && self.user_ns.uid_map.borrow().up(st.uid).is_some()
     }
 
     /// Permission check for file access (`generic_permission`): `mask` is a combination of
@@ -584,26 +587,30 @@ impl Cred {
         c
     }
 
-    /// The owner and group of a new file: in a setgid directory the group is inherited from the
-    /// directory. Returns (uid, gid, adjusted permission bits): a directory created in a setgid
-    /// directory inherits the setgid bit, and a caller not in the group cannot create a setgid
-    /// executable.
-    pub fn new_owner(&self, dir: &Stat, perm: u32, is_dir: bool) -> (u32, u32, u32) {
-        let mut perm = perm;
-        let gid = if dir.mode & mode::S_ISGID != 0 {
-            if is_dir {
-                perm |= mode::S_ISGID;
-            }
-            dir.gid
-        } else {
-            self.fsgid
-        };
+    /// The owner, group and permission bits of a new file made with `mode` under `umask` (Linux
+    /// 6.1's `vfs_prepare_mode` and `inode_init_owner`). In a setgid directory the group is the
+    /// directory's. A caller outside that group without `CAP_FSETID` cannot make a group-executable
+    /// setgid file: the bit goes before the umask is applied (`mode_strip_sgid`), so a umask that
+    /// removes group execute does not save it. A directory keeps only its permissions and the sticky
+    /// bit, and inherits the setgid bit of a setgid parent.
+    pub fn new_owner(&self, dir: &Stat, mode: u32, umask: u32, is_dir: bool) -> (u32, u32, u32) {
+        let mut perm = mode & 0o7777;
+        let setgid_dir = dir.mode & mode::S_ISGID != 0;
+        let gid = if setgid_dir { dir.gid } else { self.fsgid };
         if !is_dir
+            && setgid_dir
             && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
-            && !self.in_group(gid)
+            && !self.in_group(dir.gid)
             && !self.capable_wrt(dir, cap::FSETID)
         {
             perm &= !mode::S_ISGID;
+        }
+        perm &= !umask;
+        if is_dir {
+            perm &= 0o1777;
+            if setgid_dir {
+                perm |= mode::S_ISGID;
+            }
         }
         (self.fsuid, gid, perm)
     }
@@ -1382,12 +1389,21 @@ mod tests {
         let u = user(1000, 100);
         let mut dir = file(0o2775, 0, 50);
         dir.mode = mode::S_IFDIR | 0o2775;
-        assert_eq!(u.new_owner(&dir, 0o755, true), (1000, 50, 0o2755));
-        // Not in group 50: a new setgid executable loses the setgid bit
-        assert_eq!(u.new_owner(&dir, 0o2755, false), (1000, 50, 0o755));
+        assert_eq!(u.new_owner(&dir, 0o755, 0o022, true), (1000, 50, 0o2755));
+        // Not in group 50: a new setgid executable loses the setgid bit, even when the umask then
+        // removes group execute
+        assert_eq!(u.new_owner(&dir, 0o2755, 0o022, false), (1000, 50, 0o755));
+        assert_eq!(u.new_owner(&dir, 0o2755, 0o077, false), (1000, 50, 0o700));
+        assert_eq!(u.new_owner(&dir, 0o2755, 0o010, false), (1000, 50, 0o745));
         assert_eq!(
-            u.new_owner(&file(0o755, 0, 0), 0o644, false),
+            u.new_owner(&file(0o755, 0, 0), 0o644, 0o022, false),
             (1000, 100, 0o644)
         );
+        // mkdir keeps only the permissions and the sticky bit
+        assert_eq!(
+            u.new_owner(&file(0o755, 0, 0), 0o7777, 0o022, true),
+            (1000, 100, 0o1755)
+        );
+        assert_eq!(u.new_owner(&dir, 0o6777, 0, true), (1000, 50, 0o2777));
     }
 }

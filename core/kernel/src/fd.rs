@@ -243,12 +243,22 @@ impl OpenFile {
 
     /// Whether it is readable.
     pub fn readable(&self) -> bool {
-        self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_WRONLY
+        self.flags & oflags::O_PATH == 0
+            && matches!(
+                self.flags & oflags::O_ACCMODE,
+                oflags::O_RDONLY | oflags::O_RDWR
+            )
     }
 
-    /// Whether it is writable.
+    /// Whether it is writable. Access mode 3 (`O_WRONLY|O_RDWR`) is neither readable nor
+    /// writable: it only allows ioctls (Linux's `OPEN_FMODE`), though opening it needs read and
+    /// write permission.
     pub fn writable(&self) -> bool {
-        self.flags & oflags::O_PATH == 0 && self.flags & oflags::O_ACCMODE != oflags::O_RDONLY
+        self.flags & oflags::O_PATH == 0
+            && matches!(
+                self.flags & oflags::O_ACCMODE,
+                oflags::O_WRONLY | oflags::O_RDWR
+            )
     }
 
     /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).

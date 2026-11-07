@@ -229,13 +229,13 @@ fn exit_status_and_errors_are_propagated() {
 #[test]
 fn fatal_signals_write_core_files() {
     // With RLIMIT_CORE on, a process killed by SIGSEGV leaves an ELF core file (ET_CORE, aarch64)
-    // in the current directory; with a limit of 0 nothing is written; %e and %s in core_pattern
-    // expand to the program name and the signal
+    // in the current directory; with a limit of 0 nothing is written; %e, %s and %d in
+    // core_pattern expand to the program name, the signal and the dumpable mode (1)
     let script = "mkdir -p /tmp/cores && cd /tmp/cores && rm -f core* && ulimit -c unlimited && \
                   sh -c 'kill -SEGV $$'; echo status $?; od -A n -t x1 -N 4 core; \
                   od -A n -t d2 -j 16 -N 4 core; rm core; ulimit -c 0; \
                   sh -c 'kill -SEGV $$'; echo status $?; test -e core && echo present || echo absent; \
-                  ulimit -c unlimited; echo 'core.%e.%s' > /proc/sys/kernel/core_pattern; \
+                  ulimit -c unlimited; echo 'core.%e.%s.%d' > /proc/sys/kernel/core_pattern; \
                   sh -c 'kill -ABRT $$'; ls core.*; cat /proc/self/coredump_filter";
     for (tier, out) in run(&["/bin/sh", "-c", script]) {
         let words: Vec<String> = shell(tier, &out)
@@ -256,7 +256,7 @@ fn fatal_signals_write_core_files() {
                 "status",
                 "139",
                 "absent",
-                "core.sh.6",
+                "core.sh.6.1",
                 "00000033"
             ],
             "tier {tier}"
@@ -1708,8 +1708,12 @@ fn low_ports_bind_the_real_port_or_elsewhere() {
         // busybox's nc binds the IPv6 wildcard address, so take the same kind here
         let busy = always_map.then(|| std::net::TcpListener::bind(("::", 10000 + port)));
         if let Some(Err(_)) = busy {
-            eprintln!("skipped: cannot bind [::]:{} on the host", 10000 + port);
-            return;
+            // Only this case: the others do not need that port
+            eprintln!(
+                "skipped {tier:?} port {port}: cannot bind [::]:{} on the host",
+                10000 + port
+            );
+            continue;
         }
         let host_port = if always_map {
             20000 + port
@@ -2079,14 +2083,13 @@ fn run(args: &[&str]) -> Vec<(&'static str, Output)> {
 /// Imports the rootfs once; all test cases share the same store.
 fn store() -> Option<&'static Path> {
     static STORE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    STORE
+    let store = STORE
         .get_or_init(|| {
             let Some(tarball) = find_tarball() else {
                 assert!(
                     std::env::var_os("APPINE_REQUIRE_ROOTFS").is_none_or(|v| v != "1"),
                     "rootfs tarball not found; run scripts/fetch-rootfs"
                 );
-                eprintln!("skipping rootfs tests: run scripts/fetch-rootfs to enable them");
                 return None;
             };
             let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("rootfs-store");
@@ -2101,7 +2104,12 @@ fn store() -> Option<&'static Path> {
             assert!(out.status.success(), "import failed: {}", stderr(&out));
             Some(dir)
         })
-        .as_deref()
+        .as_deref();
+    // Every test that skips says so, not only the first to ask
+    if store.is_none() {
+        eprintln!("skipping rootfs tests: run scripts/fetch-rootfs to enable them");
+    }
+    store
 }
 
 fn find_tarball() -> Option<PathBuf> {

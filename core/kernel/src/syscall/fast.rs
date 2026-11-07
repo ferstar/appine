@@ -411,7 +411,7 @@ fn sleep_until(task: &Task, deadline: Expiry, relative: bool) -> Option<SysResul
 fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
     const POLLIN: i16 = 1;
     task.sync.in_guest.store(false, Ordering::SeqCst);
-    task.sleeping.store(true, Ordering::Relaxed);
+    task.sleeping.store(true, Ordering::SeqCst);
     let woke = loop {
         let timeout = match deadline {
             Some(d) if d.passed() => break false,
@@ -424,7 +424,7 @@ fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
             _ => break true,
         }
     };
-    task.sleeping.store(false, Ordering::Relaxed);
+    task.sleeping.store(false, Ordering::SeqCst);
     if woke {
         task.event.clear();
     }

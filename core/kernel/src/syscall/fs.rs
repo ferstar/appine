@@ -211,6 +211,17 @@ const KEPT_AT_OPEN: u32 = oflags::O_ACCMODE
     | oflags::O_DSYNC
     | oflags::O_SYNC_BIT;
 
+/// The status flags an open file keeps from `flags`: with `O_PATH` only `O_PATH` (Linux's
+/// build_open_how drops the access mode and every other flag but `O_DIRECTORY`, `O_NOFOLLOW` and
+/// `O_CLOEXEC`), otherwise [`KEPT_AT_OPEN`].
+fn kept(flags: u32) -> u32 {
+    if flags & oflags::O_PATH != 0 {
+        oflags::O_PATH
+    } else {
+        KEPT_AT_OPEN
+    }
+}
+
 /// Type and length in a file handle (`struct file_handle`): the handle is the store inode
 /// number.
 const FILE_HANDLE_TYPE: i32 = 1;
@@ -456,7 +467,7 @@ fn open_path_with(
                     continue;
                 }
                 let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-                let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, false);
+                let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), false);
                 let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
                 let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
                 tmpfs_created(&vfs, tmpfs, 0);
@@ -517,8 +528,7 @@ fn open_path_with(
     {
         display = None;
     }
-    let keep = KEPT_AT_OPEN;
-    let file = OpenFile::with_path(kind, flags & keep | largefile(flags), display);
+    let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
     }
@@ -608,7 +618,7 @@ fn open_pseudo(
     let mut mm = None;
     if let PseudoNode::Entry(
         pid,
-        _,
+        tid,
         e @ (pseudo::Entry::Mem
         | pseudo::Entry::Auxv
         | pseudo::Entry::Environ
@@ -622,8 +632,18 @@ fn open_pseudo(
         if !super::proc::may_ptrace(cx, &group.borrow()) {
             return Err(Errno::EACCES);
         }
-        if e == pseudo::Entry::Mem {
-            mm = Some(Rc::downgrade(&pseudo::process_mm(cx.kr(), pid)?));
+        // mem and pagemap work on the named thread's address space: one that has exited (a
+        // zombie, a main thread whose process lives on) has none, ESRCH at open as on Linux
+        if matches!(e, pseudo::Entry::Mem | pseudo::Entry::Pagemap) {
+            let task = cx
+                .kr()
+                .tasks
+                .get(&tid.unwrap_or(pid))
+                .cloned()
+                .ok_or(Errno::ESRCH)?;
+            if e == pseudo::Entry::Mem {
+                mm = Some(Rc::downgrade(&task.res.borrow().mm));
+            }
         }
     }
     // Device nodes cannot be opened in a nodev mount (Linux's may_open)
@@ -965,8 +985,7 @@ pub(super) fn open_by_handle_at(
     } else {
         open_store(cx, &cx.cred(), &vfs, (mnt, ino), flags, (None, None))?
     };
-    let keep = KEPT_AT_OPEN;
-    let file = OpenFile::new(kind, flags & keep | largefile(flags));
+    let file = OpenFile::new(kind, flags & kept(flags) | largefile(flags));
     file.borrow_mut().mnt = mnt;
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)
@@ -994,7 +1013,11 @@ fn open_store(
         let mut mask = open_mask(flags);
         match st.kind() {
             mode::S_IFLNK => return Err(Errno::ELOOP),
-            mode::S_IFDIR if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 => {
+            // O_TRUNC asks for write access even with O_RDONLY (Linux's build_open_flags)
+            mode::S_IFDIR
+                if accmode != oflags::O_RDONLY
+                    || flags & (oflags::O_CREAT | oflags::O_TRUNC) != 0 =>
+            {
                 return Err(Errno::EISDIR);
             }
             // Truncation: EROFS comes first in a read-only mount (Linux's do_open, before
@@ -1029,7 +1052,7 @@ fn open_store(
     Ok(match st.kind() {
         mode::S_IFLNK => return Err(Errno::ELOOP),
         mode::S_IFDIR => {
-            if accmode != oflags::O_RDONLY || flags & oflags::O_CREAT != 0 {
+            if accmode != oflags::O_RDONLY || flags & (oflags::O_CREAT | oflags::O_TRUNC) != 0 {
                 return Err(Errno::EISDIR);
             }
             FileKind::Directory {
@@ -1054,11 +1077,18 @@ fn open_store(
                 Some(f) => f,
                 None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
             };
-            if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
+            // Even with O_RDONLY, as on Linux (do_open truncates whatever the access mode),
+            // through a writable handle of its own then
+            if flags & oflags::O_TRUNC != 0 {
                 remove_privs(cx, ino)?;
-                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), &file)?;
-                truncating(cx, &file, 0);
-                file.set_len(0).map_err(host_errno)?;
+                let writable = match accmode {
+                    oflags::O_RDONLY => Some(store.open_object(ino, true)?),
+                    _ => None,
+                };
+                let target = writable.as_ref().unwrap_or(&file);
+                let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), target)?;
+                truncating(cx, target, 0);
+                target.set_len(0).map_err(host_errno)?;
                 tmpfs_resized(vfs, tmpfs, 0);
             }
             FileKind::Regular { ino, file }
@@ -1168,7 +1198,9 @@ fn open_fifo(cx: &mut Cx<'_>, ino: Ino, flags: u32) -> Result<FileKind, Errno> {
     let (read, write) = match accmode {
         oflags::O_RDONLY => (true, false),
         oflags::O_WRONLY => (false, true),
-        _ => (true, true),
+        oflags::O_RDWR => (true, true),
+        // Access mode 3 opens neither end (Linux's fifo_open)
+        _ => return Err(Errno::EINVAL),
     };
     let capacity = pipe_capacity(cx);
     let pipe = {
@@ -1914,7 +1946,8 @@ enum IoPath {
     TimerFd(Rc<RefCell<TimerFd>>),
     SignalFd(Rc<RefCell<crate::fd::SignalFd>>),
     Inotify(Rc<RefCell<super::Inotify>>),
-    /// `/proc/<pid>/pagemap`: computed on the fly from the read position.
+    /// `/proc/<pid>/pagemap` (or a task's): computed on the fly from the read position, from the
+    /// address space of that thread.
     Pagemap(Tid),
     /// `/proc/<pid>/mem`: the position is the address.
     /// The address space of `/proc/<pid>/mem` at open, None when it has been released.
@@ -3581,9 +3614,9 @@ fn io_path(f: &OpenFile) -> IoPath {
         FileKind::SignalFd(s) => IoPath::SignalFd(s.clone()),
         FileKind::Inotify(i) => IoPath::Inotify(i.clone()),
         FileKind::Proc {
-            node: PseudoNode::Entry(pid, _, pseudo::Entry::Pagemap),
+            node: PseudoNode::Entry(pid, tid, pseudo::Entry::Pagemap),
             ..
-        } => IoPath::Pagemap(*pid),
+        } => IoPath::Pagemap(tid.unwrap_or(*pid)),
         FileKind::Proc {
             node: PseudoNode::Entry(_, _, pseudo::Entry::Mem),
             mm,
@@ -4564,7 +4597,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     let vfs = cx.vfs()?;
     let cred = cx.cred();
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-    let (uid, gid, perm) = cred.new_owner(&dir_st, perm & !cx.umask() & 0o7777, true);
+    let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), true);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     vfs.store().mkdir(dir, name, perm, uid, gid)?;
     tmpfs_created(&vfs, tmpfs, 0);
@@ -4633,7 +4666,7 @@ pub(super) fn mknodat(
         }
         super::bpf::check_device(cx, kind, dev & 0xffff_ffff, crate::bpf::ACC_MKNOD)?;
     }
-    let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg & !cx.umask() & 0o7777, false);
+    let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg, cx.umask(), false);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
     if kind == 0 || kind == mode::S_IFREG {
         vfs.store().create_file(dir, name, perm, uid, gid)?;
@@ -4838,7 +4871,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     let cred = cx.cred();
     reject_trailing_slash(vfs.store(), dir, name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
-    let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, false);
+    let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, 0, false);
     // A long symlink takes an extra page in tmpfs (Linux's SHORT_SYMLINK_LEN)
     let pages = u64::from(target.len() >= 128);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), pages)?;

@@ -5,13 +5,8 @@
 # scheduling, rlimits, prctl, sysinfo, POSIX timers, restarted reads, breakpoints, and the tests'
 # own fork helpers. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/process: wait ignores __WCLONE and __WALL and the children's exit signals, so any child is
-# reaped under any flags
-SKIP="WaitpidFlagsTest.waitpidWithCloneFlagFailsWhenChildSendsSIGCHLD"
-SKIP="$SKIP:WaitpidFlagsTest.waitpidWithNoFlagsFailsWhenChildSendsNoSignal"
-SKIP="$SKIP:WaitpidFlagsTest.waitpidWithNoFlagsFailsWhenChildSendsSIGUSR1"
 # kernel/process: the ELF loader disagrees with Linux on unusual program headers
-SKIP="$SKIP:ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
+SKIP="ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
 # kernel/process: futex waiters on replaced private memory are never woken (the test hangs); PI
 # operations are ENOSYS
 SKIP="$SKIP:FutexTest.FutexWaitOnRemappedMemory:FutexTest.LockPi*"
@@ -30,9 +25,6 @@ SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileWithExplicitOffset"
 SKIP="$SKIP:ZombieProcTest.Attr*:ZombieProcTest.ClearRefs:ZombieProcTest.Io:ZombieProcTest.OomAdj"
 SKIP="$SKIP:ZombieProcTest.OomScore:ZombieProcTest.Sched:ZombieProcTest.Schedstat"
 SKIP="$SKIP:ZombieProcTest.TimerslackNs:ZombieProcTest.Wchan"
-# kernel/procfs: a zombie leader's pagemap, mounts and mountinfo come from its live thread group
-# (the test reads the whole address space's pagemap until the OOM killer ends it)
-SKIP="$SKIP:ZombieProcTest.MountInfo:ZombieProcTest.Mounts:ZombieProcTest.PageMap"
 # Cannot be compared: the native kernel fails reading a zombie leader's auxv and environ, where the
 # test (and Appine) expect them empty
 SKIP="$SKIP:ZombieProcTest.Auxv:ZombieProcTest.Environ"

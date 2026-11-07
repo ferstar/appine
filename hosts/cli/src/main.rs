@@ -19,6 +19,10 @@
 //! `--init` first boots by `/etc/inittab` (as the app does; OpenRC runs on Alpine), and shuts down
 //! by it when the program ends or the guest requests a shutdown (busybox's reboot, halt, poweroff)
 //! (the kernel/process map).
+//!
+//! SIGINT, SIGTERM and SIGHUP to appine-run (`timeout`, ^C with `--no-pty`, a closed terminal) are
+//! passed on to the program, and another a second or more later ends every guest process; either way appine-run
+//! still shuts down, syncs the store and restores the host terminal before it exits.
 
 use std::env;
 use std::ffi::OsString;
@@ -193,6 +197,8 @@ fn main() -> ExitCode {
                 .and_then(Result::ok),
         });
     }
+    // Without the pipe the signals keep their default action
+    options.stop = appine_hal::stop_notifier().ok();
     let result = appine_kernel::run(&program, &argv, &envp, &options);
     // Restore the host terminal first, then print the message
     drop(raw);

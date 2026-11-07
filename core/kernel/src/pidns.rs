@@ -20,7 +20,7 @@ pub(crate) const INIT_PID_NS: u64 = 4_026_531_836;
 /// Pid namespaces nested deeper than this cannot be created (Linux's `MAX_PID_NS_LEVEL`).
 pub(crate) const MAX_PID_NS_LEVEL: u32 = 32;
 /// After numbers reach `PID_MAX`, the search starts again from here (Linux's `RESERVED_PIDS`).
-const RESERVED_PIDS: Tid = 300;
+pub(crate) const RESERVED_PIDS: Tid = 300;
 
 /// One pid namespace. The boot namespace keeps no table: global numbers are its numbers.
 #[derive(Debug)]
