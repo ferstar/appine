@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; IPv6-only port map entries; DNS stub threads; socket I/O (one message, `MSG_WAITALL`, iovecs); blocking connect; listen events; Starnix's and gVisor's findings; bind's family checks)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; blocking connect; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown last)
 
 ## Responsibilities
 
@@ -38,8 +38,8 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   protocol, `raw` (the guest asked for `SOCK_RAW`), guest-visible peer, DNS stub state
   (`stub_peer`, queued `answers`, `answered`), `rcvtimeo`/`sndtimeo`, namespace state (owned by
   `kernel/netns`), `track` (nat state, claimed original destination, `SO_MARK`), raw ICMP and
-  ICMP-tap state, portmap `lease`/`local_map`/`peer_map`, cached traffic route. Guest
-  `O_NONBLOCK` lives on the open file.
+  ICMP-tap state, portmap `lease`/`local_map`/`peer_map`, cached traffic route, `rd_shut` (the
+  guest shut it down for reading). Guest `O_NONBLOCK` lives on the open file.
 - `Message` (one recv result), `Routed` (connect/sendto routing result: namespace map, nat,
   filter verdict, original destinations).
 - `NetlinkSocket` — protocol, `nl_pid`, datagram queue, arrival counter, `rcvtimeo`, namespace,
@@ -131,7 +131,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `tcp_recvmsg` returns what it copied. `MSG_PEEK|MSG_WAITALL` peeks from the head each time and
   waits with the host socket's `SO_RCVLOWAT` raised to the length (restored afterwards); when the
   host fd was ready but the peek did not grow (end of file, a receive buffer that can never hold
-  the length) it returns what is there instead of spinning.
+  the length) it returns what is there instead of spinning. A datagram socket shut down for
+  reading (shutdown with `SHUT_RD` or `SHUT_RDWR` records it, also when the host answers
+  `ENOTCONN` for an unconnected socket, as Linux's `inet_shutdown` takes effect then too) returns
+  0 from a blocking recv with nothing queued, before timeouts and signals, where the nonblocking
+  host socket would answer `EAGAIN` while polling readable; queued datagrams come first, and a
+  nonblocking recv stays `EAGAIN`.
 - read, write, readv and writev on a socket are one recvmsg or sendmsg over all the iovecs with no
   address, control data or flags (Linux's `sock_read_iter`/`sock_write_iter`): a datagram or
   seqpacket record is one message whatever the iovecs or the length, a read of nothing returns 0
@@ -264,12 +269,15 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - `NETLINK_ROUTE`: change requests (`NEW`/`DEL`/`SET` for links, addresses, routes) need
   `CAP_NET_ADMIN` over the namespace owner and go to `kernel/netns`'s device layer (host
   interfaces cannot be changed; requests that change nothing succeed). Queries: link dumps
-  (split at 8 KiB; filtered by master and kind), single links by index or name (`EINVAL`,
-  `ENODEV`), address dumps (one datagram per family), route dumps and `ip route get`, rule dumps,
-  nsid; dumps are not resumable, so a datagram larger than the reader's buffer is lost; neighbour
-  dumps are empty; others `EOPNOTSUPP`. In the initial namespace interfaces and addresses come
-  from the host's `getifaddrs` (MTU fixed, MAC from `AF_PACKET` entries); new namespaces see only
-  their own devices.
+  (filtered by master and kind), single links by index or name (`EINVAL`, `ENODEV`), address
+  dumps (per family, IPv4 first), route dumps (per family) and `ip route get`, rule dumps (one
+  datagram), nsid; link, address and route dumps are packed into datagrams of at most 3776 bytes
+  (Linux's `NLMSG_GOODSIZE` on 4 KiB pages, which bounds a dump's first datagram), so readers
+  with a page-sized buffer (Go's `syscall.NetlinkRIB`, behind `net.Interfaces`) get whole
+  messages; dumps are not resumable, so a datagram larger than the reader's buffer is lost;
+  neighbour dumps are empty; others `EOPNOTSUPP`. In the initial namespace interfaces and
+  addresses come from the host's `getifaddrs` (MTU fixed, MAC from `AF_PACKET` entries); new
+  namespaces see only their own devices.
 - `NETLINK_GENERIC`: `nlctrl` only, modelled on 6.8 (unknown families `ENOENT`, `GETPOLICY`
   `EOPNOTSUPP`). `NETLINK_NETFILTER` goes to nftables. `NETLINK_KOBJECT_UEVENT` never receives.
 
@@ -328,9 +336,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   written, so a bad address pointer returns an error with the fd left open; `EMFILE` is reported
   after the connection was taken from the queue and closed. Accepted inet sockets also lose the
   listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`.
-- **Netlink dumps are not resumable:** address, route and rule dumps are one datagram per family
-  and link dumps use 8 KiB chunks; a reader with a smaller buffer gets `MSG_TRUNC` and loses the
-  rest (Linux continues the dump on the next recv).
+- **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
+  most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
+  sizes later datagrams to the reader's buffer and continues the dump on the next recv.
 - **Netlink socket options misreport:** getsockopt returns 0 for `SO_TYPE`, `SO_DOMAIN`,
   `SO_SNDBUF`, `SO_RCVBUF`, `NETLINK_LIST_MEMBERSHIPS` and the ack flags, and answers
   `SO_SNDTIMEO` with 4 zero bytes instead of a timeval; unknown options and
@@ -384,11 +392,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **socketpair reports unknown inet types as protocol errors:** `socketpair(AF_INET/AF_INET6)`
   with a type that has no inet protocol is `EPROTONOSUPPORT`, where Linux answers
   `ESOCKTNOSUPPORT`.
-- **A datagram socket shut down for reading spins in recv:** a blocking recv on a UDP socket
-  returns 0 on Linux once any thread has called `shutdown(SHUT_RD)` (even when that call reports
-  `ENOTCONN`); here the nonblocking host socket answers `EAGAIN` while poll reports it readable,
-  so the receiver loops between the two at full CPU forever, and programs that wake their receiver
-  threads with `shutdown` hang.
+- **A raw ICMP socket shut down for reading still waits in recv:** the aggregation point's receive
+  path does not look at the read shutdown, so a blocking recv with nothing queued sleeps until a
+  reply, a timeout or a signal, where Linux's `skb_recv_datagram` returns 0 at once (and wakes
+  receivers already waiting); only internet datagram sockets on host sockets return 0.
 - **Odd destinations reach the host unchecked:** sendto hands a guest address the layer does not
   understand to the host socket as is, so the host kernel's own checks answer instead of Linux
   6.1's; under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux says `EINVAL`.
@@ -405,8 +412,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ## To verify
 
-- Whether glibc's `getifaddrs` (page-sized receive buffer, fails on `MSG_TRUNC`) breaks on phones
-  with enough interfaces for one 8 KiB link-dump chunk to exceed 4 KiB.
 - "Byte-identical to Linux" for address, route and rule messages: only generic netlink has a
   differential test; link messages omit `IFLA_AF_SPEC` and use a fixed MTU.
 - Host behaviour for passed-through options (`SO_PRIORITY`, `IP_TRANSPARENT`, `SO_PEERCRED` on

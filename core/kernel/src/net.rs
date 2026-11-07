@@ -112,6 +112,10 @@ pub(crate) struct InetSocket {
     pub fwd: Option<Box<crate::forward::Handle>>,
     /// The guest called listen (`SO_ACCEPTCONN` is not available on MPTCP host sockets).
     pub listening: bool,
+    /// The guest shut the socket down for reading (`SHUT_RD` or `SHUT_RDWR`; recorded also when
+    /// the call fails with `ENOTCONN`, as Linux's `inet_shutdown` sets `sk_shutdown` then too): a
+    /// blocking receive on a datagram socket with nothing queued returns 0.
+    pub rd_shut: bool,
     /// The number under which a listen in a new network namespace is registered in the namespace
     /// ([`crate::nsproxy::Listener`]), removed on close.
     pub listener: Option<std::num::NonZeroU64>,
@@ -173,6 +177,7 @@ impl InetSocket {
             track: None,
             fwd: None,
             listening: false,
+            rd_shut: false,
             listener: None,
             self_port: None,
             v6only: false,
@@ -334,9 +339,12 @@ const IFLA_CARRIER: u16 = 33;
 const IFLA_PROTO_DOWN: u16 = 39;
 const IFLA_MASTER: u16 = 10;
 const IFLA_LINKINFO: u16 = 18;
-/// The largest datagram of a dump: split into several when there are many interfaces (musl's
-/// if_nameindex and others use an 8 KiB buffer).
-const DUMP_CHUNK: usize = 8192;
+/// The largest datagram of a dump (larger dumps are split): Linux's `NLMSG_GOODSIZE` on 4 KiB
+/// pages, `SKB_WITH_OVERHEAD(PAGE_SIZE)`, which bounds a dump's first datagram and every later one
+/// for a reader whose buffer is a page. Go's `syscall.NetlinkRIB` (`net.Interfaces`,
+/// `net.InterfaceAddrs`) reads into one page and fails on a truncated datagram without checking
+/// `MSG_TRUNC`, so a dump datagram must fit in 4 KiB.
+const DUMP_CHUNK: usize = 3776;
 /// `IF_OPER_*` (RFC 2863 interface states).
 const IF_OPER_UNKNOWN: u8 = 0;
 const IF_OPER_DOWN: u8 = 2;
@@ -476,10 +484,11 @@ impl NetlinkSocket {
             Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
         };
         match ty {
-            // As on Linux, the interfaces are one datagram (split into several when too large);
-            // the addresses one per address family (IPv4 first for AF_UNSPEC), and NLMSG_DONE
-            // another one. When filtering by IFLA_MASTER or IFLA_LINKINFO's kind, the messages
-            // carry NLM_F_DUMP_FILTERED (Linux's rtnl_dump_ifinfo)
+            // As on Linux, the interfaces are one datagram (split into several when too large,
+            // `pack`); the addresses one per address family (IPv4 first for AF_UNSPEC, each split
+            // the same way), and NLMSG_DONE another one. When filtering by IFLA_MASTER or
+            // IFLA_LINKINFO's kind, the messages carry NLM_F_DUMP_FILTERED (Linux's
+            // rtnl_dump_ifinfo)
             RTM_GETLINK if dump => {
                 const NLM_F_DUMP_FILTERED: u16 = 0x20;
                 let attrs = crate::route::attrs(req.get(32..).unwrap_or_default());
@@ -500,30 +509,17 @@ impl NetlinkSocket {
                     .filter(|k| matches!(&k[..], b"bridge" | b"veth" | b"dummy"));
                 let filtered = master.is_some() || kind.is_some();
                 let mflags = NLM_F_MULTI | if filtered { NLM_F_DUMP_FILTERED } else { 0 };
-                let mut out: Vec<Vec<u8>> = Vec::new();
-                let mut cur = Vec::new();
-                for l in &host.links() {
-                    let keep = match l {
-                        Link::Host(_) => master.is_none() && kind.is_none(),
-                        Link::Virt(v, _) => {
-                            master.is_none_or(|m| v.master == Some(m))
-                                && kind
-                                    .as_deref()
-                                    .is_none_or(|k| k == v.kind.name().as_bytes())
-                        }
-                    };
-                    if !keep {
-                        continue;
+                let links = host.links();
+                let kept = links.iter().filter(|l| match l {
+                    Link::Host(_) => master.is_none() && kind.is_none(),
+                    Link::Virt(v, _) => {
+                        master.is_none_or(|m| v.master == Some(m))
+                            && kind
+                                .as_deref()
+                                .is_none_or(|k| k == v.kind.name().as_bytes())
                     }
-                    let m = reply(RTM_NEWLINK, mflags, &one(l));
-                    if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
-                        out.push(std::mem::take(&mut cur));
-                    }
-                    cur.extend(m);
-                }
-                if !cur.is_empty() {
-                    out.push(cur);
-                }
+                });
+                let mut out = pack(kept.map(|l| reply(RTM_NEWLINK, mflags, &one(l))));
                 out.push(done());
                 out
             }
@@ -534,17 +530,14 @@ impl NetlinkSocket {
                     if family != 0 && family != f {
                         continue;
                     }
-                    let d: Vec<u8> = links
+                    let messages = links
                         .iter()
                         .flat_map(|l| match l {
                             Link::Host(i) => addr_messages(i, f as u8),
                             Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
                         })
-                        .flat_map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m))
-                        .collect();
-                    if !d.is_empty() {
-                        out.push(d);
-                    }
+                        .map(|m| reply(RTM_NEWADDR, NLM_F_MULTI, &m));
+                    out.extend(pack(messages));
                 }
                 out.push(done());
                 out
@@ -579,22 +572,17 @@ impl NetlinkSocket {
                 }
                 out
             }
-            // As on Linux, the routes of each address family are one datagram, and NLMSG_DONE
-            // another one
+            // As on Linux, the routes of each address family are one datagram (split when too
+            // large), and NLMSG_DONE another one
             RTM_GETROUTE if dump => {
                 let entries = host.tables();
                 let mut out = Vec::new();
                 for f in [AF_INET, AF_INET6] {
-                    let d: Vec<u8> = entries
+                    let messages = entries
                         .iter()
                         .filter(|e| e.family == f && (family == 0 || family == f))
-                        .flat_map(|e| {
-                            reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e))
-                        })
-                        .collect();
-                    if !d.is_empty() {
-                        out.push(d);
-                    }
+                        .map(|e| reply(RTM_NEWROUTE, NLM_F_MULTI, &crate::route::route_message(e)));
+                    out.extend(pack(messages));
                 }
                 out.push(done());
                 out
@@ -693,6 +681,24 @@ impl NetlinkSocket {
         b[4..8].copy_from_slice(&self.pid.to_le_bytes());
         b
     }
+}
+
+/// Packs a dump's messages into datagrams of at most `DUMP_CHUNK` bytes, as Linux's `netlink_dump`
+/// fills one buffer after another (a message larger than that goes alone); no messages give no
+/// datagram.
+fn pack(messages: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for m in messages {
+        if !cur.is_empty() && cur.len() + m.len() > DUMP_CHUNK {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.extend(m);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Host information that netlink answers need (replaced with fixed values in tests).
@@ -1829,6 +1835,85 @@ mod tests {
         assert_eq!(errno(ask(get(0, Some(b"eth9\0")))), -19);
         assert_eq!(errno(ask(get(7, None))), -19);
         assert_eq!(errno(ask(get(0, None))), -22);
+    }
+
+    /// A host with many interfaces, each with an IPv4 and an IPv6 address.
+    struct Many(u32);
+
+    impl Host for Many {
+        fn interfaces(&self) -> Vec<Interface> {
+            (1..=self.0)
+                .map(|n| Interface {
+                    name: format!("eth{n}"),
+                    index: n,
+                    flags: 0x43,
+                    mtu: 1500,
+                    mac: Some([2, 0, 0, 0, 0, n as u8]),
+                    addrs: vec![
+                        (AF_INET, vec![10, 0, n as u8, 1], 24),
+                        (AF_INET6, [&[0xfd, 0][..], &[n as u8; 14]].concat(), 64),
+                    ],
+                })
+                .collect()
+        }
+        fn stats(&self, _: &str) -> IfStats {
+            IfStats::default()
+        }
+        fn routes(&self) -> Option<Vec<Route>> {
+            None
+        }
+        fn tx_queue_len(&self, _: &str) -> Option<u32> {
+            None
+        }
+        fn uid(&self) -> u32 {
+            0
+        }
+    }
+
+    /// Large dumps come in datagrams that fit a page-sized buffer (Go's `NetlinkRIB` reads one
+    /// page and fails on a truncated datagram), with every message kept in order: links in one
+    /// run, addresses per family, then NLMSG_DONE alone.
+    #[test]
+    fn splits_large_dumps_into_page_sized_datagrams() {
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        let host = Many(64);
+        let mut dump = |ty: u16| -> Vec<Vec<(u16, Vec<u8>)>> {
+            s.handle(
+                &message(ty, NLM_F_REQUEST | NLM_F_DUMP, 1, 0, &[0; 16]),
+                &host,
+            );
+            s.queue
+                .drain(..)
+                .map(|d| {
+                    assert!(d.len() <= 4096, "a {}-byte datagram", d.len());
+                    parse(&d)
+                })
+                .collect()
+        };
+        let links = dump(RTM_GETLINK);
+        assert!(links.len() > 2);
+        assert_eq!(links.last().unwrap()[0].0, NLMSG_DONE);
+        let names: Vec<Vec<u8>> = links[..links.len() - 1]
+            .iter()
+            .flatten()
+            .map(|(ty, p)| {
+                assert_eq!(*ty, RTM_NEWLINK);
+                attributes(&p[16..])[&IFLA_IFNAME].clone()
+            })
+            .collect();
+        let want: Vec<Vec<u8>> = (1..=64).map(|n| format!("eth{n}\0").into()).collect();
+        assert_eq!(names, want);
+        let addrs = dump(RTM_GETADDR);
+        assert_eq!(addrs.last().unwrap()[0].0, NLMSG_DONE);
+        // A datagram never mixes the families, and the IPv6 ones are split too
+        let families: Vec<Vec<u8>> = addrs[..addrs.len() - 1]
+            .iter()
+            .map(|d| d.iter().map(|(_, p)| p[0]).collect())
+            .collect();
+        assert!(families.iter().all(|f| f.iter().all(|&x| x == f[0])));
+        let v6 = families.iter().filter(|f| f[0] == AF_INET6 as u8).count();
+        assert!(v6 > 1);
+        assert_eq!(families.concat().len(), 128);
     }
 
     /// Route and rule dumps: one datagram per address family, and NLMSG_DONE another one; the

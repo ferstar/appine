@@ -1663,7 +1663,17 @@ pub(super) fn rw(
 pub(super) fn shutdown(cx: &mut Cx<'_>, fd: i32, how: i32) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
     match &mut *sock.borrow_mut() {
-        Socket::Inet(s) => appine_hal::net::shutdown(s.fd, how).map_err(Errno)?,
+        Socket::Inet(s) => {
+            const SHUT_RD: i32 = 0;
+            const SHUT_RDWR: i32 = 2;
+            let r = appine_hal::net::shutdown(s.fd, how).map_err(Errno);
+            // The host records the shutdown even on an unconnected socket, failing with ENOTCONN
+            // as Linux's inet_shutdown does, and recv needs to know about it (InetSocket::rd_shut)
+            if matches!(r, Ok(()) | Err(Errno::ENOTCONN)) && matches!(how, SHUT_RD | SHUT_RDWR) {
+                s.rd_shut = true;
+            }
+            r?
+        }
         Socket::Netlink(_) => {}
         Socket::Unix(u) => unix::shutdown(u, how)?,
     }
@@ -2270,6 +2280,23 @@ pub(crate) fn recv(
                     && let Some(m) = local(&mut s.answers, stub_addr(s.family))
                 {
                     return Ok(m);
+                }
+                // A datagram socket shut down for reading: a blocking receive with nothing queued
+                // returns 0 (Linux's __skb_wait_for_more_packets checks RCV_SHUTDOWN before
+                // waiting, timeouts and signals), while the nonblocking host socket answers EAGAIN
+                // and polls readable, so waiting would spin. Programs wake their receiving threads
+                // this way
+                if !nonblock
+                    && ty == SOCK_DGRAM
+                    && matches!(&*sock.borrow(), Socket::Inet(s) if s.rd_shut)
+                {
+                    return Ok(Message {
+                        data: Vec::new(),
+                        len: 0,
+                        addr: Vec::new(),
+                        control: Vec::new(),
+                        flags: 0,
+                    });
                 }
                 // MSG_WAITALL with part of the data read: wait for the rest; nonblocking, a signal,
                 // the timeout or an error ends it with what was read (Linux's tcp_recvmsg returns

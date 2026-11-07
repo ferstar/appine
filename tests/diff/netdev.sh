@@ -223,3 +223,36 @@ ip link del v8
 ip link del br9
 ip link show br9
 ls /sys/class/net | grep -c br9
+
+# Dumps of many interfaces come in datagrams that fit a page: Go's syscall.NetlinkRIB (behind
+# net.Interfaces and net.InterfaceAddrs) reads one page per datagram and fails on a truncated one
+echo "== many interfaces"
+mkdir -p /tmp/diff-netdev-go
+cd /tmp/diff-netdev-go
+cat > main.go <<'GO'
+package main
+
+import (
+	"fmt"
+	"net"
+)
+
+func main() {
+	ifs, err := net.Interfaces()
+	fmt.Println("interfaces:", len(ifs), err)
+	addrs, err := net.InterfaceAddrs()
+	fmt.Println("addresses:", len(addrs), err)
+}
+GO
+printf 'module diffnetdev\n\ngo 1.22\n' > go.mod
+go build -o ifaces .
+unshare -n sh -c '
+for i in $(seq 1 16); do
+    ip link add d$i type dummy
+    ip addr add 10.9.$i.1/24 dev d$i
+    ip link set d$i up
+done
+./ifaces
+'
+cd /
+rm -rf /tmp/diff-netdev-go
