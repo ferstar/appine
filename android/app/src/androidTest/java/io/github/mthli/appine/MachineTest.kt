@@ -387,9 +387,10 @@ class MachineTest {
 
     /**
      * Saved tabs (the android/service map): while the marker is still there (killed) they read back
-     * unchanged, also a second time (killed again before the kernel came up); a later save replaces
-     * them and leaves only the transcripts its index names; after a normal exit (clear) nothing is
-     * read.
+     * unchanged with the pid of the run that left it, also a second time (killed again before the
+     * kernel came up); a later save replaces them and leaves only the transcripts its index names;
+     * an earlier version's empty marker still counts as killed, with no pid; after a normal exit
+     * (clear) nothing is read.
      */
     @Test
     fun tabsComeBackOnlyAfterAKill() {
@@ -400,15 +401,19 @@ class MachineTest {
         )
         Tabs.markRunning(context)
         Tabs.save(context, tabs, 1)
-        val saved = Tabs.takeKilled(context)
+        val killed = Tabs.takeKilled(context)
+        assertEquals(android.os.Process.myPid(), killed?.pid)
+        val saved = killed?.saved
         assertEquals(tabs, saved?.tabs)
         assertEquals(1, saved?.current)
         assertTrue(saved!!.time > 0)
-        assertEquals(tabs, Tabs.takeKilled(context)?.tabs)
+        assertEquals(tabs, Tabs.takeKilled(context)?.saved?.tabs)
         Tabs.save(context, listOf(tabs[0].copy(transcript = "line 3")), 0)
-        assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.tabs?.map { it.transcript })
+        assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.transcript })
         val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
         assertEquals(transcripts.toString(), 1, transcripts.size)
+        File(context.filesDir, "tabs/running").writeText("")
+        assertEquals(0, Tabs.takeKilled(context)?.pid)
         Tabs.clear(context)
         assertEquals(null, Tabs.takeKilled(context))
     }

@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.content.Context
+import android.os.Process
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -10,12 +11,13 @@ import java.security.MessageDigest
 
 /**
  * Restoring tabs after the app was killed (the android/service map). While the kernel runs a
- * "running" marker is kept, and the tab layout and each tab's login account, current directory and
- * transcript are saved periodically in `files/tabs/`. A normal exit deletes them together with the
- * marker; if the marker is still there the next time the service starts, the system killed the app
- * last time (or it crashed), and the tabs are restored from what was saved: each tab starts a new
- * shell in its original directory, showing the original transcript and a line of notice first.
- * Processes are not restored.
+ * "running" marker naming the process is kept, and the tab layout and each tab's login account,
+ * current directory and transcript are saved periodically in `files/tabs/`. A normal exit deletes
+ * them together with the marker; if the marker is still there the next time the service starts, the
+ * system killed the app last time (or it crashed), and the tabs are restored from what was saved:
+ * each tab starts a new shell in its original directory, showing the original transcript and a line
+ * of notice first, which says why that process ended as far as Android recorded it. Processes are
+ * not restored.
  */
 internal object Tabs {
     private const val TAG = "appine"
@@ -35,6 +37,13 @@ internal object Tabs {
     /** The saved tabs, which one is current, and when they were saved (ms). */
     data class Saved(val tabs: List<Tab>, val current: Int, val time: Long)
 
+    /**
+     * A run that did not exit normally: the pid it ran as (0 when the marker does not say, as one
+     * left by an earlier version does not) and its saved tabs (null when there are none or they
+     * cannot be read).
+     */
+    data class Killed(val pid: Int, val saved: Saved?)
+
     private fun dir(context: Context) = File(context.filesDir, "tabs")
 
     private fun marker(context: Context) = File(dir(context), "running")
@@ -46,19 +55,23 @@ internal object Tabs {
     private val written = HashMap<String, Int>()
 
     /**
-     * Called once when the service starts: returns the saved tabs when the last run did not exit
-     * normally (the marker is still there), otherwise deletes the old ones and returns null. The
-     * marker and the tabs stay until they are replaced by the restored tabs' own saves or cleared
-     * by a normal exit: killed again before the kernel is up, the next start still finds them.
+     * Called once when the service starts: returns the killed run when the last run did not exit
+     * normally (the marker is still there), otherwise deletes the old tabs and returns null. The
+     * marker and the tabs stay until they are replaced by the restored run's own marker and saves or
+     * cleared by a normal exit: killed again before the kernel is up, the next start still finds
+     * them.
      */
-    fun takeKilled(context: Context): Saved? {
-        if (!marker(context).exists()) {
+    fun takeKilled(context: Context): Killed? {
+        val marker = marker(context)
+        if (!marker.exists()) {
             clear(context)
             return null
         }
-        return runCatching { load(context) }
+        val pid = runCatching { marker.readText().trim().toInt() }.getOrDefault(0)
+        val saved = runCatching { load(context) }
             .onFailure { Log.w(TAG, "cannot read the saved tabs", it) }
             .getOrNull()
+        return Killed(pid, saved)
     }
 
     private fun load(context: Context): Saved? {
@@ -74,11 +87,14 @@ internal object Tabs {
         return Saved(tabs, json.optInt("current"), json.optLong("time"))
     }
 
-    /** The kernel is up: leave the "running" marker. */
+    /**
+     * The kernel is up: leave the "running" marker with this process's pid, by which the next run
+     * finds how this one ended.
+     */
     fun markRunning(context: Context) {
         runCatching {
             dir(context).mkdirs()
-            marker(context).createNewFile()
+            marker(context).writeText(Process.myPid().toString())
         }.onFailure { Log.w(TAG, "cannot mark the tabs as running", it) }
     }
 

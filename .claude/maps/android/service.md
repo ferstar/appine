@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust, eight bugs removed; tab names removed)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; last, how a killed run ended told in its restore notice and, for crashes, a notification)
 
 ## Responsibilities
 
@@ -40,14 +40,16 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - `worker` — a single-thread executor (`appine-worker`) that serialises native calls taking the
   BKL: poll, shutdown, stop, trim, routes, `consoleCwd`.
 - Session state (internal): `sessions`, `unshown` (restored tabs not yet displayed), `restore`
-  (saved tabs from a killed run), `focus`, `current`; `sessionEvents` (title changed, finished).
+  (saved tabs from a killed run), `ended` (why that run ended), `focus`, `current`;
+  `sessionEvents` (title changed, finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a restart).
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`).
-- `Tabs` — the `files/tabs/` store: `running` marker, `index.json`, transcripts named by content
-  (`t-<128-bit SHA-256 prefix>.txt`; earlier versions wrote `t<i>.txt`, still read); `Tab(login,
-  cwd, transcript)`, `Saved(tabs, current, time)`.
+- `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
+  `index.json`, transcripts named by content (`t-<128-bit SHA-256 prefix>.txt`; earlier versions
+  wrote `t<i>.txt`, still read); `Tab(login, cwd, transcript)`, `Saved(tabs, current, time)`,
+  `Killed(pid, saved)`.
 - Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s.
 
 ## Public entry points
@@ -64,8 +66,10 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ### Start and boot
 
-- `onCreate` starts foreground (type `specialUse` on API 34+), takes saved tabs from a killed run
-  (`Tabs.takeKilled`) and calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
+- `onCreate` starts foreground (type `specialUse` on API 34+), takes a killed run
+  (`Tabs.takeKilled`): its saved tabs, and how its process ended, looked up by the marker's pid in
+  Android's exit records (`ApplicationExitInfo`); a crash or ANR of appine posts a notification at
+  once. Then it calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
 - `start` sets `starting` (the wake lock follows) and runs on an `appine-start` thread: import when
   a distro is given (`Rootfs.prepare`, then a mirror-probing thread), `ensureNetworkConfig`,
   `ensureLoginTools`, `updateProfile`, then `Native.start(store, tier)` under `Rootfs.access`'s
@@ -138,11 +142,16 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   transcripts no index names any more are deleted only after the index is replaced (a kill at any
   point leaves a consistent set). Triggers: every 60 s, 2 s after a tab opens, closes or its shell
   ends, when the last listener leaves, on memory trim.
-- The `running` marker is written after a successful start and removed (with saved tabs) on a
-  normal exit; `takeKilled` loads the tabs when it is present at service creation and leaves the
-  marker and files alone, so a second kill (or a failed start) before the kernel is up keeps them.
+- The `running` marker, holding the process's pid, is written after each successful start and
+  removed (with saved tabs) on a normal exit; `takeKilled` loads the tabs when it is present at
+  service creation and leaves the marker and files alone, so a second kill (or a failed start)
+  before the kernel is up keeps them, and the marker still names the run they belong to. A marker
+  from an earlier version is empty (pid 0).
 - Restore: each saved tab reopens with its saved login setting and cwd, preceded by its old
-  transcript and a yellow notice with the save time; the saved current tab is focused.
+  transcript and a yellow notice saying why the run ended and when the tabs were saved; the saved
+  current tab is focused. Reasons told apart: low memory, too many resources in the background,
+  force-stopped, the app updated (reported from Android 14), and a crash or an ANR of appine;
+  anything else, no record or no pid gives "Android stopped the app".
 
 ### Reports and notifications
 
@@ -153,12 +162,16 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   bug. Bugs always notify with "copy report": app version
   and build, device (Android release and API, maker and model, ABI, page size), distro and tier
   (always 1 in a release build), the kernel's report line, and up to 10 earlier kernel log records.
+- Crashes of the last run: a crash (Java or native) or ANR record of the killed run posts "appine
+  crashed" or "appine stopped responding" with "copy report": the bug report's app, device, distro
+  and tier lines and one line with the pid, the kind (with the signal for a native crash), the time
+  in UTC and, for an ANR, Android's description.
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.
 - Listens: the first listen on a non-loopback address per (guest port, host port) pair and kernel
   (the kernel queues at most 32), with remap text when the ports differ.
-- Channels: `sessions` (low), `network`, `problems`; ids 1 (ongoing), 2 (boot), 1000 + guest port
-  (listen), and from 100000 one id per kill report, counting up from a clock-seeded start
-  (wrapping after 100000).
+- Channels: `sessions` (low), `network`, `problems`; ids 1 (ongoing), 2 (boot), 3 (a crash of the
+  last run), 1000 + guest port (listen), and from 100000 one id per kill report, counting up from
+  a clock-seeded start (wrapping after 100000).
 - The ongoing notification counts running tabs; "Running in the background" when none runs, and
   "Cannot start: …" after a failed start.
 
@@ -173,6 +186,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `Native` (start, boot, shutdown, stop, trim, poll calls, routes, spawn, waitFor, consoleCwd);
   `Rootfs` (prepare, download, mirrors, ensure-files, access lock, reset, failed services); `Tabs`;
+  `ActivityManager` (exit records);
   `ConsolePty` and `VtSession`; `Documents` (`rootsChanged`, `dirsChanged`).
 
 ## Invariants and gotchas
@@ -182,6 +196,9 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   finds it).
 - Results of a poll are dropped if the kernel changed meanwhile (reports fetched just before a
   restart are lost).
+- Android names low-memory kills only where `isLowMemoryKillReportSupported`; elsewhere they are
+  plain signals, as is a `SIGKILL` from anyone, and get the general notice. Exit records are kept
+  for a limited number of processes per app, so a run killed long ago may have none.
 - `exitAll` clears listeners at once so that a quick shutdown is not mistaken for the user
   returning.
 - An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path

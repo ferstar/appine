@@ -1,5 +1,7 @@
 package io.github.mthli.appine
 
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -29,6 +31,7 @@ import androidx.core.content.edit
 import java.util.concurrent.Executors
 import java.text.DateFormat
 import java.text.DecimalFormat
+import java.time.Instant
 import java.util.Date
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
@@ -238,6 +241,9 @@ class TerminalService : Service() {
      */
     private var restore: Tabs.Saved? = null
 
+    /** Why the run whose tabs are restored ended: the start of their notice ([endedText]). */
+    private var ended = R.string.ended_android
+
     /** The tab to show after restoring (taken by the Activity). */
     internal var focus: VtSession? = null
         private set
@@ -308,8 +314,14 @@ class TerminalService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        // The last run did not exit normally: restore the tabs once the kernel is up
-        restore = Tabs.takeKilled(this)
+        // The last run did not exit normally: restore the tabs once the kernel is up, saying why
+        // it ended as far as Android recorded it; a crash of appine itself is reported now
+        Tabs.takeKilled(this)?.let { killed ->
+            val exit = lastExit(killed.pid)
+            restore = killed.saved
+            ended = endedText(exit?.reason)
+            if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifyCrash(exit)
+        }
         // First run (or the last import did not finish): import the Alpine in the APK; other
         // distros are switched to in Settings
         start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
@@ -327,6 +339,71 @@ class TerminalService : Service() {
         )
         getSystemService(NotificationManager::class.java)
             .createNotificationChannels(listOf(channel, services, problems))
+    }
+
+    /**
+     * How this app's process [pid] ended, as Android recorded it; null when that is unknown (no pid,
+     * or the record is gone: Android keeps a limited number per app).
+     */
+    private fun lastExit(pid: Int): ApplicationExitInfo? {
+        if (pid <= 0) return null
+        return runCatching {
+            getSystemService(ActivityManager::class.java)
+                .getHistoricalProcessExitReasons(packageName, pid, 1).firstOrNull()
+        }.onFailure { Log.w(TAG, "cannot read how the last run ended", it) }.getOrNull()
+    }
+
+    /**
+     * The start of the restore notice for a run that ended with [reason] (null when unknown).
+     * Android reports the low-memory killer only where `isLowMemoryKillReportSupported`; elsewhere
+     * such a kill is a plain signal and gets the general text.
+     */
+    @SuppressLint("InlinedApi") // REASON_PACKAGE_UPDATED (API 34) is a constant earlier versions never report
+    private fun endedText(reason: Int?): Int = when (reason) {
+        ApplicationExitInfo.REASON_LOW_MEMORY -> R.string.ended_memory
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> R.string.ended_resources
+        ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED -> R.string.ended_user
+        ApplicationExitInfo.REASON_PACKAGE_UPDATED -> R.string.ended_updated
+        ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> R.string.ended_crash
+        ApplicationExitInfo.REASON_ANR -> R.string.ended_anr
+        else -> R.string.ended_android
+    }
+
+    /**
+     * The last run ended because appine crashed or stopped responding: posts a notification with
+     * "Copy report" ([bugReport]), as appine's bugs in the kernel get ([reportKill]).
+     */
+    private fun notifyCrash(exit: ApplicationExitInfo) {
+        val anr = exit.reason == ApplicationExitInfo.REASON_ANR
+        val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(exit.timestamp))
+        val text = getString(if (anr) R.string.anr_text else R.string.crashed_text, time)
+        val what = when (exit.reason) {
+            ApplicationExitInfo.REASON_CRASH -> "crashed (Java)"
+            ApplicationExitInfo.REASON_CRASH_NATIVE -> "crashed (native, signal ${exit.status})"
+            else -> "stopped responding (ANR)"
+        }
+        // Android's description says only "crash" for crashes; for an ANR it says what timed out
+        val line = "The app process (pid ${exit.pid}) $what at ${Instant.ofEpochMilli(exit.timestamp)}" +
+            (exit.description?.takeIf { anr }?.let { ": $it" } ?: "")
+        val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
+            .putExtra(EXTRA_REPORT, bugReport(line, ""))
+            .putExtra(EXTRA_NOTIFICATION, CRASH_NOTIFICATION_ID)
+        val pending = PendingIntent.getService(
+            this, CRASH_NOTIFICATION_ID, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(if (anr) R.string.anr_title else R.string.crashed_title))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
+            .build()
+        getSystemService(NotificationManager::class.java).notify(CRASH_NOTIFICATION_ID, notification)
     }
 
     private fun notification(): Notification {
@@ -593,7 +670,8 @@ class TerminalService : Service() {
      */
     private fun restoreTabs(saved: Tabs.Saved) {
         val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(saved.time))
-        val notice = "\u001b[33m[appine] " + getString(R.string.restored_notice, time) + "\u001b[0m\r\n\r\n"
+        val notice = "\u001b[33m[appine] " + getString(R.string.restored_notice, getString(ended), time) +
+            "\u001b[0m\r\n\r\n"
         for (tab in saved.tabs) {
             val session = createSession(tab.login, tab.cwd)
             val body = tab.transcript.trimEnd().replace("\r\n", "\n").replace("\n", "\r\n")
@@ -1164,6 +1242,8 @@ class TerminalService : Service() {
         private const val PROBLEMS_CHANNEL_ID = "problems"
         /** The boot failure notification. */
         private const val BOOT_NOTIFICATION_ID = 2
+        /** The notification that the last run ended in a crash or ANR of appine. */
+        private const val CRASH_NOTIFICATION_ID = 3
         /**
          * Notifications of ended processes: one id per report, above every listen id, so neither a
          * listen nor a later report replaces one (and with it a bug's "Copy report").
