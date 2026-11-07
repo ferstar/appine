@@ -317,7 +317,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun showMenu(anchor: View) {
         val sessions = service?.sessions.orEmpty().toList()
         val others = sessions.filter { it != current }
-        PopupMenu(this, anchor).apply {
+        PopupMenu(this, anchor, Gravity.END, 0, R.style.Widget_Appine_MorePopup).apply {
             menu.add(R.string.close_other_tabs).apply { isEnabled = others.isNotEmpty() }.setOnMenuItemClickListener {
                 confirmClose(others)
                 true
