@@ -411,9 +411,11 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
         put(cx, attr, (SCHED_ATTR_SIZE as u32).to_le_bytes())?;
         return Err(Errno::E2BIG);
     }
-    let mut b = vec![0u8; size];
+    // Fields past a shorter structure read as 0 (copy_struct_from_user): the first version ends
+    // before util_min/util_max
+    let mut b = vec![0u8; size.max(SCHED_ATTR_SIZE)];
     cx.mm()
-        .read(crate::uaccess::UserSlice::new(attr, size), &mut b)?;
+        .read(crate::uaccess::UserSlice::new(attr, size), &mut b[..size])?;
     // When longer than the version known here, the extra part must be 0
     if b.iter().skip(SCHED_ATTR_SIZE).any(|&x| x != 0) {
         put(cx, attr, (SCHED_ATTR_SIZE as u32).to_le_bytes())?;

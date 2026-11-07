@@ -953,6 +953,7 @@ int main(void)
     set("clamp min 2000", 0x18 | 0x20, 0, 2000, 0, sizeof(struct attr));
     set("clamp min -1 resets it", 0x18 | 0x20, 0, UINT32_MAX, 0, sizeof(struct attr));
     set("clamps with the first structure", 0x18 | 0x20, 0, 10, 0, 48);
+    set("the first structure, nice 6", 0, 6, 0, 0, 48);
     set("unknown flag", 0x80, 0, 0, 0, sizeof(struct attr));
     return 0;
 }
