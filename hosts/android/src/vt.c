@@ -11,7 +11,7 @@
 // Frame format (little-endian), written by appine_vt_frame and read by VtView.kt; the two change
 // together:
 //
-//   header, 40 bytes:
+//   header, 48 bytes:
 //     u16 cols, u16 rows
 //     u8  dirty            0 nothing changed, 1 some rows, 2 every row
 //     u8  cursor_visible   1 when visible and inside the viewport
@@ -30,7 +30,10 @@
 //                          0xffff for both when there is none or it is outside the viewport
 //     u16 selection_end_x, u16 selection_end_y
 //                          its last cell, likewise
-//     u32 reserved
+//     u32 scroll_total     the scrollable area in rows (scrollback and active area), as
+//                          GhosttyTerminalScrollbar has it
+//     u32 scroll_offset    the viewport's first row in that area
+//     u32 scroll_len       the rows the viewport shows
 //   row_count rows:
 //     u16 y, u16 cell_count, u32 extra_count
 //     u16 selection_from, u16 selection_to
@@ -56,7 +59,7 @@
 
 #include <ghostty/vt.h>
 
-#define HEADER_BYTES 40
+#define HEADER_BYTES 48
 #define ROW_HEADER_BYTES 12
 #define CELL_BYTES 16
 
@@ -102,6 +105,10 @@ static void put_u32(uint8_t *p, uint32_t v) {
   p[1] = (uint8_t)(v >> 8);
   p[2] = (uint8_t)(v >> 16);
   p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t clamp_u32(uint64_t v) {
+  return v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
 }
 
 static uint32_t argb(GhosttyColorRgb c) {
@@ -472,6 +479,8 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor);
   bool bottom = true;
   ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &bottom);
+  GhosttyTerminalScrollbar scrollbar = {0};
+  ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar);
 
   vt->frame.len = 0;
   if (!buf_reserve(&vt->frame, HEADER_BYTES)) return NULL;
@@ -514,6 +523,9 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
     put_viewport(vt, h + 32, &ordered.end);
   }
   h[27] = flags;
+  put_u32(h + 36, clamp_u32(scrollbar.total));
+  put_u32(h + 40, clamp_u32(scrollbar.offset));
+  put_u32(h + 44, clamp_u32(scrollbar.len));
   vt->frame.len = HEADER_BYTES;
 
   uint16_t count = 0;

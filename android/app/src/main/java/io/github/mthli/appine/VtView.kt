@@ -35,6 +35,7 @@ import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.widget.OverScroller
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
 import androidx.core.graphics.withScale
@@ -64,8 +65,10 @@ import kotlin.math.roundToInt
  *
  * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
  * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
- * alternate screen (alternate scroll, mode 1007); a long press selects a word, and dragging on
- * extends the selection, as do its two handles; a floating menu copies, pastes and selects all.
+ * alternate screen (alternate scroll, mode 1007), and a fling goes on scrolling the same way; while
+ * the scrollback scrolls, a scroll bar like a ScrollView's shows where the viewport is in it. A long
+ * press selects a word, and dragging on extends the selection, as do its two handles; a floating
+ * menu copies, pastes and selects all.
  * The selection is the terminal's, so it stays on its text through output and scrolling.
  */
 @SuppressLint("ViewConstructor") // Created only in code
@@ -154,6 +157,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var cursorY = 0
     private var atBottom = true
 
+    // The scrollable area (scrollback and screen) in rows, the viewport's first row in it and the
+    // rows it shows, for the scroll bar
+    private var scrollTotal = 0
+    private var scrollOffset = 0
+    private var scrollLen = 0
+
     // Modes and the selection, as of the last frame (vt.c's header flags)
     private var mouseTracking = false
     private var altScreen = false
@@ -191,6 +200,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var scrollRemainder = 0f
     private var scaleRemainder = 1f
 
+    /**
+     * A fling: pixels scrolled over time, taken in rows as a drag's are, the way scrolling went when
+     * it started ([scrollWay]) and with wheel events at [flingX], [flingY]; [flingLast] is the
+     * position taken so far.
+     */
+    private val scroller = OverScroller(context)
+    private var flingWay = WAY_VIEWPORT
+    private var flingX = 0f
+    private var flingY = 0f
+    private var flingLast = 0
+
+    /** The touch under way stopped a fling, so its tap does nothing else. */
+    private var stoppedFling = false
+
     // Selection drags: by the long-pressed word, or by a handle; in mouse mode a long press held
     // on may instead become a drag for the program
     private var drag = DRAG_NONE
@@ -212,6 +235,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var lastTapY = 0f
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val doubleTapSlop = ViewConfiguration.get(context).scaledDoubleTapSlop
+    private val minFling = ViewConfiguration.get(context).scaledMinimumFlingVelocity
 
     /** Rows the viewport scrolls by while a drag is held above (-1) or below (1) the grid. */
     private var autoscroll = 0
@@ -221,6 +245,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             if (autoscroll == 0 || tab == 0L) return
             VtNative.scroll(tab, autoscroll)
             VtNative.selectTo(tab, autoscrollX, if (autoscroll < 0) 0 else rows - 1)
+            awakenScrollBars()
             invalidate()
             postDelayed(this, AUTOSCROLL_MS)
         }
@@ -247,6 +272,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         // Otherwise, focused outside touch mode (after hardware keys), the whole view is covered by
         // the system's translucent focus highlight
         defaultFocusHighlightEnabled = false
+        // The theme's scroll bar, shown and faded as a ScrollView's (computeVerticalScroll*)
+        isVerticalScrollBarEnabled = true
+        isScrollbarFadingEnabled = true
+        verticalScrollbarThumbDrawable = themeDrawable(android.R.attr.scrollbarThumbVertical)
         measureCells()
     }
 
@@ -271,7 +300,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
-     * again, and a selection drag or menu of the previous tab ends.
+     * again, and a selection drag, menu or fling of the previous tab ends.
      */
     fun attach(s: VtSession?) {
         if (s === session) return
@@ -280,7 +309,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         drag = DRAG_NONE
         autoscroll = 0
         removeCallbacks(autoscrollTick)
+        scroller.forceFinished(true)
         selected = false
+        scrollTotal = 0
+        scrollOffset = 0
+        scrollLen = 0
         session = s
         s?.view = this
         if (s != null && cols > 0) {
@@ -434,6 +467,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         selStartY = coordinate(b, 30)
         selEndX = coordinate(b, 32)
         selEndY = coordinate(b, 34)
+        scrollTotal = b.getInt(36)
+        scrollOffset = b.getInt(40)
+        scrollLen = b.getInt(44)
         if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
         if (newFg != defaultFg || newBg != defaultBg) {
             // Rows that did not change still have the old default colours
@@ -512,6 +548,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             frameRows = 0
         }
     }
+
+    // The scroll bar, which View draws after onDraw from the frame just taken; it shows only with a
+    // scrollback, so never on the alternate screen
+    override fun computeVerticalScrollRange() = scrollTotal
+
+    override fun computeVerticalScrollOffset() = scrollOffset
+
+    override fun computeVerticalScrollExtent() = scrollLen
 
     // ---- Painting ----
 
@@ -834,11 +878,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         send(data)
     }
 
-    /** Bytes for the program; the viewport returns to the bottom first. */
-    private fun send(data: ByteArray?) {
+    /**
+     * Bytes for the program; the viewport returns to the bottom first. Other input stops a fling,
+     * scrolling's own wheel events and arrow keys do not.
+     */
+    private fun send(data: ByteArray?, scrolling: Boolean = false) {
         if (data == null || data.isEmpty()) return
+        if (!scrolling) scroller.forceFinished(true)
         if (!atBottom && tab != 0L) {
             VtNative.scroll(tab, 0)
+            awakenScrollBars()
             invalidate()
         }
         host.onInput(data)
@@ -846,6 +895,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
+        // A fling not drawn to its end would jump there when the window draws again
+        if (!hasWindowFocus) scroller.forceFinished(true)
         // Focus events (mode 1004): editors reload changed files when they regain focus
         if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
         invalidate()
@@ -1138,6 +1189,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // A touch stops a fling
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            stoppedFling = !scroller.isFinished
+            scroller.forceFinished(true)
+        }
         // A mouse's buttons and drags go to a program tracking it as they are, from the press on
         val press = event.actionMasked == MotionEvent.ACTION_DOWN && mouseTracking && drag == DRAG_NONE
         if (tab != 0L && event.isFromSource(InputDevice.SOURCE_MOUSE) && (press || mouseButton != 0)) {
@@ -1239,6 +1295,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             override fun onShowPress(e: MotionEvent) = Unit
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
+                // Only stops the fling, as a tap on a flinging ScrollView does
+                if (stoppedFling) return true
                 val second = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
                     hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
                 // A third tap starts over
@@ -1299,7 +1357,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
             }
 
-            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float) = false
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (tab == 0L || drag != DRAG_NONE || abs(velocityY) < minFling) return false
+                fling(e2.x, e2.y, -velocityY.roundToInt())
+                return true
+            }
         },
     )
 
@@ -1346,25 +1408,71 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
     }
 
-    /**
-     * Scrolls by [n] rows (positive: towards the newest output): wheel events for a program
-     * tracking the mouse, arrow keys on the alternate screen with alternate scroll, else the
-     * viewport.
-     */
+    /** Scrolls by [n] rows (positive: towards the newest output), the way [scrollWay] says. */
     private fun scrollBy(n: Int, x: Float, y: Float) {
-        when {
-            mouseTracking -> repeat(abs(n)) {
-                send(VtNative.mouse(tab, MOUSE_PRESS, if (n > 0) MOUSE_WHEEL_DOWN else MOUSE_WHEEL_UP, 0, x, y, false))
+        when (scrollWay()) {
+            WAY_WHEEL -> repeat(abs(n)) {
+                val button = if (n > 0) MOUSE_WHEEL_DOWN else MOUSE_WHEEL_UP
+                send(VtNative.mouse(tab, MOUSE_PRESS, button, 0, x, y, false), scrolling = true)
             }
-            altScreen && altScroll -> {
+            WAY_ARROWS -> {
                 val arrow = VtKeys.of(if (n > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
-                repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0)) }
+                repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0), scrolling = true) }
             }
             else -> {
                 VtNative.scroll(tab, n)
+                awakenScrollBars()
                 invalidate()
             }
         }
+    }
+
+    /**
+     * How scrolling goes now: wheel events for a program tracking the mouse, arrow keys on the
+     * alternate screen with alternate scroll, else the viewport.
+     */
+    private fun scrollWay() = when {
+        mouseTracking -> WAY_WHEEL
+        altScreen && altScroll -> WAY_ARROWS
+        else -> WAY_VIEWPORT
+    }
+
+    /**
+     * Goes on scrolling after a drag at [velocity] pixels a second (positive: towards the newest
+     * output), slowing down as a ScrollView does ([computeScroll] takes the rows): the viewport up
+     * to either end, wheel events and arrow keys for at most a screen of rows.
+     */
+    private fun fling(x: Float, y: Float, velocity: Int) {
+        flingWay = scrollWay()
+        flingX = x
+        flingY = y
+        flingLast = 0
+        val reach = (if (flingWay == WAY_VIEWPORT) scrollTotal else rows) * cellHeight
+        scroller.fling(0, 0, 0, velocity, 0, 0, -reach, reach)
+        postInvalidateOnAnimation()
+    }
+
+    /**
+     * A fling's next rows, before each frame while it lasts. It stops when the way to scroll
+     * changes (a program turning mouse tracking on, the alternate screen) or the viewport reaches
+     * the end it moves to, as of the last frame.
+     */
+    override fun computeScroll() {
+        if (!scroller.computeScrollOffset()) return
+        val delta = scroller.currY - flingLast
+        flingLast = scroller.currY
+        val end = flingWay == WAY_VIEWPORT && (if (delta < 0) scrollOffset == 0 else delta > 0 && atBottom)
+        if (tab == 0L || scrollWay() != flingWay || end) {
+            scroller.forceFinished(true)
+            return
+        }
+        scrollRemainder += delta
+        val n = (scrollRemainder / cellHeight).toInt()
+        if (n != 0) {
+            scrollRemainder -= n * cellHeight
+            scrollBy(n, flingX, flingY)
+        }
+        postInvalidateOnAnimation()
     }
 
     private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
@@ -1398,7 +1506,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val CURSOR_HOLLOW = 3
 
         // The frame format (vt.c)
-        const val HEADER_BYTES = 40
+        const val HEADER_BYTES = 48
         const val ROW_HEADER_BYTES = 12
         const val FLAG_MOUSE = 1
         const val FLAG_ALT_SCREEN = 1 shl 1
@@ -1418,6 +1526,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** Rows per mouse wheel notch. */
         const val WHEEL_ROWS = 3
+
+        // How scrolling goes (scrollWay)
+        const val WAY_VIEWPORT = 0
+        const val WAY_WHEEL = 1
+        const val WAY_ARROWS = 2
 
         const val DRAG_NONE = 0
         const val DRAG_WORD = 1

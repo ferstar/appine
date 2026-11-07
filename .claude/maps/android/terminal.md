@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys, themes reworked; mouse drags, hover, double taps; cutout insets, IME-following keys; last, tab animations, the bar as TabBarView)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes reworked; mouse drags, hover, double taps; cutout and IME insets; tab animations; last, the scroll bar and flings)
 
 ## Responsibilities
 
@@ -67,9 +67,10 @@ libghostty-vt with Zig (`android/native`).
   executor; `Events` (title changed, finished) go to the service.
 - `VtView` — the view: the attached `VtSession`, cell metrics, a mirror of the screen (codepoint,
   colours, attributes, grapheme clusters per cell, each row's selected columns), a backing bitmap
-  of the grid, the modes and selection bounds of the last frame, the IME connection, gestures,
-  selection handles and the floating menu. `Host` (the activity): `onGrid`, `onInput`, `onZoom`,
-  the extra keys' `ctrl`, `alt`, `shift` and `modifiersUsed`.
+  of the grid, the modes, scroll position and selection bounds of the last frame, the IME
+  connection, gestures and the fling's `OverScroller`, selection handles and the floating menu.
+  `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift`
+  and `modifiersUsed`.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
@@ -239,8 +240,10 @@ libghostty-vt with Zig (`android/native`).
   captured at an old size is dropped and a full one requested. Attaching also resizes the tab's
   terminal and console to the view's grid when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
-  focus events 1004, a selection exists) and the selection's first and last cells in the
-  viewport; each row carries its selected columns.
+  focus events 1004, a selection exists), the selection's first and last cells in the viewport,
+  and the scroll position libghostty-vt reports for the scroll bar (the scrollable area in rows,
+  scrollback and screen, the viewport's first row in it and the rows it shows); each row carries
+  its selected columns.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
@@ -271,8 +274,9 @@ libghostty-vt with Zig (`android/native`).
   as text and leaves them on. The extra keys send presses only (a held key repeats as new presses),
   never releases. Ctrl+Shift+C and V (held, or from the extra keys) and the dedicated copy and
   paste keys copy and paste.
-- Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom,
-  then goes through the host to the tab's `vt-writer` thread (`Native.write`).
+- Typed and pasted input ends a selection; all input first scrolls the viewport back to the bottom
+  (and, but for a fling's own wheel events and arrow keys, stops a fling), then goes through the
+  host to the tab's `vt-writer` thread (`Native.write`).
 - IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
   paste, which covers the IME's clipboard); the editor action is Enter; composing text is only
   drawn at the cursor; the editable is kept empty so Backspace with nothing composed arrives as
@@ -296,6 +300,15 @@ libghostty-vt with Zig (`android/native`).
 - A vertical drag, or a mouse wheel (3 rows a notch), scrolls by whole rows: wheel events when the
   program tracks the mouse, arrow keys on the alternate screen with alternate scroll (1007, on by
   default), else the viewport.
+- A fling goes on scrolling that way, slowing down as a ScrollView does (Android's fling physics
+  in pixels, taken as whole rows like a drag): the viewport until it reaches either end, wheel
+  events and arrow keys for at most a screen of rows. It stops when the way to scroll changes
+  (mouse tracking, the alternate screen), at a touch (whose tap then does nothing else), at any
+  other input to the program, when the window loses focus and when another tab is shown.
+- The viewport scrolling (a drag, wheel, fling, a selection's autoscroll, input returning it to the
+  bottom) shows the theme's scroll bar at the right edge, faded out after a moment as a
+  ScrollView's; output alone does not show it, and with no scrollback (the alternate screen) it is
+  never drawn.
 - A long press selects the word under it (`ghostty_terminal_select_word`, installed as the
   terminal's selection) and keeps it as the anchor: moving on extends the selection from the far
   side of the word to the cell under the finger. On blank cells it selects nothing and shows a menu
@@ -444,6 +457,13 @@ libghostty-vt with Zig (`android/native`).
   full one (the render state redraws everything when the screen's selection changes).
 - With the IME shown, a hardware Esc press is taken by the IME (Gboard hides itself), so a program
   using the Kitty protocol's release events sees only the release.
+- The scroll bar is `View`'s own (`computeVerticalScrollRange`, `Offset` and `Extent` return the
+  last frame's rows), shown with `awakenScrollBars` wherever `VtView` moves the viewport. A view
+  built in code has no scroll bar until it is given a thumb (`verticalScrollbarThumbDrawable`, the
+  theme's `scrollbarThumbVertical`) and fading is turned on explicitly; `View` also flashes it
+  each time the window becomes visible again.
+- A fling runs in `computeScroll`, before each draw takes its frame, so its end checks (top row,
+  bottom) see the frame of the step before: it stops one frame after reaching an end.
 - `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
   injected keys) the system would cover the whole view with a translucent grey.
 - `MainActivity` is a framework `Activity` on a Material theme: Material dialogs and AppCompat's
@@ -490,4 +510,5 @@ libghostty-vt with Zig (`android/native`).
   not on Android 11 or real GPUs.
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
-  Gboard in English.
+  Gboard in English. Flings and the scroll bar were tried there with adb swipes only (viewport and
+  alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger.
