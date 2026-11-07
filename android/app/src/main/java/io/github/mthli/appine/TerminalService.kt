@@ -705,7 +705,13 @@ class TerminalService : Service() {
             worker.execute {
                 val tabs = snapshot.map { (session, tab) ->
                     val console = session.console
-                    if (console >= 0) tab.copy(cwd = Native.consoleCwd(m, console)) else tab
+                    val withCwd = if (console >= 0) tab.copy(cwd = Native.consoleCwd(m, console)) else tab
+                    // An "auto" tab is saved as the account it logged in as: the setting would be
+                    // resolved again at restore and might name another user by then
+                    if (tab.login != ConsolePty.LOGIN_AUTO) return@map withCwd
+                    val account = session.resolvedLogin
+                        ?: Rootfs.loginAccount(this, ConsolePty.LOGIN_AUTO).name.also { session.resolvedLogin = it }
+                    withCwd.copy(login = account)
                 }
                 Tabs.save(this, tabs, index)
             }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles at the edges last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles at the edges; panics caught in VtNative; kill reports inside strings last)
 
 ## Responsibilities
 
@@ -226,8 +226,10 @@ libghostty-vt with Zig (`android/native`).
 - Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
   wraps joined, trailing blanks trimmed); on the alternate screen it returns the last transcript
   taken on the primary one. Kill reports go through `VtNative.message` (a yellow line inserted above
-  the cursor line: down and back, save the cursor, insert lines, write, restore and move down;
-  skipped on the alternate screen) or wait until the terminal exists.
+  the cursor line: a CAN first when the parser is not at ground (`VT_GROUND`), so a program that
+  died inside an OSC, DCS or APC string does not swallow it; then down and back, save the cursor,
+  insert lines, write, restore and move down; skipped on the alternate screen) or wait until the
+  terminal exists.
 
 #### Frames and drawing
 
@@ -541,15 +543,10 @@ libghostty-vt with Zig (`android/native`).
     neither does vt.c;
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
     the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
-- **A kill report after a program died inside an OSC, DCS or APC string** is partly lost:
-  `appine_vt_message` writes into the stream wherever its parser stands, and the line feeds that
-  make the report's room are ignored in an OSC and taken as payload in a DCS or APC (the escape
-  after them ends the string, so the rest is drawn). No room is scrolled open, so the inserted
-  lines push the cursor's line down by the report's height (off the screen when it was the bottom
-  row) while the cursor goes back to its old row, now another line; after a partial UTF-8
-  sequence, a U+FFFD is printed first.
-  `GHOSTTY_TERMINAL_DATA_VT_GROUND` tells when the stream is between sequences, and a CAN (0x18)
-  returns the parser to ground from any state. Read from the parser, not reproduced.
+- **A kill report pushes the cursor's line down:** no room is scrolled open, so the inserted lines
+  push the cursor's line down by the report's height (off the screen when it was the bottom row)
+  while the cursor goes back to its old row, now another line; after a partial UTF-8 sequence, a
+  U+FFFD is printed first. Read from the parser, not reproduced.
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels): `MainActivity` handles `density` itself and
   builds its views once in `onCreate`, so the new sizes apply only once the activity is created

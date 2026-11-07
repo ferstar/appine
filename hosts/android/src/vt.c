@@ -1024,6 +1024,15 @@ static size_t utf8_width(const uint8_t *s, size_t len) {
 // where nothing is written.
 bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
   if (is_alternate(vt)) return false;
+  // The program may have died inside a sequence (an OSC, DCS or APC string): CAN returns the
+  // parser to ground first, so the line feeds that make the report's room are not ignored or
+  // taken as the string's payload
+  bool ground = true;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) == GHOSTTY_SUCCESS &&
+      !ground) {
+    static const uint8_t can = 0x18;
+    ghostty_terminal_vt_write(vt->term, &can, 1);
+  }
   size_t width = utf8_width(text, len);
   size_t rows = (width + vt->cols - 1) / vt->cols;
   if (rows > (size_t)vt->height - 1) rows = (size_t)vt->height - 1;

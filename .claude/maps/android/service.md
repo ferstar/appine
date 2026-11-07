@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; the app named Appine; last, an interrupted import resumed as its distro)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; the app named Appine; an interrupted import resumed as its distro; auto tabs saved as their account last)
 
 ## Responsibilities
 
@@ -136,7 +136,9 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   `onSessionsChanged`. `removeSession` releases the session.
 - Saving (`saveTabs`): for running sessions only, the login setting and the transcript
   (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread and the foreground
-  group's cwd (`consoleCwd` of the session's console) on the worker; unshown restored tabs keep
+  group's cwd (`consoleCwd` of the session's console) on the worker, where an `auto` login is saved
+  as the account it resolves to (`Rootfs.loginAccount`, kept in `VtSession.resolvedLogin` from the
+  tab's first save) so a restored tab logs in as the same user; unshown restored tabs keep
   their saved transcript and cwd; a `name` key in an index from versions that could rename tabs
   is ignored. Files are written temp-then-rename; a transcript's name is its
   content digest, so unchanged ones are not rewritten, the index is skipped when unchanged, and
@@ -208,8 +210,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ## Confirmed bugs / technical debt
 
-- **A restored "auto" tab may log in as another user**, since the saved value is the setting, which
-  `login.sh` resolves again.
+none
 
 ## Open questions
 

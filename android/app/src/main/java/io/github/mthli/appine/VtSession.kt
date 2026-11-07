@@ -37,6 +37,14 @@ internal class VtSession(
     /** The login account setting the tab was opened with ([ConsolePty.login]). */
     val login: String get() = pty.login
 
+    /**
+     * The account an `auto` login resolved to, found when the tab is first saved and kept, so a
+     * restored tab logs in as the same user even if the regular accounts change (only the
+     * service's worker thread uses it).
+     */
+    @Volatile
+    var resolvedLogin: String? = null
+
     /** The terminal ([VtNative]), 0 until [start] created it. */
     @Volatile
     var tab = 0L
