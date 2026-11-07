@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix and gVisor cases; image export; CI split; the AppArmor gotcha; appine-run stop signals, the LTP store stamp and test skips last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; flag values; tarballs by version; Starnix and gVisor cases; image export; CI split; AppArmor; stop signals; no macOS host last)
 
 ## Responsibilities
 
@@ -309,8 +309,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
   stops `appine-run` itself), line-buffers input and
   echoes it while the guest echoes into the pipe; the size stays 24×80.
-- **The host window size uses Linux's `TIOCGWINSZ`** (0x5413), so on macOS the console stays 24×80
-  and resizes are ignored.
 - **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
   `apk add` leaves a store the next run uses as is.
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
@@ -320,7 +318,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
-- Is native macOS a supported host for `appine-run` itself?
 - Should partial LTP runs merge into `results.txt` as the durations do?
 - CI's native kernel is newer than colima's 6.8: which Starnix tests compare differently there is
   known only after a CI run.

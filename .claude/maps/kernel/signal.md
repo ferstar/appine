@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace; frames that cannot be written; sigqueue to zombies and core %d last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale comments; kill with a thread id; retargeting process signals; syscall-stop detach; test-suite findings, ptrace; unwritable frames; sigqueue to zombies, core %d; adjtimex hosts last)
 
 ## Responsibilities
 
@@ -275,7 +275,7 @@ procfs.
   `clock_settime` validates the timespec, then is `EPERM` for `CLOCK_REALTIME` and `EINVAL` for every
   other clock; any modifying `adjtimex`/`clock_adjtime` is `EPERM` (as without `CAP_SYS_TIME`);
   queries read the host's NTP state on Linux hosts and report unsynchronized (`STA_UNSYNC`,
-  `TIME_ERROR`) on Android and other hosts.
+  `TIME_ERROR`) on Android.
 
 ## Dependencies (inbound / outbound)
 

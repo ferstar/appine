@@ -1238,12 +1238,10 @@ impl Mm {
         };
 
         let st = file.and_then(|(fd, ..)| appine_hal::fstat(fd).ok());
-        // st_dev is i32 on macOS
-        #[allow(clippy::unnecessary_cast)]
         let file_id = st
             .as_ref()
             .zip(file)
-            .map(|(s, (_, offset, _))| (s.st_dev as u64, s.st_ino as u64, offset));
+            .map(|(s, (_, offset, _))| (s.st_dev, s.st_ino, offset));
         let content = match (&st, file_id) {
             (Some(_), Some((dev, ino, _))) if shared && file.is_some_and(|f| f.2) => {
                 content::writably_shared(dev, ino);

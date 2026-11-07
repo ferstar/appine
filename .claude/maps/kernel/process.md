@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; deadlines; the exited main thread; rlimits; exit signals; robust futexes; test-suite findings; namespace limits; exit-stage panics; waits, pids, #! depth and appine-run stops last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; robust futexes; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits last)
 
 ## Responsibilities
 
@@ -276,7 +276,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 ### Waiting and waking
 
 - A guest thread never blocks in a host syscall: every wait is one host `poll()` on the thread's own
-  event (eventfd, or a pipe on other hosts) plus the host fds it waits on, with the deadline as
+  event (an eventfd) plus the host fds it waits on, with the deadline as
   timeout. Wall-clock deadlines (sleeps, futex and mqueue timeouts, timers) are `Expiry` values
   turned into an instant at each wait and checked with their own clock, so a wait woken after the
   realtime or boottime clock jumped (the host's clock set, or the device resuming) waits again

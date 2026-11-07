@@ -13,7 +13,6 @@ use super::last_errno;
 
 /// Creates a nonblocking, close-on-exec host socket.
 pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     let fd = unsafe {
         libc::socket(
             domain,
@@ -21,8 +20,6 @@ pub fn socket(domain: i32, ty: i32, protocol: i32) -> Result<i32, i32> {
             protocol,
         )
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let fd = set_flags(unsafe { libc::socket(domain, ty, protocol) });
     if fd < 0 { Err(last_errno()) } else { Ok(fd) }
 }
 
@@ -45,7 +42,6 @@ pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
 pub fn accept(fd: i32) -> Result<(i32, Vec<u8>), i32> {
     let mut addr = [0u8; 128];
     let mut len = addr.len() as libc::socklen_t;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     let new = unsafe {
         libc::accept4(
             fd,
@@ -54,8 +50,6 @@ pub fn accept(fd: i32) -> Result<(i32, Vec<u8>), i32> {
             libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
         )
     };
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let new = set_flags(unsafe { libc::accept(fd, addr.as_mut_ptr().cast(), &mut len) });
     if new < 0 {
         return Err(last_errno());
     }
@@ -165,7 +159,7 @@ pub fn recvmsg(fd: i32, buf: &mut [u8], control_len: usize, flags: i32) -> Resul
     if n < 0 {
         return Err(last_errno());
     }
-    // msg_controllen is size_t on Linux and socklen_t on macOS
+    // msg_controllen is size_t in glibc and bionic but socklen_t in musl
     #[allow(clippy::unnecessary_cast)]
     control.truncate(msg.msg_controllen as usize);
     Ok(Received {
@@ -184,18 +178,6 @@ pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
 /// Closes a host fd.
 pub fn close(fd: i32) {
     unsafe { libc::close(fd) };
-}
-
-/// Hosts without `SOCK_NONBLOCK` and accept4: set nonblocking and close-on-exec after creation.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn set_flags(fd: i32) -> i32 {
-    if fd >= 0 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-        }
-    }
-    fd
 }
 
 fn check(rc: libc::c_int) -> Result<(), i32> {
@@ -274,7 +256,6 @@ pub fn interfaces() -> Vec<Interface> {
                     .addrs
                     .push((family, sin6.sin6_addr.s6_addr.to_vec(), prefix));
             }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
             libc::AF_PACKET => {
                 let ll = unsafe { &*(a.ifa_addr as *const libc::sockaddr_ll) };
                 if ll.sll_halen == 6 {
@@ -328,7 +309,7 @@ pub struct Route {
 
 /// Unicast routes in the host's main table, read from the host's `/proc/net/route` and
 /// `/proc/net/ipv6_route`. None when they cannot be read (since Android 10 apps cannot read
-/// `/proc/net`, and macOS has neither file).
+/// `/proc/net`).
 pub fn routes() -> Option<Vec<Route>> {
     let v4 = std::fs::read_to_string("/proc/net/route").ok()?;
     let mut out = parse_route(&v4);
@@ -438,7 +419,7 @@ pub fn source_for(dst: &[u8]) -> Result<Vec<u8>, i32> {
 /// stub in the kernel/net map).
 ///
 /// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
-/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// settings all apply; on Linux hosts the name servers in the host's `/etc/resolv.conf` are asked
 /// in turn. It blocks, so the caller must not hold locks.
 #[cfg(target_os = "android")]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
@@ -479,7 +460,7 @@ pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {
 /// stub in the kernel/net map).
 ///
 /// On Android it goes to `android_res_nsend`, so Private DNS, VPN and per-network routing
-/// settings all apply; on other hosts the name servers in the host's `/etc/resolv.conf` are asked
+/// settings all apply; on Linux hosts the name servers in the host's `/etc/resolv.conf` are asked
 /// in turn. It blocks, so the caller must not hold locks.
 #[cfg(not(target_os = "android"))]
 pub fn dns_query(query: &[u8]) -> Result<Vec<u8>, i32> {

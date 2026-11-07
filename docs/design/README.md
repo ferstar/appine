@@ -95,7 +95,7 @@ Layering principles:
 
 - The **engine** only cares about executing guest instructions. On `svc`, a memory-access fault, an undefined instruction, `brk` or `ic ivau`, it hands control to the kernel layer.
 - The **kernel layer** implements the Linux user-space ABI and holds all guest state: processes, address spaces, fds, file systems.
-- The **host HAL** isolates host differences. The development host is Linux arm64 and the production host is Android; there is no macOS HAL.
+- The **host HAL** isolates host differences. The development host is Linux arm64 and the production host is Android; no other host builds (on macOS, development runs in a Linux container through `scripts/dev`).
 - The core libraries (engine + kernel layer) **depend on no Android component**. Android-specific code appears only in the HAL and the Kotlin shell.
 
 ---

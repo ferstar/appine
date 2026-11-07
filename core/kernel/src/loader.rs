@@ -301,10 +301,9 @@ impl ExeCache {
 
     /// The identity and content version of host file `fd`; None when there is no trustworthy
     /// version.
-    #[allow(clippy::unnecessary_cast)] // st_dev is i32 on macOS
     fn version(fd: i32) -> Option<(u64, u64, u64, u64)> {
         let st = appine_hal::fstat(fd).ok()?;
-        let (dev, ino) = (st.st_dev as u64, st.st_ino as u64);
+        let (dev, ino) = (st.st_dev, st.st_ino);
         crate::mm::content_version(&st, dev, ino).map(|(ctime, size)| (dev, ino, ctime, size))
     }
 

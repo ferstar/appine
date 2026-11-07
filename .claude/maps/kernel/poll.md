@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; loop devices; eventfd readv; `F_SETOWN` owners; Starnix's and gVisor's test findings; pipe write edges and fasync kinds last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps and counting; module references; loop devices; eventfd readv; `F_SETOWN` owners; test-suite findings; pipe write edges, fasync kinds; host edges on all hosts last)
 
 ## Responsibilities
 
@@ -119,8 +119,7 @@ signal delivery (`kernel/signal`).
   Linux's pipe_read wakes the writers of a full pipe). Drains are counted for
   read, readv, accept, recv* and write, writev, send*, sendfile, splice, tee when they return
   `EAGAIN`, and for short read, write, recvfrom and sendto (pread/pwrite and their vector forms
-  never count; tee's write-side entry reads the length argument instead of `fd_out`). On non-Linux
-  hosts `HostEdges` cannot be created, so only drains re-arm host-fd edges there.
+  never count; tee's write-side entry reads the length argument instead of `fd_out`).
 - Nested epolls: an inner epoll's generation is its `base` plus the shares of its armed
   interests, read side only, growing monotonically; edge-watching an inner epoll propagates host
   edge watching inward. An epoll fd reports `POLLIN` only.
@@ -162,16 +161,16 @@ signal delivery (`kernel/signal`).
 ### Outbound
 
 - The kernel's waits (`wait_objects`, `block_for`, `interrupted`), wake objects and channels,
-  `edge_waiters`; `appine_hal::poll` and `appine_hal::Edges` (host epoll; unavailable on non-Linux
-  hosts); per-kind readiness functions in `net`, `unix`, `tty`, inotify, signalfd, message queues,
-  seccomp; signals (`send_to_task`, `send_to_group`, `send_to_pgrp`).
+  `edge_waiters`; `appine_hal::poll` and `appine_hal::Edges` (host epoll); per-kind readiness
+  functions in `net`, `unix`, `tty`, inotify, signalfd, message queues, seccomp; signals
+  (`send_to_task`, `send_to_group`, `send_to_pgrp`).
 
 ## Invariants and gotchas
 
 - Readiness must be cheap and side-effect free except for edge snapshots kept in `Cell`s.
 - Generation counters only grow; anything that changes readiness must bump a counter and wake its
   object, or edge-triggered waiters miss events.
-- Without `HostEdges` (host regular files, non-Linux hosts) only drains re-arm host-fd edges.
+- Without `HostEdges` (host regular files) only drains re-arm host-fd edges.
 
 ## Confirmed bugs / technical debt
 

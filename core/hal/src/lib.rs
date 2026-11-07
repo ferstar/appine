@@ -1,12 +1,14 @@
 //! Host abstraction layer (design doc §3): keeps host system differences out of the kernel layer.
 //!
 //! The production host is Android (bionic) and the development host is Linux (glibc); both run
-//! the Linux kernel, so there is only one implementation here. The error codes returned to the
-//! kernel layer are host errnos, which on Linux hosts match the guest's numbering and can be
-//! passed to the guest unchanged. Other hosts (macOS, for example) are not supported and are
-//! meant only to compile (design doc §13.3); macOS currently does not: [`open_dir`] uses
-//! `O_PATH`, and the kernel layer calls Linux-only functions (`copy_file`, the fsync family,
-//! `msync`) without `cfg` gates.
+//! the Linux kernel, so there is only one implementation here, and no other host is supported.
+//! The error codes returned to the kernel layer are host errnos, which match the guest's
+//! numbering and are passed to the guest unchanged.
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+compile_error!(
+    "appine runs only on Linux and Android hosts; on macOS, build and test in scripts/dev"
+);
 
 pub mod net;
 
@@ -429,7 +431,6 @@ pub fn lseek(fd: i32, offset: i64, whence: i32) -> Result<u64, i32> {
 /// SIGSYS). sendfile writes at the output fd's position, so that is moved to `off_out` first, and
 /// the caller must ensure nobody else uses this fd's position meanwhile. Retries automatically on
 /// `EINTR`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn copy_file(
     fd_in: i32,
     off_in: u64,
@@ -455,7 +456,6 @@ pub fn copy_file(
 
 /// Writes host file `fd` to disk: fdatasync with `data_only` (the data and the metadata needed to
 /// read it back, such as the length), otherwise fsync.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fsync(fd: i32, data_only: bool) -> Result<(), i32> {
     let r = unsafe {
         if data_only {
@@ -479,7 +479,6 @@ pub const SYNC_FILE_RANGE_WRITE: u32 = 2;
 /// without flushing metadata or the disk cache. The Android part of the libc crate has no binding
 /// for it (bionic does), so it is called by number; on arm64 the arguments are in this order (it
 /// is not sync_file_range2).
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn sync_file_range(fd: i32, offset: i64, len: i64, flags: u32) -> Result<(), i32> {
     if unsafe { libc::syscall(libc::SYS_sync_file_range, fd, offset, len, flags) } < 0 {
         return Err(last_errno());
@@ -488,7 +487,6 @@ pub fn sync_file_range(fd: i32, offset: i64, len: i64, flags: u32) -> Result<(),
 }
 
 /// Writes the whole filesystem holding host fd `fd` to disk (syncfs).
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn syncfs(fd: i32) -> Result<(), i32> {
     if unsafe { libc::syncfs(fd) } < 0 {
         return Err(last_errno());
@@ -499,7 +497,6 @@ pub fn syncfs(fd: i32) -> Result<(), i32> {
 /// msync(2) with `MS_SYNC`: writes the modified pages of the shared file mappings in
 /// `[addr, addr + len)` on the host back to their files and waits for completion. `addr` must be
 /// aligned to the host page.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn msync(addr: usize, len: usize) -> Result<(), i32> {
     if unsafe { libc::msync(addr as *mut libc::c_void, len, libc::MS_SYNC) } < 0 {
         return Err(last_errno());
@@ -677,11 +674,6 @@ pub fn raise_fd_limit() -> u64 {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } < 0 {
         return 0;
     }
-    // On macOS the hard limit may be infinite, but setrlimit accepts no more than OPEN_MAX
-    // (10240)
-    #[cfg(target_os = "macos")]
-    let hard = rl.rlim_max.min(10240);
-    #[cfg(not(target_os = "macos"))]
     let hard = rl.rlim_max;
     if rl.rlim_cur < hard {
         rl.rlim_cur = hard;
@@ -709,7 +701,6 @@ pub fn fd_limit() -> u64 {
 /// Fills `buf` from the host's random source: `getrandom`, which needs no fd (all guest processes
 /// share the app's fd table, and opening `/dev/urandom` failed with `EMFILE` once the guest had
 /// used it up).
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
     let mut done = 0;
     while done < buf.len() {
@@ -726,15 +717,6 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
         done += n as usize;
     }
     Ok(())
-}
-
-/// Fills `buf` from the host's random source.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(buf))
-        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 // ---- Host statistics ----
@@ -782,7 +764,6 @@ pub fn memory_usage() -> Option<MemoryUsage> {
 }
 
 /// The host's total and free physical memory (bytes).
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn memory_info() -> (u64, u64) {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
@@ -793,16 +774,8 @@ pub fn memory_info() -> (u64, u64) {
     (info.totalram as u64 * unit, info.freeram as u64 * unit)
 }
 
-/// The host's total and free physical memory (bytes).
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn memory_info() -> (u64, u64) {
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    ((pages.max(0) as u64) * page_size() as u64, 0)
-}
-
 /// The host's total physical memory plus swap (bytes): the limit on a single allocation when
 /// Linux estimates the commit (`vm.overcommit_memory` is 0). 0 when it cannot be read.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn ram_and_swap() -> u64 {
     let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
@@ -811,12 +784,6 @@ pub fn ram_and_swap() -> u64 {
     }
     let unit = info.mem_unit.max(1) as u64;
     (info.totalram as u64 + info.totalswap as u64) * unit
-}
-
-/// The host's total physical memory plus swap (bytes).
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn ram_and_swap() -> u64 {
-    memory_info().0
 }
 
 /// Some fields of the host's `/proc/meminfo` (bytes); the guest's `/proc/meminfo` and sysinfo
@@ -842,23 +809,15 @@ pub struct MemInfo {
 }
 
 /// The host's `/proc/vmstat`, when the host lets the app read it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn host_vmstat() -> Option<String> {
     std::fs::read_to_string("/proc/vmstat")
         .ok()
         .filter(|t| !t.is_empty())
 }
 
-/// The host's `/proc/vmstat`: not available.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn host_vmstat() -> Option<String> {
-    None
-}
-
 /// The host's memory state, read from `/proc/meminfo`. When it cannot be read (the host does not
 /// allow it), only the few fields sysinfo can give, with the available amount estimated as free
 /// plus buffers.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(clippy::unnecessary_cast)] // unsigned long is 32 bits on 32-bit hosts
 pub fn host_meminfo() -> MemInfo {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
@@ -910,93 +869,54 @@ pub fn host_meminfo() -> MemInfo {
     }
 }
 
-/// The host's memory state: only the total physical memory is known.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn host_meminfo() -> MemInfo {
-    MemInfo {
-        total: memory_info().0,
-        ..MemInfo::default()
-    }
-}
-
 // ---- Waiting ----
 
-/// An event for waking across threads: an eventfd on Linux, replaced by a pipe on other hosts.
+/// An event for waking across threads: an eventfd.
 ///
 /// After [`Event::signal`], its fd is readable until [`Event::clear`].
 pub struct Event {
-    read: i32,
-    write: i32,
+    fd: i32,
 }
 
 impl Event {
     /// Creates an event that is not signalled.
     pub fn new() -> Result<Event, i32> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-            if fd < 0 {
-                return Err(last_errno());
-            }
-            Ok(Event {
-                read: fd,
-                write: fd,
-            })
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(last_errno());
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
-            let mut fds = [0; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-                return Err(last_errno());
-            }
-            for fd in fds {
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                }
-            }
-            Ok(Event {
-                read: fds[0],
-                write: fds[1],
-            })
-        }
+        Ok(Event { fd })
     }
 
     /// Signals the event; can be called from any thread.
     pub fn signal(&self) {
         let one = 1u64.to_ne_bytes();
-        // The write fails when the counter is full (eventfd) or the pipe is full, but then the
-        // event is already signalled
-        unsafe { libc::write(self.write, one.as_ptr().cast(), one.len()) };
+        // The write fails when the counter is full, but then the event is already signalled
+        unsafe { libc::write(self.fd, one.as_ptr().cast(), one.len()) };
     }
 
     /// Whether the event is signalled (without clearing it).
     pub fn is_signaled(&self) -> bool {
         const POLLIN: i16 = 1;
-        let mut fds = [(self.read, POLLIN, 0)];
+        let mut fds = [(self.fd, POLLIN, 0)];
         matches!(poll(&mut fds, Some(Duration::ZERO)), Ok(n) if n > 0)
     }
 
     /// Clears the signalled state.
     pub fn clear(&self) {
         let mut buf = [0u8; 64];
-        while unsafe { libc::read(self.read, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        while unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
     }
 
     /// The fd to poll (waiting for `POLLIN`).
     pub fn fd(&self) -> i32 {
-        self.read
+        self.fd
     }
 }
 
 impl Drop for Event {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.read);
-            if self.write != self.read {
-                libc::close(self.write);
-            }
-        }
+        unsafe { libc::close(self.fd) };
     }
 }
 
@@ -1011,7 +931,6 @@ pub struct Edges {
 impl Edges {
     /// Starts recording events on `fd`. If the fd is already ready when this is created, the first
     /// [`Edges::take`] reports it.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new(fd: i32) -> Result<Edges, i32> {
         use std::os::fd::FromRawFd;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -1029,14 +948,8 @@ impl Edges {
         Ok(Edges { epfd })
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub fn new(_fd: i32) -> Result<Edges, i32> {
-        Err(libc::ENOSYS)
-    }
-
     /// Takes the events since the last call: whether there are new ones in the (read, write)
     /// directions. Errors and hangups count as the read direction.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn take(&self) -> (bool, bool) {
         let mut ev = libc::epoll_event { events: 0, u64: 0 };
         if unsafe { libc::epoll_wait(self.fd(), &mut ev, 1, 0) } != 1 {
@@ -1044,11 +957,6 @@ impl Edges {
         }
         let out = (libc::EPOLLOUT | libc::EPOLLWRNORM | libc::EPOLLWRBAND) as u32;
         (ev.events & !out != 0, ev.events & out != 0)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub fn take(&self) -> (bool, bool) {
-        (false, false)
     }
 
     /// The fd of the host epoll itself: readable when there are new events, and can be waited on
@@ -1066,7 +974,6 @@ pub struct Watch {
 }
 
 impl Watch {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn new() -> Result<Watch, i32> {
         use std::os::fd::FromRawFd;
         let raw = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
@@ -1078,14 +985,8 @@ impl Watch {
         })
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub fn new() -> Result<Watch, i32> {
-        Err(libc::ENOSYS)
-    }
-
     /// Starts watching `fd`: for readability with `readable`, otherwise only for errors and hangups
     /// (the two that are always reported).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn add(&self, fd: i32, readable: bool) -> Result<(), i32> {
         let mut ev = libc::epoll_event {
             events: if readable { libc::EPOLLIN as u32 } else { 0 },
@@ -1097,19 +998,11 @@ impl Watch {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub fn add(&self, _fd: i32, _readable: bool) -> Result<(), i32> {
-        Err(libc::ENOSYS)
-    }
-
     /// Stops watching `fd` (the host removes closed fds by itself).
     pub fn remove(&self, fd: i32) {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         unsafe {
             libc::epoll_ctl(self.fd(), libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _ = fd;
     }
 
     /// The fd of the host epoll itself.
@@ -1141,7 +1034,6 @@ pub fn poll(fds: &mut [(i32, i16, i16)], timeout: Option<Duration>) -> Result<us
     Ok(rc as usize)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
     let ts = timeout.map(|t| libc::timespec {
         tv_sec: t.as_secs().min(i32::MAX as u64) as libc::time_t,
@@ -1160,15 +1052,6 @@ fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn poll_raw(raw: &mut [libc::pollfd], timeout: Option<Duration>) -> i32 {
-    // Round up to milliseconds so very short waits do not become busy waiting
-    let ms = timeout.map_or(-1, |t| {
-        t.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
-    });
-    unsafe { libc::poll(raw.as_mut_ptr(), raw.len() as libc::nfds_t, ms) }
-}
-
 // ---- Threads, CPUs and time ----
 
 /// The numbers of the host CPUs this process may use (at most 64), a snapshot taken at the first
@@ -1181,7 +1064,6 @@ pub fn host_cpus() -> &'static [usize] {
         let n = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(64);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         unsafe {
             let mut set: libc::cpu_set_t = std::mem::zeroed();
             if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
@@ -1214,62 +1096,36 @@ pub fn cpu_sysfs(cpu: usize, path: &str) -> Option<Vec<u8>> {
 
 /// The current host thread's tid.
 pub fn gettid() -> i32 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        unsafe { libc::syscall(libc::SYS_gettid) as i32 }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        0
-    }
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
 }
 
 /// Sets the calling thread's name (`/proc/self/task/<tid>/comm`, what debuggers show), truncated
 /// beyond 15 bytes.
 pub fn set_thread_name(name: &str) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let mut buf = [0u8; 16];
-        let n = name.len().min(15);
-        buf[..n].copy_from_slice(&name.as_bytes()[..n]);
-        unsafe { libc::prctl(libc::PR_SET_NAME, buf.as_ptr()) };
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = name;
+    let mut buf = [0u8; 16];
+    let n = name.len().min(15);
+    buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+    unsafe { libc::prctl(libc::PR_SET_NAME, buf.as_ptr()) };
 }
 
 /// The current thread's CPU-time clock; other threads can read it with [`clock_gettime`] too
 /// (invalid after the thread exits).
 pub fn thread_cpu_clock() -> Option<i32> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let mut id: libc::clockid_t = 0;
-        (unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut id) } == 0).then_some(id)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        None
-    }
+    let mut id: libc::clockid_t = 0;
+    (unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut id) } == 0).then_some(id)
 }
 
 /// Time the calling thread has spent in the host kernel so far (the stime of
 /// `getrusage(RUSAGE_THREAD)`).
 pub fn thread_system_ns_self() -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // Linux's UAPI constant; the libc crate does not define it on Android
-        const RUSAGE_THREAD: libc::c_int = 1;
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
-            let t = ru.ru_stime;
-            return t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
-        }
-        0
+    // Linux's UAPI constant; the libc crate does not define it on Android
+    const RUSAGE_THREAD: libc::c_int = 1;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
+        let t = ru.ru_stime;
+        return t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        0
-    }
+    0
 }
 
 /// Time host thread `tid` of this process has spent in the host kernel (the stime of
@@ -1290,17 +1146,10 @@ pub fn thread_system_ns(tid: i32) -> Option<u64> {
 /// BKL when a thread starts, and reading the `/proc` status takes about ten microseconds each
 /// time.
 pub fn thread_ctxt_switches_self() -> Option<(u64, u64)> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        const RUSAGE_THREAD: libc::c_int = 1;
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        (unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0)
-            .then_some((ru.ru_nvcsw as u64, ru.ru_nivcsw as u64))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        None
-    }
+    const RUSAGE_THREAD: libc::c_int = 1;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    (unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0)
+        .then_some((ru.ru_nvcsw as u64, ru.ru_nivcsw as u64))
 }
 
 /// The voluntary and involuntary context switch counts of host thread `tid` of this process
@@ -1322,7 +1171,6 @@ pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
 /// Restricts host thread `tid` of this process to the CPUs of [`host_cpus`] selected by `mask`
 /// (bit `i` is the `i`-th). Left unchanged on failure.
 pub fn set_thread_affinity(tid: i32, mask: u64) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         for (i, &cpu) in host_cpus().iter().enumerate() {
@@ -1332,27 +1180,21 @@ pub fn set_thread_affinity(tid: i32, mask: u64) {
         }
         libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = (tid, mask);
 }
 
 /// Sets the nice value of host thread `tid` of this process. Left unchanged on failure (no
 /// permission to raise priority).
 pub fn set_thread_nice(tid: i32, nice: i32) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         // On Linux PRIO_PROCESS applies to a single thread
         libc::setpriority(libc::PRIO_PROCESS as _, tid as libc::id_t, nice);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = (tid, nice);
 }
 
 /// Sets the IO priority of host thread `tid` (`ioprio_set(IOPRIO_WHO_PROCESS, tid, ioprio)`, with
 /// the value in Linux's encoding: the class in bits 13–15). Android's app seccomp allows it. Left
 /// unchanged without permission.
 pub fn set_thread_ioprio(tid: i32, ioprio: u16) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         const IOPRIO_WHO_PROCESS: libc::c_long = 1;
         libc::syscall(
@@ -1362,29 +1204,19 @@ pub fn set_thread_ioprio(tid: i32, ioprio: u16) {
             ioprio as libc::c_long,
         );
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let _ = (tid, ioprio);
 }
 
 /// The IO priority of host thread `tid` (`ioprio_get(IOPRIO_WHO_PROCESS, tid)`).
 pub fn thread_ioprio(tid: i32) -> Option<u16> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_ioprio_get,
-                IOPRIO_WHO_PROCESS,
-                tid as libc::c_long,
-            )
-        };
-        (r >= 0).then_some(r as u16)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = tid;
-        None
-    }
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_get,
+            IOPRIO_WHO_PROCESS,
+            tid as libc::c_long,
+        )
+    };
+    (r >= 0).then_some(r as u16)
 }
 
 /// Linux's `CLOCK_BOOTTIME`.
@@ -1408,26 +1240,19 @@ pub struct ClockWatch {
 }
 
 impl ClockWatch {
-    /// None where timerfds are unavailable (other hosts, or a refusing seccomp policy); jumps then
-    /// go unnoticed.
+    /// None where timerfds are unavailable (a refusing seccomp policy); jumps then go unnoticed.
     pub fn new() -> Option<ClockWatch> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let fd = unsafe {
-                libc::timerfd_create(libc::CLOCK_REALTIME, libc::O_NONBLOCK | libc::O_CLOEXEC)
-            };
-            if fd < 0 {
-                return None;
-            }
-            let watch = ClockWatch { fd };
-            watch.arm().then_some(watch)
+        let fd = unsafe {
+            libc::timerfd_create(libc::CLOCK_REALTIME, libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            return None;
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        None
+        let watch = ClockWatch { fd };
+        watch.arm().then_some(watch)
     }
 
     /// Arms the timer at a time that never comes (2^40 seconds, which the kernel saturates).
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn arm(&self) -> bool {
         const TFD_TIMER_ABSTIME: i32 = 1;
         const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
@@ -1444,14 +1269,11 @@ impl ClockWatch {
 
     /// Whether the clock jumped since the last call; the watch is armed again after a jump.
     pub fn take(&self) -> bool {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            let mut buf = [0u8; 8];
-            let r = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if r < 0 && last_errno() == libc::ECANCELED {
-                self.arm();
-                return true;
-            }
+        let mut buf = [0u8; 8];
+        let r = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if r < 0 && last_errno() == libc::ECANCELED {
+            self.arm();
+            return true;
         }
         false
     }
@@ -1504,7 +1326,7 @@ pub fn adjtimex_query(adjtime: bool) -> Result<(i32, [u8; TIMEX_SIZE]), i32> {
         }
         Ok((r as i32, buf))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "android")]
     {
         let _ = (adjtime, &mut buf);
         unsynchronized_timex()
