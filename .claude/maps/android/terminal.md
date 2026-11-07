@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by libghostty-vt; tab bar, extra keys and themes reworked; closing tabs animated; last, mouse drags, hover and double-tap selection)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys and themes reworked; closing tabs animated; mouse drags, hover and double taps; last, cutout insets and keys following the IME)
 
 ## Responsibilities
 
@@ -182,7 +182,12 @@ libghostty-vt with Zig (`android/native`).
   one-shot SHIFT is not used up, so it applies again once the first page is back. A key still held
   on the page going away is cancelled. The page lives as long as the view: a new activity starts
   on the first.
-- The content is edge-to-edge with the root padded by system-bar and IME insets.
+- The content is edge-to-edge with the root padded by system-bar, display-cutout and IME insets
+  (from Android 15 the window reaches into the cutout, which in landscape is at a side). As the
+  IME shows or hides, the root is laid out for the end at once (the terminal regrids once, at the
+  start) and the extra keys are drawn moving from their old place to the new one along the IME
+  animation's curve (`keysFollowIme`), rising through the IME's room or sinking over the
+  terminal's new rows; an animation that interrupts another starts from where the keys are drawn.
 
 ### Tabs
 
@@ -433,6 +438,11 @@ libghostty-vt with Zig (`android/native`).
   AppCompat forwards to the Material 3 colours (the handles are the primary colour).
   Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
   so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
+- The system lays the window out with the IME's end insets as its animation starts, when it hides
+  as well as when it shows, so without a `WindowInsetsAnimation` callback the extra keys jump
+  there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
+  already holds the IME's room, so the root must not clip to its padding (`clipToPadding` off) or
+  they stay hidden until they reach the terminal.
 - The tab bar's buttons are characters in the system font: `+`, `⋮` and `×` (the multiplication
   sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
   glyph is larger and thinner than the others.
@@ -456,8 +466,10 @@ libghostty-vt with Zig (`android/native`).
 
 ## To verify
 
-- Which IMEs on real devices deliver Enter as text; edge-to-edge insets on display-cutout devices
-  (the root ignores cutout insets).
+- Which IMEs on real devices deliver Enter as text; the cutout insets and the keys following the
+  IME on real devices, other IMEs and Android 10 (where androidx emulates the IME animation);
+  tried only with Gboard on a Pixel 4a API 34 emulator and the outer display of a Pixel 10 Pro
+  Fold API 37 emulator (landscape both ways).
 - The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
   foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing
   animation upright only, slowed down).

@@ -38,6 +38,7 @@ import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
@@ -160,6 +161,61 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
+    /**
+     * Moves the extra keys with the IME as it shows or hides. The system lays the root out for the
+     * end as the animation starts (so the terminal regrids once, at the start), and the keys are
+     * drawn from where they were on screen to their new place along the IME's own curve: as it
+     * shows, they rise through the IME's room (black) to the terminal's new bottom; as it hides,
+     * they sink over the terminal's new rows, which they hide while passing, being black.
+     */
+    private val keysFollowIme = object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_STOP) {
+        /** The IME animation being followed; an earlier one ending late leaves the keys alone. */
+        private var following: WindowInsetsAnimationCompat? = null
+
+        /** The keys' bottom on screen before the change (relative to the root). */
+        private var startBottom = 0f
+
+        /** How far from their place the keys start: below it as the IME shows, above as it hides. */
+        private var shift = 0f
+
+        override fun onPrepare(animation: WindowInsetsAnimationCompat) {
+            if (!isIme(animation)) return
+            following = animation
+            // Where they are drawn, which is not their place while an earlier animation ran
+            startBottom = keys.bottom + keys.translationY
+        }
+
+        override fun onStart(
+            animation: WindowInsetsAnimationCompat,
+            bounds: WindowInsetsAnimationCompat.BoundsCompat,
+        ): WindowInsetsAnimationCompat.BoundsCompat {
+            if (animation === following) {
+                shift = startBottom - keys.bottom
+                keys.translationY = shift
+            }
+            return bounds
+        }
+
+        override fun onProgress(
+            insets: WindowInsetsCompat,
+            runningAnimations: List<WindowInsetsAnimationCompat>,
+        ): WindowInsetsCompat {
+            following?.takeIf { it in runningAnimations }?.let {
+                keys.translationY = shift * (1 - it.interpolatedFraction)
+            }
+            return insets
+        }
+
+        override fun onEnd(animation: WindowInsetsAnimationCompat) {
+            if (animation !== following) return
+            following = null
+            keys.translationY = 0f
+        }
+
+        private fun isIme(animation: WindowInsetsAnimationCompat) =
+            animation.typeMask and WindowInsetsCompat.Type.ime() != 0
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
@@ -261,19 +317,27 @@ class MainActivity : Activity(), TerminalService.Listener {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
+            // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
+            clipToPadding = false
             addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(BAR_DP)))
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
         renderTabs()
         // Content is drawn behind the system bars (the default for targetSdk 35 from Android 15 on;
-        // done here on every version): leave room for the system bars and the IME
+        // done here on every version): leave room for the system bars, the display cutout and the
+        // IME. From Android 15 on the window also reaches into the cutout, which in landscape is
+        // at a side, over the terminal's first or last columns
         WindowCompat.setDecorFitsSystemWindows(window, false)
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.ime())
-            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            val room = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or
+                    WindowInsetsCompat.Type.ime(),
+            )
+            v.setPadding(room.left, room.top, room.right, room.bottom)
             WindowInsetsCompat.CONSUMED
         }
+        ViewCompat.setWindowInsetsAnimationCallback(root, keysFollowIme)
         setContentView(root)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
