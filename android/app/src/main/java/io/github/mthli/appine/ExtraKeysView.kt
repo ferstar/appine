@@ -108,7 +108,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /**
      * How far the fade reaches into the last column, in whole pixels, rounded down as
-     * MainActivity's dp.
+     * TabBarView's dp.
      */
     private val fadeIntoLast = (FADE_INTO_LAST_DP * density).toInt()
 
@@ -497,7 +497,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                 y += v.top
                 v = v.parent as? View ?: return
             }
-            // In whole pixels, rounded down as MainActivity's dp
+            // In whole pixels, rounded down as TabBarView's dp
             val density = label.resources.displayMetrics.density
             val width = (INDICATOR_WIDTH_DP * density).toInt()
             val height = max(1, (INDICATOR_HEIGHT_DP * density).toInt())

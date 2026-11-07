@@ -5,13 +5,14 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys, themes reworked; mouse drags, hover, double taps; cutout insets, IME-following keys; last, animated tab switches and closes, numbers rolling)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys, themes reworked; mouse drags, hover, double taps; cutout insets, IME-following keys; last, tab animations, the bar as TabBarView)
 
 ## Responsibilities
 
 `android/terminal` is the terminal screen and the pieces that render the service's sessions:
 
-- `MainActivity`: the tab bar, the terminal view, font zoom, extra keys, insets and the IME;
+- `MainActivity`: the screen's layout, the current session, closing tabs, keyboard shortcuts, font
+  zoom, insets and the IME, with the tab bar (`TabBarView`) and the extra keys (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads),
   `VtView` (drawing with the bundled JetBrains Mono, input, selection), and the emulator shim and
   JNI in the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
@@ -23,8 +24,8 @@
   (`page.xml`, `list_item.xml`, `list_header.xml`).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSession.kt`,
-`VtView.kt`, `VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `ConsolePty.kt`, `ExtraKeysView.kt`,
-`LicensesActivity.kt`, `android/app/src/main/res/`, `android/app/src/main/assets/fonts/`,
+`VtView.kt`, `VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `ConsolePty.kt`, `TabBarView.kt`,
+`ExtraKeysView.kt`, `LicensesActivity.kt`, `android/app/src/main/res/`, `android/app/src/main/assets/fonts/`,
 `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
 
 Outside the module: session lifecycle, saving and kill routing (`android/service`); the host console
@@ -33,11 +34,14 @@ libghostty-vt with Zig (`android/native`).
 
 ## Key types
 
-- `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
-  numbered tabs, with `×`, `+` and `⋮` over its end); `Tab` (one per session: its number in the
-  row, which slides, rolls to a new number and fades out when closed); `TabNumber` (the number, a
-  `TextView` drawing its digits itself so they can roll); `Host : VtView.Host`,
-  `Keys : ExtraKeysView.Target`.
+- `MainActivity` — a `TerminalService.Listener`; one `VtView`, `TabBarView` and `ExtraKeysView`,
+  with `Host : VtView.Host`, `Bar : TabBarView.Target` and `Keys : ExtraKeysView.Target`; the
+  current session and its place, from which its successor is taken.
+- `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+` and `⋮` over its
+  end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
+  buttons, and the titles long presses show, to a `Target`; `Tab` (one per session: its number in
+  the row, which slides, rolls to a new number and fades out when closed); `TabNumber` (the
+  number, a `TextView` drawing its digits itself so they can roll).
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
@@ -396,7 +400,7 @@ libghostty-vt with Zig (`android/native`).
   it is added back).
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
-  label: `refresh` invalidates every grid and the fixed column, and `renderTabs` the tab row. The
+  label: `refresh` invalidates every grid and the fixed column, and `TabBarView.render` the tab row. The
   label's place is the sum of `left` and `top` up to the container:
   `offsetDescendantRectToMyCoords` subtracts each view's scroll, and a single-line `TextView` (the
   extra keys' labels) scrolls far sideways to centre its text, which also draws a foreground
