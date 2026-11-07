@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's and gVisor's tests in grouped cases with a shared runner, built in CI; image export)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's and gVisor's tests in grouped cases with a shared runner; image export; CI split into quick, Android and full)
 
 ## Responsibilities
 
@@ -63,7 +63,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `scripts/build-gvisor-tests [--list | --all]`;
   `scripts/survey [-t tier] [-s store] [-n image] [names…]`;
   `tests/crash/crash.sh <appine|native> <power|kill> [runs] [bin]` (as root in the VM).
-- CI on every push and pull request.
+- CI: quick checks on every push and pull request (`ci.yml`), the APK when its inputs change
+  (`android.yml`), the slow suites nightly, on master and on demand (`full.yml`,
+  `gh workflow run full.yml --ref <branch>`).
 
 ## Data flow / lifecycle
 
@@ -215,23 +217,28 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `CARGO_TARGET_DIR=/work/target/linux-arm64`, volumes for the cargo registry and `/ltp`, `nice` up
   to 40, the Docker daemon's proxy, `-it` only when attached to a terminal, and only
   `APPINE_DBT_REGS` forwarded.
-- CI, Linux arm64 (`ubuntu-24.04-arm`): fmt, clippy (`-D warnings`), fetch the rootfs, `cargo test
-  --workspace` with the require switches, the network test, a long lockstep run, release build and
-  `appine-bench --runs 3 --skip-tier0`, `scripts/build-starnix-tests` (its tarball cached by the
-  hash of the script and `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the
-  hash of the script, `tests/gvisor` and its program list), `scripts/difftest` at Tier 1 with one
-  lane, and the
-  engine tests built with clang. CI, Android (x86_64): the NDK, the rootfs, Zig 0.17.0 (from
-  ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with `target/ghostty`
-  and Zig's global cache cached by the script's hash), then cargo-ndk clippy, `assembleDebug
-  lintDebug`, the APK as an artifact. Not in CI: LTP, the survey, instrumentation tests (no KVM),
-  Tier 0 difftest, parallel lanes.
+- CI is three workflows. `ci.yml`, on every push and pull request that changes more than
+  `docs/`, `.claude/`, Markdown or `android/`: Linux arm64 (`ubuntu-24.04-arm`) fmt, clippy
+  (`-D warnings`), fetch the rootfs and `cargo test --workspace` with the require switches.
+  `android.yml`, on pushes that change `core/`, `hosts/android/`, `android/`, the Cargo files or
+  the rootfs and Ghostty scripts (or on demand): the NDK, the rootfs, Zig 0.17.0 (from
+  ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with
+  `target/ghostty` and Zig's global cache cached by the script's hash), then cargo-ndk clippy,
+  `assembleDebug lintDebug`, the APK as an artifact. Both cancel a run in progress when the same
+  branch is pushed again. `full.yml`, nightly on develop when it has a commit from the last 25
+  hours, on pushes to master and on demand: the network test, a long lockstep run,
+  `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
+  `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by
+  the hash of the script, `tests/gvisor` and its program list), `scripts/difftest` at Tier 1 with
+  one lane, and the engine tests built with clang. Not in CI: LTP, the survey, instrumentation
+  tests (no KVM), Tier 0 difftest, parallel lanes, the performance probe (`appine-bench`; its
+  output check runs in `bench_programs` with small round counts).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- Developers and scripts; CI; `appine-bench` (sibling binary); round records that quote results.
+- Developers and scripts; CI; round records that quote results.
 
 ### Outbound
 
@@ -273,6 +280,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   oops taints the VM kernel until colima restarts.
 - A test that holds the BKL in one long syscall (a recursive-bind loop, see the kernel/vfs map) or
   spins in one cannot be stopped by the case's guest `timeout`; only killing `appine-run` ends it.
+- GitHub runs scheduled workflows only from the default branch (master): the nightly
+  `full.yml` exists once master has it, and uses master's copy of the workflow while checking out
+  develop.
 - busybox's `timeout` sends only `SIGTERM`: a test that ignores it, or a child that keeps the
   output pipe open, makes `$(timeout …)` wait forever on either side. `timeout -s KILL` with the
   output written to a file avoids both. Output that goes through `grep` inside the guest is
@@ -307,7 +317,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
 - **The `starnix-*` and `gvisor-*` cases pass vacuously without the built tests:** locally they
   only print that the tests are missing until `build-starnix-tests` / `build-gvisor-tests` has run
-  (they need the network and about four and ten minutes); CI builds them.
+  (they need the network and about four and ten minutes); CI's `full.yml` builds them.
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?

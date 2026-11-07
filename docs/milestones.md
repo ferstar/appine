@@ -231,7 +231,7 @@ Unless a file says otherwise, its measurements were taken under these conditions
 - **Warm cache**: from [profiling](rounds/13-profiling.md) on, each workload runs twice in the same Appine session and the second run counts (likewise on the native side). On a phone the app is a long-running process, so the second run is closer to real use.
 - **Store location**: from [translations shared between threads and targeted wakeups](rounds/24-shared-translation.md) on, the benchmark store lives on the VM-local docker volume `appine-bench`. Before that it was in `target/`, shared into the VM over virtiofs, so every host open and stat crossed the VM boundary and the ratios of file-system and process-spawning workloads came out too high. From [the host cost of file operations](rounds/33-file-ops-host-cost.md) on, native file operations run on the same volume as well (before, on the container's own overlay).
 - **A/B**: the "before" or "HEAD" column is the binary from the start of the round, alternated with the changed binary over several runs in the same session (`target/mem/ab.sh` and similar scripts), giving a range.
-- **Neoverse N2**: GitHub's `ubuntu-24.04-arm` runner (Azure Cobalt 100, 2 vCPUs), where CI's performance probe runs. Its cores are narrower than Apple Silicon's and closer to the big and mid cores of phones.
+- **Neoverse N2**: GitHub's `ubuntu-24.04-arm` runner (Azure Cobalt 100, 2 vCPUs), where CI ran the performance probe until 2026-11-07 (it now runs only by hand). Its cores are narrower than Apple Silicon's and closer to the big and mid cores of phones.
 
 ## Known flaky tests
 

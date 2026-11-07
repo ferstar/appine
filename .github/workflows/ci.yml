@@ -1,11 +1,31 @@
 name: CI
 
+# The quick checks every push gets: formatting, clippy, and the cargo tests (the lockstep oracle,
+# the guest programs and the rootfs tests). The Android build is android.yml; the slow suites
+# (differential tests with Starnix's and gVisor's tests, extended lockstep, network, performance
+# probe, the engine built with clang) are full.yml, which runs nightly on develop, on pushes to
+# master and on demand.
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - ".claude/**"
+      - "**.md"
+      - "android/**"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - ".claude/**"
+      - "**.md"
+      - "android/**"
 
 permissions:
   contents: read
+
+# A newer push to the same branch replaces the run in progress
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,160 +78,3 @@ jobs:
           APPINE_REQUIRE_ROOTFS: "1"
           APPINE_REQUIRE_MUSL: "1"
         run: cargo test --workspace
-
-      # M4's exit criterion: apk installs git and python3 from an Alpine mirror, and git clones a
-      # repository over HTTPS. It depends on the internet, so it is a separate step, which makes it
-      # easy to tell a network problem from a kernel one when it fails
-      - name: Network (apk add, git clone)
-        env:
-          APPINE_NETWORK_TESTS: "1"
-        run: cargo test -p appine-run --test rootfs_programs -- --exact apk_installs_packages_and_git_clones_over_https
-
-      - name: Lockstep (extended)
-        run: cargo run --release -p appine-lockstep -- --iterations 200000
-
-      # M2 performance probe: records Tier 1's overhead on another arm64 microarchitecture.
-      # Only checks that the three ways of running give the same output, with no time threshold
-      - name: Performance probe
-        run: |
-          cargo build --release -p appine-run -p appine-bench
-          target/release/appine-bench --runs 3 --skip-tier0
-
-      # Fuchsia Starnix's syscall tests, which the starnix-* differential cases run (without them those
-      # cases only print that they are missing). The Fuchsia commit and googletest version are fixed
-      # in the script, so its hash keys the cache, and a miss rebuilds them (about four minutes)
-      - uses: actions/cache@v6
-        with:
-          path: target/starnix-tests
-          key: starnix-tests-${{ hashFiles('scripts/build-starnix-tests', 'tests/starnix/compat/**') }}
-
-      - name: Build Starnix's syscall tests
-        run: scripts/build-starnix-tests
-
-      # gVisor's syscall tests, for the gvisor-* cases: only the programs those cases name are
-      # built, so the list is part of the key (abseil and the test library make a miss take about
-      # ten minutes)
-      - name: List gVisor's test programs
-        id: gvisor
-        run: echo "programs=$(scripts/build-gvisor-tests --list | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/cache@v6
-        with:
-          path: target/gvisor-tests
-          key: gvisor-tests-${{ hashFiles('scripts/build-gvisor-tests', 'tests/gvisor/**') }}-${{ steps.gvisor.outputs.programs }}
-
-      - name: Build gVisor's syscall tests
-        run: scripts/build-gvisor-tests
-
-      # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
-      # Alpine in docker. The first run installs the packages the test cases need with apk, which
-      # depends on the internet. Appine turns the guest's raw ICMP sockets into host ping sockets:
-      # Ubuntu does not let regular users create those by default (ping_group_range is "1 0"), while
-      # Android and the Docker container on the native side both allow all groups. rust-cache caches
-      # the whole target/ and would restore part of a store left by an earlier run, so the store is
-      # created afresh each time and deleted after the run, so that it is not saved into the cache
-      # again
-      - name: Differential tests
-        run: |
-          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
-          rm -rf target/difftest
-          scripts/difftest
-          rm -rf target/difftest
-
-      # The Android NDK compiles the C engine with clang, so clang-specific warnings show up here
-      # early
-      - name: Engine and oracle with clang
-        env:
-          CC: clang
-          CARGO_TARGET_DIR: target/clang
-        run: cargo test -p appine-engine -p appine-lockstep
-
-  android:
-    name: Android APK
-    # Google provides aapt2 for Linux only on x86_64, so the native library is cross-compiled on
-    # x86_64
-    runs-on: ubuntu-24.04
-    env:
-      NDK_VERSION: 29.0.14206865
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install toolchain from rust-toolchain.toml and the Android target
-        run: |
-          rustup toolchain install
-          rustup target add aarch64-linux-android
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-
-      # Cache the dependencies and Gradle distributions under ~/.gradle: without the cache every run
-      # downloads them, and the configuration phase takes about a minute
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 21
-          cache: gradle
-          cache-dependency-path: |
-            android/**/*.gradle*
-            android/gradle/wrapper/gradle-wrapper.properties
-
-      - name: Install the NDK
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
-          # The runner's preset ANDROID_NDK_ROOT points at another version; change both so cargo-ndk
-          # does not warn
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-
-      - uses: actions/cache@v6
-        with:
-          path: target/rootfs
-          key: rootfs-${{ hashFiles('scripts/fetch-rootfs') }}
-
-      - name: Fetch rootfs
-        run: scripts/fetch-rootfs
-
-      # The terminal, libghostty-vt, is built with Zig from the Ghostty source release that
-      # scripts/fetch-ghostty downloads with the Zig packages it uses (the android/native map).
-      # The version and sha256 are those of ziglang.org/download/index.json
-      - name: Install Zig
-        env:
-          ZIG_VERSION: 0.17.0
-          ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
-        run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/zig.tar.xz" \
-            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz"
-          echo "$ZIG_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components 1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
-      # The source with its zig-pkg/, and Zig's global cache (packages and build artifacts)
-      - uses: actions/cache@v6
-        with:
-          path: |
-            target/ghostty
-            ~/.cache/zig
-          key: ghostty-${{ hashFiles('scripts/fetch-ghostty') }}
-
-      - name: Fetch the Ghostty source
-        run: scripts/fetch-ghostty
-
-      - name: Clippy for Android
-        env:
-          CARGO_TARGET_DIR: target/android
-        run: cargo ndk -t arm64-v8a --platform 30 clippy --release -p appine-android -p appine-kernel -- -D warnings
-
-      # The instrumentation tests that run on an emulator (app/src/androidTest) need KVM, so they
-      # run locally
-      - name: Build and lint
-        working-directory: android
-        run: ./gradlew assembleDebug lintDebug --console=plain
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: appine-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
