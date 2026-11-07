@@ -83,7 +83,7 @@ in the module maps, not here.
     ever longer binds and freezes every guest process; mounts inherited by a less privileged
     namespace are not locked; a UDP socket shut down for reading spins in recv; and a bind with
     `AF_UNSPEC` passed to the host oopses the development VM's Ubuntu kernel in AppArmor, leaving
-    Appine hung. The first and the last are fixed (see "Taken so far").
+    Appine hung. All four are fixed (see "Taken so far").
 - **Not yet used:**
   - **kselftest**: mostly GPL, so download it at build time. Of 456 sources in the relevant
     directories, 311 pass a raw syntax check under musl. Of those directories, clone3,
@@ -113,11 +113,15 @@ in the module maps, not here.
 | 566da95 | `RssAnon`, `RssFile` and `RssShmem` in `status` |
 | 0b2c3c8 | inet binds check the address family before the host sees it (the AF_UNSPEC oops) |
 | 0a4712e | `fs.mount-max`; recursive binds, unmounting and mount lists linear in the table size |
+| b3e134a | A UDP socket shut down for reading returns 0 from a blocking recv instead of spinning (with netlink dumps that fit a page) |
+| 5530624 | splice, tee and vmsplice wait as Linux 6.1 does (seven skipped Starnix pipe and vmsplice tests now pass) |
+| 6d05aa9 | Mounts inherited by a less privileged namespace are locked; proc and sysfs mounts check owner and visibility; `max_*_namespaces` enforced |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
-fix deviations the full runs found (0b2c3c8 and 0a4712e those of gVisor's).
+fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
+b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead).
 
 ## Not yet taken
 
