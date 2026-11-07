@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; module references; `/sys/block`; mm fields in maps and status; sysctls; `/proc/vmstat`; names as bytes; the exited main thread; Starnix's test findings, zombies' files; `fs.mount-max` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; `/proc/vmstat`; names as bytes; test-suite findings, zombies' files; `user/max_*` last)
 
 ## Responsibilities
 
@@ -177,14 +177,16 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Sysctl scoping: SysV IPC limits and `fs/mqueue/*` per the writer's IPC namespace; `hostname`/
   `domainname` per UTS namespace (one trailing newline stripped, over 64 bytes `EINVAL`);
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
-  `conf/all/forwarding`; `NetConf` directories per interface); everything else kernel-wide
+  `conf/all/forwarding`; `NetConf` directories per interface); `user/max_*_namespaces` per user
+  namespace (the reader's or writer's: the limits of `kernel/process`'s namespace counts,
+  `INT_MAX` by default in a new one, 0 to `INT_MAX`); everything else kernel-wide
   (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`,
   `mount-max` (1 to `INT_MAX`; the mount limit of kernel/vfs),
   `pipe-max-size`, `core_pattern`, `core_uses_pid`, `protected_symlinks`/`hardlinks`, `printk*`,
-  `panic`, `user/max_*_namespaces`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
+  `panic`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
   `actions_logged` need `CAP_SYS_ADMIN` in the initial namespace, `mmap_min_addr`
   `CAP_SYS_RAWIO`).
-- Several writable sysctls are recorded without effect (`kernel.panic`, `user.max_*`, every
+- Several writable sysctls are recorded without effect (`kernel.panic`, every
   `NetSysctl` entry, `ping_group_range`, `somaxconn`, `ip_local_port_range`; of the port sysctls
   only `ip_unprivileged_port_start` is used, by bind); `kernel/pid_max` accepts writes and ignores
   them. The `RECORDED` table adds 40 more with Linux 6.1's modes, defaults and accepted ranges
@@ -201,8 +203,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   256.
 - Write permission is plain DAC against root-owned files (0644 when writable) with no
   per-namespace grants, so `CAP_DAC_OVERRIDE` counts only where root is mapped in the writer's
-  user namespace, and `user/max_*` is one kernel-wide table (Linux 6.1 keeps it per user
-  namespace).
+  user namespace; except `user/max_*`, which anyone may read and holders of `CAP_SYS_RESOURCE` in
+  their user namespace may write, whoever owns the files (Linux's `set_permissions` for the
+  per-namespace tables).
 - `/proc/<pid>/net/*` (`arp`, `dev`, `icmp`, `icmp6`, `if_inet6`, `ipv6_route`, `netstat`, `raw`,
   `raw6`, `route`, `snmp`, `sockstat`, `sockstat6`, `tcp`, `tcp6`, `udp`, `udp6`, `unix`) uses the
   target task's network namespace: sockets from every fd table plus in-flight AF_UNIX sockets,
@@ -367,9 +370,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   signalled; libmount monitors, systemd and containerd's OOM watching rely on them.
 - **`frozen 1` never appears while a vfork parent waits:** the waiting parent never counts as frozen,
   so runtimes that wait for `cgroup.events` to report frozen (runc pause) can wait until thaw.
-- **Namespace root cannot write its sysctls:** root of a child user namespace that owns a network
-  namespace cannot write that namespace's `net.*` sysctls, and `user/max_*` is global (Linux 6.1
-  grants both per namespace); rootless container runtimes setting sysctls fail with `EACCES`.
+- **Namespace root cannot write its network sysctls:** root of a child user namespace that owns a
+  network namespace cannot write that namespace's `net.*` sysctls (Linux 6.1 grants it per
+  namespace); rootless container runtimes setting sysctls fail with `EACCES`.
 - **Open-time ptrace check uses real credentials:** `mem`, `environ`, `maps` and the others are
   checked with real ids where Linux uses filesystem ids (and attach mode for `mem`), so set-id
   helpers behave differently (also noted in `kernel/signal`).
@@ -403,9 +406,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - **`/proc/sys` permissions follow ordinary DAC:** a non-root writer with `CAP_DAC_OVERRIDE` can
   open every writable sysctl (`core_pattern`, `hostname`, `pid_max`, `net.*`), whereas Linux 6.1
   decides by euid 0 / egid 0 alone and ignores capabilities; and a non-root process with
-  `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access; `user.*` likewise
-  keys on `CAP_SYS_RESOURCE`), so network daemons that drop root but keep `CAP_NET_ADMIN` get
-  `EACCES`.
+  `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access), so network daemons
+  that drop root but keep `CAP_NET_ADMIN` get `EACCES`.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.

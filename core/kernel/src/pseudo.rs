@@ -2240,12 +2240,15 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!("{a}\t{b}\t{c}\t{d}\n")
             }
             b"sys/kernel/printk_devkmsg" => format!("{}\n", ps.k.klog.borrow().devkmsg.name()),
-            // Per-user limits on the number of namespaces of each kind: the value last written
-            // (one kernel-wide table), or half of threads-max as in Linux's defaults; nothing is
-            // actually limited
+            // Limits on the namespaces of each kind created in the reader's user namespace and
+            // below it (crate::nsproxy::Ucounts): half of threads-max in the initial one and
+            // INT_MAX in the others unless written
             p if p.starts_with(b"sys/user/max_") => {
-                let v = ps.k.max_namespaces.get(p).copied();
-                format!("{}\n", v.unwrap_or(ps.k.threads_max as u64 / 2))
+                let kind = crate::nsproxy::Counted::from_sysctl(&p[b"sys/user/".len()..])
+                    .ok_or(Errno::ENOENT)?;
+                let init = crate::nsproxy::default_ns_limit(ps.k.threads_max);
+                let v = ps.k.ucounts.limit(ps.reader().user_ns.id, kind, init);
+                format!("{v}\n")
             }
             b"sys/kernel/random/boot_id" => format!("{}\n", format_uuid(&ps.k.boot_id)),
             b"sys/kernel/random/entropy_avail" | b"sys/kernel/random/poolsize" => {
@@ -3943,16 +3946,18 @@ pub(crate) fn write(
             .filter(|&v: &u64| v > 0)
             .ok_or(Errno::EINVAL)?;
     }
-    // Between 0 and INT_MAX, as on Linux; only recorded, with no actual limit
+    // Between 0 and INT_MAX, as on Linux; the writer's user namespace's own limit
     if let PseudoNode::Static(path) = node
-        && path.starts_with(b"sys/user/max_")
+        && let Some(kind) = path
+            .strip_prefix(b"sys/user/")
+            .and_then(crate::nsproxy::Counted::from_sysctl)
     {
-        let n: u64 = std::str::from_utf8(data)
+        let n: u32 = std::str::from_utf8(data)
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .filter(|&n| n <= i32::MAX as u64)
+            .filter(|&n| n <= i32::MAX as u32)
             .ok_or(Errno::EINVAL)?;
-        k.max_namespaces.insert(path.to_vec(), n);
+        k.ucounts.set_limit(cred.user_ns.id, kind, n);
     }
     if let PseudoNode::Static(b"sys/fs/aio-max-nr") = node {
         k.aio_max_nr = std::str::from_utf8(data)

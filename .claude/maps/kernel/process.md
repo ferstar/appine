@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; dying pid namespaces; DNS stub; module references; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; Starnix's and gVisor's test findings, exec and waitid last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; test-suite findings; namespace limits last)
 
 ## Responsibilities
 
@@ -76,7 +76,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
   `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups;
   held in credentials), `PidNs` (parent, level, owner, global↔local tables, reaper, dead; held per
-  thread group), `MntNs` (held in `FsContext`), `NsRef` (a strong reference to any namespace), `NsSet`.
+  thread group), `MntNs` (held in `FsContext`), `NsRef` (a strong reference to any namespace),
+  `NsSet`; `Ucounts` (`Kernel::ucounts`: the live namespaces by kind with the (user namespace,
+  user) pairs each counts for, the counts, and each user namespace's `max_*_namespaces`).
 
 ## Public entry points
 
@@ -378,10 +380,18 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   credentials, mount namespace, pid-for-children, IPC/semaphore exit and a new `NsProxy`, in that
   order; `CLONE_NEWPID` affects only children; a new mount namespace copies the whole mount tree
   (`kernel/vfs`), a new cgroup namespace is rooted at the creator's cgroup. Pid namespaces nest to
-  level 32 and user namespaces to 33 (`ENOSPC` beyond); `max_*_namespaces` sysctls are only
-  recorded. Time namespaces follow the Linux 6.2 rule: a new one becomes
-  time-for-children; non-`CLONE_VM` children enter it at fork; threads and vfork children enter at
-  execve.
+  level 32 and user namespaces to 33 (`ENOSPC` beyond). Time namespaces follow the Linux 6.2
+  rule: a new one becomes time-for-children; non-`CLONE_VM` children enter it at fork; threads and
+  vfork children enter at execve.
+- Namespace limits (Linux's ucounts): a namespace created by effective user u in user namespace n
+  (for a new user namespace, n is its parent; open_tree's anonymous mount namespaces count too)
+  counts for (n, u), then for (n's parent, n's owner) up to the initial user namespace, and every
+  one of those counts must stay below its user namespace's `max_<kind>_namespaces` (half of
+  threads-max in the initial one, as threads-max is now where Linux fixes it at boot; `INT_MAX`
+  elsewhere), else `ENOSPC`: for a user namespace after the level check and before the chroot and
+  mapping checks, for the others after the `CAP_SYS_ADMIN` check and before any is created. A
+  namespace counts while an `Rc` to it lives; those gone are taken off at the next check (a weak
+  reference per namespace), and a user namespace's limits go with it.
 - setns accepts a namespace file or a pidfd (a subset of types); every part is validated in Linux
   order (`validate_nsset`) before anything switches, then all switch together.
 - User namespaces: credentials hold kernel IDs; IDs shown outward (`get*id`, stat, procfs,
@@ -465,7 +475,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
 - **Pid allocator edge cases:** the global allocator can hand out `PID_MAX` (above `pid_max` and
   `choose_pid`'s range) and wraps to 2 instead of 300; `last_pid` reads 1 just after.
-- **`max_*_namespaces` are not enforced** (`max_user_namespaces=0` does not disable user namespaces).
 - **Minor futex deviations:** `FUTEX_CLOCK_REALTIME` is accepted with any operation, unknown high op
   bits are masked off instead of `ENOSYS`, and `FUTEX_WAKE` with a count ≤ 0 wakes none or all
   instead of one; WAKE_OP and PI operations are `ENOSYS`.

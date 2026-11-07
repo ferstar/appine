@@ -256,6 +256,23 @@ pub(crate) mod ms {
         RDONLY | NOSUID | NODEV | NOEXEC | NOSYMFOLLOW | NOATIME | NODIRATIME | RELATIME;
 }
 
+/// Locks on a mount (Linux's `MNT_LOCKED` and `MNT_LOCK_*`, kept in [`Mount::locks`]): a mount
+/// namespace copied into one owned by another user namespace (Linux's `lock_mnt_tree`) locks
+/// every mount, so a user privileged only there cannot uncover what a mount hides or loosen the
+/// flags it was given.
+pub(crate) mod lock {
+    /// The mount cannot be unmounted, moved or used as pivot_root's `new_root`, and a
+    /// non-recursive bind of a directory it is mounted under is EINVAL (it would uncover it).
+    pub const MOUNT: u64 = 1;
+    /// Flags a remount or mount_setattr cannot clear (EPERM).
+    pub const READONLY: u64 = 2;
+    pub const NODEV: u64 = 4;
+    pub const NOSUID: u64 = 8;
+    pub const NOEXEC: u64 = 0x10;
+    /// The access-time flags cannot change.
+    pub const ATIME: u64 = 0x20;
+}
+
 /// Mount flags of the root filesystem: `rw,relatime`.
 pub(crate) const ROOT_FLAGS: u64 = ms::RELATIME;
 /// Device number the root filesystem (the inode store) reports (8:1).
@@ -292,9 +309,23 @@ pub(crate) struct Mount {
     pub expiring: bool,
     /// A namespace file bind-mounted elsewhere ([`Fs::Nsfs`]): it keeps that namespace alive.
     pub pin: Option<crate::nsproxy::NsRef>,
+    /// Bits from [`lock`].
+    pub locks: u64,
 }
 
 impl Mount {
+    /// Whether flags `flags` keep everything this mount has locked (Linux's
+    /// `can_change_locked_flags`): a remount or mount_setattr to anything else is EPERM.
+    pub(crate) fn keeps_locked(&self, flags: u64) -> bool {
+        let kept = |l: u64, f: u64| self.locks & l == 0 || flags & f != 0;
+        const ATIME: u64 = ms::NOATIME | ms::NODIRATIME | ms::RELATIME;
+        kept(lock::READONLY, ms::RDONLY)
+            && kept(lock::NODEV, ms::NODEV)
+            && kept(lock::NOSUID, ms::NOSUID)
+            && kept(lock::NOEXEC, ms::NOEXEC)
+            && (self.locks & lock::ATIME == 0 || self.flags & ATIME == flags & ATIME)
+    }
+
     /// The mount the mount point is in (the second column of mountinfo); the root of the mount
     /// tree and detached mounts have none.
     pub(crate) fn parent(&self) -> Option<MountId> {
@@ -435,6 +466,7 @@ impl Mounts {
             source: source.to_vec(),
             expiring: false,
             pin: None,
+            locks: 0,
         });
     }
 
@@ -749,6 +781,7 @@ impl Vfs {
                 source: b"appine".to_vec(),
                 expiring: false,
                 pin: None,
+                locks: 0,
             }],
             detached: Vec::new(),
             next: RUN_MOUNT + 1,
@@ -1537,7 +1570,9 @@ impl Vfs {
     /// Copies all attached mounts of mount namespace `from` into a new namespace owned by user
     /// namespace `owner` (Linux's `copy_mnt_ns`). Returns the new namespace and a map from old
     /// mount ids to new ones, which the caller uses to move processes' root and current
-    /// directories onto the new mounts.
+    /// directories onto the new mounts. When `owner` is not the owner of `from`, every copy is
+    /// locked ([`lock`], Linux's `lock_mnt_tree`): the mount and its read-only, nodev, nosuid,
+    /// noexec and access-time flags.
     pub(crate) fn copy_ns(
         &self,
         from: u64,
@@ -1546,6 +1581,9 @@ impl Vfs {
         std::rc::Rc<MntNs>,
         std::collections::HashMap<MountId, MountId>,
     ) {
+        let lock_all = self
+            .find_ns(from)
+            .is_some_and(|old| old.owner.id != owner.id);
         let ns = std::rc::Rc::new(MntNs {
             id: new_ns_id(),
             owner,
@@ -1582,6 +1620,20 @@ impl Vfs {
                 .in_mount(map.get(&n.mnt()).copied().unwrap_or(n.mnt()))
         };
         for m in old {
+            let mut locks = m.locks;
+            if lock_all {
+                locks |= lock::MOUNT | lock::ATIME;
+                for (f, l) in [
+                    (ms::RDONLY, lock::READONLY),
+                    (ms::NODEV, lock::NODEV),
+                    (ms::NOSUID, lock::NOSUID),
+                    (ms::NOEXEC, lock::NOEXEC),
+                ] {
+                    if m.flags & f != 0 {
+                        locks |= l;
+                    }
+                }
+            }
             let copy = Mount {
                 id: map[&m.id],
                 ns: ns.id,
@@ -1590,6 +1642,7 @@ impl Vfs {
                 at: m.at.as_ref().map(|(d, n)| (tag(d), n.clone())),
                 root_at: m.root_at.as_ref().map(|(d, n)| (tag(d), n.clone())),
                 expiring: false,
+                locks,
                 ..m
             };
             mounts.list.push(copy);
@@ -1639,6 +1692,9 @@ impl Vfs {
             at: None,
             root_at: found,
             expiring: false,
+            // As in __do_loopback, the copy's own root is not locked (the mounts copied below it
+            // keep their locks)
+            locks: m.locks & !lock::MOUNT,
             ..m
         });
         drop(mounts);
@@ -2028,6 +2084,7 @@ impl Vfs {
             source,
             expiring: false,
             pin: None,
+            locks: 0,
         });
         drop(mounts);
         self.mounts_changed();
@@ -2090,6 +2147,7 @@ impl Vfs {
                 source: c.source.clone(),
                 expiring: false,
                 pin: c.pin.clone(),
+                locks: c.locks,
             });
             ids.push(id);
         }

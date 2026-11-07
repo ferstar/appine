@@ -288,6 +288,162 @@ impl NsProxy {
     }
 }
 
+/// The kinds of namespaces whose number `/proc/sys/user/max_*_namespaces` limits (Linux's
+/// `UCOUNT_*_NAMESPACES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Counted {
+    User,
+    Pid,
+    Uts,
+    Ipc,
+    Net,
+    Mnt,
+    Cgroup,
+    Time,
+}
+
+impl Counted {
+    /// The kind `/proc/sys/user/<name>` limits.
+    pub(crate) fn from_sysctl(name: &[u8]) -> Option<Counted> {
+        Some(match name {
+            b"max_user_namespaces" => Counted::User,
+            b"max_pid_namespaces" => Counted::Pid,
+            b"max_uts_namespaces" => Counted::Uts,
+            b"max_ipc_namespaces" => Counted::Ipc,
+            b"max_net_namespaces" => Counted::Net,
+            b"max_mnt_namespaces" => Counted::Mnt,
+            b"max_cgroup_namespaces" => Counted::Cgroup,
+            b"max_time_namespaces" => Counted::Time,
+            _ => return None,
+        })
+    }
+}
+
+/// How many namespaces each user has created, per user namespace (Linux's ucounts and
+/// `inc_ucount`): a namespace of some kind created by effective user u in user namespace n (for a
+/// new user namespace, n is its parent) counts for (n, u), then for (n's parent, n's owner), and
+/// so on up to the initial user namespace, and each count must stay below that user namespace's
+/// limit for the kind (`/proc/sys/user/max_*_namespaces`, kept per user namespace: half of
+/// threads-max in the initial one, `INT_MAX` in the others), else creating it is ENOSPC. So a limit
+/// written in a user namespace bounds everything created below it, which is how bubblewrap's
+/// `--disable-userns` works. A namespace counts while it is alive; those gone are taken off at the
+/// next check.
+#[derive(Default)]
+pub(crate) struct Ucounts {
+    live: Vec<Charged>,
+    counts: std::collections::HashMap<(u64, u32), [u32; 8]>,
+    max: std::collections::HashMap<u64, [Option<u32>; 8]>,
+}
+
+/// A namespace counted in [`Ucounts`].
+struct Charged {
+    ns: std::rc::Weak<dyn std::any::Any>,
+    kind: Counted,
+    /// The (user namespace, user) pairs it counts for.
+    keys: Vec<(u64, u32)>,
+    /// A user namespace's own number: its limits go with it.
+    user_ns: Option<u64>,
+}
+
+impl Ucounts {
+    /// The limit on namespaces of `kind` in user namespace `ns`; `init` is the initial user
+    /// namespace's default.
+    pub(crate) fn limit(&self, ns: u64, kind: Counted, init: u32) -> u32 {
+        let default = if ns == crate::cred::INIT_USER_NS {
+            init
+        } else {
+            i32::MAX as u32
+        };
+        self.max
+            .get(&ns)
+            .and_then(|m| m[kind as usize])
+            .unwrap_or(default)
+    }
+
+    pub(crate) fn set_limit(&mut self, ns: u64, kind: Counted, n: u32) {
+        self.max.entry(ns).or_default()[kind as usize] = Some(n);
+    }
+
+    /// Whether one more namespace of `kind` created by effective user `euid` in user namespace
+    /// `owner` stays within every limit: ENOSPC if not.
+    pub(crate) fn check(
+        &mut self,
+        kind: Counted,
+        owner: &UserNs,
+        euid: u32,
+        init: u32,
+    ) -> Result<(), crate::errno::Errno> {
+        self.purge();
+        for key in keys(owner, euid) {
+            let n = self.counts.get(&key).map_or(0, |c| c[kind as usize]);
+            if n >= self.limit(key.0, kind, init) {
+                return Err(crate::errno::Errno::ENOSPC);
+            }
+        }
+        Ok(())
+    }
+
+    /// Counts namespace `ns`, created after [`Ucounts::check`] allowed it, until it goes away.
+    pub(crate) fn add(
+        &mut self,
+        kind: Counted,
+        owner: &UserNs,
+        euid: u32,
+        ns: Rc<dyn std::any::Any>,
+        user_ns: Option<u64>,
+    ) {
+        let keys = keys(owner, euid);
+        for key in &keys {
+            self.counts.entry(*key).or_default()[kind as usize] += 1;
+        }
+        self.live.push(Charged {
+            ns: Rc::downgrade(&ns),
+            kind,
+            keys,
+            user_ns,
+        });
+    }
+
+    /// Takes the namespaces that have gone off the counts.
+    fn purge(&mut self) {
+        let (dead, live): (Vec<Charged>, Vec<Charged>) = std::mem::take(&mut self.live)
+            .into_iter()
+            .partition(|c| c.ns.strong_count() == 0);
+        self.live = live;
+        for c in dead {
+            for key in &c.keys {
+                if let Some(n) = self.counts.get_mut(key) {
+                    n[c.kind as usize] -= 1;
+                    if n.iter().all(|&x| x == 0) {
+                        self.counts.remove(key);
+                    }
+                }
+            }
+            if let Some(id) = c.user_ns {
+                self.max.remove(&id);
+            }
+        }
+    }
+}
+
+/// The initial user namespace's default limit on namespaces of each kind: half of threads-max
+/// (Linux's fork_init).
+pub(crate) fn default_ns_limit(threads_max: usize) -> u32 {
+    (threads_max / 2).min(i32::MAX as usize) as u32
+}
+
+/// The (user namespace, user) pairs a namespace created by `euid` in user namespace `owner`
+/// counts for: its own, then each user namespace above with the owner of the one below.
+fn keys(owner: &UserNs, euid: u32) -> Vec<(u64, u32)> {
+    let mut out = vec![(owner.id, euid)];
+    let mut ns = owner;
+    while let Some(parent) = &ns.parent {
+        out.push((parent.id, ns.owner));
+        ns = parent;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

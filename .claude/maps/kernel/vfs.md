@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks last)
 
 ## Responsibilities
 
@@ -47,7 +47,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `Vfs` — the store handle, the mount table and the no-BKL resolver state.
 - `Mount` — id, namespace, filesystem, root node, mount point (`None` for a tree root or an
   unmounted mount), the node and dentry it sits on, per-mount `MS_*` flags, device number, source,
-  `MNT_EXPIRE` mark, pinned namespace.
+  `MNT_EXPIRE` mark, pinned namespace, locks (`lock`: Linux's `MNT_LOCKED` and `MNT_LOCK_*`).
 - `Mounts` — the global list (also the mountinfo order), detached mounts, id and device counters,
   per-instance side tables (tmpfs, procfs pid namespaces, mqueue devices, devpts instances).
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue; which kinds get a new instance and
@@ -183,30 +183,44 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   namespace owning the caller's mount namespace), then remount, bind, propagation, move, new mount.
 - New mounts: proc, devpts, sysfs, cgroup2, tmpfs, mqueue; anything else `ENODEV`. sysfs, cgroup2
   and same-namespace mqueue mounted on the root of a mount of the same filesystem are `EBUSY`.
-  mqueue needs `CAP_SYS_ADMIN` over the IPC namespace. A new mount belongs to the namespace of the
-  mount its point is in.
+  mqueue needs `CAP_SYS_ADMIN` over the IPC namespace, proc over the owner of the caller's pid
+  namespace and sysfs over the owner of its network namespace (`EPERM`). In a mount namespace
+  not owned by the initial user namespace, proc and sysfs also need a fully visible instance
+  (6.1's `mount_too_revealing`, `EPERM`): a mount of that filesystem's root in the namespace whose
+  locked read-only and access-time flags the new mount keeps, with no locked mount over anything
+  but the empty `/sys/fs/cgroup`; the new mount takes over those locked flags. A new mount
+  belongs to the namespace of the mount its point is in.
 - Bind: the new mount sees the source node with the source mount's filesystem, flags, device and
-  source; `MS_REC` copies the submounts under the source from one snapshot, in one pass over a
-  child index (`plan_copies`, then `Vfs::add_copies` in one borrow); binding a namespace file
+  source, and keeps its locked flags but is not locked in place itself; `MS_REC` copies the
+  submounts under the source from one snapshot, in one pass over a child index (`plan_copies`,
+  then `Vfs::add_copies` in one borrow), locks included; without `MS_REC` a source with a mount
+  locked in place on or under it is `EINVAL` (`has_locked_children`); binding a namespace file
   creates an nsfs mount that pins the namespace (a mount-namespace file must be newer than the
   caller's namespace).
 - Remount needs the exact mount root; flags change on this mount only (atime bits are kept if
-  none are given). A tmpfs remount without `MS_BIND` reconfigures the shared instance
-  (`size=`/`nr_inodes=`/`inode32|64` per `shmem_reconfigure`).
+  none are given); clearing a locked ro, nodev, nosuid or noexec or changing locked atime flags
+  is `EPERM` before anything changes (`can_change_locked_flags`). A tmpfs remount without
+  `MS_BIND` reconfigures the shared instance (`size=`/`nr_inodes=`/`inode32|64` per
+  `shmem_reconfigure`).
 - Propagation flags are validated (one type, plus `MS_REC`/`MS_SILENT`) and have no effect;
   everything behaves as private.
-- `MS_MOVE`, `pivot_root` (6.1's checks after resolving both paths, `chroot_fs_refs` for tasks
-  whose root or cwd was the old root in the same namespace), `chroot` (`CAP_SYS_CHROOT` in the
-  caller's user namespace and search permission).
+- `MS_MOVE` (a mount locked in place `EINVAL`), `pivot_root` (6.1's checks after resolving both
+  paths, a locked `new_root` `EINVAL`; the old root's lock moves to the new root, so the old one
+  can then be detached; `chroot_fs_refs` for tasks whose root or cwd was the old root in the same
+  namespace), `chroot` (`CAP_SYS_CHROOT` in the caller's user namespace and search permission).
 - `open_tree` (without `OPEN_TREE_CLONE`: an `O_PATH` fd; with it: `CAP_SYS_ADMIN`, a detached
-  clone in a new anonymous namespace held by the fd), `move_mount` (shares `move_tree` with
+  clone in a new anonymous namespace held by the fd, which counts against `max_mnt_namespaces`
+  (`ENOSPC`, `kernel/process`); without `AT_RECURSIVE` a source with a locked mount under it is
+  `EINVAL`, and the clone's root is not locked in place), `move_mount` (shares `move_tree` with
   `MS_MOVE`; attaching a clone moves its mounts into the caller's namespace;
   `MOVE_MOUNT_SET_GROUP` is always `EINVAL`), `mount_setattr` (size and flag checks per
-  `build_mount_kattr`; per-mount flags, `AT_RECURSIVE` over the subtree; idmapped mounts end in
-  `EINVAL` after the userns fd checks — `EBADF` for a bad fd, `EPERM` for the initial namespace).
-- `umount2`: unknown flags `EINVAL`; lookup; `may_mount` (`EPERM`); not a mount root or not in
-  the caller's namespace `EINVAL`; `MNT_EXPIRE` (with `MNT_FORCE`/`MNT_DETACH` or on the caller's
-  root `EINVAL`, busy `EBUSY`, otherwise marks then `EAGAIN`; the mark is never cleared); the
+  `build_mount_kattr`; per-mount flags, `AT_RECURSIVE` over the subtree, `EPERM` before any change
+  when a mount would lose a locked flag; idmapped mounts end in `EINVAL` after the userns fd
+  checks — `EBADF` for a bad fd, `EPERM` for the initial namespace).
+- `umount2`: unknown flags `EINVAL`; lookup; `may_mount` (`EPERM`); not a mount root, not in
+  the caller's namespace or locked in place `EINVAL`; `MNT_EXPIRE` (with `MNT_FORCE`/
+  `MNT_DETACH` or on the caller's root `EINVAL`, busy `EBUSY`, otherwise marks then `EAGAIN`;
+  the mark is never cleared); the
   tree root `EBUSY` (`EINVAL` with `MNT_DETACH`); without `MNT_DETACH`, the caller's root or a
   busy mount `EBUSY` (busy means submounts, task roots/cwds, nodes of open fds, pinned PTYs — not
   mappings, running executables or mqueue fds); `MNT_FORCE` has no effect. `MNT_DETACH` moves the
@@ -225,7 +239,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `CLONE_NEWNS` (clone/unshare) calls `copy_ns`, which clones every attached mount of the source
   namespace (ids allocated first, then remapped; mounts pinning a mount namespace and anything
   under them are skipped) and remaps the task's root and cwd. tmpfs instances are shared between
-  copies.
+  copies. When the new namespace's owner is not the source's (a user namespace was created
+  with it, or the caller is in one), every copy is locked (6.1's `lock_mnt_tree`): locked in place
+  and its ro, nodev, nosuid, noexec and access-time flags locked, so a user privileged only there
+  cannot uncover what a mount hides or loosen a sandbox's flags.
 - `setns` into a mount namespace needs `CAP_SYS_ADMIN` over the target's owner plus
   `CAP_SYS_CHROOT` and `CAP_SYS_ADMIN` in the caller's namespace and an unshared fs; root and cwd
   are reset to the namespace root.
@@ -582,6 +599,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- Locks are per mount and only ever added by copying a namespace into one with another owner or
+  by binding; a bind's own root drops `lock::MOUNT`, so code that creates a mount from another
+  must decide which locks it inherits (`clone_mount`, `bind`, `add_copies` keep or clear them).
 - splice and vmsplice put what they read into the output pipe whole even when a writer took the
   room while the BKL was released for the read (Linux holds the pipe's lock throughout), so a pipe
   can briefly hold more than its capacity.
@@ -736,22 +756,14 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
   kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
   root.
-- **Mounts copied into a less privileged namespace are not locked:** a mount namespace created
-  together with, or owned by, a new user namespace does not lock the mounts it inherits, so its
-  root can unmount them or use one as pivot_root's `new_root`, where Linux 6.1 refuses with
-  `EINVAL`; can clear ro, nodev, nosuid and noexec with `MS_REMOUNT|MS_BIND` on such a mount or a
-  bind of it, where Linux keeps the inherited flags locked (`EPERM`); and can bind a tree
-  non-recursively, uncovering what its inherited submounts hid, where Linux's `do_loopback`
-  returns `EINVAL`. A sandbox that hides paths by mounting over them (masked `/proc` entries, a
-  tmpfs over a secret directory) or makes them read-only can have that undone by a rootless user
-  inside it.
-- **proc and sysfs mounts in a user namespace skip Linux's owner and visibility checks:** the root
-  of any user namespace can mount proc or sysfs, where Linux 6.1 requires `CAP_SYS_ADMIN` over the
-  owner of the caller's pid (proc) or network (sysfs) namespace and, outside the initial user
-  namespace, an existing fully visible mount of that filesystem (no locked submounts over
-  non-empty directories; locked read-only and atime flags carried over), else `EPERM`. A rootless
-  user in a sandbox that masks `/proc` or `/sys` entries can mount a fresh, unmasked, writable
-  instance.
+- **cgroup2 mounts ignore the cgroup namespace's owner:** mounting cgroup2 needs only `may_mount`,
+  where Linux 6.1 also requires `CAP_SYS_ADMIN` over the owner of the caller's cgroup namespace
+  (`cgroup_init_fs_context`), so root of a new user and mount namespace that kept the initial
+  cgroup namespace can mount the whole hierarchy (`EPERM` on Linux).
+- **Locked child mounts are not kept attached on a lazy unmount:** detaching a tree whose
+  submounts are locked in place disconnects them like any other, where Linux keeps them on their
+  detached parent (`disconnect_mount`), so through an fd kept in the detached tree the directories
+  they covered can be reached.
 - **truncate on synthetic files is `EACCES`:** truncate(2) needs a store inode before it checks
   the file type, so devpts, procfs and sysfs files fail with `EACCES` (`EROFS` on a read-only
   mount), where Linux returns `EINVAL` for a non-regular file before any permission check.

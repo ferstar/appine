@@ -12,7 +12,7 @@ use crate::cred::{Cred, MAX_USER_NS_LEVEL, UserNs, cap};
 use crate::errno::Errno;
 use crate::fd::{FileKind, Pidfd};
 use crate::kernel::{Cx, Kernel};
-use crate::nsproxy::{CgroupNs, IpcNs, NetNs, NsRef, TimeNs, UtsNs};
+use crate::nsproxy::{CgroupNs, Counted, IpcNs, NetNs, NsRef, TimeNs, UtsNs};
 use crate::pidns::{MAX_PID_NS_LEVEL, PidNs};
 use crate::pseudo::{NsKind, PseudoNode};
 use crate::task::FsContext;
@@ -21,14 +21,16 @@ use crate::vfs::{MntNs, MountId, Node, Vfs, new_ns_id};
 // ---- Creating namespaces (clone, unshare) ----
 
 /// Creates a user namespace (Linux 6.1's `create_user_ns`) and moves `cred` into it: nesting goes
-/// up to level 33 at most (ENOSPC; older kernels give EUSERS), a chrooted process may not (EPERM),
-/// and the creator's effective user ID and group ID must be mapped in the old namespace (EPERM).
+/// up to level 33 at most and the user namespaces counted under the parent stay within their limits
+/// (ENOSPC; older kernels give EUSERS for the level), a chrooted process may not (EPERM), and the
+/// creator's effective user ID and group ID must be mapped in the old namespace (EPERM).
 /// `chrooted` means the root directory is not the mount namespace's root.
-pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
+pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Result<(), Errno> {
     let parent = cred.user_ns.clone();
     if parent.level > MAX_USER_NS_LEVEL {
         return Err(Errno::ENOSPC);
     }
+    check_counts(k, &[Counted::User], &parent, cred.euid)?;
     if chrooted {
         return Err(Errno::EPERM);
     }
@@ -38,8 +40,38 @@ pub(super) fn new_user_ns(cred: &mut Cred, chrooted: bool) -> Result<(), Errno> 
         return Err(Errno::EPERM);
     }
     let ns = UserNs::child(&parent, cred.euid);
+    k.ucounts
+        .add(Counted::User, &parent, cred.euid, ns.clone(), Some(ns.id));
     cred.enter_user_ns(ns);
     Ok(())
+}
+
+/// Whether namespaces of `kinds` that effective user `euid` creates in user namespace `owner` stay
+/// within the limits of `/proc/sys/user/max_*_namespaces` ([`crate::nsproxy::Ucounts`]): ENOSPC
+/// if not, before anything is created (Linux's `inc_ucount` failing in `copy_namespaces`).
+pub(super) fn check_counts(
+    k: &mut Kernel,
+    kinds: &[Counted],
+    owner: &UserNs,
+    euid: u32,
+) -> Result<(), Errno> {
+    let init = crate::nsproxy::default_ns_limit(k.threads_max);
+    for &kind in kinds {
+        k.ucounts.check(kind, owner, euid, init)?;
+    }
+    Ok(())
+}
+
+/// Counts namespace `ns` of `kind`, created by `euid` in user namespace `owner` after
+/// [`check_counts`], for as long as it lives.
+pub(super) fn count(
+    k: &mut Kernel,
+    kind: Counted,
+    owner: &UserNs,
+    euid: u32,
+    ns: Rc<dyn std::any::Any>,
+) {
+    k.ucounts.add(kind, owner, euid, ns, None);
 }
 
 /// The root directory is not the mount namespace's root (chrooted; Linux's `current_chrooted`).

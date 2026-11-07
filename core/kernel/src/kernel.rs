@@ -307,9 +307,9 @@ pub(crate) struct Kernel {
     /// The events taken by AIO contexts (`/proc/sys/fs/aio-nr`) and the limit (`aio-max-nr`).
     pub aio_nr: u64,
     pub aio_max_nr: u64,
-    /// The written `/proc/sys/user/max_*_namespaces` values (by name; only recorded, not actually
-    /// enforced).
-    pub max_namespaces: BTreeMap<Vec<u8>, u64>,
+    /// The namespaces each user has created per user namespace, and the limits on them
+    /// (`/proc/sys/user/max_*_namespaces`).
+    pub ucounts: crate::nsproxy::Ucounts,
     /// The written values of the sysctls procfs only records (`crate::pseudo::RECORDED`, by path);
     /// a missing one still has its default.
     pub sysctls: BTreeMap<&'static [u8], i64>,
@@ -413,7 +413,7 @@ impl Kernel {
             host_routes: None,
             aio_nr: 0,
             aio_max_nr: 65536,
-            max_namespaces: BTreeMap::new(),
+            ucounts: Default::default(),
             sysctls: BTreeMap::new(),
             modprobe: b"/sbin/modprobe".to_vec(),
             tainted: 0,

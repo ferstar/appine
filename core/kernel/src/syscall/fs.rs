@@ -590,7 +590,15 @@ fn open_pseudo(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
-    if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
+    // /proc/sys/user/max_*: anyone may read the limits of their user namespace, and holders of
+    // CAP_SYS_RESOURCE in it may write them, whoever owns the files (Linux's set_permissions for
+    // the per-user-namespace sysctl tables)
+    let user_limit = matches!(&node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"));
+    if user_limit {
+        if open_mask(flags) & MAY_WRITE != 0 && !cred.capable_here(cap::SYS_RESOURCE) {
+            return Err(Errno::EACCES);
+        }
+    } else if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
     }
     // /proc/<pid>/mem requires being able to trace that process, as ptrace does

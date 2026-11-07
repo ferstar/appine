@@ -13,6 +13,7 @@ use crate::fd::{FileKind, FileRef, OpenFile, Pidfd, oflags};
 use crate::kernel::{Cx, Tid};
 use crate::loader::{self, Args, LoadError};
 use crate::mm::Mm;
+use crate::nsproxy::Counted;
 use crate::process::{self, ExitStatus, Signal, ThreadGroup};
 use crate::signal::{self, AltStack, SigInfo, code};
 use crate::task::{self, FsContext, Task, TaskState};
@@ -261,12 +262,15 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // The new user namespace is created first; the other namespaces belong to it and are checked
     // against its capabilities (Linux's copy_creds comes before copy_namespaces)
     let mut child_cred = cx.cred();
+    let euid = child_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
-        super::ns::new_user_ns(&mut child_cred, super::ns::chrooted(cx))?;
+        let chrooted = super::ns::chrooted(cx);
+        super::ns::new_user_ns(cx.k(), &mut child_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !child_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
+    super::ns::check_counts(cx.k(), &counted(flags), &child_cred.user_ns, euid)?;
     // A new IPC namespace cannot keep sharing the old SEM_UNDO adjustments
     if both(CLONE_NEWIPC, CLONE_SYSVSEM) {
         return Err(Errno::EINVAL);
@@ -282,7 +286,9 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         }
     }
     let pid_ns = if flags & CLONE_NEWPID != 0 {
-        super::ns::new_pid_ns(&active, &for_children, child_cred.user_ns.clone())?
+        let ns = super::ns::new_pid_ns(&active, &for_children, child_cred.user_ns.clone())?;
+        super::ns::count(cx.k(), Counted::Pid, &child_cred.user_ns, euid, ns.clone());
+        ns
     } else {
         for_children
     };
@@ -330,16 +336,20 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     let fs = if flags & CLONE_FS != 0 {
         cx.t.fs.clone()
     } else {
-        let f = cx.t.fs.borrow();
-        let mut copy = FsContext {
-            root: f.root.clone(),
-            cwd: f.cwd.clone(),
-            umask: f.umask,
-            mnt_ns: f.mnt_ns.clone(),
+        let mut copy = {
+            let f = cx.t.fs.borrow();
+            FsContext {
+                root: f.root.clone(),
+                cwd: f.cwd.clone(),
+                umask: f.umask,
+                mnt_ns: f.mnt_ns.clone(),
+            }
         };
         if flags & CLONE_NEWNS != 0 {
             let owner = child_cred.user_ns.clone();
             super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut copy, owner);
+            let ns = copy.mnt_ns.clone();
+            super::ns::count(cx.k(), Counted::Mnt, &child_cred.user_ns, euid, ns);
         }
         Rc::new(RefCell::new(copy))
     };
@@ -440,21 +450,24 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     };
     let tgid = if thread { cx.tgid() } else { tid };
     let mut ns = cx.ns();
+    let owner = &child_cred_owner;
     if flags & CLONE_NEWUTS != 0 {
-        ns.uts = ns.uts.copy(child_cred_owner.clone());
+        ns.uts = ns.uts.copy(owner.clone());
+        super::ns::count(cx.k(), Counted::Uts, owner, euid, ns.uts.clone());
     }
     if flags & CLONE_NEWIPC != 0 {
         let cred = cx.cred();
-        ns.ipc = cx
-            .k()
-            .new_ipc_ns(child_cred_owner.clone(), (cred.fsuid, cred.fsgid));
+        ns.ipc = cx.k().new_ipc_ns(owner.clone(), (cred.fsuid, cred.fsgid));
+        super::ns::count(cx.k(), Counted::Ipc, owner, euid, ns.ipc.clone());
     }
     if flags & CLONE_NEWNET != 0 {
-        ns.net = cx.k().new_net_ns(child_cred_owner.clone())?;
+        ns.net = cx.k().new_net_ns(owner.clone())?;
+        super::ns::count(cx.k(), Counted::Net, owner, euid, ns.net.clone());
     }
     if flags & CLONE_NEWCGROUP != 0 {
         let root = cx.t.group.borrow().cgroup;
-        ns.cgroup = super::ns::new_cgroup_ns(child_cred_owner.clone(), root);
+        ns.cgroup = super::ns::new_cgroup_ns(owner.clone(), root);
+        super::ns::count(cx.k(), Counted::Cgroup, owner, euid, ns.cgroup.clone());
     }
     // Time namespaces (Linux's copy_namespaces and timens_on_fork, since 6.2): clone3's
     // CLONE_NEWTIME creates the one for children; a child that does not share the address space
@@ -462,7 +475,9 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // children stay in the parent thread's and enter it when execve replaces the address space
     // (6.1 gives EINVAL; see the kernel/signal map)
     if flags & CLONE_NEWTIME != 0 {
-        ns.time_for_children = ns.time_for_children.copy(child_cred_owner.clone());
+        ns.time_for_children = ns.time_for_children.copy(owner.clone());
+        let time = ns.time_for_children.clone();
+        super::ns::count(cx.k(), Counted::Time, owner, euid, time);
     }
     if flags & CLONE_VM == 0 && ns.time.id != ns.time_for_children.id {
         ns.time = ns.time_for_children.clone();
@@ -1637,21 +1652,22 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     // Compute the new credentials and every check first, and change things only when all pass
     // (Linux's ksys_unshare commits only at the end)
     let mut new_cred = cx.cred();
+    let euid = new_cred.euid;
     if flags & CLONE_NEWUSER != 0 {
-        super::ns::new_user_ns(&mut new_cred, super::ns::chrooted(cx))?;
+        let chrooted = super::ns::chrooted(cx);
+        super::ns::new_user_ns(cx.k(), &mut new_cred, chrooted)?;
     }
     if flags & CLONE_NEW_ADMIN != 0 && !new_cred.capable_here(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
+    super::ns::check_counts(cx.k(), &counted(flags), &new_cred.user_ns, euid)?;
     // The new pid namespace is only for later children (the caller does not enter it); it cannot
     // be unshared again before it is entered
     let pid_ns = if flags & CLONE_NEWPID != 0 {
         let owner = new_cred.user_ns.clone();
-        Some(super::ns::new_pid_ns(
-            &cx.pid_ns(),
-            &cx.pid_ns_children(),
-            owner,
-        )?)
+        let ns = super::ns::new_pid_ns(&cx.pid_ns(), &cx.pid_ns_children(), owner)?;
+        super::ns::count(cx.k(), Counted::Pid, &new_cred.user_ns, euid, ns.clone());
+        Some(ns)
     } else {
         None
     };
@@ -1686,6 +1702,8 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWNS != 0 {
         let owner = new_cred.user_ns.clone();
         super::ns::new_mnt_ns(cx.t.vfs.as_deref(), &mut cx.t.fs.borrow_mut(), owner);
+        let ns = cx.t.fs.borrow().mnt_ns.clone();
+        super::ns::count(cx.k(), Counted::Mnt, &new_cred.user_ns, euid, ns);
         cx.shared.fast_changed();
     }
     if pid_ns.is_some() {
@@ -1701,29 +1719,53 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
     // namespace has only lo, down; a new time namespace is only for later children, copying the
     // offsets of the old one for children
     if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME) != 0 {
-        let owner = new_cred.user_ns.clone();
+        let owner = &new_cred.user_ns;
         let mut ns = cx.ns();
         if flags & CLONE_NEWTIME != 0 {
             ns.time_for_children = ns.time_for_children.copy(owner.clone());
+            let time = ns.time_for_children.clone();
+            super::ns::count(cx.k(), Counted::Time, owner, euid, time);
         }
         if flags & CLONE_NEWCGROUP != 0 {
             let root = cx.t.group.borrow().cgroup;
             ns.cgroup = super::ns::new_cgroup_ns(owner.clone(), root);
+            super::ns::count(cx.k(), Counted::Cgroup, owner, euid, ns.cgroup.clone());
         }
         if flags & CLONE_NEWNET != 0 {
             ns.net = cx.k().new_net_ns(owner.clone())?;
+            super::ns::count(cx.k(), Counted::Net, owner, euid, ns.net.clone());
         }
         if flags & CLONE_NEWUTS != 0 {
             ns.uts = ns.uts.copy(owner.clone());
+            super::ns::count(cx.k(), Counted::Uts, owner, euid, ns.uts.clone());
         }
         if flags & CLONE_NEWIPC != 0 {
             let cred = cx.cred();
-            ns.ipc = cx.k().new_ipc_ns(owner, (cred.fsuid, cred.fsgid));
+            ns.ipc = cx.k().new_ipc_ns(owner.clone(), (cred.fsuid, cred.fsgid));
+            super::ns::count(cx.k(), Counted::Ipc, owner, euid, ns.ipc.clone());
         }
         *cx.task.ns.borrow_mut() = ns;
         cx.k().collect_ipc();
     }
     Ok(0)
+}
+
+/// The namespaces other than user namespaces that `CLONE_NEW*` flags create, as counted against
+/// `/proc/sys/user/max_*_namespaces` ([`crate::nsproxy::Ucounts`]).
+fn counted(flags: u64) -> Vec<Counted> {
+    [
+        (CLONE_NEWNS, Counted::Mnt),
+        (CLONE_NEWPID, Counted::Pid),
+        (CLONE_NEWUTS, Counted::Uts),
+        (CLONE_NEWIPC, Counted::Ipc),
+        (CLONE_NEWNET, Counted::Net),
+        (CLONE_NEWCGROUP, Counted::Cgroup),
+        (CLONE_NEWTIME, Counted::Time),
+    ]
+    .into_iter()
+    .filter(|&(f, _)| flags & f != 0)
+    .map(|(_, kind)| kind)
+    .collect()
 }
 
 // ---- Process groups and sessions ----

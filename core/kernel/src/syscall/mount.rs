@@ -21,9 +21,11 @@ use super::{SysResult, get, read_path};
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::kernel::Cx;
-use crate::nsproxy::NsRef;
+use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
-use crate::vfs::{Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, ms};
+use crate::vfs::{
+    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, lock, ms,
+};
 
 const MS_REMOUNT: u64 = 0x20;
 const MS_BIND: u64 = 0x1000;
@@ -153,6 +155,23 @@ fn new_mount(
     if fs == Fs::Mqueue && !cx.cred().ns_capable(&ipc.owner, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
+    // proc needs CAP_SYS_ADMIN over the owner of the caller's pid namespace and sysfs over the
+    // owner of its network namespace (the fc->user_ns of Linux's proc_init_fs_context and
+    // sysfs_init_fs_context, checked by mount_capable); then, outside the initial user namespace,
+    // an instance must already be fully visible (mount_too_revealing)
+    let owner = match fs {
+        Fs::Proc => Some(cx.pid_ns().owner.clone()),
+        Fs::Sys => Some(cx.ns().net.owner.clone()),
+        _ => None,
+    };
+    if owner.is_some_and(|o| !cx.cred().ns_capable(&o, cap::SYS_ADMIN)) {
+        return Err(Errno::EPERM);
+    }
+    let inherited = if matches!(fs, Fs::Proc | Fs::Sys) {
+        visible_locks(cx, fs, flags)?
+    } else {
+        0
+    };
     // cgroup2 can be mounted without read-only (crun does so when mounting /sys/fs/cgroup for a
     // container), and is then writable like the boot mount
     let vfs = cx.vfs()?;
@@ -216,6 +235,9 @@ fn new_mount(
         source.unwrap_or_default(),
         dev,
     );
+    if inherited != 0 {
+        vfs.update_mount(id, |m| m.locks = inherited);
+    }
     // Every devpts mount is a new instance (since 4.7) with its own set of terminals, numbered by
     // the newly allocated device number
     if let Some(opts) = devpts {
@@ -237,6 +259,43 @@ fn new_mount(
     }
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// Linux's `mount_too_revealing` for a new proc or sysfs mount with flags `flags`: in a mount
+/// namespace owned by a user namespace other than the initial one, the caller must already see the
+/// whole filesystem, through a mount of its root in its namespace whose locked read-only and
+/// access-time flags the new mount keeps and with no locked mount over anything but an empty
+/// mount-point directory (`mnt_already_visible`); otherwise a sandbox that hides or protects parts
+/// of `/proc` or `/sys` could be undone with a new instance. EPERM when there is none; else the
+/// locks the new mount takes over from it.
+fn visible_locks(cx: &Cx<'_>, fs: Fs, flags: u64) -> Result<u64, Errno> {
+    let ns = cx.t.fs.borrow().mnt_ns.clone();
+    if ns.owner.id == crate::cred::INIT_USER_NS {
+        return Ok(0);
+    }
+    let vfs = cx.vfs()?;
+    let mounts: Vec<Mount> = vfs.mounts().into_iter().filter(|m| m.ns == ns.id).collect();
+    let visible = mounts.iter().find(|m| {
+        m.fs == fs
+            && m.root == fs.root().in_mount(m.id)
+            && (m.locks & lock::READONLY == 0 || flags & ms::RDONLY != 0)
+            && (m.locks & lock::ATIME == 0 || m.flags & ATIME == flags & ATIME)
+            && !mounts.iter().any(|c| {
+                c.parent() == Some(m.id)
+                    && c.locks & lock::MOUNT != 0
+                    && !c.point.as_ref().is_some_and(empty_mount_point)
+            })
+    });
+    match visible {
+        Some(m) => Ok(m.locks & (lock::READONLY | lock::ATIME)),
+        None => Err(Errno::EPERM),
+    }
+}
+
+/// A directory of proc or sysfs that is always empty, made only to have something mounted on it
+/// (Linux's `is_empty_dir_inode`, from `sysfs_create_mount_point`): `/sys/fs/cgroup`.
+fn empty_mount_point(point: &Node) -> bool {
+    matches!(point, Node::Pseudo(_, p) if *p == crate::pseudo::CGROUP_POINT)
 }
 
 /// The parameters of a newly mounted tmpfs: defaults for what is not given (permissions 1777,
@@ -279,6 +338,9 @@ fn bind(
     // Unmounted mounts and mounts in other namespaces cannot be bound (Linux's check_mnt)
     check_mnt(cx, &vfs, src.mnt())?;
     check_mnt(cx, &vfs, target.mnt())?;
+    if !recursive && has_locked_children(&vfs, &view, &src) {
+        return Err(Errno::EINVAL);
+    }
     let m = vfs.mount(src.mnt()).ok_or(Errno::EINVAL)?;
     // Plan the copies of the mounts inside the source before mounting: if the target is inside the
     // source, the new mount is not copied into itself
@@ -296,9 +358,25 @@ fn bind(
     if !dir {
         vfs.set_root_at(id, found);
     }
+    // As in __do_loopback, the new mount keeps the source's locked flags but is not locked itself;
+    // the mounts copied below it keep their locks
+    vfs.update_mount(id, |n| n.locks = m.locks & !lock::MOUNT);
     vfs.add_copies(id, &plan);
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// Whether a mount locked in place ([`lock::MOUNT`]) is mounted on or under `src` in its mount
+/// (Linux's `has_locked_children`): binding `src` without the mounts inside would uncover what
+/// such a mount hides.
+fn has_locked_children(vfs: &Vfs, ps: &dyn Pseudo, src: &Node) -> bool {
+    vfs.children(src.mnt()).iter().any(|c| {
+        c.locks & lock::MOUNT != 0
+            && c.point.as_ref().is_some_and(|point| {
+                let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
+                point == src || vfs.is_under(ps, from, src)
+            })
+    })
 }
 
 /// Bind-mounts a namespace file (how `ip netns add` keeps a namespace alive): the mount holds
@@ -345,6 +423,16 @@ fn remount(
     let id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
     check_mnt(cx, &vfs, id)?;
     let m = vfs.mount(id).ok_or(Errno::EINVAL)?;
+    let flags = if keep_atime {
+        (flags & !ATIME) | (m.flags & ATIME)
+    } else {
+        flags
+    };
+    // Flags locked by a less privileged mount namespace stay (Linux's can_change_locked_flags,
+    // before the superblock is touched)
+    if !m.keeps_locked(flags) {
+        return Err(Errno::EPERM);
+    }
     // Without MS_BIND the superblock changes too: a tmpfs's size and inode count; on error the
     // mount's flags do not change either
     if let Some(data) = data
@@ -352,11 +440,6 @@ fn remount(
     {
         remount_tmpfs(&vfs, m.dev, data)?;
     }
-    let flags = if keep_atime {
-        (flags & !ATIME) | (m.flags & ATIME)
-    } else {
-        flags
-    };
     vfs.update_mount(id, |m| m.flags = flags);
     // Once the root filesystem becomes nosymfollow, resolution without the BKL is no longer
     // possible
@@ -595,8 +678,17 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
     let view = cx.view(&vfs);
     let file = if clone {
         check_mnt(cx, &vfs, node.mnt())?;
+        if flags & AT_RECURSIVE == 0 && has_locked_children(&vfs, &view, &node) {
+            return Err(Errno::EINVAL);
+        }
         let dir = vfs.is_dir(&view, &node)?;
-        let ns = vfs.anon_ns(cx.t.fs.borrow().mnt_ns.owner.clone());
+        // The anonymous namespace counts against max_mnt_namespaces too (alloc_mnt_ns)
+        let owner = cx.t.fs.borrow().mnt_ns.owner.clone();
+        let euid = cx.cred().euid;
+        super::ns::check_counts(cx.k(), &[Counted::Mnt], &owner, euid)?;
+        let ns = vfs.anon_ns(owner.clone());
+        super::ns::count(cx.k(), Counted::Mnt, &owner, euid, ns.clone());
+        let view = cx.view(&vfs);
         // Note the mounts inside the source before mounting (as in bind)
         let inside = if flags & AT_RECURSIVE != 0 {
             vfs.mounts()
@@ -759,13 +851,23 @@ pub(super) fn mount_setattr(
     } else {
         vec![id]
     };
+    let changed = |m: &Mount| {
+        let mut f = (m.flags & !clr_ms) | set_ms;
+        if let Some(a) = atime {
+            f = (f & !(ms::RELATIME | ms::NOATIME)) | a;
+        }
+        f
+    };
+    // Every mount is checked before any changes (mount_setattr_prepare): locked flags stay
+    if targets
+        .iter()
+        .filter_map(|&t| vfs.mount(t))
+        .any(|m| !m.keeps_locked(changed(&m)))
+    {
+        return Err(Errno::EPERM);
+    }
     for t in targets {
-        vfs.update_mount(t, |m| {
-            m.flags = (m.flags & !clr_ms) | set_ms;
-            if let Some(a) = atime {
-                m.flags = (m.flags & !(ms::RELATIME | ms::NOATIME)) | a;
-            }
-        });
+        vfs.update_mount(t, |m| m.flags = changed(m));
     }
     cx.shared.fast_changed();
     Ok(0)
@@ -837,6 +939,9 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     let (Some(new_mnt), Some(root_mnt)) = (vfs.mount(new.mnt()), vfs.mount(root.mnt())) else {
         return Err(Errno::EINVAL);
     };
+    if new_mnt.locks & lock::MOUNT != 0 {
+        return Err(Errno::EINVAL);
+    }
     // Deleted directories (d_unlinked)
     for node in [&new, &old] {
         if let Node::Store(_, ino) = node
@@ -860,6 +965,12 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     vfs.move_mount(new_mnt.id, None);
     vfs.move_mount(root_mnt.id, Some((old, None)));
     vfs.move_mount(new_mnt.id, root_mnt.point.map(|point| (point, root_mnt.at)));
+    // The lock moves with the root: the old root, now on put_old, can be unmounted (how
+    // sandboxes drop it), the new one cannot
+    if root_mnt.locks & lock::MOUNT != 0 {
+        vfs.update_mount(new_mnt.id, |m| m.locks |= lock::MOUNT);
+        vfs.update_mount(root_mnt.id, |m| m.locks &= !lock::MOUNT);
+    }
     for task in cx.kr().tasks.values() {
         let res = task.res.borrow();
         let mut fs = res.fs.borrow_mut();
@@ -888,6 +999,10 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     let node = vfs.mounted(node);
     let id = vfs.mount_root(&node).ok_or(Errno::EINVAL)?;
     check_mnt(cx, &vfs, id)?;
+    // A mount locked in place stays (Linux's can_umount)
+    if vfs.mount(id).is_some_and(|m| m.locks & lock::MOUNT != 0) {
+        return Err(Errno::EINVAL);
+    }
     let own_root = id == cx.root().mnt();
     let detach = flags & MNT_DETACH != 0;
     if flags & MNT_EXPIRE != 0 {
@@ -1043,6 +1158,9 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
         check_mnt(cx, &vfs, id)?;
     }
     check_mnt(cx, &vfs, target.mnt())?;
+    if vfs.mount(id).is_some_and(|m| m.locks & lock::MOUNT != 0) {
+        return Err(Errno::EINVAL);
+    }
     if vfs.is_dir(&view, src)? != vfs.is_dir(&view, &target)? {
         return Err(Errno::EINVAL);
     }
