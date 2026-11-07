@@ -88,7 +88,7 @@ refresh_rules() {
     fi
     if [ -n "$nopass" ] && [ -d "${rules%/*}" ]; then
         {
-            echo "# Written by appine at each login: administrators without a password ($admins)."
+            echo "# Written by Appine at each login: administrators without a password ($admins)."
             for u in $nopass; do
                 if [ "$group" = wheel ]; then
                     echo "permit nopass $u"
@@ -132,7 +132,7 @@ if ! grep -Fqsx -- "$user" "$admins"; then
         echo "$user" >>"$admins"
         fresh=1
     else
-        echo "appine: cannot add $user to the $group group; appine tries again at the next login" >&2
+        echo "appine: cannot add $user to the $group group; Appine tries again at the next login" >&2
     fi
 fi
 
@@ -169,9 +169,9 @@ if command -v "$tool" >/dev/null; then
     fi
 elif [ -n "$interrupted" ]; then
     # The progress line of the interrupted apt stopped halfway
-    printf '\nappine: skipped installing %s; appine tries again at the next login\n' "$tool" >&2
+    printf '\nappine: skipped installing %s; Appine tries again at the next login\n' "$tool" >&2
 elif [ ! -e "$installed" ]; then
-    echo "appine: $user is in the $group group, but $tool is not installed yet; appine tries again at the next login" >&2
+    echo "appine: $user is in the $group group, but $tool is not installed yet; Appine tries again at the next login" >&2
 fi
 
 refresh_rules

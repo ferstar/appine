@@ -209,7 +209,7 @@ internal object Rootfs {
         write(
             store, "/etc/motd",
             """
-            Welcome to appine: ${distro.label}, running inside an Android app.
+            Welcome to Appine: ${distro.label}, running inside an Android app.
 
             Install packages with ${install.substringBefore(' ')}, for example:  $install
 

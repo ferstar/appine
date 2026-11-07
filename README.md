@@ -1,4 +1,4 @@
-# appine
+# Appine
 
 Run Alpine Linux as Android App 🤖
 
@@ -69,7 +69,7 @@ The tests that need the internet run only with `APPINE_NETWORK_TESTS=1`.
 ### LTP
 
 The syscall tests of the [Linux Test Project](https://github.com/linux-test-project/ltp)
-are built natively in an `alpine` arm64 container and run inside appine, one fresh
+are built natively in an `alpine` arm64 container and run inside Appine, one fresh
 `appine-run` per test:
 
 ```sh
@@ -90,18 +90,18 @@ A bug in the kernel layer or the engine (a panic, or the engine faulting on host
 only the guest process that hit it in release builds, with a report on stderr; a panic in a
 `Machine` method called by the host only fails that call. Debug builds abort the whole
 `appine-run` instead, so the bug can be debugged where it happened; `APPINE_ON_BUG=kill` or
-`APPINE_ON_BUG=abort` overrides the default. When appine's anonymous memory exceeds
+`APPINE_ON_BUG=abort` overrides the default. When Appine's anonymous memory exceeds
 `--memory-limit` (default: half the RAM), the guest process using the most memory is killed
 with SIGKILL, like the Linux OOM killer.
 
 ### Differential tests
 
-`scripts/difftest` runs each script in `tests/diff` both in appine and in a native arm64
+`scripts/difftest` runs each script in `tests/diff` both in Appine and in a native arm64
 Docker container, and compares their output and exit status. The container runs without
 Docker's seccomp profile, which changes what some syscalls return (`clone3`, `pidfd_getfd`).
 Both sides run the same files: the first run creates a store in `target/difftest/store` (minirootfs plus python3,
 gcc, Lua, SQLite, Go, Node.js, OpenJDK 21, strace and gdb from `apk`, so it needs the internet), exports its
-root filesystem from appine and imports it as a Docker image. A store made before a package was
+root filesystem from Appine and imports it as a Docker image. A store made before a package was
 added lacks it: install the package into the store with `apk add`, or delete the store, and pass
 `-r` to export it again:
 
@@ -132,7 +132,7 @@ bugs inside the app process; they do nothing unless `APPINE_TEST_HOOKS=1` is set
 
 ## License
 
-appine is free software: you can redistribute it and/or modify it under the terms of the
+Appine is free software: you can redistribute it and/or modify it under the terms of the
 GNU Affero General Public License as published by the Free Software Foundation, either
 version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
 

@@ -302,7 +302,7 @@ class MachineTest {
         val shell = sh(machine, "awk -F: '\$1 == \"root\" { print \$7 }' /etc/passwd").first.trim()
         val out = login(machine, "echo shell=\$SHELL\nexit\n")
         assertTrue(out, out.contains("shell=$shell\n"))
-        assertTrue(out, out.contains("Welcome to appine"))
+        assertTrue(out, out.contains("Welcome to Appine"))
         assertEquals("" to 0, sh(machine, "sed -i '1s|:[^:]*\$|:/bin/ash|' /etc/passwd"))
         try {
             val changed = login(machine, "echo shell=\$SHELL\nexit\n")
@@ -1146,7 +1146,7 @@ class MachineTest {
         fun text(title: String) = index.first { it[0].startsWith(title) }
             .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
         val titles = index.map { it[0] }
-        assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
+        assertTrue(text("Appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
         assertTrue(text("Fuchsia Starnix").let { it.contains("The Fuchsia Authors") && it.contains("Redistribution and use") })
         assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
         for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {

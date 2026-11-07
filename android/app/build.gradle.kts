@@ -241,13 +241,13 @@ abstract class NoticesTask : DefaultTask() {
         fun text(name: String) = File(textDir, name).readText()
 
         entry(
-            "appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
+            "Appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
             wrap(APPINE_NOTICE) + "\n\n" + license.get().asFile.readText(),
         )
         // Code adapted into appine itself (core/kernel/src/tty.rs, which names the same commit)
         entry(
             "Fuchsia Starnix line discipline", "BSD-style · parts of the terminal line discipline", "fuchsia.txt",
-            "Parts of appine's terminal line discipline (the echo queue, erasing and output processing) are " +
+            "Parts of Appine's terminal line discipline (the echo queue, erasing and output processing) are " +
                 "adapted from the line discipline of Fuchsia's Starnix (https://fuchsia.googlesource.com/fuchsia/" +
                 "+/86962cb40d56e1a2bc033ead5b4c89bb02c34ca2/src/starnix/lib/line_discipline), " +
                 "Copyright 2025-2026 The Fuchsia Authors, used under this license:\n\n" + text("fuchsia-LICENSE"),
@@ -363,7 +363,7 @@ abstract class NoticesTask : DefaultTask() {
                 "https://gitlab.alpinelinux.org/alpine/aports/-/tree/<commit>/main/<origin>) together " +
                 "with the upstream sources that it names, which Alpine mirrors at " +
                 "https://distfiles.alpinelinux.org/distfiles/. The source code of the GPL-licensed packages " +
-                "is also published together with appine's source code at $SOURCE.",
+                "is also published together with Appine's source code at $SOURCE.",
             ) + "\n\n",
         )
         for ((p, v, l, o, c) in rows) body.append("$p $v\n    License: $l\n    aports: main/$o at $c\n")
@@ -489,7 +489,7 @@ abstract class NoticesTask : DefaultTask() {
         }
 
         val APPINE_NOTICE = """
-            appine
+            Appine
             Copyright (C) 2026 Matthew Lee
 
             This program is free software: you can redistribute it and/or modify it under the terms of
@@ -507,7 +507,7 @@ abstract class NoticesTask : DefaultTask() {
             The terminal emulator is libghostty-vt from Ghostty 1.4.0 (https://ghostty.org), built with
             Zig 0.17.0 and linked into the app's native library together with what it uses: uucode,
             simdutf, Highway and Wuffs (listed below) and Zig's compiler_rt. Their source code, as
-            built, is also published together with appine's source code at $SOURCE. Ghostty's license:
+            built, is also published together with Appine's source code at $SOURCE. Ghostty's license:
         """.trimIndent()
 
         val SQLITE_BLESSING = """

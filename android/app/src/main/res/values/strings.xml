@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name" translatable="false">appine</string>
+    <string name="app_name" translatable="false">Appine</string>
     <string name="starting">Starting…</string>
     <string name="preparing">Preparing %1$s…</string>
     <string name="downloading">Downloading %1$s… %2$d / %3$d MB</string>
@@ -14,7 +14,7 @@
     <string name="exit_all">Exit all</string>
     <string name="channel_network">Network services</string>
     <string name="listening_title">%1$s is listening on port %2$d</string>
-    <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use port %2$d on this phone, so appine moved it there.</string>
+    <string name="listening_mapped">Other devices connect to port %1$d: apps cannot use port %2$d on this phone, so Appine moved it there.</string>
     <string name="listening_direct">Other devices on the network can connect to it.</string>
     <string name="new_tab">New tab</string>
     <string name="close_tab">Close tab</string>
@@ -73,7 +73,7 @@
     <string name="allow_sleep">Allow sleep</string>
     <string name="kept_awake">%1$s · kept awake</string>
     <string name="settings_licenses">Open source licenses</string>
-    <string name="licenses_summary">appine is free software under the GNU AGPL 3.0 or later, and comes with no warranty. Copyright © 2026 Matthew Lee. Source code: github.com/mthli/appine</string>
+    <string name="licenses_summary">Appine is free software under the GNU AGPL 3.0 or later, and comes with no warranty. Copyright © 2026 Matthew Lee. Source code: github.com/mthli/appine</string>
     <string name="settings_login">Login account</string>
     <string name="login_auto_choice">Automatic (the first regular user, otherwise root)</string>
     <string name="login_auto_user">Automatic: %1$s (the first regular user)</string>
@@ -86,17 +86,17 @@
     <string name="ended_resources">The previous session ended because Android stopped the app for using too many resources in the background</string>
     <string name="ended_user">The previous session ended because the app was force-stopped</string>
     <string name="ended_updated">The previous session ended because the app was updated</string>
-    <string name="ended_crash">The previous session ended because appine crashed, a bug in appine</string>
-    <string name="ended_anr">The previous session ended because appine stopped responding, a bug in appine</string>
-    <string name="crashed_title">appine crashed</string>
-    <string name="crashed_text">The previous session ended at %1$s because appine crashed. This is a bug in appine; copy the report to include it in your feedback.</string>
-    <string name="anr_title">appine stopped responding</string>
-    <string name="anr_text">The previous session ended at %1$s because appine stopped responding. This is a bug in appine; copy the report to include it in your feedback.</string>
+    <string name="ended_crash">The previous session ended because Appine crashed, a bug in Appine</string>
+    <string name="ended_anr">The previous session ended because Appine stopped responding, a bug in Appine</string>
+    <string name="crashed_title">Appine crashed</string>
+    <string name="crashed_text">The previous session ended at %1$s because Appine crashed. This is a bug in Appine; copy the report to include it in your feedback.</string>
+    <string name="anr_title">Appine stopped responding</string>
+    <string name="anr_text">The previous session ended at %1$s because Appine stopped responding. This is a bug in Appine; copy the report to include it in your feedback.</string>
     <string name="channel_problems">Processes and services</string>
     <string name="killed_title">%1$s was killed</string>
     <string name="killed_oom_app">%1$s (pid %2$d) was killed: the app\'s memory reached its limit (%3$s of %4$s), and the out-of-memory killer chose it.</string>
     <string name="killed_oom_cgroup">%1$s (pid %2$d) was killed: cgroup %3$s reached its memory.max (%4$s of %5$s).</string>
-    <string name="killed_bug">%1$s (pid %2$d) was ended by an internal error in appine. This is a bug in appine; copy the report from the notification, or see it with dmesg.</string>
+    <string name="killed_bug">%1$s (pid %2$d) was ended by an internal error in Appine. This is a bug in Appine; copy the report from the notification, or see it with dmesg.</string>
     <string name="copy_report">Copy report</string>
     <string name="report_copied">Report copied</string>
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>

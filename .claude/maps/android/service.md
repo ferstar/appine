@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; last, how a killed run ended told in its restore notice and, for crashes, a notification)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; last, the app named Appine)
 
 ## Responsibilities
 
@@ -162,8 +162,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   bug. Bugs always notify with "copy report": app version
   and build, device (Android release and API, maker and model, ABI, page size), distro and tier
   (always 1 in a release build), the kernel's report line, and up to 10 earlier kernel log records.
-- Crashes of the last run: a crash (Java or native) or ANR record of the killed run posts "appine
-  crashed" or "appine stopped responding" with "copy report": the bug report's app, device, distro
+- Crashes of the last run: a crash (Java or native) or ANR record of the killed run posts "Appine
+  crashed" or "Appine stopped responding" with "copy report": the bug report's app, device, distro
   and tier lines and one line with the pid, the kind (with the signal for a native crash), the time
   in UTC and, for an ANR, Android's description.
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.

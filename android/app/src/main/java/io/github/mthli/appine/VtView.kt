@@ -946,7 +946,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     private fun copySelection() {
         val text = VtNative.copy(tab) ?: return
-        clipboard.setPrimaryClip(ClipData.newPlainText("appine", text))
+        clipboard.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.app_name), text))
         clearSelection()
     }
 
