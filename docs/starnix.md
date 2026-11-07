@@ -83,7 +83,7 @@ in the module maps, not here.
     ever longer binds and freezes every guest process; mounts inherited by a less privileged
     namespace are not locked; a UDP socket shut down for reading spins in recv; and a bind with
     `AF_UNSPEC` passed to the host oopses the development VM's Ubuntu kernel in AppArmor, leaving
-    Appine hung.
+    Appine hung. The first and the last are fixed (see "Taken so far").
 - **Not yet used:**
   - **kselftest**: mostly GPL, so download it at build time. Of 456 sources in the relevant
     directories, 311 pass a raw syntax check under musl. Of those directories, clone3,
@@ -111,11 +111,13 @@ in the module maps, not here.
 | cbf7267 | membarrier registrations survive fork |
 | 6591eb6 | Thread names shown as their bytes |
 | 566da95 | `RssAnon`, `RssFile` and `RssShmem` in `status` |
+| 0b2c3c8 | inet binds check the address family before the host sees it (the AF_UNSPEC oops) |
+| 0a4712e | `fs.mount-max`; recursive binds, unmounting and mount lists linear in the table size |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
-fix deviations the full run found.
+fix deviations the full runs found (0b2c3c8 and 0a4712e those of gVisor's).
 
 ## Not yet taken
 
