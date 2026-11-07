@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; last, API level 30 for the app and cargo-ndk)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; API level 30 for the app and cargo-ndk; last, panics caught by every JNI function)
 
 ## Responsibilities
 
@@ -72,11 +72,17 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 - `init` replaces fd 2 with a pipe read by a thread that writes lines to logcat (tag `appine`) and
   sets `APPINE_LOG` when verbose.
-- Panics are contained only where the kernel wraps the call (`host_call`, on whenever debug
-  assertions are off, which is always on Android); the JNI layer has no `catch_unwind`, so a panic
-  elsewhere aborts the app (unwinding out of `extern "system"`). Unwrapped: `Machine::wait`,
-  `try_wait`, `processes`, `take_power`, the wait loops of console reads and writes, `boot`,
-  `shutdown` and `kill_all`, `Machine`'s drop, `sync_store`, and the JNI code itself.
+- Panics are contained where the kernel wraps the call (`host_call`, on whenever debug assertions
+  are off, which is always on Android), which turns them into errors of the call. Everything else
+  (`Machine::wait`, `try_wait`, `processes`, `take_power`, the wait loops of console reads and
+  writes, `boot`, `shutdown` and `kill_all`, `Machine`'s drop, `sync_store`, and the JNI code
+  itself, `vt.rs` included) is caught by `guarded!`, which wraps the body of every JNI function in
+  `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a line names the
+  function, and the call returns a failure value (-1 for console reads, writes and int results,
+  -9 from `waitFor`, 0 from `processes` and `takePower`, null for objects); the functions Kotlin
+  declares `@Throws` also throw `IOException("internal error in …")` unless an exception is
+  already pending. Kernel state a panic left half changed (a poisoned lock, a held BKL) is not
+  repaired, so later calls may fail or wait.
 
 ### Build
 
@@ -160,6 +166,9 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the libghostty-vt
   terminal's functions).
 - The crate is empty on non-Android hosts; `build.rs` does nothing there.
+- Every JNI function's body goes in `guarded!` (with `throws env` when Kotlin declares `@Throws`);
+  the macro is defined before `mod vt` so `vt.rs` can use it, and its closure moves the parameters,
+  so a `return` inside returns from the body.
 - Zig's HTTP client fails through some proxies (HTTP 400), so `scripts/fetch-ghostty` and `build.rs`
   remove the proxy variables.
 - `build.rs` and `scripts/fetch-ghostty` pass the same `zig build` options and change together:
@@ -171,7 +180,6 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 ## Confirmed bugs / technical debt
 
-- **Panics outside the kernel's wrapped calls abort the app** (see the list above).
 - The release build is signed with the debug key and not minified; the Alpine tarball's checksum is
   checked only in `scripts/fetch-rootfs`.
 - Local references are never deleted in loops that build arrays (harmless with ART's large table
@@ -182,7 +190,7 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 ## Open questions
 
-- Should the JNI layer catch panics itself?
+none
 
 ## To verify
 

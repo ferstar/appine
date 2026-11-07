@@ -12,8 +12,9 @@
 //! end) are made by Kotlin on background threads. Kernel-layer bugs (panics) are meant to be caught
 //! inside the [`Machine`] methods and become errors of these calls, so that they do not cross the
 //! JNI boundary and abort the app process. Only the methods that wrap their work in the kernel's
-//! `host_call` do so: a panic in an unwrapped one (such as [`Machine::wait`] or the wait loops of
-//! console reads) or in this crate's own code still aborts the app.
+//! `host_call` do so; a panic in an unwrapped one (such as [`Machine::wait`] or the wait loops of
+//! console reads) or in this crate's own code is caught by every JNI function ([`guarded`]) and
+//! fails that call instead.
 //!
 //! Compiled only for Android; on other hosts it is an empty library.
 #![cfg(target_os = "android")]
@@ -30,7 +31,47 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
 use jni::sys::{jboolean, jbooleanArray, jbyteArray, jint, jlong, jobjectArray, jstring};
 
+/// Runs the body of a JNI function. A panic in it (a kernel-layer bug outside the calls the kernel
+/// wraps itself, or one in this crate) would unwind out of `extern "system"` and abort the app
+/// with every session in it; it is caught instead, logged to logcat after the panic message the
+/// panic hook writes to stderr, and the call returns `fallback`, which Kotlin takes as a failure of
+/// that call: an `IOException` with `throws env` (the functions Kotlin declares `@Throws`), an
+/// ended console or process, or an empty answer.
+macro_rules! guarded {
+    ($function:literal, $fallback:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || $body)) {
+            Ok(r) => r,
+            Err(_) => {
+                crate::panicked($function, None);
+                $fallback
+            }
+        }
+    };
+    ($function:literal, throws $env:ident, $fallback:expr, $body:block) => {{
+        let raw = $env.get_raw();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || $body)) {
+            Ok(r) => r,
+            Err(_) => {
+                crate::panicked($function, Some(raw));
+                $fallback
+            }
+        }
+    }};
+}
+
 mod vt;
+
+/// A JNI function's body panicked ([`guarded`]): logs it, and when Kotlin expects an exception
+/// from the call, throws one unless one is already pending.
+fn panicked(function: &str, env: Option<*mut jni::sys::JNIEnv>) {
+    eprintln!("appine: internal error in {function} (a panic, logged above); the call failed");
+    // SAFETY: the pointer is the JNIEnv this call was made with, on this thread
+    if let Some(Ok(mut env)) = env.map(|raw| unsafe { JNIEnv::from_raw(raw) })
+        && !env.exception_check().unwrap_or(true)
+    {
+        throw(&mut env, format!("internal error in {function}"));
+    }
+}
 
 /// Called before any other function: stderr goes to logcat, and with `verbose` the kernel layer's
 /// debug log is turned on.
@@ -40,11 +81,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_init<'l>(
     _: JClass<'l>,
     verbose: jboolean,
 ) {
-    redirect_stderr();
-    if verbose != 0 {
-        // SAFETY: set before the kernel layer is used; no other thread reads the environment yet
-        unsafe { std::env::set_var("APPINE_LOG", "1") };
-    }
+    guarded!("Native.init", (), {
+        redirect_stderr();
+        if verbose != 0 {
+            // SAFETY: set before the kernel layer is used; no other thread reads the environment yet
+            unsafe { std::env::set_var("APPINE_LOG", "1") };
+        }
+    })
 }
 
 /// Sends stderr (kernel-layer logs, internal errors) to logcat.
@@ -91,13 +134,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_importRootfs<'l>(
     store: JString<'l>,
     tarball: JString<'l>,
 ) {
-    let (Some(store), Some(tarball)) = (string(&mut env, &store), string(&mut env, &tarball))
-    else {
-        return;
-    };
-    if let Err(e) = appine_kernel::import_rootfs(store.as_ref(), tarball.as_ref()) {
-        throw(&mut env, format!("cannot import the rootfs: {e}"));
-    }
+    guarded!("Native.importRootfs", throws env, (), {
+        let (Some(store), Some(tarball)) = (string(&mut env, &store), string(&mut env, &tarball))
+        else {
+            return;
+        };
+        if let Err(e) = appine_kernel::import_rootfs(store.as_ref(), tarball.as_ref()) {
+            throw(&mut env, format!("cannot import the rootfs: {e}"));
+        }
+    })
 }
 
 /// Writes the store to disk (after an import and writing the configuration, before renaming it into
@@ -108,12 +153,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_syncRootfs<'l>(
     _: JClass<'l>,
     store: JString<'l>,
 ) {
-    let Some(store) = string(&mut env, &store) else {
-        return;
-    };
-    if let Err(e) = appine_kernel::sync_store(store.as_ref()) {
-        throw(&mut env, format!("cannot sync the rootfs: {e}"));
-    }
+    guarded!("Native.syncRootfs", throws env, (), {
+        let Some(store) = string(&mut env, &store) else {
+            return;
+        };
+        if let Err(e) = appine_kernel::sync_store(store.as_ref()) {
+            throw(&mut env, format!("cannot sync the rootfs: {e}"));
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -126,16 +173,18 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_writeFile<'l>(
     mode: jint,
     overwrite: jboolean,
 ) {
-    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
-        return;
-    };
-    let Ok(data) = env.convert_byte_array(&data) else {
-        return;
-    };
-    let r = appine_kernel::write_file(store.as_ref(), &path, &data, mode as u32, overwrite != 0);
-    if let Err(e) = r {
-        throw(&mut env, format!("cannot write {path}: {e}"));
-    }
+    guarded!("Native.writeFile", throws env, (), {
+        let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+            return;
+        };
+        let Ok(data) = env.convert_byte_array(&data) else {
+            return;
+        };
+        let r = appine_kernel::write_file(store.as_ref(), &path, &data, mode as u32, overwrite != 0);
+        if let Err(e) = r {
+            throw(&mut env, format!("cannot write {path}: {e}"));
+        }
+    })
 }
 
 /// Reads a regular file in the store (for the host to look at configuration files, such as listing
@@ -149,20 +198,22 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_readFile<'l>(
     store: JString<'l>,
     path: JString<'l>,
 ) -> jbyteArray {
-    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
-        return std::ptr::null_mut();
-    };
-    match appine_kernel::read_file(store.as_ref(), &path) {
-        Ok(data) => env
-            .byte_array_from_slice(&data)
-            .map(JByteArray::into_raw)
-            .unwrap_or(std::ptr::null_mut()),
-        Err(appine_kernel::errno::Errno::ENOENT) => std::ptr::null_mut(),
-        Err(e) => {
-            throw(&mut env, format!("cannot read {path}: {e}"));
-            std::ptr::null_mut()
+    guarded!("Native.readFile", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+            return std::ptr::null_mut();
+        };
+        match appine_kernel::read_file(store.as_ref(), &path) {
+            Ok(data) => env
+                .byte_array_from_slice(&data)
+                .map(JByteArray::into_raw)
+                .unwrap_or(std::ptr::null_mut()),
+            Err(appine_kernel::errno::Errno::ENOENT) => std::ptr::null_mut(),
+            Err(e) => {
+                throw(&mut env, format!("cannot read {path}: {e}"));
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 // ---- The host browsing the store (DocumentsProvider, the android/documents map) ----
@@ -187,22 +238,24 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseStat<'l>(
     store: JString<'l>,
     path: JString<'l>,
 ) -> jstring {
-    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        browse::stat(s, &browse::decode_path(&path))
-    });
-    match r {
-        Ok(st) => env
-            .new_string(stat_fields(&st))
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        Err(e) => {
-            not_found(&mut env, "find", &path, e);
-            std::ptr::null_mut()
+    guarded!("Native.browseStat", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse(store.as_ref(), |s| {
+            browse::stat(s, &browse::decode_path(&path))
+        });
+        match r {
+            Ok(st) => env
+                .new_string(stat_fields(&st))
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            Err(e) => {
+                not_found(&mut env, "find", &path, e);
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Lists a directory: each entry is `<name>\t<type>\t…`, with the name written by
@@ -214,25 +267,27 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseList<'l>(
     store: JString<'l>,
     dir: JString<'l>,
 ) -> jobjectArray {
-    let (Some(store), Some(dir)) = (string(&mut env, &store), string(&mut env, &dir)) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        browse::list(s, &browse::decode_path(&dir))
-    });
-    match r {
-        Ok(entries) => {
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|e| format!("{}\t{}", browse::encode_path(&e.name), stat_fields(&e.stat)))
-                .collect();
-            string_array(&mut env, &lines)
+    guarded!("Native.browseList", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(dir)) = (string(&mut env, &store), string(&mut env, &dir)) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse(store.as_ref(), |s| {
+            browse::list(s, &browse::decode_path(&dir))
+        });
+        match r {
+            Ok(entries) => {
+                let lines: Vec<String> = entries
+                    .iter()
+                    .map(|e| format!("{}\t{}", browse::encode_path(&e.name), stat_fields(&e.stat)))
+                    .collect();
+                string_array(&mut env, &lines)
+            }
+            Err(e) => {
+                not_found(&mut env, "list", &dir, e);
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            not_found(&mut env, "list", &dir, e);
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Opens a regular file for reading and returns the host fd (handed to
@@ -244,20 +299,22 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpen<'l>(
     store: JString<'l>,
     path: JString<'l>,
 ) -> jint {
-    use std::os::fd::IntoRawFd;
-    let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
-        return -1;
-    };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        browse::open(s, &browse::decode_path(&path))
-    });
-    match r {
-        Ok(file) => file.into_raw_fd(),
-        Err(e) => {
-            not_found(&mut env, "open", &path, e);
-            -1
+    guarded!("Native.browseOpen", throws env, -1, {
+        use std::os::fd::IntoRawFd;
+        let (Some(store), Some(path)) = (string(&mut env, &store), string(&mut env, &path)) else {
+            return -1;
+        };
+        let r = appine_kernel::browse(store.as_ref(), |s| {
+            browse::open(s, &browse::decode_path(&path))
+        });
+        match r {
+            Ok(file) => file.into_raw_fd(),
+            Err(e) => {
+                not_found(&mut env, "open", &path, e);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Whether the regular files at these paths look like text ([`browse::looks_like_text`]), all
@@ -270,36 +327,38 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSniff<'l>(
     store: JString<'l>,
     paths: JObjectArray<'l>,
 ) -> jbooleanArray {
-    /// The most files looked at in one call: each has to be opened on the host and 4 KB read, so a
-    /// big directory cannot go on forever.
-    const SNIFF_MAX: usize = 1000;
-    let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        Ok(paths
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let p = browse::decode_path(&String::from_utf8_lossy(p));
-                jboolean::from(i < SNIFF_MAX && browse::looks_like_text(s, &p))
-            })
-            .collect::<Vec<jboolean>>())
-    });
-    let texts = match r {
-        Ok(t) => t,
-        Err(e) => {
-            not_found(&mut env, "open", &store, e);
+    guarded!("Native.browseSniff", throws env, std::ptr::null_mut(), {
+        /// The most files looked at in one call: each has to be opened on the host and 4 KB read, so a
+        /// big directory cannot go on forever.
+        const SNIFF_MAX: usize = 1000;
+        let (Some(store), Some(paths)) = (string(&mut env, &store), strings(&mut env, &paths)) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse(store.as_ref(), |s| {
+            Ok(paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let p = browse::decode_path(&String::from_utf8_lossy(p));
+                    jboolean::from(i < SNIFF_MAX && browse::looks_like_text(s, &p))
+                })
+                .collect::<Vec<jboolean>>())
+        });
+        let texts = match r {
+            Ok(t) => t,
+            Err(e) => {
+                not_found(&mut env, "open", &store, e);
+                return std::ptr::null_mut();
+            }
+        };
+        let Ok(array) = env.new_boolean_array(texts.len() as jint) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_boolean_array_region(&array, 0, &texts).is_err() {
             return std::ptr::null_mut();
         }
-    };
-    let Ok(array) = env.new_boolean_array(texts.len() as jint) else {
-        return std::ptr::null_mut();
-    };
-    if env.set_boolean_array_region(&array, 0, &texts).is_err() {
-        return std::ptr::null_mut();
-    }
-    array.into_raw()
+        array.into_raw()
+    })
 }
 
 /// Searches by name under a directory (case-insensitive): each entry is `<path>\t<type>\t…`.
@@ -312,35 +371,37 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseSearch<'l>(
     query: JString<'l>,
     limit: jint,
 ) -> jobjectArray {
-    let (Some(store), Some(dir), Some(query)) = (
-        string(&mut env, &store),
-        string(&mut env, &dir),
-        string(&mut env, &query),
-    ) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse(store.as_ref(), |s| {
-        browse::search(
-            s,
-            &browse::decode_path(&dir),
-            &query,
-            limit.max(0) as usize,
-            SEARCH_BUDGET,
-        )
-    });
-    match r {
-        Ok(found) => {
-            let lines: Vec<String> = found
-                .iter()
-                .map(|(p, st)| format!("{}\t{}", browse::encode_path(p), stat_fields(st)))
-                .collect();
-            string_array(&mut env, &lines)
+    guarded!("Native.browseSearch", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(dir), Some(query)) = (
+            string(&mut env, &store),
+            string(&mut env, &dir),
+            string(&mut env, &query),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse(store.as_ref(), |s| {
+            browse::search(
+                s,
+                &browse::decode_path(&dir),
+                &query,
+                limit.max(0) as usize,
+                SEARCH_BUDGET,
+            )
+        });
+        match r {
+            Ok(found) => {
+                let lines: Vec<String> = found
+                    .iter()
+                    .map(|(p, st)| format!("{}\t{}", browse::encode_path(p), stat_fields(st)))
+                    .collect();
+                string_array(&mut env, &lines)
+            }
+            Err(e) => {
+                not_found(&mut env, "search", &dir, e);
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            not_found(&mut env, "search", &dir, e);
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 // Changes: all confined to `top` (the login account's home directory), judged by real path (see
@@ -362,35 +423,37 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseCreate<'l>(
     uid: jint,
     gid: jint,
 ) -> jstring {
-    let (Some(store), Some(top), Some(dir), Some(name)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &dir),
-        string(&mut env, &name),
-    ) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::create(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&dir),
-            name.as_bytes(),
-            directory != 0,
-            (uid as u32, gid as u32),
-            changes,
-        )
-    });
-    match r {
-        Ok(name) => env
-            .new_string(browse::encode_path(&name))
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        Err(e) => {
-            not_found(&mut env, "create in", &dir, e);
-            std::ptr::null_mut()
+    guarded!("Native.browseCreate", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(top), Some(dir), Some(name)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &dir),
+            string(&mut env, &name),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::create(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&dir),
+                name.as_bytes(),
+                directory != 0,
+                (uid as u32, gid as u32),
+                changes,
+            )
+        });
+        match r {
+            Ok(name) => env
+                .new_string(browse::encode_path(&name))
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            Err(e) => {
+                not_found(&mut env, "create in", &dir, e);
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Removes a file, a symbolic link or a whole directory tree.
@@ -402,24 +465,26 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRemove<'l>(
     top: JString<'l>,
     path: JString<'l>,
 ) {
-    let (Some(store), Some(top), Some(path)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-    ) else {
-        return;
-    };
-    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::remove(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            changes,
-        )
-    });
-    if let Err(e) = r {
-        not_found(&mut env, "delete", &path, e);
-    }
+    guarded!("Native.browseRemove", throws env, (), {
+        let (Some(store), Some(top), Some(path)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &path),
+        ) else {
+            return;
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::remove(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&path),
+                changes,
+            )
+        });
+        if let Err(e) = r {
+            not_found(&mut env, "delete", &path, e);
+        }
+    })
 }
 
 /// Renames within the same directory ([name] is the new name), without replacing.
@@ -432,33 +497,35 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseRename<'l>(
     path: JString<'l>,
     name: JString<'l>,
 ) -> jstring {
-    let (Some(store), Some(top), Some(path), Some(name)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-        string(&mut env, &name),
-    ) else {
-        return std::ptr::null_mut();
-    };
-    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::rename(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            name.as_bytes(),
-            changes,
-        )
-    });
-    match r {
-        Ok(()) => env
-            .new_string(browse::encode_path(name.as_bytes()))
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut()),
-        Err(e) => {
-            not_found(&mut env, "rename", &path, e);
-            std::ptr::null_mut()
+    guarded!("Native.browseRename", throws env, std::ptr::null_mut(), {
+        let (Some(store), Some(top), Some(path), Some(name)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &path),
+            string(&mut env, &name),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::rename(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&path),
+                name.as_bytes(),
+                changes,
+            )
+        });
+        match r {
+            Ok(()) => env
+                .new_string(browse::encode_path(name.as_bytes()))
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut()),
+            Err(e) => {
+                not_found(&mut env, "rename", &path, e);
+                std::ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Moves to another directory [to], keeping the name, without replacing.
@@ -471,26 +538,28 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseMove<'l>(
     path: JString<'l>,
     to: JString<'l>,
 ) {
-    let (Some(store), Some(top), Some(path), Some(to)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-        string(&mut env, &to),
-    ) else {
-        return;
-    };
-    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::move_to(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            &browse::decode_path(&to),
-            changes,
-        )
-    });
-    if let Err(e) = r {
-        not_found(&mut env, "move", &path, e);
-    }
+    guarded!("Native.browseMove", throws env, (), {
+        let (Some(store), Some(top), Some(path), Some(to)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &path),
+            string(&mut env, &to),
+        ) else {
+            return;
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::move_to(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&path),
+                &browse::decode_path(&to),
+                changes,
+            )
+        });
+        if let Err(e) = r {
+            not_found(&mut env, "move", &path, e);
+        }
+    })
 }
 
 /// Opens a regular file for reading and writing (truncating first with [truncate], opening with
@@ -505,31 +574,33 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseOpenWrite<'l>(
     truncate: jboolean,
     append: jboolean,
 ) -> jint {
-    use std::os::fd::IntoRawFd;
-    let (Some(store), Some(top), Some(path)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-    ) else {
-        return -1;
-    };
-    let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::open_write(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            truncate != 0,
-            append != 0,
-            changes,
-        )
-    });
-    match r {
-        Ok(file) => file.into_raw_fd(),
-        Err(e) => {
-            not_found(&mut env, "open", &path, e);
-            -1
+    guarded!("Native.browseOpenWrite", throws env, -1, {
+        use std::os::fd::IntoRawFd;
+        let (Some(store), Some(top), Some(path)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &path),
+        ) else {
+            return -1;
+        };
+        let r = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::open_write(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&path),
+                truncate != 0,
+                append != 0,
+                changes,
+            )
+        });
+        match r {
+            Ok(file) => file.into_raw_fd(),
+            Err(e) => {
+                not_found(&mut env, "open", &path, e);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// A file handed out by [browseOpenWrite] was closed: tells the running kernel it was written
@@ -543,21 +614,23 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_browseWritten<'l>(
     top: JString<'l>,
     path: JString<'l>,
 ) {
-    let (Some(store), Some(top), Some(path)) = (
-        string(&mut env, &store),
-        string(&mut env, &top),
-        string(&mut env, &path),
-    ) else {
-        return;
-    };
-    let _ = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
-        browse::written(
-            s,
-            &browse::decode_path(&top),
-            &browse::decode_path(&path),
-            changes,
-        )
-    });
+    guarded!("Native.browseWritten", (), {
+        let (Some(store), Some(top), Some(path)) = (
+            string(&mut env, &store),
+            string(&mut env, &top),
+            string(&mut env, &path),
+        ) else {
+            return;
+        };
+        let _ = appine_kernel::browse_changing(store.as_ref(), |s, changes| {
+            browse::written(
+                s,
+                &browse::decode_path(&top),
+                &browse::decode_path(&path),
+                changes,
+            )
+        });
+    })
 }
 
 fn stat_fields(st: &appine_kernel::vfs::store::Stat) -> String {
@@ -590,31 +663,33 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     store: JString<'l>,
     tier: jint,
 ) -> jlong {
-    let Some(store) = string(&mut env, &store) else {
-        return 0;
-    };
-    let options = MachineOptions {
-        tier: if tier == 1 {
-            Tier::Dbt
-        } else {
-            Tier::Interpreter
-        },
-        rootfs: Some(PathBuf::from(store)),
-        memory_limit: None,
-        low_port_offset: None,
-        always_map_low_ports: false,
-    };
-    match Machine::start(&options) {
-        Ok(m) => {
-            let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-            machines().insert(handle, Arc::new(m));
-            handle
+    guarded!("Native.start", throws env, 0, {
+        let Some(store) = string(&mut env, &store) else {
+            return 0;
+        };
+        let options = MachineOptions {
+            tier: if tier == 1 {
+                Tier::Dbt
+            } else {
+                Tier::Interpreter
+            },
+            rootfs: Some(PathBuf::from(store)),
+            memory_limit: None,
+            low_port_offset: None,
+            always_map_low_ports: false,
+        };
+        match Machine::start(&options) {
+            Ok(m) => {
+                let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+                machines().insert(handle, Arc::new(m));
+                handle
+            }
+            Err(e) => {
+                throw(&mut env, format!("cannot start: {e}"));
+                0
+            }
         }
-        Err(e) => {
-            throw(&mut env, format!("cannot start: {e}"));
-            0
-        }
-    }
+    })
 }
 
 /// Boots by `/etc/inittab` (the kernel/process map): blocks until the sysinit and wait commands
@@ -625,9 +700,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    if let Some(m) = machine(handle) {
-        m.boot();
-    }
+    guarded!("Native.boot", (), {
+        if let Some(m) = machine(handle) {
+            m.boot();
+        }
+    })
 }
 
 /// The host's default network changed: the routing table the guest sees becomes `routes` (each
@@ -640,22 +717,24 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
     handle: jlong,
     routes: JObject<'l>,
 ) {
-    let routes = if routes.is_null() {
-        None
-    } else {
-        let Some(lines) = strings(&mut env, &JObjectArray::from(routes)) else {
-            return;
+    guarded!("Native.setRoutes", (), {
+        let routes = if routes.is_null() {
+            None
+        } else {
+            let Some(lines) = strings(&mut env, &JObjectArray::from(routes)) else {
+                return;
+            };
+            Some(
+                lines
+                    .iter()
+                    .filter_map(|l| parse_route(std::str::from_utf8(l).ok()?))
+                    .collect(),
+            )
         };
-        Some(
-            lines
-                .iter()
-                .filter_map(|l| parse_route(std::str::from_utf8(l).ok()?))
-                .collect(),
-        )
-    };
-    if let Some(m) = machine(handle) {
-        m.set_routes(routes);
-    }
+        if let Some(m) = machine(handle) {
+            m.set_routes(routes);
+        }
+    })
 }
 
 /// One route passed in from `Native.kt`:
@@ -709,18 +788,20 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_openConsole<'l>(
     rows: jint,
     cols: jint,
 ) -> jint {
-    let (rows, cols) = (rows.clamp(1, 0xffff) as u16, cols.clamp(1, 0xffff) as u16);
-    let Some(m) = machine(handle) else {
-        throw(&mut env, "the machine is stopped");
-        return -1;
-    };
-    match m.open_console(rows, cols) {
-        Ok(id) => id as jint,
-        Err(e) => {
-            throw(&mut env, format!("cannot open a console: {e}"));
-            -1
+    guarded!("Native.openConsole", throws env, -1, {
+        let (rows, cols) = (rows.clamp(1, 0xffff) as u16, cols.clamp(1, 0xffff) as u16);
+        let Some(m) = machine(handle) else {
+            throw(&mut env, "the machine is stopped");
+            return -1;
+        };
+        match m.open_console(rows, cols) {
+            Ok(id) => id as jint,
+            Err(e) => {
+                throw(&mut env, format!("cannot open a console: {e}"));
+                -1
+            }
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -733,25 +814,27 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_spawn<'l>(
     argv: JObjectArray<'l>,
     envp: JObjectArray<'l>,
 ) -> jint {
-    let Some(program) = string(&mut env, &program) else {
-        return -1;
-    };
-    let (Some(argv), Some(envp)) = (strings(&mut env, &argv), strings(&mut env, &envp)) else {
-        return -1;
-    };
-    // Negative: no console, use the host's stdin/stdout/stderr (for the app, /dev/null and logcat)
-    let stdio = u32::try_from(console).map_or(Stdio::Host, Stdio::Console);
-    let Some(m) = machine(handle) else {
-        throw(&mut env, "the machine is stopped");
-        return -1;
-    };
-    match m.spawn(program.as_bytes(), &argv, &envp, stdio) {
-        Ok(pid) => pid as jint,
-        Err(e) => {
-            throw(&mut env, format!("{program}: {e}"));
-            -1
+    guarded!("Native.spawn", throws env, -1, {
+        let Some(program) = string(&mut env, &program) else {
+            return -1;
+        };
+        let (Some(argv), Some(envp)) = (strings(&mut env, &argv), strings(&mut env, &envp)) else {
+            return -1;
+        };
+        // Negative: no console, use the host's stdin/stdout/stderr (for the app, /dev/null and logcat)
+        let stdio = u32::try_from(console).map_or(Stdio::Host, Stdio::Console);
+        let Some(m) = machine(handle) else {
+            throw(&mut env, "the machine is stopped");
+            return -1;
+        };
+        match m.spawn(program.as_bytes(), &argv, &envp, stdio) {
+            Ok(pid) => pid as jint,
+            Err(e) => {
+                throw(&mut env, format!("{program}: {e}"));
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Reads console output: returns the number of bytes read, 0 when the session ended, -1 when the
@@ -764,24 +847,26 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_read<'l>(
     console: jint,
     buffer: JByteArray<'l>,
 ) -> jint {
-    let Ok(len) = env.get_array_length(&buffer) else {
-        return -1;
-    };
-    let Some(m) = machine(handle) else {
-        return -1;
-    };
-    let mut buf = vec![0u8; len as usize];
-    match m.read_console(console as u32, &mut buf) {
-        Ok(n) => {
-            // SAFETY: u8 and i8 have the same layout
-            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n) };
-            match env.set_byte_array_region(&buffer, 0, bytes) {
-                Ok(()) => n as jint,
-                Err(_) => -1,
+    guarded!("Native.read", -1, {
+        let Ok(len) = env.get_array_length(&buffer) else {
+            return -1;
+        };
+        let Some(m) = machine(handle) else {
+            return -1;
+        };
+        let mut buf = vec![0u8; len as usize];
+        match m.read_console(console as u32, &mut buf) {
+            Ok(n) => {
+                // SAFETY: u8 and i8 have the same layout
+                let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), n) };
+                match env.set_byte_array_region(&buffer, 0, bytes) {
+                    Ok(()) => n as jint,
+                    Err(_) => -1,
+                }
             }
+            Err(_) => -1,
         }
-        Err(_) => -1,
-    }
+    })
 }
 
 /// Input to a console: returns the number of bytes written, -1 when the session ended or the
@@ -796,26 +881,28 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_write<'l>(
     offset: jint,
     length: jint,
 ) -> jint {
-    let mut data = vec![0i8; length.max(0) as usize];
-    if env
-        .get_byte_array_region(&buffer, offset, &mut data)
-        .is_err()
-    {
-        return -1;
-    }
-    // SAFETY: u8 and i8 have the same layout
-    let data = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len()) };
-    let Some(m) = machine(handle) else {
-        return -1;
-    };
-    let mut done = 0;
-    while done < data.len() {
-        match m.write_console(console as u32, &data[done..]) {
-            Ok(n) => done += n,
-            Err(_) => return -1,
+    guarded!("Native.write", -1, {
+        let mut data = vec![0i8; length.max(0) as usize];
+        if env
+            .get_byte_array_region(&buffer, offset, &mut data)
+            .is_err()
+        {
+            return -1;
         }
-    }
-    done as jint
+        // SAFETY: u8 and i8 have the same layout
+        let data = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len()) };
+        let Some(m) = machine(handle) else {
+            return -1;
+        };
+        let mut done = 0;
+        while done < data.len() {
+            match m.write_console(console as u32, &data[done..]) {
+                Ok(n) => done += n,
+                Err(_) => return -1,
+            }
+        }
+        done as jint
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -827,13 +914,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_resize<'l>(
     rows: jint,
     cols: jint,
 ) {
-    if let Some(m) = machine(handle) {
-        let _ = m.resize_console(
-            console as u32,
-            rows.clamp(1, 0xffff) as u16,
-            cols.clamp(1, 0xffff) as u16,
-        );
-    }
+    guarded!("Native.resize", (), {
+        if let Some(m) = machine(handle) {
+            let _ = m.resize_console(
+                console as u32,
+                rows.clamp(1, 0xffff) as u16,
+                cols.clamp(1, 0xffff) as u16,
+            );
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -843,9 +932,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_closeConsole<'l>(
     handle: jlong,
     console: jint,
 ) {
-    if let Some(m) = machine(handle) {
-        let _ = m.close_console(console as u32);
-    }
+    guarded!("Native.closeConsole", (), {
+        if let Some(m) = machine(handle) {
+            let _ = m.close_console(console as u32);
+        }
+    })
 }
 
 /// Waits for a process to end: returns the exit code, or the negated signal number when a signal
@@ -858,13 +949,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     handle: jlong,
     pid: jint,
 ) -> jint {
-    let Some(m) = machine(handle) else {
-        return -9;
-    };
-    match m.wait(pid as u32) {
-        ExitStatus::Exited(code) => code,
-        ExitStatus::Signaled { signal, .. } => -signal.number(),
-    }
+    guarded!("Native.waitFor", -9, {
+        let Some(m) = machine(handle) else {
+            return -9;
+        };
+        match m.wait(pid as u32) {
+            ExitStatus::Exited(code) => code,
+            ExitStatus::Signaled { signal, .. } => -signal.number(),
+        }
+    })
 }
 
 /// The current directory of the console's foreground process group (for restoring tabs after the
@@ -877,12 +970,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(
     handle: jlong,
     console: jint,
 ) -> jstring {
-    let Some(path) = machine(handle).and_then(|m| m.console_cwd(console as u32).ok()) else {
-        return std::ptr::null_mut();
-    };
-    env.new_string(String::from_utf8_lossy(&path))
-        .map(JString::into_raw)
-        .unwrap_or(std::ptr::null_mut())
+    guarded!("Native.consoleCwd", std::ptr::null_mut(), {
+        let Some(path) = machine(handle).and_then(|m| m.console_cwd(console as u32).ok()) else {
+            return std::ptr::null_mut();
+        };
+        env.new_string(String::from_utf8_lossy(&path))
+            .map(JString::into_raw)
+            .unwrap_or(std::ptr::null_mut())
+    })
 }
 
 /// Takes the ports the guest listened on for the first time on a non-loopback address (design doc
@@ -894,23 +989,26 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jobjectArray {
-    let events = machine(handle)
-        .map(|m| m.take_listens())
-        .unwrap_or_default();
-    let Ok(array) = env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    for (i, e) in events.iter().enumerate() {
-        let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
-        let Ok(s) = env.new_string(line) else {
+    guarded!("Native.takeListens", std::ptr::null_mut(), {
+        let events = machine(handle)
+            .map(|m| m.take_listens())
+            .unwrap_or_default();
+        let Ok(array) =
+            env.new_object_array(events.len() as jint, "java/lang/String", JObject::null())
+        else {
             return std::ptr::null_mut();
         };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
-            return std::ptr::null_mut();
+        for (i, e) in events.iter().enumerate() {
+            let line = format!("{}\t{}\t{}", e.comm, e.port, e.host_port);
+            let Ok(s) = env.new_string(line) else {
+                return std::ptr::null_mut();
+            };
+            if env.set_object_array_element(&array, i as jint, s).is_err() {
+                return std::ptr::null_mut();
+            }
         }
-    }
-    array.into_raw()
+        array.into_raw()
+    })
 }
 
 /// Takes the guest processes the kernel layer ended (kernel bug, engine fault, OOM killer): each
@@ -924,37 +1022,40 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jobjectArray {
-    let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
-    let Ok(array) = env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
-    for (i, k) in kills.iter().enumerate() {
-        let console = k.console.map_or(-1, i64::from);
-        let tail = match &k.reason {
-            appine_kernel::KillReason::Bug { report, log } => {
-                let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
-                format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
+    guarded!("Native.takeKills", std::ptr::null_mut(), {
+        let kills = machine(handle).map(|m| m.take_kills()).unwrap_or_default();
+        let Ok(array) =
+            env.new_object_array(kills.len() as jint, "java/lang/String", JObject::null())
+        else {
+            return std::ptr::null_mut();
+        };
+        let clean = |s: &str| s.replace(['\t', '\n', '\r', '\u{1e}'], " ");
+        for (i, k) in kills.iter().enumerate() {
+            let console = k.console.map_or(-1, i64::from);
+            let tail = match &k.reason {
+                appine_kernel::KillReason::Bug { report, log } => {
+                    let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
+                    format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
+                }
+                appine_kernel::KillReason::OutOfMemory {
+                    cgroup,
+                    used,
+                    limit,
+                } => format!(
+                    "oom\t{}\t{used}\t{limit}",
+                    clean(cgroup.as_deref().unwrap_or(""))
+                ),
+            };
+            let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
+            let Ok(s) = env.new_string(line) else {
+                return std::ptr::null_mut();
+            };
+            if env.set_object_array_element(&array, i as jint, s).is_err() {
+                return std::ptr::null_mut();
             }
-            appine_kernel::KillReason::OutOfMemory {
-                cgroup,
-                used,
-                limit,
-            } => format!(
-                "oom\t{}\t{used}\t{limit}",
-                clean(cgroup.as_deref().unwrap_or(""))
-            ),
-        };
-        let line = format!("{console}\t{}\t{}\t{tail}", k.pid, clean(&k.comm));
-        let Ok(s) = env.new_string(line) else {
-            return std::ptr::null_mut();
-        };
-        if env.set_object_array_element(&array, i as jint, s).is_err() {
-            return std::ptr::null_mut();
         }
-    }
-    array.into_raw()
+        array.into_raw()
+    })
 }
 
 /// Takes the guest's power request (busybox's reboot, halt, poweroff): 0 none, 1 reboot, 2 halt,
@@ -965,12 +1066,14 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takePower<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jint {
-    match machine(handle).and_then(|m| m.take_power()) {
-        None => 0,
-        Some(Power::Reboot) => 1,
-        Some(Power::Halt) => 2,
-        Some(Power::PowerOff) => 3,
-    }
+    guarded!("Native.takePower", 0, {
+        match machine(handle).and_then(|m| m.take_power()) {
+            None => 0,
+            Some(Power::Reboot) => 1,
+            Some(Power::Halt) => 2,
+            Some(Power::PowerOff) => 3,
+        }
+    })
 }
 
 /// Number of guest processes still running (not counting init).
@@ -980,7 +1083,9 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jint {
-    machine(handle).map_or(0, |m| m.processes() as jint)
+    guarded!("Native.processes", 0, {
+        machine(handle).map_or(0, |m| m.processes() as jint)
+    })
 }
 
 /// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
@@ -991,13 +1096,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeChangedDirs<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jobjectArray {
-    let dirs: Vec<String> = machine(handle)
-        .map(|m| m.take_changed_dirs())
-        .unwrap_or_default()
-        .iter()
-        .map(|d| browse::encode_path(d))
-        .collect();
-    string_array(&mut env, &dirs)
+    guarded!("Native.takeChangedDirs", std::ptr::null_mut(), {
+        let dirs: Vec<String> = machine(handle)
+            .map(|m| m.take_changed_dirs())
+            .unwrap_or_default()
+            .iter()
+            .map(|d| browse::encode_path(d))
+            .collect();
+        string_array(&mut env, &dirs)
+    })
 }
 
 /// The host is short of memory: drop caches that can be rebuilt (translations kept in the pool and
@@ -1008,9 +1115,11 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_trimMemory<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    if let Some(m) = machine(handle) {
-        m.trim_memory();
-    }
+    guarded!("Native.trimMemory", (), {
+        if let Some(m) = machine(handle) {
+            m.trim_memory();
+        }
+    })
 }
 
 /// Shuts down ([`Machine::shutdown`]): runs the shutdown commands in inittab, sends SIGTERM to all
@@ -1022,13 +1131,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_shutdown<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    if let Some(m) = machine(handle) {
-        m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
-    }
-    // Dropped only after the table's lock is released: when this is the last reference, Machine's
-    // drop syncs the store and joins threads, and every other call would wait for it
-    let m = machines().remove(&handle);
-    drop(m);
+    guarded!("Native.shutdown", (), {
+        if let Some(m) = machine(handle) {
+            m.shutdown(Power::PowerOff, appine_kernel::SHUTDOWN_TIMEOUT);
+        }
+        // Dropped only after the table's lock is released: when this is the last reference, Machine's
+        // drop syncs the store and joins threads, and every other call would wait for it
+        let m = machines().remove(&handle);
+        drop(m);
+    })
 }
 
 /// Ends all guest processes and removes the handle from the table.
@@ -1038,11 +1149,13 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_stop<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    // Remove first, then kill: kill_all waits, so the table's lock must not be held
-    let m = machines().remove(&handle);
-    if let Some(m) = m {
-        m.kill_all();
-    }
+    guarded!("Native.stop", (), {
+        // Remove first, then kill: kill_all waits, so the table's lock must not be held
+        let m = machines().remove(&handle);
+        if let Some(m) = m {
+            m.kill_all();
+        }
+    })
 }
 
 /// The Machine of a handle, holding a reference for the duration of the call; None once stopped.

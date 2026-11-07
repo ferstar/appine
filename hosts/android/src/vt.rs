@@ -178,27 +178,29 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
     cell_width: jint,
     cell_height: jint,
 ) -> jlong {
-    if machine(handle).is_none() {
-        throw(&mut env, "the machine is stopped");
-        return 0;
-    }
-    let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
-    let raw = unsafe { appine_vt_new(cols, rows, cw, ch) };
-    if raw.is_null() {
-        throw(&mut env, "cannot create a terminal");
-        return 0;
-    }
-    let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
-    let tab = Tab {
-        machine: handle,
-        console: console as u32,
-        term: Mutex::new(Term(raw)),
-        dirty: AtomicBool::new(false),
-    };
-    TABS.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(id, Arc::new(tab));
-    id
+    guarded!("VtNative.create", 0, {
+        if machine(handle).is_none() {
+            throw(&mut env, "the machine is stopped");
+            return 0;
+        }
+        let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
+        let raw = unsafe { appine_vt_new(cols, rows, cw, ch) };
+        if raw.is_null() {
+            throw(&mut env, "cannot create a terminal");
+            return 0;
+        }
+        let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
+        let tab = Tab {
+            machine: handle,
+            console: console as u32,
+            term: Mutex::new(Term(raw)),
+            dirty: AtomicBool::new(false),
+        };
+        TABS.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, Arc::new(tab));
+        id
+    })
 }
 
 /// Shows bytes from the app itself (not the program) as if the console had printed them; replies
@@ -210,11 +212,13 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
     handle: jlong,
     data: JByteArray<'l>,
 ) {
-    let Some(tab) = tab(handle) else { return };
-    let Ok(data) = env.convert_byte_array(&data) else {
-        return;
-    };
-    tab.term().feed(&data);
+    guarded!("VtNative.print", (), {
+        let Some(tab) = tab(handle) else { return };
+        let Ok(data) = env.convert_byte_array(&data) else {
+            return;
+        };
+        tab.term().feed(&data);
+    })
 }
 
 /// Moves the console's output into the terminal until the session ends or the console is closed;
@@ -227,34 +231,36 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     handle: jlong,
     session: JObject<'l>,
 ) {
-    let Some(tab) = tab(handle) else { return };
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        // Looked up again for every read, so the kernel is not kept once the service stops it
-        let Some(m) = tab.machine() else { break };
-        let n = match m.read_console(tab.console, &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        let (replies, titled) = {
-            let mut term = tab.term();
-            let replies = term.feed(&buf[..n]);
-            (replies, unsafe { appine_vt_take_title_changed(term.0) })
-        };
-        // A program waiting for an answer (DA, DSR) does not read further until it comes
-        if !replies.is_empty() && !tab.write(&m, &replies) {
-            break;
+    guarded!("VtNative.pump", (), {
+        let Some(tab) = tab(handle) else { return };
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            // Looked up again for every read, so the kernel is not kept once the service stops it
+            let Some(m) = tab.machine() else { break };
+            let n = match m.read_console(tab.console, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let (replies, titled) = {
+                let mut term = tab.term();
+                let replies = term.feed(&buf[..n]);
+                (replies, unsafe { appine_vt_take_title_changed(term.0) })
+            };
+            // A program waiting for an answer (DA, DSR) does not read further until it comes
+            if !replies.is_empty() && !tab.write(&m, &replies) {
+                break;
+            }
+            // Not kept across the calls into Java either
+            drop(m);
+            let output = !tab.dirty.swap(true, Ordering::AcqRel);
+            if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
+                || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
+            {
+                let _ = env.exception_clear();
+                break;
+            }
         }
-        // Not kept across the calls into Java either
-        drop(m);
-        let output = !tab.dirty.swap(true, Ordering::AcqRel);
-        if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
-            || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
-        {
-            let _ = env.exception_clear();
-            break;
-        }
-    }
+    })
 }
 
 /// The title a program set (OSC 0/2); null when none.
@@ -264,13 +270,15 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jstring {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let term = tab.term();
-    let mut len = 0;
-    let p = unsafe { appine_vt_title(term.0, &mut len) };
-    term.text(&mut env, p, len)
+    guarded!("VtNative.title", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let term = tab.term();
+        let mut len = 0;
+        let p = unsafe { appine_vt_title(term.0, &mut len) };
+        term.text(&mut env, p, len)
+    })
 }
 
 /// Captures a frame (vt.c's format) of the rows that changed, or of all rows with `full`. The
@@ -282,20 +290,22 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_frame<'l>(
     handle: jlong,
     full: jboolean,
 ) -> jobject {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    tab.dirty.store(false, Ordering::Release);
-    let mut len = 0;
-    let p = unsafe { appine_vt_frame(tab.term().0, full != 0, &mut len) };
-    if p.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: vt.c keeps the frame until the next appine_vt_frame call (above)
-    match unsafe { env.new_direct_byte_buffer(p as *mut u8, len) } {
-        Ok(b) => b.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    guarded!("VtNative.frame", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        tab.dirty.store(false, Ordering::Release);
+        let mut len = 0;
+        let p = unsafe { appine_vt_frame(tab.term().0, full != 0, &mut len) };
+        if p.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: vt.c keeps the frame until the next appine_vt_frame call (above)
+        match unsafe { env.new_direct_byte_buffer(p as *mut u8, len) } {
+            Ok(b) => b.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Resizes the terminal and then the console (whose foreground group gets SIGWINCH).
@@ -309,12 +319,14 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_resize<'l>(
     cell_width: jint,
     cell_height: jint,
 ) {
-    let Some(tab) = tab(handle) else { return };
-    let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
-    unsafe { appine_vt_resize(tab.term().0, cols, rows, cw, ch) };
-    if let Some(m) = tab.machine() {
-        let _ = m.resize_console(tab.console, rows, cols);
-    }
+    guarded!("VtNative.resize", (), {
+        let Some(tab) = tab(handle) else { return };
+        let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
+        unsafe { appine_vt_resize(tab.term().0, cols, rows, cw, ch) };
+        if let Some(m) = tab.machine() {
+            let _ = m.resize_console(tab.console, rows, cols);
+        }
+    })
 }
 
 fn size(cols: jint, rows: jint, cell_width: jint, cell_height: jint) -> (u16, u16, u32, u32) {
@@ -341,34 +353,36 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_key<'l>(
     text: JString<'l>,
     unshifted: jint,
 ) -> jbyteArray {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let text = if text.is_null() {
-        String::new()
-    } else {
-        string(&mut env, &text).unwrap_or_default()
-    };
-    let mut out = [0 as c_char; 128];
-    let n = unsafe {
-        appine_vt_key(
-            tab.term().0,
-            key,
-            mods as u16,
-            consumed as u16,
-            action,
-            if text.is_empty() {
-                std::ptr::null()
-            } else {
-                text.as_ptr().cast()
-            },
-            text.len(),
-            unshifted as u32,
-            out.as_mut_ptr(),
-            out.len(),
-        )
-    };
-    encoded(&mut env, &out, n)
+    guarded!("VtNative.key", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let text = if text.is_null() {
+            String::new()
+        } else {
+            string(&mut env, &text).unwrap_or_default()
+        };
+        let mut out = [0 as c_char; 128];
+        let n = unsafe {
+            appine_vt_key(
+                tab.term().0,
+                key,
+                mods as u16,
+                consumed as u16,
+                action,
+                if text.is_empty() {
+                    std::ptr::null()
+                } else {
+                    text.as_ptr().cast()
+                },
+                text.len(),
+                unshifted as u32,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        encoded(&mut env, &out, n)
+    })
 }
 
 /// Pastes clipboard text as the terminal's modes ask (bracketed paste, line breaks, unsafe
@@ -383,21 +397,23 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_paste<'l>(
     text: JString<'l>,
     allow_unsafe: jboolean,
 ) -> jbyteArray {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let Some(text) = string(&mut env, &text) else {
-        return std::ptr::null_mut();
-    };
-    let bytes = {
-        let mut term = tab.term();
-        match unsafe { appine_vt_paste(term.0, text.as_ptr(), text.len(), allow_unsafe != 0) } {
-            0 => term.take_replies(),
-            1 => return std::ptr::null_mut(),
-            _ => Vec::new(),
-        }
-    };
-    bytes_array(&mut env, &bytes)
+    guarded!("VtNative.paste", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let Some(text) = string(&mut env, &text) else {
+            return std::ptr::null_mut();
+        };
+        let bytes = {
+            let mut term = tab.term();
+            match unsafe { appine_vt_paste(term.0, text.as_ptr(), text.len(), allow_unsafe != 0) } {
+                0 => term.take_replies(),
+                1 => return std::ptr::null_mut(),
+                _ => Vec::new(),
+            }
+        };
+        bytes_array(&mut env, &bytes)
+    })
 }
 
 /// Encodes a mouse event at pixel (`x`, `y`) of the grid; empty when the program does not take
@@ -416,24 +432,26 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouse<'l>(
     y: jfloat,
     pressed: jboolean,
 ) -> jbyteArray {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let mut out = [0 as c_char; 64];
-    let n = unsafe {
-        appine_vt_mouse(
-            tab.term().0,
-            action,
-            button,
-            mods as u16,
-            x,
-            y,
-            pressed != 0,
-            out.as_mut_ptr(),
-            out.len(),
-        )
-    };
-    encoded(&mut env, &out, n)
+    guarded!("VtNative.mouse", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let mut out = [0 as c_char; 64];
+        let n = unsafe {
+            appine_vt_mouse(
+                tab.term().0,
+                action,
+                button,
+                mods as u16,
+                x,
+                y,
+                pressed != 0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        encoded(&mut env, &out, n)
+    })
 }
 
 /// Encodes focus gained or lost; empty when the program did not ask for focus events.
@@ -444,12 +462,14 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_focus<'l>(
     handle: jlong,
     gained: jboolean,
 ) -> jbyteArray {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let mut out = [0 as c_char; 16];
-    let n = unsafe { appine_vt_focus(tab.term().0, gained != 0, out.as_mut_ptr(), out.len()) };
-    encoded(&mut env, &out, n)
+    guarded!("VtNative.focus", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let mut out = [0 as c_char; 16];
+        let n = unsafe { appine_vt_focus(tab.term().0, gained != 0, out.as_mut_ptr(), out.len()) };
+        encoded(&mut env, &out, n)
+    })
 }
 
 /// The first `n` bytes of an encoder's output, null when it failed (`n` < 0).
@@ -476,9 +496,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_scroll<'l>(
     handle: jlong,
     delta: jint,
 ) {
-    if let Some(tab) = tab(handle) {
-        unsafe { appine_vt_scroll(tab.term().0, delta) };
-    }
+    guarded!("VtNative.scroll", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_scroll(tab.term().0, delta) };
+        }
+    })
 }
 
 /// Selects the word at viewport cell (`x`, `y`) and anchors drags to it; false when there is no
@@ -491,8 +513,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectWord<'l>(
     x: jint,
     y: jint,
 ) -> jboolean {
-    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_word(tab.term().0, cell(x), cell(y)) })
-        as jboolean
+    guarded!("VtNative.selectWord", 0, {
+        tab(handle)
+            .is_some_and(|tab| unsafe { appine_vt_select_word(tab.term().0, cell(x), cell(y)) })
+            as jboolean
+    })
 }
 
 /// Starts dragging the handle of the selection's last cell (`end`) or first cell: the other
@@ -504,8 +529,10 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectGrab<'l>(
     handle: jlong,
     end: jboolean,
 ) -> jboolean {
-    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_grab(tab.term().0, end != 0) })
-        as jboolean
+    guarded!("VtNative.selectGrab", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_select_grab(tab.term().0, end != 0) })
+            as jboolean
+    })
 }
 
 /// Extends the selection from its anchor to viewport cell (`x`, `y`).
@@ -517,8 +544,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectTo<'l>(
     x: jint,
     y: jint,
 ) -> jboolean {
-    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_to(tab.term().0, cell(x), cell(y)) })
-        as jboolean
+    guarded!("VtNative.selectTo", 0, {
+        tab(handle)
+            .is_some_and(|tab| unsafe { appine_vt_select_to(tab.term().0, cell(x), cell(y)) })
+            as jboolean
+    })
 }
 
 /// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
@@ -533,7 +563,9 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectAll<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jboolean {
-    tab(handle).is_some_and(|tab| unsafe { appine_vt_select_all(tab.term().0) }) as jboolean
+    guarded!("VtNative.selectAll", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_select_all(tab.term().0) }) as jboolean
+    })
 }
 
 /// Clears the selection.
@@ -543,9 +575,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectClear<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    if let Some(tab) = tab(handle) {
-        unsafe { appine_vt_select_clear(tab.term().0) };
-    }
+    guarded!("VtNative.selectClear", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_select_clear(tab.term().0) };
+        }
+    })
 }
 
 /// The selection as plain text (soft wraps joined, trailing blanks trimmed); null when there is
@@ -556,13 +590,15 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_copy<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jstring {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let term = tab.term();
-    let mut len = 0;
-    let p = unsafe { appine_vt_copy(term.0, &mut len) };
-    term.text(&mut env, p, len)
+    guarded!("VtNative.copy", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let term = tab.term();
+        let mut len = 0;
+        let p = unsafe { appine_vt_copy(term.0, &mut len) };
+        term.text(&mut env, p, len)
+    })
 }
 
 /// The link at viewport cell (`x`, `y`): its OSC 8 URI, else an http or https URL in the text
@@ -575,13 +611,15 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_link<'l>(
     x: jint,
     y: jint,
 ) -> jstring {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let term = tab.term();
-    let mut len = 0;
-    let p = unsafe { appine_vt_link(term.0, cell(x), cell(y), &mut len) };
-    term.text(&mut env, p, len)
+    guarded!("VtNative.link", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let term = tab.term();
+        let mut len = 0;
+        let p = unsafe { appine_vt_link(term.0, cell(x), cell(y), &mut len) };
+        term.text(&mut env, p, len)
+    })
 }
 
 /// Shows a yellow line of app notice above the cursor's line; false on the alternate screen.
@@ -592,10 +630,12 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_message<'l>(
     handle: jlong,
     text: JString<'l>,
 ) -> jboolean {
-    let (Some(tab), Some(text)) = (tab(handle), string(&mut env, &text)) else {
-        return 0;
-    };
-    (unsafe { appine_vt_message(tab.term().0, text.as_ptr(), text.len()) }) as jboolean
+    guarded!("VtNative.message", 0, {
+        let (Some(tab), Some(text)) = (tab(handle), string(&mut env, &text)) else {
+            return 0;
+        };
+        (unsafe { appine_vt_message(tab.term().0, text.as_ptr(), text.len()) }) as jboolean
+    })
 }
 
 /// The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed);
@@ -606,13 +646,15 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) -> jstring {
-    let Some(tab) = tab(handle) else {
-        return std::ptr::null_mut();
-    };
-    let term = tab.term();
-    let mut len = 0;
-    let p = unsafe { appine_vt_transcript(term.0, &mut len) };
-    term.text(&mut env, p, len)
+    guarded!("VtNative.transcript", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let term = tab.term();
+        let mut len = 0;
+        let p = unsafe { appine_vt_transcript(term.0, &mut len) };
+        term.text(&mut env, p, len)
+    })
 }
 
 /// Forgets a tab; its terminal is freed once a running pump has returned too.
@@ -622,11 +664,13 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_destroy<'l>(
     _: JClass<'l>,
     handle: jlong,
 ) {
-    let removed = TABS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&handle);
-    drop(removed);
+    guarded!("VtNative.destroy", (), {
+        let removed = TABS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&handle);
+        drop(removed);
+    })
 }
 
 fn tab(handle: jlong) -> Option<Arc<Tab>> {
