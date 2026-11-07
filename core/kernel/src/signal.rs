@@ -1475,7 +1475,7 @@ mod tests {
         use crate::cred::{IdMap, UserNs};
         let root = Cred::root();
         let mut inside = root.clone();
-        inside.enter_user_ns(UserNs::child(&root.user_ns, 0));
+        inside.enter_user_ns(UserNs::child(&root.user_ns, 0, true));
         // 0 inside is 1000 outside, and 100 inside is 0 outside
         *inside.user_ns.uid_map.borrow_mut() = IdMap::parse(b"0 1000 1\n100 0 1\n").unwrap();
         let uid = |i: SigInfo| match i.fields {

@@ -39,7 +39,8 @@ pub(super) fn new_user_ns(k: &mut Kernel, cred: &mut Cred, chrooted: bool) -> Re
     {
         return Err(Errno::EPERM);
     }
-    let ns = UserNs::child(&parent, cred.euid);
+    let setfcap = cred.cap_effective & 1 << cap::SETFCAP != 0;
+    let ns = UserNs::child(&parent, cred.euid, setfcap);
     k.ucounts
         .add(Counted::User, &parent, cred.euid, ns.clone(), Some(ns.id));
     cred.enter_user_ns(ns);
@@ -505,6 +506,7 @@ pub(super) fn ioctl(
             mm: None,
             ns: Some(related),
             klog: None,
+            opener: Rc::new(cx.cred()),
         },
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),
@@ -548,7 +550,7 @@ mod tests {
             Errno::EINVAL
         );
         // The owner must be the parent namespace's owner or a descendant of it
-        let other = UserNs::child(&user, 1000);
+        let other = UserNs::child(&user, 1000, false);
         let owned = new_pid_ns(&init, &init, other.clone()).unwrap();
         assert_eq!(new_pid_ns(&owned, &owned, user).unwrap_err(), Errno::EPERM);
         assert!(new_pid_ns(&owned, &owned, other).is_ok());

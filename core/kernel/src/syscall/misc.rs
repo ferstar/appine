@@ -79,6 +79,7 @@ pub(super) fn futex(
     val3: u32,
 ) -> SysResult {
     let cmd = op & FUTEX_CMD_MASK;
+    let private = op & FUTEX_PRIVATE_FLAG != 0;
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let bitset = if cmd == FUTEX_WAIT { u32::MAX } else { val3 };
@@ -105,14 +106,14 @@ pub(super) fn futex(
                     })
                 }
             };
-            futex_wait(cx, (uaddr, val, bitset), deadline)
+            futex_wait(cx, (uaddr, private, val, bitset), deadline)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             let bitset = if cmd == FUTEX_WAKE { u32::MAX } else { val3 };
             if bitset == 0 {
                 return Err(Errno::EINVAL);
             }
-            let key = futex_key(cx, uaddr)?;
+            let key = futex_key(cx, uaddr, private)?;
             Ok(cx.shared.futexes().wake(key, val, bitset) as u64)
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -120,8 +121,8 @@ pub(super) fn futex(
             if (val as i32) < 0 || (timeout as u32 as i32) < 0 {
                 return Err(Errno::EINVAL);
             }
-            let key = futex_key(cx, uaddr)?;
-            let key2 = futex_key(cx, uaddr2)?;
+            let key = futex_key(cx, uaddr, private)?;
+            let key2 = futex_key(cx, uaddr2, private)?;
             let mut futexes = cx.shared.futexes();
             if cmd == FUTEX_CMP_REQUEUE && u32::from_le_bytes(get(cx, uaddr)?) != val3 {
                 return Err(Errno::EAGAIN);
@@ -141,10 +142,10 @@ pub(super) fn futex(
 /// thaw, the wait does not start over), and with a handler it is EINTR (even with SA_RESTART).
 fn futex_wait(
     cx: &mut Cx<'_>,
-    (uaddr, val, bitset): (u64, u32, u32),
+    (uaddr, private, val, bitset): (u64, bool, u32, u32),
     deadline: Option<Expiry>,
 ) -> SysResult {
-    let key = futex_key(cx, uaddr)?;
+    let key = futex_key(cx, uaddr, private)?;
     let shared = cx.shared;
     // No-BKL wakes (syscall::fast) also take the futex lock, so nothing is missed between
     // checking the value and registering
@@ -181,6 +182,7 @@ fn futex_wait(
                     if let (Errno::ERESTART_RESTARTBLOCK, Some(deadline)) = (e, deadline) {
                         cx.t.restart = Some(Restart::Futex {
                             uaddr,
+                            private,
                             val,
                             bitset,
                             deadline,
@@ -230,7 +232,11 @@ pub(super) fn futex_waitv(
         {
             return Err(Errno::EINVAL);
         }
-        keys.push((futex_key(cx, uaddr)?, uaddr, val));
+        keys.push((
+            futex_key(cx, uaddr, wflags & FUTEX_PRIVATE_FLAG != 0)?,
+            uaddr,
+            val,
+        ));
     }
     // Holding the futex lock, so nobody can wake between checking the values and registering
     let shared = cx.shared;
@@ -275,12 +281,13 @@ pub(super) fn futex_waitv(
     }
 }
 
-/// The futex key: the translated host address.
-fn futex_key(cx: &Cx<'_>, uaddr: u64) -> Result<Key, Errno> {
+/// The futex key ([`crate::mm::Mm::futex_key`]); `private` is an operation with
+/// `FUTEX_PRIVATE_FLAG`.
+fn futex_key(cx: &Cx<'_>, uaddr: u64, private: bool) -> Result<Key, Errno> {
     if !uaddr.is_multiple_of(4) {
         return Err(Errno::EINVAL);
     }
-    cx.mm().futex_key(uaddr).ok_or(Errno::EFAULT)
+    cx.mm().futex_key(uaddr, private).ok_or(Errno::EFAULT)
 }
 
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
@@ -375,6 +382,7 @@ pub(crate) enum Restart {
     /// arguments until the original deadline.
     Futex {
         uaddr: u64,
+        private: bool,
         val: u32,
         bitset: u32,
         deadline: Expiry,
@@ -388,10 +396,11 @@ pub(super) fn restart_syscall(cx: &mut Cx<'_>) -> SysResult {
         Some(Restart::Sleep { deadline, rem }) => sleep_rest(cx, deadline, rem),
         Some(Restart::Futex {
             uaddr,
+            private,
             val,
             bitset,
             deadline,
-        }) => futex_wait(cx, (uaddr, val, bitset), Some(deadline)),
+        }) => futex_wait(cx, (uaddr, private, val, bitset), Some(deadline)),
         None => Err(Errno::EINTR),
     }
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; `/proc/vmstat`; names as bytes; test-suite findings; `user/max_*`; fd access, numeric names, cgroup ids and zombies' files last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; vmstat; names; test-suite findings; `user/max_*`; fd access, cgroup ids, zombies; write opens, opener credentials last)
 
 ## Responsibilities
 
@@ -94,23 +94,31 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 ### Opening, reading and writing
 
-- Open (in `kernel/vfs`'s pseudo open): DAC against the synthetic stat; for `mem`, `auxv`,
-  `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap` one ptrace check with real credentials
-  and no read/attach distinction (`EACCES`), while the magic-link check (`may_read`) uses
-  filesystem credentials, and also gates `fd/` and `fdinfo/` (listing and lookup in them, and
-  reading or following `fd/N`; `EACCES`), as Linux's `proc_fd_permission` and
-  `proc_fd_access_allowed` do; devpts nodes on nodev
-  mounts `EACCES`, then the cgroup device filter; write modes on ro mounts `EROFS`, on
-  non-writable nodes `EACCES`; creating names `EACCES`.
+- Open (in `kernel/vfs`'s pseudo open): DAC against the synthetic stat (`O_TRUNC` asks for write
+  permission too); for `mem`, `auxv`, `environ`, `maps`, `smaps`, `smaps_rollup` and `pagemap` one
+  ptrace check with filesystem credentials and no read/attach distinction (`EACCES`, as Linux's
+  `proc_mem_open`), and the magic-link check (`may_read`) also uses filesystem credentials and
+  gates `fd/` and `fdinfo/` (listing and lookup in them, and reading or following `fd/N`;
+  `EACCES`), as Linux's `proc_fd_permission` and `proc_fd_access_allowed` do; writing `setgroups`
+  needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
+  nodes on nodev mounts `EACCES`, then the cgroup device filter; write modes on ro mounts
+  `EROFS`; namespace files are immutable (any write mode or `O_TRUNC` is `EPERM`, before DAC). A
+  node that is not writable still opens for writing when DAC passes (root) if it is a procfs file
+  outside `/proc/sys`, and each write then fails: `EIO` for the files of proc entries (global files
+  such as `cpuinfo` and `kmsg`, `/proc/sysvipc/*`, the single-record `netstat`, `snmp`,
+  `sockstat` and `sockstat6` of `/proc/<pid>/net`; `proc_reg_write`), `EINVAL` for per-process and
+  `fdinfo` files (no write operation). `/proc/sys` refuses it (`EACCES`, `O_TRUNC` included); sysfs
+  (`kernfs_fop_open`) and the other `/proc/<pid>/net` files (`seq_open_net`) refuse only a write
+  access mode, so `O_TRUNC` alone opens them; creating names `EACCES`.
 - The content is generated once at open (`fresh`). The first read at offset 0 uses it; later reads
-  or preads at offset 0 regenerate it with the current reader's view (credentials and
-  namespaces); reads elsewhere use the current snapshot; lseek (`SEEK_SET`/`CUR`/`END` against the
+  or preads at offset 0 regenerate it with the opener's credentials (kept with the open file,
+  Linux's `f_cred`) and the current reader's namespaces; reads elsewhere use the current snapshot; lseek (`SEEK_SET`/`CUR`/`END` against the
   snapshot length) never regenerates. `pagemap`, `mem` and `/proc/kmsg` are computed at read time;
   nsfs files cannot be read (`EINVAL`) and, like write-only cgroup files, never regenerate; a
   `NetConf` file whose generation fails at open reports the error on the first read.
 - Writes pass the whole buffer of each call to `pseudo::write` with the writer's credentials and
-  namespaces, apply immediately, do not advance the position (except `mem`), and mark the snapshot
-  stale.
+  namespaces (the id maps, `setgroups` and `timens_offsets` also check the opener's, `kernel/process`),
+  apply immediately, do not advance the position (except `mem`), and mark the snapshot stale.
   Per-process numbers use `proc_number`/`kstrto` (first 12 bytes, base 0, `EINVAL`/`ERANGE`);
   most sysctls parse decimal after trimming.
 - Synthetic files (other than kmsg) cannot be added to epoll (`EPERM`) and poll as always ready, so
@@ -341,8 +349,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 ## Invariants and gotchas
 
 - Content always reflects the kernel at generation time; nothing is cached across opens, and a
-  regeneration uses the current reader's credentials and namespaces (Linux keeps the opener's
-  `f_cred`).
+  regeneration uses the opener's credentials but the current reader's namespaces.
 - `/proc/sys` lookups use the reader's namespaces; `/proc/<pid>/net` uses the target's.
 - Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts,
   xattrs, links) fail on them.
@@ -369,12 +376,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - **Namespace root cannot write its network sysctls:** root of a child user namespace that owns a
   network namespace cannot write that namespace's `net.*` sysctls (Linux 6.1 grants it per
   namespace); rootless container runtimes setting sysctls fail with `EACCES`.
-- **Open-time ptrace check uses real credentials:** `mem`, `environ`, `maps` and the others are
-  checked with real ids where Linux uses filesystem ids (and attach mode for `mem`), so set-id
-  helpers behave differently (also noted in `kernel/signal`).
-- **Regeneration uses the current reader:** a file reread from offset 0 is generated with the
-  reading task's credentials and namespaces, not the opener's (Linux's `f_cred`), so a descriptor
-  passed between processes changes content (id maps, `/proc/sys`).
+- **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
+  the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
+  looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another
+  namespace shows that namespace's value.
 - **bpf load capability:** loading a device program accepts `CAP_BPF` alone; Linux 6.1 also requires
   `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` for this program type.
 - **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555, `comm`
@@ -393,12 +398,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
   sockets only in `SCM_RIGHTS` messages show 0.
-- **Read-only proc files cannot be opened for writing even with `CAP_DAC_OVERRIDE`:** every
-  write-mode open of a node that is not writable is `EACCES` before capabilities are considered,
-  where Linux 6.1 lets root open ordinary `/proc` files (not `/proc/sys` or sysfs) with `O_WRONLY`,
-  `O_RDWR` or `O_TRUNC` and fails only the write (`EIO` for `/proc/kmsg`); C++ `std::fstream` with
-  its default mode or `fopen(..., "r+")` on `/proc/cpuinfo` or `/proc/self/status` fails outright
-  as root, and a root `/proc/kmsg` reader opening it read-write gets no descriptor.
 - **`/proc/sys` permissions follow ordinary DAC:** a non-root writer with `CAP_DAC_OVERRIDE` can
   open every writable sysctl (`core_pattern`, `hostname`, `pid_max`, `net.*`), whereas Linux 6.1
   decides by euid 0 / egid 0 alone and ignores capabilities; and a non-root process with
@@ -437,4 +436,5 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Field-by-field fdinfo layouts against Linux (eventfd ids, timerfd formatting).
 - The Linux 6.1 behaviour behind the items found by Starnix's syscall tests (a zombie leader's
   files, `proc_sys_permission`, write opens of read-only proc files, `ENODEV` from removed cgroups)
-  was observed on a native 6.8 kernel and attributed to 6.1 from knowledge of the kernel.
+  was observed on a native 6.8 kernel and attributed to 6.1 from knowledge of the kernel; so was
+  which write each kind of read-only file fails with.

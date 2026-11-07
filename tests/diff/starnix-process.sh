@@ -7,9 +7,8 @@
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/process: the ELF loader disagrees with Linux on unusual program headers
 SKIP="ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
-# kernel/process: futex waiters on replaced private memory are never woken (the test hangs); PI
-# operations are ENOSYS
-SKIP="$SKIP:FutexTest.FutexWaitOnRemappedMemory:FutexTest.LockPi*"
+# kernel/process: PI operations are ENOSYS
+SKIP="$SKIP:FutexTest.LockPi*"
 # kernel/process: sched_setattr accepts SCHED_RESET_ON_FORK inside sched_policy, validates the
 # clamps without the current values, changes the policy under SCHED_FLAG_KEEP_PARAMS and answers
 # EACCES instead of EPERM beyond RLIMIT_NICE

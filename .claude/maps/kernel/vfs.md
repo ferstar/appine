@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks, lazy unmounts; open flags and new-file modes last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, new-file modes; owners and procfs write opens last)
 
 ## Responsibilities
 
@@ -295,9 +295,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `F_SETOWN_EX`/`F_GETOWN_EX` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` and
   `FIOGETOWN`/`SIOCGPGRP` translate pids through the caller's pid namespace (the dispatcher's
   `pid_args` does it for `F_SETOWN`'s argument, -1 included as process group 1, and `F_GETOWN`'s
-  result; the others translate their own); owners are stored as global ids; in a child pid
-  namespace a pid unknown there is stored as a number that matches nothing, and an owner no longer
-  in it reads back as 0; `F_SETOWN(INT_MIN)` is `EINVAL`.
+  result; the others translate their own); owners are stored as global ids, with the setter's real
+  and effective user IDs for the delivery check (`kernel/poll`); a number no pid has, or one the
+  caller's pid namespace cannot see, is `ESRCH` (Linux's `find_vpid`), 0 removes the owner, an
+  owner no longer in the caller's namespace reads back as 0, and `F_SETOWN(INT_MIN)` is `EINVAL`.
   `F_SETSIG`, pipe size and seals are also handled in fcntl.
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
@@ -316,9 +317,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   set-id bits and truncates, with `O_RDONLY` too (through a writable handle of its own). Then dispatch by type: regular files open the host object, character
   devices by device number (see Devices), block devices as loop devices (major 7; others `ENXIO`),
   FIFOs the shared pipe, sockets `ENXIO`.
-- Pseudo nodes: permission from the synthetic stat, ptrace checks for process files, nodev for
-  PTYs, `EISDIR`/`EROFS`/`EACCES` for writes the filesystem does not allow; content is generated
-  at open.
+- Pseudo nodes: permission from the synthetic stat (`O_TRUNC` asking for write), ptrace checks
+  for process files, nodev for PTYs, `EISDIR`/`EROFS`, and `EACCES` for writes the filesystem does
+  not allow except read-only procfs files outside `/proc/sys`, which root opens and whose writes
+  fail (`kernel/procfs`); content is generated at open, and the opener's credentials are kept for
+  regeneration and id-map writes.
 - Every non-`O_PATH` store open records an inotify `Opened` (directory, name, close mask), whether
   or not watches exist; `O_TMPFILE` is not implemented: openat2 rejects invalid combinations as
   Linux does, but open/openat reach the directory branch (`EISDIR`, or a plain read-only open of
@@ -454,7 +457,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `F_GETLK` reports unlocked; named FIFOs have an inode and lock normally.
 - Leases (regular files only, owner or `CAP_LEASE`): read leases need no writers, write leases
   no other opens. Opening for write or truncating breaks all leases, opening for read breaks write
-  leases: the holder gets `F_SETSIG`'s signal or `SIGIO`; a nonblocking open returns `EAGAIN`,
+  leases: the file's owner gets `F_SETSIG`'s signal or `SIGIO` (setting a lease makes the setter
+  the owner unless the file already has one, as `lease_setup` does); a nonblocking open returns `EAGAIN`,
   others wait until the holder downgrades or `lease-break-time` (45 s) forces it. `F_NOTIFY`
   (dnotify) is `EINVAL`.
 

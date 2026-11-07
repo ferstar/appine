@@ -14,9 +14,6 @@ SKIP="$SKIP:CgroupTest.MkdirWithPermissions"
 # timerslack_ns is absent; Yama is absent; no tracefs
 SKIP="$SKIP:ProcfsTest.ZoneInfo:PressureTest/*:ProcKallsymsTest.*:ProcTaskDirTest.TimerslackNs*"
 SKIP="$SKIP:SysctlTest/SysctlNodeTest.*/kernel_yama_ptrace_scope:TracefsTest.BufferSizeKbReadWrite"
-# kernel/procfs: read-only proc files cannot be opened for writing even with CAP_DAC_OVERRIDE
-# (the test opens /proc/cpuinfo with std::fstream's default read-write mode)
-SKIP="$SKIP:CpuinfoTest.Cpuinfo"
 # kernel/procfs: /proc/<pid>/fd and fdinfo are open to everyone
 SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwner/fd"
 SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwner/fdinfo"

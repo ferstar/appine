@@ -216,7 +216,7 @@ pub(super) fn mremap(
     let r = remap(cx, old, old_len, new_len, flags, new_addr);
     // What was moved or grown may be writable shared file mappings: the no-BKL futex must know
     // where they are now
-    cx.mm().note_shared_files(true);
+    cx.mm().note_shared_maps(true);
     r
 }
 

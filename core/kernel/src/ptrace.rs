@@ -158,10 +158,9 @@ pub(crate) fn user_pstate(pstate: u64) -> u64 {
 pub(crate) struct Trace {
     /// The tracer process; None means not traced.
     pub tracer: Option<Tid>,
-    /// The tracer had `CAP_SYS_PTRACE` when tracing began (Linux's `ptracer_cred`): without it, a
-    /// tracee that execve's a setuid program or a program with file capabilities gains no new
-    /// privileges.
-    pub privileged: bool,
+    /// The tracer's credentials when tracing began (Linux's `ptracer_cred`), judged by
+    /// [`Trace::tracer_capable`].
+    pub cred: Option<crate::cred::Cred>,
     /// Traced with PTRACE_SEIZE: group-stops and PTRACE_INTERRUPT are reported as
     /// `PTRACE_EVENT_STOP`, and so is the start of an auto-attached new thread; execve does not
     /// send it SIGTRAP.
@@ -222,6 +221,17 @@ impl Trace {
     /// In a ptrace-stop and not in PTRACE_LISTEN: the tracer can send it requests.
     pub fn stopped(&self) -> bool {
         self.stop.is_some() && !self.listening
+    }
+
+    /// Whether the tracer had `CAP_SYS_PTRACE` over user namespace `ns` when tracing began
+    /// (Linux's `ptracer_capable`; true when untraced). Without it, an execve of a setuid program
+    /// or one with file capabilities gains no new privileges, and the memory of a tracee that is
+    /// not dumpable cannot be read or written with `PTRACE_PEEK*`/`POKE*`, even if the tracer has
+    /// gained the capability since.
+    pub fn tracer_capable(&self, ns: &crate::cred::UserNs) -> bool {
+        self.cred
+            .as_ref()
+            .is_none_or(|c| c.ns_capable(ns, crate::cred::cap::SYS_PTRACE))
     }
 }
 
@@ -538,7 +548,7 @@ pub(crate) fn clone(parent: &Task, child: &Task, flags: u64, exit_signal: i32) -
     {
         let mut c = child.trace.borrow_mut();
         c.tracer = p.tracer;
-        c.privileged = p.privileged;
+        c.cred = p.cred.clone();
         c.seized = p.seized;
         c.options = p.options;
         if p.seized {

@@ -13,17 +13,15 @@ SKIP="$SKIP:$P.PrctlSetPtracerDoesNotPersistPastTracerThreadExit"
 SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNotAffectCurrentTracer"
 SKIP="$SKIP:$P.PrctlNotInherited:$P.TraceParentNotAllowed:$P.TraceNonDescendantNotAllowed"
 SKIP="$SKIP:$P.ExecvePtraceLockStress"
-# kernel/signal: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; ptrace
-# memory requests skip ptrace_access_vm's check; detaching at an attach-time group stop reports
-# the stop again
+# kernel/signal: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; detaching
+# at an attach-time group stop reports the stop again
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
-SKIP="$SKIP:$P.AccessVmUsesAttachCreds_CapGainedAfterAttach"
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
 # kernel/process: minor futex deviations (WAKE_OP and PI operations are ENOSYS, FUTEX_WAKE with a
-# count of 0 wakes nobody; the untimed waiters of three of them hang); FUTEX_PRIVATE_FLAG is ignored
+# count of 0 wakes nobody; the untimed waiters of three of them hang)
 F=SharedPrivate/PrivateAndSharedFutexTest
 SKIP="$SKIP:PrivateFutexTest.WakeOp*:$F.WakeOpCond*:$F.PIBasic/*:$F.PIConcurrency/*"
-SKIP="$SKIP:$F.PITryLock/*:$F.PIWaiters/*:$F.Wake0/*:$F.WakeWrongKind/*"
+SKIP="$SKIP:$F.PITryLock/*:$F.PIWaiters/*:$F.Wake0/*"
 # kernel/cred: per-thread id changes leak to every thread (a helper thread's setresuid takes root
 # from the main thread, whose cleanup then fails); a shared fs context does not block privilege
 # gains; kernel/cred D2: no ACLs

@@ -1021,7 +1021,7 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
         if addr != 0
             && mm.shared_with_others()
             && mm.write(UserSlice::new(addr, 4), &[0; 4]).is_ok()
-            && let Some(key) = mm.futex_key(addr)
+            && let Some(key) = mm.futex_key(addr, false)
         {
             futexes.wake(key, 1, u32::MAX);
         }

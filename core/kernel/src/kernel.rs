@@ -1124,6 +1124,7 @@ impl<'a> Cx<'a> {
             vfs,
             tid: self.tid(),
             tgid: self.tgid(),
+            cred: None,
         }
     }
 

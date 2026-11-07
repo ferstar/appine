@@ -25,8 +25,6 @@ SKIP="$SKIP:PersonalityTest.ReadImpliesExecMmap:PersonalityTest.ReadImpliesExecM
 SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotect:PersonalityTest.ReadImpliesExecMprotectAfterFork"
 SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotectFile"
 SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotectMixedMappings"
-# kernel/procfs: the open-time ptrace check uses real credentials
-SKIP="$SKIP:ProcTestBase.ProcMemAccessGatedByFsUidSymmetric"
 # kernel/mm: pagemap reports no frame numbers, not even to CAP_SYS_ADMIN (after that check fails,
 # the fallback test crashes in gtest's own allocation)
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMappedAndUnmapped:ProcTestBase.ProcSelfPagemapMultiChunkBoundary"

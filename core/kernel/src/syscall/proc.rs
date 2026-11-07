@@ -793,7 +793,7 @@ fn exec(
     };
     let ptraced = {
         let t = cx.task.trace.borrow();
-        t.tracer.is_some() && !t.privileged
+        t.tracer.is_some() && !t.tracer_capable(&cred.user_ns)
     };
     let mut new_cred = cred.clone();
     let secure = new_cred.exec(
@@ -1630,6 +1630,12 @@ pub(super) fn kcmp(
 /// caller itself, or [`Cred::may_ptrace`].
 pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
     target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, false)
+}
+
+/// The same with the filesystem credentials (`PTRACE_MODE_*_FSCREDS`), as for opening a process's
+/// memory views in procfs (Linux's `proc_mem_open`).
+pub(super) fn may_ptrace_fs(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
+    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, true)
 }
 
 // ---- unshare ----

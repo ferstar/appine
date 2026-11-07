@@ -797,7 +797,12 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             }
             Ok(0)
         }
+        // Here too the host socket is left "connecting" until connected again (which answers
+        // ECONNABORTED and sends nothing), while Linux's __inet_stream_connect has already reset
+        // the guest's: otherwise the guest's next connect on this socket would get that
+        // ECONNABORTED instead of sending a new SYN
         e => {
+            let _ = appine_hal::net::connect(host_fd, &host_addr);
             if tcp {
                 count_connect(cx, &sock, Some(Errno(e)));
             }

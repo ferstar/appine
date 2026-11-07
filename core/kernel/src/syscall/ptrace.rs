@@ -76,6 +76,9 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
     match request {
         PEEKTEXT | PEEKDATA => peek(cx, &task, addr, data),
         POKETEXT | POKEDATA => {
+            if !may_access_vm(cx, &task) {
+                return Err(Errno::EIO);
+            }
             // As with Linux's FOLL_FORCE, private mappings without write permission can be
             // written: setting breakpoints
             let mm = task.res.borrow().mm.clone();
@@ -180,16 +183,13 @@ fn traceme(cx: &mut Cx<'_>) -> SysResult {
     if ppid == INIT || !cx.kr().groups.contains_key(&ppid) {
         return Err(Errno::EPERM);
     }
-    let privileged = cx.kr().groups[&ppid]
-        .borrow()
-        .cred
-        .capable(crate::cred::cap::SYS_PTRACE);
+    let tracer = cx.kr().groups[&ppid].borrow().cred.clone();
     let mut t = cx.task.trace.borrow_mut();
     if t.tracer.is_some() {
         return Err(Errno::EPERM);
     }
     t.tracer = Some(ppid);
-    t.privileged = privileged;
+    t.cred = Some(tracer);
     Ok(0)
 }
 
@@ -226,7 +226,7 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
         }
         *t = Trace {
             tracer: Some(cx.tgid()),
-            privileged: cx.cred().capable(crate::cred::cap::SYS_PTRACE),
+            cred: Some(cx.cred()),
             seized: seize,
             options,
             ..Trace::default()
@@ -289,12 +289,27 @@ fn resume(task: &Task, mode: Mode, data: u64) -> SysResult {
 
 /// PTRACE_PEEKTEXT, PTRACE_PEEKDATA: reads one word of the tracee and writes it to `data`.
 fn peek(cx: &mut Cx<'_>, task: &Task, addr: u64, data: u64) -> SysResult {
+    if !may_access_vm(cx, task) {
+        return Err(Errno::EIO);
+    }
     let mm = task.res.borrow().mm.clone();
     let mut word = [0u8; 8];
     mm.borrow()
         .read(UserSlice::new(addr, 8), &mut word)
         .map_err(|_| Errno::EIO)?;
     put(cx, data, word).map(|()| 0)
+}
+
+/// Whether the tracer may read and write the tracee's memory with `PTRACE_PEEK*`/`POKE*` (Linux's
+/// `ptrace_access_vm`): the tracee is dumpable, or the tracer had `CAP_SYS_PTRACE` over the
+/// tracee's user namespace when it attached ([`Trace::tracer_capable`]), so a process that made
+/// itself non-dumpable after an unprivileged attach (ssh-agent does) keeps its memory to itself.
+fn may_access_vm(cx: &Cx<'_>, task: &Task) -> bool {
+    let Some(group) = cx.kr().groups.get(&task.tgid) else {
+        return false;
+    };
+    let g = group.borrow();
+    g.dumpable || task.trace.borrow().tracer_capable(&g.cred.user_ns)
 }
 
 /// PTRACE_GETREGSET, PTRACE_SETREGSET: `data` points at an iovec whose length may be shorter than

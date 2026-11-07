@@ -151,6 +151,10 @@ pub enum FileKind {
         ns: Option<crate::nsproxy::NsRef>,
         /// `/proc/kmsg`: the kernel log (poll needs to look at it).
         klog: Option<Rc<RefCell<crate::klog::Klog>>>,
+        /// The opener's credentials (Linux's `f_cred`): regeneration translates IDs through them
+        /// and the id maps, `setgroups` and `timens_offsets` check writes with them, so a
+        /// descriptor handed to another process keeps its opener's view and rights.
+        opener: Rc<crate::cred::Cred>,
     },
 }
 
@@ -176,6 +180,10 @@ pub struct OpenFile {
     /// readiness and with which signal (0 is SIGIO); they are also signalled when a file lease is
     /// broken.
     pub owner: (i32, i32),
+    /// The real and effective user IDs (kernel IDs) of whoever set `owner` (Linux's
+    /// `f_owner.uid`/`euid`): they decide which processes the signals may reach
+    /// (`syscall::poll::send_to_owner`).
+    pub owner_ids: (u32, u32),
     pub sig: i32,
     /// How many times the program has used up the data in each direction, read and write, on this
     /// open file: from this, epoll's `EPOLLET` knows the program has used up the last reported
@@ -228,6 +236,7 @@ impl OpenFile {
             dentry: None,
             mnt: crate::vfs::ROOT_MOUNT,
             owner: (0, 0),
+            owner_ids: (0, 0),
             sig: 0,
             drained: [0; 2],
             reads: 0,

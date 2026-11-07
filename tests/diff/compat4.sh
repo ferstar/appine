@@ -455,6 +455,9 @@ int main(void) {
 C
 rm -rf /tmp/sgid /tmp/plain
 gcc -O1 -o newmodes newmodes.c && ./newmodes
+# Other groups run later in the same Appine store (compat's file-capability case copies a program
+# to /tmp/plain)
+rm -rf /tmp/sgid /tmp/plain
 # accept4: no free fd is EMFILE with the connection still queued; a bad address drops the
 # connection without leaving an fd; accepted TCP sockets keep the listener's timeouts and AF_UNIX
 # ones its SO_PASSCRED. Socket timeouts: microseconds outside a second are EDOM, a short value

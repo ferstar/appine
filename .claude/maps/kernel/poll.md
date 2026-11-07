@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps and counting; module references; loop devices; eventfd readv; `F_SETOWN` owners; test-suite findings; pipe write edges, fasync kinds; host edges on all hosts last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps and counting; module references; loop devices; eventfd readv; test-suite findings; pipe write edges, fasync kinds; host edges; `F_SETOWN` owners and their rights last)
 
 ## Responsibilities
 
@@ -148,7 +148,9 @@ signal delivery (`kernel/signal`).
   syscalls only — and arrivals), computes new events, adds host fds' not-yet-ready bits to its
   host poll, and sends: `SIGIO` with kernel siginfo, or the `F_SETSIG` signal with `POLL_*` code,
   band (Linux's band table) and fd. Owners are a thread, process or process group
-  (`send_to_owner`), stored as global ids.
+  (`send_to_owner`), stored as global ids with the setter's real and effective user IDs; a process
+  gets the signal only when that effective ID is root or either ID is its real or saved user ID
+  (Linux's `sigio_perm`, checked for each process of a group).
 
 ## Dependencies (inbound / outbound)
 
@@ -174,10 +176,6 @@ signal delivery (`kernel/signal`).
 
 ## Confirmed bugs / technical debt
 
-- **Signal-driven I/O can signal any process:** no credentials are recorded at `F_SETOWN*` and
-  nothing like Linux's `sigio_perm` runs at delivery, so an unprivileged user can set a pipe's
-  owner to a root process, `F_SETSIG(SIGKILL)` (or leave the default `SIGIO`, which terminates),
-  turn on `O_ASYNC` and kill it with one write. Unknown owners are accepted without `ESRCH`.
 - **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
   sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
   bit on a closed fd just above that can be ignored where Linux returns `EBADF`.

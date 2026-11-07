@@ -122,8 +122,14 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
             });
         }
     }
-    // As on Linux, the signal for a break goes to the process that set the lease
-    file.borrow_mut().owner = (1, tgid);
+    // As on Linux (lease_setup's __f_setown without force), the signal for a break goes to the
+    // process that set the lease, unless the file already has an owner
+    let cred = cx.cred();
+    let mut f = file.borrow_mut();
+    if f.owner.1 == 0 {
+        f.owner = (1, tgid);
+        f.owner_ids = (cred.ruid, cred.euid);
+    }
     Ok(())
 }
 
@@ -206,9 +212,9 @@ pub(super) fn break_leases(
         let Some(file) = file.upgrade() else {
             continue;
         };
-        let ((ty, pid), sig) = {
+        let (owner, ids, sig) = {
             let f = file.borrow();
-            (f.owner, f.sig)
+            (f.owner, f.owner_ids, f.sig)
         };
         let Some(signo) = Signal::new(if sig == 0 { 29 } else { sig }) else {
             continue;
@@ -223,7 +229,7 @@ pub(super) fn break_leases(
                 ..SigInfo::default()
             }
         };
-        super::poll::send_to_owner(cx.kr(), ty, pid, signo, info);
+        super::poll::send_to_owner(cx.kr(), owner, ids, signo, info);
     }
     if nonblock {
         return Err(Errno::EAGAIN);

@@ -5,12 +5,9 @@
 # /proc/net, epoll and poll. Run by tests/diff/gtest/run.sh, one process per test. Tests that
 # differ for a reason recorded in a map, or that cannot be compared, are skipped, with the reason
 # above them.
-# kernel/net: a refused blocking connect leaves the host socket connecting
-SKIP="AllInetTests/SimpleTcpSocketTest.NonBlockingConnectRetry/*"
-SKIP="$SKIP:AllInetTests/SimpleTcpSocketTest.CleanupOnConnectionRefused/*"
 # Cannot be compared: Appine hands the malformed destination to the host socket, and in this VM
 # the host's AppArmor answers EAFNOSUPPORT before Linux's own EINVAL check
-SKIP="$SKIP:IPUnboundSockets/IPUnboundSocketTest.InsufficientBufferTOS/*"
+SKIP="IPUnboundSockets/IPUnboundSocketTest.InsufficientBufferTOS/*"
 # kernel/net: netlink socket options misreport (unbound sockets keep nl_pid 0, getsockopt answers
 # 0 or 4 zero bytes, SO_PASSCRED has no effect)
 SKIP="$SKIP:ProtocolTest/NetlinkTest.ConnectBinds/*:ProtocolTest/NetlinkTest.GetSendTimeout/*"

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale comments; kill with a thread id; retargeting process signals; syscall-stop detach; test-suite findings, ptrace; unwritable frames; sigqueue to zombies, core %d; adjtimex hosts last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: comments; kill by thread id; process-signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; sigqueue to zombies, core %d; adjtimex; ptracer credentials last)
 
 ## Responsibilities
 
@@ -196,7 +196,9 @@ procfs.
 - Tracees are threads; the tracer is a process (any of its threads may issue requests; tracees are
   released only when the whole tracer process exits). No Yama restrictions. Tracing pid 1 is
   `ESRCH`; `PTRACE_TRACEME` under init is `EPERM`. Access needs the same user (and dumpable, with a
-  capability subset) or `CAP_SYS_PTRACE`.
+  capability subset) or `CAP_SYS_PTRACE`. Attach and `TRACEME` keep the tracer's credentials of
+  that moment (Linux's `ptracer_cred`), judged later with `CAP_SYS_PTRACE` over the relevant user
+  namespace.
 - Attaching: `ATTACH` sends `SIGSTOP`; `SEIZE` takes options and never stops. Requests other than
   `KILL` and `INTERRUPT` need the tracee in a ptrace stop (else `ESRCH`); unknown requests are `EIO`.
 - Every ptrace stop saves a copy of the registers; the tracer reads and writes the copy and it is
@@ -220,7 +222,9 @@ procfs.
   `NT_ARM_HW_BREAK` (6 slots), `NT_ARM_HW_WATCH` (4 slots); nothing for SVE, PAC, MTE, SME. Debug
   slots are handed to the engine (`set_hw_debug`): breakpoints force Tier 0, watchpoints keep
   Tier 1 with watched pages out of the TLB.
-- Memory: `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
+- Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
+  `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
+  `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
   non-writable mappings, translation invalidation; written mappings stop being trusted translation
   sources). `process_vm_writev` uses plain writes.
 - wait: the tracer finds its tracees without `WUNTRACED`; a stop reports `code << 8 | 0x7f`. A
@@ -325,8 +329,7 @@ procfs.
 - **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
   skipped syscall (number -1), the step is not reported at syscall return.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`
-  pages Linux can read; `/proc/<pid>/mem` opens are checked with real rather than filesystem
-  credentials; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
+  pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 - **`SIGILL` frames carry an `esr_context` with EC 0:** Linux 6.1 emits none for undefined
   instructions.
 - **`rt_sigaction` echoes unknown flag bits:** Linux 5.11+ clears them, so `SA_UNSUPPORTED` probing
@@ -338,10 +341,6 @@ procfs.
   `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
   `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1
   gives them (there the execve waits for it); a tracer that collects state at exit misses them.
-- **ptrace memory requests skip `ptrace_access_vm`'s check:** `PTRACE_PEEK*`/`POKE*` never compare
-  the tracee's dumpable state with the tracer's privilege at attach, so a tracer attached without
-  `CAP_SYS_PTRACE` keeps reading and writing the memory of a process that later made itself
-  non-dumpable (`PR_SET_DUMPABLE` 0, as ssh-agent does), where Linux 6.1 returns `EIO`.
 - **Detaching at an attach-time group stop reports the stop again:** after `PTRACE_ATTACH` to a
   stopped process and a detach during its group-stop report, the thread takes the `SIGSTOP` that
   ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,

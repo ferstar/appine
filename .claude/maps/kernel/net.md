@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; blocking connect; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order and timeout parsing last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order, timeouts; blocking connect last)
 
 ## Responsibilities
 
@@ -106,7 +106,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   Linux's `__inet_stream_connect`: `SO_SNDTIMEO` bounds the wait (then `EINPROGRESS`, or `EALREADY`
   for the repeated connect, and the connection goes on), and a signal gives `ERESTARTSYS`
   (restarted under `SA_RESTART`, the restarted call waiting again) or `EINTR` when there is a
-  timeout; then it reads `SO_ERROR` and connects again so the host reports `EISCONN`. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
+  timeout; then it reads `SO_ERROR` and connects again, so the host reports `EISCONN` after a
+  success and, after a failure, has reset the socket so that the guest's next connect sends a new
+  SYN. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
 - accept4 (Linux's `__sys_accept4_file` order): bad flags `EINVAL`; no free fd `EMFILE` before a
   connection is taken; host accept with waits bounded by the listener's `SO_RCVTIMEO` (`EAGAIN` on
   timeout); the new socket inherits protocol, local port map, namespace state, mark, the claimed
@@ -374,10 +376,6 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `msg_name`, so a message addressed to another port or to multicast groups is handled as a kernel
   request, without `netlink_sendmsg`'s checks (`EINVAL` for a short or non-`AF_NETLINK` address,
   `EPERM` for sending to a group or port without `CAP_NET_ADMIN` on rtnetlink).
-- **A refused blocking connect leaves the host socket connecting:** after the wait the result
-  comes from `SO_ERROR` without connecting the host socket again, so the guest's next connect on
-  the same socket gets a spurious `ECONNABORTED`, where Linux has already reset the socket and
-  sends a new SYN; wait-for-port loops that retry on one socket see one extra failure.
 - **getpeername echoes the connect address:** an inet socket reports the sockaddr it was connected
   with, so an `AF_INET6` socket connected with a `sockaddr_in` reports a 16-byte `AF_INET` peer
   (Linux: a v4-mapped `sockaddr_in6`) and a connect to `0.0.0.0` or `::` reports the wildcard

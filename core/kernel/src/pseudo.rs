@@ -882,6 +882,9 @@ pub(crate) struct View<'a> {
     pub vfs: &'a Vfs,
     pub tid: Tid,
     pub tgid: Tid,
+    /// Credentials to read with instead of the process's: an open file's opener's, when its
+    /// content is generated again ([`crate::fd::FileKind::Proc`]).
+    pub cred: Option<Rc<Cred>>,
 }
 
 /// The view used before the kernel has started (resolving the first program's path): the
@@ -1008,9 +1011,12 @@ impl<'a> View<'a> {
         (ns as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
     }
 
-    /// The reader's credentials (of the process `self` points to): IDs in procfs are translated
-    /// through its user namespace.
+    /// The reader's credentials (of the process `self` points to, or the opener's given with the
+    /// view): IDs in procfs are translated through its user namespace.
     pub(crate) fn reader(&self) -> Cred {
+        if let Some(c) = &self.cred {
+            return (**c).clone();
+        }
         self.group(self.tgid)
             .map_or_else(Cred::root, |g| g.borrow().cred.clone())
     }
@@ -2065,6 +2071,41 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
             )
     ) || matches!(node, PseudoNode::Static(p)
         if p.starts_with(b"sys/user/max_") || recorded(p).is_some())
+}
+
+/// For a file that is not [`writable`] but that whoever passes its permission check (root, through
+/// `CAP_DAC_OVERRIDE`) may still open for writing, the error each write then returns: procfs files
+/// outside `/proc/sys`, as Linux's open checks only the mode there. Files of proc entries
+/// (`/proc/cpuinfo`, `/proc/kmsg`, `/proc/sysvipc/*`, the single-record files of
+/// `/proc/<pid>/net`) go through `proc_reg_write`, `EIO` without a write handler; per-process files
+/// have no write operation, so `vfs_write` answers `EINVAL`. `None`: the open is refused
+/// ([`open_unwritable`]).
+pub(crate) fn unwritable_error(node: &PseudoNode) -> Option<Errno> {
+    match node {
+        PseudoNode::Global(_) => Some(Errno::EIO),
+        PseudoNode::Net(_, _, name)
+            if matches!(*name, b"netstat" | b"snmp" | b"sockstat" | b"sockstat6") =>
+        {
+            Some(Errno::EIO)
+        }
+        PseudoNode::Static(p) if p.starts_with(b"sysvipc/") => Some(Errno::EIO),
+        PseudoNode::Entry(..) | PseudoNode::FdInfo(..) => Some(Errno::EINVAL),
+        _ => None,
+    }
+}
+
+/// An open asking for write permission (`for_write`: an access mode that writes, rather than
+/// `O_TRUNC` alone) of a node that is not [`writable`], once its permission check has passed: Ok
+/// opens it ([`unwritable_error`] says what its writes get), Err refuses it. `/proc/sys` decides by
+/// the mode alone (`proc_sys_permission`, which refuses `O_TRUNC` too); sysfs (`kernfs_fop_open`)
+/// and the other `/proc/<pid>/net` files (`seq_open_net`) refuse only an open for writing.
+pub(crate) fn open_unwritable(node: &PseudoNode, for_write: bool) -> Result<(), Errno> {
+    match node {
+        PseudoNode::Static(p) if p.starts_with(b"sys/") => Err(Errno::EACCES),
+        PseudoNode::NetConf(..) | PseudoNode::NetSysctl(_) => Err(Errno::EACCES),
+        _ if unwritable_error(node).is_some() || !for_write => Ok(()),
+        _ => Err(Errno::EACCES),
+    }
 }
 
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
@@ -3857,14 +3898,18 @@ fn host_cpu(n: u32) -> Option<usize> {
 /// `setgroups` and `timens_offsets` to their own writers, and the other writable files check the
 /// value and record it (namespaced sysctls in the writer's namespaces); some recorded values have
 /// no effect, and `kernel/pid_max` accepts writes and ignores them. `cred`, `ns` and `pid_ns` are
-/// the writer's.
+/// the writer's, `opener` the credentials the file was opened with.
 pub(crate) fn write(
     k: &mut Kernel,
-    (tid, cred): (Tid, &Cred),
+    (tid, cred, opener): (Tid, &Cred, &Cred),
     (ns, pid_ns): (&crate::nsproxy::NsProxy, &PidNs),
     node: &PseudoNode,
     data: &[u8],
 ) -> Result<(), Errno> {
+    // Opened for writing by root although not writable ([`unwritable_error`])
+    if !writable(node) && !matches!(node, PseudoNode::Cgroup(..)) {
+        return Err(unwritable_error(node).unwrap_or(Errno::EINVAL));
+    }
     match node {
         PseudoNode::Cgroup(id, name) => {
             let writer = crate::cgroup::Writer {
@@ -3875,11 +3920,13 @@ pub(crate) fn write(
             return crate::cgroup::write(k, &writer, (*id, name), data);
         }
         PseudoNode::Entry(pid, _, e @ (Entry::UidMap | Entry::GidMap)) => {
-            return write_id_map(k, cred, *pid, *e == Entry::GidMap, data);
+            return write_id_map(k, (cred, opener), *pid, *e == Entry::GidMap, data);
         }
-        PseudoNode::Entry(pid, _, Entry::Setgroups) => return write_setgroups(k, cred, *pid, data),
+        PseudoNode::Entry(pid, _, Entry::Setgroups) => {
+            return write_setgroups(k, opener, *pid, data);
+        }
         PseudoNode::Entry(pid, None, Entry::TimensOffsets) => {
-            return write_timens_offsets(k, cred, *pid, data);
+            return write_timens_offsets(k, opener, *pid, data);
         }
         // Network namespace sysctls: the writer's namespace (crate::netconf)
         PseudoNode::NetConf(v6, dir, name) => {
@@ -4220,39 +4267,63 @@ pub(crate) fn write(
     Ok(())
 }
 
-/// Writes `/proc/<pid>/uid_map` or `gid_map` (Linux's `map_write`): it can be written only once
-/// (EPERM), the writing process needs `CAP_SYS_ADMIN` in that user namespace (EPERM), and bad
-/// contents are EINVAL; then `new_idmap_permitted`: the creator maps its own effective ID as one
-/// extent of one (for gid_map, setgroups must first be written as deny), or has
-/// `CAP_SETUID`/`CAP_SETGID` in the parent namespace; otherwise EPERM. A second column unmapped
-/// in the parent is EPERM too. Linux checks the first two with the open file's credentials; here
-/// the writing process's are used.
-fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> Result<(), Errno> {
+/// Writes `/proc/<pid>/uid_map` or `gid_map` (Linux's `proc_uid_map_write` and `map_write`), with
+/// the opener's credentials where Linux uses the file's: the initial namespace's maps cannot be
+/// written, and the opener must be in that namespace or its parent (EPERM); a map can be written
+/// only once and the opener needs `CAP_SYS_ADMIN` in that namespace (EPERM); bad contents are
+/// EINVAL. Then `new_idmap_permitted`: mapping the parent's uid 0 needs `CAP_SETFCAP`, that the
+/// creator had when the namespace was made if the opener is inside it, or that the opener has in
+/// the parent otherwise (`verify_root_map`); the opener, owning the namespace, maps its own
+/// effective ID as one extent of one (for gid_map, setgroups must first be written as deny), or
+/// both writer and opener have `CAP_SETUID`/`CAP_SETGID` in the parent namespace; otherwise
+/// EPERM. A second column unmapped in the parent is EPERM too. So a map file opened by an
+/// unprivileged user and handed to a setuid program grants no more than the user could write.
+fn write_id_map(
+    k: &Kernel,
+    (writer, opener): (&Cred, &Cred),
+    pid: Tid,
+    gid: bool,
+    data: &[u8],
+) -> Result<(), Errno> {
     let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
+    let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
+    if opener.user_ns.id != ns.id && opener.user_ns.id != parent.id {
+        return Err(Errno::EPERM);
+    }
     let map = if gid { &ns.gid_map } else { &ns.uid_map };
-    if !map.borrow().extents().is_empty() || !writer.ns_capable(&ns, cap::SYS_ADMIN) {
+    if !map.borrow().extents().is_empty() || !opener.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let new = crate::cred::IdMap::parse(data)?;
-    let parent = ns.parent.clone().ok_or(Errno::EPERM)?;
     let parent_map = if gid {
         parent.gid_map.borrow().clone()
     } else {
         parent.uid_map.borrow().clone()
     };
+    if !gid && new.extents().iter().any(|&(_, lower, _)| lower == 0) {
+        let setfcap = if opener.user_ns.id == ns.id {
+            ns.parent_could_setfcap
+        } else {
+            opener.ns_capable(&parent, cap::SETFCAP)
+        };
+        if !setfcap {
+            return Err(Errno::EPERM);
+        }
+    }
     let own = match new.extents() {
-        &[(_, lower, 1)] if ns.owner == writer.euid => {
+        &[(_, lower, 1)] if ns.owner == opener.euid => {
             if gid {
-                !ns.setgroups.get() && parent_map.down(lower) == Some(writer.egid)
+                !ns.setgroups.get() && parent_map.down(lower) == Some(opener.egid)
             } else {
-                parent_map.down(lower) == Some(writer.euid)
+                parent_map.down(lower) == Some(opener.euid)
             }
         }
         _ => false,
     };
     let setid = if gid { cap::SETGID } else { cap::SETUID };
-    if !own && !writer.ns_capable(&parent, setid) {
+    let capable = writer.ns_capable(&parent, setid) && opener.ns_capable(&parent, setid);
+    if !own && !capable {
         return Err(Errno::EPERM);
     }
     let kernel = new.lower_to_kernel(&parent_map)?;
@@ -4261,12 +4332,14 @@ fn write_id_map(k: &Kernel, writer: &Cred, pid: Tid, gid: bool, data: &[u8]) -> 
 }
 
 /// Writes `/proc/<pid>/setgroups` (Linux's `proc_setgroups_write`): "allow" or "deny", followed
-/// only by whitespace (EINVAL); needs `CAP_SYS_ADMIN` in that user namespace. Once denied it
-/// cannot be allowed again, and it cannot be denied after gid_map has been written (EPERM).
-fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
+/// only by whitespace (EINVAL); the opener needs `CAP_SYS_ADMIN` in that user namespace (checked
+/// at open as Linux's `proc_setgroups_open` does, `EACCES`, and again here in case the process has
+/// moved to another namespace since, EPERM). Once denied it cannot be allowed again, and it cannot
+/// be denied after gid_map has been written (EPERM).
+fn write_setgroups(k: &Kernel, opener: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
     let g = group_of(k, pid).ok_or(Errno::ESRCH)?;
     let ns = g.borrow().cred.user_ns.clone();
-    if !writer.ns_capable(&ns, cap::SYS_ADMIN) {
+    if !opener.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let (allow, rest) = if let Some(rest) = data.strip_prefix(b"allow") {
@@ -4295,9 +4368,9 @@ fn write_setgroups(k: &Kernel, writer: &Cred, pid: Tid, data: &[u8]) -> Result<(
 /// Writes `/proc/<pid>/timens_offsets` (Linux 6.1's `timens_offsets_write`,
 /// `proc_timens_set_offset`): one or two lines of `<clock> <seconds> <nanoseconds>`, where the
 /// clock is `monotonic`, `boottime` or their numbers 1 and 7. Writes into the time namespace that
-/// process uses for children: needs `CAP_SYS_TIME` in its owner (EPERM; Linux uses the
-/// credentials at open, here the writing process's), the clocks with the offsets added must be
-/// within [0, KTIME_SEC_MAX / 2] (ERANGE), and once a process has entered it is EACCES.
+/// process uses for children: the opener needs `CAP_SYS_TIME` in its owner (EPERM; Linux's
+/// `file_ns_capable`), the clocks with the offsets added must be within [0, KTIME_SEC_MAX / 2]
+/// (ERANGE), and once a process has entered it is EACCES.
 fn write_timens_offsets(k: &Kernel, cred: &Cred, pid: Tid, data: &[u8]) -> Result<(), Errno> {
     const KTIME_SEC_MAX: i64 = i64::MAX / 1_000_000_000;
     if data.len() >= 4096 {

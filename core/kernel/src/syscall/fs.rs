@@ -600,21 +600,34 @@ fn open_pseudo(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let accmode = flags & oflags::O_ACCMODE;
+    // O_TRUNC asks for write permission too (Linux's build_open_flags), although nothing here can
+    // be truncated
+    let mask = open_mask(flags)
+        | if flags & oflags::O_TRUNC != 0 {
+            MAY_WRITE
+        } else {
+            0
+        };
     // /proc/sys/user/max_*: anyone may read the limits of their user namespace, and holders of
     // CAP_SYS_RESOURCE in it may write them, whoever owns the files (Linux's set_permissions for
     // the per-user-namespace sysctl tables)
     let user_limit = matches!(&node, PseudoNode::Static(p) if p.starts_with(b"sys/user/max_"));
+    // Namespace files are immutable (nsfs): asking to write is EPERM before any permission check
+    if matches!(node, PseudoNode::NsFile(..)) && mask & MAY_WRITE != 0 {
+        return Err(Errno::EPERM);
+    }
     if user_limit {
-        if open_mask(flags) & MAY_WRITE != 0 && !cred.capable_here(cap::SYS_RESOURCE) {
+        if mask & MAY_WRITE != 0 && !cred.capable_here(cap::SYS_RESOURCE) {
             return Err(Errno::EACCES);
         }
     } else if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
-        cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, open_mask(flags))?;
+        cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, mask)?;
     }
     // /proc/<pid>/mem requires being able to trace that process, as ptrace does
     // (PTRACE_MODE_ATTACH); auxv, environ, maps, smaps and pagemap require being able to trace it
     // read-only (PTRACE_MODE_READ, same rules): even for a process of the same user they cannot
-    // be opened when it is not dumpable
+    // be opened when it is not dumpable. Both use the filesystem credentials (proc_mem_open adds
+    // PTRACE_MODE_FSCREDS)
     let mut mm = None;
     if let PseudoNode::Entry(
         pid,
@@ -629,7 +642,7 @@ fn open_pseudo(
     ) = node
     {
         let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-        if !super::proc::may_ptrace(cx, &group.borrow()) {
+        if !super::proc::may_ptrace_fs(cx, &group.borrow()) {
             return Err(Errno::EACCES);
         }
         // mem and pagemap work on the named thread's address space: one that has exited (a
@@ -646,6 +659,16 @@ fn open_pseudo(
             }
         }
     }
+    // Writing setgroups needs CAP_SYS_ADMIN in the process's user namespace, checked at open
+    // (proc_setgroups_open)
+    if let PseudoNode::Entry(pid, _, pseudo::Entry::Setgroups) = node
+        && mask & MAY_WRITE != 0
+    {
+        let group = pseudo::group_of(cx.kr(), pid).ok_or(Errno::ESRCH)?;
+        if !cred.ns_capable(&group.borrow().cred.user_ns, cap::SYS_ADMIN) {
+            return Err(Errno::EACCES);
+        }
+    }
     // Device nodes cannot be opened in a nodev mount (Linux's may_open)
     if matches!(node, PseudoNode::Pts(..) | PseudoNode::PtsPtmx(_))
         && vfs.mount(mnt).is_some_and(|m| m.flags & ms::NODEV != 0)
@@ -659,7 +682,7 @@ fn open_pseudo(
         _ => None,
     };
     if let Some(r) = rdev {
-        super::bpf::check_device(cx, mode::S_IFCHR, r, device_access(open_mask(flags)))?;
+        super::bpf::check_device(cx, mode::S_IFCHR, r, device_access(mask))?;
     }
     match node {
         PseudoNode::Pts(fs, n) => return tty::open_slave(cx, (fs, n, mnt, true), flags),
@@ -696,16 +719,14 @@ fn open_pseudo(
     if flags & oflags::O_DIRECTORY != 0 {
         return Err(Errno::ENOTDIR);
     }
-    if accmode != oflags::O_RDONLY && vfs.readonly(&full) {
+    if mask & MAY_WRITE != 0 && vfs.readonly(&full) {
         return Err(Errno::EROFS);
     }
     // cgroup files are checked only by permission bits (root can open read-only ones; writing is
-    // what gets EINVAL)
-    if accmode != oflags::O_RDONLY
-        && !pseudo::writable(&node)
-        && !matches!(node, PseudoNode::Cgroup(..))
+    // what gets EINVAL), the others by pseudo::open_unwritable
+    if mask & MAY_WRITE != 0 && !pseudo::writable(&node) && !matches!(node, PseudoNode::Cgroup(..))
     {
-        return Err(Errno::EACCES);
+        pseudo::open_unwritable(&node, accmode != oflags::O_RDONLY)?;
     }
     // Network sysctls fail only when read (an unset stable_secret is EIO, Linux's
     // proc_sys_call_handler): open starts with empty contents and the first read regenerates them
@@ -745,6 +766,7 @@ fn open_pseudo(
         mm,
         ns,
         klog,
+        opener: Rc::new(cred.clone()),
     })
 }
 
@@ -1426,7 +1448,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             record_lock(cx, &file, cmd, arg)
         }
         // The dispatcher translates F_SETOWN's argument and F_GETOWN's result (pid_args)
-        F_SETOWN => set_owner(&file, arg as i32).map(|()| 0),
+        F_SETOWN => set_owner(cx, &file, arg as i32).map(|()| 0),
         F_GETOWN => Ok(get_owner(&file) as i64 as u64),
         F_SETOWN_EX => {
             let b: [u8; 8] = get(cx, arg)?;
@@ -1435,8 +1457,7 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if !matches!(ty, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
                 return Err(Errno::EINVAL);
             }
-            file.borrow_mut().owner = (ty, cx.pid_in(pid));
-            Ok(0)
+            record_owner(cx, &file, (ty, cx.pid_in(pid))).map(|()| 0)
         }
         F_GETOWN_EX => {
             let (ty, pid) = file.borrow().owner;
@@ -1513,13 +1534,38 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
 /// `F_SETOWN` and the socket ioctls `FIOSETOWN`/`SIOCSPGRP` (Linux's `f_setown`): `pid` is
 /// already a global number, a negative one a process group; `INT_MIN`, which has no negation, is
 /// `EINVAL`.
-fn set_owner(file: &FileRef, pid: i32) -> Result<(), Errno> {
+fn set_owner(cx: &Cx<'_>, file: &FileRef, pid: i32) -> Result<(), Errno> {
     let owner = match pid.checked_neg() {
         None => return Err(Errno::EINVAL),
         Some(g) if pid < 0 => (F_OWNER_PGRP, g),
         Some(_) => (F_OWNER_PID, pid),
     };
-    file.borrow_mut().owner = owner;
+    record_owner(cx, file, owner)
+}
+
+/// Records a file's owner (type, global number) for `F_SETOWN*` (Linux's `__f_setown` with
+/// force): a number no pid has is `ESRCH` (`find_vpid`; numbers the caller cannot see arrive as
+/// [`super::NO_PID`]), 0 removes the owner, and the caller's real and effective user IDs are kept
+/// with it for the permission check at delivery ([`super::poll::send_to_owner`]).
+fn record_owner(cx: &Cx<'_>, file: &FileRef, (ty, pid): (i32, i32)) -> Result<(), Errno> {
+    if pid != 0 {
+        let k = cx.kr();
+        let named = k.tasks.contains_key(&pid)
+            || k.groups.contains_key(&pid)
+            || k.groups.values().any(|g| {
+                let g = g.borrow();
+                g.pgid == pid || g.sid == pid
+            });
+        if !named {
+            return Err(Errno::ESRCH);
+        }
+    }
+    let cred = cx.cred();
+    let mut f = file.borrow_mut();
+    f.owner = (ty, pid);
+    if pid != 0 {
+        f.owner_ids = (cred.ruid, cred.euid);
+    }
     Ok(())
 }
 
@@ -1807,7 +1853,7 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
                     p if p < 0 && p != i32::MIN => -cx.pid_in(-p),
                     p => p,
                 };
-                return set_owner(&file, pid).map(|()| 0);
+                return set_owner(cx, &file, pid).map(|()| 0);
             }
             let pid = get_owner(&file);
             let local = cx.pid_out(pid.abs());
@@ -3237,7 +3283,7 @@ fn proc_kmsg_read(
 /// current content. Content just generated at open and not yet read or written is not
 /// regenerated.
 fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Result<(), Errno> {
-    let (mnt, node) = {
+    let (mnt, node, opener) = {
         let mut f = file.borrow_mut();
         let pos = offset.unwrap_or(f.pos);
         match &mut f.kind {
@@ -3247,18 +3293,25 @@ fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Resul
                 fresh,
                 ns: None,
                 klog: None,
+                opener,
                 ..
             } if pos == 0 && !pseudo::unreadable(node) => {
                 if std::mem::take(fresh) {
                     return Ok(());
                 }
-                (*mnt, node.clone())
+                (*mnt, node.clone(), opener.clone())
             }
             _ => return Ok(()),
         }
     };
     let vfs = cx.vfs()?;
-    let content = pseudo::content(&cx.view(&vfs), mnt, &node)?;
+    // With the opener's credentials, as Linux's seq_file handlers use the file's f_cred: a
+    // descriptor passed to another process shows the same IDs
+    let view = pseudo::View {
+        cred: Some(opener),
+        ..cx.view(&vfs)
+    };
+    let content = pseudo::content(&view, mnt, &node)?;
     if let FileKind::Proc { data, .. } = &mut file.borrow_mut().kind {
         *data = content;
     }
@@ -3349,8 +3402,8 @@ pub(super) fn write_bytes(
             Err(Errno::EINVAL)
         }
         IoPath::Kmsg => kmsg_write(cx, file, data),
-        // Opened read-only (no proc_write)
-        IoPath::ProcKmsg(_) => Err(Errno::EBADF),
+        // Opened for writing by root: proc_reg_write without a proc_write
+        IoPath::ProcKmsg(_) => Err(Errno::EIO),
         IoPath::Loop(dev) => super::loopdev::write(cx, file, &dev, data, offset),
         IoPath::Mem(mm) => {
             let pos = offset.unwrap_or(file.borrow().pos);
@@ -3375,15 +3428,15 @@ pub(super) fn write_bytes(
                 size.max(pos + data.len() as u64)
             })?;
             let proc_node = match &file.borrow().kind {
-                FileKind::Proc { node, .. } => Some(node.clone()),
+                FileKind::Proc { node, opener, .. } => Some((node.clone(), opener.clone())),
                 _ => None,
             };
             let mut written = data.len();
-            if let Some(node) = proc_node {
+            if let Some((node, opener)) = proc_node {
                 let cred = cx.cred();
                 let (ns, pid_ns) = (cx.ns(), cx.pid_ns());
                 let tid = cx.tid();
-                pseudo::write(cx.k(), (tid, &cred), (&ns, &pid_ns), &node, data)?;
+                pseudo::write(cx.k(), (tid, &cred, &opener), (&ns, &pid_ns), &node, data)?;
                 written = pseudo::written(&node, data.len());
                 if let FileKind::Proc { fresh, .. } = &mut file.borrow_mut().kind {
                     *fresh = false;

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; robust futexes; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits; futex keys, id-map openers last)
 
 ## Responsibilities
 
@@ -61,7 +61,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `wake` channels: `FILE`, `OTHER`, `CHILD`, `WATCHED`, `EXITED`, `LOCK`, `SIGNAL` (plus the
   internal `OBJECTS`); `wake::Object` is the address of a value inside a `RefCell`.
 - Waiter — (event, interest channels, optional sorted object list), stored in `Kernel::waiters`.
-- `futex::Key` — `Host(address)` or `File{dev, ino, offset}`; `Futexes` — one queue of
+- `futex::Key` — `Private{mm, addr, shared}`, `Host(address)` or `File{dev, ino, offset}`;
+  `Futexes` — one queue of
   (id, key, bitset, event) with its own mutex; `Enqueued` — removes its entry on drop.
 
 ### Exec, timers, init, namespaces
@@ -74,8 +75,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   (absolute realtime and TAI, boottime), compared with that clock whenever looked at; the global
   wall-clock jump count (`clock_epoch`); `loadavg::LoadAvg`; `inittab::Entry`, `Power`.
 - `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
-  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups;
-  held in credentials), `PidNs` (parent, level, owner, global↔local tables, reaper, dead; held per
+  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups,
+  whether the creator had `CAP_SETFCAP`; held in credentials), `PidNs` (parent, level, owner, global↔local tables, reaper, dead; held per
   thread group), `MntNs` (held in `FsContext`), `NsRef` (a strong reference to any namespace),
   `NsSet`; `Ucounts` (`Kernel::ucounts`: the live namespaces by kind with the (user namespace,
   user) pairs each counts for, the counts, and each user namespace's `max_*_namespaces`).
@@ -309,11 +310,14 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### Futexes
 
-- Keys are the translated host address, except for addresses in a shared file mapping (even a
-  read-only one), which use (device, inode, offset) so different processes mapping the same file
-  meet. `FUTEX_PRIVATE_FLAG` is ignored, so private futexes on shared file pages share a queue
-  across processes, and private and non-private operations on one address meet where Linux keeps
-  them apart (only extra wake-ups). The single waiter list is scanned linearly.
+- Keys follow Linux's `get_futex_key`: private memory, and any memory for an operation with
+  `FUTEX_PRIVATE_FLAG`, is keyed by the address space's id and the address (with whether the
+  operation was shared, so private and shared operations never meet), whatever page is there now;
+  without the flag, shared anonymous memory (shared mappings, SysV shm) uses its host address and
+  a shared file mapping (even a read-only one) (device, inode, offset), so processes sharing them
+  meet. Kernel wakes (robust list, `clear_child_tid`) are shared operations. The no-BKL path
+  handles only writable private pages outside the address space's writable shared mappings. The
+  single waiter list is scanned linearly.
 - Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, `futex_waitv`; WAKE_OP and
   the PI operations return `ENOSYS`.
 - Wait: compare and enqueue under the futex lock, then wait alone (no channels); dequeued means
@@ -411,9 +415,13 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   order (`validate_nsset`) before anything switches, then all switch together.
 - User namespaces: credentials hold kernel IDs; IDs shown outward (`get*id`, stat, procfs,
   `SO_PEERCRED`, `si_uid`) are mapped through the viewer's maps, unmapped as 65534. Each map can be
-  written once and needs `CAP_SYS_ADMIN` in the target namespace; without `CAP_SETUID`/`CAP_SETGID`
-  in the parent, the namespace owner may write only a single extent of its own euid (or egid after
-  `setgroups` is set to deny). Capability checks come in four forms (`capable` in the initial
+  written once, and the checks use the credentials the file was opened with (as Linux's
+  `file_ns_capable`): the opener must be in the namespace or its parent and have `CAP_SYS_ADMIN` in
+  the namespace; mapping the parent's uid 0 needs `CAP_SETFCAP`, which the creator must have had if
+  the opener is inside, or the opener must have in the parent; otherwise the opener, owning the
+  namespace, may write only a single extent of its own euid (or egid after `setgroups` is set to
+  deny), unless both opener and writer have `CAP_SETUID`/`CAP_SETGID` in the parent;
+  `timens_offsets` checks the opener's `CAP_SYS_TIME`. Capability checks come in four forms (`capable` in the initial
   namespace, `capable_here`, `ns_capable` following Linux `cap_capable`,
   `capable_wrt_inode_uidgid`).
 - Pid namespaces: kernel pids are global; each namespace keeps global↔local tables; syscall
@@ -470,10 +478,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ## Confirmed bugs / technical debt
 
-- **`uid_map`/`gid_map` (and `timens_offsets`) writes trust the writer, not the opener:** the opener's
-  credentials, the opener-namespace check and the `CAP_SETFCAP` check for mapping uid 0 are
-  missing, so an unprivileged user can pass an opened map file to a setuid-root program and get an
-  arbitrary mapping (the confused-deputy case Linux closed).
 - **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`) leaves the earlier
   credential, mount and pid-for-children changes in place. A pidfd `setns` combining
   `CLONE_NEWNS` with other types while the fs is shared switches the mount namespace of every fs
@@ -485,11 +489,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **Minor futex deviations:** `FUTEX_CLOCK_REALTIME` is accepted with any operation, unknown high op
   bits are masked off instead of `ENOSYS`, and `FUTEX_WAKE` with a count ≤ 0 wakes none or all
   instead of one; WAKE_OP and PI operations are `ENOSYS`.
-- **Futex waiters on replaced private memory are never woken:** private futexes are keyed by the
-  page's host memory rather than by address space and address, so threads waiting on a private
-  page that is then replaced at the same address (a `MAP_FIXED` mmap, or munmap and mmap again)
-  miss a later `FUTEX_WAKE` at that address and sleep until a signal or timeout, where Linux wakes
-  them; programs that recycle memory with `MAP_FIXED` while threads still wait in it hang.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.

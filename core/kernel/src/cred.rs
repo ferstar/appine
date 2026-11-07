@@ -624,13 +624,13 @@ impl Cred {
     /// (Linux's `__ptrace_may_access` plus `cap_ptrace_access_check`): the real user and group
     /// (the filesystem ones with `fscreds`) equal all of the target's users and groups and the
     /// target is dumpable, or there is `CAP_SYS_PTRACE` in the target's user namespace; then both
-    /// are in the same user namespace and the target's permitted set does not exceed our own, or
-    /// there is that `CAP_SYS_PTRACE`.
+    /// are in the same user namespace and the target's permitted set does not exceed our own
+    /// permitted set (our effective set with `fscreds`), or there is that `CAP_SYS_PTRACE`.
     pub fn may_ptrace(&self, target: &Cred, dumpable: bool, fscreds: bool) -> bool {
-        let (uid, gid) = if fscreds {
-            (self.fsuid, self.fsgid)
+        let (uid, gid, caps) = if fscreds {
+            (self.fsuid, self.fsgid, self.cap_effective)
         } else {
-            (self.ruid, self.rgid)
+            (self.ruid, self.rgid, self.cap_permitted)
         };
         let same = [target.ruid, target.euid, target.suid]
             .iter()
@@ -639,8 +639,7 @@ impl Cred {
                 .iter()
                 .all(|&g| g == gid);
         let privileged = self.ns_capable(&target.user_ns, cap::SYS_PTRACE);
-        let subset =
-            self.user_ns.id == target.user_ns.id && target.cap_permitted & !self.cap_permitted == 0;
+        let subset = self.user_ns.id == target.user_ns.id && target.cap_permitted & !caps == 0;
         privileged || same && dumpable && subset
     }
 
@@ -945,6 +944,9 @@ pub(crate) struct UserNs {
     /// `/proc/<pid>/setgroups` is "allow": after it is written as "deny", setgroups is not allowed
     /// in this namespace.
     pub setgroups: Cell<bool>,
+    /// The creator had `CAP_SETFCAP` in its effective set (Linux's `parent_could_setfcap`): only
+    /// then may a process inside map the parent's uid 0 into it.
+    pub parent_could_setfcap: bool,
 }
 
 impl UserNs {
@@ -958,12 +960,14 @@ impl UserNs {
             uid_map: RefCell::new(IdMap::identity()),
             gid_map: RefCell::new(IdMap::identity()),
             setgroups: Cell::new(true),
+            parent_could_setfcap: true,
         })
     }
 
-    /// A new namespace under `parent` whose creator's effective user ID is `owner`. The setgroups
-    /// state is inherited from the parent.
-    pub fn child(parent: &Rc<UserNs>, owner: u32) -> Rc<UserNs> {
+    /// A new namespace under `parent` whose creator's effective user ID is `owner` and who had
+    /// `CAP_SETFCAP` in its effective set or not (`could_setfcap`). The setgroups state is
+    /// inherited from the parent.
+    pub fn child(parent: &Rc<UserNs>, owner: u32, could_setfcap: bool) -> Rc<UserNs> {
         Rc::new(UserNs {
             id: crate::vfs::new_ns_id(),
             parent: Some(parent.clone()),
@@ -972,6 +976,7 @@ impl UserNs {
             uid_map: RefCell::new(IdMap::default()),
             gid_map: RefCell::new(IdMap::default()),
             setgroups: Cell::new(parent.setgroups.get()),
+            parent_could_setfcap: could_setfcap,
         })
     }
 
@@ -1071,7 +1076,7 @@ mod tests {
         };
         let init = user.user_ns.clone();
         let mut inside = user.clone();
-        inside.enter_user_ns(UserNs::child(&init, 1000));
+        inside.enter_user_ns(UserNs::child(&init, 1000, false));
         let ns = inside.user_ns.clone();
         assert!(inside.capable_here(cap::SYS_ADMIN));
         assert!(!inside.capable(cap::SYS_ADMIN));

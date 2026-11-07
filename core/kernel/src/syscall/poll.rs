@@ -1157,12 +1157,12 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
             (POLLHUP, POLL_HUP, POLLHUP | POLLERR),
         ] {
             if new & bit != 0 {
-                signals.push((f.owner, f.sig, code, band, e.fd));
+                signals.push((f.owner, f.owner_ids, f.sig, code, band, e.fd));
             }
         }
         true
     });
-    for ((ty, pid), sig, code, band, fd) in signals {
+    for (owner, ids, sig, code, band, fd) in signals {
         let Some(signo) = crate::process::Signal::new(if sig == 0 { 29 } else { sig }) else {
             continue;
         };
@@ -1180,16 +1180,20 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
                 ..signal::SigInfo::default()
             }
         };
-        send_to_owner(k, ty, pid, signo, info);
+        send_to_owner(k, owner, ids, signo, info);
     }
     host
 }
 
 /// Sends a signal to the owner recorded by `F_SETOWN_EX`; none when there is no owner (pid 0).
+/// `ids` are the real and effective user IDs of whoever set the owner ([`OpenFile::owner_ids`]):
+/// a process gets the signal only when the effective one is root or either one is its real or
+/// saved user ID (Linux's `sigio_perm`, checked for each process of a group), so no one can point
+/// a file at another user's process and signal it.
 pub(crate) fn send_to_owner(
     k: &crate::kernel::Kernel,
-    ty: i32,
-    pid: i32,
+    (ty, pid): (i32, i32),
+    (uid, euid): (u32, u32),
     sig: crate::process::Signal,
     info: signal::SigInfo,
 ) {
@@ -1198,14 +1202,31 @@ pub(crate) fn send_to_owner(
     if pid <= 0 {
         return;
     }
+    let allowed = |tgid: crate::kernel::Tid| {
+        k.groups.get(&tgid).is_some_and(|g| {
+            let c = &g.borrow().cred;
+            euid == 0 || [uid, euid].iter().any(|&id| id == c.ruid || id == c.suid)
+        })
+    };
     match ty {
         F_OWNER_TID => {
-            if let Some(t) = k.tasks.get(&pid) {
+            if let Some(t) = k.tasks.get(&pid).filter(|t| allowed(t.tgid)) {
                 signal::send_to_task(k, t, sig, info);
             }
         }
-        F_OWNER_PGRP => signal::send_to_pgrp(k, pid, sig, info),
-        _ => signal::send_to_group(k, pid, sig, info),
+        F_OWNER_PGRP => {
+            let members: Vec<crate::kernel::Tid> = k
+                .groups
+                .values()
+                .filter(|g| g.borrow().pgid == pid)
+                .map(|g| g.borrow().tgid)
+                .collect();
+            for tgid in members.into_iter().filter(|&g| allowed(g)) {
+                signal::send_to_group(k, tgid, sig, info);
+            }
+        }
+        _ if allowed(pid) => signal::send_to_group(k, pid, sig, info),
+        _ => {}
     }
 }
 

@@ -16,9 +16,10 @@
 //!
 //! Futex wait and wake and nanosleep are here too: the futex wait queue has its own lock
 //! ([`Shared::futexes`]), and a waiting thread sleeps on its own event, woken by futex wakes,
-//! signals and thread-group exit just as when waiting with the BKL held. Only keys that are host
-//! addresses are handled (the page is writable in the thread's page table and not in a writable
-//! shared file mapping, [`Mm::futex_key`](crate::mm::Mm::futex_key)). When the thread wakes
+//! signals and thread-group exit just as when waiting with the BKL held. Only private memory is
+//! handled, keyed by address space and address (the page is writable in the thread's page table
+//! and not in a writable shared mapping, [`Mm::futex_key`](crate::mm::Mm::futex_key)). When the
+//! thread wakes
 //! neither by a futex wake nor by expiry (most likely a signal arrived), the call goes to the BKL
 //! path to be redone, which handles the signal and the restart.
 //!
@@ -70,9 +71,11 @@ pub(crate) struct Fast {
     tid: Tid,
     /// The host thread's CPU clock and its reading when the thread started ([`Task::cpu_ns`]).
     cpu_clock: Option<(i32, u64)>,
-    /// The ranges of the writable shared file mappings in the address space
-    /// ([`crate::mm::Mm::shared_files`]): futex keys there are not host addresses.
-    shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
+    /// The address space's [`crate::mm::Mm::id`], for futex keys.
+    mm: u64,
+    /// The ranges of the writable shared mappings in the address space
+    /// ([`crate::mm::Mm::shared_maps`]): futex keys there are not the address space's.
+    shared_maps: Arc<RwLock<Vec<(u64, u64)>>>,
     /// The address of the vDSO mapping (an execve that replaces the address space changes
     /// [`Shared::fast_epoch`]).
     vdso: u64,
@@ -117,7 +120,8 @@ impl Fast {
             paths,
             tid: task.tid.get(),
             cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
-            shared_files: t.mm.borrow().shared_files(),
+            mm: t.mm.borrow().id,
+            shared_maps: t.mm.borrow().shared_maps(),
             vdso: t.mm.borrow().vdso,
             time: task.ns.borrow().time.offsets_ns(),
         }
@@ -173,7 +177,9 @@ impl Fast {
         let s = cpu.state();
         let a = [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]];
         match s.x[8] {
-            98 if !self.in_shared_file(a[0]) => futex(shared, task, cpu, &a, self.time[0]),
+            98 if !self.in_shared_map(a[0]) => {
+                futex(shared, (task, cpu, self.mm), &a, self.time[0])
+            }
             101 => nanosleep(task, cpu, a[0]),
             115 => {
                 let clock = a[0] as i32;
@@ -222,9 +228,9 @@ impl Fast {
     }
 
     /// `addr` is in a writable shared file mapping.
-    fn in_shared_file(&self, addr: u64) -> bool {
+    fn in_shared_map(&self, addr: u64) -> bool {
         let ranges = self
-            .shared_files
+            .shared_maps
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         ranges.iter().any(|&(s, e)| (s..e).contains(&addr))
@@ -283,14 +289,14 @@ const CLOCK_MONOTONIC: i32 = 1;
 const CLOCK_BOOTTIME: i32 = 7;
 const TIMER_ABSTIME: u32 = 1;
 
-/// Futex wait and wake of `misc::futex`, with `a` the syscall arguments. The timeout is relative
-/// in FUTEX_WAIT and absolute in WAIT_BITSET.
+/// Futex wait and wake of `misc::futex` on private memory, with `a` the syscall arguments and `mm`
+/// the address space's [`crate::mm::Mm::id`]. The timeout is relative in FUTEX_WAIT and absolute
+/// in WAIT_BITSET.
 /// `monotonic` is the monotonic clock's offset in the time namespace (WAIT_BITSET's absolute
 /// timeout is converted with it).
 fn futex(
     shared: &Shared,
-    task: &Task,
-    cpu: &Cpu,
+    (task, cpu, mm): (&Task, &Cpu, u64),
     a: &[u64; 6],
     monotonic: i64,
 ) -> Option<SysResult> {
@@ -301,14 +307,18 @@ fn futex(
         FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET if val3 != 0 => val3,
         _ => return None,
     };
-    // The key of private memory is the host address (Mm::futex_key). A borrowed copy-on-write
-    // page must first be replaced by one's own, and futexes in read-only mappings are rare: both
-    // go to the BKL path
+    // The key of private memory is the address space and the address (Mm::futex_key; the caller
+    // left shared mappings to the BKL path). Borrowed copy-on-write pages and read-only mappings
+    // are rare places for a futex: they go to the BKL path too, which reads them
     if !uaddr.is_multiple_of(4) {
         return None;
     }
     let host = cpu.translate(uaddr, prot::WRITE)?.as_ptr().cast::<u32>();
-    let key = Key::Host(host as usize);
+    let key = Key::Private {
+        mm,
+        addr: uaddr,
+        shared: op & FUTEX_PRIVATE_FLAG == 0,
+    };
     if cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET {
         let woken = shared.futexes().wake(key, val, bitset);
         crate::kernel::flush_signals();

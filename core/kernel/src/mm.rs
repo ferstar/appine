@@ -276,8 +276,10 @@ pub struct Mm {
     /// Ranges where an executable mapping was torn down or changed permissions or contents: the
     /// translations there must be invalidated.
     code_ranges: Vec<(u64, u64)>,
-    /// Ranges of writable shared file mappings ([`Mm::shared_files`]).
-    shared_files: Arc<RwLock<Vec<(u64, u64)>>>,
+    /// Identifies the address space in futex keys ([`crate::futex::Key::Private`]); never reused.
+    pub id: u64,
+    /// Ranges of writable shared mappings ([`Mm::shared_maps`]).
+    shared_maps: Arc<RwLock<Vec<(u64, u64)>>>,
     /// Shootdown generation: when it changes, users flush their TLBs before re-entering guest code.
     generation: Arc<AtomicU64>,
     /// Code generation: when it changes, users invalidate Tier 1 translations according to
@@ -352,7 +354,11 @@ impl Mm {
             brk: 0,
             dirty: false,
             code_ranges: Vec::new(),
-            shared_files: Arc::default(),
+            id: {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
+            shared_maps: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
             code_generation: Arc::new(AtomicU64::new(0)),
             code_log: Arc::default(),
@@ -1171,25 +1177,28 @@ impl Mm {
         Ok(())
     }
 
-    /// The key of the futex at `addr`; None when nothing is mapped there.
-    pub fn futex_key(&self, addr: u64) -> Option<crate::futex::Key> {
-        // The key of private memory is its host address: a borrowed page is first replaced by our
-        // own, or the key would change after copy-on-write and threads waiting on the old key
-        // could never be woken; this also keeps it from matching the key on the owner's side
-        let page = addr & !(PAGE_SIZE - 1);
-        if self.cow.borrow().borrowed.contains_key(&page) {
-            self.materialize(page, true);
-        }
+    /// The key of the futex at `addr` (Linux's `get_futex_key`; `private` is an operation with
+    /// `FUTEX_PRIVATE_FLAG`); None when nothing readable is mapped there. Private memory, and any
+    /// memory for a private operation, is keyed by this address space and the address, whatever
+    /// page is there now; shared anonymous memory by its host address and shared file mappings by
+    /// file and offset, which every process mapping them sees alike.
+    pub fn futex_key(&self, addr: u64, private: bool) -> Option<crate::futex::Key> {
+        use crate::futex::Key;
         // As on Linux, the futex address must be readable
         let host = self.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
-        Some(match v.file_id {
-            Some((dev, ino, offset)) if v.backing == Backing::Shared => crate::futex::Key::File {
+        Some(match (v.backing, v.file_id) {
+            (Backing::Shared, Some((dev, ino, offset))) if !private => Key::File {
                 dev,
                 ino,
                 offset: offset + (addr - start),
             },
-            _ => crate::futex::Key::Host(host.as_ptr() as usize),
+            (Backing::Shared, None) if !private => Key::Host(host.as_ptr() as usize),
+            _ => Key::Private {
+                mm: self.id,
+                addr,
+                shared: !private,
+            },
         })
     }
 
@@ -1341,8 +1350,8 @@ impl Mm {
         v.cow = cached;
         v.file = dup;
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
-        if backing == Backing::Shared && file_id.is_some() && may_write {
-            self.note_shared_files(false);
+        if backing == Backing::Shared && may_write {
+            self.note_shared_maps(false);
         }
         Ok(start)
     }
@@ -1867,6 +1876,7 @@ impl Mm {
             host,
         )?;
         self.vmas.get_mut(&start).unwrap().shm = Some((id, start));
+        self.note_shared_maps(false);
         Ok(start)
     }
 
@@ -2583,11 +2593,11 @@ impl Mm {
             .lent
             .append(&mut lent.into_iter().collect());
         let ranges = self
-            .shared_files
+            .shared_maps
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         if !ranges.is_empty() {
-            child.note_shared_files(false);
+            child.note_shared_maps(false);
         }
         drop(child);
         Ok(shared)
@@ -2693,23 +2703,24 @@ impl Mm {
 
     // ---- Files ----
 
-    /// Ranges of shared file mappings that can be written (writable now, or can be mprotected
-    /// writable later): futexes there are keyed by file and offset ([`Mm::futex_key`]), so the
-    /// no-BKL futex keyed by host address (`syscall::fast`, which handles only writable pages)
-    /// must avoid them. Shared mappings of files opened read-only do not count: Go's toolchain
-    /// reads files through them and also maps a telemetry counter file shared and writable in
-    /// every process, hence tracking by range. Recounted after such a mapping is created or moved
-    /// ([`Mm::note_shared_files`]); torn-down ones need not be removed at once, it only means
+    /// Ranges of shared mappings (of files, anonymous, or System V shared memory) that can be
+    /// written (writable now, or can be mprotected writable later): futexes there are not keyed
+    /// by address space and address ([`Mm::futex_key`]), so the no-BKL futex, which handles only
+    /// writable private pages (`syscall::fast`), must leave them to the locked path. Shared
+    /// mappings of files opened read-only do not count: Go's toolchain reads files through them
+    /// and also maps a telemetry counter file shared and writable in every process, hence
+    /// tracking by range. Recounted after such a mapping is created or moved
+    /// ([`Mm::note_shared_maps`]); torn-down ones need not be removed at once, it only means
     /// futexes there take the locked path.
-    pub fn shared_files(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
-        self.shared_files.clone()
+    pub fn shared_maps(&self) -> Arc<RwLock<Vec<(u64, u64)>>> {
+        self.shared_maps.clone()
     }
 
-    /// Recounts [`Mm::shared_files`] from the current mappings. With `moved`, only when such
+    /// Recounts [`Mm::shared_maps`] from the current mappings. With `moved`, only when such
     /// mappings exist (after mremap: the ones moved or grown may be among them).
-    pub fn note_shared_files(&self, moved: bool) {
+    pub fn note_shared_maps(&self, moved: bool) {
         let mut ranges = self
-            .shared_files
+            .shared_maps
             .write()
             .unwrap_or_else(PoisonError::into_inner);
         if moved && ranges.is_empty() {
@@ -2718,7 +2729,7 @@ impl Mm {
         *ranges = self
             .vmas
             .iter()
-            .filter(|(_, v)| v.backing == Backing::Shared && v.file_id.is_some() && v.may_write)
+            .filter(|(_, v)| v.backing == Backing::Shared && v.may_write)
             .map(|(&s, v)| (s, s + v.len))
             .collect();
     }
@@ -6223,7 +6234,7 @@ mod tests {
     }
 
     #[test]
-    fn futex_keys_of_borrowed_pages_are_their_own() {
+    fn futex_keys_of_private_memory_follow_the_address() {
         let parent = Mm::new().into_shared();
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
         let a = parent
@@ -6232,13 +6243,29 @@ mod tests {
             .unwrap();
         poke(&parent, a, 1);
         let child = parent.borrow_mut().fork().unwrap();
-        // The key would change after copy-on-write: a borrowed page is first replaced by our own
-        let key = child.borrow().futex_key(a).unwrap();
-        assert!(child.borrow().cow.borrow().borrowed.is_empty());
-        assert!(key != parent.borrow().futex_key(a).unwrap());
+        // A borrowed page has the child's own key, which copy-on-write does not change
+        let key = child.borrow().futex_key(a, false).unwrap();
+        assert!(key != parent.borrow().futex_key(a, false).unwrap());
         poke(&child, a, 2);
-        assert!(child.borrow().futex_key(a).unwrap() == key);
+        assert!(child.borrow().futex_key(a, false).unwrap() == key);
         assert_eq!(byte(&parent, a), 1);
+        // New memory at the same address keeps the key; a private operation has its own
+        let fixed = anon | flags::MAP_FIXED;
+        child
+            .borrow_mut()
+            .mmap(a, PAGE_SIZE, RW, fixed, None)
+            .unwrap();
+        assert!(child.borrow().futex_key(a, false).unwrap() == key);
+        assert!(child.borrow().futex_key(a, true).unwrap() != key);
+        // Shared anonymous memory is the same in both after fork
+        let shared = flags::MAP_SHARED | flags::MAP_ANONYMOUS;
+        let s = parent
+            .borrow_mut()
+            .mmap(0, PAGE_SIZE, RW, shared, None)
+            .unwrap();
+        let child = parent.borrow_mut().fork().unwrap();
+        assert!(child.borrow().futex_key(s, false) == parent.borrow().futex_key(s, false));
+        assert!(child.borrow().futex_key(s, true) != parent.borrow().futex_key(s, true));
     }
 
     #[test]

@@ -143,7 +143,13 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
         (fs.root.clone(), fs.cwd.clone())
     };
     let vfs = k.vfs.as_ref().ok_or(Errno::ENOENT)?;
-    let view = crate::pseudo::View { k, vfs, tid, tgid };
+    let view = crate::pseudo::View {
+        k,
+        vfs,
+        tid,
+        tgid,
+        cred: None,
+    };
     vfs.path_of(&view, &root, &cwd)
 }
 

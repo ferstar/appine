@@ -17,12 +17,9 @@ SKIP="$SKIP:PivotRootTest.OnSharedPutOldMountpoint:PivotRootTest.LockedNewRootFa
 SKIP="$SKIP:Inotify.Utimensat:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
 SKIP="$SKIP:Inotify.ExcludeUnlink*:Inotify.Exec"
 # kernel/vfs: F_GETFL never shows O_DIRECT; O_PATH descriptors pass fcntl, flock and getdents64;
-# open with O_PATH keeps other status flags; kernel/vfs D25: F_SETOWN accepts unknown pids;
-# locks on inode-less files (pipes) are no-ops
+# open with O_PATH keeps other status flags; locks on inode-less files (pipes) are no-ops
 SKIP="$SKIP:FcntlTest.GetAllFlags:FcntlTest.SetFileStatusFlagWithOpath:FcntlTest.BadFcntlsWithOpath"
 SKIP="$SKIP:GetdentsTest/0.OpathFile:GetdentsTest/0.OpathDirectory:FcntlTest.GetOpathFlag"
-SKIP="$SKIP:FcntlTest.SetOwnInvalidPid:FcntlTest.SetOwnInvalidPgrp:FcntlTest.SetOwnExInvalidTid"
-SKIP="$SKIP:FcntlTest.SetOwnExInvalidPid:FcntlTest.SetOwnExInvalidPgrp"
 SKIP="$SKIP:FlockTestNoFixture.FlockSymlink:FlockTestNoFixture.FlockPipe"
 # kernel/vfs: O_TRUNC with O_RDONLY is only half a write; O_DIRECT is never refused at open; access
 # mode 3 opens read-write; renameat2 ignores RENAME_NOREPLACE for . and ..; rename in synthetic

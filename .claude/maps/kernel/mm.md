@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private files; truncation order; idle checks and shared NORESERVE last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries, stack growth; smaps, RSS; fork; Starnix findings; private-file `MADV_DONTNEED`; truncation; idle checks, shared NORESERVE; futex keys last)
 
 ## Responsibilities
 
@@ -152,7 +152,8 @@ dumps and the host abstraction layer (`core/hal`).
   break CoW), `read_cstr`, `write_kernel`, `write_force` (ptrace and `/proc/<pid>/mem` writes),
   `check_mapped`, `populate`.
 - **Threads and processes**: `add_user`, `remove_user`, `sync` (after every BKL syscall),
-  `quiesce`, `generations`, `code_space`, `invalidate_code`, `fork`, `futex_key`, `shared_files`.
+  `quiesce`, `generations`, `code_space`, `invalidate_code`, `fork`, `futex_key`, `shared_maps`,
+  `id`.
 - **Files**: `file_truncated` (truncate, ftruncate, `O_TRUNC`), `writably_maps` (`F_SEAL_WRITE`),
   `shared_file_ranges` (msync), `content_version`.
 - **SysV shm**: `SharedMemory::new`, `attach_shm`, `detach_shm`, `shm_attachments`.
@@ -391,7 +392,9 @@ signals may still be delivered).
   in runs that never cross VMAs, without a flush.
 - mprotect over CoW pages stops other threads first, so none can write into a lent page between
   granting and removing write permission.
-- A futex on a borrowed page copies the page first, because private futex keys are host addresses.
+- Futex keys of private memory are the address space's id and the address, so a futex on a
+  borrowed page does not copy it; shared anonymous memory is keyed by host address and shared file
+  mappings by file and offset (`kernel/process`).
 - Kernel writes: `Mm::write` breaks CoW per page; `write_kernel` and `write_force` settle CoW
   (`cow_settle`) and ignore VMA permissions. No-BKL fast-path writes go through the CPU's
   `translate(WRITE)` and fall back to the BKL path on failure.
@@ -510,8 +513,8 @@ signals may still be delivered).
   growth at entry).
 - Processes: `syscall/proc.rs` (clone/fork, execve), `task.rs` (run loop, fault dispatch, users),
   `kernel.rs` (`Cx` stack growth, BKL hooks), `signal.rs` (signal frames).
-- Loader (`loader.rs`), ptrace (`write_force`), futexes (`futex_key`, `translate`, `shared_files`
-  on the fast path), membarrier (`quiesce`), SysV IPC, `syscall/fs.rs` (truncation, `ETXTBSY` via
+- Loader (`loader.rs`), ptrace (`write_force`), futexes (`futex_key`, `translate`, `id` and
+  `shared_maps` on the fast path), membarrier (`quiesce`), SysV IPC, `syscall/fs.rs` (truncation, `ETXTBSY` via
   `exe`, seals).
 - Observers: procfs (`pseudo.rs`), core dumps, rusage, cgroups.
 - `Machine` (initial `FileMaps`, `trim_memory`, the memory limit at start).
@@ -548,7 +551,7 @@ signals may still be delivered).
 - Lent and borrowed pages are never writable in place. `Mm::translate` does not break CoW, so any
   kernel code that writes guest memory through it must handle CoW pages itself.
 - `Mm`, `Loans`, `Cow` and `CodeGroup` use `Rc`/`RefCell` and are correct only under the BKL; every
-  BKL release asserts that no such borrow is held. The counters, `CodeLog`, `shared_files`,
+  BKL release asserts that no such borrow is held. The counters, `CodeLog`, `shared_maps`,
   `TaskSync` and `CodeSpace` are shared across threads.
 - CoW never mutably borrows two address spaces at once: borrower-side loan returns run inside the
   borrower's own operation or drop, and owner-side `recall` only takes shared borrows of borrowers.
@@ -627,8 +630,8 @@ signals may still be delivered).
 - Should `WRITABLY_SHARED` ever be cleared (for example when the inode is deleted)?
 - In a code group, every member's drop calls `set_sources` on the shared `DbtSpace`; is
   last-writer-wins intended?
-- Is the window in `mmap` between installing entries and `note_shared_files` acceptable for a
-  concurrent fast-path futex on a writable shared file page?
+- Is the window in `mmap` and `shmat` between installing entries and `note_shared_maps` acceptable
+  for a concurrent fast-path futex on a writable shared page?
 - `statm` reports data = rss while `status` reports VmData = VmSize; is the mismatch intentional?
 - A kill frees no Tier 1 translations kept in the translator's pool or shared through code groups,
   and the OOM killer never trims the pool; is that acceptable when translations dominate the root

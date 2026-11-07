@@ -1,7 +1,10 @@
-//! Futex wait queues (the kernel/process map). Keys are translated host addresses, so processes
-//! that share one piece of host memory after fork can wake each other; shared file mappings are
-//! keyed by host file and offset, because processes that each map the same file (the `/dev/shm`
-//! file of `sem_open`) see different host addresses.
+//! Futex wait queues (the kernel/process map). Keys follow Linux's `get_futex_key`: private
+//! memory is keyed by address space and address, so a waiter is still found after the memory at
+//! its address has been replaced (a `MAP_FIXED` mmap, or munmap and mmap again); shared anonymous
+//! memory (shared mappings, System V shared memory) by its host address, so processes that share
+//! one piece of host memory after fork can wake each other; shared file mappings by host file and
+//! offset, because processes that each map the same file (the `/dev/shm` file of `sem_open`) see
+//! different host addresses. With `FUTEX_PRIVATE_FLAG` every futex is keyed as private memory.
 //!
 //! A waiter registers in the queue and then waits; a woken waiter is removed from the queue, and
 //! when it re-checks and finds itself no longer in the queue it knows it was woken by FUTEX_WAKE.
@@ -23,7 +26,11 @@ use crate::uaccess::UserSlice;
 /// A futex key ([`crate::mm::Mm::futex_key`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Key {
-    /// Host address.
+    /// Private memory, or any memory with `FUTEX_PRIVATE_FLAG`: the address space
+    /// ([`crate::mm::Mm::id`]) and the address. `shared` is an operation without the flag
+    /// (Linux's `FUT_OFF_MMSHARED`): private and shared operations on one address never meet.
+    Private { mm: u64, addr: u64, shared: bool },
+    /// Shared anonymous memory: its host address.
     Host(usize),
     /// Offset in a host file (device number, inode).
     File { dev: u64, ino: u64, offset: u64 },
@@ -229,8 +236,10 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     // SAFETY: 4-byte-aligned, writable guest memory; the host memory is held by the address space
     let lock = unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) };
     let mut cur = lock.load(Ordering::SeqCst);
+    // As Linux's handle_futex_death, a shared wake (glibc's robust mutexes use shared operations
+    // for this reason)
     let wake = |futexes: &mut Futexes| {
-        if let Some(key) = mm.futex_key(addr) {
+        if let Some(key) = mm.futex_key(addr, false) {
             futexes.wake(key, 1, u32::MAX);
         }
     };

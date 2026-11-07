@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials last)
 
 ## Responsibilities
 
@@ -101,7 +101,8 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - Inputs: the final interpreter's stat; setuid/setgid apply only with the mode bit, no
   no_new_privs, a mount without nosuid, owner and group mapped in the caller's namespace (setgid
   also needs group exec); file caps are read unless the mount is nosuid (parse errors fail exec with
-  `EINVAL`); "traced" means a tracer recorded as unprivileged.
+  `EINVAL`); "traced" means a tracer whose credentials when tracing began (Linux's
+  `ptracer_cred`) lack `CAP_SYS_PTRACE` over the caller's user namespace (`ptracer_capable`).
 - `Cred::exec` (Linux 6.1 `bprm_fill_uid` + `cap_bprm_creds_from_file`): euid/egid from the file;
   permitted = (bounding ∩ file permitted) | (inheritable ∩ file inheritable), `EPERM` when the file's
   effective bit is set and not all file permitted capabilities were granted; root emulation unless
@@ -139,10 +140,10 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   within the session.
 - `may_ptrace(target, dumpable, fscreds)`: privileged (`CAP_SYS_PTRACE` over the target's
   namespace) or (all three target uids and gids equal the caller's filesystem or real ids, the target
-  is dumpable, same namespace and the target's permitted ⊆ the caller's permitted — permitted even
-  with filesystem credentials); procfs links use filesystem credentials, ptrace attach,
-  process_vm, pidfd_getfd, kcmp and the opens of `/proc/<pid>/mem`, `auxv`, `environ`, `maps`,
-  `smaps` and `pagemap` use real ones.
+  is dumpable, same namespace and the target's permitted ⊆ the caller's effective set with
+  filesystem credentials, its permitted set with real ones); procfs links and the opens of
+  `/proc/<pid>/mem`, `auxv`, `environ`, `maps`, `smaps` and `pagemap` use filesystem credentials,
+  ptrace attach, process_vm, pidfd_getfd, kcmp and setns through a pidfd real ones.
 
 ### seccomp
 
@@ -218,12 +219,6 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - **`PRIO_USER` uses an untranslated uid.** setpriority/getpriority match `who` against kernel uids
   without mapping it through the caller's user namespace, and do not skip processes invisible in
   the caller's pid namespace (ioprio translates both).
-- **ptrace access checks diverge.** The capability subset test uses permitted capabilities even
-  with filesystem credentials (Linux uses effective, so Appine is more permissive), and the
-  `/proc/<pid>/mem`-class opens use real credentials where Linux uses filesystem ones.
-- **The tracer's privilege is judged in the initial namespace.** A tracer privileged only inside a
-  container (container root running strace or gdb) makes setuid and file-capability programs lose
-  their gains, where Linux would grant them.
 - **The vDSO bypass covers every clock.** Linux's vDSO falls back to a real (filtered) syscall for
   CPU-time clocks, the alarm clocks (`CLOCK_REALTIME_ALARM`, `CLOCK_BOOTTIME_ALARM`) and invalid
   ids; here filters restricting clock ids (Chromium's) never fire, and
