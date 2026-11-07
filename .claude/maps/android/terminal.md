@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys and themes reworked; mouse drags, hover and double taps; cutout insets, keys following the IME; last, tab closes and switches animated)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys, themes reworked; mouse drags, hover, double taps; cutout insets, IME-following keys; last, animated tab switches and closes, numbers rolling)
 
 ## Responsibilities
 
@@ -35,7 +35,8 @@ libghostty-vt with Zig (`android/native`).
 
 - `MainActivity` — a `TerminalService.Listener`; one `VtView`; the tab bar (a scrolling row of
   numbered tabs, with `×`, `+` and `⋮` over its end); `Tab` (one per session: its number in the
-  row, which slides, changes and fades out when closed); `Host : VtView.Host`,
+  row, which slides, rolls to a new number and fades out when closed); `TabNumber` (the number, a
+  `TextView` drawing its digits itself so they can roll); `Host : VtView.Host`,
   `Keys : ExtraKeysView.Target`.
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
@@ -111,9 +112,12 @@ libghostty-vt with Zig (`android/native`).
   primary colour, centred 4 dp below the label's baseline, in whole pixels rounded down; the row
   draws it over its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so
   the system font scale leaves them as they are (dialogs, menus and toasts follow it).
-- Closing tabs is animated (150–200 ms a step, under the system's animator duration scale): a
+- Closing tabs is animated (150–300 ms a step, under the system's animator duration scale): a
   closed tab shrinks and fades out where it was; the tabs after it slide into the places left,
-  still showing their old numbers, then fade the old number out and the new one in. The indicator
+  still showing their old numbers, then roll to the new ones (300 ms, like SwiftUI's numeric
+  text): each digit that changes moves down and out, fading and blurring, as the new one comes in
+  from above and sharpens (from below for a higher number, which closing never gives); digits
+  that stay the same in place stay still, and a number of another length rolls whole. The indicator
   keeps to the current tab's place on screen, so closing the current tab of a row that does not
   scroll shows the next one sliding in above it; a row at its end scrolls back as it shortens, the
   tabs before slide right instead, and the indicator slides on to the new current tab. Showing
@@ -401,9 +405,14 @@ libghostty-vt with Zig (`android/native`).
   It animates a change from the on-screen places taken at the first change before the next
   layout (closing the current tab renders the row twice), in a pre-draw listener once laid out.
   Closed tabs are drawn in the row's overlay, past its end once it shortens, so its scroll view
-  does not clip its children. The indicator goes by the label's layout place, not its
-  translation (the row's own slide comes as `drawIndicator`'s `dx`), and takes the label's
-  opacity, so a changing number fades its text colour, not the view.
+  does not clip its children; a roll under way goes on there. The indicator goes by the label's
+  layout place, not its translation (the row's own slide comes as `drawIndicator`'s `dx`), and
+  takes the label's opacity, so a number rolls inside the label, which keeps its opacity and place.
+- `TabNumber` draws its digits one by one, centred between its paddings, rolling or not, never
+  through `TextView`'s layout, whose centring rounds differently: a digit that stays would shift
+  by a fraction of a pixel as a roll starts or ends. The blur is a `BlurMaskFilter` on the
+  `TextView`'s own paint, made in the roll's update listener (`onDraw` must not allocate) and
+  cleared after each draw.
 
 ### The terminal
 
@@ -473,7 +482,8 @@ libghostty-vt with Zig (`android/native`).
   outer display of a Pixel 10 Pro Fold API 37 emulator (landscape both ways).
 - The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
   foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing and
-  switching animations upright only, slowed down).
+  switching animations upright only, slowed down). The rolling numbers' blur was seen only there,
+  not on Android 11 or real GPUs.
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English.

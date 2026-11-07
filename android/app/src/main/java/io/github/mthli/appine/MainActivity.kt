@@ -2,13 +2,17 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.MaskFilter
 import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.InsetDrawable
@@ -43,7 +47,6 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -532,11 +535,11 @@ class MainActivity : Activity(), TerminalService.Listener {
      * it; a long press shows its title.
      *
      * The indicator goes by the current tab's place in the row ([moveIndicator]), not by where the
-     * tab is while it slides, and only the number's colour fades when it changes, not the view
-     * (whose opacity the indicator takes), so a changing number leaves the indicator as it is.
+     * tab is while it slides, and a changing number rolls inside the view ([TabNumber]), whose
+     * opacity the indicator takes, so it leaves the indicator as it is.
      */
     private inner class Tab(val session: VtSession, i: Int) {
-        val view = TextView(this@MainActivity).apply {
+        val view = TabNumber(this@MainActivity).apply {
             text = number(i)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, TAB_NUMBER_DP)
             gravity = Gravity.CENTER
@@ -547,10 +550,6 @@ class MainActivity : Activity(), TerminalService.Listener {
                 true
             }
         }
-
-        /** How much of the number's colour shows: 1 but while it changes ([renumber]). */
-        private var shown = 1f
-        private var renumbering: ValueAnimator? = null
 
         /**
          * Whether it shows another number than that of its place in the row: it is still on its
@@ -575,31 +574,18 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
 
         /**
-         * Fades its number out and the number of its place in, when they differ. A change while
-         * one runs is taken at its end.
+         * Rolls its number to the number of its place, when they differ. A change while it rolls
+         * is taken at its end.
          */
         fun renumber() {
-            if (renumbering != null || !stale) return
-            renumbering = ValueAnimator.ofFloat(-1f, 1f).apply {
-                duration = RENUMBER_MS
-                addUpdateListener {
-                    val f = it.animatedValue as Float
-                    // The new number from halfway on, from its place then
-                    if (f >= 0f && stale) view.text = number(rowTabs.indexOf(this@Tab))
-                    shown = abs(f)
-                    paint()
-                }
-                doOnEnd {
-                    renumbering = null
-                    renumber()
-                }
-                start()
-            }
+            if (!view.rolling && stale) view.roll(number(rowTabs.indexOf(this))) { renumber() }
         }
 
-        /** Out of the row, into its overlay, where it shrinks and fades out in its place. */
+        /**
+         * Out of the row, into its overlay, where it shrinks and fades out in its place; a roll
+         * under way goes on.
+         */
         fun leave() {
-            renumbering?.cancel()
             // A slide stops where it is
             view.animate().cancel()
             tabs.overlay.add(view)
@@ -609,8 +595,106 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
 
         private fun paint() {
-            val color = if (session == current) currentTabColor else mutedColor
-            view.setTextColor(ColorUtils.setAlphaComponent(color, (Color.alpha(color) * shown).roundToInt()))
+            view.setTextColor(if (session == current) currentTabColor else mutedColor)
+        }
+    }
+
+    /**
+     * A tab's number, which rolls to a new one ([roll]) like SwiftUI's numeric text: each digit
+     * that changes moves out, fading and blurring, as the new one moves in from the other side and
+     * sharpens; a lower number comes in from above, a higher one from below. Digits that stay the
+     * same in place stay still, and a number of another length rolls whole.
+     *
+     * Drawn by hand digit by digit, rolling or not, centred as by its gravity, so that a digit
+     * that stays does not shift by a fraction of a pixel as a roll starts or ends.
+     */
+    @SuppressLint("AppCompatCustomView") // The activity is a framework one, like the views it builds
+    private class TabNumber(context: Context) : TextView(context) {
+        /** The number rolling out; null while none rolls. */
+        private var old: String? = null
+
+        /** How far the roll has come, eased: from 0, the old number in place, to 1. */
+        private var progress = 0f
+
+        /** 1 when the new number comes in from above, -1 from below. */
+        private var direction = 1f
+
+        /** The blur of the digits moving out and of those moving in, null when too slight. */
+        private var outBlur: MaskFilter? = null
+        private var inBlur: MaskFilter? = null
+
+        val rolling get() = old != null
+
+        /** Rolls to [number] (when not [rolling]); [onEnd] runs once it shows alone. */
+        fun roll(number: String, onEnd: () -> Unit) {
+            val from = text.toString()
+            old = from
+            text = number
+            direction = if ((number.toIntOrNull() ?: 0) < (from.toIntOrNull() ?: 0)) 1f else -1f
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = RENUMBER_MS
+                interpolator = STANDARD
+                addUpdateListener {
+                    progress = it.animatedValue as Float
+                    outBlur = blur(progress)
+                    inBlur = blur(1f - progress)
+                    invalidate()
+                }
+                doOnEnd {
+                    old = null
+                    outBlur = null
+                    inBlur = null
+                    invalidate()
+                    onEnd()
+                }
+                start()
+            }
+        }
+
+        /** A blur by [f] of the most, made here as onDraw must not allocate. */
+        private fun blur(f: Float): MaskFilter? {
+            val radius = f * textSize * ROLL_BLUR
+            return if (radius < 0.5f) null else BlurMaskFilter(radius, BlurMaskFilter.Blur.NORMAL)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val new = text.toString()
+            val old = old
+            val color = currentTextColor
+            val y = baseline.toFloat()
+            val shift = textSize * ROLL_DISTANCE * direction
+            val newStart = start(new)
+            for (i in new.indices) {
+                val x = newStart + paint.measureText(new, 0, i)
+                if (old == null || stays(old, new, i)) {
+                    drawDigit(canvas, new, i, x, y, color, 1f, null)
+                } else {
+                    drawDigit(canvas, new, i, x, y - shift * (1f - progress), color, progress, inBlur)
+                }
+            }
+            if (old != null) {
+                val oldStart = start(old)
+                for (i in old.indices) {
+                    if (stays(old, new, i)) continue
+                    val x = oldStart + paint.measureText(old, 0, i)
+                    drawDigit(canvas, old, i, x, y + shift * progress, color, 1f - progress, outBlur)
+                }
+            }
+            paint.maskFilter = null
+        }
+
+        /** Whether [old]'s [i]th digit stays as [new]'s, in its place. */
+        private fun stays(old: String, new: String, i: Int) = old.length == new.length && old[i] == new[i]
+
+        /** Where [number] starts when centred between the paddings. */
+        private fun start(number: String) =
+            paddingLeft + (width - paddingLeft - paddingRight - paint.measureText(number)) / 2
+
+        /** Draws [number]'s [i]th digit at [x], [y] in [color], [shown] opaque. */
+        private fun drawDigit(canvas: Canvas, number: String, i: Int, x: Float, y: Float, color: Int, shown: Float, blur: MaskFilter?) {
+            paint.color = ColorUtils.setAlphaComponent(color, (Color.alpha(color) * shown).roundToInt())
+            paint.maskFilter = blur
+            canvas.drawText(number, i, i + 1, x, y, paint)
         }
     }
 
@@ -881,10 +965,14 @@ class MainActivity : Activity(), TerminalService.Listener {
         private const val LEAVE_MS = 150L
         private const val LEAVE_SCALE = 0.6f
 
-        /** How long a tab takes to fade its number out and the new one in, half each. */
-        private const val RENUMBER_MS = 200L
+        /** How long a tab's number takes to roll to the new one (Material's medium 2). */
+        private const val RENUMBER_MS = 300L
 
-        /** Material's standard easing, for the slide. */
+        /** How far a rolling digit moves, and how much it blurs at most, in its text size. */
+        private const val ROLL_DISTANCE = 0.7f
+        private const val ROLL_BLUR = 0.12f
+
+        /** Material's standard easing, for the slide and the roll. */
         private val STANDARD = PathInterpolator(0.2f, 0f, 0f, 1f)
 
         /** Material's standard accelerate easing, for a closed tab on its way out. */
