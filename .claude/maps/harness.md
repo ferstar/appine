@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's and gVisor's tests in grouped cases with a shared runner; image export; CI split into quick, Android and full)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix and gVisor cases with a shared runner; image export; CI split; the AppArmor gotcha last)
 
 ## Responsibilities
 
@@ -272,14 +272,13 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Cases with `--privileged` act on the development VM itself: a test that sets the clock succeeds
   natively and moves the VM's clock until its time sync corrects it (Starnix's
   `timerfd_mutable_test` and `time_test` call settimeofday), so such tests must stay out of cases.
-- The development VM's Ubuntu 6.8 kernel oopses in AppArmor (`aa_inet_bind_perm`) when a bound
-  inet socket is bound again with `AF_UNSPEC` from a confined container: the native side of a case
-  runs privileged (unconfined) and passes, but Appine passes the bind to the host from its
-  confined container, the dying host thread holds the BKL and the whole `appine-run` hangs. gVisor's
-  `UdpSocketTest.DisconnectAfterBindToUnspecAndConnect` does this, so it must not run there; each
-  oops taints the VM kernel until colima restarts.
-- A test that holds the BKL in one long syscall (a recursive-bind loop, see the kernel/vfs map) or
-  spins in one cannot be stopped by the case's guest `timeout`; only killing `appine-run` ends it.
+- The development VM's Ubuntu 6.8 kernel oopses in AppArmor (`aa_inet_bind_perm`) on an inet bind
+  with `AF_UNSPEC` from a confined container, and each oops taints the VM kernel until colima
+  restarts. Appine no longer passes such a bind to the host (the kernel/net map), but a case whose
+  native side makes one must run unconfined (`--privileged`, or `--security-opt
+  apparmor=unconfined` as `inet-bind` does).
+- A test that holds the BKL in one long syscall, or spins in one, cannot be stopped by the case's
+  guest `timeout`; only killing `appine-run` ends it.
 - GitHub runs scheduled workflows only from the default branch (master): the nightly
   `full.yml` exists once master has it, and uses master's copy of the workflow while checking out
   develop.

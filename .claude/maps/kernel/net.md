@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; IPv6-only port map entries; DNS stub threads; socket read/write as one message; `MSG_WAITALL`; msghdr iovecs; blocking connect; listen events; Starnix's and gVisor's test findings)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; IPv6-only port map entries; DNS stub threads; socket I/O (one message, `MSG_WAITALL`, iovecs); blocking connect; listen events; Starnix's and gVisor's findings; bind's family checks)
 
 ## Responsibilities
 
@@ -88,8 +88,11 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ### Binding, listening, connecting, accepting
 
-- bind: sockaddr over 128 bytes `EINVAL`; raw sockets drop the port; the namespace translation
-  runs; ports below `ip_unprivileged_port_start` need `CAP_NET_BIND_SERVICE` over the namespace
+- bind: sockaddr over 128 bytes `EINVAL`; inet sockets then check the length and family as Linux
+  6.1 does first (shorter than the family's sockaddr `EINVAL`; IPv4 takes `AF_UNSPEC` with the
+  wildcard address as `AF_INET` and refuses other families with `EAFNOSUPPORT`, raw IPv4 ignores
+  the family; IPv6 takes only `AF_INET6`, raw IPv6 answers `EINVAL`), so the host only sees
+  `AF_INET` and `AF_INET6`; raw sockets drop the port; the namespace translation runs; ports below `ip_unprivileged_port_start` need `CAP_NET_BIND_SERVICE` over the namespace
   owner (`EACCES`); then portmap (section 6) or a plain host bind; namespace registration and
   forwarding hooks follow.
 - listen binds implicitly if needed, listens on the host, registers the listener in a new
@@ -307,6 +310,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - Addresses are rewritten at the boundary in both directions (namespaces, ports, nat, DNS stub);
   anything returning an address to the guest must go through the same unmapping.
 - Netlink replies are snapshots taken at send time.
+- A bind must not reach the host with `AF_UNSPEC`: Ubuntu's 6.8 kernels (colima's 6.8.0-117) oops
+  in AppArmor's `aa_inet_bind_perm` on one from a confined process, and the host thread dies
+  holding the BKL, hanging every guest process. bind rewrites the family to `AF_INET` first.
 - The portmap key has no address, so binds of one guest port share one host port and the host
   decides their conflicts, except that IPv6-only binds in new namespaces get their own.
 - The raw ICMP id rewrite assumes one echo id per raw socket (the last one sent).
@@ -383,14 +389,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `ENOTCONN`); here the nonblocking host socket answers `EAGAIN` while poll reports it readable,
   so the receiver loops between the two at full CPU forever, and programs that wake their receiver
   threads with `shutdown` hang.
-- **Odd addresses reach the host unchecked:** bind and sendto hand a guest address the layer does
-  not understand to the host socket as is, so the host kernel's own checks answer
-  instead of Linux 6.1's. Under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux
-  says `EINVAL`, and on Ubuntu's 6.8 kernels (colima's 6.8.0-117) a bind of an already bound inet
-  socket with `AF_UNSPEC` oopses the host in `aa_inet_bind_perm`: the host thread dies holding the
-  BKL and every guest process hangs, unkillable. Linux's `inet_bind` takes `AF_UNSPEC` with
-  `INADDR_ANY` as `AF_INET` (and `EAFNOSUPPORT` otherwise; IPv6 sockets always `EAFNOSUPPORT`), so
-  handling the family in the layer would also avoid the host bug. Android has no AppArmor.
+- **Odd destinations reach the host unchecked:** sendto hands a guest address the layer does not
+  understand to the host socket as is, so the host kernel's own checks answer instead of Linux
+  6.1's; under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux says `EINVAL`.
+- **A raw socket cannot be bound again:** Linux's `raw_bind` lets a raw socket be bound any number
+  of times; the host ping socket that emulates a raw ICMP socket refuses a second bind with
+  `EINVAL`.
 
 ## Open questions
 

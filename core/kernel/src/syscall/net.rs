@@ -217,6 +217,14 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
     }
+    let kind = match &*sock.borrow() {
+        Socket::Inet(s) => Some((s.family, s.raw)),
+        _ => None,
+    };
+    let addr = match kind {
+        Some((family, raw)) => inet_bind_addr(family, raw, addr)?,
+        None => addr,
+    };
     // In a new network namespace, translate to the host address first (EADDRNOTAVAIL when it is
     // not a local address)
     let (net, icmp6, raw) = match &*sock.borrow() {
@@ -378,6 +386,44 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         forward_all(cx.kr());
     }
     Ok(0)
+}
+
+/// The address an inet socket binds, checked as Linux 6.1 checks it first (`inet_bind`,
+/// `ping_check_bind_addr`, `raw_bind`, `inet6_bind`, `rawv6_bind`): shorter than the family's
+/// sockaddr is EINVAL; an IPv4 socket takes AF_UNSPEC with the wildcard address as AF_INET (a
+/// compatibility rule) and refuses other families with EAFNOSUPPORT, while a raw one ignores the
+/// family; an IPv6 socket takes only AF_INET6 (a raw one answers EINVAL). The host never sees
+/// another family: some Ubuntu kernels oops in AppArmor on an AF_UNSPEC bind, and the host thread
+/// would die holding the BKL.
+fn inet_bind_addr(family: i32, raw: bool, mut addr: Vec<u8>) -> Result<Vec<u8>, Errno> {
+    const AF_UNSPEC: i32 = 0;
+    let given = addr
+        .get(..2)
+        .map(|b| i32::from(u16::from_le_bytes([b[0], b[1]])));
+    if family == AF_INET6 {
+        if addr.len() < 24 {
+            return Err(Errno::EINVAL);
+        }
+        if given != Some(AF_INET6) {
+            return Err(if raw {
+                Errno::EINVAL
+            } else {
+                Errno::EAFNOSUPPORT
+            });
+        }
+        return Ok(addr);
+    }
+    if addr.len() < 16 {
+        return Err(Errno::EINVAL);
+    }
+    match given {
+        Some(AF_INET) => {}
+        Some(AF_UNSPEC) if addr[4..8] == [0; 4] => {}
+        _ if raw => {}
+        _ => return Err(Errno::EAFNOSUPPORT),
+    }
+    addr[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    Ok(addr)
 }
 
 pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
