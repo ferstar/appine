@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's tests and PTY scenarios, now six grouped cases with a shared runner, built in CI)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's and gVisor's tests in grouped cases with a shared runner, built in CI; image export)
 
 ## Responsibilities
 
@@ -16,17 +16,18 @@
 - the cargo integration tests that drive it (`guest_programs`, `rootfs_programs`,
   `bench_programs`) and the guest test programs (`tests/guest`);
 - the benchmark runner `appine-bench` (`tests/bench`);
-- the differential tests (`scripts/difftest`, `tests/diff`), including Fuchsia Starnix's syscall
-  tests (`scripts/build-starnix-tests`, `tests/starnix`), the LTP build and runner
+- the differential tests (`scripts/difftest`, `tests/diff`), including Fuchsia Starnix's and
+  gVisor's syscall tests (`scripts/build-starnix-tests`, `tests/starnix`,
+  `scripts/build-gvisor-tests`, `tests/gvisor`), the LTP build and runner
   (`scripts/build-ltp`, `scripts/ltp`), the workload survey (`scripts/survey`, `tests/survey`) and
   the power-loss test (`tests/crash`);
 - the development container (`scripts/dev`, `scripts/dev.Dockerfile`) and CI
   (`.github/workflows/ci.yml`).
 
 Root: `hosts/cli/`, `tests/guest/`, `tests/bench/`, `tests/diff/`, `tests/survey/`,
-`tests/crash/`, `tests/starnix/`, `scripts/dev`, `scripts/dev.Dockerfile`, `scripts/difftest`,
-`scripts/build-ltp`, `scripts/ltp`, `scripts/build-starnix-tests`, `scripts/survey`,
-`.github/workflows/`.
+`tests/crash/`, `tests/starnix/`, `tests/gvisor/`, `scripts/dev`, `scripts/dev.Dockerfile`,
+`scripts/difftest`, `scripts/build-ltp`, `scripts/ltp`, `scripts/build-starnix-tests`,
+`scripts/build-gvisor-tests`, `scripts/survey`, `.github/workflows/`.
 
 Outside the module: the instruction-level lockstep tests (`engine`); unit tests inside each crate;
 the kernel's `run`, boot and console bridge (`kernel/process`, `kernel/tty`); bug reporting and
@@ -59,6 +60,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - `appine-bench [--runs N] [--quick] [--skip-tier0] [--only NAME] [--stats]`.
 - `scripts/dev <command>`; `scripts/difftest [-t tier] [-r] [-s store] [-j n] [case…]`;
   `scripts/build-ltp`; `scripts/ltp [-a] [-j n] [-t tier] [regex]`; `scripts/build-starnix-tests`;
+  `scripts/build-gvisor-tests [--list | --all]`;
   `scripts/survey [-t tier] [-s store] [-n image] [names…]`;
   `tests/crash/crash.sh <appine|native> <power|kill> [runs] [bin]` (as root in the VM).
 - CI on every push and pull request.
@@ -131,7 +133,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
   from another directory works.
 
-### Starnix's syscall tests
+### Starnix's and gVisor's syscall tests
 
 - `build-starnix-tests` fetches a pinned Fuchsia commit (a sparse checkout of
   `src/starnix/tests/syscalls/cpp` and the small libraries it uses: fit, stdcompat, fbl's
@@ -142,18 +144,36 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `tests/starnix/compat` supplies glibc's `TEMP_FAILURE_RETRY` (forced include), a `<linux/prctl.h>`
   that defers to musl's `<sys/prctl.h>`, and Android's copy of `<linux/bpf.h>`. At 86962cb, 81
   tests build and 12 do not (glibc-only interfaces, Fuchsia-only devices).
-- difftest installs the newest tarball into its store at `/usr/lib/starnix-tests` whenever the
-  tarball's `VERSION` differs from the installed one, and then exports the image again.
-- Six cases cover 63 of the 81 built programs by subsystem (`starnix-mm`, `-process`, `-signal`,
-  `-fs`, `-proc`, `-io`). Each ships `tests/diff/starnix/run.sh` through `# difftest-files:` and calls it
-  with its skip filter and program list; the runner lists each program's tests (minus disabled
-  ones) and runs each in its own process under `timeout -s KILL 60`, stdin from `/dev/null` and
-  its output in a file (a crash or hang, a test ignoring `SIGTERM`, a child keeping the output
-  open or a test reading stdin does not take the rest with it), printing `<test> ok|failed|skipped|exit <code>`, with core files off and the
+- `build-gvisor-tests` fetches a pinned gVisor commit (a sparse checkout of `test/syscalls/linux`
+  and `test/util`) and the abseil, googletest and google benchmark versions gVisor's
+  `MODULE.bazel` pins (sha256), and in `alpine:3.24` (`tests/gvisor/build.sh`, which can be rerun
+  in one container reusing the built dependencies) compiles the test library and, without Bazel,
+  each program from the sources and local libraries `tests/gvisor/parse-build.awk` reads from the
+  BUILD file (arm64 branches of `select_arch` only; test-case libraries linked as objects so their
+  tests register). `tests/gvisor/compat` supplies glibc names musl lacks (forced include), headers
+  that defer kernel headers to musl's where both define the same structures, and a `RunfilePath`
+  that finds helper programs next to the tests. Only the programs named in the `gvisor-*` cases
+  and every helper (targets not ending in `_test`) are built, into
+  `target/gvisor-tests/gvisor-tests-<commit>-<list hash>.tar` (older ones removed); `--list` prints
+  the programs, `--all` builds all 264 that build for arm64 into `target/gvisor-tests/all/` for a
+  full run by hand (about 700 MB, too large for the difftest image on the development VM).
+- difftest installs each suite's tarball into its store at `/usr/lib/<suite>-tests` whenever the
+  tarball's `VERSION` differs from the installed one or from the image's, and then exports the
+  image again, removing the image it replaced.
+- Six Starnix cases cover 63 of its 81 built programs by subsystem (`starnix-mm`, `-process`,
+  `-signal`, `-fs`, `-proc`, `-io`), and four gVisor cases a first set of its programs
+  (`gvisor-process`, `-fs`, `-net`, `-unix`). Each ships `tests/diff/gtest/run.sh` through
+  `# difftest-files:` and calls it with the suite, its skip filter and its program list; the
+  runner lists each program's tests (minus disabled ones) and runs each in its own process under
+  `timeout -s KILL 60`, stdin from `/dev/null` and its output in a file (a crash or hang, a test
+  ignoring `SIGTERM`, a child keeping the output open or a test reading stdin does not take the
+  rest with it), printing `<test> ok|failed|skipped|exit <code>`, with core files off and the
   shell's crash reports filtered out.
 - Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
-  (it fails on the native side because of docker, the VM or a newer kernel, or depends on timing).
+  (it fails on the native side because of docker, the VM or a newer kernel, depends on timing, or
+  hangs on both sides), or a gVisor test that sleeps 10 s or more by design (left out for CI
+  time; the four gVisor cases still take about 6.5 minutes per side).
   The runner's header lists the programs in no case and why: those that would reboot, suspend or
   set the clock of the VM, features Appine does not have (bpf maps and other program types, perf,
   process_mrelease, userfaultfd, overlayfs, tun), devices neither side has, and two with nothing
@@ -198,7 +218,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - CI, Linux arm64 (`ubuntu-24.04-arm`): fmt, clippy (`-D warnings`), fetch the rootfs, `cargo test
   --workspace` with the require switches, the network test, a long lockstep run, release build and
   `appine-bench --runs 3 --skip-tier0`, `scripts/build-starnix-tests` (its tarball cached by the
-  hash of the script and `tests/starnix/compat`), `scripts/difftest` at Tier 1 with one lane, and the
+  hash of the script and `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the
+  hash of the script, `tests/gvisor` and its program list), `scripts/difftest` at Tier 1 with one
+  lane, and the
   engine tests built with clang. CI, Android (x86_64): the NDK, the rootfs, Zig 0.17.0 (from
   ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with `target/ghostty`
   and Zig's global cache cached by the script's hash), then cargo-ndk clippy, `assembleDebug
@@ -243,6 +265,14 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Cases with `--privileged` act on the development VM itself: a test that sets the clock succeeds
   natively and moves the VM's clock until its time sync corrects it (Starnix's
   `timerfd_mutable_test` and `time_test` call settimeofday), so such tests must stay out of cases.
+- The development VM's Ubuntu 6.8 kernel oopses in AppArmor (`aa_inet_bind_perm`) when a bound
+  inet socket is bound again with `AF_UNSPEC` from a confined container: the native side of a case
+  runs privileged (unconfined) and passes, but Appine passes the bind to the host from its
+  confined container, the dying host thread holds the BKL and the whole `appine-run` hangs. gVisor's
+  `UdpSocketTest.DisconnectAfterBindToUnspecAndConnect` does this, so it must not run there; each
+  oops taints the VM kernel until colima restarts.
+- A test that holds the BKL in one long syscall (a recursive-bind loop, see the kernel/vfs map) or
+  spins in one cannot be stopped by the case's guest `timeout`; only killing `appine-run` ends it.
 - busybox's `timeout` sends only `SIGTERM`: a test that ignores it, or a child that keeps the
   output pipe open, makes `$(timeout …)` wait forever on either side. `timeout -s KILL` with the
   output written to a file avoids both. Output that goes through `grep` inside the guest is
@@ -275,9 +305,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
   `apk add` leaves a store the next run uses as is.
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
-- **The `starnix-*` cases pass vacuously without the built tests:** locally they only print that
-  the tests are missing until `build-starnix-tests` has run (it needs the network and about four
-  minutes); CI builds them.
+- **The `starnix-*` and `gvisor-*` cases pass vacuously without the built tests:** locally they
+  only print that the tests are missing until `build-starnix-tests` / `build-gvisor-tests` has run
+  (they need the network and about four and ten minutes); CI builds them.
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?

@@ -1,8 +1,8 @@
 # docker-run-options: --privileged
-# difftest-files: starnix
+# difftest-files: gtest
 # Fuchsia Starnix's syscall tests on files, pipes and mounts: file I/O and metadata, fcntl locks
 # and flags, fallocate, renameat2, symlinks, xattrs, tmpfs, sync, sendfile, splice and vmsplice,
-# pipes, AIO, inotify, mount and its flags, loop devices. Run by tests/diff/starnix/run.sh, one
+# pipes, AIO, inotify, mount and its flags, loop devices. Run by tests/diff/gtest/run.sh, one
 # process per test. Tests that differ for a reason recorded in a map, or that cannot be compared,
 # are skipped, with the reason above them.
 # kernel/vfs: AIO contexts belong to the thread group, not the address space
@@ -58,6 +58,6 @@ SKIP="$SKIP:PipeTest.PolloutFragmentation"
 SKIP="$SKIP:FcntlLockTest.CloneFiles:MknodTest.MknodChrZeroDoesNotRequireCapMknod"
 SKIP="$SKIP:DetachedMountTest.BindFails:DetachedMountTest.MoveFails:DetachedMountTest.PivotRootFails"
 SKIP="$SKIP:DetachedMountTest.SubmountFails:DetachedMountTest.UnsharePreservesDetachedState"
-sh /tmp/difftest-files/starnix/run.sh "$SKIP" fs_test fcntl_test fallocate_test read_write_test \
+sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" fs_test fcntl_test fallocate_test read_write_test \
     renameat2_exchange_sticky_test symlink_test xattr_test tmpfs_test sync_test sendfile_test \
     vmsplice_test pipe_test aio_test inotify_test mount_test loop_test

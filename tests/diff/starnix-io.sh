@@ -1,8 +1,8 @@
 # docker-run-options: --privileged
-# difftest-files: starnix
+# difftest-files: gtest
 # Fuchsia Starnix's syscall tests on readiness, timers, terminals and netlink: epoll, poll,
 # timerfd, getrandom, ioctls on sockets and terminals, PTYs, rtnetlink. Run by
-# tests/diff/starnix/run.sh, one process per test. Tests that differ for a reason recorded in a
+# tests/diff/gtest/run.sh, one process per test. Tests that differ for a reason recorded in a
 # map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/poll: epoll_wait does not check the event buffer up front
 SKIP="EpollTest.WaitInvalidParams"
@@ -30,5 +30,5 @@ SKIP="$SKIP:IoctlTest.EVIOCGNAME_*:IoctlTest.SIOCGIFNETMASK_Success"
 # Hangs on both sides in this case until the 60 s timeout, although it passes when terminal_test
 # runs alone in the same image (cause not found): only the timeout would be compared
 SKIP="$SKIP:Pty.SendSignals"
-sh /tmp/difftest-files/starnix/run.sh "$SKIP" epoll_test poll_test timerfd_test getrandom_test \
+sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" epoll_test poll_test timerfd_test getrandom_test \
     ioctl_test terminal_test netlink_test

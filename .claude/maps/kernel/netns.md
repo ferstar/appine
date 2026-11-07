@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-05 (targeted verification only since the full mapping: IPv6-only binds get their own host port, so IPv4 and IPv6 bind one port side by side; `DELTABLE` without family, name or handle flushes tables, so `nft flush ruleset` works)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests)
 
 ## Responsibilities
 
@@ -308,6 +308,21 @@ structure (`kernel/procfs`); host sockets (`hal`).
   virtual devices is unusable and on-link IPv6 is handed to the host; `hostmap` entries are never
   freed and collide once 65534 are used; PREROUTING filter chains see the post-DNAT destination at
   every priority; POSTROUTING, SNAT and MASQUERADE do nothing.
+- **Route requests insist on exact address sizes:** `RTA_DST`, `RTA_GATEWAY` and `RTA_PREFSRC` in
+  `RTM_NEWROUTE`/`RTM_DELROUTE` must be exactly 4 or 16 bytes, otherwise `EINVAL`; Linux 6.1
+  answers `ERANGE` for a short IPv4 attribute or IPv6 gateway, uses the first 4 bytes of a longer
+  IPv4 attribute, and needs only the prefix's bytes of an IPv6 destination. iproute2 sends exact
+  sizes, so only oddly encoded requests are affected.
+- **Gateways resolve to the last matching subnet:** a route with a gateway but no device takes the
+  device of the last longest-prefix route covering the gateway, where Linux takes the first
+  (lowest index); with two devices on one subnet the route lands on the other device, and a later
+  duplicate naming the first device is accepted instead of `EEXIST`.
+- **Next-hop checks ignore `onlink` and Linux's special cases:** route requests never read
+  `rtm_flags`, so `RTNH_F_ONLINK` (`ip route add … via GW dev X onlink`, used by CNI and VPN
+  setups) still requires a route covering the gateway and fails with `ENETUNREACH`; an all-zero
+  `RTA_GATEWAY` counts as a gateway instead of none; IPv6 link-local gateways are looked up in the
+  table (failing while the device has no carrier) where Linux accepts them with a device; and an
+  unreachable IPv6 gateway is `ENETUNREACH` where Linux says `EHOSTUNREACH`.
 
 ## Open questions
 

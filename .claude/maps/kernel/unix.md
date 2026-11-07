@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets; deviations found by gVisor's tests)
 
 ## Responsibilities
 
@@ -132,7 +132,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   uid/gid 65534 without a peer, including listeners); others `ENOPROTOOPT`.
 - Readiness: `POLLIN` when data or EOF is readable, `POLLOUT` when the queue is under a quarter of
   the capacity (or the peer is gone, so writers get `EPIPE`), `POLLRDHUP`/`POLLHUP` from shutdown
-  state, never `POLLERR`; listeners are readable with pending connections. `FIONREAD`: complete
+  state (`POLLHUP` only on stream and seqpacket sockets), never `POLLERR`; listeners are readable with pending connections. `FIONREAD`: complete
   stream bytes, the next packet's length for seqpacket/datagram, 0 on listeners; `SIOCOUTQ` is not
   implemented.
 - `/proc/net/unix`: sockets from fd tables plus in-flight ones, filtered by the reader's namespace;
@@ -201,7 +201,44 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   queue) and 0 on listeners (Linux `EINVAL`); no `SIOCOUTQ`; datagram queues have no length
   limit; non-`SOL_SOCKET` control messages are rejected instead of skipped; signal-interrupted
   timed waits return `ERESTARTSYS` (Linux `EINTR` with a timeout); `/proc/net/unix` shows connected
-  datagram sockets as state 3.
+  datagram sockets as state 3; the generic `SOL_SOCKET` options (`SO_LINGER`, `SO_KEEPALIVE`,
+  `SO_RCVLOWAT`, `SO_BROADCAST` and the like) are accepted by setsockopt and `ENOPROTOOPT` to
+  getsockopt; buffer sizes are fixed at 212992, so `SO_SNDBUF`/`SO_RCVBUF` (and their `FORCE`
+  forms) change nothing, a small send buffer does not make writes block and a larger one does
+  not unblock them. Timeout parsing is `kernel/net`'s (**Socket timeouts are parsed leniently**).
+- **Datagram sends ignore the receiver's read shutdown:** after the receiving socket does
+  `shutdown(SHUT_RD)`, datagrams to it are still queued and the send succeeds, where Linux 6.1
+  fails them with `EPIPE` (without `SIGPIPE`), so senders never learn that the peer stopped
+  reading.
+- **Datagram sockets never poll `POLLHUP`:** after `SHUT_RDWR` a datagram socket reports
+  `POLLIN|POLLOUT|POLLRDHUP` without the `POLLHUP` of Linux's `unix_dgram_poll`, so an event loop
+  waiting only for hangups on a datagram socket never wakes.
+- **Stream sends ignore a destination address:** sendto/sendmsg with an address on a stream socket
+  sends to the connected peer, where Linux fails with `EISCONN` (`EOPNOTSUPP` when unconnected).
+- **Credentials are attached to messages sent without `SO_PASSCRED`:** every message records the
+  sender's pid, uid and gid, so a receiver that turns `SO_PASSCRED` on later gets real credentials
+  for data sent earlier, where Linux delivers pid 0 and uid/gid 65534 for them (Linux attaches
+  credentials only while the sender or receiver has the option). The same stamping causes the read
+  splits of **Stream reads split and merge at the wrong places**.
+- **Short control buffers lose the credentials header:** with 16 to 27 bytes of control buffer and
+  `SO_PASSCRED` on, recvmsg returns no control message at all and sets `MSG_CTRUNC`; Linux's
+  `put_cmsg` writes a truncated `SCM_CREDENTIALS` header (and the pid when it fits).
+- **recvmsg faults lose messages and leak passed fds:** a message is taken off the queue and its
+  `SCM_RIGHTS` files are installed before the data and control buffer are copied out, so a bad
+  iovec or `msg_control` returns `EFAULT` with the data gone and the files left open under fd
+  numbers the program never learns (pipes and sockets then never reach EOF), and recvmsg with a
+  NULL control buffer and a nonzero length fails outright. Linux keeps a stream message queued on
+  a data fault, and for a bad control buffer drops the files and returns the data with
+  `MSG_CTRUNC`.
+- **Accepted sockets don't inherit `SO_PASSCRED`:** Linux's `unix_accept` copies the listener's
+  `SO_PASSCRED` to the new socket; here it starts off, so servers that enable credential passing
+  on the listening socket get no `SCM_CREDENTIALS` on their connections.
+- **No sender address on connections:** recvfrom/recvmsg on stream and seqpacket sockets return an
+  empty address, where Linux returns the sending socket's bound name as it is at receive time.
+- **Abstract names ignore the socket type:** Linux keys abstract names by name and socket type, so
+  a stream and a datagram socket can bind the same name and a connect with the wrong type finds
+  nothing (`ECONNREFUSED`); here the name alone is the key, so the second bind is `EADDRINUSE` and
+  the wrong-type connect is `EPROTOTYPE`.
 
 ## Open questions
 

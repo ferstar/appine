@@ -1,9 +1,9 @@
 # docker-run-options: --privileged
-# difftest-files: starnix
+# difftest-files: gtest
 # Fuchsia Starnix's syscall tests on processes and threads: execve and the ELF loader, exit, abort
 # and zombies, thread-group lifecycle, waitpid flags and exit signals, pidfd, kcmp, futexes,
 # scheduling, rlimits, prctl, sysinfo, POSIX timers, restarted reads, breakpoints, and the tests'
-# own fork helpers. Run by tests/diff/starnix/run.sh, one process per test. Tests that differ for a
+# own fork helpers. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/process: wait ignores __WCLONE and __WALL and the children's exit signals, so any child is
 # reaped under any flags
@@ -38,14 +38,15 @@ SKIP="$SKIP:ZombieProcTest.MountInfo:ZombieProcTest.Mounts:ZombieProcTest.PageMa
 SKIP="$SKIP:ZombieProcTest.Auxv:ZombieProcTest.Environ"
 # Hang on both sides (killed after 60 s, so only the timeout would be compared): a thread ending
 # through the raw exit syscall never marks itself exited, which musl's pthread_join waits for
-# (glibc waits for the kernel's tid clearing); the robust futex test execs syscall_test_exec_child, a helper
-# scripts/build-starnix-tests does not build, and then waits for it forever
+# (glibc waits for the kernel's tid clearing); the robust futex test execs
+# syscall_test_exec_child, a helper scripts/build-starnix-tests does not build, and then waits for
+# it forever
 SKIP="$SKIP:ExitTest.SysExitGroupMultipleThread:RobustFutexTest.FutexStateAfterExecCheck"
 # Cannot be compared: docker sets its own RLIMIT_NOFILE; the test needs Linux 6.3 and skips itself
 # on Appine's 6.1; the alarm timer is checked 5 µs after it is due, too close under load
 SKIP="$SKIP:KernelDefaults/RLimitDefaultTest.CurAndMaxDefaults/NOFILE"
 SKIP="$SKIP:PrctlTest.SetresuidAndSetresgidNoopPreservesFsIds:Timers.RealtimeAlarm"
-sh /tmp/difftest-files/starnix/run.sh "$SKIP" exec_test exit_test abort_test zombie_test \
+sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" exec_test exit_test abort_test zombie_test \
     thread_group_lifecycle_test waitpid_flags_test waitpid_exit_signal_test pidfd_test kcmp_test \
     futex_test sched_test rlimit_test prctl_test sysinfo_test timers_test restart_read_test \
     sw_breakpoint_test test_helper_test trivial_test

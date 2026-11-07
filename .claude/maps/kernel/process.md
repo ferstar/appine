@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; dying pid namespaces; DNS stub; module references; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; Starnix's test findings, `sched_setattr` last)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; dying pid namespaces; DNS stub; module references; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; Starnix's and gVisor's test findings, exec and waitid last)
 
 ## Responsibilities
 
@@ -181,7 +181,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `/proc/<pid>/exe`. It must be a regular executable file (`EACCES`), not on a noexec mount;
   nosuid is noted.
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
-  relative to the cwd; more than four nested levels is `ELOOP`.
+  relative to the cwd; more than four nested levels is `ELOOP` (Linux 6.1 allows five).
 - `ETXTBSY` if a writable open file refers to the final executable.
 - Credentials: setuid/setgid apply unless `no_new_privs`, nosuid, or the owner/group are unmapped;
   file capabilities come from the xattr. A secure exec clamps the stack limit to 8 MB (written back
@@ -298,7 +298,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Keys are the translated host address, except for addresses in a shared file mapping (even a
   read-only one), which use (device, inode, offset) so different processes mapping the same file
   meet. `FUTEX_PRIVATE_FLAG` is ignored, so private futexes on shared file pages share a queue
-  across processes (only extra wake-ups). The single waiter list is scanned linearly.
+  across processes, and private and non-private operations on one address meet where Linux keeps
+  them apart (only extra wake-ups). The single waiter list is scanned linearly.
 - Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, `futex_waitv`; WAKE_OP and
   the PI operations return `ENOSYS`.
 - Wait: compare and enqueue under the futex lock, then wait alone (no channels); dequeued means
@@ -484,7 +485,20 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `PT_PHDR`, fails execve with `ENOEXEC`, where Linux 6.1 execs it (with `AT_PHDR` 0) and the new
   image then runs or faults; conversely, segments whose file offset and address disagree within the
   page are loaded by copying, where Linux kills the process with `SIGSEGV` after the point of no
-  return. Only hand-made ELFs and unusual linker-script output are affected.
+  return. `Elf::parse` also fails with `ENOEXEC`, before the point of no return, for a `PT_INTERP`
+  with a NUL before its last byte (Linux uses the string up to the first NUL: `"\0\0"` opens the
+  cwd and fails with `EACCES`), a `PT_LOAD` whose file range runs past EOF (Linux maps it, zeros
+  after EOF) and a `PT_LOAD` ending above 2^48 (Linux commits and kills with `SIGSEGV`); an
+  interpreter that is not an aarch64 ELF is `ENOEXEC` where Linux returns `ELIBBAD`. Only
+  hand-made ELFs and unusual linker-script output are affected (gVisor's `exec_binary_test` builds
+  its ELFs with the headers outside the only `PT_LOAD`, so most of it fails here).
+- **`#!` scripts nest one level less than Linux:** execve allows four nested interpreter scripts
+  (`MAX_INTERP_DEPTH`) and returns `ELOOP` for a fifth, where Linux 6.1's `exec_binprm`
+  (`depth > 5`) runs five scripts plus the final binary.
+- **`waitid` without `WEXITED` waits forever on zombies:** `find_event` counts zombie children as
+  waitable when only `WSTOPPED`/`WCONTINUED` are requested, so the call blocks (or returns 0 with
+  `WNOHANG`) where Linux 6.1 returns `ECHILD`; a loop that waits only for stops and continues
+  hangs once its children have exited.
 - **`sched_setattr` departs from `__sched_setscheduler` in four details:** `SCHED_RESET_ON_FORK`
   inside `sched_policy` is accepted (Linux: `EINVAL`, not a valid policy); the clamps are compared
   with each other only when both are given, not with the thread's current ones, so a minimum above

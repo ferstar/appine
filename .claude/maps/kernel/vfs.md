@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC` from open; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; Starnix's test findings, mount flags last)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC` from open; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; Starnix's and gVisor's test findings, mounts and inotify last)
 
 ## Responsibilities
 
@@ -660,7 +660,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Fidelity gaps:** statx never reports btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`; no
   `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
   fallocate writes zeros; with tmpfs's size accounting a sparse file can fill an instance: LTP
-  fallocate04, fallocate05, openat02); `RLIMIT_NOFILE`
+  fallocate04, fallocate05, openat02; and a fault on a mapping of a full tmpfs never raises
+  Linux's `SIGBUS`); `RLIMIT_NOFILE`
   set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
   access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
   emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
@@ -726,6 +727,76 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
   kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
   root.
+- **No mount limit, and recursive binds stall the kernel:** there is no `fs.mount-max`, so a
+  loop of recursive binds of a tree onto itself never gets Linux's `ENOSPC`; each step doubles the
+  mounts and the time one bind holds the BKL (about four times longer per step: 0.05, 0.2, 0.7,
+  3 s…), during which every guest process waits and `SIGKILL` takes no effect. Any user able to
+  `unshare -Urm` can freeze the whole Appine kernel this way (gVisor's
+  `FailedBindDoesNotBreakPropagation` does it while looking for the limit).
+- **Mounts copied into a less privileged namespace are not locked:** a mount namespace created
+  together with, or owned by, a new user namespace does not lock the mounts it inherits, so its
+  root can unmount them or use one as pivot_root's `new_root`, where Linux 6.1 refuses with
+  `EINVAL`; can clear ro, nodev, nosuid and noexec with `MS_REMOUNT|MS_BIND` on such a mount or a
+  bind of it, where Linux keeps the inherited flags locked (`EPERM`); and can bind a tree
+  non-recursively, uncovering what its inherited submounts hid, where Linux's `do_loopback`
+  returns `EINVAL`. A sandbox that hides paths by mounting over them (masked `/proc` entries, a
+  tmpfs over a secret directory) or makes them read-only can have that undone by a rootless user
+  inside it.
+- **proc and sysfs mounts in a user namespace skip Linux's owner and visibility checks:** the root
+  of any user namespace can mount proc or sysfs, where Linux 6.1 requires `CAP_SYS_ADMIN` over the
+  owner of the caller's pid (proc) or network (sysfs) namespace and, outside the initial user
+  namespace, an existing fully visible mount of that filesystem (no locked submounts over
+  non-empty directories; locked read-only and atime flags carried over), else `EPERM`. A rootless
+  user in a sandbox that masks `/proc` or `/sys` entries can mount a fresh, unmasked, writable
+  instance.
+- **truncate on synthetic files is `EACCES`:** truncate(2) needs a store inode before it checks
+  the file type, so devpts, procfs and sysfs files fail with `EACCES` (`EROFS` on a read-only
+  mount), where Linux returns `EINVAL` for a non-regular file before any permission check.
+- **`IN_EXCL_UNLINK` filters the wrong events:** the flag is honoured only by directory watches
+  and keyed on the child's link count, so a file's own watch keeps reporting writes and closes
+  after the file is unlinked, a directory watch keeps reporting I/O through an unlinked name while
+  another link remains, and a directory watch loses `IN_ATTRIB`/`IN_MODIFY` from fchmod, futimes
+  and ftruncate of an unlinked child. Linux excludes exactly the open, access, modify and close
+  events of an unlinked name, on both watches.
+- **Executing a file reports no inotify events:** execve opens and reads the program (and a
+  script's interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
+- **`O_PATH` descriptors pass fcntl, flock and getdents64:** every fcntl command works on an
+  `O_PATH` fd (`F_SETFL`, owners, signals, leases), where Linux allows only dup, fd flags and
+  `F_GETFL` and returns `EBADF` otherwise; flock on one takes a real lock (Linux `EBADF`), so a
+  path-only fd can hold or contend locks and block real openers; getdents64 on one is `ENOTDIR`
+  instead of `EBADF`.
+- **open with `O_PATH` keeps other status flags:** openat does not drop everything but
+  `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` when `O_PATH` is given (Linux's `build_open_how`), so
+  `F_GETFL` on such an fd reports the access mode, `O_APPEND`, `O_NONBLOCK` and `O_SYNC`, and code
+  reading the access mode from `F_GETFL` thinks a path fd is writable.
+- **getdents64 accepts counts above `INT_MAX`:** a count of 2^31 or more is taken as a huge buffer,
+  where Linux returns `EINVAL`.
+- **`SEEK_END` on directories is `EINVAL`:** every directory refuses it, where Linux allows it on
+  procfs and ext4 directories (which the store stands in for) and refuses it only on tmpfs-like
+  ones.
+- **Scoped openat2 never returns `EAGAIN`:** with `RESOLVE_BENEATH` or `RESOLVE_IN_ROOT`, a `..`
+  walked while another thread mounts or renames is never `EAGAIN`, because the whole walk is
+  atomic under the BKL; Linux returns it so callers retry. Safe, but callers never see the retry
+  signal.
+- **`O_TRUNC` with `O_RDONLY` is only half a write:** open checks write permission, `ETXTBSY` and
+  leases for it but neither truncates the file nor refuses a directory, so `open(dir,
+  O_RDONLY|O_TRUNC)` succeeds and `open(file, O_RDONLY|O_TRUNC)` keeps the data, where Linux 6.1
+  returns `EISDIR` and truncates.
+- **`O_DIRECT` is never refused at open:** directories (and, from the code, tmpfs and synthetic
+  files) open with `O_DIRECT` where Linux 6.1 returns `EINVAL`, so programs probing for direct
+  I/O support (databases, `dd oflag=direct`, fio) are told it works.
+- **Access mode 3 opens read-write:** an fd opened with `O_WRONLY|O_RDWR` (the "ioctl-only" mode)
+  reads and writes regular files, FIFOs and devices, where Linux allows neither (`EBADF`); a tool
+  that opens a device that way only to issue ioctls can change its contents.
+- **renameat2 ignores `RENAME_NOREPLACE` for `.`/`..`:** such a destination is `EBUSY` even with
+  the flag, where Linux 6.1 returns `EEXIST`.
+- **rename in synthetic filesystems is `EACCES` first:** renameat2 needs store directories before
+  any other check, so in procfs, sysfs or devpts a rename of a path to itself fails where Linux
+  returns 0, a `.`/`..` target is `EACCES` instead of `EBUSY`, and other renames are `EACCES`
+  where Linux says `EPERM`.
+- **Anonymous pipes and sockets cannot change owner:** fchown on them always succeeds and changes
+  nothing, even for an unprivileged caller that Linux refuses with `EPERM`, and fstat shows the
+  caller as owner rather than the creator.
 
 ## Open questions
 

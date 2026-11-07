@@ -1,8 +1,8 @@
 # docker-run-options: --privileged
-# difftest-files: starnix
+# difftest-files: gtest
 # Fuchsia Starnix's syscall tests on procfs, sysfs, sysctls and cgroups: per-process and system
 # files, their permissions, /proc/sys, /sys/kernel, cpuinfo, pressure files, the cgroup v2 tree and
-# its freezer. Run by tests/diff/starnix/run.sh, one process per test. Tests that differ for a
+# its freezer. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/procfs: no change notifications (polling cgroup.events never wakes, so the test hangs);
 # writes through a removed cgroup's open files give the wrong result; fidelity gaps: chown
@@ -46,5 +46,5 @@ SKIP="$SKIP:SysctlTest/SysctlTestReadBack.ReadBack/core_wmem_max_*"
 # Cannot be compared: pid 2 is kthreadd only on a whole system; docker's pid namespace has no pid 2
 # and Appine gives it to an ordinary process
 SKIP="$SKIP:ProcTaskDirTest.Kthread*"
-sh /tmp/difftest-files/starnix/run.sh "$SKIP" procfs_test sysctl_test sysfs_kernel_test \
+sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" procfs_test sysctl_test sysfs_kernel_test \
     cpuinfo_test pressure_test cgroup_test cgroup_freezer_test

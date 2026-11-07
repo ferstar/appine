@@ -1,8 +1,8 @@
 # docker-run-options: --privileged
-# difftest-files: starnix
+# difftest-files: gtest
 # Fuchsia Starnix's syscall tests on memory: mmap and mremap corner cases, address-space bounds,
 # anonymous inodes, mlock, memfd, membarrier, /proc/<pid>/mem and pagemap, personality. Run by
-# tests/diff/starnix/run.sh, one process per test. Tests that differ for a reason recorded in a
+# tests/diff/gtest/run.sh, one process per test. Tests that differ for a reason recorded in a
 # map, or that cannot be compared, are skipped, with the reason above them.
 # Fail on the native side, depending on its newer kernel (VMA merging of file mappings)
 SKIP="MMapProcTest.AdjacentFileMappings"
@@ -32,5 +32,5 @@ SKIP="$SKIP:ProcTestBase.ProcMemAccessGatedByFsUidSymmetric"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMappedAndUnmapped:ProcTestBase.ProcSelfPagemapMultiChunkBoundary"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMultipleMappingsAndHoles"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapFallbackBoundary"
-sh /tmp/difftest-files/starnix/run.sh "$SKIP" mmap_test aspace_test anon_test mlock_test \
+sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" mmap_test aspace_test anon_test mlock_test \
     memfd_test membarrier_test procfs_mem_test personality_test

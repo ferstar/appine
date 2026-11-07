@@ -26,9 +26,9 @@
 # gzipped tar in base64 (neither side has the work tree, and the store stays as it is), so they
 # count towards the 128 KB limit.
 #
-# The starnix-* cases run Fuchsia Starnix's syscall tests (gtest programs), one process per test,
-# once scripts/build-starnix-tests has built them; without them they only print that they are
-# missing.
+# The starnix-* and gvisor-* cases run Fuchsia Starnix's and gVisor's syscall tests (gtest
+# programs), one process per test, once scripts/build-starnix-tests or scripts/build-gvisor-tests
+# has built them; without them they only print that they are missing.
 #
 # Both sides' outputs are written to target/difftest/<name>.native and .appine and overwritten on
 # the next run; on a mismatch a copy is also saved as
@@ -127,28 +127,44 @@ if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
     exit 1
 fi
 
-# Fuchsia Starnix's syscall tests, once built (scripts/build-starnix-tests): installed into the store
-# at /usr/lib/starnix-tests whenever the built version differs from the installed one, which also
-# exports the image again; the starnix-* cases run them
-starnix=$(ls target/starnix-tests/starnix-tests-*.tar 2>/dev/null | tail -n 1)
-if [ -n "$starnix" ]; then
-    want=$(tar xOf "$starnix" ./VERSION)
-    have=$(appine --rootfs "$store" -- /bin/cat /usr/lib/starnix-tests/VERSION 2>/dev/null || true)
+# Prebuilt syscall test suites, once built (scripts/build-starnix-tests for Fuchsia Starnix's,
+# scripts/build-gvisor-tests for gVisor's): each is installed into the store at
+# /usr/lib/<suite>-tests whenever the built version differs from the installed one, which also
+# exports the image again; the starnix-* and gvisor-* cases run them
+for suite in starnix gvisor; do
+    tests=$(ls target/$suite-tests/$suite-tests-*.tar 2>/dev/null | tail -n 1)
+    if [ -z "$tests" ]; then
+        continue
+    fi
+    want=$(tar xOf "$tests" ./VERSION)
+    have=$(appine --rootfs "$store" -- /bin/cat /usr/lib/$suite-tests/VERSION 2>/dev/null || true)
     if [ "$want" != "$have" ]; then
-        echo "installing $starnix into $store"
-        linux "$run --rootfs $store -- /bin/sh -c 'rm -rf /usr/lib/starnix-tests &&
-            mkdir -p /usr/lib/starnix-tests && tar xf - -C /usr/lib/starnix-tests' <$starnix"
+        echo "installing $tests into $store"
+        linux "$run --rootfs $store -- /bin/sh -c 'rm -rf /usr/lib/$suite-tests &&
+            mkdir -p /usr/lib/$suite-tests && tar xf - -C /usr/lib/$suite-tests' <$tests"
         rebuild=1
     fi
-fi
+    # The image (and with it the lane clones) is checked too: an export that failed after the
+    # install (a full VM disk) leaves the store current and the image without the tests
+    if [ "$rebuild" = 0 ] && [ "$want" != "$(docker run --rm --platform linux/arm64 "$image" \
+        cat /usr/lib/$suite-tests/VERSION 2>/dev/null || true)" ]; then
+        rebuild=1
+    fi
+done
 
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "exporting the root filesystem of $store"
     # /tmp needs only the directory itself: what earlier runs left in the store's /tmp (possibly
     # gigabytes) need not go into the image
+    old=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)
     appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / --exclude='tmp/*' \
         bin etc lib sbin usr tmp 2>/dev/null |
         docker import --platform linux/arm64 - "$image" >/dev/null
+    # The replaced image is left untagged and would keep its gigabytes in the VM until the disk
+    # fills; a container still using it keeps it (rmi refuses)
+    if [ -n "$old" ] && [ "$old" != "$(docker image inspect --format '{{.Id}}' "$image")" ]; then
+        docker rmi "$old" >/dev/null 2>&1 || true
+    fi
 fi
 fi
 

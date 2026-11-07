@@ -88,6 +88,21 @@ jobs:
       - name: Build Starnix's syscall tests
         run: scripts/build-starnix-tests
 
+      # gVisor's syscall tests, for the gvisor-* cases: only the programs those cases name are
+      # built, so the list is part of the key (abseil and the test library make a miss take about
+      # ten minutes)
+      - name: List gVisor's test programs
+        id: gvisor
+        run: echo "programs=$(scripts/build-gvisor-tests --list | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: target/gvisor-tests
+          key: gvisor-tests-${{ hashFiles('scripts/build-gvisor-tests', 'tests/gvisor/**') }}-${{ steps.gvisor.outputs.programs }}
+
+      - name: Build gVisor's syscall tests
+        run: scripts/build-gvisor-tests
+
       # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
       # Alpine in docker. The first run installs the packages the test cases need with apk, which
       # depends on the internet. Appine turns the guest's raw ICMP sockets into host ping sockets:

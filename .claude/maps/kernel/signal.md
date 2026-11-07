@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; bugs from Starnix's syscall tests; kill with a thread id; retargeting process signals; detaching at syscall stops)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace last)
 
 ## Responsibilities
 
@@ -334,6 +334,27 @@ procfs.
 - **`MADV_DONTNEED` wipes the vDSO:** the vDSO is a private anonymous copy, so discarding it (alone
   or inside a larger range) zeroes it and the next vDSO clock call or signal return through
   `__kernel_rt_sigreturn` raises `SIGILL`, where Linux refills the vDSO from the kernel image.
+- **Threads ended by another thread report no `PTRACE_EVENT_EXIT`:** only threads calling
+  `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
+  `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1
+  gives them (there the execve waits for it); a tracer that collects state at exit misses them.
+- **ptrace memory requests skip `ptrace_access_vm`'s check:** `PTRACE_PEEK*`/`POKE*` never compare
+  the tracee's dumpable state with the tracer's privilege at attach, so a tracer attached without
+  `CAP_SYS_PTRACE` keeps reading and writing the memory of a process that later made itself
+  non-dumpable (`PR_SET_DUMPABLE` 0, as ssh-agent does), where Linux 6.1 returns `EIO`.
+- **Detaching at an attach-time group stop reports the stop again:** after `PTRACE_ATTACH` to a
+  stopped process and a detach during its group-stop report, the thread takes the `SIGSTOP` that
+  ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
+  where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
+  gdb or strace sees a duplicate stop.
+- **rt_sigqueueinfo to a zombie is `ESRCH`:** the process-directed queue syscall refuses a child
+  that has exited but not been reaped, while kill and pidfd_send_signal accept it as Linux does
+  (0), so `sigqueue()` to a child that just exited fails and `sigqueue(pid, 0, …)` liveness probes
+  disagree with `kill(pid, 0)`.
+- **Queued siginfo keeps only code, pid, uid and value:** rt_sigqueueinfo, rt_tgsigqueueinfo and
+  pidfd_send_signal rebuild the caller's siginfo, dropping `si_errno` and every other union field,
+  where Linux 6.1 delivers it as given (only `si_signo` forced); `PTRACE_SETSIGINFO` is not
+  affected.
 - **Minor divergences:** `core_pattern` access follows file DAC with `CAP_DAC_OVERRIDE` instead of
   Linux's euid-only sysctl rule; `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits
@@ -345,7 +366,6 @@ procfs.
 
 - Is the per-group (instead of per-user) `RLIMIT_SIGPENDING` accounting an intended
   simplification?
-- Should the other threads of an `exit_group` also stop at `PTRACE_EVENT_EXIT`?
 
 ## To verify
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; epoll refuses loop devices; eventfd readv; bugs from Starnix's tests; `F_SETOWN` owners)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; pselect6's `nfds` clamp, set counting and `POLLNVAL`; module references; loop devices; eventfd readv; `F_SETOWN` owners; Starnix's and gVisor's test findings)
 
 ## Responsibilities
 
@@ -203,6 +203,11 @@ signal delivery (`kernel/signal`).
   it, so a regular file with `O_ASYNC` raises `SIGIO` after every read.
 - **Per-scan cost:** every scan holds the BKL and makes one zero-timeout host poll per host fd (and
   computes readiness twice per file); epoll has no ready list.
+- **epoll_ctl reports errors in a different order:** epfd's type is checked before the target fd
+  and the event is read after the fd checks, so a non-epoll epfd gives `EINVAL` where Linux 6.1
+  gives `EBADF` or `EPERM` for a bad or unpollable target, and a bad event pointer gives `EBADF`
+  or `EPERM` where Linux (which copies the event first, except for `EPOLL_CTL_DEL`) gives
+  `EFAULT`. Only the error codes of invalid calls differ.
 
 ## Open questions
 

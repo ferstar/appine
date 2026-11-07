@@ -36,7 +36,7 @@ in the module maps, not here.
   statically against musl, and CI builds them too. 63 programs run in six differential cases by
   subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`) through a shared runner,
   each skipping by reason the tests that differ for a deviation recorded in a map or cannot be
-  compared. The other 18 are listed with their reasons in `tests/diff/starnix/run.sh`: they would
+  compared. The other 18 are listed with their reasons in `tests/diff/gtest/run.sh`: they would
   reboot, suspend or set the clock of the VM, test what Appine does not implement (bpf maps, perf,
   process_mrelease, userfaultfd, overlayfs, tun), need devices, or have nothing to compare.
 - **Full run of the other programs (2026-11-07, at 8dc166b):**
@@ -69,12 +69,22 @@ in the module maps, not here.
     docker's messages (`/dev/kmsg` reads from the start), docker's pid namespace (a dead lock
     owner's pid is 0), its device cgroup (mknod), its network namespace (no `net.core.rmem_max`),
     and a test that leaves lo's address changed for the next one.
+- **gVisor's syscall tests** (Apache-2.0), taken after this survey recommended them:
+  - `scripts/build-gvisor-tests` builds them without Bazel against the abseil, googletest and
+    google benchmark versions gVisor pins; 264 of the 266 programs build for arm64 (the other two
+    have x86 sources only). Four `gvisor-*` cases run a first set of the programs, chosen from
+    Appine's weaker areas (processes, signals and ptrace; files, terminals and mounts; inet
+    sockets and netlink; AF_UNIX); the harness map has the details.
+  - A full run at gVisor 9ee2906 (2026-11-07): of about 14,500 tests, about 11,200 passed on both
+    sides and about 2,500 only natively, many of them one cause repeated over parameters (the
+    AF_UNIX socket-option and control-message tests run once per socket kind).
+  - About 40 unrecorded causes went into the maps of kernel/process, signal, vfs, net, netns, unix
+    and poll. The most serious: a recursive-bind loop with no `fs.mount-max` holds the BKL for
+    ever longer binds and freezes every guest process; mounts inherited by a less privileged
+    namespace are not locked; a UDP socket shut down for reading spins in recv; and a bind with
+    `AF_UNSPEC` passed to the host oopses the development VM's Ubuntu kernel in AppArmor, leaving
+    Appine hung.
 - **Not yet used:**
-  - **gVisor's syscall tests** (Apache-2.0): 298 sources, 258 programs, 4298 `TEST`s before
-    parameterisation. They need googletest, abseil and google benchmark, not Bazel. A syntax-only
-    pass under musl with a few compatibility headers suggests about 250 programs would build;
-    linking was not tried. They cover pty, mount, netlink route, ptrace, signals, exec and sockets,
-    which are Appine's weaker areas.
   - **kselftest**: mostly GPL, so download it at build time. Of 456 sources in the relevant
     directories, 311 pass a raw syntax check under musl. Of those directories, clone3,
     pid_namespace, ptrace and timens all pass; futex, pidfd, proc and timers almost all do.
@@ -113,7 +123,6 @@ Ordered by value for effort.
 
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
-| gVisor's tests | Runs prebuilt glibc binaries with a long expectation file | A pinned build script like `build-starnix-tests`, starting with about 25 programs | Medium |
 | Count unimplemented paths | `track_stub!` counts each call site and flag value; `not_found` counts `ENOENT` under `/proc`, `/sys`, `/dev` | Count the default arms of prctl, ioctl, fcntl, madvise and futex, and put the top entries in the bug report | Small |
 | BKL watchdog | A lockup detector that names threads stuck in one syscall | A thread that takes no BKL, records holder, syscall and pc after 10 s, and reports through the kernel log and the bug report | Small to medium |
 | Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |

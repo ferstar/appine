@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket timeouts of `KTIME_MAX` or more; IPv6-only port map entries in new namespaces; DNS stub queries on host threads; socket read/write as one message; bugs from Starnix's syscall tests; `MSG_WAITALL`; msghdr iovecs; blocking connect; listen events)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; IPv6-only port map entries; DNS stub threads; socket read/write as one message; `MSG_WAITALL`; msghdr iovecs; blocking connect; listen events; Starnix's and gVisor's test findings)
 
 ## Responsibilities
 
@@ -326,10 +326,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   and link dumps use 8 KiB chunks; a reader with a smaller buffer gets `MSG_TRUNC` and loses the
   rest (Linux continues the dump on the next recv).
 - **Netlink socket options misreport:** getsockopt returns 0 for `SO_TYPE`, `SO_DOMAIN`,
-  `SO_RCVBUF` and the ack flags; unknown options and `NETLINK_ADD_MEMBERSHIP` succeed silently, so
-  monitors subscribe and never hear anything; `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query
-  and generic-netlink errors; unbound sockets keep `nl_pid` 0 and explicit ids are not checked for
-  uniqueness.
+  `SO_SNDBUF`, `SO_RCVBUF`, `NETLINK_LIST_MEMBERSHIPS` and the ack flags, and answers
+  `SO_SNDTIMEO` with 4 zero bytes instead of a timeval; unknown options and
+  `NETLINK_ADD_MEMBERSHIP` succeed silently, so monitors subscribe and never hear anything;
+  `SO_PASSCRED` has no effect; `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
+  generic-netlink errors; unbound sockets keep `nl_pid` 0 (no autobind on connect or send) and
+  explicit ids are not checked for uniqueness.
 - **Option passthrough uses host semantics:** privileged options (`SO_PRIORITY` above 6,
   `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
   `SO_BINDTODEVICE` names are resolved against host interfaces; `SO_ATTACH_BPF` passes a guest fd
@@ -342,7 +344,8 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   zeros there.
 - **Netlink requests are not validated as Linux validates them:** `NETLINK_GET_STRICT_CHK` is
   accepted and ignored (no header checks, no header-based dump filtering), attributes of the wrong
-  size are skipped instead of rejected with `ERANGE`, and a single IPv6 `RTM_GETADDR` is
+  size are skipped instead of rejected (`ERANGE`; `EINVAL` for a short IPv6 `RTA_DST` of `ip route
+  get`, while a longer one is used by its first bytes), and a single IPv6 `RTM_GETADDR` is
   `EOPNOTSUPP` without Linux's header checks (`EINVAL` for a short body); malformed or mis-typed
   requests, such as a route dump carrying an `ifinfomsg` or an `ip route get` with a short
   `RTA_FLOW`, are answered with data where Linux returns an error.
@@ -355,6 +358,39 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   nexthops and the like) answer `EOPNOTSUPP` even to unprivileged callers, where Linux answers
   `EPERM` first, so an unprivileged `ip rule add` reports "Operation not supported" instead of
   "Operation not permitted".
+- **Netlink destination addresses are ignored:** sendto/sendmsg on a netlink socket never looks at
+  `msg_name`, so a message addressed to another port or to multicast groups is handled as a kernel
+  request, without `netlink_sendmsg`'s checks (`EINVAL` for a short or non-`AF_NETLINK` address,
+  `EPERM` for sending to a group or port without `CAP_NET_ADMIN` on rtnetlink).
+- **Socket timeouts are parsed leniently:** `SO_RCVTIMEO`/`SO_SNDTIMEO` (inet, netlink and unix
+  sockets alike) accept any `tv_usec`, where Linux 6.1's `sock_set_timeout` returns `EDOM` outside
+  `[0, 1000000)`; a negative `tv_sec` and a short buffer mean no timeout, where Linux makes a
+  negative time 0 (reads and writes fail with `EAGAIN` at once) and a short buffer `EINVAL`. A
+  program that sets a negative timeout to mean "don't wait" blocks forever instead.
+- **A refused blocking connect leaves the host socket connecting:** after the wait the result
+  comes from `SO_ERROR` without connecting the host socket again, so the guest's next connect on
+  the same socket gets a spurious `ECONNABORTED`, where Linux has already reset the socket and
+  sends a new SYN; wait-for-port loops that retry on one socket see one extra failure.
+- **getpeername echoes the connect address:** an inet socket reports the sockaddr it was connected
+  with, so an `AF_INET6` socket connected with a `sockaddr_in` reports a 16-byte `AF_INET` peer
+  (Linux: a v4-mapped `sockaddr_in6`) and a connect to `0.0.0.0` or `::` reports the wildcard
+  (Linux: `127.0.0.1` or `::1`).
+- **socketpair reports unknown inet types as protocol errors:** `socketpair(AF_INET/AF_INET6)`
+  with a type that has no inet protocol is `EPROTONOSUPPORT`, where Linux answers
+  `ESOCKTNOSUPPORT`.
+- **A datagram socket shut down for reading spins in recv:** a blocking recv on a UDP socket
+  returns 0 on Linux once any thread has called `shutdown(SHUT_RD)` (even when that call reports
+  `ENOTCONN`); here the nonblocking host socket answers `EAGAIN` while poll reports it readable,
+  so the receiver loops between the two at full CPU forever, and programs that wake their receiver
+  threads with `shutdown` hang.
+- **Odd addresses reach the host unchecked:** bind and sendto hand a guest address the layer does
+  not understand to the host socket as is, so the host kernel's own checks answer
+  instead of Linux 6.1's. Under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux
+  says `EINVAL`, and on Ubuntu's 6.8 kernels (colima's 6.8.0-117) a bind of an already bound inet
+  socket with `AF_UNSPEC` oopses the host in `aa_inet_bind_perm`: the host thread dies holding the
+  BKL and every guest process hangs, unkillable. Linux's `inet_bind` takes `AF_UNSPEC` with
+  `INADDR_ANY` as `AF_INET` (and `EAFNOSUPPORT` otherwise; IPv6 sockets always `EAFNOSUPPORT`), so
+  handling the family in the layer would also avoid the host bug. Android has no AppArmor.
 
 ## Open questions
 
