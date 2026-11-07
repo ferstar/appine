@@ -13,12 +13,9 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
-import android.system.ErrnoException
-import android.system.Os
 import android.util.Log
 import android.webkit.MimeTypeMap
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
 import kotlin.concurrent.read
@@ -128,25 +125,20 @@ class Documents : DocumentsProvider() {
         val path = writable(home, documentId)
         val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
         val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
-        val opened = ParcelFileDescriptor.adoptFd(browse { Native.browseOpenWrite(it, home.path, path, truncate, append) })
+        val fd = browse { Native.browseOpenWrite(it, home.path, path, truncate, append) }
         // The other side writes the host object directly, and the kernel sees neither what was
-        // written nor when it is closed: reopen it by the object's path with a close callback, and
-        // tell the running kernel on close (programs watching in the guest receive IN_MODIFY and
-        // IN_CLOSE_WRITE). Truncation has already been done
+        // written nor when it is closed: hand the fd out with a close callback, and tell the
+        // running kernel on close (programs watching in the guest receive IN_MODIFY and
+        // IN_CLOSE_WRITE)
         return try {
-            val file = File(Os.readlink("/proc/self/fd/${opened.fd}"))
-            val mode = flags and ParcelFileDescriptor.MODE_TRUNCATE.inv()
-            ParcelFileDescriptor.open(file, mode, closer) {
+            ParcelFileDescriptor.wrap(ParcelFileDescriptor.adoptFd(fd), closer) {
                 runCatching { browse { Native.browseWritten(it, home.path, path) } }
             }
         } catch (e: IOException) {
+            // wrap lets go of the fd before it creates the socket pair that carries the close, so
+            // the fd is still open here: hand it out without the close events
             Log.w(TAG, "cannot watch $documentId for closing", e)
-            ParcelFileDescriptor.dup(opened.fileDescriptor)
-        } catch (e: ErrnoException) {
-            Log.w(TAG, "cannot watch $documentId for closing", e)
-            ParcelFileDescriptor.dup(opened.fileDescriptor)
-        } finally {
-            opened.close()
+            ParcelFileDescriptor.adoptFd(fd)
         }
     }
 
@@ -381,9 +373,11 @@ class Documents : DocumentsProvider() {
          * app lists them again if it is looking at them.
          */
         fun dirsChanged(context: Context, dirs: Array<String>) {
-            for (dir in dirs) {
-                context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
-            }
+            if (dirs.isEmpty()) return
+            val authority = authority(context)
+            // One call for all of them (each notifyChange is a call into the system server)
+            val uris = dirs.map { DocumentsContract.buildChildDocumentsUri(authority, it) }
+            context.contentResolver.notifyChange(uris, null, 0)
         }
 
         /**

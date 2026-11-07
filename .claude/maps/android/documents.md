@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification: the system root no longer depends on a home root; a home of `/` is no home, and the native side refuses `/` as the writable top; two bugs removed)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the system root independent of a home root, a home of `/` refused as writable; last, write fds wrapped with their close callback and guest changes notified in one call)
 
 ## Responsibilities
 
@@ -63,10 +63,11 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 - Every call holds `Rootfs.access`'s read lock and opens the store afresh per JNI call; errors
   surface as `FileNotFoundException`.
 - Read: the host object file opened read-only and adopted as the returned fd.
-- Write modes: the native side checks the real path against the home, truncates if asked and
-  returns an fd; the provider reopens the host object path with a close listener (on a
-  `documents-close` thread) that reports the write, so the kernel sees `IN_MODIFY` and
-  `IN_CLOSE_WRITE`; data goes directly into the host object.
+- Write modes: the native side checks the real path against the home, truncates if asked, opens
+  with `O_APPEND` for append modes and returns an fd; the provider hands that fd out wrapped with a
+  close listener (`ParcelFileDescriptor.wrap`, run on a `documents-close` thread) that reports the
+  write, so the kernel sees `IN_MODIFY` and `IN_CLOSE_WRITE`; data goes directly into the host
+  object.
 - Create: names sanitised (`/` and NUL to `_`; empty, `.`, `..` to `_`), an extension added from
   the MIME type for files; owned by the home account, 0644/0755, numbered on collision. Delete,
   rename (no overwrite, no extension added) and move are limited to the home by real path; each
@@ -78,8 +79,8 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 - Provider to kernel: the store's change path replays the changes under each running kernel's lock
   (guest inotify events).
 - Kernel to Files app: the service's 2 s poll passes directories the guest changed to
-  `dirsChanged`, which notifies their child-document URIs; `rootsChanged` follows login and setting
-  changes and each successful kernel start.
+  `dirsChanged`, which notifies their child-document URIs in one call; `rootsChanged` follows
+  login and setting changes and each successful kernel start.
 - With no rootfs `queryRoots` returns nothing and other calls fail; during a rootfs replacement the
   write lock holds provider calls until the store is gone.
 
@@ -101,8 +102,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   symlinks wherever they point, so an app holding a grant on the home tree can read outside it
   through a link the guest user made (an accepted limitation: no guest permission checks apply).
 - Flags shown in the Files app are a hint; the real write check is in the native code.
-- If reopening a write fd with a close listener fails, the plain fd is returned and the guest gets
-  no `IN_MODIFY`/`IN_CLOSE_WRITE` for that write (the data still lands).
+- If wrapping a write fd fails (the socket pair that carries the close cannot be created), the
+  plain fd is handed out and the guest gets no `IN_MODIFY`/`IN_CLOSE_WRITE` for that write (the
+  data still lands). `wrap` detaches the fd before creating that pair, so after a failure the fd
+  is still open and is adopted again by number.
 
 ## Confirmed bugs / technical debt
 

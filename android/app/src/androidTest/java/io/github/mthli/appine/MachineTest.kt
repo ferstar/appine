@@ -956,7 +956,7 @@ class MachineTest {
     /**
      * Changes made in the Files app go to the running kernel, and a program watching in the guest
      * receives inotify events: a written file is reported only when the Files app side closes it
-     * ([Documents.openDocument] reopens the object with a close callback). The other way round,
+     * ([Documents.openDocument] hands the fd out with a close callback). The other way round,
      * directories whose entries the guest changed are taken by [Native.takeChangedDirs], and
      * [Documents.dirsChanged] tells the Files app to refresh.
      */
