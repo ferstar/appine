@@ -1,5 +1,6 @@
 # The sequel to compat3.sh (difftest passes the whole script as one argument of sh -c, which must
-# not exceed 128 KB): MADV_DONTNEED on private file mappings
+# not exceed 128 KB): MADV_DONTNEED on private file mappings; signal frames that cannot be written
+# and bad rt_sigreturn frames
 set -e
 cd /tmp
 # MADV_DONTNEED on a private file mapping drops the written copies: the pages read the file again
@@ -77,3 +78,94 @@ int main(void) {
 }
 C
 gcc -O1 -o dontneedfile dontneedfile.c && ./dontneedfile
+# A signal whose frame cannot be written (its alternate stack is read-only) forces a SIGSEGV
+# (SI_KERNEL) that a handler may catch; one for SIGSEGV itself ends the process with SIGSEGV. A bad
+# rt_sigreturn frame returns 0 and forces a SIGSEGV at the stack pointer (SEGV_ACCERR below a
+# mapping)
+cat > badframe.c <<'C'
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static sigjmp_buf back;
+static volatile int usr1;
+
+static void on_segv(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    printf("SIGSEGV handler: sig %d code %d addr %s\n", sig, si->si_code,
+           si->si_code == SI_KERNEL ? "-" : "set");
+    fflush(stdout);
+    siglongjmp(back, 1);
+}
+
+static void on_usr1(int sig) {
+    (void)sig;
+    usr1 = 1;
+}
+
+static void bad_sigreturn(void *sp) {
+    __asm__ volatile("mov x1, sp\n\tmov sp, %0\n\tmov x8, #139\n\tsvc #0\n\tmov sp, x1"
+                     :
+                     : "r"(sp)
+                     : "x0", "x1", "x8", "memory");
+}
+
+static void *ro_stack(size_t len) {
+    return mmap(NULL, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+int main(void) {
+    size_t len = 64 * 1024;
+    stack_t ss = {.ss_sp = ro_stack(len), .ss_size = len};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_usr1;
+    sa.sa_flags = SA_ONSTACK;
+    sigaction(SIGUSR1, &sa, NULL);
+    struct sigaction segv = {0};
+    segv.sa_sigaction = on_segv;
+    segv.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &segv, NULL);
+    if (sigsetjmp(back, 1) == 0) {
+        raise(SIGUSR1);
+        printf("not reached\n");
+    }
+    printf("after the forced SIGSEGV: usr1 ran %d\n", usr1);
+
+    // A bad frame at rt_sigreturn: SIGSEGV handled on a good alternate stack
+    stack_t good = {.ss_sp = malloc(len), .ss_size = len};
+    sigaltstack(&good, NULL);
+    segv.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &segv, NULL);
+    void *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sigsetjmp(back, 1) == 0) {
+        bad_sigreturn(none);
+        printf("not reached\n");
+    }
+    printf("after the bad sigreturn\n");
+    fflush(stdout);
+
+    // SIGSEGV's own frame cannot be written either: the process ends with SIGSEGV
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct rlimit no = {0, 0};
+        setrlimit(RLIMIT_CORE, &no);
+        stack_t bad = {.ss_sp = ro_stack(len), .ss_size = len};
+        sigaltstack(&bad, NULL);
+        raise(SIGUSR1);
+        printf("child not reached\n");
+        _exit(0);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    printf("child: signaled %d sig %d\n", WIFSIGNALED(st), WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+    return 0;
+}
+C
+gcc -O1 -o badframe badframe.c && ./badframe

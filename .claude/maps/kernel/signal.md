@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace last)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; kill with a thread id; retargeting process signals; detaching at syscall stops; Starnix's and gVisor's test findings, ptrace; frames that cannot be written last)
 
 ## Responsibilities
 
@@ -140,7 +140,12 @@ procfs.
 - Restores x0–x30, SP, PC, NZCV (and DIT when advertised), FPSR, FPCR (unmasked), V0–V31, the mask
   (minus `SIGKILL`/`SIGSTOP`) and the altstack. The engine looks up translations by the new PC, so a
   handler may change it (Go preemption, V8 wasm traps).
-- A frame that cannot be written, or a bad frame at sigreturn, kills the group with `SIGSEGV`.
+- A frame that cannot be written (Linux's `force_sigsegv`) leaves the mask unchanged, puts back a
+  mask swapped by sigsuspend or ppoll, and forces a `SIGSEGV` (`SI_KERNEL`) delivered next, which a
+  handler on an alternate stack can take; when the signal was `SIGSEGV` itself, the forced one is
+  fatal (`force_fatal`), ending the process with a core and the tracer's stops. Restart is decided by
+  the first signal taken. A bad frame at sigreturn changes nothing, returns 0 and forces a
+  `SIGSEGV` at SP (`SEGV_ACCERR` when a mapping ends above it, else `SEGV_MAPERR`).
 
 ### Synchronous faults to signals (run loop, after `kernel/mm` decides page faults)
 
@@ -307,10 +312,6 @@ procfs.
 
 ## Confirmed bugs / technical debt
 
-- **Unwritable frames and bad sigreturn frames kill the group silently:** both call group exit with
-  `SIGSEGV` directly, so no `SIGSEGV` handler (on an altstack) gets a chance, no core file is
-  written and tracers see no stop or exit event (Linux forces a deliverable `SIGSEGV`). A stack
-  overflow inside a handler is the common way to hit this.
 - **`CLD_STOPPED` is reported early:** the parent is notified as soon as the first thread starts a
   group stop, while siblings may still be running (Linux notifies once the last thread has
   stopped).

@@ -955,6 +955,14 @@ impl Mm {
         grew
     }
 
+    /// Whether some mapping ends above a guest address (Linux's `find_vma` finds one).
+    pub fn mapped_above(&self, addr: u64) -> bool {
+        self.vmas
+            .iter()
+            .next_back()
+            .is_some_and(|(&s, v)| s + v.len > addr)
+    }
+
     /// Whether a guest address falls in some mapping (telling SEGV_MAPERR from SEGV_ACCERR).
     pub fn is_mapped(&self, addr: u64) -> bool {
         self.vmas

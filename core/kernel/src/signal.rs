@@ -956,18 +956,26 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
                 st.pc = cont;
             }
         }
+        // Decided by the first signal taken, even if its frame cannot be written (Linux's do_signal
+        // forgets the syscall before handling it)
+        restart = None;
         // The mask temporarily swapped by sigsuspend or ppoll: the frame saves the original,
         // restored when the handler returns
-        let saved = cx
-            .task
-            .saved_sigmask
-            .take()
-            .unwrap_or(cx.task.sigmask.get());
+        let swapped = cx.task.saved_sigmask.take();
+        let saved = swapped.unwrap_or(cx.task.sigmask.get());
         if setup_frame(cx, cpu, sig, &info, &act, saved).is_err() {
+            // Linux's force_sigsegv: a SIGSEGV is forced on the thread instead, delivered next
+            // (to a handler on an alternate stack, or ending the process with a core and the
+            // tracer's stops); one whose own frame cannot be written ends the process. The mask
+            // is unchanged, and a mask swapped by sigsuspend or ppoll still waits to be restored
             crate::debug::log(format_args!("cannot set up the frame for {sig}"));
-            let group = cx.t.group.clone();
-            group_exit(cx.k(), &group, killed_by(Signal::SEGV));
-            return Flow::Exit;
+            cx.task.saved_sigmask.set(swapped);
+            if sig == Signal::SEGV {
+                force_fatal(cx, Signal::SEGV, SigInfo::kernel());
+            } else {
+                force(cx, Signal::SEGV, SigInfo::kernel());
+            }
+            continue;
         }
         let mut mask = cx.task.sigmask.get() | act.mask;
         if act.flags & sa::NODEFER == 0 {
@@ -1335,13 +1343,20 @@ fn w64(b: &mut [u8], off: usize, v: u64) {
 }
 
 /// rt_sigreturn: restores registers, the signal mask and the alternate stack from the signal
-/// frame on the stack. An invalid frame terminates with SIGSEGV.
+/// frame on the stack. An invalid frame changes nothing, returns 0 and forces a SIGSEGV at the
+/// stack pointer (arm64's `arm64_notify_segfault`), which a handler may catch.
 pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     if restore_frame(cx, cpu).is_err() {
         crate::debug::log(format_args!("rt_sigreturn: bad signal frame"));
-        let group = cx.t.group.clone();
-        group_exit(cx.k(), &group, killed_by(Signal::SEGV));
-        return Flow::Exit;
+        let sp = cpu.state().sp;
+        // SEGV_MAPERR only when no mapping ends above the address (Linux's find_vma)
+        let code = if cx.mm().mapped_above(sp) {
+            code::SEGV_ACCERR
+        } else {
+            code::SEGV_MAPERR
+        };
+        force(cx, Signal::SEGV, SigInfo::fault(code, sp, 0));
+        cpu.state_mut().x[0] = 0;
     }
     // PTRACE_SYSCALL: stop at exit, and the tracer sees the restored registers (crate::ptrace)
     if crate::ptrace::traced(cx.task) && !crate::ptrace::syscall_exit(cx, cpu) {
