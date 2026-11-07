@@ -322,9 +322,10 @@ class TerminalService : Service() {
             ended = endedText(exit?.reason)
             if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifyCrash(exit)
         }
-        // First run (or the last import did not finish): import the Alpine in the APK; other
-        // distros are switched to in Settings
-        start(if (Rootfs.isReady(this)) null else Rootfs.Distro.ALPINE)
+        // First run: import the Alpine in the APK (other distros are switched to in Settings); an
+        // import or switch the app was killed in is started again with the same distro, its
+        // download reused when it is still in the cache
+        start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
     }
 
     private fun createChannel() {
@@ -540,9 +541,10 @@ class TerminalService : Service() {
                     val error = it.message ?: it.toString()
                     if (distro != null && distro != Rootfs.Distro.ALPINE && !Rootfs.isReady(this)) {
                         // The import failed while switching to another distro (the download was
-                        // already verified, so most likely space ran out): the old store is already
-                        // deleted, so fall back to the Alpine in the APK rather than leave the user
-                        // facing an app that does not work
+                        // already verified, so most likely space ran out) or while resuming one
+                        // the app was killed in (its download may have been needed again): the old
+                        // store is already deleted, so fall back to the Alpine in the APK rather
+                        // than leave the user facing an app that does not work
                         tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
                         start(Rootfs.Distro.ALPINE)
                     } else {

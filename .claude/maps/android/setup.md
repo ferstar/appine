@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-04 (targeted verification only since the full mapping: NOPASSWD rules fail closed and are refreshed at root logins; admins recorded once and matched literally; mirrors recorded only after writing; downloads stop past the pinned length)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed and are refreshed at root logins; admins recorded once and matched literally; mirrors recorded only after writing; downloads stop past the pinned length; interrupted imports resumed as their distro last)
 
 ## Responsibilities
 
@@ -65,9 +65,12 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ### Import
 
-- `prepare`: delete `rootfs.tmp`, import into it, delete the tarball, `configure`, record the
-  distro and its first mirror in preferences (`commit`), sync the store, rename to the real store
-  and fsync `files/`. A store without a distro record counts as Alpine.
+- `prepare`: record the distro it imports (`commit`), delete `rootfs.tmp`, import into it,
+  `configure`, record the distro and its first mirror in preferences (`commit`), sync the store,
+  rename to the real store, fsync `files/` and only then delete the tarball. A store without a
+  distro record counts as Alpine. While there is no store, the record names the distro an import
+  was last started for (`importing`; Alpine when there is none), which the service imports at the
+  next launch.
 - `configure` writes: package sources (apk `main` and `community`; Debian deb822 over http for
   trixie, -updates, -security), `hostname`, `hosts` (Alpine only when absent, Debian always),
   Debian's `resolv.conf` pointing at the DNS stub, `motd`, and `/etc/profile.d/appine.sh` (motd,
@@ -143,8 +146,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   mirror-probing thread reads and writes the sources without the lock; it writes only after its
   probes finish (seconds later, never offline) and only after a fresh import, so an overlap with the
   kernel's open is unlikely and would skip a cleanup that has nothing to clean.
-- An import interrupted by a kill is redone as Alpine on the next launch (no store means
-  `start(ALPINE)`), without telling the user; a verified Debian tarball stays in the cache.
+- An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
+  distro on the next launch, from the verified tarball still in the cache or by downloading it
+  again with the usual progress; if that fails, the service falls back to Alpine with its notice.
 - Preferences are written before the rename, so an existing store always has its distro record.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
@@ -154,11 +158,10 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - **A password set in a running session keeps NOPASSWD for a while.** The rules are rewritten only
   when a tab logs in, so after `passwd` the account still escalates without one until the next tab
   opens.
-- **A switch interrupted by a kill silently becomes Alpine** (see above).
 
 ## Open questions
 
-- Should an interrupted Debian import resume as Debian?
+none
 
 ## To verify
 

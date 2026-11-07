@@ -103,8 +103,9 @@ internal object Rootfs {
     private const val RESUMES = 5
 
     /**
-     * Records (SharedPreferences): the installed distro, the mirror written into the sources,
-     * whether the user chose the mirror in Settings.
+     * Records (SharedPreferences): the installed distro (while there is no store, the one an
+     * import was last started for), the mirror written into the sources, whether the user chose
+     * the mirror in Settings.
      */
     private const val KEY_DISTRO = "distro"
     private const val KEY_MIRROR = "mirror"
@@ -140,11 +141,21 @@ internal object Rootfs {
     }
 
     /**
+     * The distro to import when the app's store is missing: the one an import was last started for
+     * (an import or distro switch the app was killed in, [prepare]), Alpine on the first run.
+     */
+    fun importing(context: Context): Distro {
+        val name = prefs(context).getString(KEY_DISTRO, null)
+        return Distro.entries.firstOrNull { it.name == name } ?: Distro.ALPINE
+    }
+
+    /**
      * Imports [distro] into store [store] (by default the one the app uses). It is first imported
      * into a temporary directory and renamed when done, so a kill midway means starting over next
-     * time. The tarball to download stays in the cache directory once verified ([download]) and is
-     * deleted only after a successful import, so retrying a failed import needs no new download.
-     * Blocks; call it on a background thread.
+     * time, with the same distro ([importing]). The tarball to download stays in the cache
+     * directory once verified ([download]) and is deleted only once the store is in place, so
+     * retrying a failed or killed import needs no new download. Blocks; call it on a background
+     * thread.
      */
     @SuppressLint("ApplySharedPref") // The record must be on disk before the rename into place
     @Throws(IOException::class)
@@ -155,6 +166,8 @@ internal object Rootfs {
         store: File = store(context),
     ) {
         if (isReady(store)) return
+        // The next launch resumes this distro if the app is killed before the store is in place
+        if (store == store(context)) prefs(context).edit(commit = true) { putString(KEY_DISTRO, distro.name) }
         val tmp = File(store.parentFile, "${store.name}.tmp")
         tmp.deleteRecursively()
         val tarball = tarball(context, distro)
@@ -166,7 +179,6 @@ internal object Rootfs {
             download(context, distro, progress)
         }
         Native.importRootfs(tmp.path, tarball.path)
-        tarball.delete()
         configure(tmp.path, distro)
         if (store == store(context)) {
             // Written to disk before the rename: once the store is there, the record is its own
@@ -183,6 +195,7 @@ internal object Rootfs {
         Native.syncRootfs(tmp.path)
         if (!tmp.renameTo(store)) throw IOException("cannot move the rootfs into place")
         syncDir(store.parentFile!!)
+        tarball.delete()
     }
 
     private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")

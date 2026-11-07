@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; last, the app named Appine)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; the app named Appine; last, an interrupted import resumed as its distro)
 
 ## Responsibilities
 
@@ -69,7 +69,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - `onCreate` starts foreground (type `specialUse` on API 34+), takes a killed run
   (`Tabs.takeKilled`): its saved tabs, and how its process ended, looked up by the marker's pid in
   Android's exit records (`ApplicationExitInfo`); a crash or ANR of Appine posts a notification at
-  once. Then it calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
+  once. Then it calls `start(Rootfs.importing())` when no rootfs is ready (Alpine on the first
+  run, else the distro an import was last started for), else `start(null)`.
 - `start` sets `starting` (the wake lock follows) and runs on an `appine-start` thread: import when
   a distro is given (`Rootfs.prepare`, then a mirror-probing thread), `ensureNetworkConfig`,
   `ensureLoginTools`, `updateProfile`, then `Native.start(store, tier)` under `Rootfs.access`'s
