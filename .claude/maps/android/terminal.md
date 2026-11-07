@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes reworked; mouse drags, hover, double taps; insets; tab animations; scroll bar and flings; last, opening links)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; last, unwired libghostty-vt features)
 
 ## Responsibilities
 
@@ -506,7 +506,48 @@ libghostty-vt with Zig (`android/native`).
 
 - **The terminal lacks** the bell, triple-tap (line) or rectangular selection, and handles that
   flip at the screen edges (a selection starting at column 0 has its start handle mostly
-  off-screen).
+  off-screen). libghostty-vt has the two selections (`ghostty_terminal_select_line`, a
+  selection's `rectangle` flag).
+- **Kitty graphics and the Glyph Protocol are advertised but never drawn**: libghostty-vt turns
+  both on by default (Kitty images in a 10 MB store, sent inline; the Glyph Protocol's APC) and
+  vt.c turns neither off, so a program that probes gets a positive reply (`OK` to a Kitty query,
+  `fmt=glyf` to a Glyph Protocol support query) and may then send images or register icon glyphs
+  that never appear: the frame format carries no images, and the C API gives no access to
+  registered glyphs.
+- **libghostty-vt features not wired**: no callbacks for OSC 52 clipboard writes, OSC 9/777
+  notifications, OSC 9;4 progress, OSC 7501 program status, OSC 7 working directories or OSC 133
+  prompts (the last two also need shell integration, which Ghostty ships for bash, zsh, fish,
+  elvish and nushell but not ash, and Appine installs none); no search; no scrollback compression
+  (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
+  libghostty-vt snapshots; no terminfo name is set, so XTGETTCAP `TN` goes unanswered; and
+  `VtView` ignores the frame header's `cursor_blinking`, so the cursor never blinks.
+- **More of libghostty-vt left unused**:
+  - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`,
+    `select_output` (needs OSC 133), and the selection gesture state machine (click counts to
+    cell, word, line or output selection), for which `VtView` has its own taps and long presses;
+  - drawing: overscan (rows captured beyond the viewport, to scroll by pixels; drags and flings
+    move whole rows); the default palette, colour and cursor style/blink options (the 256 colours
+    are libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
+    pointer shape for a mouse; `row_iterator_next_dirty` and the two-phase render update
+    (`begin_update` under the lock, `end_update` after), so `frame` holds the tab's lock while
+    it encodes every row;
+  - the rest: no action to reset the terminal or clear the scrollback (`ghostty_terminal_reset`)
+    and no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
+    colours and OSC 8 links; the memory usage is never read; the library's log and
+    unknown-sequence callbacks are unset, so its warnings never reach logcat; KAM (mode 2) is
+    ignored: Ghostty's own surface drops keys while it is set, but the key encoder does not, and
+    neither does vt.c;
+  - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
+    the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
+- **A kill report after a program died inside an OSC, DCS or APC string** is partly lost:
+  `appine_vt_message` writes into the stream wherever its parser stands, and the line feeds that
+  make the report's room are ignored in an OSC and taken as payload in a DCS or APC (the escape
+  after them ends the string, so the rest is drawn). No room is scrolled open, so the inserted
+  lines push the cursor's line down by the report's height (off the screen when it was the bottom
+  row) while the cursor goes back to its old row, now another line; after a partial UTF-8
+  sequence, a U+FFFD is printed first.
+  `GHOSTTY_TERMINAL_DATA_VT_GROUND` tells when the stream is between sequences, and a CAN (0x18)
+  returns the parser to ground from any state. Read from the parser, not reproduced.
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels): `MainActivity` handles `density` itself and
   builds its views once in `onCreate`, so the new sizes apply only once the activity is created
@@ -532,3 +573,6 @@ libghostty-vt with Zig (`android/native`).
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English. Flings and the scroll bar were tried there with adb swipes only (viewport and
   alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger.
+- What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
+  `kitten icat`) show in the terminal; the positive replies were read from libghostty-vt's source
+  and tests, not seen on a device.
