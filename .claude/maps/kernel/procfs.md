@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the socket owner column of `/proc/net/*`; `/proc/<tid>` resolves any thread; module references; `/sys/block` for loop devices; `vm.mmap_min_addr`, VmStk, newlines in maps; bugs from Starnix's syscall tests; recorded sysctls; the exited main thread; `/proc/vmstat`; names as bytes; the RSS split)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: socket owners in `/proc/net`; `/proc/<tid>`; module references; `/sys/block`; mm fields in maps and status; sysctls; `/proc/vmstat`; names as bytes; the exited main thread; Starnix's test findings, zombies' files last)
 
 ## Responsibilities
 
@@ -150,7 +150,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
   `setgroups`, `timens_offsets`.
 - Zombies keep their group without tasks: stat/status work (state Z), cmdline/environ/auxv are
-  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`. A main thread that has exited while
+  empty, `fd/` is empty, `cwd`/`root`/`exe`/`ns` are `ENOENT`, `mounts`/`mountinfo` list the
+  initial mount namespace. A main thread that has exited while
   other threads run is shown the same way, as Linux's zombie leader: `task/` still lists it,
   `task/<pid>` and the process directory report Z with its name (kept in the group, as for
   zombies) and its own CPU time for `task/<pid>/stat`, and `Threads`/`num_threads` and `task/`'s
@@ -421,6 +422,12 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `cgroup.procs`, `cgroup.freeze` and value files fail with `ENOENT` and `cgroup.kill` succeeds
   silently, where Linux 6.1 fails every write with `ENODEV`, which container managers treat as
   "cgroup gone".
+- **Zombies' address-space and mount files fall back to someone else's:** `mounts` and `mountinfo`
+  of a zombie, or of a main thread that exited while other threads run, list the initial mount
+  namespace's mounts, where Linux fails the open with `EINVAL` (no namespaces left); and an exited
+  main thread's `pagemap` reads its live thread group's address space, where Linux has none for it.
+  A reader that reads such a `pagemap` to EOF (Starnix's zombie test) runs through the whole 48-bit
+  range and is ended by the OOM killer.
 
 ## Open questions
 

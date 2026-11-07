@@ -77,6 +77,17 @@ jobs:
           cargo build --release -p appine-run -p appine-bench
           target/release/appine-bench --runs 3 --skip-tier0
 
+      # Fuchsia Starnix's syscall tests, which the starnix-* differential cases run (without them those
+      # cases only print that they are missing). The Fuchsia commit and googletest version are fixed
+      # in the script, so its hash keys the cache, and a miss rebuilds them (about four minutes)
+      - uses: actions/cache@v6
+        with:
+          path: target/starnix-tests
+          key: starnix-tests-${{ hashFiles('scripts/build-starnix-tests', 'tests/starnix/compat/**') }}
+
+      - name: Build Starnix's syscall tests
+        run: scripts/build-starnix-tests
+
       # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
       # Alpine in docker. The first run installs the packages the test cases need with apk, which
       # depends on the internet. Appine turns the guest's raw ICMP sockets into host ping sockets:

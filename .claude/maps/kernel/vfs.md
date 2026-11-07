@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`/`O_DSYNC` from open; POSIX locks in unshared fd tables; set-id chown as 6.2; AIO; module references; loop devices; readv/writev by kind; timerfd clocks; faulting buffers; Starnix's bugs; owners, lock ranges, linkat, sendfile)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC` from open; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; Starnix's test findings, mount flags last)
 
 ## Responsibilities
 
@@ -718,6 +718,14 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   the bound directory is deleted, where Linux shows its old path followed by `//deleted`, so tools
   reading bind sources from mountinfo (findmnt, container runtimes) see a bind of the whole
   filesystem.
+- **No superblock flags:** read-only, sync, dirsync, lazytime and mandlock given to a new mount are
+  flags of that mount only, so a tmpfs mounted read-only becomes writable through a bind remount
+  (Linux keeps the superblock read-only and every mount of it with it), binds do not inherit a
+  read-only superblock, and mountinfo's superblock options always say `rw`.
+- **Propagation changes outside the namespace are `EINVAL`:** the propagation type is set only on a
+  mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
+  kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
+  root.
 
 ## Open questions
 

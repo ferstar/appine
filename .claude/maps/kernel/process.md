@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts saturate at `KTIME_MAX`; a dying pid namespace's orphans go to the virtual init; DNS stub answers; module references; wall-clock deadlines; bugs from Starnix's syscall tests; the exited main thread; `RLIMIT_MSGQUEUE`; `sched_setattr` flags; `CLONE_PARENT` exit signals; thread-directed timers; robust futexes on CoW pages)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: timeouts; dying pid namespaces; DNS stub; module references; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; Starnix's test findings, `sched_setattr` last)
 
 ## Responsibilities
 
@@ -359,8 +359,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   priority floors at host nice -4 (never above Android's display threads); `SCHED_IDLE` maps to host
   nice 19; real-time policies are only recorded; a real-time I/O class becomes best-effort on the
   host. `sched_setattr` takes Linux 6.1's flags: `SCHED_FLAG_KEEP_POLICY`/`KEEP_PARAMS` keep the
-  current policy or parameters, the utilization clamps are validated as `uclamp_validate` does
-  and only recorded per thread (copied at clone, reset by `SCHED_RESET_ON_FORK`, read back by
+  current policy or parameters, the utilization clamps are checked against 1024 and each other
+  (not the current values) and only recorded per thread (copied at clone, reset by `SCHED_RESET_ON_FORK`, read back by
   `sched_getattr`), and the deadline flags are accepted unused.
 - Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` returns at once.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
@@ -453,7 +453,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   CPU state (a crash if it was unmapped), and a vfork parent waits forever for completion.
 - **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
   so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
-  for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-wait` case skips them).
+  for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-process` case skips them).
 - **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`) leaves the earlier
   credential, mount and pid-for-children changes in place. A pidfd `setns` combining
   `CLONE_NEWNS` with other types while the fs is shared switches the mount namespace of every fs
@@ -485,6 +485,13 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   image then runs or faults; conversely, segments whose file offset and address disagree within the
   page are loaded by copying, where Linux kills the process with `SIGSEGV` after the point of no
   return. Only hand-made ELFs and unusual linker-script output are affected.
+- **`sched_setattr` departs from `__sched_setscheduler` in four details:** `SCHED_RESET_ON_FORK`
+  inside `sched_policy` is accepted (Linux: `EINVAL`, not a valid policy); the clamps are compared
+  with each other only when both are given, not with the thread's current ones, so a minimum above
+  the current maximum is stored; `SCHED_FLAG_KEEP_PARAMS` keeps the parameters but still switches
+  the policy (Linux leaves both); and a nice value beyond `RLIMIT_NICE` returns setpriority's
+  `EACCES` instead of `EPERM`. Tools that set clamps one at a time or keep the parameters see
+  different results from Linux.
 
 ## Open questions
 

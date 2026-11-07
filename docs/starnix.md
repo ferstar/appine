@@ -33,8 +33,12 @@ in the module maps, not here.
 - **PTY scenarios:** the 83 recorded scenarios are the `line-discipline` differential case. All of
   them pass since the line discipline follows n_tty.
 - **`tests/syscalls/cpp`:** `scripts/build-starnix-tests` builds 81 of its 93 gtest programs
-  statically against musl. Only `mmap_test` and the two waitpid programs have cases
-  (`starnix-mmap`, `starnix-wait`).
+  statically against musl, and CI builds them too. 63 programs run in six differential cases by
+  subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`) through a shared runner,
+  each skipping by reason the tests that differ for a deviation recorded in a map or cannot be
+  compared. The other 18 are listed with their reasons in `tests/diff/starnix/run.sh`: they would
+  reboot, suspend or set the clock of the VM, test what Appine does not implement (bpf maps, perf,
+  process_mrelease, userfaultfd, overlayfs, tun), need devices, or have nothing to compare.
 - **Full run of the other programs (2026-11-07, at 8dc166b):**
   - About 70 more programs ran one test per process, as root, on native Linux 6.8 and on Appine.
     Of 2484 tests, 1186 passed on both sides, 532 passed only natively (203 of them in
@@ -44,12 +48,27 @@ in the module maps, not here.
     (propagation, PI futexes, absent proc files, the vvar page, the decided `ENOSYS` syscalls).
   - The biggest single causes were a thread-group leader that exits before its threads vanishing
     from `/proc/<pid>/task` (35 tests) and missing or misjudged sysctls (about 170). Both are
-    fixed, with seven smaller causes (see "Taken so far"); the run has not been repeated since.
+    fixed, with seven smaller causes (see "Taken so far").
   - Excluded:
     - behaviour newer than 6.1 (the io_uring sysctls of 6.6, a setresuid test that needs 6.3);
     - docker's environment (the `RLIMIT_NOFILE` hard limit, `/proc/2`, input devices);
     - eight cgroup tests that failed only because an earlier hung test left its directory behind;
     - a pagemap test that crashed only after its frame-number checks had already failed.
+- **Second full run (2026-11-07, at fcf4c93), which the cases were cut from:**
+  - All 77 programs that do not act on the VM, at Tier 1. Leaving out `mmap_test` and the waitpid
+    programs, as the first run did: of 2500 tests, 1294 passed on both sides, 560 only natively
+    and 31 were skipped only on Appine. 267 of the native-only passes are in programs now left out
+    of the cases (203 in `bpf_test`); the rest are skipped in the cases by reason.
+  - The sysctl fixes turned most skips into runs: `/proc/sys` permission tests that used to skip
+    now fail for the recorded DAC deviation.
+  - New causes, recorded in the maps: four `sched_setattr` details left by bc44b65 (kernel/process),
+    a zombie's `mounts` and an exited main thread's `pagemap` taken from someone else (procfs; the
+    zombie test read that pagemap until the OOM killer ended it), no superblock flags and
+    propagation changes refused on detached mounts (vfs).
+  - Native-side failures that are docker's or the VM's, not Linux's: the kernel log wrapping under
+    docker's messages (`/dev/kmsg` reads from the start), docker's pid namespace (a dead lock
+    owner's pid is 0), its device cgroup (mknod), its network namespace (no `net.core.rmem_max`),
+    and a test that leaves lo's address changed for the next one.
 - **Not yet used:**
   - **gVisor's syscall tests** (Apache-2.0): 298 sources, 258 programs, 4298 `TEST`s before
     parameterisation. They need googletest, abseil and google benchmark, not Bazel. A syntax-only
@@ -94,7 +113,6 @@ Ordered by value for effort.
 
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
-| Wire the other Starnix programs | Runs them in CI with expectation files | Run them all again to see what the fixes since the full run changed, then one case per group of programs, skipping by reason as `starnix-mmap` does; CI does not build the tests yet (an open question in the harness map) | Small |
 | gVisor's tests | Runs prebuilt glibc binaries with a long expectation file | A pinned build script like `build-starnix-tests`, starting with about 25 programs | Medium |
 | Count unimplemented paths | `track_stub!` counts each call site and flag value; `not_found` counts `ENOENT` under `/proc`, `/sys`, `/dev` | Count the default arms of prctl, ioctl, fcntl, madvise and futex, and put the top entries in the bug report | Small |
 | BKL watchdog | A lockup detector that names threads stuck in one syscall | A thread that takes no BKL, records holder, syscall and pc after 10 s, and reports through the kernel log and the bug report | Small to medium |

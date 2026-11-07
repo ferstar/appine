@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer in the toolchain and dev image; LTP devices are loop devices on tmpfs; difftest case files; Starnix's syscall tests and PTY scenarios, and the pitfalls of running them all; flags refuse values; SIGKILL timeouts for Starnix's tests; tarballs chosen by version)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: rust-analyzer; LTP devices on tmpfs; difftest case files; flags refuse values; tarballs by version; Starnix's tests and PTY scenarios, now six grouped cases with a shared runner, built in CI)
 
 ## Responsibilities
 
@@ -144,14 +144,21 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   tests build and 12 do not (glibc-only interfaces, Fuchsia-only devices).
 - difftest installs the newest tarball into its store at `/usr/lib/starnix-tests` whenever the
   tarball's `VERSION` differs from the installed one, and then exports the image again.
-- The `starnix-*` cases list a binary's tests and run each in its own process under
-  `timeout -s KILL 60` with its output in a file (a crash or hang, a test ignoring `SIGTERM` or a
-  child keeping the output open does not take the rest with it), printing `<test> ok|failed|
-  skipped|exit <code>`, with core files off and the shell's crash reports filtered out. Tests that
-  cannot be compared are skipped through a negative gtest filter, with the reason beside them: in
-  `starnix-mmap` two that fail on the native kernel itself (VMA merging of file mappings),
-  in `starnix-wait` the `__WCLONE`/`__WALL` bug of the kernel/process map. Without the tarball the
-  cases print that it is missing and pass.
+- Six cases cover 63 of the 81 built programs by subsystem (`starnix-mm`, `-process`, `-signal`,
+  `-fs`, `-proc`, `-io`). Each ships `tests/diff/starnix/run.sh` through `# difftest-files:` and calls it
+  with its skip filter and program list; the runner lists each program's tests (minus disabled
+  ones) and runs each in its own process under `timeout -s KILL 60`, stdin from `/dev/null` and
+  its output in a file (a crash or hang, a test ignoring `SIGTERM`, a child keeping the output
+  open or a test reading stdin does not take the rest with it), printing `<test> ok|failed|skipped|exit <code>`, with core files off and the
+  shell's crash reports filtered out.
+- Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
+  kernel map (named with its module), a feature decided against, or a test that cannot be compared
+  (it fails on the native side because of docker, the VM or a newer kernel, or depends on timing).
+  The runner's header lists the programs in no case and why: those that would reboot, suspend or
+  set the clock of the VM, features Appine does not have (bpf maps and other program types, perf,
+  process_mrelease, userfaultfd, overlayfs, tun), devices neither side has, and two with nothing
+  to compare.
+- Without the tarball the cases print that it is missing and pass.
 
 ### LTP
 
@@ -190,7 +197,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `APPINE_DBT_REGS` forwarded.
 - CI, Linux arm64 (`ubuntu-24.04-arm`): fmt, clippy (`-D warnings`), fetch the rootfs, `cargo test
   --workspace` with the require switches, the network test, a long lockstep run, release build and
-  `appine-bench --runs 3 --skip-tier0`, `scripts/difftest` at Tier 1 with one lane, and the
+  `appine-bench --runs 3 --skip-tier0`, `scripts/build-starnix-tests` (its tarball cached by the
+  hash of the script and `tests/starnix/compat`), `scripts/difftest` at Tier 1 with one lane, and the
   engine tests built with clang. CI, Android (x86_64): the NDK, the rootfs, Zig 0.17.0 (from
   ziglang.org, checked against a pinned sha256) and `scripts/fetch-ghostty` (with `target/ghostty`
   and Zig's global cache cached by the script's hash), then cargo-ndk clippy, `assembleDebug
@@ -267,17 +275,16 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
   `apk add` leaves a store the next run uses as is.
 - LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
-- **The `starnix-*` cases pass vacuously without the built tests:** CI does not build them
-  (`build-starnix-tests` needs the network and about four minutes), so there they only print that
-  the tests are missing.
+- **The `starnix-*` cases pass vacuously without the built tests:** locally they only print that
+  the tests are missing until `build-starnix-tests` has run (it needs the network and about four
+  minutes); CI builds them.
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?
 - Is native macOS a supported host for `appine-run` itself?
 - Should partial LTP runs merge into `results.txt` as the durations do?
-- Should CI build Starnix's tests (with a cache keyed by the pinned commit) so the `starnix-*`
-  cases run there, and which of the other 79 built test programs should get cases next?
-  (`docs/starnix.md` has the outcome of running them all once.)
+- CI's native kernel is newer than colima's 6.8: which Starnix tests compare differently there is
+  known only after a CI run.
 
 ## To verify
 
