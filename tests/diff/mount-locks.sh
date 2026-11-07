@@ -7,8 +7,12 @@
 # root, and the old root can then be detached. proc and sysfs need CAP_SYS_ADMIN over the owner of
 # the caller's pid and network namespace, and a mount namespace not owned by the initial user
 # namespace must already see the whole filesystem (mount_too_revealing): a locked mount over a
-# non-empty directory of it is EPERM, one on an empty mount point (/sys/fs/cgroup) is not. The
-# native side is privileged so that its /proc and /sys are rw and unmasked, as Appine's are.
+# non-empty directory of it is EPERM, one on an empty mount point (/sys/fs/cgroup) is not;
+# cgroup2 needs CAP_SYS_ADMIN over the owner of the caller's cgroup namespace. A lazy unmount, or
+# the end of the namespace, leaves locked mounts on their detached parent (disconnect_mount), so an
+# fd kept in the detached tree still sees what hides a path, while unlocked mounts are
+# disconnected. The native side is privileged so that its /proc and /sys are rw and unmasked, as
+# Appine's are.
 set -e
 cd /tmp
 python3 - <<'PY'
@@ -109,6 +113,7 @@ def locked():
     show("umount the bind of a", umount("/tmp/lk/x"))
     show("move a", mount("/tmp/lk/a", "/tmp/lk/x", None, MS_MOVE))
     show("proc without a pid namespace", mount("proc", "/tmp/lk/p", "proc", 0))
+    show("cgroup2 without a cgroup namespace", mount("cgroup2", "/tmp/lk/p", "cgroup2", 0))
     show("sysfs without a network namespace", mount("sysfs", "/tmp/lk/p", "sysfs", 0))
     show("pivot_root to a", pivot_root("/tmp/lk/a", "/tmp/lk/a/old"))
     show("new root", mount("n", "/tmp/lk/x", "tmpfs", 0))
@@ -121,6 +126,66 @@ def locked():
 
 
 child(locked)
+
+
+def listing(fd, name):
+    d = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+    try:
+        return sorted(os.listdir(d))
+    finally:
+        os.close(d)
+
+
+def lazy():
+    enter_userns()
+    show("== lazy unmounts in a new user namespace")
+    os.mkdir("/tmp/lk/x/y")
+    show("rbind the tree", mount("/tmp/lk", "/tmp/lk/x/y", None, MS_BIND | MS_REC))
+    show("own mount on a", mount("own", "/tmp/lk/x/y/a/old", "tmpfs", 0))
+    open("/tmp/lk/x/y/a/old/mine", "w").close()
+    fd = os.open("/tmp/lk/x/y", os.O_RDONLY | os.O_DIRECTORY)
+    show("detach the rbind", umount("/tmp/lk/x/y", MNT_DETACH))
+    show("hidden through the detached tree", listing(fd, "hidden"))
+    show("a through the detached tree", listing(fd, "a"))
+    show("own mount through the detached tree", listing(fd, "a/old"))
+    os.chdir(fd)
+    show("dotdot from hidden", sorted(os.listdir("hidden/..")) == sorted(os.listdir(".")))
+    os.close(fd)
+
+
+child(lazy)
+
+
+def dead_ns():
+    import socket
+    a, b = socket.socketpair()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            enter_userns()
+            fd = os.open("/tmp/lk", os.O_RDONLY | os.O_DIRECTORY)
+            socket.send_fds(a, [b"x"], [fd])
+        finally:
+            os._exit(0)
+    _, fds, _, _ = socket.recv_fds(b, 1, 1)
+    os.waitpid(pid, 0)
+    show("== after the namespace ended")
+    show("hidden through its tree", listing(fds[0], "hidden"))
+    os.close(fds[0])
+
+
+child(dead_ns)
+
+
+def own_cgroup():
+    enter_userns(os.CLONE_NEWCGROUP)
+    show("== with its own cgroup namespace")
+    show("cgroup2", mount("cgroup2", "/tmp/lk/p", "cgroup2", 0))
+    show("cgroup.procs", os.path.exists("/tmp/lk/p/cgroup.procs"))
+    show("umount", umount("/tmp/lk/p"))
+
+
+child(own_cgroup)
 
 
 def own_proc_sysfs():

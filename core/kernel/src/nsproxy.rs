@@ -128,7 +128,7 @@ pub(crate) struct CgroupNs {
     pub id: u64,
     /// Root: the cgroup its creating process was in at the time (a [`crate::cgroup`] number).
     pub root: u64,
-    /// The user namespace it was created in (for setns permission checks).
+    /// The user namespace it was created in (for setns and cgroup2 mount permission checks).
     pub owner: Rc<UserNs>,
 }
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice; mount locks and lazy unmounts last)
 
 ## Responsibilities
 
@@ -184,7 +184,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - New mounts: proc, devpts, sysfs, cgroup2, tmpfs, mqueue; anything else `ENODEV`. sysfs, cgroup2
   and same-namespace mqueue mounted on the root of a mount of the same filesystem are `EBUSY`.
   mqueue needs `CAP_SYS_ADMIN` over the IPC namespace, proc over the owner of the caller's pid
-  namespace and sysfs over the owner of its network namespace (`EPERM`). In a mount namespace
+  namespace, sysfs over the owner of its network namespace and cgroup2 over the owner of its
+  cgroup namespace (`EPERM`). In a mount namespace
   not owned by the initial user namespace, proc and sysfs also need a fully visible instance
   (6.1's `mount_too_revealing`, `EPERM`): a mount of that filesystem's root in the namespace whose
   locked read-only and access-time flags the new mount keeps, with no locked mount over anything
@@ -224,7 +225,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   tree root `EBUSY` (`EINVAL` with `MNT_DETACH`); without `MNT_DETACH`, the caller's root or a
   busy mount `EBUSY` (busy means submounts, task roots/cwds, nodes of open fds, pinned PTYs — not
   mappings, running executables or mqueue fds); `MNT_FORCE` has no effect. `MNT_DETACH` moves the
-  subtree to the detached list, where nodes keep working and the mount root has no parent.
+  subtree to the detached list, where nodes keep working: the mount root and every unlocked mount
+  below it lose their mount point, while a mount locked in place stays on its detached parent
+  (6.1's `disconnect_mount`), so an fd kept in the detached tree still finds what hides a path.
 - Mount flags are enforced where Linux checks them: ro (`EROFS` in creation after `EEXIST`,
   before directory write permission; in unlink/rmdir/rename before lookup; attribute changes;
   write opens of regular files, with `O_TRUNC` checked before permission), noexec (exec `EACCES`,
@@ -247,7 +250,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `CAP_SYS_CHROOT` and `CAP_SYS_ADMIN` in the caller's namespace and an unshared fs; root and cwd
   are reset to the namespace root.
 - Namespaces are held by `Rc`; the table keeps weak references. `collect` drops dead namespace
-  entries, detaches the mounts of dead namespaces, drops detached mounts no longer in use, deletes
+  entries, detaches the mounts of dead namespaces (locked ones staying on their parents, as for
+  `MNT_DETACH`), drops detached mounts no longer in use and not connected below one that is
+  (disconnecting a connected mount whose parent goes), deletes
   tmpfs instances with no remaining mount, and repeats if releasing pins killed another namespace.
   It runs on every `umount2`, and at task exit only when some mount namespace has lost its last
   reference; closing fds never triggers it, so reclaim of unused detached mounts, open_tree clones
@@ -599,6 +604,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- A detached mount has a mount point only while it is locked in place on a detached parent;
+  lifting to mounts (`mounted`) and climbing out of a mount root (`root_point`) search the detached
+  list too, while everything acting on attached mounts (`mount`, `mount_root`, `children`,
+  mountinfo) looks at the attached list only.
 - Locks are per mount and only ever added by copying a namespace into one with another owner or
   by binding; a bind's own root drops `lock::MOUNT`, so code that creates a mount from another
   must decide which locks it inherits (`clone_mount`, `bind`, `add_copies` keep or clear them).
@@ -756,14 +765,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
   kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
   root.
-- **cgroup2 mounts ignore the cgroup namespace's owner:** mounting cgroup2 needs only `may_mount`,
-  where Linux 6.1 also requires `CAP_SYS_ADMIN` over the owner of the caller's cgroup namespace
-  (`cgroup_init_fs_context`), so root of a new user and mount namespace that kept the initial
-  cgroup namespace can mount the whole hierarchy (`EPERM` on Linux).
-- **Locked child mounts are not kept attached on a lazy unmount:** detaching a tree whose
-  submounts are locked in place disconnects them like any other, where Linux keeps them on their
-  detached parent (`disconnect_mount`), so through an fd kept in the detached tree the directories
-  they covered can be reached.
 - **truncate on synthetic files is `EACCES`:** truncate(2) needs a store inode before it checks
   the file type, so devpts, procfs and sysfs files fail with `EACCES` (`EROFS` on a read-only
   mount), where Linux returns `EINVAL` for a non-regular file before any permission check.

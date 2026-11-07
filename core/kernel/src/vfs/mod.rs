@@ -415,8 +415,9 @@ struct Mounts {
     /// tree, and it is not moved even when that is no longer true after pivot_root.
     list: Vec<Mount>,
     /// Detached mounts (`MNT_DETACH`) that still have a process's root, current directory or
-    /// open files in them: their nodes keep working, and the mount's root has no parent
-    /// ([`Vfs::collect`] removes the unused ones).
+    /// open files in them: their nodes keep working, and the mount's root has no parent unless
+    /// the mount is locked in place on a detached parent ([`detach`]; [`Vfs::collect`] removes the
+    /// unused ones).
     detached: Vec<Mount>,
     /// The id of the next mount. Ids of detached mounts are never reused: files still open and
     /// current directories after the detach keep the old id, which must not count toward a new
@@ -1425,10 +1426,13 @@ impl Vfs {
     pub(crate) fn mounted(&self, node: Node) -> Node {
         let mounts = self.mounts.borrow();
         let mut node = node;
+        // Detached mounts have a mount point only while they stay on a detached parent
+        // ([`detach`]), so only nodes of detached mounts find them
         while let Some(m) = mounts
             .list
             .iter()
             .rev()
+            .chain(mounts.detached.iter().rev())
             .find(|m| m.point.as_ref() == Some(&node))
         {
             node = m.root.clone();
@@ -1494,11 +1498,15 @@ impl Vfs {
         })
     }
 
-    /// When `node` is the root of an attached mount with a mount point, the mount point and
-    /// [`Mount::at`].
+    /// When `node` is the root of a mount with a mount point (an attached one, or a detached one
+    /// still on its detached parent), the mount point and [`Mount::at`].
     fn root_point(&self, node: &Node) -> Option<(Node, Option<Dentry>)> {
         let mounts = self.mounts.borrow();
-        let m = mounts.list.iter().find(|m| m.id == node.mnt())?;
+        let m = mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .find(|m| m.id == node.mnt())?;
         if m.root != *node {
             return None;
         }
@@ -2197,21 +2205,14 @@ impl Vfs {
         let mut mounts = self.mounts.borrow_mut();
         let gone: std::collections::HashSet<MountId> =
             tree_of(&mounts.list, id).into_iter().collect();
-        let list = std::mem::take(&mut mounts.list);
-        let (out, keep): (Vec<_>, Vec<_>) = list.into_iter().partition(|m| gone.contains(&m.id));
-        mounts.list = keep;
-        for mut m in out {
-            m.point = None;
-            m.at = None;
-            mounts.detached.push(m);
-        }
+        detach(&mut mounts, |m| gone.contains(&m.id));
         drop(mounts);
         self.mounts_changed();
     }
 
     /// Drops detached mounts not in `in_use` (no process's root or current directory and no
-    /// open file is in them). tmpfs instances no mount can see any more are deleted with their
-    /// files.
+    /// open file is in them) and not connected below one that is. tmpfs instances no mount can
+    /// see any more are deleted with their files.
     pub(crate) fn collect(&self, in_use: &std::collections::HashSet<MountId>) {
         // Mount namespaces nobody uses: all their mounts are detached
         self.namespaces
@@ -2233,21 +2234,13 @@ impl Vfs {
             .any(|m| !live.contains(&m.ns))
         {
             let mut mounts = self.mounts.borrow_mut();
-            let list = std::mem::take(&mut mounts.list);
-            let (keep, out): (Vec<_>, Vec<_>) =
-                list.into_iter().partition(|m| live.contains(&m.ns));
-            mounts.list = keep;
-            for mut m in out {
-                m.point = None;
-                m.at = None;
-                mounts.detached.push(m);
-            }
+            detach(&mut mounts, |m| !live.contains(&m.ns));
             drop(mounts);
             self.mounts_changed();
         }
         let gone: Vec<Ino> = {
             let mut mounts = self.mounts.borrow_mut();
-            mounts.detached.retain(|m| in_use.contains(&m.id));
+            keep_used(&mut mounts.detached, in_use);
             let live: std::collections::HashSet<u64> = mounts
                 .list
                 .iter()
@@ -2487,6 +2480,55 @@ fn tree_of(list: &[Mount], id: MountId) -> Vec<MountId> {
         i += 1;
     }
     out
+}
+
+/// Moves the attached mounts that `gone` picks to the detached list (Linux's `umount_tree`
+/// without `UMOUNT_SYNC`): each is disconnected from its mount point, except a mount locked in
+/// place whose parent is detached with it, which stays on that parent (`disconnect_mount`), so an
+/// fd kept in the detached tree still finds it there and cannot reach what it covers.
+fn detach(mounts: &mut Mounts, gone: impl Fn(&Mount) -> bool) {
+    let list = std::mem::take(&mut mounts.list);
+    let (out, keep): (Vec<_>, Vec<_>) = list.into_iter().partition(|m| gone(m));
+    mounts.list = keep;
+    let ids: std::collections::HashSet<MountId> = out.iter().map(|m| m.id).collect();
+    for mut m in out {
+        let connected =
+            m.locks & lock::MOUNT != 0 && m.parent().is_some_and(|p| p != m.id && ids.contains(&p));
+        if !connected {
+            m.point = None;
+            m.at = None;
+        }
+        mounts.detached.push(m);
+    }
+}
+
+/// Keeps the detached mounts that are in `in_use`, with the mounts still connected below them
+/// ([`detach`]); a connected mount whose parent goes is disconnected, as one holding its own
+/// reference outlives its parent on Linux.
+fn keep_used(detached: &mut Vec<Mount>, in_use: &std::collections::HashSet<MountId>) {
+    let mut keep: std::collections::HashSet<MountId> = detached
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| in_use.contains(id))
+        .collect();
+    loop {
+        let before = keep.len();
+        for m in detached.iter() {
+            if m.parent().is_some_and(|p| keep.contains(&p)) {
+                keep.insert(m.id);
+            }
+        }
+        if keep.len() == before {
+            break;
+        }
+    }
+    detached.retain(|m| keep.contains(&m.id));
+    for m in detached.iter_mut() {
+        if m.parent().is_some_and(|p| !keep.contains(&p)) {
+            m.point = None;
+            m.at = None;
+        }
+    }
 }
 
 /// Mount `m` is mounted on `name` (inode `ino`) in store directory `dir`.

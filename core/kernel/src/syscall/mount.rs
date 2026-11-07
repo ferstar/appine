@@ -155,13 +155,15 @@ fn new_mount(
     if fs == Fs::Mqueue && !cx.cred().ns_capable(&ipc.owner, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    // proc needs CAP_SYS_ADMIN over the owner of the caller's pid namespace and sysfs over the
-    // owner of its network namespace (the fc->user_ns of Linux's proc_init_fs_context and
-    // sysfs_init_fs_context, checked by mount_capable); then, outside the initial user namespace,
-    // an instance must already be fully visible (mount_too_revealing)
+    // proc needs CAP_SYS_ADMIN over the owner of the caller's pid namespace, sysfs over the owner
+    // of its network namespace and cgroup2 over the owner of its cgroup namespace (the
+    // fc->user_ns of Linux's proc_init_fs_context, sysfs_init_fs_context and
+    // cgroup_init_fs_context, checked by mount_capable); then, outside the initial user
+    // namespace, a proc or sysfs instance must already be fully visible (mount_too_revealing)
     let owner = match fs {
         Fs::Proc => Some(cx.pid_ns().owner.clone()),
         Fs::Sys => Some(cx.ns().net.owner.clone()),
+        Fs::Cgroup => Some(cx.ns().cgroup.owner.clone()),
         _ => None,
     };
     if owner.is_some_and(|o| !cx.cred().ns_capable(&o, cap::SYS_ADMIN)) {
