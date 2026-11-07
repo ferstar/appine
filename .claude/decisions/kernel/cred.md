@@ -39,7 +39,7 @@
 ### D5: Guest seccomp is implemented in the kernel layer with Linux 6.1 semantics
 - **What**: Strict mode and cBPF filters with Linux's program checks, chain size limit, action precedence, inheritance and TSYNC; filters run in an interpreter at syscall entry (after a `PTRACE_SYSCALL` entry stop); `PTRACE_EVENT_SECCOMP` and the notification fd (including `ADDFD`) are supported; `KILL_PROCESS`'s `SIGSYS` cannot be caught, as with `SA_IMMUTABLE`.
 - **Why**: Programs that sandbox themselves either failed or ran without the sandbox; `strace --seccomp-bpf` and notification supervisors did not work.
-- **Tradeoffs**: The interpreter costs about 4.5 ns per instruction (Linux uses a JIT); `LOG` and logged actions go to appine's debug log instead of audit; the vDSO clock stubs skip filters for every clock (Linux's vDSO handles only some); a `TRACE` re-check uses the chain from before the stop; `ADDFD` installs directly and never sees the target interrupted.
+- **Tradeoffs**: The interpreter costs about 4.5 ns per instruction (Linux uses a JIT); `LOG` and logged actions go to Appine's debug log instead of audit; the vDSO clock stubs skip filters for every clock (Linux's vDSO handles only some); a `TRACE` re-check uses the chain from before the stop; `ADDFD` installs directly and never sees the target interrupted.
 - **Watch out**: Every syscall entry, including the no-BKL fast path, must consult the filter; a fast path that misses `seccomp_on` bypasses filters silently, which the first tests did not catch.
 - **Source**: round 59 (`59-seccomp`)
 

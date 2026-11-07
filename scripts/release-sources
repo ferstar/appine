@@ -4,7 +4,7 @@
 #
 #   scripts/release-sources [output directory]
 #
-#   appine-<commit>.tar.gz            appine itself (git archive HEAD; an error when the work tree
+#   appine-<commit>.tar.gz            Appine itself (git archive HEAD; an error when the work tree
 #                                     has changes)
 #   appine-<commit>-vendor.tar.gz     cargo vendor: the crates statically linked into the app
 #   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK: each
@@ -40,7 +40,7 @@ sha512() {
     fi | cut -d' ' -f1
 }
 
-# ---- appine itself ----
+# ---- Appine itself ----
 cd "$root"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "release-sources: the work tree has changes; commit them first" >&2
@@ -91,7 +91,7 @@ if [ ! -s "$work/gpl" ]; then
 fi
 {
     echo "Source code of the GPL-licensed packages in the Alpine Linux $version minirootfs"
-    echo "that the appine app bundles ($(basename "$tarball")). Each directory holds the"
+    echo "that the Appine app bundles ($(basename "$tarball")). Each directory holds the"
     echo "package's directory in Alpine's aports repository at the given commit (the"
     echo "APKBUILD and patches) and the upstream sources that the APKBUILD names, checked"
     echo "against its sha512sums."

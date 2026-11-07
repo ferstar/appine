@@ -186,7 +186,7 @@ abstract class RootfsAssetTask : DefaultTask() {
 /**
  * Generates the content of the "Open source licenses" page in Settings (design doc §13.4) under
  * `notices/` in the assets: each line of `index.tsv` is "title<TAB>description<TAB>file name", and
- * the files are plain text. In order: appine itself (AGPL), the parts of appine adapted from
+ * the files are plain text. In order: Appine itself (AGPL), the parts of Appine adapted from
  * Fuchsia's Starnix (the terminal line discipline, BSD-style), the terminal (libghostty-vt and the
  * libraries it links, and the JetBrains Mono font, from texts in `android/licenses/`), the packages
  * of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked into
@@ -244,7 +244,7 @@ abstract class NoticesTask : DefaultTask() {
             "Appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
             wrap(APPINE_NOTICE) + "\n\n" + license.get().asFile.readText(),
         )
-        // Code adapted into appine itself (core/kernel/src/tty.rs, which names the same commit)
+        // Code adapted into Appine itself (core/kernel/src/tty.rs, which names the same commit)
         entry(
             "Fuchsia Starnix line discipline", "BSD-style · parts of the terminal line discipline", "fuchsia.txt",
             "Parts of Appine's terminal line discipline (the echo queue, erasing and output processing) are " +
@@ -449,7 +449,7 @@ abstract class NoticesTask : DefaultTask() {
      * The license files a crate publishes. When MIT is one of the alternatives in the license
      * (`MIT OR Apache-2.0` and the like), only the MIT one and the ones not tied to a license (the
      * `AND` term, Unicode for example) are attached, and the other alternatives (Apache, Zlib,
-     * 0BSD, Unlicense) are not: appine uses these crates under MIT.
+     * 0BSD, Unlicense) are not: Appine uses these crates under MIT.
      */
     private fun licenseFiles(dir: File, expr: String): List<File> {
         val all = dir.listFiles().orEmpty()

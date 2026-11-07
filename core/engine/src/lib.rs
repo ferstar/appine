@@ -1,4 +1,4 @@
-//! Rust bindings for the appine engine (implemented in C).
+//! Rust bindings for the Appine engine (implemented in C).
 //!
 //! The engine executes guest instructions and the soft-MMU fast path (the engine and kernel/mm
 //! maps). The kernel layer drives execution with [`Cpu::run`] and then handles syscalls,

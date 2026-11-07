@@ -10,7 +10,7 @@
 //! take effect (handled in [`crate::netdev`]): `disable_ipv6` removes and restores an interface's
 //! IPv6, `forwarding` written on `all` (`ip_forward` is its alias) is applied to every interface,
 //! and IPv4 `default` is applied to the interfaces that have not set that entry on their own. The
-//! others are only recorded: appine does no forwarding and sends or receives no ARP or router
+//! others are only recorded: Appine does no forwarding and sends or receives no ARP or router
 //! advertisements.
 //!
 //! As on Linux, a new interface copies the `default` of its namespace; a new namespace's IPv4 part

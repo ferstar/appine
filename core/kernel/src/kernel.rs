@@ -220,7 +220,7 @@ pub(crate) struct Kernel {
     pub printk: [i32; 4],
     pub saved_console_loglevel: Option<i32>,
     pub dmesg_restrict: bool,
-    /// `/proc/sys/kernel/panic`: only recorded; appine's kernel layer has no panic (a kernel bug
+    /// `/proc/sys/kernel/panic`: only recorded; Appine's kernel layer has no panic (a kernel bug
     /// ends only the process that hits it).
     pub panic: i32,
     /// `/proc/sys/fs/protected_symlinks`, `protected_hardlinks` (Linux's `may_follow_link`,
@@ -312,7 +312,7 @@ pub(crate) struct Kernel {
     pub sysctls: BTreeMap<&'static [u8], i64>,
     /// `/proc/sys/kernel/modprobe` (only recorded: there are no modules).
     pub modprobe: Vec<u8>,
-    /// `/proc/sys/kernel/tainted`: the taint flags written by privileged processes (appine itself
+    /// `/proc/sys/kernel/tainted`: the taint flags written by privileged processes (Appine itself
     /// taints nothing).
     pub tainted: u64,
     /// All inotify watches. Open files must report `IN_CLOSE_*` when destroyed, so it is shared

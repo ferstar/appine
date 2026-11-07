@@ -68,7 +68,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `onCreate` starts foreground (type `specialUse` on API 34+), takes a killed run
   (`Tabs.takeKilled`): its saved tabs, and how its process ended, looked up by the marker's pid in
-  Android's exit records (`ApplicationExitInfo`); a crash or ANR of appine posts a notification at
+  Android's exit records (`ApplicationExitInfo`); a crash or ANR of Appine posts a notification at
   once. Then it calls `start(ALPINE)` when no rootfs is ready, else `start(null)`.
 - `start` sets `starting` (the wake lock follows) and runs on an `appine-start` thread: import when
   a distro is given (`Rootfs.prepare`, then a mirror-probing thread), `ensureNetworkConfig`,
@@ -150,7 +150,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Restore: each saved tab reopens with its saved login setting and cwd, preceded by its old
   transcript and a yellow notice saying why the run ended and when the tabs were saved; the saved
   current tab is focused. Reasons told apart: low memory, too many resources in the background,
-  force-stopped, the app updated (reported from Android 14), and a crash or an ANR of appine;
+  force-stopped, the app updated (reported from Android 14), and a crash or an ANR of Appine;
   anything else, no record or no pid gives "Android stopped the app".
 
 ### Reports and notifications
@@ -158,7 +158,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Kill reports (one tab-separated line each): written into the tab whose console matches
   (`VtSession.showMessage`), in yellow above the cursor line (skipped on the alternate screen); a
   notification follows unless the message was shown in the tab the terminal Activity is showing
-  while it is visible (another tab or Settings in front does not count), and always for an appine
+  while it is visible (another tab or Settings in front does not count), and always for an Appine
   bug. Bugs always notify with "copy report": app version
   and build, device (Android release and API, maker and model, ABI, page size), distro and tier
   (always 1 in a release build), the kernel's report line, and up to 10 earlier kernel log records.

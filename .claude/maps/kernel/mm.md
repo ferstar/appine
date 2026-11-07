@@ -639,7 +639,7 @@ signals may still be delivered).
 ## To verify
 
 - Linux 6.1 arm64 semantics for `PROT_EXEC`-only mappings (execute-only with Enhanced PAN, or
-  exec implying read): needs the Linux 6.1 source to decide whether appine's execute-only behaviour
+  exec implying read): needs the Linux 6.1 source to decide whether Appine's execute-only behaviour
   matches.
 - Whether the host kernel commit-accounts the read-write `MAP_PRIVATE` host file mappings used for
   private file VMAs that miss `FileMaps`: depends on host kernel rules, not repository code.

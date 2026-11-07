@@ -1,22 +1,22 @@
 #!/bin/sh
-# Differential tests (design doc §13.3 layer 4): the same script runs on appine and on real arm64
+# Differential tests (design doc §13.3 layer 4): the same script runs on Appine and on real arm64
 # Linux, and the outputs and exit codes are compared. Run on a host with docker:
 #
 #   scripts/difftest [-t tier] [-r] [-s store directory] [-j jobs] [case name…]
 #
 # -j runs several groups at once (4 by default on macOS, 1 on other hosts): on the native side each
-# runs in its own container; on the appine side each concurrent slot uses a clone of the store
+# runs in its own container; on the Appine side each concurrent slot uses a clone of the store
 # (<store>-w<n>; the groups all write files of the same names into the guest's /tmp, so sharing one
 # store would make them overwrite each other), which on macOS is an APFS clonefile (`cp -c`,
 # copy-on-write, taking almost no space) and elsewhere `cp --reflink=auto` (a real copy where
 # unsupported). Clones are remade when missing or with -r (after new packages are installed into the
 # main store, -r is needed anyway to re-export the image). Groups that took long last time start
 # first (recorded in target/difftest/durations-t<tier>.txt). Each group's result is printed as a
-# whole, and the `ok` line carries the times (seconds each for native and appine). -j 1 runs the
+# whole, and the `ok` line carries the times (seconds each for native and Appine). -j 1 runs the
 # groups one by one as before.
 # Test cases are tests/diff/<name>.sh, run by the guest's /bin/sh with stderr merged into stdout.
 # The real Linux side is a docker container: the store's root filesystem is first packed inside
-# appine and imported as an image, so both sides run exactly the same files. The image is generated
+# Appine and imported as an image, so both sides run exactly the same files. The image is generated
 # only the first time or with -r; after changing the store, pass -r. The options on a test case's
 # `# docker-run-options: …` line are added to its container (such as CAP_SYS_ADMIN for mount), and
 # those on the `# appine-options: …` line to appine-run (such as --always-map-low-ports for
@@ -39,7 +39,7 @@
 #
 # The store is target/difftest/store by default; when it does not exist the minirootfs is imported
 # (run scripts/fetch-rootfs first) and then the packages the test cases need are installed with apk
-# inside appine, which needs the network (using the host's or docker's proxy). The store must be
+# inside Appine, which needs the network (using the host's or docker's proxy). The store must be
 # inside the work tree. appine-run also runs in a container and sees the same kind of network as the
 # native side (the container's eth0, routes, addresses), so that network test cases are comparable:
 # on a Linux arm64 host it runs in APPINE_IMAGE (debian:trixie-slim by default; its glibc must not
@@ -264,7 +264,7 @@ else
             touch "$clone/.cloned"
         fi
     done
-    # Groups that took long last time (native plus appine) start first, so no long group is left to
+    # Groups that took long last time (native plus Appine) start first, so no long group is left to
     # run alone at the end; groups that never ran go last
     durations=$out/durations-t$tier.txt
     touch "$durations"

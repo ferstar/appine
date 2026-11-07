@@ -5,7 +5,7 @@
  * bytes added are exactly the payload sent and received, and peeking (MSG_PEEK) does not count;
  * the IP packet and byte counts in /proc/net/snmp and netstat equal lo's, and TCP connections, UDP
  * datagrams and ping echoes are counted correctly too. The packet and byte counts hold only in
- * appine: Linux also counts protocol headers and ACKs. Prints "all ok" when it passes; a failure
+ * Appine: Linux also counts protocol headers and ACKs. Prints "all ok" when it passes; a failure
  * prints the reason and exits with 1.
  */
 #define _GNU_SOURCE

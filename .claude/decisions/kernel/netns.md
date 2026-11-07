@@ -52,7 +52,7 @@
 
 ### D7: A host thread forwards outside connections to published ports
 - **What**: Initial-namespace sockets matched by PREROUTING DNAT are served by a forwarder thread that accepts and connects to the target; IPv4 TCP clients from outside keep their real address through a 127.254.x.y binding.
-- **Why**: Connections from outside appine (the phone's browser, other devices) reached podman's port-holding socket, which never accepts; Linux delivers them through DNAT, and containers' access logs, rate limits and allow lists need the real client address.
+- **Why**: Connections from outside Appine (the phone's browser, other devices) reached podman's port-holding socket, which never accepts; Linux delivers them through DNAT, and containers' access logs, rate limits and allow lists need the real client address.
 - **Tradeoffs**: The decision comes from a synthetic probe; loopback, IPv6 and UDP clients see the gateway.
 - **Watch out**: The thread must never take the BKL.
 - **Source**: rounds 173 (`173-port-forwarding`), 176 (`176-real-client-address`)

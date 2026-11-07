@@ -1,7 +1,7 @@
 # Fuchsia Starnix as a reference
 
 Starnix is Fuchsia's Linux syscall layer, written in Rust. It was surveyed twice for code, tests
-and ideas appine could use: on 2026-11-06 at Fuchsia 86962cb and on 2026-11-07 at 06ce521f.
+and ideas Appine could use: on 2026-11-06 at Fuchsia 86962cb and on 2026-11-07 at 06ce521f.
 Almost none of its code can be moved over, because it is built on Zircon, FIDL and `starnix_core`,
 and its execution model (Zircon restricted mode) has nothing in common with a soft MMU. What pays
 is its test suites and its reading of Linux semantics. The deviations its tests found are recorded
@@ -17,14 +17,14 @@ in the module maps, not here.
   - The runtime lock-order checks of `starnix_sync`.
   - `lib/ebpf`, which has no use yet.
 - **Not usable:**
-  - `starnix_rcu` needs Fuchsia's `fuchsia_rcu`. appine's no-BKL path resolver already validates
+  - `starnix_rcu` needs Fuchsia's `fuchsia_rcu`. Appine's no-BKL path resolver already validates
     its reads with change counters.
-  - The vendored `rust_netlink` crates would add dependencies. appine's netlink encoders are small
+  - The vendored `rust_netlink` crates would add dependencies. Appine's netlink encoders are small
     and checked byte for byte by the differential tests.
   - The FUSE, overlayfs, userfaultfd and perf modules are written against its `FsNode`/`FileOps`
     and Zircon.
 - **Locking:** Starnix's per-object locks are no argument for replacing the BKL (kernel/process D2).
-  It has some of the same signal bugs as appine.
+  It has some of the same signal bugs as Appine.
 
 ## Tests
 
@@ -36,9 +36,9 @@ in the module maps, not here.
   statically against musl. Only `mmap_test` and the two waitpid programs have cases
   (`starnix-mmap`, `starnix-wait`).
 - **Full run of the other programs (2026-11-07, at 8dc166b):**
-  - About 70 more programs ran one test per process, as root, on native Linux 6.8 and on appine.
+  - About 70 more programs ran one test per process, as root, on native Linux 6.8 and on Appine.
     Of 2484 tests, 1186 passed on both sides, 532 passed only natively (203 of them in
-    `bpf_test`) and 138 were skipped only on appine, mostly for missing sysctls.
+    `bpf_test`) and 138 were skipped only on Appine, mostly for missing sysctls.
   - The failures came down to about 45 unrecorded causes, now in the maps of kernel/process, mm,
     signal, net, tty, cred, poll, procfs and vfs, plus causes the maps had already recorded
     (propagation, PI futexes, absent proc files, the vvar page, the decided `ENOSYS` syscalls).
@@ -55,7 +55,7 @@ in the module maps, not here.
     parameterisation. They need googletest, abseil and google benchmark, not Bazel. A syntax-only
     pass under musl with a few compatibility headers suggests about 250 programs would build;
     linking was not tried. They cover pty, mount, netlink route, ptrace, signals, exec and sockets,
-    which are appine's weaker areas.
+    which are Appine's weaker areas.
   - **kselftest**: mostly GPL, so download it at build time. Of 456 sources in the relevant
     directories, 311 pass a raw syntax check under musl. Of those directories, clone3,
     pid_namespace, ptrace and timens all pass; futex, pidfd, proc and timers almost all do.
@@ -83,7 +83,7 @@ in the module maps, not here.
 | 6591eb6 | Thread names shown as their bytes |
 | 566da95 | `RssAnon`, `RssFile` and `RssShmem` in `status` |
 
-b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with appine's: readv
+b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full run found.
@@ -92,7 +92,7 @@ fix deviations the full run found.
 
 Ordered by value for effort.
 
-| Idea | What Starnix does | For appine | Effort |
+| Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
 | Wire the other Starnix programs | Runs them in CI with expectation files | Run them all again to see what the fixes since the full run changed, then one case per group of programs, skipping by reason as `starnix-mmap` does; CI does not build the tests yet (an open question in the harness map) | Small |
 | gVisor's tests | Runs prebuilt glibc binaries with a long expectation file | A pinned build script like `build-starnix-tests`, starting with about 25 programs | Medium |
@@ -118,7 +118,7 @@ Ordered by value for effort.
 - **Alarm clocks through AlarmManager, and a `CLOCK_MONOTONIC` that counts suspend:** the first
   needs exact-alarm permission and is useless without the wake-lock change. The second changes
   the 6.1 contract.
-- **Netlink stubs that only answer `NLMSG_DONE`:** appine stopped doing this for unsupported
+- **Netlink stubs that only answer `NLMSG_DONE`:** Appine stopped doing this for unsupported
   families in round 83.
 - **Guest-initiated suspend, container freezing, `wakeup_count`:** Android decides when the phone
   sleeps.

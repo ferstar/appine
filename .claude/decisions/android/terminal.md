@@ -8,14 +8,14 @@
 
 ## Active
 
-### D2: Messages from appine are inserted above the cursor line
+### D2: Messages from Appine are inserted above the cursor line
 - **What**: `VtSession.showMessage` (`appine_vt_message` in vt.c) scrolls if needed, saves the cursor, inserts lines above the current one, writes the yellow message and restores the cursor below it; it is skipped on the alternate screen.
 - **Why**: Kill reports arrive after the shell has already printed its prompt; appending put the message after the prompt and left the cursor on an empty line, which looked like a lost prompt and desynchronised line editing.
 - **Tradeoffs**: The shell does not know the screen changed (its cursor and line still match); the guest's saved-cursor slot is overwritten.
 - **Source**: round 195 (`195-kill-reports`); 6ffb912
 
 ### D3: Licence notices are generated at build time and shown in-app
-- **What**: The build writes `notices/` (appine, libghostty-vt's components and JetBrains Mono, Alpine packages from the bundled rootfs, Android libraries, Rust crates, SQLite, full licence texts); Settings shows the AGPL statement and opens `LicensesActivity`.
+- **What**: The build writes `notices/` (Appine, libghostty-vt's components and JetBrains Mono, Alpine packages from the bundled rootfs, Android libraries, Rust crates, SQLite, full licence texts); Settings shows the AGPL statement and opens `LicensesActivity`.
 - **Why**: AGPL sections 0 and 5 require the interface to show copyright, the lack of warranty, the licence and where to read it; generating from the actual inputs keeps the list complete.
 - **Tradeoffs**: The licence pages are English only.
 - **Source**: round 192 (`192-license`); list updated in b38d29c (android/native D6)
@@ -26,7 +26,7 @@
 - **Tradeoffs**: `ConsolePty` and `VtSession` are filed here although the service creates and owns them.
 - **Source**: 12c4afa (file list since updated by 394aecf, 6ffb912, b38d29c)
 
-### D5: Terminal state lives in libghostty-vt inside the native library, drawn by appine's own view
+### D5: Terminal state lives in libghostty-vt inside the native library, drawn by Appine's own view
 - **What**: Each tab has one libghostty-vt 1.4.0 terminal in the native library, fed straight from the kernel console by a pump thread that writes the terminal's replies back and asks for one frame of dirty rows per burst; `VtView` mirrors the frames onto an integer cell grid in JetBrains Mono (glyphs scaled evenly, never stretched, with wide cells filled as in D9; box drawing, blocks and Powerline triangles as shapes; ligatures off), keys go through libghostty-vt's encoder, grapheme clustering (mode 2027) is on and synchronized output holds the screen for at most 1 s.
 - **Why**: The Termux view flattened CJK (horizontal-only scaling to the cell), broke box-drawing lines between rows, showed Powerline symbols as boxes and split emoji sequences; Ghostty's full renderer targets macOS and GTK, while libghostty-vt is a plain C library for the terminal state.
 - **Tradeoffs**: CJK glyphs still come from the system fallback fonts; programs that count widths per codepoint disagree with mode 2027 on emoji sequences.

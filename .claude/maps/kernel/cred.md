@@ -164,7 +164,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   with syscall/arch/address), TRACE (`PTRACE_EVENT_SECCOMP` stop and re-check, or `ENOSYS` without
   a tracer), USER_NOTIF, LOG, ALLOW, KILL_THREAD (or KILL_PROCESS when it is the last live
   thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions go to
-  appine's debug log only (stderr with `APPINE_LOG`); USER_NOTIF is never logged.
+  Appine's debug log only (stderr with `APPINE_LOG`); USER_NOTIF is never logged.
 - User notifications: the waiting thread is woken by replies, ends on fatal signals, and returns
   `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a
   signal costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
@@ -221,7 +221,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   with umask 077 in a setgid directory gives 02700 where Linux gives 0700), and mkdir keeps
   caller-supplied setuid/setgid bits (Linux keeps only permissions and the sticky bit).
 - **ptrace access checks diverge.** The capability subset test uses permitted capabilities even
-  with filesystem credentials (Linux uses effective, so appine is more permissive), and the
+  with filesystem credentials (Linux uses effective, so Appine is more permissive), and the
   `/proc/<pid>/mem`-class opens use real credentials where Linux uses filesystem ones.
 - **`owns` also requires the gid mapping.** Linux's `inode_owner_or_capable` needs only the uid
   mapped, so namespace root gets `EPERM` for chmod, utimensat, `O_NOATIME` and similar on files
@@ -233,7 +233,7 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   CPU-time clocks, the alarm clocks (`CLOCK_REALTIME_ALARM`, `CLOCK_BOOTTIME_ALARM`) and invalid
   ids; here filters restricting clock ids (Chromium's) never fire, and
   a guest can jump to the vDSO's `svc` to skip its own filter for these three syscalls.
-- **seccomp logging is incomplete.** Logged actions reach only appine's debug stderr (not the guest
+- **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.
 - **`for_access` ignores `SECBIT_NO_SETUID_FIXUP`**, so access(2) answers differ for

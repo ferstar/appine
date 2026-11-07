@@ -24,7 +24,7 @@
 
 ### D3: Nested epolls re-report when inner interests see new events
 - **What**: An inner epoll's generation is the sum of its interests' event counts, and an outer edge-triggered interest fires again when it grows.
-- **Why**: Linux's `ep_poll_callback` wakes the outer epoll on every inner wakeup, even when the interest is already on the ready list; appine reported only the first event.
+- **Why**: Linux's `ep_poll_callback` wakes the outer epoll on every inner wakeup, even when the interest is already on the ready list; Appine reported only the first event.
 - **Tradeoffs**: Generations only grow; removed interests' shares are kept in a base.
 - **Watch out**: Edge-watching an inner epoll must propagate host edge tracking inward.
 - **Source**: round 47 (`47-nested-epoll`)

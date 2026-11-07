@@ -486,7 +486,7 @@ int main(void)
     CHECK(waitpid(child, &st, 0) == child && WEXITSTATUS(st) == 5, "waitpid");
     ok("waitpid");
     seccomp_listener();
-    /* syslog reads: the log of a newly started appine is empty, so wait until a signal arrives
+    /* syslog reads: the log of a newly started Appine is empty, so wait until a signal arrives
      * (the handler has no SA_RESTART: EINTR); then wait until someone writes /dev/kmsg */
     struct sigaction sa = {.sa_handler = on_alrm};
     sigaction(SIGALRM, &sa, NULL);

@@ -40,9 +40,9 @@
 - **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index.
 - **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183
 
-### D6: Kernel kills are explained in the tab or a notification; appine bugs always notify with a copyable report
-- **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records); OpenRC services that failed at boot are notified too.
-- **Why**: Tabs used to show only "Killed" or "Segmentation fault", which does not tell an OOM kill from an appine bug; after release the copied report is what a user can bring to the developer.
+### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
+- **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records); OpenRC services that failed at boot are notified too.
+- **Why**: Tabs used to show only "Killed" or "Segmentation fault", which does not tell an OOM kill from an Appine bug; after release the copied report is what a user can bring to the developer.
 - **Tradeoffs**: Reports are polled, so they arrive after the shell's prompt (hence the insertion above the cursor, `android/terminal` D2).
 - **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`)
 

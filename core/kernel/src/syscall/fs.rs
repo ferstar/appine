@@ -304,7 +304,7 @@ pub(super) fn openat2(cx: &mut Cx<'_>, dirfd: i32, path: u64, how: u64, size: us
         return Err(Errno::EINVAL);
     }
     // RESOLVE_CACHED: creation, truncation and O_TMPFILE (which includes O_DIRECTORY, so
-    // O_DIRECTORY counts too) are not tried; everything else resolves as usual, since appine's
+    // O_DIRECTORY counts too) are not tried; everything else resolves as usual, since Appine's
     // resolution waits for nothing but host I/O
     let busy = (oflags::O_TRUNC | oflags::O_CREAT | oflags::O_DIRECTORY) as u64 | O_TMPFILE_BIT;
     if res & resolve::CACHED != 0 && f & busy != 0 {

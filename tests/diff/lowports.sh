@@ -1,4 +1,4 @@
-# Ports below 1024 (docs/rounds/156-low-ports.md): appine binds them to other ports on the host,
+# Ports below 1024 (docs/rounds/156-low-ports.md): Appine binds them to other ports on the host,
 # and on the guest side this must be indistinguishable from native (root in the container binds
 # them directly): getsockname, getpeername, the peer from accept, the source from recvfrom, the
 # ports in /proc/net; connecting to these local ports (loopback, IPv6 dual stack, wildcard
@@ -67,7 +67,7 @@ static int server(int type, const char *ip, int port, int reuse)
     return s;
 }
 
-/* Lines whose local end is this port: TCP counts only listeners (appine does not list connections
+/* Lines whose local end is this port: TCP counts only listeners (Appine does not list connections
  * not yet accepted), UDP counts all */
 static void proc_net(const char *file, int port, int tcp)
 {

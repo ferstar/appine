@@ -31,7 +31,7 @@
 
 ### D4: Boot mounts match systemd and container runtimes; `/tmp` stays in the store
 - **What**: `/dev` (tmpfs with standard nodes, like devtmpfs), `/dev/pts`, `/dev/shm`, `/dev/mqueue` and `/run` are mounted at boot with systemd's options; `/tmp` is a store directory.
-- **Why**: OpenRC's `init.sh` and devfs service otherwise mount over appine's directories; seeing them already mounted, they leave them alone. `/dev/shm` stays executable and unlimited so JIT double mappings keep working.
+- **Why**: OpenRC's `init.sh` and devfs service otherwise mount over Appine's directories; seeing them already mounted, they leave them alone. `/dev/shm` stays executable and unlimited so JIT double mappings keep working.
 - **Tradeoffs**: Nodes created with mknod in `/dev` do not survive a reboot (as on Linux).
 - **Watch out**: The store's own `/dev` is still populated with the same nodes, so unmounting `/dev` leaves a working directory underneath.
 - **Source**: rounds 05 (`05-m3b`), 184 (`184-boot-tmpfs`)
@@ -64,16 +64,16 @@
 - **Watch out**: New syscalls that create or modify files must call the read-only check at the matching point.
 - **Source**: rounds 116 (`116-store-binds`), 168 (`168-open-tree`)
 
-### D9: openat2's `RESOLVE_*` are implemented in appine's own walker
+### D9: openat2's `RESOLVE_*` are implemented in Appine's own walker
 - **What**: `BENEATH`, `IN_ROOT`, `NO_SYMLINKS`, `NO_MAGICLINKS` and `NO_XDEV` follow 6.1's `fs/namei.c` inside the normal path walk; `RESOLVE_CACHED` only rejects create, truncate and tmpfile opens.
-- **Why**: New GNU tar with glibc ≥ 2.43 fails hard without openat2, and bubblewrap 0.12 uses it; Android's app seccomp does not allow openat2, so it cannot be passed to the host. appine's resolution never blocks on a cache miss, so `RESOLVE_CACHED` has nothing to distinguish (as in gVisor).
+- **Why**: New GNU tar with glibc ≥ 2.43 fails hard without openat2, and bubblewrap 0.12 uses it; Android's app seccomp does not allow openat2, so it cannot be passed to the host. Appine's resolution never blocks on a cache miss, so `RESOLVE_CACHED` has nothing to distinguish (as in gVisor).
 - **Tradeoffs**: The "root already taken" rule for `NO_XDEV` while following dangling links on create is approximated.
-- **Watch out**: `exe` is treated as a magic link here even though appine follows it by content elsewhere.
+- **Watch out**: `exe` is treated as a magic link here even though Appine follows it by content elsewhere.
 - **Source**: round 144 (`144-openat2`)
 
 ### D10: Mounting over `/proc/<pid>/fd` entries is refused as in Linux 6.12
 - **What**: A mount point reached through `/proc/<pid>/fd/<n>` to a deleted file or pipe, or that is an `fd`/`fdinfo` entry itself, is `ENOENT`.
-- **Why**: Linux 6.12 blocked this ("proc: block mounting on top of /proc/<pid>/fd/*"), and LTP's mount08 tests it; 6.1 and native 6.8 allow it. appine follows the newer rule as one of the deliberate exceptions to the 6.1 contract.
+- **Why**: Linux 6.12 blocked this ("proc: block mounting on top of /proc/<pid>/fd/*"), and LTP's mount08 tests it; 6.1 and native 6.8 allow it. Appine follows the newer rule as one of the deliberate exceptions to the 6.1 contract.
 - **Tradeoffs**: Differs from the reported kernel version.
 - **Watch out**: Count it among the 6.1 contract exceptions when deciding on a contract upgrade.
 - **Source**: round 105 (`105-mount-subset`)
@@ -150,7 +150,7 @@
 
 ### D21: Loop devices forward I/O to their backing open file
 - **What**: `syscall/loopdev.rs` keeps loop devices in `Kernel::loops` (eight at boot, more on demand with nodes in the boot `/dev`), block nodes dispatch by major 7, I/O goes through the backing open file's own read and write paths at the device offset (regular files without the BKL), and the loop and common block ioctls follow 6.1's errors and order.
-- **Why**: LTP takes its test device from loop-control, so 151 tests broke before reaching appine, and losetup and image tools did not work.
+- **Why**: LTP takes its test device from loop-control, so 151 tests broke before reaching Appine, and losetup and image tools did not work.
 - **Tradeoffs**: There is no page cache, no partitions, discard, fallocate, direct I/O or mmap of the device, `BLKGETDISKSEQ` is approximate, and nothing can be mounted from a device.
 - **Watch out**: Native kernels after 6.1 unbind an autoclear device some time after the last close, so differential cases must wait, and a loop over a loop keeps the lower device open until the upper one is unbound.
 - **Source**: a26c8b4
@@ -208,7 +208,7 @@
 - **What**: sendfile returns `EINVAL` for an `O_APPEND` output other than a pipe, after the input checks.
 - **Why**: Linux sends non-pipe outputs through `do_splice_direct`, which rejects `O_APPEND`.
 - **Tradeoffs**: None.
-- **Watch out**: Programs that relied on appine appending now get `EINVAL`, as on Linux.
+- **Watch out**: Programs that relied on Appine appending now get `EINVAL`, as on Linux.
 - **Source**: 298cadb
 
 ## Superseded

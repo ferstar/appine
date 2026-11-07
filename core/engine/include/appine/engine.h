@@ -1,5 +1,5 @@
 /*
- * The appine engine's public interface (design doc §13.1, the engine and kernel/mm maps).
+ * The Appine engine's public interface (design doc §13.1, the engine and kernel/mm maps).
  *
  * The engine only executes guest instructions and the soft-MMU fast path. On svc, a memory access
  * failure, an undefined instruction or brk, appine_cpu_run() returns an exit reason; the kernel

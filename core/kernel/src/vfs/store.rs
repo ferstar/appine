@@ -22,7 +22,7 @@
 //! a few milliseconds are committed together; each operation is a savepoint in the transaction
 //! and on error rolls back only itself. When the app is killed, at most the last few milliseconds
 //! of changes are lost, and the store is still the complete state of some moment (Linux loses
-//! more on power loss). While other appine processes are also using the store, every operation
+//! more on power loss). While other Appine processes are also using the store, every operation
 //! commits immediately. Checkpoints (writing the WAL back into the database file, which needs
 //! fsync) are done by a background thread ([`wal_hook`]), not in commits, which mostly hold the
 //! BKL.
@@ -39,7 +39,7 @@
 //!
 //! Path resolution and stat go through an in-memory metadata cache (dentries, including names that
 //! do not exist; inode rows; symlink targets) instead of querying the database level by level.
-//! Our own writes only remove the affected entries. Several appine processes can share one store,
+//! Our own writes only remove the affected entries. Several Appine processes can share one store,
 //! so the first 8 bytes of the `lock` file are a counter that all processes map shared: it is
 //! bumped after every commit, and when the cache finds that it changed other than by its own
 //! commit, the whole cache is invalidated.
@@ -352,7 +352,7 @@ impl Store {
             .map_err(db_err)?;
         db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)
             .map_err(db_err)?;
-        // Several appine processes can use the same store at once: wait for others' write
+        // Several Appine processes can use the same store at once: wait for others' write
         // transactions to end instead of failing at once
         db.busy_timeout(Duration::from_secs(10)).map_err(db_err)?;
         // Metadata operations are very frequent: every statement is compiled only once
@@ -1670,7 +1670,7 @@ impl Store {
     /// the WAL back to disk at any time, and by then the new file's content must already be on
     /// disk, so that after power loss the name does not hold an empty or truncated file. Native
     /// ext4 does the same on a replacing rename (auto_da_alloc), and apk installing files and
-    /// editors saving rely on it without calling fsync; appine's renames are only in the
+    /// editors saving rely on it without calling fsync; Appine's renames are only in the
     /// database, invisible to the host. A few files are fdatasynced one by one (writeback is
     /// started for all of them first, which ext4 merges into one journal commit); for more, the
     /// whole filesystem is syncfsed once. This holds the BKL, so other processes wait during the
@@ -2609,7 +2609,7 @@ mod tests {
     #[test]
     fn cache_follows_own_and_other_processes_writes() {
         let (a, dir) = temp_store("cache");
-        // A second connection stands in for another appine process
+        // A second connection stands in for another Appine process
         let b = Store::open(&dir, &[]).unwrap();
         let names = |s: &Store| -> Vec<Vec<u8>> {
             s.readdir(ROOT)
@@ -2982,7 +2982,7 @@ mod tests {
 
     #[test]
     fn concurrent_connections_wait_for_each_other() {
-        // Several appine processes using one store at once: writes wait for others' transactions
+        // Several Appine processes using one store at once: writes wait for others' transactions
         // to end and do not fail
         let (s, dir) = temp_store("concurrent");
         let dirs: Vec<Ino> = (0..4)

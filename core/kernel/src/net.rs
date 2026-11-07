@@ -827,7 +827,7 @@ pub(crate) fn configure_host_link(
         }
     });
     let Some(dev) = found else {
-        // appine cannot create one when asked to (Linux also gives EOPNOTSUPP when it has no
+        // Appine cannot create one when asked to (Linux also gives EOPNOTSUPP when it has no
         // driver for that kind of interface)
         return Some(if newlink && flags & NLM_F_CREATE != 0 {
             EOPNOTSUPP

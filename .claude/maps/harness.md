@@ -9,7 +9,7 @@
 
 ## Responsibilities
 
-`harness` is how appine is run and tested on the development host:
+`harness` is how Appine is run and tested on the development host:
 
 - `appine-run` (`hosts/cli`), the command-line front end that runs one guest program, optionally
   in an inode store, through a PTY bridge or the host's stdio;
@@ -112,11 +112,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined); elsewhere through `scripts/dev`.
 - A store (`target/difftest/store`) is imported once and gets about 18 packages; a tool check aborts
-  if any is missing; its `bin etc lib sbin usr tmp` are exported from inside appine and imported as
+  if any is missing; its `bin etc lib sbin usr tmp` are exported from inside Appine and imported as
   the docker image `appine-difftest` (first run or `-r`).
 - Each case script runs with stderr merged into stdout on both sides: natively with
-  `docker run` plus the case's docker options, and as `/bin/sh -c` under `appine-run` plus the
-  case's appine options; an `exit N` line is appended to each output. A case passes when the two
+  `docker run` plus the case's `# docker-run-options:`, and as `/bin/sh -c` under `appine-run` plus
+  its `# appine-options:`; an `exit N` line is appended to each output. A case passes when the two
   outputs are byte-identical and `appine-run`'s own stderr has no `appine: internal error` line;
   scripts normalise varying output themselves. A script over 128 KB is rejected.
 - `# difftest-files: <dir>` ships `tests/diff/<dir>` with the script: a ustar archive, gzipped and
@@ -159,9 +159,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   does not build with musl, into `target/ltp/ltp-<ver>.tar`.
 - `ltp` uses a store on the `appine-ltp` volume when `/ltp` exists (inside `scripts/dev`), else
   `target/ltp/store` (`LTP_STORE` overrides), built once with LTP unpacked; a kernel config listing
-  appine's features (loop devices included) is written and passed as `KCONFIG_PATH`.
-- Tests that need a device get one of appine's loop devices over a file in their `/tmp` directory,
-  and `LTP_DEV_FS_TYPE=tmpfs` makes LTP skip mkfs and mount a tmpfs there instead (appine has no
+  Appine's features (loop devices included) is written and passed as `KCONFIG_PATH`.
+- Tests that need a device get one of Appine's loop devices over a file in their `/tmp` directory,
+  and `LTP_DEV_FS_TYPE=tmpfs` makes LTP skip mkfs and mount a tmpfs there instead (Appine has no
   disk filesystems), as Starnix runs LTP; tests that need a particular disk filesystem report
   TCONF, and some (remounting the device to find files again, mounting a read-only device, mount
   errors of a block device) fail on Linux's tmpfs too.
@@ -246,8 +246,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   tier-qualified, each run wipes the other's lane claims, `-r` deletes clones another run is using,
   and there is no lock.
 - **The two difftest sides start from different files.** The native image lacks `/root`, `/var`,
-  `/opt`, `/home` and `/run`, while the appine store keeps `/tmp` and `/root` between runs, so
-  caches such as `/root/.cache` (Go, uv) exist only on the appine side; cases clean `/tmp` by hand
+  `/opt`, `/home` and `/run`, while the Appine store keeps `/tmp` and `/root` between runs, so
+  caches such as `/root/.cache` (Go, uv) exist only on the Appine side; cases clean `/tmp` by hand
   and nothing handles `$HOME` (one epoll case assumes an empty uv cache).
 - **`scripts/ltp` is stale and fragile outside its container.** Its store is never rebuilt when the
   LTP tarball or rootfs changes, an existing binary is never rebuilt, and outside `scripts/dev` its

@@ -7,7 +7,7 @@
 
 ## Active
 
-### D1: Differential tests compare appine with a real Linux kernel running the same rootfs
+### D1: Differential tests compare Appine with a real Linux kernel running the same rootfs
 - **What**: Each `tests/diff` script runs in a docker container built from the store's own files and under `appine-run`, and the two outputs (stderr merged, exit code appended) must match byte for byte; `appine-run` itself runs in a container so both sides see the same kind of network.
 - **Why**: The real kernel is the reference; exporting the image from the test store keeps the userland identical, so any difference is the kernel layer's; route, interface and address cases are only comparable when both sides share the network setup.
 - **Tradeoffs**: Behaviour that changes with the host kernel version is not compared; a failure identical on both sides passes; scripts must normalise addresses, pids and random markers themselves.
@@ -43,7 +43,7 @@
 
 ### D7: The workload survey is read by a human, not compared
 - **What**: `scripts/survey` runs services, tools, suites and AI CLIs inside a store with `APPINE_LOG=1` and reports exit code, time, internal errors and unimplemented syscalls per workload; `-n` runs the same scripts natively for comparison when something looks wrong.
-- **Why**: The differential tests cover only a few runtimes (C, coreutils, Go, Java, Node.js, Python, Lua/SQLite, gdb); most services and tools common on a phone terminal had never run in appine, and the survey finds the gaps they actually hit.
+- **Why**: The differential tests cover only a few runtimes (C, coreutils, Go, Java, Node.js, Python, Lua/SQLite, gdb); most services and tools common on a phone terminal had never run in Appine, and the survey finds the gaps they actually hit.
 - **Source**: round 62 (`62-workload-survey`)
 
 ### D8: Store durability is tested by simulating power loss with dm-flakey
@@ -124,7 +124,7 @@
 
 ### D19: Fuchsia Starnix's syscall tests run as differential cases
 - **What**: scripts/build-starnix-tests builds a pinned Fuchsia commit's tests and a pinned googletest with clang statically against musl into a tarball that scripts/difftest installs into its store when VERSION changes, and the `starnix-*` cases run each test in its own process under `timeout -s KILL 60` with its output in a file, skipping known divergences by negative gtest filter grouped by reason and recorded in kernel maps.
-- **Why**: Starnix's syscall tests are a Linux-validated gtest corpus covering the subsystems appine emulates, and running them on both sides finds divergences no case covered.
+- **Why**: Starnix's syscall tests are a Linux-validated gtest corpus covering the subsystems Appine emulates, and running them on both sides finds divergences no case covered.
 - **Tradeoffs**: Building needs the network and about 4 minutes and adds 158 MB to the store, and without the tarball (as on CI) the cases pass vacuously.
 - **Watch out**: Privileged cases act on the development VM (clock-setting tests move its clock), busybox's `timeout` sends only SIGTERM unless told otherwise, googlesource must keep serving fetches by hash, and a Fuchsia upgrade can change tests and need new skips.
 - **Source**: 1459292, e03c0cc, 612d238, c11c1db

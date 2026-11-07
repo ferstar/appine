@@ -416,7 +416,7 @@ const STATIC: [&[u8]; 128] = [
 /// them: (path relative to `/proc`, mode, default, lowest and highest value accepted), the range
 /// being that of Linux 6.1's handler (any int for `proc_dointvec`). A write keeps the value in
 /// `Kernel::sysctls` and changes nothing else; `kernel.randomize_va_space` starts at 0 because
-/// appine places mappings at fixed addresses.
+/// Appine places mappings at fixed addresses.
 pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
     const INT_MIN: i64 = i32::MIN as i64;
     const INT_MAX: i64 = i32::MAX as i64;

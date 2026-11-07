@@ -40,7 +40,7 @@ if [ -t 0 ] && [ -t 1 ]; then
 fi
 
 # --ulimit nice: as with Android's init.rc (setrlimit nice 40 40), threads can lower their nice
-# value to -20 without privileges; appine sets the nice values of guest threads on host threads.
+# value to -20 without privileges; Appine sets the nice values of guest threads on host threads.
 # /ltp is a docker volume local to the VM, where scripts/ltp keeps its store (not going through
 # virtiofs)
 # shellcheck disable=SC2086

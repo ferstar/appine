@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs LTP's syscall tests inside appine (design doc §13.3 layer 2). Build LTP with
+# Runs LTP's syscall tests inside Appine (design doc §13.3 layer 2). Build LTP with
 # scripts/build-ltp first. Runs on Linux arm64; on macOS through scripts/dev:
 #
 #   scripts/dev scripts/ltp [-a] [-j jobs] [-t tier] [regex matching the whole test name]
@@ -44,13 +44,13 @@ if [ "${1:-}" = --one ]; then
     [ -f "$log" ] && mv "$log" "$out/logs/$name.prev.log"
     start=$(date +%s.%N)
     set +e
-    # LTP judges timeouts by its own timer; appine is slower than native, so allow 5 times as long
+    # LTP judges timeouts by its own timer; Appine is slower than native, so allow 5 times as long
     # (at least 2.5 minutes per test). The factor also multiplies TST_RETRY_FUNC's backoff limit: at
     # 20 times, system calls that always fail (the bpf ones) would be retried for 33 seconds. Race
     # tests that run for a set duration (inotify09, timerfd_settime02 and so on, fuzzy sync) run
     # only a tenth of it: they look for races in Linux itself, and one alone used to take 1–2
     # minutes. Tests that need a device get a loop device over a file in /tmp, as on Linux;
-    # appine has no disk filesystems, so the device's filesystem is tmpfs (LTP then skips mkfs
+    # Appine has no disk filesystems, so the device's filesystem is tmpfs (LTP then skips mkfs
     # and mounts a tmpfs instead, as Starnix runs LTP), and tests that need a particular one
     # report TCONF
     timeout 900 "$run" --tier "$tier" --rootfs "$store" \
@@ -102,7 +102,7 @@ if [ ! -f "$store/.ltp" ]; then
 fi
 
 # Tests decide whether to run by the kernel configuration (.needs_kconfigs): list the features
-# appine implements; anything not listed counts as absent
+# Appine implements; anything not listed counts as absent
 "$run" --rootfs "$store" -- /bin/sh -c 'cat >/opt/ltp/appine.config' <<'EOF'
 CONFIG_64BIT=y
 CONFIG_ARM64=y

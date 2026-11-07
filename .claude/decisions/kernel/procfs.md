@@ -38,7 +38,7 @@
 
 ### D5: Only pids, memory, freeze, kill and the device filter are enforced
 - **What**: `pids.max` stops fork and thread creation, `memory.max` is enforced by the OOM killer's periodic check (and immediately when lowered), `cgroup.freeze` stops threads transparently, `cgroup.kill` kills the subtree; other limits are format-checked and stored.
-- **Why**: These are what `docker run --pids-limit`/`--memory`, podman's equivalents, `docker pause` and systemd's `TasksMax=`/`MemoryMax=` write. Host threads' scheduling is not under appine's control, so `cpu.max`, `cpu.weight` and `cpuset.cpus` have nothing to act on.
+- **Why**: These are what `docker run --pids-limit`/`--memory`, podman's equivalents, `docker pause` and systemd's `TasksMax=`/`MemoryMax=` write. Host threads' scheduling is not under Appine's control, so `cpu.max`, `cpu.weight` and `cpuset.cpus` have nothing to act on.
 - **Tradeoffs**: `memory.max` can be exceeded by tens of MB before the check notices; `memory.current` counts shared pages once per process; `memory.high`/`low`/`min` and swap limits do nothing.
 - **Watch out**: Freezing must not look like a stop signal: parents and wait must not see it, and interrupted syscalls restart after thaw.
 - **Source**: rounds 164 (`164-cgroup-limits`), 165 (`165-cgroup-freeze`)
@@ -116,13 +116,13 @@
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions.
 - **Why**: Setup scripts write these sysctls and checkers read them, and `sysctl -p` and `sysctl -w` failed where Linux succeeds because the files were missing or read-only for root.
-- **Tradeoffs**: The recorded values change nothing, and randomize_va_space starts at 0, true of appine's fixed layout, where Linux starts at 2.
+- **Tradeoffs**: The recorded values change nothing, and randomize_va_space starts at 0, true of Appine's fixed layout, where Linux starts at 2.
 - **Watch out**: Programs that read a recorded value back may act as if the setting applied.
 - **Source**: 42d2ffe
 
 ### D17: An exited main thread shows as a zombie until the process is reaped
 - **What**: The process directory no longer falls back to the first live thread: listing, link and thread counts, state (Z for the exited leader), comm and CPU time use `ThreadGroup::leader_exit` (kernel/process D21), exe is `ENOENT` without a live task, and `/proc/<tid>`'s state follows that thread.
-- **Why**: Linux keeps an exited main thread as a zombie until the group is reaped, while appine dropped it and let the process directory describe another thread, which alone failed 35 Starnix tests.
+- **Why**: Linux keeps an exited main thread as a zombie until the group is reaped, while Appine dropped it and let the process directory describe another thread, which alone failed 35 Starnix tests.
 - **Tradeoffs**: Entries that need a task (cmdline, maps, fd/, the mount namespace) behave as for a zombie while the rest of the process runs, as on Linux.
 - **Watch out**: Code that reached a live thread's state through the process directory after the leader exited gets nothing (none was found in the kernel).
 - **Source**: 79a60cf

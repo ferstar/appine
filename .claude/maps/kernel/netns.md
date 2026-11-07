@@ -18,7 +18,7 @@ provides:
 - virtual devices (bridge, veth, dummy) with addresses, routes and sysctls, and the mapping of
   their IPv4 addresses to host loopback addresses;
 - nftables: the ruleset over `NETLINK_NETFILTER` and its evaluation at connect/sendto;
-- forwarding of connections from outside appine to published (DNAT) ports.
+- forwarding of connections from outside Appine to published (DNAT) ports.
 
 Root: `core/kernel/src/netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs`, `netconf.rs`.
 

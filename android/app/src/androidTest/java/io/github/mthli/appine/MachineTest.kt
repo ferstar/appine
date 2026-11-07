@@ -1133,7 +1133,7 @@ class MachineTest {
     }
 
     /**
-     * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
+     * The open-source notices generated at build time (design doc §13.4) are in the APK: Appine's
      * own AGPL notice and full text, Fuchsia's license for the parts of the line discipline adapted
      * from Starnix, libghostty-vt with what it links and the terminal font, the GPL
      * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the

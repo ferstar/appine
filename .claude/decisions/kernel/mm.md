@@ -150,7 +150,7 @@
 
 ### D21: mremap with an old length of 0 duplicates shared mappings
 - **What**: `Mm::duplicate` follows 6.1's order (`EFAULT` without a VMA, a `MREMAP_FIXED` target validated and unmapped, `EINVAL` for private mappings, `ENOMEM` without `MREMAP_MAYMOVE`), maps shared files again from the address's offset and clones shared anonymous and SysV VMAs onto the same host memory with `file_len` capped at the host region's end (kernel/ipc D2).
-- **Why**: Linux 6.1 lets mremap with an old length of 0 duplicate a shared mapping, and appine refused it outright.
+- **Why**: Linux 6.1 lets mremap with an old length of 0 duplicate a shared mapping, and Appine refused it outright.
 - **Tradeoffs**: The copy may run past the source VMA only within the original host region, and accesses past that raise `SIGBUS` as past the end of a shmem object.
 - **Watch out**: A copied VMA's `file_len` is bounded by its shared host region, so code assuming a shared anonymous VMA's `file_len` equals its length is wrong for such copies.
 - **Source**: 5dcf7db
@@ -171,7 +171,7 @@
 
 ### D24: `vm.overcommit_memory=1` lets fork skip its commit check
 - **What**: A global `OVERCOMMIT_MEMORY`, set through procfs (kernel/procfs D16), makes fork skip `commit_too_big` when it is 1.
-- **Why**: Redis and similar servers set it so that fork for snapshots does not fail with `ENOMEM`, and fork's commit check is appine's version of Linux's heuristic mode.
+- **Why**: Redis and similar servers set it so that fork for snapshots does not fail with `ENOMEM`, and fork's commit check is Appine's version of Linux's heuristic mode.
 - **Tradeoffs**: Mode 2's strict accounting is not emulated and behaves as 0.
 - **Watch out**: With 1, a huge fork that would have failed goes on and can run the app out of memory.
 - **Source**: 42d2ffe

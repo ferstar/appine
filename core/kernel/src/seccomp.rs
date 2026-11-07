@@ -75,7 +75,7 @@ mod ret {
 mod flag {
     pub const TSYNC: u32 = 1;
     pub const LOG: u32 = 2;
-    /// Do not apply the speculative-execution mitigations (on the host, out of appine's control):
+    /// Do not apply the speculative-execution mitigations (on the host, out of Appine's control):
     /// only checked.
     pub const SPEC_ALLOW: u32 = 4;
     pub const NEW_LISTENER: u32 = 8;
@@ -96,7 +96,7 @@ const MAX_INSNS_PER_PATH: usize = (1 << 18) / 8;
 /// The size of `struct seccomp_data`.
 const DATA_SIZE: usize = 64;
 /// How many numbers the per-number cache bitmap covers (on Linux, the number of arm64 syscalls;
-/// 512 here, which covers every number appine implements), and how many words it has.
+/// 512 here, which covers every number Appine implements), and how many words it has.
 const CACHED_NRS: usize = 512;
 pub(crate) const CACHE_WORDS: usize = CACHED_NRS / 64;
 /// SIGSYS's `si_code`.

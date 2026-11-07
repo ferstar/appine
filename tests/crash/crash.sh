@@ -8,7 +8,7 @@
 # A freshly imported Alpine store is put in an ext4 on dm-flakey and workload.sh runs; at a random
 # moment (3–15 seconds), power makes the device drop all later writes (like a power loss), ends the
 # workload, unmounts, restores and remounts; kill only ends the workload (the app being killed),
-# with the host's page cache intact. Then check.sh runs inside appine (with the boot cleanup done as
+# with the host's page cache intact. Then check.sh runs inside Appine (with the boot cleanup done as
 # usual). native runs the same workload directly in an alpine container, for comparison. The binary
 # is a path in the container (the repository is mounted at /work). With STOP=1 it stops at the first
 # failure, leaving the store in /mnt/appine-crash/s.

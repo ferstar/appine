@@ -1,4 +1,4 @@
-//! The appine kernel layer: the Linux user-space ABI implemented in-process (design doc §3 and
+//! The Appine kernel layer: the Linux user-space ABI implemented in-process (design doc §3 and
 //! each module's map).
 //!
 //! Every guest thread runs on its own host thread, and the kernel layer is protected by one big

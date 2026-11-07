@@ -45,7 +45,7 @@
 
 ### D7: OpenRC gets a loopback interfaces file and osclock, not `rc_provide`
 - **What**: Before each start a loopback-only `/etc/network/interfaces` is written when missing; before boot osclock is added to the boot runlevel when OpenRC is installed and no clock service is configured.
-- **Why**: Services needing `net` made OpenRC start networking, which failed without the file; `rc_provide` in rc.conf applies to every service, warned about `loopback` and created dependency cycles once `clock` was added; hwclock always fails because appine has no RTC and cannot set the host time.
+- **Why**: Services needing `net` made OpenRC start networking, which failed without the file; `rc_provide` in rc.conf applies to every service, warned about `loopback` and created dependency cycles once `clock` was added; hwclock always fails because Appine has no RTC and cannot set the host time.
 - **Watch out**: Leave user-provided interfaces files and clock services alone.
 - **Source**: round 187 (`187-app-init`)
 

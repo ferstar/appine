@@ -1,4 +1,4 @@
-# Login for an appine terminal tab (the android/setup map): runs as root, and $1 is the login
+# Login for an Appine terminal tab (the android/setup map): runs as root, and $1 is the login
 # account from Settings: auto, root or an account name. auto uses the first regular user created
 # (the one with the smallest UID among those with UID 1000–65533 and a login shell), or root when
 # there is none; a named account that no longer exists is root too. $2 is the directory to start in

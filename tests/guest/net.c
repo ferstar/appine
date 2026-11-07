@@ -297,7 +297,7 @@ static void test_udp_loopback(void)
 }
 
 /*
- * The replies of the DNS stub (127.0.0.53:53) are in appine's own queue: FIONREAD must report the
+ * The replies of the DNS stub (127.0.0.53:53) are in Appine's own queue: FIONREAD must report the
  * length of the next reply. glibc's resolver sends both the A and the AAAA query at once with
  * sendmmsg and sizes the buffer for the second reply by FIONREAD; when that reports 0 it cannot
  * take the AAAA reply and resolution fails (Debian's apt). Without outside network the stub replies

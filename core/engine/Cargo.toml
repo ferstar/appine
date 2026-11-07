@@ -1,6 +1,6 @@
 [package]
 name = "appine-engine"
-description = "appine CPU engine (C) and its Rust bindings"
+description = "Appine CPU engine (C) and its Rust bindings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

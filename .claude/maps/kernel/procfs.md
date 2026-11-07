@@ -434,7 +434,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 ## To verify
 
 - Linux 6.1's permission rules for cgroup device program attach/detach (believed to need no
-  capability since CAP_BPF; appine checks nothing on the target cgroup) and for SysV IPC/mqueue
+  capability since CAP_BPF; Appine checks nothing on the target cgroup) and for SysV IPC/mqueue
   sysctls in child user namespaces (believed to be refused until about 6.8).
 - Whether reopening a deleted file through `/proc/<pid>/fd/N` (the open-file node) checks
   permission (pipes do not).

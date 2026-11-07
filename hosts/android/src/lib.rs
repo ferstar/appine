@@ -1,4 +1,4 @@
-//! appine's Android native library (design doc §3, the android/native map): the Kotlin shell uses
+//! Appine's Android native library (design doc §3, the android/native map): the Kotlin shell uses
 //! the kernel layer through JNI.
 //!
 //! The matching Kotlin declarations are in

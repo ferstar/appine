@@ -48,9 +48,9 @@ use crate::process::ThreadGroup;
 /// The root cgroup's id (also its inode number, 1 as on Linux).
 pub(crate) const ROOT: u64 = 1;
 
-/// Linux's cgroup v2 controllers (in ssid order) and whether appine has them: `cgroup.controllers`
+/// Linux's cgroup v2 controllers (in ssid order) and whether Appine has them: `cgroup.controllers`
 /// lists them in this order; writing any other name to `subtree_control` is EINVAL, and writing
-/// one appine lacks is ENOENT.
+/// one Appine lacks is ENOENT.
 const CONTROLLERS: [(&str, bool); 8] = [
     ("cpuset", true),
     ("cpu", true),
@@ -62,7 +62,7 @@ const CONTROLLERS: [(&str, bool); 8] = [
     ("misc", false),
 ];
 
-/// The controllers appine has (bits in [`CONTROLLERS`]).
+/// The controllers Appine has (bits in [`CONTROLLERS`]).
 const AVAILABLE: u32 = 1 | 1 << 1 | 1 << MEMORY | 1 << PIDS;
 /// The positions of the memory and pids controllers in [`CONTROLLERS`].
 const MEMORY: usize = 3;
@@ -603,7 +603,7 @@ pub(crate) fn write(
     data: &[u8],
 ) -> Result<(), Errno> {
     // On a namespace root only cgroup.procs, cgroup.threads and cgroup.subtree_control may be
-    // written, anything else is EPERM (nsdelegate). appine's root looks like a container's root
+    // written, anything else is EPERM (nsdelegate). Appine's root looks like a container's root
     // and follows this too: writing its memory.max and the like would not change the OOM
     // killer's limit, so as in a container it is not allowed
     if (id == w.ns_root || id == ROOT)

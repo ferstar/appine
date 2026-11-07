@@ -315,7 +315,7 @@ class TerminalService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         // The last run did not exit normally: restore the tabs once the kernel is up, saying why
-        // it ended as far as Android recorded it; a crash of appine itself is reported now
+        // it ended as far as Android recorded it; a crash of Appine itself is reported now
         Tabs.takeKilled(this)?.let { killed ->
             val exit = lastExit(killed.pid)
             restore = killed.saved
@@ -370,8 +370,8 @@ class TerminalService : Service() {
     }
 
     /**
-     * The last run ended because appine crashed or stopped responding: posts a notification with
-     * "Copy report" ([bugReport]), as appine's bugs in the kernel get ([reportKill]).
+     * The last run ended because Appine crashed or stopped responding: posts a notification with
+     * "Copy report" ([bugReport]), as Appine's bugs in the kernel get ([reportKill]).
      */
     private fun notifyCrash(exit: ApplicationExitInfo) {
         val anr = exit.reason == ApplicationExitInfo.REASON_ANR
@@ -744,7 +744,7 @@ class TerminalService : Service() {
      * OOM killer). When its controlling terminal is a tab, the reason is explained in that tab (the
      * shell only prints "Killed" or "Segmentation fault"); when it is not in a tab (a background
      * service), when the tab is in a full-screen program, or when the UI is gone, a notification is
-     * posted. appine's own bugs always get a notification, with "Copy report" ([bugReport]) on it,
+     * posted. Appine's own bugs always get a notification, with "Copy report" ([bugReport]) on it,
      * for the user to paste into feedback.
      */
     private fun reportKill(line: String) {
@@ -1242,7 +1242,7 @@ class TerminalService : Service() {
         private const val PROBLEMS_CHANNEL_ID = "problems"
         /** The boot failure notification. */
         private const val BOOT_NOTIFICATION_ID = 2
-        /** The notification that the last run ended in a crash or ANR of appine. */
+        /** The notification that the last run ended in a crash or ANR of Appine. */
         private const val CRASH_NOTIFICATION_ID = 3
         /**
          * Notifications of ended processes: one id per report, above every listen id, so neither a

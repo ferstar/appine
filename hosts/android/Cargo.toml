@@ -1,6 +1,6 @@
 [package]
 name = "appine-android"
-description = "appine's native library for the Android app (JNI)"
+description = "Appine's native library for the Android app (JNI)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

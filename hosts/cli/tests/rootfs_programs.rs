@@ -311,7 +311,7 @@ fn tiocsti_needs_the_controlling_terminal_or_cap_sys_admin() {
 
 #[test]
 fn kernel_log_is_empty_and_keeps_console_levels() {
-    // A new kernel's log is empty (appine writes no boot messages): dmesg prints nothing; the
+    // A new kernel's log is empty (Appine writes no boot messages): dmesg prints nothing; the
     // console level dmesg -n changes is visible in /proc/sys/kernel/printk; with dmesg_restrict at
     // 1 ordinary users cannot read it, and only 0 and 1 can be written
     let script = "dmesg; echo rc=$?; dmesg -n 3; cat /proc/sys/kernel/printk; \
@@ -336,7 +336,7 @@ fn kernel_log_is_empty_and_keeps_console_levels() {
 
 #[test]
 fn recorded_sysctls_keep_what_is_written() {
-    // Sysctls appine only records take what Linux 6.1's handlers take and read it back:
+    // Sysctls Appine only records take what Linux 6.1's handlers take and read it back:
     // swappiness 0 to 200, drop_caches write-only, overcommit_memory 0 to 2, tainted only adds
     // flags (of the 19 defined), modules_disabled only goes to 1, modprobe a string;
     // randomize_va_space starts at 0, as nothing is randomized

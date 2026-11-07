@@ -59,7 +59,7 @@
 
 ### D8: `SO_ORIGINAL_DST` is answered from records the socket layer keeps
 - **What**: Connects rewritten by nat record the original destination keyed by the host 4-tuple; accept claims it; `SO_MARK` is stored on the socket and only used by nftables.
-- **Why**: Transparent proxies (`sslocal --protocol redir`, redsocks, clash) ask `SO_ORIGINAL_DST` after accepting; nat happens in appine's socket layer, so the host has no conntrack entry and answered `ENOENT`. The app cannot set host marks.
+- **Why**: Transparent proxies (`sslocal --protocol redir`, redsocks, clash) ask `SO_ORIGINAL_DST` after accepting; nat happens in Appine's socket layer, so the host has no conntrack entry and answered `ENOENT`. The app cannot set host marks.
 - **Tradeoffs**: TCP only; no TPROXY.
 - **Watch out**: Register the record before releasing the BKL so the peer cannot accept first.
 - **Source**: round 180 (`180-original-dst`)
@@ -94,7 +94,7 @@
 
 ### D13: Socket read, write, readv and writev are one recv or send
 - **What**: `net::rw` does one recv of the iovecs' total (capped at `MSG_MAX`) scattered in order, and gathers writes into one send for message sockets or 1 MiB sends for streams until done or short (kernel/vfs D22).
-- **Why**: Linux's `sock_read_iter`/`sock_write_iter` make each call one recvmsg or sendmsg, while appine wrote 64 KiB chunks per iovec and capped reads at 64 KiB.
+- **Why**: Linux's `sock_read_iter`/`sock_write_iter` make each call one recvmsg or sendmsg, while Appine wrote 64 KiB chunks per iovec and capped reads at 64 KiB.
 - **Tradeoffs**: A message over 1 MiB is cut to `MSG_MAX`, as sendmsg already did.
 - **Watch out**: A blocking stream write of many MiB now goes in 1 MiB sends, which shows only in partial progress under signals.
 - **Source**: b295644
@@ -115,7 +115,7 @@
 
 ### D16: Blocking connect honours `SO_SNDTIMEO` and restarts after signals
 - **What**: The host's `EALREADY` on a blocking socket joins the wait, a timeout returns the host's own answer (`EINPROGRESS` or `EALREADY`), and a signal is `ERESTARTSYS` without a timeout and `EINTR` with one.
-- **Why**: Programs bound connects with `SO_SNDTIMEO` or rely on `SA_RESTART` handlers (SIGWINCH on resize, SIGCHLD) not to break a blocking connect, and appine ignored the first and broke the second.
+- **Why**: Programs bound connects with `SO_SNDTIMEO` or rely on `SA_RESTART` handlers (SIGWINCH on resize, SIGCHLD) not to break a blocking connect, and Appine ignored the first and broke the second.
 - **Tradeoffs**: A restarted connect redoes routing and nat before the host says `EALREADY`, though nothing is sent twice.
 - **Watch out**: None known.
 - **Source**: 5296a0a

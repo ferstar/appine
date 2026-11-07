@@ -115,7 +115,7 @@
 
 ### D16: Process signals are retargeted to a thread that will take them
 - **What**: `retarget` wakes, per signal, the first thread that does not block it; delivery calls it for shared pending signals the thread blocks, thread exit for all of them (kernel/process D20), and group sends skip threads in a ptrace stop.
-- **Why**: Linux retargets shared pending signals when a thread blocks them or exits and never picks a stopped or traced thread, while appine left them with the chosen thread, so Ctrl-C or SIGTERM sometimes did nothing.
+- **Why**: Linux retargets shared pending signals when a thread blocks them or exits and never picks a stopped or traced thread, while Appine left them with the chosen thread, so Ctrl-C or SIGTERM sometimes did nothing.
 - **Tradeoffs**: While such a signal stays pending, every delivery on the blocking thread kicks the other thread again, and `CLD_STOPPED` still comes early.
 - **Watch out**: A thread that blocks a signal another thread is slow to take wakes that thread repeatedly until it does.
 - **Source**: 22e2b41

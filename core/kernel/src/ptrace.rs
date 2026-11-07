@@ -3,7 +3,7 @@
 //! are in `syscall::ptrace`.
 //!
 //! Tracees are threads, and the tracer is recorded as a process (tgid). Linux accepts requests
-//! only from the tracer thread itself, while any thread in the thread group may wait; appine does
+//! only from the tracer thread itself, while any thread in the thread group may wait; Appine does
 //! not record which thread forked (the tracer of PTRACE_TRACEME is the parent process), so this is
 //! relaxed to any thread in the tracer process.
 //!

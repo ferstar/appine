@@ -1766,7 +1766,7 @@ impl Vfs {
     /// Parameters and usage (pages, inodes) of tmpfs instance `dev`. Usage is counted as in
     /// Linux's tmpfs: the root directory and every name take one inode each (hard links too;
     /// Linux's `shmem_link` takes another for each link), regular files by page count (treated
-    /// as having no holes, like appine's `st_blocks`), long symlinks one page. With `fresh` it
+    /// as having no holes, like Appine's `st_blocks`), long symlinks one page. With `fresh` it
     /// recounts (statfs, remount: changes that bypass the accounting, such as direct changes to
     /// the store or writes through shared mappings, are included too); otherwise it uses the
     /// recorded usage and counts only when none is recorded.

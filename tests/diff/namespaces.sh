@@ -1088,7 +1088,7 @@ busybox unshare -n sh -c '
     ping -c 1 -W 1 10.0.0.1 2>&1 | tail -1
 '
 
-# ICMPv6 in a new network namespace: once lo is up, ::1 can be pinged (appine's ICMPv6 sockets use
+# ICMPv6 in a new network namespace: once lo is up, ::1 can be pinged (Appine's ICMPv6 sockets use
 # the host's ::1)
 busybox unshare -n sh -c 'ping6 -c 1 -W 1 ::1 2>&1 | tail -1; ip link set lo up; ping6 -c 1 ::1 | sed "s/ time=.*//; /round-trip/d"'
 

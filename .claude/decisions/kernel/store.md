@@ -66,7 +66,7 @@
 
 ### D9: The host browse API skips guest permissions but confines writes
 - **What**: The provider resolves guest paths itself, reads anywhere and writes only below a caller-supplied directory (the login account's home), refusing with `EACCES` one whose real path is the root directory.
-- **Why**: Users copy files in and out of appine through Android's Files app; the provider acts for the device owner, not a guest user.
+- **Why**: Users copy files in and out of Appine through Android's Files app; the provider acts for the device owner, not a guest user.
 - **Tradeoffs**: Guest permission bits do not restrict the provider; confinement relies on the caller-supplied directory.
 - **Watch out**: Host writes are replayed to running kernels as inotify events so guest watchers notice them.
 - **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`), 201 (`201-documents-notify`); d5dbe29

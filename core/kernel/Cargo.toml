@@ -1,6 +1,6 @@
 [package]
 name = "appine-kernel"
-description = "appine kernel layer: the Linux user-space ABI implemented in-process"
+description = "Appine kernel layer: the Linux user-space ABI implemented in-process"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

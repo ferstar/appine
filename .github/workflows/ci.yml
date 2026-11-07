@@ -77,9 +77,9 @@ jobs:
           cargo build --release -p appine-run -p appine-bench
           target/release/appine-bench --runs 3 --skip-tier0
 
-      # M7's exit criterion: the same scripts give the same output on appine (Tier 1) and on native
+      # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
       # Alpine in docker. The first run installs the packages the test cases need with apk, which
-      # depends on the internet. appine turns the guest's raw ICMP sockets into host ping sockets:
+      # depends on the internet. Appine turns the guest's raw ICMP sockets into host ping sockets:
       # Ubuntu does not let regular users create those by default (ping_group_range is "1 0"), while
       # Android and the Docker container on the native side both allow all groups. rust-cache caches
       # the whole target/ and would restore part of a store left by an earlier run, so the store is

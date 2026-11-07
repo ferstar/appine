@@ -619,7 +619,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
 /// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a
 /// directory fd (with `F_EMPTY_PATH`/`T_EMPTY_PATH` they may be the fd itself, with
 /// `F_SYMLINKS`/`T_SYMLINKS` the last symlink is followed), and the move works as `MS_MOVE`
-/// ([`move_tree`]). appine has no shared mounts, so `MOVE_MOUNT_SET_GROUP` is always EINVAL (as
+/// ([`move_tree`]). Appine has no shared mounts, so `MOVE_MOUNT_SET_GROUP` is always EINVAL (as
 /// it is on Linux when the source is not shared).
 pub(super) fn sys_move_mount(
     cx: &mut Cx<'_>,
@@ -646,7 +646,7 @@ pub(super) fn sys_move_mount(
 /// mount (with those below it under `AT_RECURSIVE`). `struct mount_attr` is at least 32 bytes,
 /// and anything beyond must be 0; changing the access time requires giving the whole
 /// `MOUNT_ATTR__ATIME` in attr_clr as well. Propagation types have no effect after being checked
-/// (appine's mounts do not propagate to each other). Idmapped mounts (`MOUNT_ATTR_IDMAP`) are
+/// (Appine's mounts do not propagate to each other). Idmapped mounts (`MOUNT_ATTR_IDMAP`) are
 /// EINVAL after the userns fd is checked, the same as for a filesystem that does not support
 /// them.
 pub(super) fn mount_setattr(

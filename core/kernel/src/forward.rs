@@ -1,7 +1,7 @@
 //! Connections from outside the host to published ports (docs/rounds/173-port-forwarding.md).
 //!
 //! When the initial namespace has PREROUTING DNAT rules (ports published by podman or docker), a
-//! connection from outside appine (another device, a browser on the phone) to that port on the
+//! connection from outside Appine (another device, a browser on the phone) to that port on the
 //! host reaches the socket the guest is listening on in the host (the one podman holds the port
 //! with and never accepts on). Such a socket is duplicated and handed to the host thread here: it
 //! accepts connections, connects to the DNAT destination (the container's loopback address on the

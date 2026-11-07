@@ -323,7 +323,7 @@ libghostty-vt with Zig (`android/native`).
 
 ### Licenses
 
-- The build writes `notices/` (appine's licence; Ghostty's libghostty-vt, uucode, simdutf,
+- The build writes `notices/` (Appine's licence; Ghostty's libghostty-vt, uucode, simdutf,
   Highway, Wuffs, Zig's compiler_rt and JetBrains Mono; Alpine packages from the rootfs database,
   the doas package, Android libraries, Rust crates, SQLite, then full texts); full text is
   monospace, selectable and sized to fit 74 columns.

@@ -81,7 +81,7 @@
 ### D11: TIOCSTI follows Linux 6.1: one's own controlling terminal or `CAP_SYS_ADMIN`
 - **What**: TIOCSTI returns `EPERM` unless the fd is a slave that is the caller's controlling terminal or the caller has `CAP_SYS_ADMIN`; a master is never a controlling terminal, and with the capability its byte goes to what the master reads, ahead of held output.
 - **Why**: Typing into another session's terminal is a privilege-escalation path (a root shell reading a terminal that an unprivileged process still holds).
-- **Tradeoffs**: Newer distribution kernels refuse TIOCSTI to everyone without `CAP_SYS_ADMIN`, while appine keeps 6.1's rule for one's own terminal.
+- **Tradeoffs**: Newer distribution kernels refuse TIOCSTI to everyone without `CAP_SYS_ADMIN`, while Appine keeps 6.1's rule for one's own terminal.
 - **Watch out**: None known.
 - **Source**: ef5f836
 

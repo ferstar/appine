@@ -9,7 +9,7 @@
 ## Active
 
 ### D1: The guest ISA is aarch64, the same as the host
-- **What**: appine runs Alpine's official aarch64 binaries and translates aarch64 to aarch64.
+- **What**: Appine runs Alpine's official aarch64 binaries and translates aarch64 to aarch64.
 - **Why**: Guest and host share ARM's weak memory model (no TSO translation), most instructions can be copied verbatim, and arm64 requires `ic ivau` plus `isb` after modifying code, which gives a free invalidation hook without write-protecting code pages.
 - **Tradeoffs**: Only aarch64 guests, and the engine's fast paths only work on aarch64 hosts.
 - **Watch out**: Relying on `ic ivau` requires CTR_EL0 to report DIC = IDC = 0.
@@ -108,7 +108,7 @@
 
 ### D15: Processes of the same program share one instance (code groups)
 - **What**: Address spaces running the same executable share one instance; blocks in consistent, trusted ranges are shared, others are private to the member that translated them.
-- **Why**: Each process had its own translation cache (four parallel `cc1` used 34–40 MB each); appine has no ASLR, so the same program maps at the same addresses.
+- **Why**: Each process had its own translation cache (four parallel `cc1` used 34–40 MB each); Appine has no ASLR, so the same program maps at the same addresses.
 - **Tradeoffs**: Shared blocks never link to private ones; members with diverging layouts leave the group.
 - **Watch out**: The engine trusts the kernel to share only ranges every member maps identically.
 - **Source**: round 108 (`108-shared-translation`); see `kernel/mm` D13

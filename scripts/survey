@@ -1,5 +1,5 @@
 #!/bin/sh
-# Workload survey (docs/rounds/62-workload-survey.md): runs common services and tools inside appine
+# Workload survey (docs/rounds/62-workload-survey.md): runs common services and tools inside Appine
 # and collects failures and the kernel layer's logs. Run on a host with docker:
 #
 #   scripts/survey [-t tier] [-s store directory] [-n image] [workload name…]

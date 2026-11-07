@@ -98,7 +98,7 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - Assets: the newest Alpine minirootfs tarball by version (as `rootfs.tgz`, since AAPT would
   unpack `.gz`), the newest `doas.apk` (both by `byVersion`, the numbers in the name), generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
   `BuildConfig` carries the Alpine branch.
-- Notices (`NoticesTask`): appine's notice, Fuchsia's BSD-style license for the line-discipline
+- Notices (`NoticesTask`): Appine's notice, Fuchsia's BSD-style license for the line-discipline
   parts adapted from Starnix (`kernel/tty`), then the terminal's components with their license
   texts from `android/licenses/` (Ghostty, uucode with the Unicode and Hoehrmann licenses, simdutf,
   Highway and Wuffs under their MIT or BSD option, Zig's compiler_rt, JetBrains Mono's OFL),

@@ -47,14 +47,14 @@ const USAGE: &str = "usage: appine-run [options] [--] <program> [args...]
   --env NAME=VALUE     add a guest environment variable (repeatable)
   --pty                run on an in-process terminal even if stdin is not a tty
   --no-pty             give the guest the host stdin/stdout/stderr directly
-  --memory-limit <n>   kill a guest process when appine's anonymous memory exceeds n
+  --memory-limit <n>   kill a guest process when Appine's anonymous memory exceeds n
                        bytes (K, M, G suffixes; \"none\" for no limit; default: half the RAM)
   --low-port-offset <n>
                        bind guest ports below 1024 to port + n on the host (then + 2n,
                        + 3n, or any free port) when the host refuses the port itself;
                        0 binds them as they are (default: 10000)
   --always-map-low-ports
-                       move guest ports below 1024 even when the host lets appine bind them
+                       move guest ports below 1024 even when the host lets Appine bind them
   --init               boot by /etc/inittab first (sysinit, wait, once entries; output in
                        /var/log/boot.log) and shut down by it when the program exits or
                        the guest asks to (reboot, halt, poweroff)

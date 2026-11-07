@@ -509,7 +509,7 @@ grep ' lo$' /proc/net/if_inet6 || echo "if_inet6: no lo"
 # Interface traffic counters: the header of /proc/net/dev and the format of the lo line, the
 # attributes of /sys/class/net/lo and the files under statistics; after sending and receiving on
 # loopback lo's counters grow by at least the payload bytes (Linux also counts protocol headers,
-# appine counts only the payload), and both places read the same. Other interfaces depend on the
+# Appine counts only the payload), and both places read the same. Other interfaces depend on the
 # container's network
 head -n 2 /proc/net/dev
 grep '^ *lo:' /proc/net/dev | awk '{ print "lo fields:", NF }'
@@ -1309,7 +1309,7 @@ PY
 # user ID; the permissions to set, read and remove the extended attribute; writing, truncating
 # and chown removing file capabilities and the setuid and setgid bits; securebits locks. Only the
 # few capabilities used are printed, and a set equal to the bounding set prints as all (docker's
-# default bounding set is smaller than appine's)
+# default bounding set is smaller than Appine's)
 cat > showcaps.c <<'C'
 #include <stdio.h>
 #include <string.h>

@@ -581,7 +581,7 @@ pub(super) fn adjtimex(cx: &mut Cx<'_>, clock: Option<i32>, buf: u64) -> SysResu
     let freq = i64::from_le_bytes(tx[16..24].try_into().unwrap());
     let result = (|| {
         // do_clock_adjtime: only CLOCK_REALTIME can be adjusted; an fd-encoded dynamic clock
-        // would need the fd of a device such as PTP, which appine does not have
+        // would need the fd of a device such as PTP, which Appine does not have
         match clock {
             None | Some(CLOCK_REALTIME) => {}
             Some(c) if c < 0 && c & 7 == CLOCKFD => return Err(Errno::EINVAL),
@@ -1200,7 +1200,7 @@ pub(super) fn sysinfo(cx: &mut Cx<'_>, buf: u64) -> SysResult {
 /// membarrier(2). Kicking the other threads that share the address space out of guest code amounts
 /// to a full memory barrier and context synchronization on them (V8 uses the `SYNC_CORE` form
 /// after rewriting code). Global commands also act only on this process: other processes share
-/// only shared mappings with it, and all of appine's guest threads are in one host process, so a
+/// only shared mappings with it, and all of Appine's guest threads are in one host process, so a
 /// host memory barrier is added here as well.
 pub(super) fn membarrier(cx: &mut Cx<'_>, cmd: i32, flags: u32) -> SysResult {
     const QUERY: i32 = 0;

@@ -2521,10 +2521,10 @@ impl Mm {
     /// Before fork, like Linux's `dup_mmap`, checks every commit-accounted VMA (writable private
     /// mappings without `MAP_NORESERVE`) against the commit estimate (`vm.overcommit_memory` is
     /// 0): if one exceeds `limit`, the total of memory and swap (in bytes, 0 if unknown), it is
-    /// ENOMEM. In appine every mmap is its own piece of host memory and VMAs cannot merge, while
+    /// ENOMEM. In Appine every mmap is its own piece of host memory and VMAs cannot merge, while
     /// Linux merges adjacent ones with the same flags, so they are counted merged. LTP's fork14
     /// maps 1 GB more each time and forks: natively, fork fails once the merged one exceeds total
-    /// memory, while appine used to always succeed, with the child's page table growing ever
+    /// memory, while Appine used to always succeed, with the child's page table growing ever
     /// larger (2 MB per GB in the soft-MMU).
     ///
     /// Unlike Linux: Linux's `VM_ACCOUNT` stays set once the mapping has been writable, while
@@ -3630,7 +3630,7 @@ pub struct CodeSpace {
 /// map the same code at the same addresses, the blocks are valid for all of them. A member's
 /// trusted executable mappings (private file mappings never written that have a version, and the
 /// vDSO) must agree with what the group has registered: one address range can only be the same
-/// piece of the same version of a file (appine has no ASLR, so processes of the same program map
+/// piece of the same version of a file (Appine has no ASLR, so processes of the same program map
 /// at the same addresses). Blocks in registered mappings are shared by all members; other
 /// executable memory (JIT output, code that was written) is private to a member: the engine keeps
 /// blocks there apart by member tag ([`appine_engine::DbtSpace::share`]), private ranges may not

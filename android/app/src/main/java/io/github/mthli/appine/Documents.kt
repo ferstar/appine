@@ -21,7 +21,7 @@ import java.io.IOException
 import kotlin.concurrent.read
 
 /**
- * appine in the system Files app (the android/documents map): the login account's home directory is
+ * Appine in the system Files app (the android/documents map): the login account's home directory is
  * one root, and once turned on in Settings there is also the whole system (`/`), read-only.
  *
  * Document IDs are the guest's absolute paths (written as described in [Native]) and are looked up

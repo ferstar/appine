@@ -142,7 +142,7 @@ fn threads_signals_and_fork() {
 fn thread_churn_keeps_the_host_heap_intact() {
     // 4 processes, each with 4 threads that keep creating and joining short-lived threads for 5
     // seconds: an exiting thread dropping an Rc weak reference outside the BKL corrupts the host
-    // heap, and appine exits with SIGABRT (tests/guest/churn.c)
+    // heap, and Appine exits with SIGABRT (tests/guest/churn.c)
     let Some(program) = build_c_guest("churn") else {
         return;
     };

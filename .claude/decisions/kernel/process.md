@@ -157,7 +157,7 @@
 
 ### D22: `RLIMIT_MSGQUEUE` starts at 819200 bytes
 - **What**: The message-queue limit defaults to (819200, 819200), as on Linux.
-- **Why**: appine reported it unlimited where Linux reports 819200.
+- **Why**: Appine reported it unlimited where Linux reports 819200.
 - **Tradeoffs**: The limit is still not enforced by mq_open.
 - **Watch out**: None known.
 - **Source**: 97b1d62
@@ -171,21 +171,21 @@
 
 ### D24: CLONE_PARENT children take their creator's exit signal
 - **What**: With `CLONE_PARENT` the child's exit signal is copied from the creating thread group, as Linux does.
-- **Why**: Linux sets `exit_signal` from the current group leader for `CLONE_PARENT`, and appine used the requested one.
+- **Why**: Linux sets `exit_signal` from the current group leader for `CLONE_PARENT`, and Appine used the requested one.
 - **Tradeoffs**: ptrace still picks the fork or clone event from the requested signal, as Linux does.
 - **Watch out**: None known.
 - **Source**: 14dede6
 
 ### D25: Timer signals for an exited thread are dropped
 - **What**: A thread-targeted POSIX timer signal goes to its task only if that task still exists in the timer's process, and otherwise nothing is sent.
-- **Why**: Linux's `posix_timer_event` finds no task and sends nothing, where appine fell back to the process.
+- **Why**: Linux's `posix_timer_event` finds no task and sends nothing, where Appine fell back to the process.
 - **Tradeoffs**: A thread of the same process that reused the number still receives it, where Linux's pinned pid would not.
 - **Watch out**: None known.
 - **Source**: d98f60b
 
 ### D26: Robust futex cleanup breaks copy-on-write
 - **What**: Marking a robust lock owner-died translates its address, breaking copy-on-write or faulting the page in when needed, before the existing compare-and-swap loop.
-- **Why**: Linux's `handle_futex_death` faults the page in writable, while appine's translate does not break copy-on-write, so locks on such pages were skipped (kernel/mm's rule for writers through translate).
+- **Why**: Linux's `handle_futex_death` faults the page in writable, while Appine's translate does not break copy-on-write, so locks on such pages were skipped (kernel/mm's rule for writers through translate).
 - **Tradeoffs**: A lent page is recalled from its borrowers during the dying thread's exit.
 - **Watch out**: None known.
 - **Source**: e4d3386
