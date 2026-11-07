@@ -282,6 +282,33 @@ fn remap(
     )
 }
 
+/// Reads pieces of private file mappings from their files again after `MADV_DONTNEED`
+/// ([`Mm::discard`](crate::mm::Mm::discard)): zeros past the end of the file, and zeros for all of
+/// a piece whose file can no longer be opened (deleted and reclaimed).
+fn reread(cx: &mut Cx<'_>, rereads: Vec<crate::mm::Reread>) -> Result<(), Errno> {
+    if rereads.is_empty() {
+        return Ok(());
+    }
+    let vfs = cx.vfs()?;
+    for r in rereads {
+        let mut buf = vec![0u8; r.len as usize];
+        if let Some(f) = (r.ino != 0)
+            .then(|| vfs.store().open_object(r.ino, false).ok())
+            .flatten()
+        {
+            let mut at = 0;
+            while at < buf.len() {
+                match appine_hal::pread(f.as_raw_fd(), &mut buf[at..], r.offset + at as u64) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => at += n,
+                }
+            }
+        }
+        cx.mm_mut().fill_private(r.addr, &buf);
+    }
+    Ok(())
+}
+
 /// remap_file_pages: deprecated, and emulated with mmap as on Linux since 4.0
 /// ([`Mm::remap_file_pages`]). `prot` must be 0, and of `flags` only `MAP_NONBLOCK` is looked
 /// at.
@@ -351,8 +378,12 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     match advice {
         MADV_DONTNEED if locked => Err(Errno::EINVAL),
         // The other advice only affects performance and can be ignored; after DONTNEED anonymous
-        // memory must read back as 0
-        MADV_DONTNEED => cx.mm_mut().discard(addr, len).map(|()| 0),
+        // memory must read back as 0, and private file mappings as the file
+        MADV_DONTNEED => {
+            let rereads = cx.mm_mut().discard(addr, len)?;
+            reread(cx, rereads)?;
+            Ok(0)
+        }
         MADV_FREE | MADV_WIPEONFORK if !private_anon => Err(Errno::EINVAL),
         MADV_WIPEONFORK | MADV_KEEPONFORK => cx
             .mm_mut()

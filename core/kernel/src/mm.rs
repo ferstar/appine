@@ -144,6 +144,18 @@ pub enum Backing {
     Shared,
 }
 
+/// A piece of a private file mapping whose written pages `MADV_DONTNEED` dropped but whose host
+/// memory could not simply be given back to the host file ([`Mm::discard`]): the caller reads it
+/// from the file again (zeros past the end of the file) and stores it with [`Mm::fill_private`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reread {
+    pub addr: u64,
+    pub len: u64,
+    /// The mapped file's inode in the store (0 if unknown) and the file offset at `addr`.
+    pub ino: u64,
+    pub offset: u64,
+}
+
 /// A piece of a file to map again at the old address after mremap(`MREMAP_DONTUNMAP`): it was a
 /// private file mapping, and on Linux its pages are read from the file again afterwards.
 pub struct Refill {
@@ -2091,8 +2103,12 @@ impl Mm {
     }
 
     /// madvise(MADV_DONTNEED): anonymous memory goes back to the host (reading zero afterwards);
-    /// other mappings stay unchanged. The range must be fully mapped.
-    pub fn discard(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+    /// the written pages of private file mappings go back to the file's contents (Linux drops
+    /// their copies and reads the file again): whole host pages of a host file mapping through the
+    /// host, the rest returned as [`Reread`]s for the caller to read from the file; shared
+    /// mappings stay unchanged. The range must be fully mapped.
+    pub fn discard(&mut self, addr: u64, len: u64) -> Result<Vec<Reread>, Errno> {
+        let mut rereads = Vec::new();
         let len = page_up(len).ok_or(Errno::EINVAL)?;
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
         let mut cursor = addr;
@@ -2119,9 +2135,61 @@ impl Mm {
                     discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
                 };
             }
+            // Only written pages differ from the file (a `cow` mapping never is), and whole pages
+            // past the end of the file have no entries
+            let in_file = stop.min(s + page_up(v.file_len).unwrap_or(v.len));
+            if v.backing == Backing::PrivateFile && v.written.get() && !v.cow && cursor < in_file {
+                if v.prot & prot::EXEC != 0 {
+                    self.code_ranges.push((cursor, in_file - cursor));
+                }
+                let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
+                let reread = |a: u64, l: u64| Reread {
+                    addr: a,
+                    len: l,
+                    ino: v.ino,
+                    offset: base + (a - cursor),
+                };
+                if v.region.anonymous.is_none() {
+                    // A host private file mapping: the host drops its copies of whole host pages
+                    // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
+                    let left = unsafe {
+                        discard_file_host(
+                            v.host.add((cursor - s) as usize),
+                            (in_file - cursor) as usize,
+                        )
+                    };
+                    for (off, l) in left {
+                        rereads.push(reread(cursor + off as u64, l as u64));
+                    }
+                } else {
+                    // Anonymous memory holding a copy of the file (copied before it became
+                    // writable)
+                    rereads.push(reread(cursor, in_file - cursor));
+                }
+            }
             cursor = stop;
         }
-        Ok(())
+        Ok(rereads)
+    }
+
+    /// Stores `data` at `addr` in a private file mapping, from the file again after
+    /// [`discard`](Self::discard) (its pages are never lent, so they are written in place).
+    pub fn fill_private(&mut self, addr: u64, data: &[u8]) {
+        let Some((&s, v)) = self.vmas.range(..=addr).next_back() else {
+            return;
+        };
+        let end = addr.saturating_add(data.len() as u64);
+        if v.backing != Backing::PrivateFile || v.cow || end > s + v.len {
+            return;
+        }
+        // SAFETY: [addr, end) is inside this VMA's own writable host memory
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                v.host.as_ptr().add((addr - s) as usize),
+                data.len(),
+            );
+        }
     }
 
     /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
@@ -4894,18 +4962,36 @@ fn extent(size: i64, offset: u64, len: u64) -> u64 {
 ///
 /// `[ptr, ptr + len)` is private anonymous host memory held by an [`Mm`].
 unsafe fn discard_host(ptr: NonNull<u8>, len: usize) {
+    // SAFETY: the caller's guarantee; what the host keeps is zeroed
+    unsafe {
+        for (off, l) in discard_file_host(ptr, len) {
+            std::ptr::write_bytes(ptr.as_ptr().add(off), 0, l);
+        }
+    }
+}
+
+/// Gives the whole host pages of `[ptr, ptr + len)` back to the host (`MADV_DONTNEED`: zeros for
+/// anonymous memory, the file's contents for a private file mapping) and returns the pieces it
+/// could not, as (offset, length): the partial host pages at both ends when host pages are larger
+/// than 4K, or everything when the host refuses.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` is private host memory (anonymous or a private file mapping) held by an
+/// [`Mm`].
+unsafe fn discard_file_host(ptr: NonNull<u8>, len: usize) -> Vec<(usize, usize)> {
     let page = appine_hal::page_size();
     let addr = ptr.as_ptr() as usize;
     let head = (addr.next_multiple_of(page) - addr).min(len);
     let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
     // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
-    unsafe {
-        if head < tail && appine_hal::discard(ptr.add(head), tail - head).is_ok() {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, head);
-            std::ptr::write_bytes(ptr.as_ptr().add(tail), 0, len - tail);
-        } else {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, len);
-        }
+    if head < tail && unsafe { appine_hal::discard(ptr.add(head), tail - head) }.is_ok() {
+        [(0, head), (tail, len - tail)]
+            .into_iter()
+            .filter(|&(_, l)| l > 0)
+            .collect()
+    } else {
+        vec![(0, len)]
     }
 }
 

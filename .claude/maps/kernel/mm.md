@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: madvise at fork and mremap; the OOM killer; mremap of length 0; Linux VMA boundaries, `PROT_GROWSDOWN`, guard gaps, stack growth, `mmap_min_addr`, smaps Rss; bugs from Starnix's syscall tests; mlock lengths; `overcommit_memory`; membarrier at fork; the RSS split; robust futexes on CoW pages)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private file mappings last)
 
 ## Responsibilities
 
@@ -286,6 +286,13 @@ signals may still be delivered).
   needs the range fully mapped, splits the VMAs at its ends and sets the flag. Whether the range is
   locked (`MADV_DONTNEED` is `EINVAL`) or all private anonymous (`MADV_FREE` and `MADV_WIPEONFORK`
   otherwise `EINVAL`) is judged over the VMAs overlapping it only.
+- `MADV_DONTNEED` (`discard`): private anonymous memory goes back to the host and reads zero
+  (CoW pages settled first); the written pages of a private file mapping before EOF go back to the
+  file's contents: whole host pages of a host private file mapping through host `MADV_DONTNEED`,
+  and the rest (partial host pages on 16 KB hosts, or a mapping copied into anonymous memory when it
+  became writable) as `Reread`s that the syscall reads from the store object (zeros past EOF, or
+  for an object that cannot be opened) and stores with `fill_private`. Executable ranges are queued
+  for code invalidation; shared mappings and unwritten or `cow` ones are left alone.
 
 ### Stack and heap growth
 
@@ -570,9 +577,8 @@ signals may still be delivered).
 
 - **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
   but do nothing.
-- **`MADV_DONTNEED` on private file mappings is a no-op:** written private pages keep their data
-  instead of reverting to the file. `MADV_REMOVE` zero-fills through the host mapping rather than
-  punching a hole, so storage is not freed.
+- **`MADV_REMOVE` frees no storage:** it zero-fills through the host mapping rather than punching
+  a hole.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
 - **Truncation race can kill the process or the app:** the host file is shortened before page-table
