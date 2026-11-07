@@ -1,6 +1,6 @@
 # The sequel to compat3.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): MADV_DONTNEED on private file mappings; signal frames that cannot be written
-# and bad rt_sigreturn frames
+# and bad rt_sigreturn frames; truncating a file while its tail is read through a mapping
 set -e
 cd /tmp
 # MADV_DONTNEED on a private file mapping drops the written copies: the pages read the file again
@@ -169,3 +169,61 @@ int main(void) {
 }
 C
 gcc -O1 -o badframe badframe.c && ./badframe
+# Cutting a file while another thread reads its mapped tail: the reader gets SIGBUS, never a dead
+# process (the pages past the new end are unmapped before the file shrinks)
+cat > truncrace.c <<'C'
+#include <fcntl.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static __thread sigjmp_buf back;
+static volatile unsigned char *tail;
+static volatile int started;
+
+static void on_bus(int sig) {
+    (void)sig;
+    siglongjmp(back, 1);
+}
+
+static void *reader(void *arg) {
+    (void)arg;
+    unsigned sum = 0;
+    if (sigsetjmp(back, 1) == 0) {
+        started = 1;
+        for (;;) sum += tail[0];
+    }
+    return (void *)1;
+}
+
+int main(void) {
+    struct sigaction sa = {0};
+    sa.sa_handler = on_bus;
+    sigaction(SIGBUS, &sa, NULL);
+    int bus = 0;
+    for (int round = 0; round < 200; round++) {
+        int fd = open("truncfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        ftruncate(fd, 2 * 4096);
+        unsigned char *p = mmap(NULL, 2 * 4096, PROT_READ, round % 2 ? MAP_PRIVATE : MAP_SHARED, fd, 0);
+        tail = p + 4096;
+        started = 0;
+        pthread_t t;
+        pthread_create(&t, NULL, reader, NULL);
+        while (!started) {
+        }
+        ftruncate(fd, 4096);
+        void *r;
+        pthread_join(t, &r);
+        bus += r == (void *)1;
+        munmap(p, 2 * 4096);
+        close(fd);
+    }
+    printf("readers ended by SIGBUS: %d of 200\n", bus);
+    return 0;
+}
+C
+gcc -O1 -pthread -o truncrace truncrace.c && ./truncrace

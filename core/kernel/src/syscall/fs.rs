@@ -1057,9 +1057,9 @@ fn open_store(
             if flags & oflags::O_TRUNC != 0 && accmode != oflags::O_RDONLY {
                 remove_privs(cx, ino)?;
                 let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), &file)?;
+                truncating(cx, &file, 0);
                 file.set_len(0).map_err(host_errno)?;
                 tmpfs_resized(vfs, tmpfs, 0);
-                truncated(cx, &file);
             }
             FileKind::Regular { ino, file }
         }
@@ -5501,9 +5501,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             remove_privs(cx, ino)?;
             let host = vfs.store().open_object(ino, true)?;
             let tmpfs = tmpfs_size(&vfs, &node, &host)?;
+            truncating(cx, &host, len);
             host.set_len(len).map_err(host_errno)?;
             tmpfs_resized(&vfs, tmpfs, len);
-            truncated(cx, &host);
             if inotify::active(cx.kr()) {
                 let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
                 let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
@@ -5531,9 +5531,9 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             remove_privs(cx, *ino)?;
             let vfs = cx.vfs()?;
             let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)?;
+            truncating(cx, file, len);
             file.set_len(len).map_err(host_errno)?;
             tmpfs_resized(&vfs, tmpfs, len);
-            truncated(cx, file);
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
             Ok(0)
         }
@@ -6033,14 +6033,21 @@ fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
     cx.vfs()?.store().remove_privs(ino, keep_setid)
 }
 
-/// Called after a file gets shorter: in every address space, pages mapping it beyond the new end
-/// are removed from the page tables ([`crate::mm::Mm::file_truncated`]). The current process's
-/// address space syncs at the end of the syscall; other processes' sync here.
-fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
+/// Called before a file is cut to `len` bytes: in every address space, pages mapping it beyond
+/// the new end are removed from the page tables ([`crate::mm::Mm::file_truncated`]) and every
+/// address space that had some syncs at once, the current one too, so no thread can still reach
+/// that tail through a stale translation when the host file shrinks (the host would raise SIGBUS
+/// in the engine, ending the process as a kernel bug). Afterwards an access there faults into the
+/// kernel, waits for the BKL and gets the guest's SIGBUS. Nothing happens when `len` is not
+/// shorter.
+fn truncating(cx: &Cx<'_>, host: &std::fs::File, len: u64) {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = host.metadata() else {
         return;
     };
+    if len >= meta.len() {
+        return;
+    }
     let sync = cx.task.sync.clone();
     let mut seen = Vec::new();
     for t in cx.kr().tasks.values() {
@@ -6053,7 +6060,7 @@ fn truncated(cx: &Cx<'_>, host: &std::fs::File) {
             crate::debug::log(format_args!("truncate: an address space is busy"));
             continue;
         };
-        if m.file_truncated(meta.dev(), meta.ino(), meta.len()) && !Rc::ptr_eq(&mm, &cx.t.mm) {
+        if m.file_truncated(meta.dev(), meta.ino(), len) {
             m.sync(&sync);
         }
     }

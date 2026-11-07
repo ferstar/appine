@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private file mappings last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries and stack growth; smaps and RSS; fork details; Starnix findings; `MADV_DONTNEED` on private file mappings; truncation order last)
 
 ## Responsibilities
 
@@ -420,10 +420,12 @@ signals may still be delivered).
 
 - Whole pages past EOF have no entries. A shared mapping whose file grew picks up the new content on
   the next fault; private mappings do not.
-- truncate, ftruncate and `O_TRUNC` first shorten the host file, then call `file_truncated` on
-  every address space: entries past the new end are removed, executable ranges are queued for
-  invalidation, `dirty` is set; other address spaces are synced immediately and the current one at
-  syscall exit.
+- truncate, ftruncate and `O_TRUNC` that shorten a file first call `file_truncated` on every
+  address space (entries past the new end are removed, executable ranges are queued for
+  invalidation, `dirty` is set) and sync each one that changed, the current one included, and only
+  then shorten the host file: no thread can reach the dropped tail through a stale translation, so
+  an access there faults into the kernel and gets the guest's `SIGBUS` once the BKL is free. A
+  host truncation that then fails leaves the mappings' EOF at the requested length.
 
 ### Introspection
 
@@ -581,10 +583,6 @@ signals may still be delivered).
   a hole.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
-- **Truncation race can kill the process or the app:** the host file is shortened before page-table
-  entries are removed and other threads are quiesced, so a concurrent guest access to the dropped
-  tail takes a host `SIGBUS` — the guest process is killed as an internal error (or the app aborts
-  when the fault guard is off) instead of receiving a catchable `SIGBUS`.
 - **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before
   validating the destination and keeps the splits on `EINVAL`; a move that hits the limit after its
   entries were moved drops VMAs and leaves stale entries at the destination.
