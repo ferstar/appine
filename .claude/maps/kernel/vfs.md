@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; module references; loop devices; readv/writev; timerfd clocks; faulting buffers; owners, linkat, sendfile; test-suite findings; the mount limit and large mount tables last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; owners, linkat, sendfile; test-suite findings; mount limit; splice last)
 
 ## Responsibilities
 
@@ -318,7 +318,18 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `copy_file_range` rejects nonzero flags (`EINVAL`) and `O_APPEND` output (`EBADF`); `sendfile`
   rejects `O_APPEND` output other than a pipe (`EINVAL`, as `do_splice_direct`). `splice`, `tee` and
   `vmsplice` copy through buffers (one side of `splice` must be a pipe; data leaves the pipe only
-  after the write succeeds).
+  after the write succeeds); a zero length returns 0 before anything else and unknown flags are
+  `EINVAL`. When they wait follows 6.1: between two pipes and for tee, for data (going on at end of
+  file) and then for room, unless `SPLICE_F_NONBLOCK` or either end's `O_NONBLOCK`, then moving or
+  copying what is there and fits (splice waits again if a race took it, tee returns 0); from a
+  pipe, for data unless `SPLICE_F_NONBLOCK` or the input's `O_NONBLOCK`, writing as the output's
+  own `O_NONBLOCK` says; into a pipe, for room unless `SPLICE_F_NONBLOCK` or the output's
+  `O_NONBLOCK` (`EPIPE` with `SIGPIPE` without readers), reading at most the room as the input's
+  own `O_NONBLOCK` says, except that an AF_UNIX stream socket also stops waiting for the splice
+  flag or the pipe's `O_NONBLOCK` (TCP does not). vmsplice writes when the fd is open for writing
+  (a FIFO opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever
+  the pipe's `O_NONBLOCK`. Room for these is the free space in whole pages, as Linux counts free
+  page buffers.
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
 - readv and writev follow Linux's `read_iter`/`write_iter` split: pipes, terminals and sockets
   (and eventfd reads) do one read or write over all the iovecs (one read of up to 64 KiB scattered
@@ -571,6 +582,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- splice and vmsplice put what they read into the output pipe whole even when a writer took the
+  room while the BKL was released for the read (Linux holds the pipe's lock throughout), so a pipe
+  can briefly hold more than its capacity.
 - The mount table is a list, and a namespace may hold 100000 mounts: anything that visits many
   mounts indexes them once (by parent in `plan_copies` and `tree_of`, by id in `mounts_from`),
   since a scan of the table per mount holds the BKL for tens of seconds at that size.
@@ -677,22 +691,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   creates a notification pipe or, without watch queues, fails with `ENOPKG`); vmsplice copies the
   data at the call where Linux queues references to the user pages, so changes the writer makes
   to the buffer before the reader reads are not seen.
-- **splice, tee and vmsplice block by the wrong flags:** `SPLICE_F_NONBLOCK` and a pipe end's
-  `O_NONBLOCK` only stop the wait for data in an input pipe; writing into an output pipe follows
-  that pipe end's own `O_NONBLOCK`, reading a socket follows the socket's, and tee ignores
-  `O_NONBLOCK` on both pipes, so a nonblocking splice or tee into a full pipe, or from an empty
-  socket, sleeps (possibly forever) where Linux returns `EAGAIN`; vmsplice honours the pipe's
-  `O_NONBLOCK` and, when reading, ignores `SPLICE_F_NONBLOCK`, the reverse of Linux. tee also
-  takes the source data before waiting for room and returns 0 at source EOF without looking at the
-  destination, so after sleeping on a full pipe it writes data a reader has since consumed, and a
-  full or reader-less destination gives 0 instead of `EAGAIN`/`EPIPE`.
-- **splice-family argument checks differ:** splice looks up its fds before returning 0 for a zero
-  length (Linux returns 0 first, even for bad fds and flags) and an offset on a socket or other
-  unseekable non-pipe is `ESPIPE` instead of `EINVAL`; vmsplice is `EBADF` on a non-pipe before an
-  empty request returns 0 or a bad iovec is `EFAULT`, a zero-length vmsplice into a pipe without
-  readers raises `SIGPIPE` and fails with `EPIPE` instead of returning 0, and on a FIFO opened
-  read-write vmsplice reads where Linux writes; unknown splice, tee and vmsplice flags are accepted
-  (Linux: `EINVAL`).
+- **splice's argument checks differ:** the fds' access modes (`EBADF`) are checked before a pipe
+  given an offset (`ESPIPE`), where 6.1's `__do_splice` returns `ESPIPE` first, and an offset on a
+  socket or other unseekable non-pipe is `ESPIPE` instead of `EINVAL`.
 - **splice into a file stops quietly at `RLIMIT_FSIZE`:** a splice from a pipe into a regular file
   that the limit cuts short returns the short count without `SIGXFSZ`, where Linux's splice loop
   tries the next write at the limit and raises `SIGXFSZ` (fatal by default) while still returning

@@ -1402,3 +1402,159 @@ int main(void)
 C
 gcc -O1 -pthread -o robustcow robustcow.c && ./robustcow
 rm -f robustcow robustcow.c
+# When splice, tee and vmsplice wait (Linux 6.1's do_splice, do_tee, vmsplice_to_pipe and
+# vmsplice_to_user): into a pipe, for a free page unless SPLICE_F_NONBLOCK or the output pipe's
+# O_NONBLOCK; an AF_UNIX stream socket read into a pipe also stops at either; between two pipes and
+# for tee, either end's O_NONBLOCK counts too; tee from a source at end of file gives 0, EAGAIN
+# into a full nonblocking pipe and EPIPE without readers; vmsplice looks only at
+# SPLICE_F_NONBLOCK, both ways. Blocking calls are bounded by an alarm (EINTR)
+cat > splicewait.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+static void on_alarm(int s) { (void)s; }
+
+static void show(const char *what, long r) {
+    if (r < 0)
+        printf("%s: %s\n", what, strerror(errno));
+    else
+        printf("%s: %ld\n", what, r);
+    fflush(stdout);
+}
+
+/* Every call that could wait is bounded by its own alarm, so a broken wait ends in EINTR */
+#define TRY(what, call)                                                                            \
+    do {                                                                                           \
+        alarm(2);                                                                                  \
+        long r_ = (call);                                                                          \
+        int e_ = errno;                                                                            \
+        alarm(0);                                                                                  \
+        errno = e_;                                                                                \
+        show(what, r_);                                                                            \
+    } while (0)
+
+/* A pipe of one page, filled to `fill` bytes */
+static void small_pipe(int p[2], int flags, int fill) {
+    char buf[4096];
+    pipe2(p, flags);
+    fcntl(p[1], F_SETPIPE_SZ, 4096);
+    memset(buf, 'x', sizeof buf);
+    if (fill)
+        write(p[1], buf, fill);
+}
+
+static int late_fd;
+static void *write_late(void *arg) {
+    usleep(100000);
+    write(late_fd, "late", 4);
+    return arg;
+}
+static void *read_late(void *arg) {
+    char buf[4096];
+    usleep(100000);
+    read(late_fd, buf, sizeof buf);
+    return arg;
+}
+
+int main(void) {
+    struct sigaction sa = {.sa_handler = on_alarm};
+    sigaction(SIGALRM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+    int p[2], q[2], s[2], f;
+    char buf[64];
+    pthread_t t;
+
+    /* An empty blocking AF_UNIX stream socket into a pipe */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    pipe(p);
+    TRY("unix socket, SPLICE_F_NONBLOCK", splice(s[0], NULL, p[1], NULL, 8, SPLICE_F_NONBLOCK));
+    close(p[0]), close(p[1]);
+    pipe2(p, O_NONBLOCK);
+    TRY("unix socket, O_NONBLOCK pipe", splice(s[0], NULL, p[1], NULL, 8, 0));
+    show("socket still blocking", !!(fcntl(s[0], F_GETFL) & O_NONBLOCK));
+    close(p[0]), close(p[1]);
+
+    /* A file into a pipe with less than a page free */
+    f = open("splicewait.c", O_RDONLY);
+    small_pipe(p, 0, 4000);
+    TRY("file into a full pipe, SPLICE_F_NONBLOCK", splice(f, NULL, p[1], NULL, 8, SPLICE_F_NONBLOCK));
+    TRY("file into a full pipe, blocking", splice(f, NULL, p[1], NULL, 8, 0));
+    late_fd = p[0];
+    pthread_create(&t, NULL, read_late, NULL);
+    TRY("file into a pipe being read", splice(f, NULL, p[1], NULL, 8, 0));
+    pthread_join(t, NULL);
+    show("file position", lseek(f, 0, SEEK_CUR));
+    close(p[0]), close(p[1]);
+
+    /* Between two pipes: the source has data, the destination is full */
+    pipe(q);
+    write(q[1], "abc", 3);
+    small_pipe(p, 0, 4096);
+    TRY("pipe to a full pipe, SPLICE_F_NONBLOCK", splice(q[0], NULL, p[1], NULL, 8, SPLICE_F_NONBLOCK));
+    fcntl(p[1], F_SETFL, O_NONBLOCK);
+    TRY("pipe to a full O_NONBLOCK pipe", splice(q[0], NULL, p[1], NULL, 8, 0));
+    show("source kept", read(q[0], buf, sizeof buf));
+    fcntl(q[0], F_SETFL, O_NONBLOCK);
+    fcntl(p[1], F_SETFL, 0);
+    read(p[0], buf, sizeof buf);
+    TRY("empty O_NONBLOCK source", splice(q[0], NULL, p[1], NULL, 8, 0));
+    TRY("the same pipe", splice(q[0], NULL, q[1], NULL, 8, 0));
+    close(p[0]), close(p[1]), close(q[0]), close(q[1]);
+
+    /* tee: an empty source, a source at end of file, a full and a reader-less destination */
+    pipe(q);
+    pipe2(p, O_NONBLOCK);
+    TRY("tee from an empty pipe into an O_NONBLOCK one", tee(q[0], p[1], 16, 0));
+    close(q[1]);
+    TRY("tee from end of file", tee(q[0], p[1], 16, 0));
+    close(p[0]), close(p[1]);
+    small_pipe(p, O_NONBLOCK, 4096);
+    TRY("tee from end of file into a full pipe", tee(q[0], p[1], 16, 0));
+    close(p[0]);
+    TRY("tee into a pipe without readers", tee(q[0], p[1], 16, 0));
+    close(p[1]), close(q[0]);
+    /* A blocked tee whose source reaches end of file while it waits copies nothing */
+    pipe(q);
+    write(q[1], "U000", 4);
+    close(q[1]);
+    small_pipe(p, 0, 4096);
+    late_fd = p[0];
+    pthread_create(&t, NULL, read_late, NULL);
+    char drained[4];
+    read(q[0], drained, 4);
+    TRY("blocked tee after the source drained", tee(q[0], p[1], 4, 0));
+    pthread_join(t, NULL);
+    close(p[0]), close(p[1]), close(q[0]);
+
+    /* vmsplice ignores the pipe's O_NONBLOCK both ways */
+    struct iovec v = {buf, 4};
+    pipe2(p, O_NONBLOCK);
+    TRY("vmsplice from an empty pipe, SPLICE_F_NONBLOCK", vmsplice(p[0], &v, 1, SPLICE_F_NONBLOCK));
+    late_fd = p[1];
+    pthread_create(&t, NULL, write_late, NULL);
+    TRY("vmsplice from an empty O_NONBLOCK pipe", vmsplice(p[0], &v, 1, 0));
+    pthread_join(t, NULL);
+    close(p[0]), close(p[1]);
+    small_pipe(p, O_NONBLOCK, 4096);
+    TRY("vmsplice into a full pipe, SPLICE_F_NONBLOCK", vmsplice(p[1], &v, 1, SPLICE_F_NONBLOCK));
+    late_fd = p[0];
+    pthread_create(&t, NULL, read_late, NULL);
+    TRY("vmsplice into a full O_NONBLOCK pipe", vmsplice(p[1], &v, 1, 0));
+    pthread_join(t, NULL);
+    close(p[0]);
+    struct iovec none = {buf, 0};
+    TRY("empty vmsplice without readers", vmsplice(p[1], &none, 1, 0));
+    close(p[1]);
+    return 0;
+}
+C
+gcc -O1 -pthread -o splicewait splicewait.c && ./splicewait
+rm -f splicewait splicewait.c

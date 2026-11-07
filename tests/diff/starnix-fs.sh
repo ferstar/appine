@@ -39,16 +39,12 @@ SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_SYNCHRON
 SKIP="$SKIP:ProcMountsTest.FilesystemMountOptions"
 # kernel/vfs: O_NOTIFICATION_PIPE is EINVAL; pipe I/O with faulting buffers ignores Linux's
 # per-buffer rules; splice-family argument checks differ; splice into a file stops quietly at
-# RLIMIT_FSIZE; splice, tee and vmsplice block by the wrong flags (three tests hang); vmsplice
-# copies the data at the call
+# RLIMIT_FSIZE; vmsplice copies the data at the call
 SKIP="$SKIP:PipeTest.NotificationPipeUnsupported:PipeTest.PartialEfaultRollbackAndShortCounts"
-SKIP="$SKIP:PipeTest.ZeroLengthIoAndSplicePrecedence:PipeTest.SpliceValidationAndRlimitFsize"
-SKIP="$SKIP:PipeTest.SpliceNonblockSocketEndpoint:PipeTest.TeeAndSplicePipeToPipeEdgeCases"
-SKIP="$SKIP:PipeTest.TeeBlockedOnFullDestWakesOnSourceEof:PipeTest.VmspliceRdwrFifoPrioritizesWrite"
+SKIP="$SKIP:PipeTest.SpliceValidationAndRlimitFsize"
 SKIP="$SKIP:VmspliceTest.FileInPipe:VmspliceTest.ForkWithBufferInPipe:VmspliceTest.ModifyBufferInPipe"
 SKIP="$SKIP:VmspliceTest.RemapSharedBufferInPipeThenModify:VmspliceTest.UnmapBufferInPipe"
 SKIP="$SKIP:VmspliceTest.UnmapBufferInPipeThenMapInPlace"
-SKIP="$SKIP:VmspliceTest.VmspliceIgnoresPipeNonblockWithoutFlag:VmspliceTest.ZeroLengthVmsplice"
 SKIP="$SKIP:VmspliceTest/VmspliceUnmapBufferAfterVmsplicingRemappedBufferTest.*"
 # kernel/poll: pipe POLLOUT counts bytes, not buffers
 SKIP="$SKIP:PipeTest.PolloutFragmentation"
