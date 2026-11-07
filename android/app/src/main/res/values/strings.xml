@@ -117,4 +117,9 @@
     </plurals>
     <string name="paste_unsafe_title">Paste text that may run commands?</string>
     <string name="paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n%1$s</string>
+    <string name="open_link">Open link</string>
+    <string name="link_no_app">No app can open this link</string>
+    <string name="link_remote_file">This file is on %1$s, not in Appine</string>
+    <string name="link_hidden_file">Outside your home: turn on “Show the whole system in Files” in Settings</string>
+    <string name="link_missing_file">Cannot find this file</string>
 </resources>

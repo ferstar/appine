@@ -820,6 +820,146 @@ const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
   return keep_text(vt, text, text_len, len);
 }
 
+// ---- Links ----
+//
+// A tap opens the link under it: the cell's OSC 8 hyperlink, else an http or https URL written as
+// text, found in the cell's line with its soft wraps joined (libghostty-vt leaves matching URLs in
+// text to the embedder; Ghostty's own renderer does it by regex). The scheme an OSC 8 link may
+// have is VtView's to check.
+
+// Rows of a soft-wrapped line read above and below the tapped one, bounding a tap's work
+#define LINK_ROWS 64
+
+static bool screen_ref(AppineVt *vt, uint16_t x, uint32_t y, GhosttyGridRef *out) {
+  GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x = x, .y = y}};
+  *out = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  return ghostty_terminal_grid_ref(vt->term, p, out) == GHOSTTY_SUCCESS;
+}
+
+// Whether screen row y is soft-wrapped onto the next one
+static bool row_wraps(AppineVt *vt, uint32_t y) {
+  GhosttyGridRef ref;
+  GhosttyRow row;
+  bool wrap = false;
+  return screen_ref(vt, 0, y, &ref) && ghostty_grid_ref_row(&ref, &row) == GHOSTTY_SUCCESS &&
+         ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, &wrap) == GHOSTTY_SUCCESS && wrap;
+}
+
+// The characters a URL in text is made of: ASCII letters, digits and the punctuation RFC 3986
+// allows, less the quote that usually encloses one (as in Ghostty's URL regex). Text in other
+// scripts ends a URL, so one followed by Chinese without a space stops before it.
+static bool url_char(uint32_t c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+         (c != 0 && c < 0x80 && strchr("-._~:/?#[]@!$&*+,;=%()", (int)c) != NULL);
+}
+
+// The length of "http://" or "https://" (any case) at cps[i], else 0
+static size_t url_scheme(const uint32_t *cps, size_t count, size_t i) {
+  static const char *const schemes[] = {"https://", "http://"};
+  for (size_t k = 0; k < sizeof(schemes) / sizeof(schemes[0]); k++) {
+    size_t n = strlen(schemes[k]);
+    size_t j = 0;
+    for (; j < n && i + j < count; j++) {
+      uint32_t c = cps[i + j];
+      if ((c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c) != (uint32_t)schemes[k][j]) break;
+    }
+    if (j == n) return n;
+  }
+  return 0;
+}
+
+// Finds the URL around cps[at] in a line of count characters: from the run's first scheme at or
+// before at, over URL characters while brackets balance (an unmatched closing one ends it), less
+// the punctuation that ends a sentence. Sets [*start, *end) and returns true when at is inside it.
+static bool find_url(const uint32_t *cps, size_t count, size_t at, size_t *start, size_t *end) {
+  if (at >= count || !url_char(cps[at])) return false;
+  size_t s = at;
+  while (s > 0 && url_char(cps[s - 1])) s--;
+  size_t rest = 0;
+  for (; s <= at; s++) {
+    if ((rest = url_scheme(cps, count, s)) != 0) break;
+  }
+  if (rest == 0) return false;
+  size_t e = s + rest;
+  int depth = 0;
+  for (; e < count && url_char(cps[e]); e++) {
+    if (cps[e] == '(' || cps[e] == '[') {
+      depth++;
+    } else if (cps[e] == ')' || cps[e] == ']') {
+      if (depth == 0) break;
+      depth--;
+    }
+  }
+  while (e > s + rest && strchr(".,;:!?", (int)cps[e - 1]) != NULL) e--;
+  if (e == s + rest || at >= e) return false;
+  *start = s;
+  *end = e;
+  return true;
+}
+
+// The link at viewport cell (x, y): its OSC 8 URI, else an http or https URL in the text there;
+// NULL with len 0 when there is none. Valid until the next text call.
+const uint8_t *appine_vt_link(AppineVt *vt, uint16_t x, uint16_t y, size_t *len) {
+  *len = 0;
+  vt->text.len = 0;
+  GhosttyGridRef ref;
+  GhosttyPointCoordinate at;
+  if (!viewport_ref(vt, x, y, &ref) || !screen_point(vt, &ref, &at)) return NULL;
+  size_t n = 0;
+  if (ghostty_grid_ref_hyperlink_uri(&ref, NULL, 0, &n) == GHOSTTY_OUT_OF_SPACE && n > 0 &&
+      buf_reserve(&vt->text, n) &&
+      ghostty_grid_ref_hyperlink_uri(&ref, vt->text.ptr, n, &n) == GHOSTTY_SUCCESS && n > 0) {
+    vt->text.len = n;
+    *len = n;
+    return vt->text.ptr;
+  }
+
+  // The tapped row's line: up while the row above wraps onto it, down while it wraps onward
+  uint32_t top = at.y;
+  uint32_t bottom = at.y;
+  while (top > 0 && at.y - top < LINK_ROWS && row_wraps(vt, top - 1)) top--;
+  while (bottom - at.y < LINK_ROWS && row_wraps(vt, bottom)) bottom++;
+  uint32_t *cps = malloc((size_t)(bottom - top + 1) * vt->cols * sizeof(*cps));
+  if (cps == NULL) return NULL;
+  // One character per cell, wide characters once (the tapped cell may be their second half);
+  // the blank a wide character left at the end of a wrapped row is not part of the line
+  size_t count = 0;
+  size_t tapped = SIZE_MAX;
+  for (uint32_t row = top; row <= bottom; row++) {
+    for (uint16_t col = 0; col < vt->cols; col++) {
+      GhosttyGridRef c;
+      GhosttyCell cell;
+      if (!screen_ref(vt, col, row, &c) || ghostty_grid_ref_cell(&c, &cell) != GHOSTTY_SUCCESS) {
+        row = bottom;
+        break;
+      }
+      bool here = row == at.y && col == at.x;
+      GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+      ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &wide);
+      if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD) {
+        if (here && wide == GHOSTTY_CELL_WIDE_SPACER_TAIL && count > 0) tapped = count - 1;
+        continue;
+      }
+      uint32_t cp = 0;
+      ghostty_cell_get(cell, GHOSTTY_CELL_DATA_CODEPOINT, &cp);
+      if (here) tapped = count;
+      cps[count++] = cp;
+    }
+  }
+  size_t start = 0;
+  size_t end = 0;
+  bool found = tapped != SIZE_MAX && find_url(cps, count, tapped, &start, &end) &&
+               buf_reserve(&vt->text, end - start);
+  if (found) {
+    // URL characters are all ASCII
+    for (size_t i = start; i < end; i++) vt->text.ptr[i - start] = (uint8_t)cps[i];
+    vt->text.len = end - start;
+    *len = vt->text.len;
+  }
+  free(cps);
+  return found ? vt->text.ptr : NULL;
+}
+
 // ---- Title, messages, transcript ----
 
 // Whether a program set the title since the last call

@@ -3,6 +3,7 @@ package io.github.mthli.appine
 import android.content.Context
 import android.database.Cursor
 import android.database.MatrixCursor
+import android.net.Uri
 import android.os.CancellationSignal
 import android.os.Handler
 import android.os.HandlerThread
@@ -198,6 +199,28 @@ class Documents : DocumentsProvider() {
         return doc != parent && doc.startsWith(if (parent == "/") "/" else "$parent/")
     }
 
+    /**
+     * The documents from a root (or [parentDocumentId]) down to a document: the Files app needs it
+     * to open a directory it is sent to (a `file:` link to one), and without it shows its default
+     * place. The home root is preferred for what lies in both.
+     */
+    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+        val context = attached()
+        val child = visible(context, childDocumentId)
+        val home = home(context)?.path
+        val (rootId, top) = when {
+            parentDocumentId != null -> null to visible(context, parentDocumentId)
+            home != null && (child == home || isChildDocument(home, child)) -> ROOT_HOME to home
+            else -> ROOT_SYSTEM to "/"
+        }
+        if (child != top && !isChildDocument(top, child)) {
+            throw FileNotFoundException("$childDocumentId is not under $top")
+        }
+        val path = mutableListOf(child)
+        while (path.last() != top) path.add(parent(path.last()))
+        return DocumentsContract.Path(rootId, path.reversed())
+    }
+
     override fun querySearchDocuments(rootId: String, query: String, projection: Array<out String>?): Cursor {
         val context = attached()
         val dir = when (rootId) {
@@ -338,6 +361,21 @@ class Documents : DocumentsProvider() {
         context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
     }
 
+    /** What a `file:` link names ([fileLink]). */
+    sealed interface FileLink {
+        /** A document shown now, and its MIME type. */
+        data class Found(val uri: Uri, val mime: String) : FileLink
+
+        /** A file on another machine: a program there (over ssh) wrote the link. */
+        data class Remote(val host: String) : FileLink
+
+        /** A file outside the home directory while the whole system is not shown. */
+        data object Hidden : FileLink
+
+        /** No directory or regular file there in the store (or no store). */
+        data object Missing : FileLink
+    }
+
     companion object {
         const val ROOT_HOME = "home"
         const val ROOT_SYSTEM = "system"
@@ -378,6 +416,99 @@ class Documents : DocumentsProvider() {
             // One call for all of them (each notifyChange is a call into the system server)
             val uris = dirs.map { DocumentsContract.buildChildDocumentsUri(authority, it) }
             context.contentResolver.notifyChange(uris, null, 0)
+        }
+
+        /**
+         * The document a `file:` URI names, for a program's OSC 8 link (`ls --hyperlink`): only on
+         * this machine (no host, `localhost` or the name in `/etc/hostname`), and only where the
+         * provider shows documents now, so opening one from a link reaches no more than the Files
+         * app does. Reads the store: not on the main thread.
+         */
+        fun fileLink(context: Context, link: Uri): FileLink {
+            val host = link.host.orEmpty()
+            if (host.isNotEmpty() && !host.equals("localhost", ignoreCase = true) &&
+                !host.equals(hostname(context), ignoreCase = true)
+            ) {
+                return FileLink.Remote(host)
+            }
+            val id = link.encodedPath?.let { linkPath(it) } ?: return FileLink.Missing
+            val uri = DocumentsContract.buildDocumentUri(authority(context), id)
+            // Through the provider itself, which applies what is shown now and types the file
+            val mime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+            if (mime != null) return FileLink.Found(uri, mime)
+            val exists = runCatching {
+                Rootfs.access.read { Native.browseStat(Rootfs.store(context).path, id) }
+            }.isSuccess
+            return if (exists) FileLink.Hidden else FileLink.Missing
+        }
+
+        /** The guest's host name as `/etc/hostname` has it; null when it cannot be read. */
+        private fun hostname(context: Context): String? = runCatching {
+            Rootfs.access.read { Native.readFile(Rootfs.store(context).path, "/etc/hostname") }
+        }.getOrNull()?.let { String(it, Charsets.UTF_8).trim() }
+
+        /**
+         * A `file:` URI's percent-encoded path as a canonical document ID: `%XX` turned into bytes,
+         * written back as the native side writes paths, with empty and `.` components dropped; null
+         * when it is not absolute or has `..` (resolving it by name could differ from the guest's
+         * resolution through symbolic links).
+         */
+        private fun linkPath(encoded: String): String? {
+            if (!encoded.startsWith("/")) return null
+            val bytes = ByteArrayOutputStream()
+            var i = 0
+            while (i < encoded.length) {
+                val hex = encoded.substring(i + 1, minOf(i + 3, encoded.length))
+                if (encoded[i] == '%' && hex.length == 2 && hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+                    bytes.write(hex.toInt(16))
+                    i += 3
+                } else {
+                    val end = if (Character.isHighSurrogate(encoded[i]) && i + 1 < encoded.length) i + 2 else i + 1
+                    bytes.write(encoded.substring(i, end).toByteArray(Charsets.UTF_8))
+                    i = end
+                }
+            }
+            val parts = documentId(bytes.toByteArray()).split('/').filter { it.isNotEmpty() && it != "." }
+            if (parts.any { it == ".." }) return null
+            return canonical("/" + parts.joinToString("/"))
+        }
+
+        /**
+         * A guest path as the native side writes it ([Native]): valid UTF-8 kept, and `%`, control
+         * characters and bytes that are not UTF-8 written as `%XX`.
+         */
+        private fun documentId(path: ByteArray): String {
+            val out = StringBuilder()
+            var i = 0
+            while (i < path.size) {
+                val n = utf8Length(path, i)
+                val c = if (n == 0) -1 else String(path, i, n, Charsets.UTF_8).codePointAt(0)
+                if (c >= 0 && c != '%'.code && !Character.isISOControl(c)) {
+                    out.appendCodePoint(c)
+                } else {
+                    for (k in i until i + maxOf(n, 1)) out.append("%%%02X".format(path[k].toInt() and 0xff))
+                }
+                i += maxOf(n, 1)
+            }
+            return out.toString()
+        }
+
+        /** The length of the well-formed UTF-8 sequence at [i] (Unicode's table 3-7), 0 when none. */
+        private fun utf8Length(b: ByteArray, i: Int): Int {
+            fun at(k: Int) = if (i + k < b.size) b[i + k].toInt() and 0xff else -1
+            fun cont(k: Int, lo: Int = 0x80, hi: Int = 0xbf) = at(k) in lo..hi
+            val b0 = at(0)
+            return when {
+                b0 < 0x80 -> 1
+                b0 in 0xc2..0xdf -> if (cont(1)) 2 else 0
+                b0 == 0xe0 -> if (cont(1, 0xa0) && cont(2)) 3 else 0
+                b0 == 0xed -> if (cont(1, hi = 0x9f) && cont(2)) 3 else 0
+                b0 in 0xe1..0xef -> if (cont(1) && cont(2)) 3 else 0
+                b0 == 0xf0 -> if (cont(1, 0x90) && cont(2) && cont(3)) 4 else 0
+                b0 in 0xf1..0xf3 -> if (cont(1) && cont(2) && cont(3)) 4 else 0
+                b0 == 0xf4 -> if (cont(1, hi = 0x8f) && cont(2) && cont(3)) 4 else 0
+                else -> 0
+            }
         }
 
         /**

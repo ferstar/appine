@@ -80,6 +80,7 @@ unsafe extern "C" {
     fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
     fn appine_vt_select_clear(vt: *mut AppineVt);
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_message(vt: *mut AppineVt, text: *const u8, len: usize) -> bool;
@@ -561,6 +562,25 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_copy<'l>(
     let term = tab.term();
     let mut len = 0;
     let p = unsafe { appine_vt_copy(term.0, &mut len) };
+    term.text(&mut env, p, len)
+}
+
+/// The link at viewport cell (`x`, `y`): its OSC 8 URI, else an http or https URL in the text
+/// there; null when there is none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_link<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jstring {
+    let Some(tab) = tab(handle) else {
+        return std::ptr::null_mut();
+    };
+    let term = tab.term();
+    let mut len = 0;
+    let p = unsafe { appine_vt_link(term.0, cell(x), cell(y), &mut len) };
     term.text(&mut env, p, len)
 }
 

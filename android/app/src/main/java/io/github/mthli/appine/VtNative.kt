@@ -89,6 +89,12 @@ internal object VtNative {
     @JvmStatic external fun copy(tab: Long): String?
 
     /**
+     * The link at viewport cell ([x], [y]): its OSC 8 URI (any scheme), else an http or https URL
+     * written there, soft wraps joined; null when there is none.
+     */
+    @JvmStatic external fun link(tab: Long, x: Int, y: Int): String?
+
+    /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the
      * alternate screen, where nothing is written.
      */

@@ -2,11 +2,13 @@ package io.github.mthli.appine
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -23,6 +25,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsAnimationCompat
@@ -30,6 +33,7 @@ import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import kotlin.concurrent.thread
 
 /**
  * The terminal screen: the tab bar ([TabBarView]) on top, the terminal ([VtView]) in the middle,
@@ -461,6 +465,50 @@ class MainActivity : Activity(), TerminalService.Listener {
         override val shift: Boolean get() = keys.shift
 
         override fun modifiersUsed() = keys.modifiersUsed()
+
+        /**
+         * Opens it in the app the system picks: a web page or mail as a browsable intent, which
+         * reaches only apps that take links from the web, a guest file through the Files app's
+         * provider ([openFile]).
+         */
+        override fun onLink(uri: String) {
+            val link = uri.toUri()
+            if (link.scheme.equals("file", ignoreCase = true)) {
+                openFile(link)
+            } else {
+                startViewer(Intent(Intent.ACTION_VIEW, link).addCategory(Intent.CATEGORY_BROWSABLE))
+            }
+        }
+
+        /**
+         * A guest file from a program's `file:` link, opened as the Files app opens one, read-only;
+         * looked up off the main thread, since that reads the store ([Documents.fileLink]).
+         */
+        private fun openFile(link: Uri) {
+            thread(name = "appine-link") {
+                val found = Documents.fileLink(this@MainActivity, link)
+                runOnUiThread {
+                    if (isDestroyed) return@runOnUiThread
+                    when (found) {
+                        is Documents.FileLink.Found -> startViewer(
+                            Intent(Intent.ACTION_VIEW).setDataAndType(found.uri, found.mime)
+                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                        )
+                        is Documents.FileLink.Remote -> showToast(getString(R.string.link_remote_file, found.host))
+                        Documents.FileLink.Hidden -> showToast(getString(R.string.link_hidden_file), long = true)
+                        Documents.FileLink.Missing -> showToast(getString(R.string.link_missing_file))
+                    }
+                }
+            }
+        }
+
+        private fun startViewer(intent: Intent) {
+            try {
+                startActivity(intent)
+            } catch (e: ActivityNotFoundException) {
+                showToast(getString(R.string.link_no_app))
+            }
+        }
     }
 
     /** Taps on the tab bar: a tab, its title, `×`, `+` and `⋮`. */
@@ -488,12 +536,12 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * A tab's title or a notice from the extra keys, in place of the last one, so that quick long
-     * presses do not queue toasts.
+     * A tab's title, a notice from the extra keys or why a link did not open, in place of the last
+     * one, so that quick long presses do not queue toasts; [long] for text that takes a while to read.
      */
-    private fun showToast(text: String) {
+    private fun showToast(text: String, long: Boolean = false) {
         toast?.cancel()
-        toast = Toast.makeText(this, text, Toast.LENGTH_SHORT).apply { show() }
+        toast = Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).apply { show() }
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()

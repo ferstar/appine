@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes reworked; mouse drags, hover, double taps; cutout and IME insets; tab animations; last, the scroll bar and flings)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes reworked; mouse drags, hover, double taps; insets; tab animations; scroll bar and flings; last, opening links)
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@
 - `MainActivity`: the screen's layout, the current session, closing tabs, keyboard shortcuts, font
   zoom, insets and the IME, with the tab bar (`TabBarView`) and the extra keys (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads),
-  `VtView` (drawing with the bundled JetBrains Mono, input, selection), and the emulator shim and
+  `VtView` (drawing with the bundled JetBrains Mono, input, selection, links), and the emulator shim and
   JNI in the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
@@ -70,7 +70,7 @@ libghostty-vt with Zig (`android/native`).
   of the grid, the modes, scroll position and selection bounds of the last frame, the IME
   connection, gestures and the fling's `OverScroller`, selection handles and the floating menu.
   `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift`
-  and `modifiersUsed`.
+  and `modifiersUsed`, and `onLink` (opens a link in another app).
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers, modifier bits, actions.
@@ -88,7 +88,7 @@ libghostty-vt with Zig (`android/native`).
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`,
   `paste`, `mouse`, `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`,
-  `copy`, `title`, `message`, `transcript`, `print`; `pump` calls `VtSession.onOutput` and
+  `copy`, `link`, `title`, `message`, `transcript`, `print`; `pump` calls `VtSession.onOutput` and
   `onTitle` back.
 
 ## Data flow / lifecycle
@@ -291,12 +291,26 @@ libghostty-vt with Zig (`android/native`).
 
 #### Gestures and selection
 
-- A tap ends a selection or its menu; otherwise it opens the IME and, when the program tracks the
-  mouse, also sends a left click (press and release at the tap's pixel position, in the program's
-  format). Taps act at once: `VtView` tells a double tap itself (the second tap's press within the
+- A tap ends a selection or its menu; otherwise, when the program does not track the mouse and the
+  tap is on a link, it opens the link instead of the IME; otherwise it opens the IME and, when the
+  program tracks the mouse, also sends a left click (press and release at the tap's pixel position,
+  in the program's format). Taps act at once: `VtView` tells a double tap itself (the second tap's press within the
   system's double-tap timeout and slop of the first's lift), so without mouse tracking the second
   tap selects the word under it (with the menu), and with it both taps are clicks, for the
-  program's own double click; a third tap counts as a first.
+  program's own double click; a third tap counts as a first, and so does a tap after one that
+  opened a link.
+- A link is a cell's OSC 8 hyperlink, else an `http://` or `https://` URL written in the text
+  (`VtNative.link`): vt.c joins the cell's soft-wrapped line (up to 64 rows above and below), takes
+  the run's first scheme at or before the cell and runs on over ASCII URL characters (letters,
+  digits and RFC 3986 punctuation but the single quote) while brackets balance, then drops a
+  trailing `.,;:!?`; any other character, CJK included, ends it. Only `http`, `https`, `mailto`
+  and `file` links open (an OSC 8 link can name any scheme, other apps' deep links among them). The
+  activity opens a web or mail link as a browsable `ACTION_VIEW` intent; a `file:` link (`ls
+  --hyperlink`) is looked up off the main thread through the Files app's provider
+  (`Documents.fileLink`) and opened as its document, typed by it and with read access granted: a
+  directory in the Files app, a file in the app the system picks. A link from another host, outside
+  the home while the whole system is not shown, or to nothing in the store gets a toast instead, as
+  does a link no app takes.
 - A vertical drag, or a mouse wheel (3 rows a notch), scrolls by whole rows: wheel events when the
   program tracks the mouse, arrow keys on the alternate screen with alternate scroll (1007, on by
   default), else the viewport.
@@ -327,9 +341,10 @@ libghostty-vt with Zig (`android/native`).
   selection's ends; the other end is the anchor, kept as tracked grid references so output does not
   move it. The finger keeps its offset from the dragged cell; held above or below the grid, the
   viewport scrolls one row every 50 ms and the selection follows.
-- After a drag, a floating action mode (`TYPE_FLOATING`) offers Copy (with a selection), Paste
-  (with a clipboard), Select all (scrollback included), with the system's own labels, placed over
-  the selected rows. Copy takes the selection as plain text with soft wraps joined and trailing
+- After a drag, a floating action mode (`TYPE_FLOATING`) offers Open link (when the long press
+  that began the selection was on a link, also in mouse mode), Copy (with a selection), Paste
+  (with a clipboard), Select all (scrollback included), with the system's own labels but Open
+  link's, placed over the selected rows. Open link ends the selection and opens the link. Copy takes the selection as plain text with soft wraps joined and trailing
   blanks trimmed (as Ghostty copies), puts it on the clipboard and ends the selection.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
   and resizes the terminal and then the console (SIGWINCH).
@@ -364,9 +379,11 @@ libghostty-vt with Zig (`android/native`).
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
   (`android/native`); `Machine::read_console`, `write_console` and `resize_console` called from
-  `vt.rs` directly; the system clipboard; JetBrains Mono 2.304 (variable, upright and italic) in
-  the assets, and the system's fallback fonts for everything else (CJK from Noto Sans CJK on AOSP
-  images); the wide-cell setting `TerminalService.fillWide`.
+  `vt.rs` directly; the system clipboard; the app the system picks for a link (a browser, or a
+  viewer or the Files app for a guest file through `Documents.fileLink`, android/documents);
+  JetBrains Mono 2.304 (variable, upright and italic) in the assets, and the system's fallback
+  fonts for everything else (CJK from Noto Sans CJK on AOSP images); the wide-cell setting
+  `TerminalService.fillWide`.
 
 ## Invariants and gotchas
 
@@ -501,6 +518,9 @@ libghostty-vt with Zig (`android/native`).
 
 ## To verify
 
+- Opening links on real devices and with other browsers, mail apps, viewers and file managers;
+  tried only on a Pixel 4a API 34 emulator with Chrome, HTML Viewer and the Files app, with taps and
+  long presses from adb (http, https and `file`, not `mailto`).
 - Which IMEs on real devices deliver Enter as text; the cutout insets and the keys following the
   IME on real devices and other IMEs; tried only with Gboard on a Pixel 4a API 34 emulator and the
   outer display of a Pixel 10 Pro Fold API 37 emulator (landscape both ways).

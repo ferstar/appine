@@ -39,9 +39,11 @@ import android.widget.OverScroller
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
 import androidx.core.graphics.withScale
+import androidx.core.net.toUri
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -92,6 +94,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** The next key or character took the one-shot modifiers. */
         fun modifiersUsed()
+
+        /** A link was tapped or chosen from the menu, to open in another app. */
+        fun onLink(uri: String)
     }
 
     /** The tab shown, null for none. */
@@ -262,6 +267,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /** Show the menu after the next frame, which has the selection's new bounds. */
     private var menuPending = false
+
+    /** The link under the long press that began the selection, which the menu offers to open. */
+    private var menuLink: String? = null
 
     /** The IME asked for cursor positions as they change (its candidate window follows them). */
     private var monitorCursor = false
@@ -1081,16 +1089,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
-    /** The floating menu: Copy with a selection, Paste with text on the clipboard, Select all. */
+    /**
+     * The floating menu: Open link after a long press on one, Copy with a selection, Paste with
+     * text on the clipboard, Select all.
+     */
     private fun showMenu() {
         menu?.finish()
         if (tab == 0L || (!selected && menuX < 0)) return
         menu = startActionMode(
             object : ActionMode.Callback2() {
                 override fun onCreateActionMode(mode: ActionMode, m: Menu): Boolean {
-                    if (selected) m.add(Menu.NONE, MENU_COPY, 0, android.R.string.copy)
-                    if (clipboard.hasPrimaryClip()) m.add(Menu.NONE, MENU_PASTE, 1, android.R.string.paste)
-                    m.add(Menu.NONE, MENU_SELECT_ALL, 2, android.R.string.selectAll)
+                    if (menuLink != null) m.add(Menu.NONE, MENU_OPEN_LINK, 0, R.string.open_link)
+                    if (selected) m.add(Menu.NONE, MENU_COPY, 1, android.R.string.copy)
+                    if (clipboard.hasPrimaryClip()) m.add(Menu.NONE, MENU_PASTE, 2, android.R.string.paste)
+                    m.add(Menu.NONE, MENU_SELECT_ALL, 3, android.R.string.selectAll)
                     return true
                 }
 
@@ -1098,6 +1110,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
                 override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
                     when (item.itemId) {
+                        MENU_OPEN_LINK -> menuLink?.let {
+                            clearSelection()
+                            host.onLink(it)
+                        }
                         MENU_COPY -> copySelection()
                         MENU_PASTE -> {
                             mode.finish()
@@ -1105,6 +1121,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                         }
                         MENU_SELECT_ALL -> if (VtNative.selectAll(tab)) {
                             selected = true
+                            menuLink = null
                             menuX = -1f
                             menuPending = true
                             mode.finish()
@@ -1181,6 +1198,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun clearSelection() {
         if (tab != 0L) VtNative.selectClear(tab)
         selected = false
+        menuLink = null
         menu?.finish()
         invalidate()
     }
@@ -1269,6 +1287,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The finger moved on after a long press in mouse mode: the program gets a left-button drag. */
     private fun startMouseDrag(e: MotionEvent) {
         if (selected) clearSelection()
+        menuLink = null
         drag = DRAG_MOUSE
         send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, pressX, pressY, true))
         send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_LEFT, 0, e.x, e.y, true))
@@ -1306,6 +1325,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 // In mouse mode both taps are clicks, for the program's own double click
                 if (second && !mouseTracking && tab != 0L && VtNative.selectWord(tab, cellX(e.x), cellY(e.y))) {
                     selected = true
+                    menuLink = null
                     menuX = -1f
                     menuPending = true
                     invalidate()
@@ -1313,6 +1333,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
                 if (selected || menu != null) {
                     clearSelection()
+                    return true
+                }
+                // A link opens instead of the keyboard (in mouse mode the tap is the program's,
+                // and the long press's menu opens links); a tap after it is a first tap again
+                val link = if (tab != 0L && !mouseTracking) linkAt(e.x, e.y) else null
+                if (link != null) {
+                    lastTapTime = 0L
+                    host.onLink(link)
                     return true
                 }
                 if (tab != 0L && mouseTracking) click(e)
@@ -1336,6 +1364,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 if (tab == 0L || scaler.isInProgress) return
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 val word = VtNative.selectWord(tab, cellX(e.x), cellY(e.y))
+                menuLink = linkAt(e.x, e.y)
                 if (mouseTracking) {
                     // Whether this selects the word or drags for the program waits for the finger
                     selected = word
@@ -1406,6 +1435,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun click(e: MotionEvent) {
         send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
         send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    }
+
+    /**
+     * The link at a touch that may be opened: one with a scheme in [LINK_SCHEMES] (a program's
+     * OSC 8 link can name any, other apps' deep links among them); null for none.
+     */
+    private fun linkAt(x: Float, y: Float): String? {
+        val link = VtNative.link(tab, cellX(x), cellY(y)) ?: return null
+        return link.takeIf { link.toUri().scheme?.lowercase(Locale.ROOT) in LINK_SCHEMES }
     }
 
     /** Scrolls by [n] rows (positive: towards the newest output), the way [scrollWay] says. */
@@ -1543,6 +1581,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val MENU_COPY = 1
         const val MENU_PASTE = 2
         const val MENU_SELECT_ALL = 3
+        const val MENU_OPEN_LINK = 4
+
+        /**
+         * The schemes a tapped link may have: web pages, and from an OSC 8 link mail and guest
+         * files (`ls --hyperlink`).
+         */
+        val LINK_SCHEMES = setOf("http", "https", "mailto", "file")
 
         /** Characters of a paste shown when asking whether to paste it. */
         const val PASTE_PREVIEW = 300

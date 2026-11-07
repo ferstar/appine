@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the system root independent of a home root, a home of `/` refused as writable; last, write fds wrapped with their close callback and guest changes notified in one call)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: the system root independent of a home root, a home of `/` refused as writable; write fds with a close callback, guest changes notified in one call; last, `file:` links and document paths)
 
 ## Responsibilities
 
@@ -17,7 +17,8 @@ app and in other apps' pickers:
 - document IDs, columns, flags and MIME types;
 - reading, writing, creating, deleting, renaming, moving and searching through the store's browse
   API, without the kernel;
-- change notifications in both directions.
+- change notifications in both directions;
+- the documents that the terminal's `file:` links name.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Documents.kt` (and its manifest entry).
 
@@ -34,8 +35,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 - Framework: `queryRoots`, `queryDocument`, `queryChildDocuments`, `openDocument`,
   `createDocument`, `deleteDocument`, `renameDocument`, `moveDocument`, `isChildDocument`,
-  `querySearchDocuments` (no `copyDocument`, `removeDocument`, recents or thumbnails).
-- Static, for the service: `rootsChanged`, `dirsChanged`.
+  `findDocumentPath`, `querySearchDocuments` (no `copyDocument`, `removeDocument`, recents or
+  thumbnails).
+- Static, for the service: `rootsChanged`, `dirsChanged`; for the terminal: `fileLink`, with its
+  result `FileLink` (`Found` with the document's URI and MIME type, `Remote`, `Hidden`, `Missing`).
 
 ## Data flow / lifecycle
 
@@ -57,6 +60,9 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 - MIME: by extension (`MimeTypeMap`); files without a known extension are sniffed in one batch
   (first 4 KB without NUL and valid UTF-8 → `text/plain`, at most 1000 per call); otherwise
   `application/octet-stream`.
+- Document paths (`findDocumentPath`, which the Files app needs to open a directory it is sent
+  to): the IDs from the home root's document down to a visible document under it, else from the
+  system root's `/`, or from a given parent; a document not under the parent is not found.
 
 ### Operations
 
@@ -74,6 +80,16 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   revokes grants on the source ID and notifies the affected directories.
 - Search: by name under the root, breadth first (200 results, 50,000 entries).
 
+### Links from the terminal
+
+- `fileLink` (called off the main thread) takes a `file:` URI from a program's OSC 8 link. Its host
+  must be empty, `localhost` or the name in the store's `/etc/hostname` (any case), else `Remote`.
+  The path's `%XX` escapes become bytes, written back as an ID the way the native side writes
+  paths, empty and `.` components dropped; a relative path or one with `..` is `Missing`. The
+  document's type comes from the provider itself (`getType`, so what is shown now applies and
+  extensionless text is sniffed): `Found`; otherwise `Hidden` when the store has a directory or
+  regular file there, else `Missing`.
+
 ### Notifications
 
 - Provider to kernel: the store's change path replays the changes under each running kernel's lock
@@ -89,7 +105,8 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 ### Inbound
 
 - The framework (manifest provider: exported, grant URI permissions, `MANAGE_DOCUMENTS`);
-  `TerminalService` (`rootsChanged`, `dirsChanged`); `MachineTest`.
+  `TerminalService` (`rootsChanged`, `dirsChanged`); `MainActivity` (`fileLink`, granting the
+  viewer read access to a `Found` document); `MachineTest`.
 
 ### Outbound
 
@@ -102,6 +119,12 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   symlinks wherever they point, so an app holding a grant on the home tree can read outside it
   through a link the guest user made (an accepted limitation: no guest permission checks apply).
 - Flags shown in the Files app are a hint; the real write check is in the native code.
+- `fileLink` writes IDs in Kotlin by the same rules as the native `encode_path` (`%`, Unicode
+  control characters and bytes outside well-formed UTF-8 as `%XX`); the two change together. A
+  differing ID would still reach the file (the native side decodes any `%XX`) but not compare
+  equal to the home's ID in the visibility check.
+- A link's host is matched against `/etc/hostname` in the store, not the running system's name:
+  after `hostname` alone, without the file, the machine's own links count as `Remote`.
 - If wrapping a write fd fails (the socket pair that carries the close cannot be created), the
   plain fd is handed out and the guest gets no `IN_MODIFY`/`IN_CLOSE_WRITE` for that write (the
   data still lands). `wrap` detaches the fd before creating that pair, so after a failure the fd
@@ -120,3 +143,5 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 ## To verify
 
 - The framework's grant semantics for path-shaped IDs (taken from AOSP, not checked on a device).
+- `fileLink` and `findDocumentPath` on real devices and other file managers; tried only on a Pixel
+  4a API 34 emulator with Google's Files app, HTML Viewer and Chrome.
