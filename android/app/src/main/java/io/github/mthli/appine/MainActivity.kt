@@ -114,7 +114,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                 // those that slide (a 0 to 0 slide); one still sliding renumbers at its end
                 if (tab in rowTabs && (shift != 0 || tab.stale && tab.view.translationX == 0f)) tab.slide()
             }
-            moveIndicator(closed = from.keys.any { it !in rowTabs })
+            moveIndicator()
             return true
         }
     }
@@ -459,8 +459,9 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * Shows the tabs, a number each, the current one marked and scrolled into view. Called whenever
-     * tabs, titles or the current tab change.
+     * Shows the tabs, a number each, the current one marked (the indicator sliding to it from the
+     * last current one, [moveIndicator]) and scrolled into view. Called whenever tabs, titles or
+     * the current tab change.
      *
      * Closed tabs shrink and fade out in place, and the tabs after them slide into the places left,
      * keeping their numbers until they are there ([slideTabs]): closing the current tab shows the
@@ -616,20 +617,26 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun number(i: Int) = "%d".format(i + 1)
 
     /**
-     * Moves the indicator to the current tab's new place on screen ([slideTabs]): sliding there
-     * from where it was drawn when tabs [closed], at once when another tab was shown. Closing the
-     * current tab of a row that does not scroll leaves its place where it was, so the indicator
-     * stays while the next tab slides in above it; a row scrolled to its end scrolls back as it
-     * shortens, and the indicator slides on to the next tab.
+     * Moves the indicator to the current tab's new place on screen ([slideTabs]), sliding there
+     * from where it was drawn, whether another tab was shown or tabs closed; a change while it
+     * slides (a held Ctrl+Tab) slides on from where it is. Closing the current tab of a row that
+     * does not scroll leaves its place where it was, so the indicator stays while the next tab
+     * slides in above it; a row scrolled to its end scrolls back as it shortens, and the indicator
+     * slides on to the next tab. With no place to come from (the row's first layout) it is put
+     * there at once.
      */
-    private fun moveIndicator(closed: Boolean) {
+    private fun moveIndicator() {
         val tab = currentTab
         val from = indicatorFrom
         indicatorFrom = null
         val shift = if (tab == null || from == null) null else from - (tab.left - strip.scrollX)
-        when {
-            shift == 0 -> {} // the same place: a slide still running goes on
-            shift != null && closed -> {
+        when (shift) {
+            0 -> {} // the same place: a slide still running goes on
+            null -> {
+                indicatorSlide?.cancel()
+                indicatorShift = 0f
+            }
+            else -> {
                 indicatorSlide?.cancel()
                 indicatorSlide = ValueAnimator.ofFloat(indicatorShift + shift, 0f).apply {
                     duration = SLIDE_MS
@@ -640,10 +647,6 @@ class MainActivity : Activity(), TerminalService.Listener {
                     }
                     start()
                 }
-            }
-            else -> {
-                indicatorSlide?.cancel()
-                indicatorShift = 0f
             }
         }
     }

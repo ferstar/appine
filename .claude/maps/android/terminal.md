@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys and themes reworked; closing tabs animated; mouse drags, hover and double taps; last, cutout insets and keys following the IME)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; tab bar, extra keys and themes reworked; mouse drags, hover and double taps; cutout insets, keys following the IME; last, tab closes and switches animated)
 
 ## Responsibilities
 
@@ -117,8 +117,10 @@ libghostty-vt with Zig (`android/native`).
   keeps to the current tab's place on screen, so closing the current tab of a row that does not
   scroll shows the next one sliding in above it; a row at its end scrolls back as it shortens, the
   tabs before slide right instead, and the indicator slides on to the new current tab. Showing
-  another tab moves the indicator at once, and TalkBack's descriptions take the new numbers at
-  once.
+  another tab (a tap, Ctrl+Tab, a new tab) slides the indicator there the same way (200 ms) from
+  where it is drawn, so a switch during a slide sends it on without a jump, and one to a tab out
+  of view slides it while the row scrolls; only the row's first layout puts it in place at once.
+  The numbers' colours change at once, and so do TalkBack's descriptions.
 - Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier), cancelling the previous one. TalkBack reads "Tab N: title".
@@ -471,8 +473,8 @@ libghostty-vt with Zig (`android/native`).
   tried only with Gboard on a Pixel 4a API 34 emulator and the outer display of a Pixel 10 Pro
   Fold API 37 emulator (landscape both ways).
 - The tab bar's 32 dp tabs and buttons (below the 48 dp touch target) on real phones, tablets and
-  foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing
-  animation upright only, slowed down).
+  foldables; tried only on a Pixel 4a API 34 emulator, upright and on its side (the closing and
+  switching animations upright only, slowed down).
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English.
