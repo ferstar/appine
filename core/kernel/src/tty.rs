@@ -9,6 +9,17 @@
 //!
 //! Only plain data structures and the line discipline live here; blocking, signals and job
 //! control checks are done in the syscall layer.
+//!
+//! The line discipline follows the rules of Linux's n_tty. Its echo queue (`Echo` and
+//! `commit_echoes`), erasing (`erase`, `echo_erased`) and output processing (`output_char`) are
+//! adapted from the line discipline of Fuchsia's Starnix (`src/starnix/lib/line_discipline` at
+//! commit 86962cb40d56e1a2bc033ead5b4c89bb02c34ca2), under its BSD-style license:
+//!
+//! ```text
+//! Copyright 2025-2026 The Fuchsia Authors. All rights reserved.
+//! Use of this source code is governed by a BSD-style license that can be
+//! found in android/licenses/fuchsia-LICENSE.
+//! ```
 
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};

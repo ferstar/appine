@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY` on a master; `TIOCSTI` needs the ctty or `CAP_SYS_ADMIN`; the line discipline follows n_tty (all 83 recorded scenarios); `/dev/tty` identity; taking a controlling terminal)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: master-side `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY`; `TIOCSTI` rules; the line discipline follows n_tty, parts adapted from Starnix; `/dev/tty` identity; taking a controlling terminal)
 
 ## Responsibilities
 
@@ -277,6 +277,11 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   other input) show their echoes discarded, which this reproduces deterministically.
 - A deferred hangup whose terminal has no remaining references is skipped; nothing is left to
   signal, and `new_pty` prunes the dead table entry later.
+- The echo queue (`Echo`, `commit_echoes`), erasing (`erase`, `echo_erased`) and output processing
+  (`output_char`) are adapted from Starnix's `lib/line_discipline` and carry The Fuchsia Authors'
+  BSD-style notice in `tty.rs`'s module docs, matched by the app's notices (`android/native`).
+  Code moved out of those parts takes the notice along; only a rewrite that no longer derives from
+  Starnix drops it, from both places.
 
 ## Confirmed bugs / technical debt
 
@@ -315,7 +320,8 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 - Linux 6.1's `TIOCOUTQ` and `TIOCSBRK`/`TIOCCBRK` results on ptys (believed 0 and success; here
   the output queue length and `ENOTTY`).
-- The comparisons with Linux in this map come from knowledge of `n_tty.c`, `tty_io.c`,
-  `tty_jobctrl.c` and `pty.c`, not from a source checkout; the differential tests `pty` and
-  `line-discipline` (Starnix's 83 recorded scenarios, all compared natively) cover the common
-  paths and the line-discipline rules above.
+- The comparisons with Linux in this map come from knowledge of `tty_io.c`, `tty_jobctrl.c` and
+  `pty.c`, not from a source checkout; of `n_tty.c`, only the special-character order, erasing,
+  output processing and mode switches were checked against 6.1's source. The differential tests
+  `pty` and `line-discipline` (Starnix's 83 recorded scenarios, all compared natively) cover the
+  common paths and the line-discipline rules above.

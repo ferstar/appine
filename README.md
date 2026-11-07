@@ -140,6 +140,10 @@ version 3 of the License, or (at your option) any later version. See [LICENSE](L
 Copyright (C) 2026 Matthew Lee
 ```
 
+Parts of the terminal line discipline in `core/kernel/src/tty.rs` are adapted from Fuchsia's
+Starnix; they keep The Fuchsia Authors' copyright notice and BSD-style license
+(`android/licenses/fuchsia-LICENSE`).
+
 The Android app also contains code under other licenses: Ghostty's libghostty-vt and the
 libraries it links (MIT, BSD 3-Clause, Unicode), the JetBrains Mono font (OFL 1.1), the Alpine
 Linux minirootfs (busybox, apk-tools and others under the GPL 2.0), AndroidX and Kotlin

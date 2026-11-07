@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version)
+> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice)
 
 ## Responsibilities
 
@@ -98,7 +98,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - Assets: the newest Alpine minirootfs tarball by version (as `rootfs.tgz`, since AAPT would
   unpack `.gz`), the newest `doas.apk` (both by `byVersion`, the numbers in the name), generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
   `BuildConfig` carries the Alpine branch.
-- Notices (`NoticesTask`): appine's notice, then the terminal's components with their license
+- Notices (`NoticesTask`): appine's notice, Fuchsia's BSD-style license for the line-discipline
+  parts adapted from Starnix (`kernel/tty`), then the terminal's components with their license
   texts from `android/licenses/` (Ghostty, uucode with the Unicode and Hoehrmann licenses, simdutf,
   Highway and Wuffs under their MIT or BSD option, Zig's compiler_rt, JetBrains Mono's OFL),
   Alpine, the Android libraries, the crates, SQLite and full texts. Every Android library on the

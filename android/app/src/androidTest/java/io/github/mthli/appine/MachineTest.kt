@@ -1129,7 +1129,8 @@ class MachineTest {
 
     /**
      * The open-source notices generated at build time (design doc §13.4) are in the APK: appine's
-     * own AGPL notice and full text, libghostty-vt with what it links and the terminal font, the GPL
+     * own AGPL notice and full text, Fuchsia's license for the parts of the line discipline adapted
+     * from Starnix, libghostty-vt with what it links and the terminal font, the GPL
      * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the
      * library (no proc macros), and the full license texts; every file in the index is present.
      */
@@ -1141,6 +1142,7 @@ class MachineTest {
             .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
         val titles = index.map { it[0] }
         assertTrue(text("appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
+        assertTrue(text("Fuchsia Starnix").let { it.contains("The Fuchsia Authors") && it.contains("Redistribution and use") })
         assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
         for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {
             assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))

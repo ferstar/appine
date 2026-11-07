@@ -48,7 +48,9 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
 ## Open source licenses
 
 `NoticesTask` in `app/build.gradle.kts` writes the notices shown under Settings → Open source
-licenses into the assets (`notices/`): appine's AGPL notice, Ghostty's libghostty-vt with the
+licenses into the assets (`notices/`): appine's AGPL notice, Fuchsia's BSD-style license for
+the parts of the line discipline adapted from Starnix (`licenses/fuchsia-LICENSE`, the same
+commit `core/kernel/src/tty.rs` names), Ghostty's libghostty-vt with the
 libraries it links (uucode, simdutf, Highway, Wuffs, Zig's compiler_rt) and the JetBrains Mono
 font (their texts are in `licenses/`, taken from the sources `scripts/fetch-ghostty` downloads;
 update them with its version), the packages of the bundled Alpine minirootfs (from its `lib/apk/db/installed`, with the aports commit of

@@ -186,7 +186,8 @@ abstract class RootfsAssetTask : DefaultTask() {
 /**
  * Generates the content of the "Open source licenses" page in Settings (design doc §13.4) under
  * `notices/` in the assets: each line of `index.tsv` is "title<TAB>description<TAB>file name", and
- * the files are plain text. In order: appine itself (AGPL), the terminal (libghostty-vt and the
+ * the files are plain text. In order: appine itself (AGPL), the parts of appine adapted from
+ * Fuchsia's Starnix (the terminal line discipline, BSD-style), the terminal (libghostty-vt and the
  * libraries it links, and the JetBrains Mono font, from texts in `android/licenses/`), the packages
  * of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked into
  * libappine.so (with the license files each one publishes attached as they are), SQLite, and last
@@ -242,6 +243,14 @@ abstract class NoticesTask : DefaultTask() {
         entry(
             "appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
             wrap(APPINE_NOTICE) + "\n\n" + license.get().asFile.readText(),
+        )
+        // Code adapted into appine itself (core/kernel/src/tty.rs, which names the same commit)
+        entry(
+            "Fuchsia Starnix line discipline", "BSD-style · parts of the terminal line discipline", "fuchsia.txt",
+            "Parts of appine's terminal line discipline (the echo queue, erasing and output processing) are " +
+                "adapted from the line discipline of Fuchsia's Starnix (https://fuchsia.googlesource.com/fuchsia/" +
+                "+/86962cb40d56e1a2bc033ead5b4c89bb02c34ca2/src/starnix/lib/line_discipline), " +
+                "Copyright 2025-2026 The Fuchsia Authors, used under this license:\n\n" + text("fuchsia-LICENSE"),
         )
         // The terminal: libghostty-vt and what it links, and the font (texts in ../licenses, from
         // the sources scripts/fetch-ghostty downloads; change them together with its version)
