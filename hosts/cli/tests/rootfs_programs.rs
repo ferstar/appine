@@ -1135,6 +1135,35 @@ fn end_of_piped_input_is_an_eof_on_the_terminal() {
 }
 
 #[test]
+fn end_of_piped_input_survives_leaving_canonical_mode() {
+    // The end of file sent after piped input (above) lands in canonical mode when the program is
+    // between reads there, as a shell running a command is; the program then leaves canonical
+    // mode before reading it, as the shell's line editor does, and must read the VEOF character
+    // (tests/guest/eofmode.c) rather than the NUL a typed VEOF becomes on Linux, which the line
+    // editor would insert into its line and then wait forever
+    let Some(program) = build_static("eofmode") else {
+        return;
+    };
+    for tier in TIERS {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--pty", "--"])
+            .arg(&program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"x\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("byte 04"),
+            "tier {tier}: exited with {:?}; output:\n{text}",
+            out.status
+        );
+    }
+}
+
+#[test]
 fn interactive_shell_runs_on_a_terminal() {
     let Some(store) = store() else {
         return;

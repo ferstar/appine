@@ -447,6 +447,9 @@ struct Line {
     /// Ended by VEOF, which Linux keeps after the data as a `__DISABLED_CHAR` (0) that a read takes
     /// without returning it: a line with no data is end of file.
     eof: bool,
+    /// The end of file the host console hands the program when its input ends
+    /// ([`Tty::inject_eof`]): leaving canonical mode turns it into the VEOF character, not a NUL.
+    injected: bool,
 }
 
 /// An echo waiting to be written to the output (Linux's echo buffer). Echoes are formatted, and
@@ -636,6 +639,30 @@ impl Tty {
             self.arrivals[0] += 1;
         }
         self.take_signals()
+    }
+
+    /// The end of file the host console sends when its input has ended and the program has read
+    /// everything before it (`terminal::send_eof`): VEOF, as util-linux's script sends it. With
+    /// nothing being edited in canonical mode it is an empty line ended by VEOF, which reads as end
+    /// of file; marked so that if the program leaves canonical mode before reading it, it arrives
+    /// as the VEOF character, which a shell's line editor takes as end of file. Linux would leave a
+    /// NUL there instead, which the line editor inserts into its line (script has that problem).
+    /// Otherwise it is VEOF typed as input. Nothing when VEOF is disabled.
+    pub fn inject_eof(&mut self) -> Vec<Signal> {
+        let eof = self.termios.cc[VEOF];
+        if eof == 0 {
+            return Vec::new();
+        }
+        if self.canonical() && self.editing.is_empty() && self.unprocessed.is_empty() {
+            self.lines.push_back(Line {
+                data: Vec::new(),
+                eof: true,
+                injected: true,
+            });
+            self.arrivals[0] += 1;
+            return Vec::new();
+        }
+        self.write_input(&[eof])
     }
 
     /// Takes the signals input has generated since the last call (also by input taken when the
@@ -909,6 +936,7 @@ impl Tty {
         self.lines.push_back(Line {
             data,
             eof: end.is_none(),
+            injected: false,
         });
     }
 
@@ -1238,7 +1266,8 @@ impl Tty {
     /// (Linux's `tty_set_termios`), and a PTY is always 8 bits, without parity, with the receiver
     /// enabled (`pty_set_termios`). As Linux's `n_tty_set_termios` does: switching ICANON or EXTPROC
     /// ends LNEXT and an ECHOPRT erase, and input already queued changes queue: from canonical
-    /// mode the lines become raw data, a VEOF in it a NUL; into canonical mode all of it becomes
+    /// mode the lines become raw data, a VEOF in it a NUL (the host console's end of file the VEOF
+    /// character instead, [`Tty::inject_eof`]); into canonical mode all of it becomes
     /// one line, readable at once, with a final NUL taken as its VEOF. Clearing IXON restarts
     /// output that ^S stopped.
     pub fn set_termios(&mut self, mut t: Termios) -> Vec<Signal> {
@@ -1267,7 +1296,8 @@ impl Tty {
                 for line in std::mem::take(&mut self.lines) {
                     self.raw.extend(line.data);
                     if line.eof {
-                        self.raw.push_back(0);
+                        self.raw
+                            .push_back(if line.injected { old.cc[VEOF] } else { 0 });
                     }
                 }
                 self.raw.extend(self.editing.drain(..));
@@ -1278,7 +1308,11 @@ impl Tty {
                 if eof {
                     data.pop();
                 }
-                self.lines.push_back(Line { data, eof });
+                self.lines.push_back(Line {
+                    data,
+                    eof,
+                    injected: false,
+                });
             }
             _ => {}
         }

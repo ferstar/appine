@@ -199,8 +199,6 @@ enum Eof {
     Open,
     /// Input has ended; waiting for the program to read the input already sent in.
     Pending,
-    /// Sent in canonical mode: VEOF is the EOF marker at the end of a line.
-    Canonical,
     Sent,
 }
 
@@ -231,7 +229,9 @@ pub(crate) fn bridge(shared: Arc<Shared>, term: Terminal, id: u32, pid: Tid) {
         if k.watched.get(&pid).is_some_and(Option::is_some) && k.tasks.is_empty() {
             break;
         }
-        eof = eof_after(&k, id, eof);
+        if eof == Eof::Pending && send_eof(&k, id) {
+            eof = Eof::Sent;
+        }
         let room = input_room(&k, id).unwrap_or(0);
         let mut fds = Vec::new();
         if eof == Eof::Open && room > 0 {
@@ -287,50 +287,30 @@ fn write_all(fd: i32, mut data: &[u8]) {
     }
 }
 
-/// The step after an EOF sent in canonical mode: if the program switched to non-canonical mode
-/// before reading it (a shell switches back to canonical mode to run a command after reading a
-/// line, the bridge thread sends VEOF then, and back at the prompt the line editor switches to
-/// non-canonical mode again), the EOF marker is lost (on Linux it becomes a NUL byte; script has
-/// the same problem), so it is sent once more, this time as a character.
-fn eof_after(k: &Kernel, id: u32, eof: Eof) -> Eof {
-    match eof {
-        Eof::Pending => match send_eof(k, id) {
-            Some(true) => Eof::Canonical,
-            Some(false) => Eof::Sent,
-            None => Eof::Pending,
-        },
-        Eof::Canonical if tty_of(k, id).is_ok_and(|t| !t.borrow().canonical()) => {
-            match send_eof(k, id) {
-                Some(_) => Eof::Sent,
-                None => Eof::Canonical,
-            }
-        }
-        e => e,
-    }
-}
-
 /// After the host's input ends, sends a VEOF (^D) into the console's input, as util-linux's
 /// script does: in canonical mode a VEOF at the start of a line makes read return 0, so programs
 /// that end at EOF, such as a shell or cat, exit; outside canonical mode the program receives the
 /// character (a shell's line editor treats it as EOF). As script does, it waits until the program
-/// has read the input already sent in; while that is unread it returns None, and the console's PTY
-/// wakes the bridge thread when the program reads input. Once sent, returns whether it was sent in
-/// canonical mode. Sends nothing when VEOF is disabled.
-fn send_eof(k: &Kernel, id: u32) -> Option<bool> {
+/// has read the input already sent in: while that is unread it returns false, and the console's
+/// PTY wakes the bridge thread when the program reads input. A program that leaves canonical mode
+/// before reading the EOF gets the VEOF character ([`Tty::inject_eof`]). Sends nothing when VEOF
+/// is disabled.
+fn send_eof(k: &Kernel, id: u32) -> bool {
     let Ok(tty) = tty_of(k, id) else {
-        return Some(false);
+        return true;
     };
-    let (eof, canonical) = {
-        let t = tty.borrow();
-        if t.input_pending() {
-            return None;
-        }
-        (t.termios.cc[crate::tty::cc::VEOF], t.canonical())
-    };
-    if eof != 0 {
-        let _ = feed(k, id, &[eof]);
+    if tty.borrow().input_pending() {
+        return false;
     }
-    Some(canonical)
+    let signals = tty.borrow_mut().inject_eof();
+    request_wake_object(wake::of(&tty));
+    let fg = tty.borrow().fg;
+    if let Some(fg) = fg {
+        for sig in signals {
+            signal::send_to_pgrp(k, fg, sig, SigInfo::kernel());
+        }
+    }
+    true
 }
 
 /// The host terminal's window size.
