@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; wall-clock deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; test-suite findings; namespace limits last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; deadlines; the exited main thread; rlimits; exit signals; thread timers; robust futexes; test-suite findings; namespace limits; panics in exit's first stage last)
 
 ## Responsibilities
 
@@ -147,7 +147,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   group status (Linux 6.1 `synchronize_group_exit`).
 - `task::exit` runs in stages, each contained by `bug::catch`: collect statistics and CPU time,
   sample RSS if last, release the address space (robust list, `clear_child_tid` wake when the
-  address space is shared, vfork completion, leave its users), ptrace and seccomp cleanup; remove
+  address space is shared, vfork completion, leave its users), ptrace and seccomp cleanup; when
+  that stage panics, vfork completion and leaving the users run again on their own (both are
+  idempotent) before the process is killed, so no stale user is kicked and no vfork parent waits;
+  remove
   the task and its pid; hand this thread's children to another live thread (non-last) or finish
   the group (last); drop references under the BKL; request an `EXITED` wake. The engine CPU state is
   freed after the BKL is released.
@@ -459,9 +462,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   credentials, the opener-namespace check and the `CAP_SETFCAP` check for mapping uid 0 are
   missing, so an unprivileged user can pass an opened map file to a setuid-root program and get an
   arbitrary mapping (the confused-deputy case Linux closed).
-- **A panic in the first stage of thread exit leaves a stale user and can hang vfork:** if the stage
-  that releases the address space panics before leaving its users, a later shootdown kicks the freed
-  CPU state (a crash if it was unmapped), and a vfork parent waits forever for completion.
 - **`wait` ignores `__WCLONE`/`__WALL` and `exit_signal`:** every child is eligible under any flags,
   so a plain `waitpid(-1)` reaps clone children (non-`SIGCHLD` exit signal) that Linux would leave
   for `__WCLONE` waiters (Starnix's waitpid tests show it; the `starnix-process` case skips them).

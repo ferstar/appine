@@ -197,6 +197,24 @@ int main(int argc, char **argv)
         fail("panic while exiting preserves the group exit code");
     printf("panic while exiting: kept exit code 11\n");
 
+    /*
+     * A vfork child whose exit panics before it leaves the address space: the parent still goes
+     * on (an alarm ends a parent left waiting)
+     */
+    pid = fork();
+    if (pid == 0) {
+        alarm(5);
+        pid_t child = vfork();
+        if (child == 0) {
+            syscall(TEST_SYSCALL, HOOK_PANIC_ON_EXIT);
+            _exit(0);
+        }
+        _exit(child > 0 ? 20 : 21);
+    }
+    if (waitpid(pid, &exit_status, 0) != pid || !WIFEXITED(exit_status) || WEXITSTATUS(exit_status) != 20)
+        fail("a vfork parent goes on after its child's exit panicked");
+    printf("vfork child's exit panicked: parent went on\n");
+
     /* Some threads have not exited yet: the fault still ends the whole process, and the parent
      * sees SIGSEGV. */
     pid = fork();

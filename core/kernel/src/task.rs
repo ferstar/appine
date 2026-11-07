@@ -883,6 +883,22 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
         crate::seccomp::exited(&task, &mut group.borrow_mut());
     });
     if released.is_none() {
+        // The stage stopped part way: what it may not have reached must still happen, or a later
+        // shootdown kicks this thread's freed CPU state and a vfork parent waits for good (both
+        // are idempotent)
+        let left = crate::bug::catch(|| {
+            let mut st = task.state.borrow_mut();
+            if let Some((done, parent)) = st.vfork_done.take() {
+                done.set(true);
+                crate::kernel::signal_later(&parent);
+            }
+            st.mm.borrow_mut().remove_user(&task.sync);
+        });
+        if left.is_none() {
+            crate::bug::report(format_args!(
+                "kernel panic while thread {tid} was leaving its address space"
+            ));
+        }
         let what = format_args!("kernel panic while the thread was exiting");
         crate::bug::kill(&k, &task, pc, what);
     }

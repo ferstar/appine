@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: stale source comments fixed; which template locks the guard misses; failed internal checks under the guard)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; which template locks the guard misses; failed internal checks under the guard; the stale kicker after an exit panic, fixed in the kernel, last)
 
 ## Responsibilities
 
@@ -463,9 +463,6 @@ Tier 1, only CPUID advertised).
   serialized with `attach`, and the kernel attaches new threads and code-group members without
   stopping running ones, so a conditional branch can be rewritten while another thread executes it
   (architecturally unpredictable; in practice old and new targets behave the same).
-- **Stale `Kicker` after a panic in thread exit:** if the kernel's `exit()` panics before the
-  thread leaves the address space's users (including the exit test hook), a later shootdown kicks a
-  freed `Cpu`; if that state was unmapped rather than pooled, the app crashes (kernel-side path).
 - **Locks taken inside guarded code are not all registered:** the template arena lock, the shard
   locks `template_clear` takes all at once (the per-bucket `template_lock` is registered) and the
   perf-map lock are not released on host-fault recovery, so a fault while holding one
