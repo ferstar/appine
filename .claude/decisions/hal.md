@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -69,3 +69,24 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `sockaddr`, used by the kernel too, sits under the DNS header.
 - **Watch out**: Code appended at the end of a file drifts from this order, and the Android cfg branches that moved with their Linux twins were only compiled by CI.
 - **Source**: 9e7bfd5
+
+### D11: Host clock jumps are watched with a cancel-on-set timerfd
+- **What**: `ClockWatch` arms a timerfd at 2^40 s with `ABSTIME` and `CANCEL_ON_SET`, and `take()` reads `ECANCELED` and re-arms it, for the timer thread (kernel/process D19).
+- **Why**: The kernel needs to know when the host's wall clock jumps against the monotonic clock.
+- **Tradeoffs**: It costs one host fd per kernel.
+- **Watch out**: An Android kernel whose seccomp policy forbids timerfd_create silently disables it (`ClockWatch::new` returns None).
+- **Source**: 63b9e59
+
+### D12: pagemap tells whether a private file mapping holds written pages
+- **What**: `has_private_pages` reads pagemap for pages present without the file bit or swapped, sharing one pagemap fd with `touched_pages`.
+- **Why**: fork needs to know whether a private file mapping has pages written since it was mapped (kernel/mm D22).
+- **Tradeoffs**: One pread per call.
+- **Watch out**: Hosts that hide pagemap fall back to "has private pages".
+- **Source**: e03c0cc
+
+### D13: The host's `/proc/vmstat` is read through hal
+- **What**: `host_vmstat` returns the host's text, or None when it is unreadable or on non-Linux hosts (kernel/procfs D18).
+- **Why**: The kernel layer reads host files through hal.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 60921b2

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -103,15 +103,15 @@
 - **What**: kernel/process covers tasks, execve and the ELF loader, the BKL and fast path, waits and futexes, timers, PID 1 and namespaces, leaving mount trees to kernel/vfs, network namespaces to kernel/netns and credentials to kernel/cred.
 - **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source (wake channels, fast-path coverage, timer-thread duties, boot plan, pid-namespace orphans).
 - **Tradeoffs**: The map is large because the module spans many files, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `uid_map` writes trusting the writer rather than the opener, a stale user after a panic in the first stage of thread exit, `wait` ignoring `__WCLONE`/`__WALL` and `exit_signal`, and a non-atomic `unshare`.
-- **Source**: dd6c288
+- **Watch out**: Bugs confirmed at the split or found by Starnix's tests stay open in the map, among them `uid_map` writes trusting the writer rather than the opener, a stale user after a panic in the first stage of thread exit, `wait` ignoring `__WCLONE`/`__WALL` and `exit_signal` (the starnix-wait case skips its tests), a non-atomic `unshare`, futex waiters on replaced private memory never woken and the ELF loader's handling of unusual program headers.
+- **Source**: dd6c288 (bug list since updated by 1459292 and 4e64e74)
 
 ### D15: Guest times saturate at KTIME_MAX through one helper
-- **What**: `timespec()` in `syscall/mod.rs` validates guest timespecs and saturates them at KTIME_MAX, and `read_timespec`, the fast path's reader, `timer_settime` and `read_itimerval` all use it, so deadlines stay plain `Instant`s and timers report the saturated time left as Linux does.
+- **What**: `timespec()` in `syscall/mod.rs` validates guest timespecs and saturates them at KTIME_MAX, and `read_timespec`, the fast path's reader, `timer_settime` and `read_itimerval` all use it, so deadlines (monotonic instants, or clock times in `itimer::Expiry` since D19) cannot overflow and timers report the saturated time left as Linux does.
 - **Why**: `Instant + Duration` panics on overflow, so any valid timespec with a huge `tv_sec` (`sleep infinity`, futex waits, timers) killed the calling process.
 - **Tradeoffs**: Readers of guest times that do not go through the helper stay unprotected.
 - **Watch out**: A new reader of guest times added without the helper brings the panic back (a map gotcha).
-- **Source**: 96cd8bd
+- **Source**: 96cd8bd; 63b9e59
 
 ### D16: Orphans of a dying pid namespace go to the built-in init
 - **What**: A namespace's pid 1 is chosen as the new parent only while the namespace is not dead, so a dying namespace's orphans fall through to the built-in init, which reaps them at once and lets the held init be released when the namespace empties.
@@ -133,3 +133,63 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `store_changed` sits at the end of machine.rs, away from `RUNNING`, which describes it.
 - **Watch out**: Code appended at the end of a file drifts from this order; bug.rs, debug.rs and syscall/mod.rs are not in the module registry.
 - **Source**: 0758e3c
+
+### D19: Wall-clock deadlines stay on their own clocks
+- **What**: `itimer::Expiry` keeps a deadline as a monotonic instant or as a time on its host clock, mapping clocks as Linux's `__hrtimer_init` does (absolute realtime and TAI on the realtime clock, boottime on the boottime clock, relative realtime on monotonic); waits re-derive their instant on every pass, and the timer thread watches the host for clock jumps (hal D11) and wakes every task when one happens, for timerfds (kernel/vfs D23) and message queues (kernel/ipc D3) too.
+- **Why**: Absolute realtime and boottime deadlines were turned into monotonic instants when set, so they fired late after the device slept or the wall clock was stepped.
+- **Tradeoffs**: A clock jump wakes every thread once, and alarm clocks still cannot wake a sleeping device.
+- **Watch out**: An instant cached across a wait comes back late, and without the host watch (non-Linux hosts, a seccomp policy refusing timerfds) jumps go unnoticed until something else wakes the waiter.
+- **Source**: 63b9e59
+
+### D20: A thread leaving a live process hands its shared pending signals on
+- **What**: The exit path of a thread that is not the last calls `signal::retarget` with every shared pending signal once the thread has left its group, as Linux's `exit_signals` does (kernel/signal D16).
+- **Why**: A process signal left for an exiting thread could wait forever while the other threads slept.
+- **Tradeoffs**: None known.
+- **Watch out**: None known beyond kernel/signal D16's repeated wake-ups.
+- **Source**: 22e2b41
+
+### D21: An exited main thread is remembered until its process is reaped
+- **What**: `ThreadGroup::leader_exit` keeps the exited leader's name and CPU time, set at exit for tid == tgid and cleared when another thread's execve takes over the tgid, so procfs can show it as a zombie (kernel/procfs D17).
+- **Why**: The exited leader's name and CPU time lived only on its Task, which leaves the task table at exit.
+- **Tradeoffs**: None known.
+- **Watch out**: None known.
+- **Source**: 79a60cf
+
+### D22: `RLIMIT_MSGQUEUE` starts at 819200 bytes
+- **What**: The message-queue limit defaults to (819200, 819200), as on Linux.
+- **Why**: appine reported it unlimited where Linux reports 819200.
+- **Tradeoffs**: The limit is still not enforced by mq_open.
+- **Watch out**: None known.
+- **Source**: 97b1d62
+
+### D23: sched_setattr accepts the keep and clamp flags and short structures
+- **What**: The keep flags are resolved before validation in `sys_sched_setattr`'s order, utilization clamps are recorded on the task and inherited like Linux's `uclamp_req`, and a structure shorter than the current version is read into a zeroed full-size buffer.
+- **Why**: Linux 6.1 accepts these flags (with uclamp built in, as on Android) and refusing them broke tools that only meant to set a hint; the first fix then read past the 48-byte first version and killed the caller.
+- **Tradeoffs**: The clamps change nothing on the host, and clamp flags with the short structure are still `EINVAL`.
+- **Watch out**: Other syscalls taking versioned structures may read past a short copy the same way (LTP's clone3, openat2 and mount_setattr tests would show it).
+- **Source**: bc44b65, e43c40c
+
+### D24: CLONE_PARENT children take their creator's exit signal
+- **What**: With `CLONE_PARENT` the child's exit signal is copied from the creating thread group, as Linux does.
+- **Why**: Linux sets `exit_signal` from the current group leader for `CLONE_PARENT`, and appine used the requested one.
+- **Tradeoffs**: ptrace still picks the fork or clone event from the requested signal, as Linux does.
+- **Watch out**: None known.
+- **Source**: 14dede6
+
+### D25: Timer signals for an exited thread are dropped
+- **What**: A thread-targeted POSIX timer signal goes to its task only if that task still exists in the timer's process, and otherwise nothing is sent.
+- **Why**: Linux's `posix_timer_event` finds no task and sends nothing, where appine fell back to the process.
+- **Tradeoffs**: A thread of the same process that reused the number still receives it, where Linux's pinned pid would not.
+- **Watch out**: None known.
+- **Source**: d98f60b
+
+### D26: Robust futex cleanup breaks copy-on-write
+- **What**: Marking a robust lock owner-died translates its address, breaking copy-on-write or faulting the page in when needed, before the existing compare-and-swap loop.
+- **Why**: Linux's `handle_futex_death` faults the page in writable, while appine's translate does not break copy-on-write, so locks on such pages were skipped (kernel/mm's rule for writers through translate).
+- **Tradeoffs**: A lent page is recalled from its borrowers during the dying thread's exit.
+- **Watch out**: None known.
+- **Source**: e4d3386
+
+## Superseded
+
+- ~~Deadlines stay plain `Instant`s (D15 in part, 96cd8bd)~~ → replaced by **D19** in 63b9e59 (2026-11-07)

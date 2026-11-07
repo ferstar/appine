@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
 - **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
 - **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check and no poll notifications.
-- **Source**: c5236a1 (bug list since updated by 173da76)
+- **Watch out**: Bugs confirmed at the split or found by Starnix's tests stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check, no poll notifications, `/proc/<pid>/fd` open to everyone, `/proc/sys` permissions following plain DAC and no zoneinfo, pressure or kallsyms files.
+- **Source**: c5236a1 (bug list since updated by 173da76 and 4e64e74)
 
 ### D10: `/proc/stat`'s btime is computed in nanoseconds on every read and follows the time namespace
 - **What**: Each read takes realtime in nanoseconds minus `with_boot_offset(uptime_ns())`, then whole seconds (no less than 0), so btime stays fixed and moves back by the reader's boottime offset.
@@ -96,5 +96,54 @@
 - **What**: pseudo.rs runs lookup, stat and readdir, per-process files, system-wide files, /proc/<pid>/net, sysfs, writing, contents and shared helpers; cgroup.rs goes from mkdir through reading, writing, fork, the OOM killer and device programs to members; bpf.rs runs programs, verifier, interpreter; syscall/bpf.rs follows dispatch order; syscall/mqueue.rs, filed here, puts the calls taking a name before those taking an fd.
 - **Why**: The user wanted each Rust file to read in the order its code runs, as the Kotlin code does since a546fea; pseudo.rs had 57 functions above their first caller.
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `write_mem` stays with `read_mem`, and `file_mode` with `FILES` since stat calls it.
-- **Watch out**: Code appended at the end of a file drifts from this order; syscall/mqueue.rs is not in the module registry.
-- **Source**: a63a7b4
+- **Watch out**: Code appended at the end of a file drifts from this order; syscall/mqueue.rs has since been registered under kernel/ipc.
+- **Source**: a63a7b4; registry since 4140c75
+
+### D14: Loop devices appear under `/sys/block`
+- **What**: Each loop device has a node under a new `/sys/block/` with dev, removable, ro, size, `queue/*` and, while bound, `loop/*`, read from `Loops::sysfs_read`, as plain directories like `/sys/class/net`.
+- **Why**: LTP's ioctl_loop tests check loop state there, and statx11's setup loops forever without `/sys/block/<dev>/queue`.
+- **Tradeoffs**: There is no `/sys/dev/block` and no uevents, so ioctl_loop05 and udev-style lookups still fail.
+- **Watch out**: Tools expecting `/sys/block` entries to be symlinks into `/sys/devices` can misbehave.
+- **Source**: a26c8b4
+
+### D15: Memory views follow Linux's stack and file-name rules
+- **What**: `/proc/sys/vm/mmap_min_addr` is a global sysctl (writes need `CAP_SYS_RAWIO`), VmStk comes from grows-down VMAs, newlines in mapped file paths print as `\012`, and `/proc/<pid>/mem` grows stacks within the accessor's `RLIMIT_STACK`.
+- **Why**: mmap_min_addr had no sysctl, VmStk read 0 and maps printed newlines in file names raw.
+- **Tradeoffs**: VmData, VmExe and VmLib stay approximate.
+- **Watch out**: None known.
+- **Source**: e03c0cc
+
+### D16: Common sysctls exist, and root can write the read-only ones
+- **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions.
+- **Why**: Setup scripts write these sysctls and checkers read them, and `sysctl -p` and `sysctl -w` failed where Linux succeeds because the files were missing or read-only for root.
+- **Tradeoffs**: The recorded values change nothing, and randomize_va_space starts at 0, true of appine's fixed layout, where Linux starts at 2.
+- **Watch out**: Programs that read a recorded value back may act as if the setting applied.
+- **Source**: 42d2ffe
+
+### D17: An exited main thread shows as a zombie until the process is reaped
+- **What**: The process directory no longer falls back to the first live thread: listing, link and thread counts, state (Z for the exited leader), comm and CPU time use `ThreadGroup::leader_exit` (kernel/process D21), exe is `ENOENT` without a live task, and `/proc/<tid>`'s state follows that thread.
+- **Why**: Linux keeps an exited main thread as a zombie until the group is reaped, while appine dropped it and let the process directory describe another thread, which alone failed 35 Starnix tests.
+- **Tradeoffs**: Entries that need a task (cmdline, maps, fd/, the mount namespace) behave as for a zombie while the rest of the process runs, as on Linux.
+- **Watch out**: Code that reached a live thread's state through the process directory after the leader exited gets nothing (none was found in the kernel).
+- **Source**: 79a60cf
+
+### D18: `/proc/vmstat` is the host's
+- **What**: `/proc/vmstat` copies the host's file read through hal (D13 there), or a 16-line fallback when it cannot be read.
+- **Why**: procps' vmstat cannot start without it, and meminfo already shows the host's memory figures (D3).
+- **Tradeoffs**: The counters are the whole device's, not the guest's, and the fallback's event counters are 0.
+- **Watch out**: Android may refuse `/proc/vmstat` to apps, so phones are likely to show the fallback.
+- **Source**: 60921b2
+
+### D19: Thread names are shown as their bytes
+- **What**: `comm_of` returns bytes, and comm, stat and status are built as byte vectors, with status escaping the name as Linux does.
+- **Why**: Linux prints the raw bytes of a thread name, which Rust strings cannot hold when they are not UTF-8.
+- **Tradeoffs**: Log lines elsewhere (OOM kills, bug reports, the kernel log) still show the name lossily.
+- **Watch out**: None known.
+- **Source**: 6591eb6
+
+### D20: status splits VmRSS into RssAnon, RssFile and RssShmem
+- **What**: status prints the three lines from kernel/mm's `resident_split` (D26 there) and VmRSS as their sum.
+- **Why**: Linux's status has these lines, and VmRSS is their sum.
+- **Tradeoffs**: statm and stat still use `resident_pages`, which can differ slightly from status.
+- **Watch out**: None known.
+- **Source**: 566da95

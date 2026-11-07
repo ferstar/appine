@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/net covers `net.rs`, `syscall/net.rs`, raw ICMP, the routing table, the port map, traffic counters and `SO_ORIGINAL_DST`, with host socket wrappers in hal and the namespace hooks described from kernel/netns's side.
 - **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits.
 - **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `MSG_PEEK|MSG_WAITALL` duplicating data, blocking connect ignoring `SO_SNDTIMEO`, accept4 leaking fds, unchecked recvmsg iovec sums, non-resumable netlink dumps, one echo id per raw ICMP socket and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them accept4 leaking fds, an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, unsupported rtnetlink changes skipping the capability check, one echo id per raw ICMP socket and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3 (bug list since updated by 58ce3df and 4e64e74)
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -91,6 +91,41 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `ensure_bound`, `register_udp` and `count_connect` stay with binding although sending and options use them too.
 - **Watch out**: Code appended at the end of a file drifts from this order, and a constant paragraph shared by several sections must stay above its first user (`IPPROTO_*` was once carried to the end and moved back by hand).
 - **Source**: 412ffba
+
+### D13: Socket read, write, readv and writev are one recv or send
+- **What**: `net::rw` does one recv of the iovecs' total (capped at `MSG_MAX`) scattered in order, and gathers writes into one send for message sockets or 1 MiB sends for streams until done or short (kernel/vfs D22).
+- **Why**: Linux's `sock_read_iter`/`sock_write_iter` make each call one recvmsg or sendmsg, while appine wrote 64 KiB chunks per iovec and capped reads at 64 KiB.
+- **Tradeoffs**: A message over 1 MiB is cut to `MSG_MAX`, as sendmsg already did.
+- **Watch out**: A blocking stream write of many MiB now goes in 1 MiB sends, which shows only in partial progress under signals.
+- **Source**: b295644
+
+### D14: MSG_WAITALL waits for the whole length on TCP
+- **What**: recv keeps reading and waiting between pieces until it has the length or meets nonblocking, a timeout, a signal, end of file or a host error, a peek re-reads from the head with the host's `SO_RCVLOWAT` raised for the wait, and recvfrom and recvmsg continue past 1 MiB piece by piece.
+- **Why**: Fixed-size readers using MSG_WAITALL got short reads, and `MSG_PEEK|MSG_WAITALL` returned corrupted data, once data arrived in more than one piece.
+- **Tradeoffs**: An error after a partial read is lost (the host already took it), a peek against a buffer that can never hold the length returns the part where Linux blocks, and AF_UNIX is not covered.
+- **Watch out**: Another thread polling the socket sees the raised `SO_RCVLOWAT` while a peek waits, and a fault on a later piece loses that piece's data.
+- **Source**: 58ce3df
+
+### D15: recvmsg and sendmsg check iovecs in `import_iovec`'s order
+- **What**: A negative length is `EINVAL`, an iovec reaching past 2^48 (arm64's `TASK_SIZE_MAX`) is `EFAULT`, and the total is cut to `MAX_RW_COUNT` by shortening the iovec that reaches it.
+- **Why**: recvmsg summed the guest's iovec lengths unchecked and accepted negative lengths.
+- **Tradeoffs**: `TASK_SIZE_MAX` is fixed at 48-bit addresses, where a 52-bit Linux accepts up to 2^52.
+- **Watch out**: sendmsg shares `read_msghdr` and returns the same new errors.
+- **Source**: 09188ec
+
+### D16: Blocking connect honours `SO_SNDTIMEO` and restarts after signals
+- **What**: The host's `EALREADY` on a blocking socket joins the wait, a timeout returns the host's own answer (`EINPROGRESS` or `EALREADY`), and a signal is `ERESTARTSYS` without a timeout and `EINTR` with one.
+- **Why**: Programs bound connects with `SO_SNDTIMEO` or rely on `SA_RESTART` handlers (SIGWINCH on resize, SIGCHLD) not to break a blocking connect, and appine ignored the first and broke the second.
+- **Tradeoffs**: A restarted connect redoes routing and nat before the host says `EALREADY`, though nothing is sent twice.
+- **Watch out**: None known.
+- **Source**: 5296a0a
+
+### D17: A listen counts as reported only once it is queued
+- **What**: The port map checks the 32-event queue's room before marking a listen reported, so a listen dropped while the queue was full is reported when the program listens again.
+- **Why**: Marking it first lost the listen for good, so the app was never told about its mapped port.
+- **Tradeoffs**: A dropped listen is reported only if the program listens on it again.
+- **Watch out**: None known.
+- **Source**: 6adbd6c
 
 ## Superseded
 

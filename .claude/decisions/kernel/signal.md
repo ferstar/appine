@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -89,8 +89,8 @@
 - **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log and the Linux 6.1 ABI contract (uname, the ENOSYS policy, clock setting), leaving host-side signal handling to engine and auxv to kernel/process.
 - **Why**: The retired design doc's §7 was the only current-state description of signals, ptrace, core dumps and the ABI contract, and it said nothing about generation and delivery semantics.
 - **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them silent group kills on unwritable or bad frames, stalled process-directed signals, `kill(tid)` returning `ESRCH`, coalesced siginfo, hardware slots left armed after detach, late single-step reports and unforced ptrace reads.
-- **Source**: 9e5be2b
+- **Watch out**: Bugs confirmed at the split or found by Starnix's tests stay open in the map, among them silent group kills on unwritable or bad frames, an early `CLD_STOPPED`, coalesced siginfo, hardware slots left armed after detach, late single-step reports, unforced ptrace reads and `MADV_DONTNEED` wiping the vDSO.
+- **Source**: 9e5be2b (bug list since updated by 4e64e74)
 
 ### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
 - **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
@@ -105,3 +105,24 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; Default impls stay before the inherent impls, as constructors.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: bf240bc
+
+### D15: kill takes a thread's id for its process
+- **What**: A positive pid names the thread group with that id if one exists (so a group whose leader has exited stays reachable) and otherwise the thread group of the task with that id, as Linux's `kill_pid_info` does.
+- **Why**: Users pick threads by id in htop and `top -H`, and kill returned `ESRCH` for them.
+- **Tradeoffs**: None known.
+- **Watch out**: None known.
+- **Source**: f85963d
+
+### D16: Process signals are retargeted to a thread that will take them
+- **What**: `retarget` wakes, per signal, the first thread that does not block it; delivery calls it for shared pending signals the thread blocks, thread exit for all of them (kernel/process D20), and group sends skip threads in a ptrace stop.
+- **Why**: Linux retargets shared pending signals when a thread blocks them or exits and never picks a stopped or traced thread, while appine left them with the chosen thread, so Ctrl-C or SIGTERM sometimes did nothing.
+- **Tradeoffs**: While such a signal stays pending, every delivery on the blocking thread kicks the other thread again, and `CLD_STOPPED` still comes early.
+- **Watch out**: A thread that blocks a signal another thread is slow to take wakes that thread repeatedly until it does.
+- **Source**: 22e2b41
+
+### D17: Detaching at a syscall stop keeps the syscall number
+- **What**: Detach keeps `syscallno` with the stop and saved registers of a stopped thread, and a tracer's exit detaches through the same path.
+- **Why**: The number of a thread stopped at syscall entry lives in its trace state so the tracer can change it, and detach reset it to 0.
+- **Tradeoffs**: None known.
+- **Watch out**: Other trace-state fields a stopped thread reads after resuming would be lost the same way, since only stop, regs, resume and syscallno are kept.
+- **Source**: b877707

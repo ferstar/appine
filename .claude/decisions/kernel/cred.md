@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -54,8 +54,8 @@
 - **What**: kernel/cred covers `cred.rs` except user namespaces, `syscall/cred.rs` and `seccomp.rs`, while user namespaces stay in kernel/process.
 - **Why**: §11.1's credential and seccomp design had to leave the retired design doc, and the user asked for a module of its own.
 - **Tradeoffs**: User namespaces sit in kernel/process although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading.
-- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, global pids in seccomp notifications, privilege gains despite a shared fs context, untranslated `PRIO_USER`, new-file modes and the ptrace access checks.
-- **Source**: 12c4afa
+- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, global pids in seccomp notifications, privilege gains despite a shared fs context, untranslated `PRIO_USER`, new-file modes, the ptrace access checks and the vDSO bypassing seccomp for every clock, alarm clocks included.
+- **Source**: 12c4afa (bug list since updated by 4e64e74)
 
 ### D8: Credential and seccomp files read in the order their code runs
 - **What**: cred.rs runs credentials and file capabilities with the user namespace types (owned by kernel/process) last and `impl Cred`'s entry points before id translation and scope checks; syscall/cred.rs runs id syscalls, capabilities, then committing; seccomp.rs goes from installing filters through syscall entry, the sysctls, user notifications, ptrace and thread exit to the always-allow cache, cBPF and shared helpers; constants several sections use stay at the top.

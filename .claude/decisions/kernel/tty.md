@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -55,7 +55,7 @@
 - **Why**: The reversed direction and non-blocking TCOOFF made CPython's test_termios and test_ioctl hang until their 20-minute timeouts.
 - **Tradeoffs**: none
 - **Watch out**: Output stopped by `TCOOFF` cannot be restarted by `^Q`.
-- **Source**: round 75 (`75-pty-flow`)
+- **Source**: round 75 (`75-pty-flow`); 8dc166b
 
 ### D8: The host console mimics `script` at end of input
 - **What**: Each app tab and each `appine-run` session is a console with a new session leader; when the host's input ends, the bridge waits until the program has read what was sent and then sends `VEOF` instead of hanging up.
@@ -68,8 +68,8 @@
 - **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
 - **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
 - **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `TIOCSCTTY` stealing terminals without privilege, echoes growing the output without limit, non-canonical read timing, pending input hidden on switching to canonical mode, no `SIGTTOU` for background tcflush/tcflow/tcdrain and an extra `SIGCONT` at a session leader's exit.
-- **Source**: 5d21cc4
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them echoes growing the output without limit, non-canonical read timing, no `SIGTTOU` for background tcflush/tcflow/tcdrain, an extra `SIGCONT` at a session leader's exit and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
+- **Source**: 5d21cc4 (bug list since updated by 24ecd25 and 4e64e74)
 
 ### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
 - **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
@@ -91,3 +91,22 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; Default impls for `Termios` and `Winsize` stay before the inherent impls, and terminal.rs's shared helpers section holds one function.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 688efa0
+
+### D13: The line discipline is a port of Linux's n_tty
+- **What**: Input waits in a 64 KiB `unprocessed` buffer (Linux's flip buffer) and enters the 4095-byte line discipline as it has room, also on slave reads and termios changes, with n_tty's special-character order, ECHOPRT and column-aware erase, output processing with the cursor column, an echo queue committed per batch, lines carrying their VEOF mark, queued input merged on mode switches and TCFLSH as `pty_flush_buffer`.
+- **Why**: Starnix's recorded PTY scenarios showed the line discipline differing from Linux in 37 cases (missing ECHOPRT, ONOCR, ONLRET, OLCUC, XTABS, IUCLC, ISTRIP, PARMRK and EXTPROC handling, erase echo without columns, ECHOCTL rules, flushes, packet status, input lost on mode switches).
+- **Tradeoffs**: Signal characters discard output Linux may already have passed on, IMAXBEL, HUPCL, VDISCARD and flow-control lookahead stay unimplemented, and master writes now block at 64 KiB of unprocessed input instead of 4096 bytes.
+- **Watch out**: Programs that relied on the old leniency (TIOCSTI past a full buffer, TCIOFF under TCOOFF) see Linux's behaviour, and input processed on slave reads sends its signals from the reader's thread.
+- **Source**: 24ecd25, 8dc166b
+
+### D14: Taking a terminal needs read access, and stealing one needs `CAP_SYS_ADMIN`
+- **What**: TIOCSCTTY takes another session's terminal only with argument 1 and `CAP_SYS_ADMIN` and needs `CAP_SYS_ADMIN` through an fd without read access, and opening a slave acquires it only for reading opens, with readability passed in by the vfs (kernel/vfs D26).
+- **Why**: Any session leader holding an fd to a terminal, even a write-only one or the stdin a sandbox inherits, could make it its controlling terminal and read its input and signals.
+- **Tradeoffs**: `CAP_SYS_ADMIN` counts only in the initial user namespace, as Linux's `capable()` does, so container root cannot steal terminals either.
+- **Watch out**: `OpenFile::readable` treats access mode 3 as readable where Linux's `FMODE_READ` does not, so an ioctl-only open still takes a terminal.
+- **Source**: 838b5b4
+
+## Superseded
+
+- ~~Output stopped by ^S kept in the queue behind a mark (`held_from`, D7 in part, round 75)~~ → replaced by **D13** in 8dc166b (2026-11-07)
+- ~~The line-discipline subset described at the module split (5d21cc4)~~ → replaced by **D13** in 8dc166b (2026-11-07)

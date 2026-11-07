@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -43,9 +43,9 @@
 ### D7: Selection, paste, mouse and focus go through libghostty-vt
 - **What**: Under the tab's lock, vt.c keeps the selection as the terminal's own (a long press selects a word as a tracked anchor, finger or handle drags extend it and autoscroll beyond the grid), pastes through `ghostty_terminal_paste` (asking with a preview when it returns REJECTED), and encodes mouse clicks and wheel, alternate-scroll arrows (mode 1007) and focus (mode 1004); frame and row headers carry the selection for `VtView`'s highlight and handles, keys add releases and lone modifiers for the Kitty protocol, and the IME turns a lone newline into Enter and a multi-line commit into a paste.
 - **Why**: The prototype could only type keys and scroll: no copy or paste, no mouse for programs that track it, and unsafe multi-line pastes ran at once; libghostty-vt's selection tracks its cells through output, soft wraps and scrollback, which a Kotlin selection over the screen mirror could not.
-- **Tradeoffs**: A long press always selects, even when the program tracks the mouse, which gets only clicks and the wheel; no double- or triple-tap or rectangular selection; handles do not flip at the edges; every selection change costs a full frame; typing ends a selection.
+- **Tradeoffs**: No triple-tap or rectangular selection; handles do not flip at the edges; every selection change costs a full frame; typing ends a selection.
 - **Watch out**: Grid references from the API are valid only until the terminal changes, so vt.c must take fresh ones per call; under the Kitty protocol a program that exits without popping its flags leaves the shell receiving CSI u keys, Ctrl-C included.
-- **Source**: ee830a0
+- **Source**: ee830a0; 62f6092 (mouse tracking and double taps replaced by D25)
 
 ### D8: libghostty-vt is the only terminal, and each tab is a `VtSession` owned by the service
 - **What**: `TerminalService` owns one `VtSession` per tab, which keeps parsing output without a view (starting its shell once a view knows the grid, printing restored text and queued messages first, with pump, waiter and writer threads); `MainActivity` has a single `VtView` that tabs attach to and closes an ended tab on Enter; the Termux libraries, `TermuxSession` and the `Session` interface are gone, `ConsolePty` keeps only start, waitFor and close, and the fonts are main assets.
@@ -159,6 +159,13 @@
 - **Watch out**: `renderTabs` matches tabs by position, relying on sessions being added only at the end (reordering tabs would need matching by session); Close other tabs is untried; seen only on an API 34 emulator.
 - **Source**: afd086a
 
+### D25: Mouse-tracking programs get drags, hover and real clicks; a double tap selects a word
+- **What**: In mouse mode a long press selects the word and becomes a left-button drag once moved past the touch slop, mouse and touchpad presses bypass the gestures with their buttons and modifiers, hover goes as button-less motion, `VtView` detects double taps itself (selecting a word only without mouse tracking), and vt.c deduplicates motion per cell except in SGR-Pixels.
+- **Why**: Programs tracking the mouse could not be dragged in or hovered over, double clicks in them lost the second click, and selecting a word needed a long press.
+- **Tradeoffs**: A finger drag in a program needs a long press first, a still long press stays the terminal's selection so programs get no long click, there is no triple tap, and a double tap right after hiding the keyboard can select another row.
+- **Watch out**: Touchpads reporting taps without `SOURCE_MOUSE` go through the gestures, mode 1003 hover while scrolled back returns the view to the bottom, and a press begun before tracking was turned on stays with the gestures.
+- **Source**: 62f6092
+
 ## Superseded
 
 - ~~D1: Termux's terminal libraries are vendored, with `TerminalSession` rewritten around a PTY interface~~ → replaced by **D8** in b38d29c (2026-11-04)
@@ -173,3 +180,4 @@
 - ~~The tab bar and extra keys in the surface container colour (D13 in part, d16025a)~~ → replaced by **D14** in 883e652 (2026-11-05)
 - ~~A long press toggles a modifier, locking only from off, and a locked modifier is underlined (D12 in part, c3c3b38)~~ → replaced by **D12** in ba60e25 and **D20** in d48dd10 (2026-11-06)
 - ~~The current tab told apart by the primary colour (D13 in part, d16025a), then boxed in a 2 dp outline with a bold number (1eac62e)~~ → replaced by **D20** in d48dd10 (2026-11-06)
+- ~~A long press always selects even when the program tracks the mouse, which gets only clicks and the wheel, and there is no double-tap selection (D7 in part, ee830a0)~~ → replaced by **D25** in 62f6092 (2026-11-07)

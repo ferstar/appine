@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -33,8 +33,8 @@
 - **What**: kernel/unix covers `unix.rs` and `syscall/unix.rs`, separate from kernel/net.
 - **Why**: The retired design doc's §10 gave a single line to a full in-process socket family with its own garbage collector.
 - **Tradeoffs**: Its map was verified more lightly (two research concerns, one verifier) than the large modules'.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them no `ECONNRESET`, datagram sends raising `SIGPIPE`, stream reads split and merged at the wrong places, zero-length recv blocking, `shutdown` refusing unconnected sockets and wrong `SO_PEERCRED` values without a peer.
-- **Source**: c3df5d3
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them no `ECONNRESET`, datagram sends raising `SIGPIPE`, stream reads split and merged at the wrong places and wrong `SO_PEERCRED` values without a peer.
+- **Source**: c3df5d3 (bug list since updated by 2b72eeb)
 
 ### D5: AF_UNIX parses socket timeouts with kernel/net's parser
 - **What**: Unix sockets use net's `timeval()` for `SO_RCVTIMEO` and `SO_SNDTIMEO` instead of their own copy.
@@ -49,3 +49,10 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 2847887
+
+### D7: Zero-length reads and shutdown of unconnected sockets answer as Linux does
+- **What**: A stream read of nothing with data queued returns 0 and passes the head message's files (moved, or cloned with `MSG_PEEK`) and credentials while leaving its data, and shutdown sets its flags on any socket.
+- **Why**: Programs probing with zero-length reads or shutting a socket down before connecting failed or hung.
+- **Tradeoffs**: Shutdown flags on a listening socket change nothing observable.
+- **Watch out**: None known.
+- **Source**: 2b72eeb

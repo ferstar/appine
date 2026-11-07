@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -73,6 +73,20 @@
 - **Tradeoffs**: A warning stops local builds too, unlike local cargo builds; outdated dependencies and target SDK deadlines fail nothing and must be noticed in the report; formatting stays manual.
 - **Watch out**: Upgrading compileSdk, AGP, Kotlin or a library can surface new deprecations or checks as failures; Play SDK Index errors from outside data can still fail lint; an informational issue ID that a later AGP drops would be reported as unknown, now an error.
 - **Source**: 4c1a3ce
+
+### D11: Route lines with non-ASCII hex fields are skipped
+- **What**: `parse_route` requires its hex fields to be ASCII and otherwise skips the route like any malformed one.
+- **Why**: It sliced the fields by bytes, so a non-ASCII character would panic, and a panic in the JNI layer aborts the app.
+- **Tradeoffs**: None.
+- **Watch out**: Other unwrapped JNI code can still panic (D5's Watch out).
+- **Source**: 09188ec
+
+### D12: The APK bundles the newest Alpine tarball and doas package by version
+- **What**: build.gradle.kts picks both with a `byVersion` comparator that compares the numbers in their names in order, as the scripts do (harness D20).
+- **Why**: Lexical order picks the wrong release as soon as a minor version gains a digit, and the APK bundles whatever the build picks.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: b014e84
 
 ## Superseded
 

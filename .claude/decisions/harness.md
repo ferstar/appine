@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -53,11 +53,11 @@
 - **Source**: rounds 190 (`190-settings-default-alpine`), 198 (`198-power-loss`)
 
 ### D9: The harness module is appine-run plus the layers that drive it
-- **What**: harness holds `hosts/cli`, `tests/{guest,bench,diff,survey,crash}`, the dev container, the difftest, LTP and survey scripts and CI; lockstep stays with engine, `scripts/fetch-rootfs` with android/setup and `scripts/release-sources` with android/native, and design §13.3 remains the overview.
+- **What**: harness holds `hosts/cli`, `tests/{guest,bench,diff,survey,crash,starnix}`, the dev container, the difftest, LTP, Starnix-build and survey scripts and CI; lockstep stays with engine, `scripts/fetch-rootfs` with android/setup and `scripts/release-sources` with android/native, and design §13.3 remains the overview.
 - **Why**: hosts/cli was the last code with no module, its value lies in the test layers that drive it, and those layers' gotchas lived only in personal notes; `harness` names the drivers rather than every test.
 - **Tradeoffs**: "All tests" span two maps (lockstep is in engine), and the map repeats part of §13.3's overview.
 - **Watch out**: Recorded weaknesses let tests pass without running (the low-ports early return, silent skips without a rootfs), and the two difftest sides start from different files, so results can be flaky.
-- **Source**: 16ac7a2 (list since updated by 1f93e3d)
+- **Source**: 16ac7a2 (list since updated by 1f93e3d and 1459292)
 
 ### D10: CI installs a pinned Zig and fetches the Ghostty source for the Android job
 - **What**: The Android job downloads zig-x86_64-linux-0.17.0 from ziglang.org, checks it against the sha256 copied from ziglang.org/download/index.json, puts it on `PATH`, runs `scripts/fetch-ghostty`, and caches `target/ghostty` and `~/.cache/zig` keyed by the script's hash.
@@ -88,11 +88,11 @@
 - **Source**: 96cd8bd, 65c44f6, d8136b6, e020977, ea08993, 68cafce
 
 ### D14: Cases check only what Linux guarantees, not timing or order
-- **What**: Cases count processes with the shell's own glob (`set -- /proc/[0-9]*`) instead of a pipeline that races `ls`, and guest tests accept independent answers (DNS A and AAAA) in either order.
-- **Why**: The bwrap case's count flipped between 3 and 4 depending on whether grep had started, failing CI on unrelated pushes, and the asynchronous DNS stub answers in resolution order.
+- **What**: Cases count processes with the shell's own glob (`set -- /proc/[0-9]*`) instead of a pipeline that races `ls`, guest tests accept independent answers (DNS A and AAAA) in either order, compat2 waits up to 5 s for a joined thread's `/proc/<tid>` to go, and namespaces reads a pipe written by several commands until EOF.
+- **Why**: The bwrap case's count flipped between 3 and 4 depending on whether grep had started, failing CI on unrelated pushes, the asynchronous DNS stub answers in resolution order, and one read or one check right after a join returns whatever has happened so far on either side.
 - **Tradeoffs**: The bwrap case no longer runs ls or grep inside the sandbox and expects "2 processes".
 - **Watch out**: Other cases may still count processes or read `/proc` while their own pipelines run; the map's gotchas say how to count.
-- **Source**: 404a804, fe4bb2b
+- **Source**: 404a804, fe4bb2b, c11c1db, 093cb96
 
 ### D15: Test helpers follow the tests that use them
 - **What**: Test files keep their tests in order, a helper with one user follows it and shared helpers follow all tests in the order they run; tests/bench puts `main` right after the types, then its helpers in call order.
@@ -107,3 +107,43 @@
 - **Tradeoffs**: The toolchain's rust-analyzer is older than the extension's own; each CI job and the dev image download one more component; the lists are kept in two places by hand.
 - **Watch out**: A component added to rust-toolchain.toml but not to the Dockerfile makes every `scripts/dev` call download it again (in the map's gotchas).
 - **Source**: 503022d
+
+### D17: LTP's device tests run on tmpfs over loop devices
+- **What**: scripts/ltp sets `LTP_DEV_FS_TYPE=tmpfs` and lists `CONFIG_BLOCK` and `CONFIG_BLK_DEV_LOOP`, so LTP skips mkfs and mounts a tmpfs on the device's mountpoint, and `tests/diff/loop.sh` defines the loop structures itself, makes its own node for whatever device loop-control hands out and waits for autoclear unbinding.
+- **Why**: Starnix runs LTP's device tests this way, and loop devices (kernel/vfs D21) needed a differential guard.
+- **Tradeoffs**: Tests that need a particular disk filesystem stay TCONF, and ioctl04, inotify03, lstat03, mount02 and umount2_01 fail on Linux's tmpfs too.
+- **Watch out**: Each device test fallocates a sparse 300 MB file in the store's `/tmp`, and the native side shares the host's loop devices, which makes it flaky (recorded in `docs/milestones.md`).
+- **Source**: a26c8b4
+
+### D18: Starnix's PTY scenarios run from files packed into the difftest script
+- **What**: A `# difftest-files:` line makes scripts/difftest pack that `tests/diff/<dir>` as a gzipped, base64 ustar archive prepended to the script, which both sides unpack with busybox into `/tmp/difftest-files/<dir>`, and the line-discipline case runs all 83 of Starnix's recorded scenarios (copied unchanged with Fuchsia's licence) one by one against the native kernel.
+- **Why**: The scenarios and generator are about 410 KB, a difftest script travels as one `sh -c` argument (128 KB limit), neither side has the work tree, and the store should not change for test data.
+- **Tradeoffs**: Packed files count towards the 128 KB, behaviour that changed after 6.1 is compared with the native kernel, and a future failing scenario needs the removed skip mechanism back.
+- **Watch out**: CI's native kernel may trace some scenario differently, the generator's 2 s deadlines leave little margin at Tier 0 (where the case takes about three minutes), and updating the copied files must keep the README's commit current.
+- **Source**: 24ecd25, 8dc166b
+
+### D19: Fuchsia Starnix's syscall tests run as differential cases
+- **What**: scripts/build-starnix-tests builds a pinned Fuchsia commit's tests and a pinned googletest with clang statically against musl into a tarball that scripts/difftest installs into its store when VERSION changes, and the `starnix-*` cases run each test in its own process under `timeout -s KILL 60` with its output in a file, skipping known divergences by negative gtest filter grouped by reason and recorded in kernel maps.
+- **Why**: Starnix's syscall tests are a Linux-validated gtest corpus covering the subsystems appine emulates, and running them on both sides finds divergences no case covered.
+- **Tradeoffs**: Building needs the network and about 4 minutes and adds 158 MB to the store, and without the tarball (as on CI) the cases pass vacuously.
+- **Watch out**: Privileged cases act on the development VM (clock-setting tests move its clock), busybox's `timeout` sends only SIGTERM unless told otherwise, googlesource must keep serving fetches by hash, and a Fuchsia upgrade can change tests and need new skips.
+- **Source**: 1459292, e03c0cc, 612d238, c11c1db
+
+### D20: Alpine tarballs are chosen by version, not by name
+- **What**: difftest, ltp and survey sort with `sort -V`, and the rootfs tests use `version_key` (the numbers in the name), as the APK build does (android/native D12).
+- **Why**: Lexical order picks the wrong release as soon as a minor version gains a digit.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: b014e84
+
+### D21: appine-run refuses an inline value on a flag
+- **What**: A flag given an inline value (such as `--pty=0`) is a usage error with exit status 2, while options that take a value still accept one inline (`--tier=0`).
+- **Why**: appine-run took `--pty=0` as the flag itself, the opposite of what it asked.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: c11c1db
+
+## Superseded
+
+- ~~Line-discipline scenarios skipped by group until fixed (24ecd25)~~ → replaced by **D18** in 8dc166b (2026-11-07)
+- ~~Each Starnix test captured with `$(timeout 60 …)` (1459292, kept in 612d238)~~ → replaced by **D19** in c11c1db (2026-11-07)

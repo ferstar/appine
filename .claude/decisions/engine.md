@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -138,8 +138,8 @@
 - **What**: engine covers the Tier 0 interpreter, the Tier 1 translator, CPU features, the host fault guard, the C API with its Rust bindings and `tests/lockstep`, while the page table and the TLB fill and flush belong to kernel/mm.
 - **Why**: The retired design doc's §4 was the only current-state description of the CPU engine and had drifted from the source (precise state, indirect-branch lookup, flush triggers, feature gating).
 - **Tradeoffs**: D1–D18 cite rounds rather than commits, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them the generated table lookup entering the wrong block for target 0, `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread, internal aborts bypassing the fault guard and unregistered locks inside guarded code.
-- **Source**: f9edf81
+- **Watch out**: Bugs confirmed at the split stay open in the map, among them the generated table lookup entering the wrong block for target 0, `ic ivau` on guest page 0 being lost, conditional-branch relinking racing a new thread and unregistered locks inside guarded code.
+- **Source**: f9edf81 (bug list since updated by e5922b1)
 
 ### D20: Engine files read in the order their code runs
 - **What**: lib.rs is sectioned into the page table, CPU state and exits, Tier 1 and process-wide calls (`Cpu::reset` after `tlb_flush`, as at execve); in tests a helper used by one test follows it and shared helpers follow all tests; lockstep's class functions follow the `CLASSES` table and its runner goes from its types through `run` and `run_class` to the helpers in call order.
@@ -147,3 +147,10 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; in lockstep's classes.rs, `imm_width`, `single_reg` and `pair` sit after their last user, further from their first.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 91fabe2
+
+### D21: A failed internal check ends only the guest process
+- **What**: `appine_guard_fail` unwinds through the armed fault guard like a host fault, recording `SIGABRT` and the caller's address and releasing registered locks, and aborts only when no guard is armed.
+- **Why**: An engine bug caught by a check is no worse than one caught by a host fault, yet it killed the whole app instead of one guest process.
+- **Tradeoffs**: The guest process ends instead of the block falling back to Tier 0, and debug builds, which install no guard, still abort as tests want.
+- **Watch out**: A check reached while holding an unregistered lock (such as the template arena lock) leaves that lock held.
+- **Source**: e5922b1

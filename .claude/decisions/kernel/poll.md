@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -54,8 +54,8 @@
 - **What**: kernel/poll covers `syscall/poll.rs`: the readiness model, ppoll and pselect6, epoll, eventfd2 and signal-driven I/O.
 - **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions.
 - **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them signal-driven I/O signalling any process, `EPOLLEXCLUSIVE` timerfds that may never fire, edge-triggered host sockets stalling without host edges and epoll results lost on `EFAULT`.
-- **Source**: c3df5d3
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them signal-driven I/O signalling any process (no `sigio_perm` check, no `ESRCH`), `EPOLLEXCLUSIVE` timerfds that may never fire, edge-triggered host sockets stalling without host edges, epoll results lost on `EFAULT`, pipe `POLLOUT` counting bytes rather than buffers and epoll_wait not checking its event buffer first.
+- **Source**: c3df5d3 (bug list since updated by 09188ec and 4e64e74)
 
 ### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
 - **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.
@@ -70,3 +70,17 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; the readiness model the module docs describe first now comes near the end.
 - **Watch out**: Code appended at the end of the file drifts from this order.
 - **Source**: d795d07
+
+### D10: epoll_ctl refuses loop devices
+- **What**: `Device::Loop` and `Device::LoopControl` join epoll_ctl's `EPERM` list, while poll keeps reporting them ready.
+- **Why**: Linux's block devices and loop-control have no poll operation, so epoll_ctl refuses them (kernel/vfs D21).
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: a26c8b4
+
+### D11: eventfd reads scatter over iovecs
+- **What**: eventfd reads go through `read_scattered`, so the 8-byte value may span iovecs, while writes stay per-iovec as Linux's plain write operation does (kernel/vfs D22).
+- **Why**: eventfd readv checked each iovec separately.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: b295644

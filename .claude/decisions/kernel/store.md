@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -75,8 +75,8 @@
 - **What**: kernel/store covers `vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs` and the host wrappers in `lib.rs` (the namespace and objects, deferred commits and power-loss ordering, the reaper and checkpoints, boot cleanup, the metadata cache, import and the browse API), with the VFS layer above it in kernel/vfs.
 - **Why**: The retired design doc's §8.1 described the store in prose that had drifted from the code.
 - **Tradeoffs**: The rationale lives only in this decisions file, and rounds keep § references to the design doc of their time.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `linkat` re-linking nlink-0 files, memfds owned by root, leaked objects and misreported import errors.
-- **Source**: c5236a1
+- **Watch out**: Bugs confirmed at the split stay open in the map: leaked objects and misreported import errors.
+- **Source**: c5236a1 (bug list since updated by 907b82b and c108be0)
 
 ### D11: Boot cleanup keeps the numbers it removed away from the reaper
 - **What**: `remove_orphans` drops the inode numbers it just deleted from the doomed list, so the boot commit hands none of them to the reaper.
@@ -98,3 +98,17 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `remove_lost_objects` stays in boot cleanup although commit calls it too.
 - **Watch out**: Code appended at the end of `impl Store` or of a file drifts from this order.
 - **Source**: 27365c6
+
+### D14: memfds belong to their creator's filesystem ids
+- **What**: `create_anonymous` takes a uid and gid and writes them into the new row in the same transaction, and memfd_create passes the caller's fsuid and fsgid (kernel/vfs D27).
+- **Why**: Linux's memfd inode is owned by its creator, and root-owned memfds broke fchmod and ownership checks for every other user.
+- **Tradeoffs**: None known.
+- **Watch out**: None known.
+- **Source**: 907b82b
+
+### D15: An unlinked inode cannot get a new name
+- **What**: `Store::link` returns `ENOENT` for a row with link count 0, after the directory check, as Linux's `vfs_link` does (kernel/vfs D28).
+- **Why**: An nlink-0 inode's object is deleted after the next commit, so a new name would dangle and boot cleanup would never remove it.
+- **Tradeoffs**: O_TMPFILE's `I_LINKABLE` exception has no counterpart, since O_TMPFILE is not implemented.
+- **Watch out**: None known.
+- **Source**: c108be0

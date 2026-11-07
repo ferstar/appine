@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
@@ -39,9 +39,9 @@
 ### D5: Device nodes are dispatched by device number to in-process implementations
 - **What**: Opening any character-device node, wherever it is, selects the implementation from its device number (null, zero, full, random, kmsg; tty, console, ptmx and pts routed to the terminal layer); unknown numbers are `ENXIO`.
 - **Why**: This is Linux's static `/dev` plus devpts model: guests can copy or mknod nodes (for example into a chroot) and get the same behaviour, and deleted standard nodes come back at the next boot.
-- **Tradeoffs**: There are no block devices or loop devices, so mounts of disk filesystems are impossible.
+- **Tradeoffs**: Loop devices (D21) are the only block devices, and with no disk filesystems nothing can be mounted from them.
 - **Watch out**: nodev mounts and the cgroup BPF device filter must be checked before dispatch.
-- **Source**: rounds 04 (`04-m3a`), 05 (`05-m3b`), 184 (`184-boot-tmpfs`)
+- **Source**: rounds 04 (`04-m3a`), 05 (`05-m3b`), 184 (`184-boot-tmpfs`); a26c8b4
 
 ### D6: Mount propagation is accepted but not emulated; remount changes only one mount
 - **What**: shared, slave, private and unbindable are validated and then ignored, so every mount behaves as private; remount changes the flags of the one mount (tmpfs size options excepted, which belong to the instance).
@@ -107,11 +107,11 @@
 - **Source**: round 185 (`185-protected-links-random`); 12c4afa
 
 ### D15: Mounts, fds, file syscalls, pipes, locks, devices and inotify are one kernel/vfs module
-- **What**: kernel/vfs covers path resolution, the mount table and namespace tables, tmpfs instances, fd tables and file I/O, metadata syscalls, xattrs, pipes and FIFOs, locks and leases, device nodes, timerfd and inotify, with eventfd in kernel/poll.
+- **What**: kernel/vfs covers path resolution, the mount table and namespace tables, tmpfs instances, fd tables and file I/O, metadata syscalls, xattrs, pipes and FIFOs, locks and leases, device nodes and loop devices, timerfd, inotify and native AIO, with eventfd in kernel/poll.
 - **Why**: The retired design doc's §8.2–§8.3 covered mounts and inotify but not fd tables, file syscalls, pipes, locks or devices.
 - **Tradeoffs**: One large map covers about 12k lines of source.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `/proc/<pid>/fd` without an access check, relinking of unlinked files, unprotected `system.*` xattrs, file position races, `F_SETOWN` ignoring pid namespaces, `sendfile` appending to `O_APPEND` output and umount ignoring mappings.
-- **Source**: c5236a1
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `/proc/<pid>/fd` without an access check, unprotected `system.*` xattrs, file position races, umount ignoring mappings, pending AIO polls that can block io_getevents forever and splice, tee and vmsplice blocking by the wrong flags (three Starnix tests hang).
+- **Source**: c5236a1 (scope since extended by 3f3db11; bug list since updated by 3f3db11 and 4e64e74)
 
 ### D16: timerfd and lease deadlines saturate at KTIME_MAX
 - **What**: timerfd's parser uses the shared `timespec()` helper (kernel/process D15), and the lease-break deadline clamps the `lease-break-time` sysctl at KTIME_MAX.
@@ -147,3 +147,71 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; `random_ioctl` stays above `ioctl`, sharing a paragraph with the ioctl constants.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 866b1cf
+
+### D21: Loop devices forward I/O to their backing open file
+- **What**: `syscall/loopdev.rs` keeps loop devices in `Kernel::loops` (eight at boot, more on demand with nodes in the boot `/dev`), block nodes dispatch by major 7, I/O goes through the backing open file's own read and write paths at the device offset (regular files without the BKL), and the loop and common block ioctls follow 6.1's errors and order.
+- **Why**: LTP takes its test device from loop-control, so 151 tests broke before reaching appine, and losetup and image tools did not work.
+- **Tradeoffs**: There is no page cache, no partitions, discard, fallocate, direct I/O or mmap of the device, `BLKGETDISKSEQ` is approximate, and nothing can be mounted from a device.
+- **Watch out**: Native kernels after 6.1 unbind an autoclear device some time after the last close, so differential cases must wait, and a loop over a loop keeps the lower device open until the upper one is unbound.
+- **Source**: a26c8b4
+
+### D22: Vectored I/O on pipes, terminals and sockets is one operation
+- **What**: Following Linux's split between `read_iter`/`write_iter` and plain operations (checked against 6.1), sockets go to kernel/net's `rw` (D13 there), pipe, PTY and eventfd reads do one 64 KiB read scattered over the iovecs, pipe and PTY writes go in 64 KiB pieces across iovecs until one is short, and positional files keep the per-iovec loop.
+- **Why**: readv and writev called the file's read or write once per iovec, so message boundaries, pipe readv waits and pipe write atomicity differed from Linux.
+- **Tradeoffs**: A pipe or terminal readv still reads at most 64 KiB per call, and host stdio fds stay per-iovec.
+- **Watch out**: Borrows of the open file must end before any socket or pipe call that can wait, and a file kind whose Linux operations change between plain and iter needs its arm moved.
+- **Source**: b295644
+
+### D23: timerfds keep their clock and honour `TFD_TIMER_CANCEL_ON_SET`
+- **What**: A timerfd keeps an `Expiry` (kernel/process D19) and, for absolute realtime timers with `CANCEL_ON_SET`, the clock-jump count at settime, so a later jump counts as one expiration for poll and epoll and the next read returns `ECANCELED` once while the timer stays armed.
+- **Why**: timerfds converted absolute times once at settime, and `CANCEL_ON_SET` was accepted but never cancelled, so systemd's clock-change detection could not work.
+- **Tradeoffs**: A jump nobody looks at is noticed at the next look, with the same observable result.
+- **Watch out**: None known.
+- **Source**: 63b9e59
+
+### D24: Reads into partly faulting buffers return what was copied
+- **What**: read_file and readv copy out through `Cx::write_user_partial`, growing a stack below the buffer first, and return the bytes copied, rewinding a regular file's position past the uncopied part, while writes read their buffer through `Cx::read_user`.
+- **Why**: A read into a buffer faulting partway returned `EFAULT` and lost the data, and a buffer below a grows-down mapping never grew it, where Linux returns the bytes copied and grows.
+- **Tradeoffs**: Pipe and terminal data past the fault is still consumed, where Linux leaves it unread.
+- **Watch out**: Callers that expected `EFAULT` for partly valid buffers now get a short count, as on Linux.
+- **Source**: e03c0cc
+
+### D25: F_SETOWN and lock ranges take arguments at the edges of their types as Linux does
+- **What**: `set_owner`/`get_owner` follow Linux's `f_setown` (`INT_MIN` is `EINVAL`) on global numbers, with F_SETOWN/F_GETOWN translated once by the dispatcher's `pid_args` (which maps F_SETOWN(-1) to process group 1) and the socket owner ioctls translating their own, and record-lock ranges are computed with an inclusive last byte in `flock64_to_posix_lock`'s order.
+- **Why**: F_SETOWN(`INT_MIN`) overflowed its negation, owners ignored pid namespaces, lock ranges added a negative `l_len` before checking the start and could not end at `OFFSET_MAX`, and the first fix translated owners a second time in child pid namespaces.
+- **Tradeoffs**: An unknown pid is still accepted where Linux returns `ESRCH`, and F_SETOWN's translation stays split between the dispatcher and fcntl.
+- **Watch out**: Syscalls listed in `pid_args` must not translate again in their handlers.
+- **Source**: 09188ec, 5656ada
+
+### D26: The tty ioctls learn whether their fd can read
+- **What**: The vfs ioctl dispatch passes `file.readable()` to `tty::ioctl`, so TIOCSCTTY can require read access (kernel/tty D14).
+- **Why**: Taking a terminal through an fd without read access needs `CAP_SYS_ADMIN` on Linux, and only the vfs knows the open file's mode.
+- **Tradeoffs**: Every tty ioctl carries a flag only TIOCSCTTY reads.
+- **Watch out**: None known.
+- **Source**: 838b5b4
+
+### D27: memfd_create gives the store its caller's filesystem ids
+- **What**: memfd_create passes the caller's fsuid and fsgid (kernel ids) to the store's `create_anonymous` (kernel/store D14).
+- **Why**: memfd_create is the store's only caller of `create_anonymous` and the one that knows the caller.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 907b82b
+
+### D28: linkat follows 6.1's checks for deleted and fd-named files
+- **What**: `AT_EMPTY_PATH` without `CAP_DAC_READ_SEARCH` is `ENOENT`, a deleted regular file reached through `/proc/<pid>/fd/N` becomes its store node on the mount it was opened through (memfds stay `EXDEV`), `protected_hardlinks` reads the database row, and the store refuses a new name for an nlink-0 inode (kernel/store D15).
+- **Why**: linkat's other differences let a link to an unlinked file through or reported it wrongly, and the hardlink check read the host object of a deleted file.
+- **Tradeoffs**: Following 6.1, unprivileged `AT_EMPTY_PATH` links fail where 6.10 and later allow them for the opener.
+- **Watch out**: Non-root programs that link O_TMPFILE-style files must use the `/proc/self/fd` fallback.
+- **Source**: c108be0
+
+### D29: sendfile refuses an `O_APPEND` output that is not a pipe
+- **What**: sendfile returns `EINVAL` for an `O_APPEND` output other than a pipe, after the input checks.
+- **Why**: Linux sends non-pipe outputs through `do_splice_direct`, which rejects `O_APPEND`.
+- **Tradeoffs**: None.
+- **Watch out**: Programs that relied on appine appending now get `EINVAL`, as on Linux.
+- **Source**: 298cadb
+
+## Superseded
+
+- ~~There are no block devices or loop devices (D5's tradeoff, rounds 04, 05, 184)~~ → replaced by **D21** in a26c8b4 (2026-11-06)
+- ~~F_SETOWN/F_GETOWN owners translated by the owner helpers (09188ec)~~ → replaced by **D25** in 5656ada (2026-11-07)
