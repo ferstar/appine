@@ -444,6 +444,76 @@ internal object Rootfs {
     )
 
     /**
+     * podman's and docker's configuration (written before every kernel start; what the user chose
+     * is left alone):
+     * - the network rootless podman gives its containers by default, only when that file is
+     *   missing: the host's. Appine has no TUN device, so pasta and slirp4netns, the networks
+     *   podman makes for an ordinary user, cannot start, and every `podman run` without
+     *   `--network host` would fail (the kernel/netns map). `containers.rootless.conf.d` is read
+     *   only for rootless podman, so containers run as root keep their bridge networks; a user's
+     *   own `~/.config/containers/containers.conf` overrides it.
+     * - podman's storage driver, vfs ([storageConfig]).
+     * - dockerd's settings, only when `/etc/docker/daemon.json` is missing: the native snapshotter.
+     *   Docker 29 keeps images in containerd and by default uses its overlayfs snapshotter, which
+     *   does not fall back without overlayfs: pulls work and every `docker run` fails. native
+     *   copies each layer in full (like podman's vfs) and keeps the containerd image store. The
+     *   docker packages ship no daemon.json, and as JSON it cannot carry a comment saying why.
+     */
+    @Throws(IOException::class)
+    fun ensureContainersConfig(context: Context) {
+        val store = store(context).path
+        write(store, "/etc/containers/containers.rootless.conf.d/appine.conf", ROOTLESS_CONTAINERS, overwrite = false)
+        write(store, "/etc/docker/daemon.json", DOCKER_DAEMON, overwrite = false)
+        // Not a regular file (a symbolic link, say): the user's choice, left alone
+        val old = runCatching { Native.readFile(store, STORAGE_CONF) }.getOrElse { return }?.let { String(it) }
+        storageConfig(old)?.let { write(store, STORAGE_CONF, it, overwrite = old != null) }
+    }
+
+    /**
+     * What podman's `/etc/containers/storage.conf` becomes, given its content [old] (null when
+     * missing); null when it stays. Appine has neither overlayfs nor FUSE (for fuse-overlayfs), so
+     * the overlay driver Alpine's and Debian's packages choose fails every podman command, as root
+     * and rootless alike (a user without a storage.conf of their own takes this file's driver). A
+     * missing file becomes one choosing vfs: written before podman is installed, it is kept by apk
+     * (the package's goes to `storage.conf.apk-new`), and Debian's package has only
+     * `/usr/share/containers/storage.conf`, which is not read while this one exists. In an existing
+     * file (podman installed by an older version of the app, or in an imported rootfs), a driver
+     * line choosing overlay is changed to vfs; any other choice stays.
+     */
+    fun storageConfig(old: String?): String? {
+        if (old == null) return STORAGE
+        val new = OVERLAY_DRIVER.replace(old, VFS_DRIVER)
+        return new.takeIf { it != old }
+    }
+
+    private const val STORAGE_CONF = "/etc/containers/storage.conf"
+
+    private const val STORAGE = """# Written by Appine when missing: Appine has neither overlayfs nor FUSE, so podman uses the vfs
+# storage driver (each layer a full copy). It is read instead of
+# /usr/share/containers/storage.conf, and by users without a storage.conf of their own in
+# ~/.config/containers.
+[storage]
+driver = "vfs"
+"""
+
+    /** A `driver = "overlay"` line (either quote, with a trailing comment or not). */
+    private val OVERLAY_DRIVER =
+        Regex("""^[ \t]*driver[ \t]*=[ \t]*(["'])overlay\1[ \t]*(#.*)?$""", RegexOption.MULTILINE)
+
+    private const val VFS_DRIVER =
+        "# Changed from overlay by Appine, which has neither overlayfs nor FUSE\ndriver = \"vfs\""
+
+    private const val DOCKER_DAEMON = "{\n  \"storage-driver\": \"native\"\n}\n"
+
+    private const val ROOTLESS_CONTAINERS = """# Written by Appine when missing: Appine has no TUN device, so pasta and slirp4netns (the
+# networks podman makes for an ordinary user) cannot start, and rootless containers use the
+# host's network instead. Containers run as root are not affected. To change it, edit this file
+# or set netns in ~/.config/containers/containers.conf.
+[containers]
+netns = "host"
+"""
+
+    /**
      * On Alpine, puts the doas package bundled with the app into the store
      * (`/var/cache/appine/doas.apk`): the login script installs it offline when a regular user
      * first becomes the login account (the android/setup map). Written before every kernel start,

@@ -1,8 +1,9 @@
 # podman run by an ordinary user (rootless): the user's own user namespace through newuidmap and
-# /etc/subuid, the vfs storage driver in its home, no systemd (cgroupfs, file events), pasta and
-# slirp4netns networking. Uses the podman store: scripts/survey -s target/survey/podman
-# podman-rootless. Native comparison: SURVEY_DOCKER_OPTS=--privileged scripts/survey -n
-# appine-podman-native podman-rootless
+# /etc/subuid, the vfs storage driver (from the system's storage.conf, as the Android app sets it),
+# no systemd (cgroupfs, file events), pasta and slirp4netns networking (which need a TUN device:
+# the default is the host network the Android app configures). Uses the podman store:
+# scripts/survey -s target/survey/podman podman-rootless. Native comparison:
+# SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-podman-native podman-rootless
 exec 2>&1
 for p in podman crun shadow-uidmap passt slirp4netns libcap-utils; do
     apk info -e $p >/dev/null || apk add -q $p
@@ -11,8 +12,20 @@ id rl >/dev/null 2>&1 || adduser -D -u 1000 rl
 grep -q '^rl:' /etc/subuid || echo rl:100000:65536 >>/etc/subuid
 grep -q '^rl:' /etc/subgid || echo rl:100000:65536 >>/etc/subgid
 mkdir -p /run/user/1000 && chown rl:rl /run/user/1000 && chmod 700 /run/user/1000
+# What the Android app writes before every start (Rootfs.ensureContainersConfig): without a TUN
+# device rootless containers default to the host's network (when missing), and without overlayfs
+# podman's storage driver is vfs (written when missing, an overlay driver changed); the user has no
+# storage.conf of its own and takes the system's driver
+mkdir -p /etc/containers/containers.rootless.conf.d
+[ -e /etc/containers/containers.rootless.conf.d/appine.conf ] ||
+    printf '[containers]\nnetns = "host"\n' >/etc/containers/containers.rootless.conf.d/appine.conf
+if [ -e /etc/containers/storage.conf ]; then
+    sed -i 's/^driver = "overlay"/driver = "vfs"/' /etc/containers/storage.conf
+else
+    printf '[storage]\ndriver = "vfs"\n' >/etc/containers/storage.conf
+fi
 mkdir -p /home/rl/.config/containers
-printf '[storage]\ndriver = "vfs"\n' >/home/rl/.config/containers/storage.conf
+rm -f /home/rl/.config/containers/storage.conf
 printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' >/home/rl/.config/containers/containers.conf
 chown -R rl:rl /home/rl/.config
 # As the user, with its runtime directory; each step's output and exit status

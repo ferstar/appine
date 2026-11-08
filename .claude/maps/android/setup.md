@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed and are refreshed at root logins; admins recorded once and matched literally; mirrors recorded only after writing; downloads stop past the pinned length; interrupted imports resumed as their distro last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refresh at root logins; admins recorded once; mirrors recorded after writing; downloads stop past the pinned length; resumed imports; rootless podman's network; podman and docker storage last)
 
 ## Responsibilities
 
@@ -44,7 +44,8 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 ## Public entry points
 
 - `Rootfs.prepare(distro)`, `download`, `fetch`, `isReady`, `installed`, `reset`, `configure`,
-  `ensureNetworkConfig`, `ensureLoginTools`, `updateProfile`, `PREFER_OSCLOCK`, `failedServices`,
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`,
+  `PREFER_OSCLOCK`, `failedServices`,
   `chooseMirror`, `setMirror`, `retarget`, `loginAccount`, `regularAccounts`.
 - `scripts/fetch-rootfs` (build-time download of the Alpine minirootfs and the doas package).
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
@@ -75,7 +76,18 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   trixie, -updates, -security), `hostname`, `hosts` (Alpine only when absent, Debian always),
   Debian's `resolv.conf` pointing at the DNS stub, `motd`, and `/etc/profile.d/appine.sh` (motd,
   `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, `PS1`).
-- Before every start: a loopback-only `/etc/network/interfaces` when absent; on Alpine the bundled
+- Before every start: a loopback-only `/etc/network/interfaces` when absent;
+  `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
+  (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
+  reads that directory, and a user's own `containers.conf` overrides it); podman's
+  `/etc/containers/storage.conf` choosing the vfs driver when absent, or an active
+  `driver = "overlay"` line in it changed to vfs (Appine has neither overlayfs nor FUSE; written
+  before podman is installed, apk keeps it and puts the package's in `storage.conf.apk-new`, and
+  Debian ships only `/usr/share/containers/storage.conf`, which it overrides; rootless users
+  without their own storage.conf take its driver; a file that cannot be read, such as a symbolic
+  link, is left alone); `/etc/docker/daemon.json` choosing the native snapshotter when absent
+  (docker 29 keeps images in containerd, whose default overlayfs snapshotter does not fall back:
+  pulls work and every run fails; the packages ship no daemon.json); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`; an unmodified old profile (with `cd "$HOME"`) replaced.
 - Before boot (`PREFER_OSCLOCK`): with OpenRC installed and no clock service in any runlevel, add
   osclock to boot.

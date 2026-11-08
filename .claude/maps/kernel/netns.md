@@ -282,7 +282,7 @@ structure (`kernel/procfs`); host sockets (`hal`).
 - **No TUN/TAP device:** `/dev/net/tun` does not exist (there is no network stack to attach a tap
   device to), so pasta and slirp4netns cannot start: rootless podman's default network, its port
   publishing and `--network slirp4netns` fail, and rootless containers work only with
-  `--network host`.
+  `--network host` (the Android app makes that rootless podman's default, `android/setup`).
 - **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
   xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
   trigger; byte limits and quotas count headers only, so they let through more than Linux.

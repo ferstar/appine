@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving made robust; tab names removed; how a killed run ended told in its restore notice and a crash notification; the app named Appine; an interrupted import resumed as its distro; auto tabs saved as their account last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; robust start, exit and tab saving; tab names removed; kill reports; the app named Appine; resumed imports; auto tabs saved as their account; rootless containers file last)
 
 ## Responsibilities
 
@@ -73,7 +73,7 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   run, else the distro an import was last started for), else `start(null)`.
 - `start` sets `starting` (the wake lock follows) and runs on an `appine-start` thread: import when
   a distro is given (`Rootfs.prepare`, then a mirror-probing thread), `ensureNetworkConfig`,
-  `ensureLoginTools`, `updateProfile`, then `Native.start(store, tier)` under `Rootfs.access`'s
+  `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`, then `Native.start(store, tier)` under `Rootfs.access`'s
   write lock (`tier` is the setting in a debug build and always 1 in a release build, whatever an
   earlier debug install recorded). Back on the main thread it clears `starting`; if "exit all"
   came meanwhile it stops the new kernel (`Native.stop`, not booted) and finishes the exit. On

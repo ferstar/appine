@@ -485,6 +485,7 @@ class TerminalService : Service() {
                     }
                 }
                 Rootfs.ensureNetworkConfig(this)
+                Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
                 Rootfs.updateProfile(this)
                 // The kernel must be the only user of the store when it opens it (a separate
