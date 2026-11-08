@@ -29,6 +29,9 @@ if [ ! -d "$T" ]; then
     exit 0
 fi
 cd /tmp
+# gVisor's ExecTest.ExecuteOnlySpecialFiles names its special files by pid and leaves them behind
+# when it fails; Appine's store keeps /tmp, and the same pid in the lane's next run fails on them
+rm -f /tmp/exec-only-*
 # Core files would change the shell's report of a crash on one side only
 ulimit -c 0
 for bin in "$@"; do

@@ -7,8 +7,6 @@
 # are skipped, with the reason above them.
 # kernel/signal D4: there is no vvar page, and the vDSO is a private anonymous copy
 SKIP="VdsoProcTest.*"
-# kernel/signal: MADV_DONTNEED wipes the vDSO (the next call through it is SIGILL)
-SKIP="$SKIP:VdsoTest.VdsoCanBeMadvised"
 # kernel/cred: the vDSO bypass covers every clock; capset does not mask bits above CAP_LAST_CAP
 SKIP="$SKIP:SeccompTest.NonVdsoClockGettimeFiltered:CapsTest.CapsetMasksReservedBits"
 # kernel/signal: coalesced standard signals report the last sender (the forced SIGSYS replaces the
@@ -17,6 +15,10 @@ SKIP="$SKIP:SeccompTest.RetTrapBlockedUnmasksAndResetsHandlerAtSendTime"
 # kernel/vfs: security.capability writes check the magic under a mask and accept any v2 or v3
 # size, so malformed values are stored
 SKIP="$SKIP:FileCapTest.MalformedAndRevision1FileCapabilitiesRejected"
+# Cannot be compared: the VM's AppArmor (apparmor_restrict_unprivileged_userns) denies capabilities
+# in a user namespace an unprivileged process creates, so setting file capabilities there fails
+# natively
+SKIP="$SKIP:FileCapTest.FileCapabilityCoercionInsideUserNamespace"
 # Fail on the native side at times: docker's own messages keep the VM's kernel log wrapping, so a
 # read from its start can find the record gone
 SKIP="$SKIP:SyslogTest.Read:SyslogTest.ReadDevKmsg:SyslogTest.DevKmsgSeekSet:SyslogTest.DevKmsgSeekEnd"

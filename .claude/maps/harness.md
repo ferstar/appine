@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; tarballs by version; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; difftest lock and suite skips last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; tarballs by version; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; difftest lock, suite skips and gtest leftovers last)
 
 ## Responsibilities
 
@@ -185,7 +185,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `timeout -s KILL 60`, stdin from `/dev/null` and its output in a file (a crash or hang, a test
   ignoring `SIGTERM`, a child keeping the output open or a test reading stdin does not take the
   rest with it), printing `<test> ok|failed|skipped|exit <code>`, with core files off and the
-  shell's crash reports filtered out.
+  shell's crash reports filtered out. It first deletes the `/tmp/exec-only-*` files a failed
+  `ExecTest.ExecuteOnlySpecialFiles` leaves in the lane's store (named by pid, they would fail a
+  later run that gets the same pid).
 - Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
   (it fails on the native side because of docker, the VM or a newer kernel, depends on timing, or
