@@ -134,6 +134,8 @@ pub const INPUT_MAX: usize = 4096;
 pub const UNPROCESSED_MAX: usize = 64 * 1024;
 /// The output queue capacity: once the slave has filled it, writes block until the master reads.
 pub const OUTPUT_MAX: usize = 64 * 1024;
+/// The most echoes waiting for room in the output queue (n_tty's 4096-byte echo buffer).
+const ECHO_MAX: usize = 4096;
 /// How much of the slave's output the master side has taken on Linux: its own line discipline
 /// buffers [`INPUT_MAX`] bytes less the free one, and the rest is still in the PTY's buffer, where
 /// TCOFLUSH on the slave drops it.
@@ -1081,10 +1083,31 @@ impl Tty {
     /// Writes the waiting echoes to the output unless output is stopped (Linux's
     /// `process_echoes`).
     fn commit_echoes(&mut self) {
+        // n_tty's echo buffer holds 4096 bytes and drops the oldest echoes when full
+        if self.echoes.len() > ECHO_MAX {
+            self.echoes.drain(..self.echoes.len() - ECHO_MAX);
+        }
         if self.stopped || self.echoes.is_empty() {
             return;
         }
-        for echo in std::mem::take(&mut self.echoes) {
+        // __process_echoes: echoes go out only while the output queue has room for each whole;
+        // the rest wait for the next commit
+        let mut done = 0;
+        while let Some(&echo) = self.echoes.get(done) {
+            let need = match echo {
+                Echo::Char(0xff) => 1,
+                Echo::Char(c) => self.processed_len(c),
+                Echo::Ctrl(_) => 2,
+                Echo::EraseTab { columns, after_tab } => {
+                    let columns = columns + if after_tab { 0 } else { self.canon_column };
+                    8 - columns % 8
+                }
+                Echo::SetCanonColumn | Echo::MoveBackColumn => 0,
+            };
+            if need > OUTPUT_MAX.saturating_sub(self.output.len()) {
+                break;
+            }
+            done += 1;
             match echo {
                 Echo::Char(0xff) => {
                     self.output.push_back(0xff);
@@ -1106,7 +1129,22 @@ impl Tty {
                 Echo::MoveBackColumn => self.column = self.column.saturating_sub(1),
             }
         }
-        self.arrivals[1] += 1;
+        self.echoes.drain(..done);
+        if done > 0 {
+            self.arrivals[1] += 1;
+        }
+    }
+
+    /// How many bytes output processing makes of `c` now ([`Tty::output_char`]).
+    fn processed_len(&self, c: u8) -> usize {
+        let t = self.termios;
+        match c {
+            _ if !t.o(OPOST) => 1,
+            b'\n' if t.o(ONLCR) => 2,
+            b'\r' if t.o(ONOCR) && self.column == 0 => 0,
+            b'\t' if t.oflag & TABDLY == XTABS => 8 - self.column % 8,
+            _ => 1,
+        }
     }
 
     // ---- Slave reads ----
@@ -1411,7 +1449,8 @@ impl Tty {
     /// `tty_send_xchar`): output stopped by ^S restarts for that one character and stops again
     /// (reported in packet mode); while TCOOFF holds it the character is lost.
     pub fn send_xchar(&mut self, c: u8) {
-        if self.tco_stopped {
+        // A full output queue drops it (pty_write takes what fits)
+        if self.tco_stopped || self.output.len() >= OUTPUT_MAX {
             return;
         }
         if self.stopped {

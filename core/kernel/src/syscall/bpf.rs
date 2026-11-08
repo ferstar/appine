@@ -94,6 +94,14 @@ fn prog_load(cx: &mut Cx<'_>, attr: &[u8]) -> SysResult {
     {
         return Err(Errno::EPERM);
     }
+    // Device programs are among the networking types that also need CAP_NET_ADMIN or
+    // CAP_SYS_ADMIN (is_net_admin_prog_type)
+    if prog_type == bpf::PROG_TYPE_CGROUP_DEVICE
+        && !cx.cred().capable(cap::NET_ADMIN)
+        && !cx.cred().capable(cap::SYS_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
     // No types other than device programs; offloading to a NIC (prog_ifindex) and sleepable ones
     // are not allowed either
     if prog_type != bpf::PROG_TYPE_CGROUP_DEVICE || u32_at(attr, 64) != 0 || flags & SLEEPABLE != 0

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations; restarted mqueue waits; registrations ended by close last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments; mqueue timeouts; sysctl bounds, fallible allocations; restarted mqueue waits; registrations ended by close; shm reaping, capped mqueue defaults last)
 
 ## Responsibilities
 
@@ -157,8 +157,11 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   mremap duplicate (old length 0) of a segment is its own base, so it counts, as on Linux.
 - shmctl IPC_RMID sets `SHM_DEST`, makes the key private and removes the segment only when nothing
   is attached; otherwise `reap_shm` removes destroyed segments with no attachments, in every
-  namespace, and it runs only from shmget, shmdt and shmctl (any command). shmat does not check
-  `SHM_DEST`. SHM_LOCK and SHM_UNLOCK (owner, creator or `CAP_IPC_LOCK`) only toggle
+  namespace. It runs from shmget, shmdt and shmctl (any command), and after anything else that can
+  end an attachment: munmap, mremap and `MAP_FIXED` mmap, execve dropping the old address space,
+  and a thread leaving the task table at exit; so a segment goes with its last attachment, as on
+  Linux. shmat does not check `SHM_DEST` (a segment still attached can be attached again, as on
+  Linux). SHM_LOCK and SHM_UNLOCK (owner, creator or `CAP_IPC_LOCK`) only toggle
   `SHM_LOCKED`.
 
 ### SysV wake-ups
@@ -182,8 +185,9 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   access mode 3 is `EINVAL`. An existing queue is `EEXIST` with `O_CREAT|O_EXCL`, else permission
   by access mode. A new one: attr's `mq_maxmsg` and `mq_msgsize` must be positive and within
   `msg_max` and `msgsize_max` (the hard limits 65536 and 16 MiB with `CAP_SYS_RESOURCE`), the
-  defaults without attr; at most `queues_max` named queues (`ENOSPC`, unless `CAP_SYS_RESOURCE`);
-  owner fsuid/fsgid and mode `perm & ~umask & 0o777`. The fd (always close-on-exec) is installed
+  defaults capped by `msg_max` and `msgsize_max` without attr (`mqueue_get_inode`); at most
+  `queues_max` named queues (`ENOSPC`, unless `CAP_SYS_RESOURCE`); owner fsuid/fsgid and mode
+  `perm & ~umask & 0o777`. The fd (always close-on-exec) is installed
   before the name is entered, so a failed install leaves nothing; opening an existing queue also
   touches the root directory's times. Neither mq_open nor mq_unlink checks permission on the root
   directory.
@@ -265,11 +269,8 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - **SysV capabilities ignore user namespaces:** `CAP_IPC_OWNER`, `CAP_SYS_ADMIN` (IPC_SET,
   IPC_RMID) and `CAP_IPC_LOCK` count only in the initial user namespace, so root in a container's
   user namespace cannot bypass permissions on, change or remove other users' objects in its own IPC
-  namespace (Linux checks them over the user namespace owning the IPC namespace).
-- **Destroyed shm segments outlive their last mapping:** when the last attachment of a `SHM_DEST`
-  segment goes through munmap, execve or exit rather than shmdt, the segment keeps its host memory
-  and stays in the table until the next shmget, shmdt or shmctl; until then shmat on its id
-  succeeds and `/proc/sysvipc/shm` lists it (Linux destroys it at the last detach by any path).
+  namespace (Linux checks them over the user namespace owning the IPC namespace; root of a rootless
+  podman container with `--cap-add SYS_ADMIN,IPC_OWNER` cannot ipcrm another user's queue).
 - **unshare and setns drop sibling threads' undo:** undo records are per process, so one thread's
   `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
   adjustments of every thread in the process (Linux applies a shared undo list only when its last
@@ -282,9 +283,7 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - **mqueue registrations are keyed by tgid alone:** one whose process exited while its fd table
   lives on in another process (`CLONE_FILES`) stays registered, and a reused tgid looks alive and
   would get the signal (Linux holds the registrant's `struct pid`).
-- **mqueue limits and root permissions are partly missing:** without an attr a queue gets
-  `msg_default`/`msgsize_default` uncapped by `msg_max`/`msgsize_max`; `RLIMIT_MSGQUEUE` is not
-  enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem
+- **mqueue limits and root permissions are partly missing:** `RLIMIT_MSGQUEUE` is not enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem
   paths make (it matters once the 01777 root is chmod'ed), and unlink applies the sticky rule even
   when the root has lost `S_ISVTX`.
 

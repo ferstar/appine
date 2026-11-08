@@ -1654,6 +1654,12 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
             crate::cgroup::file_mode(name).unwrap_or(0o444)
         }
         (mode::S_IFDIR, _) => 0o555,
+        // proc_fd_instantiate: read and search bits for a readable file, write and search for a
+        // writable one (none for O_PATH)
+        (_, PseudoNode::Fd(pid, fd)) => ps.open_file(*pid, *fd).map_or(0, |f| {
+            let f = f.borrow();
+            (if f.readable() { 0o500 } else { 0 }) | if f.writable() { 0o300 } else { 0 }
+        }),
         (mode::S_IFLNK, _) => 0o777,
         (_, PseudoNode::Pts(fs, n)) => pty(ps.k, *fs, *n).map_or(0o620, |t| t.borrow().mode),
         // ptmx's permission bits follow the instance's ptmxmode
@@ -1715,6 +1721,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         atime_ns,
         mtime_ns,
         ctime_ns,
+        blocks: None,
     })
 }
 
@@ -2689,7 +2696,11 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
         g.no_new_privs as u8
     )
     .unwrap();
-    writeln!(s, "Cpus_allowed_list:\t0-{}", cpus() - 1).unwrap();
+    // The thread's affinity (the main thread's for the process), within the online CPUs
+    let online = u64::MAX >> (64 - cpus().clamp(1, 64));
+    let allowed = task.as_ref().map_or(u64::MAX, |t| t.affinity.get()) & online;
+    let allowed: Vec<usize> = (0..64).filter(|b| allowed >> b & 1 != 0).collect();
+    write!(s, "Cpus_allowed_list:\t{}", cpu_list_of(&allowed)).unwrap();
     // Each time a host thread goes to sleep (waits) is one voluntary switch: a thread that has
     // not been woken does not change
     let (vol, nonvol) = task.as_ref().map_or((0, 0), |t| {

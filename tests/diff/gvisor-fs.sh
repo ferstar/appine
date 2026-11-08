@@ -18,14 +18,9 @@ SKIP="$SKIP:Inotify.ExcludeUnlink*:Inotify.Exec"
 # inode-less files (pipes) are no-ops
 SKIP="$SKIP:FcntlTest.GetAllFlags:FcntlTest.GetOpathFlag"
 SKIP="$SKIP:FlockTestNoFixture.FlockSymlink:FlockTestNoFixture.FlockPipe"
-# kernel/vfs: O_TRUNC with O_RDONLY is only half a write; access mode 3 opens read-write;
-# renameat2 ignores RENAME_NOREPLACE for . and ..; rename in synthetic filesystems is EACCES first
+# kernel/vfs: O_TRUNC with O_RDONLY is only half a write; access mode 3 opens read-write
 SKIP="$SKIP:OpenTest.OTrunc:OpenTest.OTruncAndReadOnlyDir:OpenTest.CanTruncateReadOnly"
-SKIP="$SKIP:OpenTest.OpenWithStrangeFlags:Renameat2Test.NoReplaceDot"
-SKIP="$SKIP:RenameTest.SysfsFileToSelf:RenameTest.SysfsDirectoryToSelf"
-SKIP="$SKIP:RenameTest.SysfsPathEndingWithDots"
-# kernel/vfs: SEEK_END on directories is EINVAL
-SKIP="$SKIP:GetdentsTest/0.Issue128ProcSeekEnd"
+SKIP="$SKIP:OpenTest.OpenWithStrangeFlags"
 # kernel/vfs: scoped openat2 never returns EAGAIN (the rename variants loop for minutes)
 SKIP="$SKIP:Openat2Test.BeneathRaceWithMount:Openat2Test.InRootRaceWithMount"
 SKIP="$SKIP:Openat2Test.BeneathRaceWithRename:Openat2Test.InRootRaceWithRename"

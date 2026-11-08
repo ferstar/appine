@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: comments; kill by thread id; process-signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; sigqueue to zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill last)
 
 ## Responsibilities
 
@@ -189,7 +189,8 @@ procfs.
 - One page, built at runtime as a minimal real ELF shared object (`ET_DYN`, a loadable segment and a
   dynamic segment, `DT_HASH`, symbol versions with `LINUX_2.6.39`, soname `linux-vdso.so.1`) and
   passed through `AT_SYSINFO_EHDR`. Each process maps a private anonymous copy (debuggers can set
-  breakpoints in it).
+  breakpoints in it); `MADV_DONTNEED` over it brings back the image (`kernel/mm`), as Linux's
+  special mapping faults its pages back.
 - `__kernel_rt_sigreturn` is exactly `mov x8, #139; svc #0` (libgcc's unwinder matches the bytes),
   preceded by a `nop`.
 - `__kernel_gettimeofday`, `clock_gettime` and `clock_getres` are `mov x8, #nr; svc #0; ret` stubs;
@@ -336,9 +337,6 @@ procfs.
   pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 - **`SIGILL` frames carry an `esr_context` with EC 0:** Linux 6.1 emits none for undefined
   instructions.
-- **`MADV_DONTNEED` wipes the vDSO:** the vDSO is a private anonymous copy, so discarding it (alone
-  or inside a larger range) zeroes it and the next vDSO clock call or signal return through
-  `__kernel_rt_sigreturn` raises `SIGILL`, where Linux refills the vDSO from the kernel image.
 - **Threads ended by another thread report no `PTRACE_EVENT_EXIT`:** only threads calling
   `exit`/`exit_group` or taking the fatal signal stop there, so the other threads of an
   `exit_group`, and the leader killed by a non-leader's execve, exit without the stop Linux 6.1

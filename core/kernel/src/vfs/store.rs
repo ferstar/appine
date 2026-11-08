@@ -172,6 +172,9 @@ pub struct Stat {
     pub mtime_ns: i64,
     /// Status change time (nanoseconds).
     pub ctime_ns: i64,
+    /// Storage a regular file takes in 512-byte blocks, as the host reports it for the object
+    /// (holes take none); `None` where there is no object, and the size stands in for it.
+    pub blocks: Option<u64>,
 }
 
 impl Stat {
@@ -698,6 +701,7 @@ impl Store {
             atime_ns: mtime_ns,
             mtime_ns,
             ctime_ns,
+            blocks: None,
         })
     }
 
@@ -986,6 +990,7 @@ impl Store {
             atime_ns: now,
             mtime_ns: now,
             ctime_ns: now,
+            blocks: None,
         }));
         let (lo, hi) = self.meta.commits.fresh();
         if lo.load(Ordering::Relaxed) == 0 {
@@ -2143,6 +2148,7 @@ fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), 
     st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
     st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
     st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
+    st.blocks = Some(o.st_blocks as u64);
     Ok(())
 }
 
@@ -2501,6 +2507,7 @@ fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
     st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
     st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
     st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
+    st.blocks = Some(meta.blocks());
 }
 
 fn to_ns(t: SystemTime) -> i64 {

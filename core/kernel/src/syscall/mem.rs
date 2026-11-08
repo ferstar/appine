@@ -175,6 +175,10 @@ pub(super) fn mmap(
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
     let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
+    // MAP_FIXED may have replaced a segment's last attachment
+    if flags & flags::MAP_FIXED != 0 {
+        crate::ipc::reap_shm(cx.k());
+    }
     // MAP_GROWSDOWN on a file mapping does not grow (on Linux the grown part also maps the file,
     // and no program uses it that way)
     if growsdown && file.is_none() && kind == flags::MAP_PRIVATE {
@@ -272,14 +276,17 @@ fn remap(
         Some(ino) => Some(cx.vfs()?.store().open_object(ino, false)?),
         None => None,
     };
-    cx.mm_mut().mremap(
+    let r = cx.mm_mut().mremap(
         old,
         old_len,
         new_len,
         flags & MREMAP_MAYMOVE != 0,
         fixed,
         file.as_ref().map(|f| f.as_raw_fd()),
-    )
+    );
+    // A shrunk or replaced segment attachment may have been the last one
+    crate::ipc::reap_shm(cx.k());
+    r
 }
 
 /// Reads pieces of private file mappings from their files again after `MADV_DONTNEED`
@@ -524,7 +531,10 @@ pub(super) fn msync(cx: &mut Cx<'_>, addr: u64, len: u64, flags: u32) -> SysResu
 }
 
 pub(super) fn munmap(cx: &mut Cx<'_>, addr: u64, len: u64) -> SysResult {
-    cx.mm_mut().munmap(addr, len).map(|()| 0)
+    cx.mm_mut().munmap(addr, len)?;
+    // A segment marked for removal goes with its last attachment, whatever detaches it
+    crate::ipc::reap_shm(cx.k());
+    Ok(0)
 }
 
 /// mincore: reports whether each page is resident, by host memory.

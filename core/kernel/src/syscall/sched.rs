@@ -138,11 +138,21 @@ fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
                 .flat_map(threads)
                 .collect()
         }
+        // `who` is a user ID in the caller's user namespace (0 for its own real user ID; one
+        // that is not mapped matches nobody), and processes invisible in its pid namespace do
+        // not count (Linux's make_kuid and task_pid_vnr)
         PRIO_USER => {
-            let uid = if who == 0 { cx.cred().ruid } else { who as u32 };
+            let uid = if who == 0 {
+                Some(cx.cred().ruid)
+            } else {
+                cx.cred().uid_in(who as u32)
+            };
             k.groups
                 .values()
-                .filter(|g| g.borrow().cred.ruid == uid)
+                .filter(|g| {
+                    let g = g.borrow();
+                    Some(g.cred.ruid) == uid && cx.pid_out(g.tgid) != 0
+                })
                 .flat_map(threads)
                 .collect()
         }

@@ -37,6 +37,19 @@ const IPPROTO_UDPLITE: i32 = 136;
 const IPPROTO_MPTCP: i32 = 262;
 
 const SOL_SOCKET: i32 = 1;
+/// `SOL_NETLINK` and its options.
+const SOL_NETLINK: i32 = 270;
+const NETLINK_ADD_MEMBERSHIP: i32 = 1;
+const NETLINK_DROP_MEMBERSHIP: i32 = 2;
+const NETLINK_PKTINFO: i32 = 3;
+const NETLINK_BROADCAST_ERROR: i32 = 4;
+const NETLINK_NO_ENOBUFS: i32 = 5;
+const NETLINK_LISTEN_ALL_NSID: i32 = 8;
+const NETLINK_LIST_MEMBERSHIPS: i32 = 9;
+const NETLINK_CAP_ACK: i32 = 10;
+const NETLINK_EXT_ACK: i32 = 11;
+const NETLINK_GET_STRICT_CHK: i32 = 12;
+const SCM_CREDENTIALS: i32 = 2;
 const SO_TYPE: i32 = 3;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
@@ -44,6 +57,7 @@ const SO_ERROR: i32 = 4;
 const SO_MARK: i32 = 36;
 
 const MSG_PEEK: u32 = 0x2;
+const MSG_CTRUNC: u32 = 0x8;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u32 = 0x40;
 const MSG_ERRQUEUE: u32 = 0x2000;
@@ -134,7 +148,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             ) {
                 return Err(Errno::EPROTONOSUPPORT);
             }
-            let mut s = NetlinkSocket::new(protocol);
+            let mut s = NetlinkSocket::new(protocol, base);
             s.net = net;
             Socket::Netlink(s)
         }
@@ -173,21 +187,29 @@ pub(super) fn socketpair(
     }
     match domain {
         AF_UNIX => {}
-        // As on Linux, first check the type and protocol as for an ordinary socket, then report
+        // As on Linux, first create the socket (__sock_create, inet_create: a type outside
+        // SOCK_MAX is EINVAL, a type no inet protocol has ESOCKTNOSUPPORT, a protocol the type
+        // does not have EPROTONOSUPPORT, a raw socket without CAP_NET_RAW EPERM), then report
         // that socketpair is not supported
         AF_INET | AF_INET6 => {
-            let ok = match (ty & SOCK_TYPE_MASK) as i32 {
+            const SOCK_MAX: i32 = 11;
+            let base = (ty & SOCK_TYPE_MASK) as i32;
+            let ok = match base {
                 SOCK_STREAM => matches!(protocol, 0 | IPPROTO_TCP | IPPROTO_MPTCP),
                 SOCK_DGRAM => matches!(protocol, 0 | IPPROTO_UDP | IPPROTO_ICMP | IPPROTO_UDPLITE),
                 // Raw sockets cannot use protocol 0
                 SOCK_RAW => protocol != 0,
-                _ => false,
+                _ if base >= SOCK_MAX => return Err(Errno::EINVAL),
+                _ => return Err(Errno::ESOCKTNOSUPPORT),
             };
-            return Err(if ok {
-                Errno::EOPNOTSUPP
-            } else {
-                Errno::EPROTONOSUPPORT
-            });
+            if !ok {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let owner = cx.task.ns.borrow().net.owner.clone();
+            if base == SOCK_RAW && !cx.cred().ns_capable(&owner, crate::cred::cap::NET_RAW) {
+                return Err(Errno::EPERM);
+            }
+            return Err(Errno::EOPNOTSUPP);
         }
         AF_NETLINK => return Err(Errno::EOPNOTSUPP),
         _ => return Err(Errno::EAFNOSUPPORT),
@@ -228,6 +250,9 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     let addr = read_addr(cx, addr, len)?;
     if is_unix(&sock) {
         return unix::bind(cx, &sock, &addr).map(|()| 0);
+    }
+    if let Socket::Netlink(s) = &mut *sock.borrow_mut() {
+        return netlink_bind(cx, s, &addr).map(|()| 0);
     }
     let kind = match &*sock.borrow() {
         Socket::Inet(s) => Some((s.family, s.raw)),
@@ -380,17 +405,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                 forward_socket(cx.kr(), s);
             }
         }
-        Socket::Netlink(s) => {
-            let pid = addr
-                .get(4..8)
-                .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-            s.pid = if pid == 0 {
-                cx.pid_out(cx.tgid()) as u32
-            } else {
-                pid
-            };
-        }
-        Socket::Unix(_) => unreachable!("handled above"),
+        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
     }
     if remap
         && cx
@@ -404,6 +419,91 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
         forward_all(cx.kr());
     }
     Ok(0)
+}
+
+/// bind on a netlink socket (Linux's `netlink_bind`): the address must be a whole
+/// `sockaddr_nl`; groups need a protocol anyone may listen to or `CAP_NET_ADMIN` over the
+/// namespace owner (rtnetlink's multicast-routing groups always), and only those the protocol
+/// has count; a bound socket keeps its `nl_pid` (another one is EINVAL), an unbound one takes
+/// the one given or, for 0, the caller's tgid (other sockets holding it are not looked for); the
+/// groups given replace the first 32 joined.
+fn netlink_bind(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), Errno> {
+    const RTNLGRP_MROUTE_R: u64 = (1 << 29) | (1 << 30);
+    if addr.len() < 12 || u16::from_le_bytes([addr[0], addr[1]]) != AF_NETLINK as u16 {
+        return Err(Errno::EINVAL);
+    }
+    let pid = u32::from_le_bytes(addr[4..8].try_into().unwrap());
+    let mut groups = u64::from(u32::from_le_bytes(addr[8..12].try_into().unwrap()));
+    let admin = netlink_admin(cx, s);
+    if groups != 0 {
+        if !(admin || netlink_listen_unprivileged(s.protocol)) {
+            return Err(Errno::EPERM);
+        }
+        s.groups.get_or_insert(0);
+    }
+    groups &= (1 << s.ngroups()) - 1;
+    if s.pid != 0 && pid != s.pid {
+        return Err(Errno::EINVAL);
+    }
+    if s.protocol == NETLINK_ROUTE && groups & RTNLGRP_MROUTE_R != 0 && !admin {
+        return Err(Errno::EPERM);
+    }
+    if s.pid == 0 {
+        s.pid = if pid == 0 {
+            cx.pid_out(cx.tgid()) as u32
+        } else {
+            pid
+        };
+    }
+    if let Some(g) = &mut s.groups {
+        *g = (*g & !0xffff_ffff) | groups;
+    }
+    Ok(())
+}
+
+/// connect on a netlink socket (Linux's `netlink_connect`): `AF_UNSPEC` disconnects; otherwise
+/// the address must be a whole `sockaddr_nl`, and naming a port or group needs `CAP_NET_ADMIN`
+/// over the namespace owner (no protocol here lets anyone send to one). An unbound socket gets
+/// its `nl_pid` ([`netlink_autobind`]). Only the kernel answers, so the peer is not recorded.
+fn netlink_connect(cx: &Cx<'_>, s: &mut NetlinkSocket, addr: &[u8]) -> Result<(), Errno> {
+    let family = addr
+        .get(..2)
+        .map(|f| u16::from_le_bytes([f[0], f[1]]))
+        .ok_or(Errno::EINVAL)?;
+    if family == 0 {
+        return Ok(());
+    }
+    if family != AF_NETLINK as u16 || addr.len() < 12 {
+        return Err(Errno::EINVAL);
+    }
+    if addr[4..12] != [0; 8] && !netlink_admin(cx, s) {
+        return Err(Errno::EPERM);
+    }
+    netlink_autobind(cx, s);
+    Ok(())
+}
+
+/// Gives an unbound netlink socket its `nl_pid` at connect and send, as bind with 0 does (Linux's
+/// `netlink_autobind`, which takes another number when the tgid is held; other sockets are not
+/// looked at here).
+fn netlink_autobind(cx: &Cx<'_>, s: &mut NetlinkSocket) {
+    if s.pid == 0 {
+        s.pid = cx.pid_out(cx.tgid()) as u32;
+    }
+}
+
+/// Whether the caller has `CAP_NET_ADMIN` over the owner of the netlink socket's network
+/// namespace (Linux's `netlink_allowed` and `netlink_net_capable`).
+fn netlink_admin(cx: &Cx<'_>, s: &NetlinkSocket) -> bool {
+    let net = s.net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
+    cx.cred()
+        .ns_capable(&net.owner, crate::cred::cap::NET_ADMIN)
+}
+
+/// Whether anyone may join the protocol's multicast groups (`NL_CFG_F_NONROOT_RECV`: all but
+/// `NETLINK_NETFILTER` here).
+fn netlink_listen_unprivileged(protocol: i32) -> bool {
+    protocol != NETLINK_NETFILTER
 }
 
 /// The address an inet socket binds, checked as Linux 6.1 checks it first (`inet_bind`,
@@ -601,6 +701,9 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
     if is_unix(&sock) {
         return unix::connect(cx, &sock, nonblock, &addr).map(|()| 0);
     }
+    if let Socket::Netlink(s) = &mut *sock.borrow_mut() {
+        return netlink_connect(cx, s, &addr).map(|()| 0);
+    }
     let map = cx.k().portmap.clone();
     let w = cx.kr().world();
     let init = cx.kr().init_ns.net.clone();
@@ -643,7 +746,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 if let crate::nft::Outcome::Reject(e) = verdict.0 {
                     return Err(Errno(e));
                 }
-                s.guest_peer = Some(addr.clone());
+                s.guest_peer = Some(connected_peer(s, &addr));
                 let hole = blackhole(cx.kr()).ok_or(Errno::ETIMEDOUT)?;
                 let hole = if s.family == AF_INET6 {
                     let mut a = vec![0u8; 28];
@@ -679,7 +782,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 }
                 // getpeername reports the address connected to (right even when the host-side peer
                 // cannot be translated back, such as when connecting to its own address)
-                s.guest_peer = crate::netns::is_inet(&addr).then(|| addr.clone());
+                s.guest_peer = crate::netns::is_inet(&addr).then(|| connected_peer(s, &addr));
                 // Mapped low ports on the local machine become the host's (crate::portmap), by the
                 // namespace the destination is in
                 let key = m.target.as_ref().map_or(0, key_of);
@@ -732,8 +835,7 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
                 (host_addr, tcp, s.fd, stream.then_some(origs))
             }
         }
-        Socket::Netlink(_) => return Ok(0),
-        Socket::Unix(_) => unreachable!("handled above"),
+        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
     };
     let r = appine_hal::net::connect(host_fd, &host_addr);
     if tcp {
@@ -1020,6 +1122,71 @@ fn sockname(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, peer: bool) -> Sy
     write_addr_to(cx, addr, addrlen, &value).map(|()| 0)
 }
 
+/// The peer getpeername reports after connecting inet socket `s` to `addr` (Linux's
+/// `inet_getname` and `inet6_getname` after connect): the wildcard address stands for the local
+/// machine (`ip_route_connect` and `tcp_v6_connect` take the loopback address, IPv4-mapped when
+/// the IPv6 socket's local address is), an IPv4 address given to an IPv6 socket is reported
+/// IPv4-mapped, and an IPv6 peer has no flow information and a scope only when link-local. An
+/// IPv4 socket bound to an address of its own would connect to that one instead of the loopback;
+/// this is not followed.
+fn connected_peer(s: &InetSocket, addr: &[u8]) -> Vec<u8> {
+    let family = s.family;
+    // Shorter than its family's sockaddr: kept as given (the host refuses the connect)
+    let fam = addr
+        .get(..2)
+        .map_or(0, |f| u16::from_le_bytes([f[0], f[1]]) as i32);
+    let short = match fam {
+        AF_INET => addr.len() < 16,
+        AF_INET6 => addr.len() < 24,
+        _ => true,
+    };
+    if short {
+        return addr.to_vec();
+    }
+    let port = &addr[2..4];
+    match fam {
+        AF_INET => {
+            let mut ip: [u8; 4] = addr[4..8].try_into().unwrap();
+            if ip == [0; 4] {
+                ip = [127, 0, 0, 1];
+            }
+            if family == AF_INET6 {
+                let mut a = vec![0u8; 28];
+                a[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+                a[2..4].copy_from_slice(port);
+                a[18..20].copy_from_slice(&[0xff, 0xff]);
+                a[20..24].copy_from_slice(&ip);
+                a
+            } else {
+                let mut a = vec![0u8; 16];
+                a[..4].copy_from_slice(&addr[..4]);
+                a[4..8].copy_from_slice(&ip);
+                a
+            }
+        }
+        AF_INET6 => {
+            let mut a = addr.to_vec();
+            a.resize(28, 0);
+            let mapped = a[8..20] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+            let mapped_local = appine_hal::net::sockname(s.fd, false)
+                .is_ok_and(|l| l.get(8..20) == Some(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]));
+            if a[8..24] == [0; 16] && mapped_local {
+                a[18..24].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+            } else if a[8..24] == [0; 16] {
+                a[23] = 1;
+            } else if mapped && a[20..24] == [0; 4] {
+                a[20..24].copy_from_slice(&[127, 0, 0, 1]);
+            }
+            a[4..8].fill(0);
+            if !(a[8] == 0xfe && a[9] & 0xc0 == 0x80) {
+                a[24..28].fill(0);
+            }
+            a
+        }
+        _ => addr.to_vec(),
+    }
+}
+
 /// The host socket's local (or with `peer`, peer) address as the guest sees it (getsockname,
 /// getpeername).
 fn inet_name(cx: &Cx<'_>, s: &InetSocket, peer: bool) -> Result<Vec<u8>, Errno> {
@@ -1075,9 +1242,23 @@ pub(super) fn setsockopt(
     const SO_SNDBUFFORCE: i32 = 32;
     const SO_RCVBUFFORCE: i32 = 33;
     let (sock, _) = socket_of(cx, fd)?;
+    let name = new_timeouts(level, name);
     let len = (len as usize).min(256);
     let mut v = vec![0u8; len];
     cx.mm().read(UserSlice::new(value, len), &mut v)?;
+    // Netlink and AF_UNIX sockets keep their options in process
+    match &mut *sock.borrow_mut() {
+        Socket::Netlink(s) => return netlink_setsockopt(cx, s, level, name, &v).map(|()| 0),
+        Socket::Unix(u) => {
+            let net = u.net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
+            let privileged = (
+                cx.cred().capable(crate::cred::cap::NET_ADMIN),
+                priority_allowed(cx, &net),
+            );
+            return unix::setsockopt(u, level, name, &v, privileged).map(|()| 0);
+        }
+        Socket::Inet(_) => {}
+    }
     // SO_*BUFFORCE, which ignore the limits, require CAP_NET_ADMIN, which the app does not have
     // on the host: guest processes with this capability fall back to the plain SO_*BUF (limited
     // by the host)
@@ -1173,24 +1354,206 @@ pub(super) fn setsockopt(
             }
             _ => appine_hal::net::setsockopt(s.fd, level, name, &v).map_err(Errno)?,
         },
-        // Other options (buffer sizes, multicast and so on) are all accepted but have no effect
-        Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
-            s.rcvtimeo = timeval(&v)?
-        }
-        // SOL_NETLINK's NETLINK_CAP_ACK, NETLINK_EXT_ACK
-        Socket::Netlink(s) if level == 270 && (name == 10 || name == 11) => {
-            let on = v.get(..4).ok_or(Errno::EINVAL)?;
-            let on = i32::from_le_bytes(on.try_into().unwrap()) != 0;
-            if name == 10 {
-                s.cap_ack = on;
-            } else {
-                s.ext_ack = on;
-            }
-        }
-        Socket::Netlink(_) => {}
-        Socket::Unix(u) => unix::setsockopt(u, level, name, &v)?,
+        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
     }
     Ok(0)
+}
+
+/// `SO_RCVTIMEO_NEW` and `SO_SNDTIMEO_NEW` are the old options on a 64-bit kernel: the same
+/// `struct timeval` (`__kernel_sock_timeval` has two 64-bit fields too).
+fn new_timeouts(level: i32, name: i32) -> i32 {
+    const SO_RCVTIMEO_NEW: i32 = 66;
+    const SO_SNDTIMEO_NEW: i32 = 67;
+    match (level, name) {
+        (SOL_SOCKET, SO_RCVTIMEO_NEW) => SO_RCVTIMEO,
+        (SOL_SOCKET, SO_SNDTIMEO_NEW) => SO_SNDTIMEO,
+        _ => name,
+    }
+}
+
+/// Whether the caller may give a socket in `net` a priority outside 0..=6 (`CAP_NET_RAW` or
+/// `CAP_NET_ADMIN` over the namespace owner, `sk_setsockopt`).
+fn priority_allowed(cx: &Cx<'_>, net: &crate::nsproxy::NetNs) -> bool {
+    let cred = cx.cred();
+    cred.ns_capable(&net.owner, crate::cred::cap::NET_RAW)
+        || cred.ns_capable(&net.owner, crate::cred::cap::NET_ADMIN)
+}
+
+/// setsockopt on a netlink socket. `SOL_SOCKET`: the timeouts, `SO_PASSCRED` and the options
+/// [`SockOpts`] records, others accepted without effect; `SOL_NETLINK` as Linux's
+/// `netlink_setsockopt` (the value read only when it is a whole int): memberships and flags
+/// recorded ([`NetlinkSocket`]), `NETLINK_CAP_ACK` and `NETLINK_EXT_ACK` shaping error acks;
+/// other levels ENOPROTOOPT.
+fn netlink_setsockopt(
+    cx: &Cx<'_>,
+    s: &mut NetlinkSocket,
+    level: i32,
+    name: i32,
+    v: &[u8],
+) -> Result<(), Errno> {
+    const SO_PASSCRED: i32 = 16;
+    const RTNLGRP_IPV4_MROUTE_R: u32 = 30;
+    const RTNLGRP_IPV6_MROUTE_R: u32 = 31;
+    let net = s.net.clone().unwrap_or_else(|| cx.kr().init_ns.net.clone());
+    if level == SOL_SOCKET {
+        match name {
+            SO_RCVTIMEO => s.rcvtimeo = timeval(v)?,
+            SO_SNDTIMEO => s.sndtimeo = timeval(v)?,
+            SO_PASSCRED => {
+                let on = v.get(..4).ok_or(Errno::EINVAL)?;
+                s.passcred = on != [0; 4];
+            }
+            _ => {
+                let admin = cx.cred().capable(crate::cred::cap::NET_ADMIN);
+                if let Some(r) = s.opts.set(name, v, admin, priority_allowed(cx, &net)) {
+                    r?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    if level != SOL_NETLINK {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    let val = v
+        .get(..4)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    match name {
+        NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+            let admin = netlink_admin(cx, s);
+            if !(admin || netlink_listen_unprivileged(s.protocol)) {
+                return Err(Errno::EPERM);
+            }
+            // The set is allocated before the group is checked
+            s.groups.get_or_insert(0);
+            if val == 0 || val > s.ngroups() {
+                return Err(Errno::EINVAL);
+            }
+            // rtnetlink_bind
+            if name == NETLINK_ADD_MEMBERSHIP
+                && s.protocol == NETLINK_ROUTE
+                && matches!(val, RTNLGRP_IPV4_MROUTE_R | RTNLGRP_IPV6_MROUTE_R)
+                && !admin
+            {
+                return Err(Errno::EPERM);
+            }
+            let bit = 1u64 << (val - 1);
+            let groups = s.groups.get_or_insert(0);
+            if name == NETLINK_ADD_MEMBERSHIP {
+                *groups |= bit;
+            } else {
+                *groups &= !bit;
+            }
+        }
+        NETLINK_CAP_ACK => s.cap_ack = val != 0,
+        NETLINK_EXT_ACK => s.ext_ack = val != 0,
+        NETLINK_LISTEN_ALL_NSID
+            if !cx
+                .cred()
+                .ns_capable(&net.owner, crate::cred::cap::NET_BROADCAST) =>
+        {
+            return Err(Errno::EPERM);
+        }
+        NETLINK_PKTINFO
+        | NETLINK_BROADCAST_ERROR
+        | NETLINK_NO_ENOBUFS
+        | NETLINK_LISTEN_ALL_NSID
+        | NETLINK_GET_STRICT_CHK => {
+            if val != 0 {
+                s.flags |= 1 << name;
+            } else {
+                s.flags &= !(1 << name);
+            }
+        }
+        _ => return Err(Errno::ENOPROTOOPT),
+    }
+    Ok(())
+}
+
+/// getsockopt on a netlink socket: the data and the length to report when it differs from the
+/// data's (`NETLINK_LIST_MEMBERSHIPS` reports the whole set's size whatever fits). `SOL_SOCKET`
+/// as Linux's `sk_getsockopt` (no peer: pid 0, uid and gid -1), `SOL_NETLINK` as
+/// `netlink_getsockopt` (a flag needs room for an int), other levels ENOPROTOOPT.
+fn netlink_getsockopt(
+    s: &NetlinkSocket,
+    level: i32,
+    name: i32,
+    room: usize,
+) -> Result<(Vec<u8>, Option<usize>), Errno> {
+    const SO_PROTOCOL: i32 = 38;
+    const SO_DOMAIN: i32 = 39;
+    const SO_PASSCRED: i32 = 16;
+    const SO_PEERCRED: i32 = 17;
+    const SO_ACCEPTCONN: i32 = 30;
+    let int = |v: i32| Ok((v.to_le_bytes().to_vec(), None));
+    if level == SOL_SOCKET {
+        return match name {
+            SO_TYPE => int(s.ty),
+            SO_PROTOCOL => int(s.protocol),
+            SO_DOMAIN => int(AF_NETLINK),
+            SO_ERROR | SO_ACCEPTCONN => int(0),
+            SO_PASSCRED => int(s.passcred as i32),
+            SO_RCVTIMEO => Ok((encode_timeval(s.rcvtimeo), None)),
+            SO_SNDTIMEO => Ok((encode_timeval(s.sndtimeo), None)),
+            SO_PEERCRED => {
+                let mut b = 0i32.to_le_bytes().to_vec();
+                b.extend_from_slice(&(-1i32).to_le_bytes());
+                b.extend_from_slice(&(-1i32).to_le_bytes());
+                Ok((b, None))
+            }
+            _ => s
+                .opts
+                .get(name)
+                .map(|b| (b, None))
+                .ok_or(Errno::ENOPROTOOPT),
+        };
+    }
+    if level != SOL_NETLINK {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    match name {
+        NETLINK_LIST_MEMBERSHIPS => {
+            let Some(groups) = s.groups else {
+                return Ok((Vec::new(), Some(0)));
+            };
+            let size = (s.ngroups() as usize).div_ceil(8).next_multiple_of(4);
+            let mut out = Vec::new();
+            for word in 0..size / 4 {
+                if room - out.len() < 4 {
+                    break;
+                }
+                let w = groups.checked_shr(word as u32 * 32).unwrap_or(0) as u32;
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            Ok((out, Some(size)))
+        }
+        NETLINK_PKTINFO
+        | NETLINK_BROADCAST_ERROR
+        | NETLINK_NO_ENOBUFS
+        | NETLINK_LISTEN_ALL_NSID
+        | NETLINK_CAP_ACK
+        | NETLINK_EXT_ACK
+        | NETLINK_GET_STRICT_CHK => {
+            if room < 4 {
+                return Err(Errno::EINVAL);
+            }
+            let on = match name {
+                NETLINK_CAP_ACK => s.cap_ack,
+                NETLINK_EXT_ACK => s.ext_ack,
+                _ => s.flags & (1 << name) != 0,
+            };
+            int(on as i32)
+        }
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+/// A timeout as `struct timeval` (0 for none).
+fn encode_timeval(t: Option<Duration>) -> Vec<u8> {
+    let t = t.unwrap_or_default();
+    let mut b = (t.as_secs() as i64).to_le_bytes().to_vec();
+    b.extend_from_slice(&(t.subsec_micros() as i64).to_le_bytes());
+    b
 }
 
 /// `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux 6.1's `sock_set_timeout`): a short buffer is EINVAL and
@@ -1222,13 +1585,16 @@ pub(super) fn getsockopt(
     len: u64,
 ) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
+    let name = new_timeouts(level, name);
     let room = usize::try_from(i32::from_le_bytes(get(cx, len)?)).map_err(|_| Errno::EINVAL)?;
-    let encode_tv = |t: Option<Duration>| {
-        let t = t.unwrap_or_default();
-        let mut b = (t.as_secs() as i64).to_le_bytes().to_vec();
-        b.extend_from_slice(&(t.subsec_micros() as i64).to_le_bytes());
-        b
-    };
+    let encode_tv = encode_timeval;
+    if let Socket::Netlink(s) = &*sock.borrow() {
+        let (out, size) = netlink_getsockopt(s, level, name, room)?;
+        let n = room.min(out.len());
+        cx.mm().write(UserSlice::new(value, n), &out[..n])?;
+        let size = size.unwrap_or(n) as u32;
+        return put(cx, len, size.to_le_bytes()).map(|()| 0);
+    }
     let pid_ns = cx.pid_ns();
     // SO_ORIGINAL_DST: Linux writes only the sockaddr and writes optlen back unchanged
     if let Some(r) = original_dst(cx, &sock, level, name, room) {
@@ -1276,10 +1642,7 @@ pub(super) fn getsockopt(
                     appine_hal::net::getsockopt(s.fd, level, name, room.min(256)).map_err(Errno)?
                 }
             },
-            Socket::Netlink(s) if (level, name) == (SOL_SOCKET, SO_RCVTIMEO) => {
-                encode_tv(s.rcvtimeo)
-            }
-            Socket::Netlink(_) => 0i32.to_le_bytes().to_vec(),
+            Socket::Netlink(_) => unreachable!("handled above"),
             Socket::Unix(u) => unix::getsockopt(u, level, name, &pid_ns, &cx.cred())?,
         }
     };
@@ -1379,6 +1742,38 @@ pub(crate) struct Message {
     pub addr: Vec<u8>,
     pub control: Vec<u8>,
     pub flags: u32,
+}
+
+/// Appends a control message the way Linux's `put_cmsg` writes it into a buffer with `room` bytes
+/// left: with less than a header left nothing is written; with less than the whole message the
+/// header and as much data as fits, its `cmsg_len` cut to what was written; `MSG_CTRUNC` in
+/// either case. `room` shrinks by the message's aligned length (at most to 0).
+pub(super) fn put_cmsg(
+    control: &mut Vec<u8>,
+    room: &mut usize,
+    flags: &mut u32,
+    level: i32,
+    ty: i32,
+    data: &[u8],
+) {
+    const MSG_CTRUNC: u32 = 0x8;
+    const CMSG_HDR: usize = 16;
+    if *room < CMSG_HDR {
+        *flags |= MSG_CTRUNC;
+        return;
+    }
+    let mut len = CMSG_HDR + data.len();
+    if *room < len {
+        *flags |= MSG_CTRUNC;
+        len = *room;
+    }
+    control.extend_from_slice(&(len as u64).to_le_bytes());
+    control.extend_from_slice(&level.to_le_bytes());
+    control.extend_from_slice(&ty.to_le_bytes());
+    control.extend_from_slice(&data[..len - CMSG_HDR]);
+    let space = (CMSG_HDR + data.len()).next_multiple_of(8).min(*room);
+    control.resize(control.len() + space - len, 0);
+    *room -= space;
 }
 
 /// The guest's `struct msghdr`.
@@ -1567,7 +1962,32 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         controllen,
     } = read_msghdr(cx, msg)?;
     let total: usize = iovecs.iter().map(|v| v.1).sum();
-    let m = recv(cx, &sock, nonblock, total, controllen.min(4096), flags)?;
+    // AF_UNIX data is taken off its queue: when the part of the iovecs that the queued data
+    // would fill cannot take it, fail first, leaving the data queued (Linux keeps a stream's
+    // message when copying it faults)
+    let queued = match &*sock.borrow() {
+        Socket::Unix(u) => u.unread().unwrap_or(0),
+        _ => 0,
+    };
+    let mut need = total.min(queued);
+    for &(base, len) in &iovecs {
+        if need == 0 {
+            break;
+        }
+        let n = len.min(need);
+        if !cx.mm().can_write(base, n as u64) {
+            return Err(Errno::EFAULT);
+        }
+        need -= n;
+    }
+    // A NULL control buffer holds nothing whatever its length (scm_recv): control messages are
+    // cut (MSG_CTRUNC) and passed files dropped
+    let room = if control == 0 {
+        0
+    } else {
+        controllen.min(4096)
+    };
+    let mut m = recv(cx, &sock, nonblock, total, room, flags)?;
     scatter(cx, &iovecs, 0, &m.data)?;
     let more = recv_rest(
         cx,
@@ -1584,9 +2004,18 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
         cx.mm().write(UserSlice::new(name, n), &m.addr[..n])?;
         put(cx, msg + 8, (m.addr.len() as u32).to_le_bytes())?;
     }
-    let n = controllen.min(m.control.len());
-    if n > 0 {
-        cx.mm().write(UserSlice::new(control, n), &m.control[..n])?;
+    let mut n = controllen.min(m.control.len());
+    // A control buffer that cannot be written loses its messages, not the data: the passed files
+    // are not installed (receive_fd_user) and MSG_CTRUNC is set
+    if n > 0
+        && cx
+            .mm()
+            .write(UserSlice::new(control, n), &m.control[..n])
+            .is_err()
+    {
+        unix::drop_passed_files(cx, &m.control);
+        m.flags |= MSG_CTRUNC;
+        n = 0;
     }
     put(cx, msg + 40, (n as u64).to_le_bytes())?;
     // As on Linux, msg_flags echoes the MSG_CMSG_CLOEXEC the caller gave
@@ -1787,6 +2216,7 @@ pub(crate) fn send(
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
         Socket::Netlink(s) => {
+            netlink_autobind(cx, s);
             let host = KernelHost {
                 k: cx.kr(),
                 cred: cx.cred(),
@@ -2168,7 +2598,36 @@ pub(crate) fn recv(
                     b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
                     b
                 };
-                if let Some(m) = local(&mut s.queue, addr) {
+                if let Some(mut m) = local(&mut s.queue, addr) {
+                    // netlink_recvmsg: the pktinfo (group 0, answers being unicast), then the
+                    // credentials of the kernel, which sends as root (pid 0; uid and gid 0 as
+                    // the receiver sees them, the overflow IDs when 0 is not mapped)
+                    let mut room = control_len;
+                    if s.flags & (1 << NETLINK_PKTINFO) != 0 {
+                        let group = 0u32.to_le_bytes();
+                        put_cmsg(
+                            &mut m.control,
+                            &mut room,
+                            &mut m.flags,
+                            SOL_NETLINK,
+                            NETLINK_PKTINFO,
+                            &group,
+                        );
+                    }
+                    if s.passcred {
+                        let cred = cx.cred();
+                        let mut ucred = 0i32.to_le_bytes().to_vec();
+                        ucred.extend_from_slice(&cred.uid_out(0).to_le_bytes());
+                        ucred.extend_from_slice(&cred.gid_out(0).to_le_bytes());
+                        put_cmsg(
+                            &mut m.control,
+                            &mut room,
+                            &mut m.flags,
+                            SOL_SOCKET,
+                            SCM_CREDENTIALS,
+                            &ucred,
+                        );
+                    }
                     return Ok(m);
                 }
                 let timeo = s.rcvtimeo;
@@ -2636,6 +3095,11 @@ impl crate::net::Host for KernelHost<'_> {
         self.net.is_none()
     }
 
+    fn net_admin(&self) -> bool {
+        self.cred
+            .ns_capable(&self.ns().owner, crate::cred::cap::NET_ADMIN)
+    }
+
     fn stats(&self, name: &str) -> crate::traffic::IfStats {
         match &self.net {
             Some(_) => Default::default(),
@@ -2724,7 +3188,8 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
         }
         Socket::Inet(s) => Some(s.fd),
         Socket::Unix(u) if request == FIONREAD => {
-            return put(cx, arg, (u.unread() as i32).to_le_bytes()).map(|()| 0);
+            let n = u.unread().ok_or(Errno::EINVAL)? as i32;
+            return put(cx, arg, n.to_le_bytes()).map(|()| 0);
         }
         Socket::Netlink(_) | Socket::Unix(_) => None,
     };

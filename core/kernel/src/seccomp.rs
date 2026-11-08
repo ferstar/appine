@@ -492,10 +492,12 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
             }
         });
         if let Some(t) = unsyncable {
-            if flags & flag::TSYNC_ESRCH != 0 {
+            // The thread's number in the caller's pid namespace (ESRCH when it has none there)
+            let tid = cx.pid_out(t.tid.get());
+            if flags & flag::TSYNC_ESRCH != 0 || tid == 0 {
                 return Err(Errno::ESRCH);
             }
-            return Ok(t.tid.get() as u64);
+            return Ok(tid as u64);
         }
     }
     let allow = cache(&prog, prev.as_ref().map(|p| &p.allow));
@@ -990,6 +992,8 @@ fn recv(cx: &mut Cx<'_>, f: &Filter, arg: u64) -> Result<u64, Errno> {
         let k = knotif.borrow();
         (k.id, k.tid, k.data)
     };
+    // The thread as the receiver's pid namespace sees it, 0 when invisible (task_pid_vnr)
+    let tid = cx.pid_out(tid);
     b[..8].copy_from_slice(&id.to_le_bytes());
     b[8..12].copy_from_slice(&tid.to_le_bytes());
     b[16..].copy_from_slice(&data);

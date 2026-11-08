@@ -1178,13 +1178,21 @@ impl Mm {
     }
 
     /// The key of the futex at `addr` (Linux's `get_futex_key`; `private` is an operation with
-    /// `FUTEX_PRIVATE_FLAG`); None when nothing readable is mapped there. Private memory, and any
-    /// memory for a private operation, is keyed by this address space and the address, whatever
-    /// page is there now; shared anonymous memory by its host address and shared file mappings by
-    /// file and offset, which every process mapping them sees alike.
+    /// `FUTEX_PRIVATE_FLAG`). A private operation's key is this address space and the address,
+    /// whatever is mapped there or not (Linux only checks that the address is a user one, so a
+    /// private wake on an unmapped address wakes nobody); None outside the address space. Other
+    /// operations need a readable page (None when there is none): private memory is keyed the
+    /// same way, shared anonymous memory by its host address and shared file mappings by file and
+    /// offset, which every process mapping them sees alike.
     pub fn futex_key(&self, addr: u64, private: bool) -> Option<crate::futex::Key> {
         use crate::futex::Key;
-        // As on Linux, the futex address must be readable
+        if private {
+            return (addr.checked_add(4)? <= 1 << VA_BITS).then_some(Key::Private {
+                mm: self.id,
+                addr,
+                shared: false,
+            });
+        }
         let host = self.translate(addr, prot::READ)?;
         let (&start, v) = self.vmas.range(..=addr).next_back()?;
         Some(match (v.backing, v.file_id) {
@@ -2049,9 +2057,11 @@ impl Mm {
         Ok(())
     }
 
-    /// madvise(`MADV_REMOVE`): zeroes this part of shared mappings. For a file mapping Linux
-    /// punches a hole in the file; here the zeros are written through the host mapping, so the
-    /// file reads back zeros but its storage is not freed. As on Linux, a range with locked pages
+    /// madvise(`MADV_REMOVE`): frees this part of shared mappings, which then read zeros. The
+    /// host mapping is shared too, so the host punches the hole in the file or shared memory
+    /// behind it (Linux punches one in the file); the parts of host pages at the ends (4 KB guest
+    /// pages on a 16 KB host), or everything when the host refuses, are zeroed through the
+    /// mapping instead, which keeps their storage. As on Linux, a range with locked pages
     /// or private anonymous mappings is EINVAL, and other private mappings or ones that cannot get
     /// write permission are EACCES (since 6.7 what counts is whether write permission can be
     /// granted, not whether it is held now). The range must be fully mapped.
@@ -2082,11 +2092,11 @@ impl Mm {
             let to = end.min(s + v.file_len);
             if from < to {
                 // SAFETY: [from, to) is inside this VMA, which holds the host memory; for a shared
-                // mapping that can get write permission the host mapping is always writable
+                // mapping that can get write permission the host mapping is always writable and
+                // shared
                 unsafe {
-                    std::ptr::write_bytes(
+                    remove_host(
                         v.host.as_ptr().add((from - s) as usize),
-                        0,
                         (to - from) as usize,
                     )
                 };
@@ -2151,6 +2161,25 @@ impl Mm {
                 unsafe {
                     discard_host(v.host.add((cursor - s) as usize), (stop - cursor) as usize)
                 };
+                // The vDSO comes back as the kernel's image, not zeros (on Linux a special
+                // mapping whose pages fault back in; breakpoints written into it are gone)
+                if s == self.vdso {
+                    let image = crate::vdso::image();
+                    let (from, to) = (
+                        (cursor - s) as usize,
+                        ((stop - s) as usize).min(image.len()),
+                    );
+                    if from < to {
+                        // SAFETY: [from, to) is inside this VMA's host memory, writable on the host
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                image[from..].as_ptr(),
+                                v.host.add(from).as_ptr(),
+                                to - from,
+                            )
+                        };
+                    }
+                }
             }
             // Only written pages differ from the file (a `cow` mapping never is), and whole pages
             // past the end of the file have no entries
@@ -3423,6 +3452,28 @@ impl Mm {
         self.exec_changed |= v.prot & prot::EXEC != 0;
         self.vmas.insert(start, v);
         Ok(())
+    }
+
+    /// Whether `[addr, addr + len)` lies in mappings that allow writing (an empty range always
+    /// does), for a kernel write that must not fail halfway; mapped pages and stack growth are not
+    /// looked at.
+    pub fn can_write(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let mut cursor = addr;
+        while cursor < end {
+            match self
+                .vmas
+                .range(..=cursor)
+                .next_back()
+                .filter(|&(&s, v)| s + v.len > cursor)
+            {
+                Some((&s, v)) if v.prot & prot::WRITE != 0 => cursor = s + v.len,
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// The range check of msync(2): the range must be fully mapped.
@@ -5010,6 +5061,32 @@ unsafe fn discard_file_host(ptr: NonNull<u8>, len: usize) -> Vec<(usize, usize)>
             .collect()
     } else {
         vec![(0, len)]
+    }
+}
+
+/// Frees the contents of shared host memory (`MADV_REMOVE`): the whole host pages are punched
+/// out of the file or shared memory behind them, and the partial host pages at both ends when
+/// host pages are larger than 4K, or everything when the host refuses, are zeroed.
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` is writable shared host memory held by an [`Mm`].
+unsafe fn remove_host(ptr: *mut u8, len: usize) {
+    let page = appine_hal::page_size();
+    let addr = ptr as usize;
+    let head = (addr.next_multiple_of(page) - addr).min(len);
+    let tail = ((addr + len) & !(page - 1)).max(addr + head) - addr;
+    // SAFETY: all offsets are in [0, len]; [head, tail) is aligned to host pages
+    unsafe {
+        let removed = head < tail
+            && NonNull::new(ptr.add(head))
+                .is_some_and(|p| appine_hal::remove(p, tail - head).is_ok());
+        if removed {
+            std::ptr::write_bytes(ptr, 0, head);
+            std::ptr::write_bytes(ptr.add(tail), 0, len - tail);
+        } else {
+            std::ptr::write_bytes(ptr, 0, len);
+        }
     }
 }
 

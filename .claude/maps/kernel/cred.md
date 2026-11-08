@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials; seccomp notification and TSYNC pids last)
 
 ## Responsibilities
 
@@ -152,8 +152,8 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   namespace `EACCES`; the classic and seccomp checkers (aligned loads of `seccomp_data`, forward
   jumps, packet loads and MOD rejected); mode must be disabled or filter; a second listener
   `EBUSY`; total converted length plus 4 per filter over 32768 `ENOMEM`; TSYNC requires every other
-  thread to be disabled or on an ancestor chain (else that thread's global tid, or `ESRCH` with
-  `TSYNC_ESRCH`). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
+  thread to be disabled or on an ancestor chain (else that thread's tid in the caller's pid
+  namespace, or `ESRCH` with `TSYNC_ESRCH` or when the caller cannot see it). The always-allow bitmap is built (ANDed with the previous filter's) and the filter
   pushed; TSYNC copies the chain to other threads; the listener fd is close-on-exec.
 - Filters belong to threads, are copied by clone/fork and kept across execve; an exiting leader's
   chain is held until the group is reaped.
@@ -170,7 +170,8 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - User notifications: the waiting thread is woken by replies, ends on fatal signals, and returns
   `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a
   signal costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
-  nonblocking, `ENOENT` for withdrawn; the `pid` field is the global tid), SEND (flags, `CONTINUE`, `ENOENT`,
+  nonblocking, `ENOENT` for withdrawn; the `pid` field is the notified thread as the receiver's pid
+  namespace sees it, 0 when invisible), SEND (flags, `CONTINUE`, `ENOENT`,
   `EINPROGRESS` for a second answer), ID_VALID, ADDFD (installs into the target's table, optionally
   replacing an fd and answering); closing the listener answers waiters with `ENOSYS`; poll readiness
   and `POLLHUP` when no thread uses the filter.
@@ -210,15 +211,9 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   not broadcast `setfsuid`/`setfsgid` or raw id syscalls; threaded file servers that switch
   filesystem ids per thread (Samba, nfs-ganesha, FUSE servers, Go raw syscalls) would have one
   thread's checks run as another thread's user.
-- **seccomp notifications report global pids.** RECV's `pid` and the TSYNC failure tid are not
-  translated into the caller's pid namespace; a notify agent inside a child pid namespace (nested
-  containers, `unshare -p` supervisors) finds the wrong `/proc/<pid>` or `pidfd_open` target.
 - **A shared fs context does not block privilege gains.** Nothing models Linux's
   `LSM_UNSAFE_SHARE`: a process sharing `CLONE_FS` with a setuid program can still change its cwd,
   root or umask.
-- **`PRIO_USER` uses an untranslated uid.** setpriority/getpriority match `who` against kernel uids
-  without mapping it through the caller's user namespace, and do not skip processes invisible in
-  the caller's pid namespace (ioprio translates both).
 - **The vDSO bypass covers every clock.** Linux's vDSO falls back to a real (filtered) syscall for
   CPU-time clocks, the alarm clocks (`CLOCK_REALTIME_ALARM`, `CLOCK_BOOTTIME_ALARM`) and invalid
   ids; here filters restricting clock ids (Chromium's) never fire, and

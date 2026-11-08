@@ -1149,7 +1149,7 @@ fn open_store(
                 let tmpfs = tmpfs_size(vfs, &Node::Store(mnt, ino), target)?;
                 truncating(cx, target, 0);
                 target.set_len(0).map_err(host_errno)?;
-                tmpfs_resized(vfs, tmpfs, 0);
+                tmpfs_resized(vfs, tmpfs, target);
             }
             FileKind::Regular { ino, file }
         }
@@ -3576,10 +3576,8 @@ pub(super) fn write_bytes(
                 })?,
                 None => local_write(&mut file.borrow_mut(), data, offset)?.min(written),
             };
-            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind)
-                && let Ok(meta) = host.metadata()
-            {
-                tmpfs_resized(&*cx.vfs()?, Some(t), meta.len());
+            if let (Some(t), FileKind::Regular { file: host, .. }) = (tmpfs, &file.borrow().kind) {
+                tmpfs_resized(&*cx.vfs()?, Some(t), host);
             }
             if n > 0 {
                 inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_MODIFY);
@@ -3989,10 +3987,25 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
         } => return super::loopdev::seek(&open.dev, pos, offset, whence),
         // As with Linux's /dev/null and the like, seek always succeeds and stays at 0
         FileKind::Device { .. } => return Ok(0),
-        FileKind::Directory { entries, .. } => {
-            let new = match whence {
-                SEEK_SET => offset,
-                SEEK_CUR => (*pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
+        FileKind::Directory { entries, node, .. } => {
+            // Where SEEK_END and SEEK_DATA/SEEK_HOLE count from: store directories stand in for
+            // ext4's, whose hashed directories end at the largest position (ext4_dir_llseek);
+            // procfs, sysfs and cgroup2 ones are of size 0 (generic_file_llseek); tmpfs, devpts
+            // and mqueue directories take only SEEK_SET and SEEK_CUR (dcache_dir_lseek)
+            let eof = match cx.vfs()?.fs_of(node) {
+                Fs::Store => Some(i64::MAX),
+                Fs::Proc | Fs::Sys | Fs::Cgroup => Some(0),
+                _ => None,
+            };
+            let new = match (whence, eof) {
+                (SEEK_SET, _) => offset,
+                (SEEK_CUR, _) => (*pos as i64).checked_add(offset).ok_or(Errno::EINVAL)?,
+                (SEEK_END, Some(eof)) => eof.checked_add(offset).ok_or(Errno::EINVAL)?,
+                (SEEK_DATA | SEEK_HOLE, Some(eof)) if offset as u64 >= eof as u64 => {
+                    return Err(Errno::ENXIO);
+                }
+                (SEEK_DATA, Some(_)) => offset,
+                (SEEK_HOLE, Some(eof)) => eof,
                 _ => return Err(Errno::EINVAL),
             };
             if new < 0 {
@@ -4010,12 +4023,21 @@ pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysRe
                 SEEK_SET => 0,
                 SEEK_CUR => *pos as i64,
                 SEEK_END => size,
-                SEEK_DATA if offset >= size => return Err(Errno::ENXIO),
-                SEEK_DATA => 0,
-                SEEK_HOLE if offset >= size => return Err(Errno::ENXIO),
-                SEEK_HOLE => {
-                    *pos = size as u64;
-                    return Ok(size as u64);
+                SEEK_DATA | SEEK_HOLE if offset < 0 || offset >= size => {
+                    return Err(Errno::ENXIO);
+                }
+                // Store objects and tmpfs files are host files, whose holes the host knows; a
+                // host filesystem that cannot tell has data everywhere (a hole only at the end)
+                SEEK_DATA | SEEK_HOLE => {
+                    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+                    let found = match appine_hal::lseek(fd, offset, whence as i32) {
+                        Ok(at) => at,
+                        Err(e) if e == Errno::ENXIO.0 => return Err(Errno::ENXIO),
+                        Err(_) if whence == SEEK_DATA => offset as u64,
+                        Err(_) => size as u64,
+                    };
+                    *pos = found;
+                    return Ok(found);
                 }
                 _ => return Err(Errno::EINVAL),
             }
@@ -4603,7 +4625,14 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
             let st = vfs.store().stat_open(ino, host)?;
             Ok(encode_stat(&st, vfs.dev_of(&Node::Store(mnt, ino))))
         }
-        Node::Pseudo(_, p) => Ok(encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node))),
+        Node::Pseudo(_, p) => {
+            let mut b = encode_stat(&pseudo::stat(&view, p)?, vfs.dev_of(node));
+            // procfs and devpts have 1024-byte blocks (proc_fill_super, devpts_fill_super)
+            if matches!(vfs.fs_of(node), Fs::Proc | Fs::Pts) {
+                b[56..60].copy_from_slice(&1024u32.to_le_bytes());
+            }
+            Ok(b)
+        }
     }
 }
 
@@ -4621,6 +4650,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             atime_ns: 0,
             mtime_ns: 0,
             ctime_ns: 0,
+            blocks: None,
         };
         encode_stat(&st, dev)
     };
@@ -4707,6 +4737,7 @@ fn host_stat(fd: i32) -> Result<[u8; 128], Errno> {
         atime_ns: s.st_atime as i64 * 1_000_000_000 + s.st_atime_nsec as i64,
         mtime_ns: s.st_mtime as i64 * 1_000_000_000 + s.st_mtime_nsec as i64,
         ctime_ns: s.st_ctime as i64 * 1_000_000_000 + s.st_ctime_nsec as i64,
+        blocks: Some(s.st_blocks as u64),
     };
     Ok(encode_stat(&st, s.st_dev as u64))
 }
@@ -4738,7 +4769,9 @@ pub(super) fn encode_stat(st: &Stat, dev: u64) -> [u8; 128] {
     // trailing NUL they fit in `i_data`), on others such as tmpfs within 128 bytes
     // (`shmem_symlink`'s `SHORT_SYMLINK_LEN`)
     let inline = if dev == ROOT_DEV { 60 } else { 128 };
-    let blocks = if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
+    let blocks = if let Some(blocks) = st.blocks {
+        blocks
+    } else if dev == Fs::Sys.dev() || (st.is_symlink() && size < inline) {
         0
     } else {
         size.div_ceil(4096) * 8
@@ -5174,20 +5207,42 @@ pub(super) fn renameat2(
     }
     let oldpath = read_path(cx, oldpath)?;
     let newpath = read_path(cx, newpath)?;
-    let (old_mnt, old_dir, old_name) = parent_at(cx, olddirfd, &oldpath)?;
-    let (new_mnt, new_dir, new_name) = parent_at(cx, newdirfd, &newpath)?;
-    // Two sides reached through different mounts are EXDEV, and only then come `.`, `..` and
-    // the read-only mount (Linux's do_renameat2)
-    if old_mnt != new_mnt {
+    let parent = |dirfd, path| -> Result<(Node, &[u8]), Errno> {
+        let start = start_dir(cx, dirfd, path)?;
+        let vfs = cx.vfs()?;
+        vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)
+    };
+    let (old_parent, old_name) = parent(olddirfd, &oldpath)?;
+    let (new_parent, new_name) = parent(newdirfd, &newpath)?;
+    // Two sides reached through different mounts are EXDEV, and only then come `.` and `..` (a
+    // destination one is EEXIST with RENAME_NOREPLACE), the read-only mount (Linux's
+    // do_renameat2)
+    if old_parent.mnt() != new_parent.mnt() {
         return Err(Errno::EXDEV);
     }
-    if [old_name, new_name]
-        .iter()
-        .any(|n| *n == b"." || *n == b"..")
-    {
+    let dots = |n: &[u8]| n == b"." || n == b"..";
+    if dots(old_name) {
         return Err(Errno::EBUSY);
     }
+    if dots(new_name) {
+        return Err(if flags & RENAME_NOREPLACE != 0 {
+            Errno::EEXIST
+        } else {
+            Errno::EBUSY
+        });
+    }
+    if let (Node::Pseudo(..), _) | (_, Node::Pseudo(..)) = (&old_parent, &new_parent) {
+        return rename_synthetic(
+            cx,
+            (olddirfd, &oldpath),
+            (newdirfd, &newpath),
+            flags,
+            &old_parent,
+        );
+    }
     let vfs = cx.vfs()?;
+    let (old_mnt, old_dir) = store_dir(&vfs, &old_parent)?;
+    let (new_mnt, new_dir) = store_dir(&vfs, &new_parent)?;
     writable_dir(&vfs, (old_mnt, old_dir))?;
     // If either side ends in /, what is moved must be a directory
     if (oldpath.ends_with(b"/") || newpath.ends_with(b"/"))
@@ -5675,16 +5730,28 @@ pub(super) fn utimensat(
     } else {
         vfs.store().set_times(ino, atime, mtime)?;
     }
+    // fsnotify_change: both times are a utime call (IN_ATTRIB), the access time alone is
+    // IN_ACCESS and the modification time alone IN_MODIFY
+    let event = match (atime, mtime) {
+        (Some(_), None) => inotify::IN_ACCESS,
+        (None, Some(_)) => inotify::IN_MODIFY,
+        _ => inotify::IN_ATTRIB,
+    };
     if path.is_empty() {
-        attrib_fd(cx, dirfd);
+        event_fd(cx, dirfd, event);
     } else {
-        attrib_at(cx, ino, dirfd, &path, follow);
+        event_at(cx, ino, dirfd, &path, follow, event);
     }
     Ok(0)
 }
 
 /// Metadata changed by path: report IN_ATTRIB (also to the containing directory).
 pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool) {
+    event_at(cx, ino, dirfd, path, follow, inotify::IN_ATTRIB);
+}
+
+/// Reports `event` for a change made by path (also to the containing directory).
+fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event: u32) {
     if inotify::active(cx.kr()) {
         let parent = inotify::watched_parent(cx, dirfd, path, follow);
         let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
@@ -5692,14 +5759,19 @@ pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: 
             Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
             _ => 0,
         };
-        inotify::path_event(cx.kr(), ino, parent, inotify::IN_ATTRIB | dir);
+        inotify::path_event(cx.kr(), ino, parent, event | dir);
     }
 }
 
 /// Metadata changed by fd: report IN_ATTRIB.
 pub(super) fn attrib_fd(cx: &Cx<'_>, fd: i32) {
+    event_fd(cx, fd, inotify::IN_ATTRIB);
+}
+
+/// Reports `event` for a change made through fd `fd`.
+fn event_fd(cx: &Cx<'_>, fd: i32, event: u32) {
     if let Ok(file) = cx.fds().get(fd) {
-        inotify::file_event(cx.kr(), &file.borrow(), inotify::IN_ATTRIB);
+        inotify::file_event(cx.kr(), &file.borrow(), event);
     }
 }
 
@@ -5746,7 +5818,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             let tmpfs = tmpfs_size(&vfs, &node, &host)?;
             truncating(cx, &host, len);
             host.set_len(len).map_err(host_errno)?;
-            tmpfs_resized(&vfs, tmpfs, len);
+            tmpfs_resized(&vfs, tmpfs, &host);
             if inotify::active(cx.kr()) {
                 let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
                 let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
@@ -5776,7 +5848,7 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
             let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)?;
             truncating(cx, file, len);
             file.set_len(len).map_err(host_errno)?;
-            tmpfs_resized(&vfs, tmpfs, len);
+            tmpfs_resized(&vfs, tmpfs, file);
             inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
             Ok(0)
         }
@@ -5813,44 +5885,60 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     };
     let size = host.metadata().map_err(host_errno)?.len();
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
-    // A store object is a regular file on the host: reserving space means lengthening the file;
-    // punching holes and zeroing write zeros
+    let vfs = cx.vfs()?;
+    let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, ino), host)?;
+    // Store files stand in for ext4's, which can also zero a range; tmpfs only reserves and
+    // punches (shmem_fallocate)
     let zero = match mode & !FALLOC_FL_KEEP_SIZE {
         0 => false,
         FALLOC_FL_PUNCH_HOLE if keep => true,
-        FALLOC_FL_ZERO_RANGE => true,
+        FALLOC_FL_ZERO_RANGE if tmpfs.is_none() => true,
         _ => return Err(Errno::EOPNOTSUPP),
     };
     if !keep {
         check_fsize(cx, end)?;
     }
     check_seals(cx, &f, zero, |size| if keep { size } else { size.max(end) })?;
-    // In tmpfs this range must get its pages (Linux's shmem_fallocate), except for punching
-    // holes; the accounting is by size only, though
-    let vfs = cx.vfs()?;
-    let tmpfs = tmpfs_size(&vfs, &Node::Store(f.mnt, ino), host)?;
+    // In tmpfs the pages of the range that have none must all fit (Linux's shmem_fallocate gets
+    // them one by one and undoes them on ENOSPC); punching needs none
     if let Some((dev, own)) = tmpfs
         && mode & FALLOC_FL_PUNCH_HOLE == 0
-        && vfs
-            .tmpfs_room(dev, own)?
-            .is_some_and(|room| end.div_ceil(TMPFS_PAGE) > room.max(own))
+        && let Some(room) = vfs.tmpfs_room(dev, own)?
+        && pages_needed(
+            host,
+            size,
+            offset,
+            end,
+            room.saturating_sub(own) + reserved_unwritten(host, size, own),
+        )
+        .is_err()
     {
         return Err(Errno::ENOSPC);
     }
     remove_privs(cx, ino)?;
-    if zero {
-        let zeros = vec![0u8; IO_CHUNK];
-        let mut pos = offset;
-        while pos < end.min(size) {
-            let n = (end.min(size) - pos).min(IO_CHUNK as u64) as usize;
-            host.write_all_at(&zeros[..n], pos).map_err(host_errno)?;
-            pos += n as u64;
+    // Store objects and tmpfs files are host files: the host reserves, punches (freeing the
+    // hole's storage) or zeroes; on a host filesystem that cannot, a hole or zeroed range is
+    // written with zeros and a reservation only lengthens the file
+    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+    match appine_hal::fallocate(fd, mode as i32, offset, len) {
+        Ok(()) => {}
+        Err(e) if e == Errno::EOPNOTSUPP.0 => {
+            if zero {
+                let zeros = vec![0u8; IO_CHUNK];
+                let mut pos = offset;
+                while pos < end.min(size) {
+                    let n = (end.min(size) - pos).min(IO_CHUNK as u64) as usize;
+                    host.write_all_at(&zeros[..n], pos).map_err(host_errno)?;
+                    pos += n as u64;
+                }
+            }
+            if !keep && end > size {
+                host.set_len(end).map_err(host_errno)?;
+            }
         }
+        Err(e) => return Err(Errno(e)),
     }
-    if !keep && end > size {
-        host.set_len(end).map_err(host_errno)?;
-        tmpfs_resized(&vfs, tmpfs, end);
-    }
+    tmpfs_resized(&vfs, tmpfs, host);
     inotify::file_event(cx.kr(), &f, inotify::IN_MODIFY);
     Ok(0)
 }
@@ -5921,6 +6009,48 @@ pub(super) fn parent_at<'p>(
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
     let (mnt, dir) = store_dir(&vfs, &dir)?;
     Ok((mnt, dir, name))
+}
+
+/// renameat2 in a synthetic filesystem (Linux's `do_renameat2` and `vfs_rename`, after the mount
+/// and `.`/`..` checks): a read-only mount is EROFS, a missing source ENOENT (and in procfs a
+/// missing destination too: its lookups fail rather than give a negative dentry), an existing
+/// destination with `RENAME_NOREPLACE` EEXIST, a name renamed to itself succeeds without change;
+/// anything else is refused as by [`store_dir`] (no synthetic directory renames), except that in
+/// procfs, sysfs and devpts a caller who could delete there is told EPERM (no rename operation)
+/// and others EACCES (`may_delete`).
+fn rename_synthetic(
+    cx: &Cx<'_>,
+    (olddirfd, oldpath): (i32, &[u8]),
+    (newdirfd, newpath): (i32, &[u8]),
+    flags: u32,
+    old_parent: &Node,
+) -> SysResult {
+    let vfs = cx.vfs()?;
+    if vfs.readonly(old_parent) {
+        return Err(Errno::EROFS);
+    }
+    let src = lookup_at(cx, olddirfd, oldpath, false)?;
+    let dst = lookup_at(cx, newdirfd, newpath, false);
+    if let Err(e) = &dst
+        && vfs.fs_of(old_parent) == Fs::Proc
+    {
+        return Err(*e);
+    }
+    if flags & RENAME_NOREPLACE != 0 && dst.is_ok() {
+        return Err(Errno::EEXIST);
+    }
+    if dst.is_ok_and(|d| d == src) {
+        return Ok(0);
+    }
+    let Node::Pseudo(_, p) = old_parent else {
+        return store_dir(&vfs, old_parent).map(|_| 0);
+    };
+    if matches!(p, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) {
+        return Err(Errno::EPERM);
+    }
+    let st = pseudo::stat(&cx.view(&vfs), p)?;
+    cx.cred().permission(&st, MAY_WRITE | MAY_EXEC)?;
+    Err(Errno::EPERM)
 }
 
 /// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
@@ -6130,9 +6260,9 @@ pub(super) fn tmpfs_created(vfs: &Vfs, dev: Option<u64>, pages: u64) {
 
 /// Writing a regular file in tmpfs: writes until the instance is full (Linux's
 /// `shmem_write_begin` asks page by page and returns what was already written when it cannot get
-/// one), ENOSPC when not even a page can be written; writes within the original size are not
-/// limited. Returns the number of bytes allowed, plus the device number and the page count
-/// before the write that the accounting needs afterwards ([`tmpfs_resized`]).
+/// one), ENOSPC when not even a page can be written; pages that already hold data need nothing.
+/// Returns the number of bytes allowed, plus the device number and the page count before the
+/// write that the accounting needs afterwards ([`tmpfs_resized`]).
 fn tmpfs_write_room(
     cx: &Cx<'_>,
     f: &OpenFile,
@@ -6149,38 +6279,118 @@ fn tmpfs_write_room(
     let Some(room) = vfs.tmpfs_room(dev, own)?.filter(|_| len > 0) else {
         return Ok((len, Some(t)));
     };
+    let size = file.metadata().map_err(host_errno)?.len();
     let pos = match offset {
         Some(off) => off,
-        None if f.flags & oflags::O_APPEND != 0 => file.metadata().map_err(host_errno)?.len(),
+        None if f.flags & oflags::O_APPEND != 0 => size,
         None => f.pos,
     };
-    let end = room.max(own).saturating_mul(TMPFS_PAGE);
-    if pos >= end {
-        return Err(Errno::ENOSPC);
+    let end = pos.saturating_add(len as u64);
+    // Looking for holes only when the pages the write spans might not all fit
+    let free = room.saturating_sub(own);
+    if end.div_ceil(TMPFS_PAGE) - pos / TMPFS_PAGE <= free {
+        return Ok((len, Some(t)));
     }
-    Ok((
-        len.min((end - pos).try_into().unwrap_or(usize::MAX)),
-        Some(t),
-    ))
+    let free = free + reserved_unwritten(file, size, own);
+    match pages_needed(file, size, pos, end, free) {
+        Ok(_) => Ok((len, Some(t))),
+        Err(stop) if stop <= pos => Err(Errno::ENOSPC),
+        Err(stop) => Ok(((stop - pos) as usize, Some(t))),
+    }
+}
+
+/// How many pages of `[from, to)` in host file `host` (`size` bytes long) would need storage
+/// when written: holes and pages past the end, found with the host's `SEEK_DATA` and
+/// `SEEK_HOLE` (a page holding any data needs none; a host that cannot tell has data everywhere
+/// before the end). When more than `budget` are needed, `Err` gives the offset of the first page
+/// that no longer fits.
+fn pages_needed(
+    host: &std::fs::File,
+    size: u64,
+    from: u64,
+    to: u64,
+    budget: u64,
+) -> Result<u64, u64> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+    let end = to.div_ceil(TMPFS_PAGE);
+    let mut page = from / TMPFS_PAGE;
+    let mut needed = 0;
+    while page < end {
+        let at = page * TMPFS_PAGE;
+        let data = if at >= size {
+            end
+        } else {
+            match appine_hal::lseek(fd, at as i64, SEEK_DATA as i32) {
+                Ok(d) => d / TMPFS_PAGE,
+                Err(e) if e == Errno::ENXIO.0 => end,
+                Err(_) => page,
+            }
+        };
+        let holes = data.min(end) - page;
+        if needed + holes > budget {
+            return Err((page + budget - needed) * TMPFS_PAGE);
+        }
+        needed += holes;
+        if data >= end {
+            break;
+        }
+        let hole = appine_hal::lseek(fd, (data * TMPFS_PAGE) as i64, SEEK_HOLE as i32)
+            .unwrap_or(size)
+            .div_ceil(TMPFS_PAGE);
+        page = hole.max(data + 1);
+    }
+    Ok(needed)
+}
+
+/// How many of the `own` pages host file `host` (`size` bytes long) takes hold no data: space
+/// reserved by fallocate and not written yet, which the host reports as holes although it is
+/// allocated (Linux's tmpfs has those pages already). Writes there need no new pages, so they make
+/// up for that many of the holes [`pages_needed`] finds.
+fn reserved_unwritten(host: &std::fs::File, size: u64, own: u64) -> u64 {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(host);
+    let mut data = 0;
+    let mut at = 0;
+    while at < size {
+        let d = match appine_hal::lseek(fd, at as i64, SEEK_DATA as i32) {
+            Ok(d) => d,
+            Err(e) if e == Errno::ENXIO.0 => break,
+            // A host that cannot tell: data everywhere
+            Err(_) => {
+                data += size.div_ceil(TMPFS_PAGE) - at / TMPFS_PAGE;
+                break;
+            }
+        };
+        let h = appine_hal::lseek(fd, d as i64, SEEK_HOLE as i32).unwrap_or(size);
+        data += h.div_ceil(TMPFS_PAGE) - d / TMPFS_PAGE;
+        at = h.max(d + 1);
+    }
+    own.saturating_sub(data)
 }
 
 /// When `node` (a regular file, `host` on the host) is in tmpfs, that instance's device number
-/// and the file's current page count: after the size changes, they go to [`tmpfs_resized`] for
+/// and the pages the file's object takes: after it changes, they go to [`tmpfs_resized`] for
 /// accounting.
 fn tmpfs_size(vfs: &Vfs, node: &Node, host: &std::fs::File) -> Result<Option<(u64, u64)>, Errno> {
     let Some(dev) = vfs.tmpfs_dev(node) else {
         return Ok(None);
     };
-    let size = host.metadata().map_err(host_errno)?.len();
-    Ok(Some((dev, size.div_ceil(TMPFS_PAGE))))
+    Ok(Some((dev, object_pages(host)?)))
 }
 
-/// A regular file in tmpfs became `size` bytes: accounts the difference in pages
-/// ([`tmpfs_size`] recorded the old count).
-fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, size: u64) {
-    if let Some((dev, own)) = tmpfs {
-        let pages = size.div_ceil(TMPFS_PAGE) as i64 - own as i64;
-        vfs.tmpfs_charge(dev, pages, 0);
+/// The pages a regular file's object takes on the host (holes take none).
+fn object_pages(host: &std::fs::File) -> Result<u64, Errno> {
+    use std::os::unix::fs::MetadataExt;
+    let blocks = host.metadata().map_err(host_errno)?.blocks();
+    Ok(blocks.div_ceil(TMPFS_PAGE / 512))
+}
+
+/// A regular file in tmpfs was written, truncated, reserved or punched: accounts the difference
+/// in pages ([`tmpfs_size`] recorded the old count).
+fn tmpfs_resized(vfs: &Vfs, tmpfs: Option<(u64, u64)>, host: &std::fs::File) {
+    if let Some((dev, own)) = tmpfs
+        && let Ok(pages) = object_pages(host)
+    {
+        vfs.tmpfs_charge(dev, pages as i64 - own as i64, 0);
     }
 }
 

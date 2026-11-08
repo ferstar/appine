@@ -1,5 +1,6 @@
 //! Miscellaneous syscalls: futex, time, resource limits and so on.
 
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use super::{IO_CHUNK, SysResult, get, put, read_timespec, write_pair};
@@ -16,11 +17,16 @@ const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_WAKE_OP: u32 = 5;
+const FUTEX_LOCK_PI: u32 = 6;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
+const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+const FUTEX_LOCK_PI2: u32 = 13;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
-/// The command bits after removing `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`.
-const FUTEX_CMD_MASK: u32 = 0x7f;
+/// The command: everything but `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`, so unknown high
+/// bits make an unknown command (Linux's `FUTEX_CMD_MASK`).
+const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
 const TIMER_ABSTIME: u32 = 1;
 const ITIMER_REAL: i32 = 0;
@@ -80,6 +86,24 @@ pub(super) fn futex(
 ) -> SysResult {
     let cmd = op & FUTEX_CMD_MASK;
     let private = op & FUTEX_PRIVATE_FLAG != 0;
+    // sys_futex reads and checks the timeout of the commands that take one before do_futex
+    // allows FUTEX_CLOCK_REALTIME only for the absolute waits (ENOSYS)
+    if timeout != 0
+        && matches!(
+            cmd,
+            FUTEX_WAIT | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI
+        )
+    {
+        read_timespec(cx, timeout)?;
+    }
+    if op & FUTEX_CLOCK_REALTIME != 0
+        && !matches!(
+            cmd,
+            FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2
+        )
+    {
+        return Err(Errno::ENOSYS);
+    }
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let bitset = if cmd == FUTEX_WAIT { u32::MAX } else { val3 };
@@ -114,8 +138,10 @@ pub(super) fn futex(
                 return Err(Errno::EINVAL);
             }
             let key = futex_key(cx, uaddr, private)?;
-            Ok(cx.shared.futexes().wake(key, val, bitset) as u64)
+            Ok(cx.shared.futexes().wake(key, wake_count(val), bitset) as u64)
         }
+        // The fourth argument is the second wake count
+        FUTEX_WAKE_OP => futex_wake_op(cx, (uaddr, uaddr2), private, (val, timeout as u32), val3),
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             // The wake and requeue counts are ints; negative values are EINVAL
             if (val as i32) < 0 || (timeout as u32 as i32) < 0 {
@@ -133,6 +159,71 @@ pub(super) fn futex(
         }
         _ => Err(Errno::ENOSYS),
     }
+}
+
+/// How many waiters a wake count wakes at most: Linux counts with an int and stops once the count
+/// is reached after waking one, so 0 and negative counts wake one.
+pub(super) fn wake_count(n: u32) -> u32 {
+    if (n as i32) <= 0 { 1 } else { n }
+}
+
+/// `FUTEX_WAKE_OP` (Linux's `futex_wake_op`): applies the operation `encoded` holds to the word at
+/// `uaddr2` atomically (set, add, or, and-not or xor with its argument, which with
+/// `FUTEX_OP_OPARG_SHIFT` is a shift count; another operation ENOSYS before anything changes),
+/// wakes up to `nr` waiters on `uaddr`, and when the old value compares with the comparison
+/// argument as asked, up to `nr2` on `uaddr2` (an unknown comparison is ENOSYS after the word has
+/// changed). Returns how many were woken.
+fn futex_wake_op(
+    cx: &mut Cx<'_>,
+    (uaddr, uaddr2): (u64, u64),
+    private: bool,
+    (nr, nr2): (u32, u32),
+    encoded: u32,
+) -> SysResult {
+    const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+    let key = futex_key(cx, uaddr, private)?;
+    let key2 = futex_key(cx, uaddr2, private)?;
+    // 12-bit fields, sign-extended
+    let field = |v: u32| ((v & 0xfff) << 20) as i32 >> 20;
+    let op = (encoded >> 28) & 7;
+    let cmp = (encoded >> 24) & 15;
+    let mut oparg = field(encoded >> 12);
+    let cmparg = field(encoded);
+    if encoded >> 28 & FUTEX_OP_OPARG_SHIFT != 0 {
+        oparg = 1 << (oparg & 31);
+    }
+    let mut futexes = cx.shared.futexes();
+    let mm = cx.mm();
+    let word = crate::futex::writable_word(&mm, uaddr2).ok_or(Errno::EFAULT)?;
+    // FUTEX_OP_SET, ADD, OR, ANDN, XOR
+    let apply = |old: i32| match op {
+        0 => Some(oparg),
+        1 => Some(old.wrapping_add(oparg)),
+        2 => Some(old | oparg),
+        3 => Some(old & !oparg),
+        4 => Some(old ^ oparg),
+        _ => None,
+    };
+    let old = word
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            apply(v as i32).map(|n| n as u32)
+        })
+        .map_err(|_| Errno::ENOSYS)? as i32;
+    // FUTEX_OP_CMP_EQ, NE, LT, LE, GT, GE
+    let matched = match cmp {
+        0 => old == cmparg,
+        1 => old != cmparg,
+        2 => old < cmparg,
+        3 => old <= cmparg,
+        4 => old > cmparg,
+        5 => old >= cmparg,
+        _ => return Err(Errno::ENOSYS),
+    };
+    let mut woken = futexes.wake(key, wake_count(nr), u32::MAX);
+    if matched {
+        woken += futexes.wake(key2, wake_count(nr2), u32::MAX);
+    }
+    Ok(woken as u64)
 }
 
 /// A futex wait (Linux's `futex_wait`): while `*uaddr` is `val`, waits until woken, `deadline`, or

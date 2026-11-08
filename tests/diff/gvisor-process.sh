@@ -17,11 +17,9 @@ SKIP="$SKIP:$P.ExecvePtraceLockStress"
 # at an attach-time group stop reports the stop again
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
-# kernel/process: minor futex deviations (WAKE_OP and PI operations are ENOSYS, FUTEX_WAKE with a
-# count of 0 wakes nobody; the untimed waiters of three of them hang)
+# kernel/process: PI futex operations are ENOSYS (the untimed waiters of some of them hang)
 F=SharedPrivate/PrivateAndSharedFutexTest
-SKIP="$SKIP:PrivateFutexTest.WakeOp*:$F.WakeOpCond*:$F.PIBasic/*:$F.PIConcurrency/*"
-SKIP="$SKIP:$F.PITryLock/*:$F.PIWaiters/*:$F.Wake0/*"
+SKIP="$SKIP:$F.PIBasic/*:$F.PIConcurrency/*:$F.PITryLock/*:$F.PIWaiters/*"
 # kernel/cred: per-thread id changes leak to every thread (a helper thread's setresuid takes root
 # from the main thread, whose cleanup then fails); a shared fs context does not block privilege
 # gains; kernel/cred D2: no ACLs

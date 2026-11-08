@@ -561,10 +561,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     {
         crate::signal::wake(t);
     }
+    // Every new task counts, threads too (Linux's total_forks)
+    cx.k().forks += 1;
     if !thread {
         let ppid = group.borrow().ppid;
         let k = cx.k();
-        k.forks += 1;
         k.groups.insert(tid, group);
         if let Some(parent) = k.groups.get(&ppid) {
             parent.borrow_mut().children.push(tid);
@@ -929,6 +930,9 @@ fn exec(
     // assignment, and cpu no longer uses it
     unsafe { cpu.reset(mm.borrow().mmu()) };
     cx.set_mm(mm);
+    // The old address space's attachments are gone: a segment marked for removal goes with its
+    // last one
+    crate::ipc::reap_shm(cx.k());
     cx.t.altstack = AltStack::default();
     cx.task.saved_sigmask.set(None);
     cx.task.comm.set(process::comm_of(&comm));

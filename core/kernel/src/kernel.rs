@@ -175,7 +175,7 @@ pub(crate) struct Kernel {
     pub dbt_stats: Option<DbtStats>,
     /// The total CPU time used by exited threads (`/proc/stat`).
     pub cpu: CpuTime,
-    /// The number of processes created (processes in `/proc/stat`).
+    /// The number of tasks created, threads included (processes in `/proc/stat`).
     pub forks: u64,
     /// `/proc/sys/kernel/random/boot_id` of this run.
     pub boot_id: [u8; 16],

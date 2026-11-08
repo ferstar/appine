@@ -26,8 +26,6 @@ use crate::vfs::store::mode;
 const SOL_SOCKET: i32 = 1;
 const SO_TYPE: i32 = 3;
 const SO_ERROR: i32 = 4;
-const SO_SNDBUF: i32 = 7;
-const SO_RCVBUF: i32 = 8;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
 const SO_RCVTIMEO: i32 = 20;
@@ -154,8 +152,18 @@ pub(super) fn listen(u: &mut UnixSocket, backlog: i32, cred: Ucred) -> Result<()
             };
             Ok(())
         }
-        Link::Listening { backlog: b, .. } => {
+        // unix_listen: every listen records the credentials again, and a larger backlog wakes the
+        // connectors waiting for room
+        Link::Listening {
+            backlog: b,
+            cred: c,
+            ..
+        } => {
+            if backlog > *b {
+                request_wake_object(wake::of(&u.rx));
+            }
             *b = backlog;
+            *c = cred;
             Ok(())
         }
         _ => Err(Errno::EINVAL),
@@ -254,10 +262,15 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
         return Ok(());
     }
     let target = find(cx, sock, addr)?;
+    let own_rx = with(sock, |u| Rc::downgrade(&u.rx));
     let link = match &*target.borrow() {
-        Socket::Unix(p) if p.ty == SOCK_DGRAM => Link::Dgram {
-            tx: Rc::downgrade(&p.rx),
-            peer_addr: p.name(),
+        // unix_may_send: a peer connected to another socket takes nothing from this one
+        Socket::Unix(p) if p.ty == SOCK_DGRAM => match &p.link {
+            Link::Dgram { tx, .. } if !Weak::ptr_eq(tx, &own_rx) => return Err(Errno::EPERM),
+            _ => Link::Dgram {
+                tx: Rc::downgrade(&p.rx),
+                peer_addr: p.name(),
+            },
         },
         Socket::Unix(_) => return Err(Errno::EPROTOTYPE),
         _ => return Err(Errno::ECONNREFUSED),
@@ -440,11 +453,20 @@ fn send_dgram(
     if shut_wr {
         return Err(Errno::EPIPE);
     }
-    let rx: ChannelRef = if addr.is_empty() {
-        connected
-            .ok_or(Errno::ENOTCONN)?
-            .upgrade()
-            .ok_or(Errno::ECONNREFUSED)?
+    // unix_dgram_sendmsg: sending to a dead connected peer disconnects the socket, ECONNREFUSED
+    // this time and ENOTCONN from then on
+    let disconnect = |tx: &Weak<_>| {
+        with(sock, |u| {
+            if matches!(&u.link, Link::Dgram { tx: t, .. } if Weak::ptr_eq(t, tx)) {
+                u.link = Link::None;
+            }
+        });
+        Errno::ECONNREFUSED
+    };
+    let rx: ChannelRef = if let Some(tx) = connected.as_ref().filter(|_| addr.is_empty()) {
+        tx.upgrade().ok_or_else(|| disconnect(tx))?
+    } else if addr.is_empty() {
+        return Err(Errno::ENOTCONN);
     } else {
         let target = find(cx, sock, addr)?;
         let t = target.borrow();
@@ -470,7 +492,11 @@ fn send_dgram(
         {
             let mut c = rx.borrow_mut();
             if c.closed {
-                return Err(Errno::ECONNREFUSED);
+                drop(c);
+                return Err(match connected.as_ref().filter(|_| addr.is_empty()) {
+                    Some(tx) => disconnect(tx),
+                    None => Errno::ECONNREFUSED,
+                });
             }
             // The receiver has shut down reading (RCV_SHUTDOWN): EPIPE, without SIGPIPE
             if c.eof {
@@ -573,8 +599,9 @@ pub(super) fn recv(
 }
 
 /// Hands the data read to the guest: attaches the credentials and installs the passed open files
-/// into the current process's fd table. What the control buffer cannot hold is dropped and
-/// `MSG_CTRUNC` is set, as on Linux.
+/// into the current process's fd table, as Linux's `scm_recv` fills a control buffer of
+/// `control_len` bytes: the credentials cut to what fits (`put_cmsg`), then as many files as fit
+/// after a header (`scm_detach_fds`); what does not fit is dropped and `MSG_CTRUNC` is set.
 fn deliver(
     cx: &mut Cx<'_>,
     r: Received,
@@ -583,28 +610,32 @@ fn deliver(
     flags: u32,
 ) -> Message {
     let mut control = Vec::new();
+    let mut room = control_len;
     let mut out_flags = if r.len > r.data.len() { MSG_TRUNC } else { 0 };
     if passcred {
-        if control_len >= CMSG_HDR + 12 {
-            // pid and IDs as the receiver sees them (Linux's scm_recv uses pid_vnr,
-            // from_kuid_munged)
-            let me = cx.cred();
-            let cred = Ucred {
-                pid: cx.pid_out(r.cred.pid),
-                uid: me.uid_out(r.cred.uid),
-                gid: me.gid_out(r.cred.gid),
-            };
-            push_cmsg(&mut control, SCM_CREDENTIALS, &cred.encode());
-        } else {
-            out_flags |= MSG_CTRUNC;
-        }
+        // pid and IDs as the receiver sees them (Linux's scm_recv uses pid_vnr, from_kuid_munged)
+        let me = cx.cred();
+        let cred = Ucred {
+            pid: cx.pid_out(r.cred.pid),
+            uid: me.uid_out(r.cred.uid),
+            gid: me.gid_out(r.cred.gid),
+        };
+        let data = cred.encode();
+        super::net::put_cmsg(
+            &mut control,
+            &mut room,
+            &mut out_flags,
+            SOL_SOCKET,
+            SCM_CREDENTIALS,
+            &data,
+        );
     }
     if !r.fds.is_empty() {
-        let room = control_len.saturating_sub(control.len() + CMSG_HDR) / 4;
+        let fit = room.saturating_sub(CMSG_HDR) / 4;
         let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
         let mut fds = Vec::new();
         let total = r.fds.len();
-        for file in r.fds.into_iter().take(room) {
+        for file in r.fds.into_iter().take(fit) {
             match cx.fds_mut().install(file, cloexec, 0) {
                 Ok(fd) => fds.extend_from_slice(&fd.to_le_bytes()),
                 Err(_) => break,
@@ -614,10 +645,16 @@ fn deliver(
             out_flags |= MSG_CTRUNC;
         }
         if !fds.is_empty() {
-            push_cmsg(&mut control, SCM_RIGHTS, &fds);
+            super::net::put_cmsg(
+                &mut control,
+                &mut room,
+                &mut out_flags,
+                SOL_SOCKET,
+                SCM_RIGHTS,
+                &fds,
+            );
         }
     }
-    control.truncate(control_len);
     Message {
         data: r.data,
         len: r.len,
@@ -627,35 +664,55 @@ fn deliver(
     }
 }
 
-/// Appends a `SOL_SOCKET` control message, padded to 8-byte alignment.
-fn push_cmsg(out: &mut Vec<u8>, ty: i32, data: &[u8]) {
-    out.extend_from_slice(&((CMSG_HDR + data.len()) as u64).to_le_bytes());
-    out.extend_from_slice(&SOL_SOCKET.to_le_bytes());
-    out.extend_from_slice(&ty.to_le_bytes());
-    out.extend_from_slice(data);
-    out.resize(out.len().next_multiple_of(8), 0);
+/// The control buffer that would carry `control` cannot be written: the files passed in it,
+/// already installed, are closed again (Linux installs a file only once its number is written,
+/// `receive_fd_user`).
+pub(super) fn drop_passed_files(cx: &mut Cx<'_>, control: &[u8]) {
+    let mut off = 0;
+    while let Some(h) = control.get(off..off + CMSG_HDR) {
+        let len = u64::from_le_bytes(h[..8].try_into().unwrap()) as usize;
+        let level = i32::from_le_bytes(h[8..12].try_into().unwrap());
+        let ty = i32::from_le_bytes(h[12..16].try_into().unwrap());
+        if len < CMSG_HDR {
+            break;
+        }
+        if (level, ty) == (SOL_SOCKET, SCM_RIGHTS) {
+            let data = control.get(off + CMSG_HDR..off + len).unwrap_or_default();
+            for fd in data.chunks_exact(4) {
+                let _ = cx
+                    .fds_mut()
+                    .close(i32::from_le_bytes(fd.try_into().unwrap()));
+            }
+        }
+        off += len.next_multiple_of(8);
+    }
 }
 
 // ---- Options and shutdown ----
 
+/// `privileged` is (`CAP_NET_ADMIN` in the initial user namespace, whether a priority outside
+/// 0..=6 is allowed), for [`SockOpts::set`](crate::net::SockOpts::set).
 pub(super) fn setsockopt(
     u: &mut UnixSocket,
     level: i32,
     name: i32,
     value: &[u8],
+    (admin, net_admin): (bool, bool),
 ) -> Result<(), Errno> {
     if level != SOL_SOCKET {
         return Err(Errno::EOPNOTSUPP);
     }
-    let int = value
-        .get(..4)
-        .map_or(0, |b| i32::from_le_bytes(b.try_into().unwrap()));
     match name {
-        SO_PASSCRED => u.passcred = int != 0,
+        SO_PASSCRED => u.passcred = value.get(..4).ok_or(Errno::EINVAL)? != [0; 4],
         SO_RCVTIMEO => u.rcvtimeo = timeval(value)?,
         SO_SNDTIMEO => u.sndtimeo = timeval(value)?,
-        // Buffer sizes, SO_REUSEADDR and so on: accepted but without effect
-        _ => {}
+        // Buffer sizes, lingering and the like are only recorded; other options are accepted
+        // without effect
+        _ => {
+            if let Some(r) = u.opts.set(name, value, admin, net_admin) {
+                r?;
+            }
+        }
     }
     Ok(())
 }
@@ -677,27 +734,29 @@ pub(super) fn getsockopt(
         SO_TYPE => int(u.ty),
         SO_ERROR | SO_PROTOCOL => int(0),
         SO_DOMAIN => int(AF_UNIX),
-        SO_SNDBUF | SO_RCVBUF => int(CAPACITY as i32),
         SO_PASSCRED => int(u.passcred as i32),
         SO_ACCEPTCONN => int(matches!(u.link, Link::Listening { .. }) as i32),
         SO_RCVTIMEO => encode_timeval(u.rcvtimeo),
         SO_SNDTIMEO => encode_timeval(u.sndtimeo),
-        // Without a peer, as on Linux: pid 0, and uid and gid are overflowuid
-        SO_PEERCRED => u
-            .peer_cred
-            .map(|c| Ucred {
-                pid: pid_ns.vnr(c.pid).unwrap_or(0),
-                uid: cred.uid_out(c.uid),
-                gid: cred.gid_out(c.gid),
-            })
-            .unwrap_or(Ucred {
-                pid: 0,
-                uid: 65534,
-                gid: 65534,
-            })
-            .encode()
-            .to_vec(),
-        _ => return Err(Errno::ENOPROTOOPT),
+        // A listener's are its own, recorded at listen; without a peer, as Linux's cred_to_ucred
+        // without credentials: pid 0, uid and gid -1
+        SO_PEERCRED => match &u.link {
+            Link::Listening { cred, .. } => Some(*cred),
+            _ => u.peer_cred,
+        }
+        .map(|c| Ucred {
+            pid: pid_ns.vnr(c.pid).unwrap_or(0),
+            uid: cred.uid_out(c.uid),
+            gid: cred.gid_out(c.gid),
+        })
+        .unwrap_or(Ucred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        })
+        .encode()
+        .to_vec(),
+        _ => return u.opts.get(name).ok_or(Errno::ENOPROTOOPT),
     })
 }
 

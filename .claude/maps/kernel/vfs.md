@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, modes; owners, procfs write opens, remounts; small-batch errno rules last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; faulting I/O; timerfd clocks; test-suite findings; mounts; splice; open flags, modes, owners; remounts; holes, directory seeks, renames, utimensat events last)
 
 ## Responsibilities
 
@@ -268,10 +268,14 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `nr_inodes=`, octal `mode=`, `uid=`, `gid=`, `inode32`/`inode64`; `huge=`/`mpol=` parsed and
   ignored; unknown `EINVAL`); root mode defaults to 1777 owned by the mounter's fsuid/fsgid.
 - Accounting per instance: one inode per name (each hard link) plus the root; regular files by
-  size rounded up to pages (no holes); symlinks of 128 bytes or more one page. Limits default to
-  half of RAM in pages for both; 0 is unlimited. Creates check room (`ENOSPC`); writes are clipped
-  to the remaining room; truncation is never limited; unlinking the last name frees immediately.
-  statfs and remount recount the whole tree; boot instances start uncounted.
+  the pages their host objects take (holes take none, so lengthening by truncation costs nothing
+  and punching gives pages back); symlinks of 128 bytes or more one page. Limits default to half
+  of RAM in pages for both; 0 is unlimited. Creates check room (`ENOSPC`); a write needs room only
+  for the pages it spans that hold no data yet (found with the host's `SEEK_DATA`/`SEEK_HOLE` when
+  they might not fit, less the pages the file has reserved and not written, which the host reports
+  as holes) and is clipped where it runs out; reservations need room for all such pages
+  of the range or fail whole; truncation is never limited; unlinking the last name frees
+  immediately. statfs and remount recount the whole tree; boot instances start uncounted.
 
 ### fd tables and open files
 
@@ -344,9 +348,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   also appends unless `RWF_NOAPPEND`. After a write, `write_sync` syncs the object (with the BKL
   released) when the open file has `O_DSYNC` (fdatasync) or `O_SYNC` (fsync), or the call passed
   `RWF_DSYNC`/`RWF_SYNC`; `sendfile`, `copy_file_range` and `splice` into such a file do not.
-- No holes: `SEEK_DATA` returns the offset and `SEEK_HOLE` the size. `fallocate` mode 0 extends
-  the length, `PUNCH_HOLE` (with `KEEP_SIZE`) and `ZERO_RANGE` write zeros under the BKL, other
-  modes `EOPNOTSUPP`.
+- Holes are the host's: `SEEK_DATA` and `SEEK_HOLE` ask the host object (offsets outside the file
+  `ENXIO`; a host that cannot tell has data everywhere). `fallocate` passes mode 0, `KEEP_SIZE`,
+  `PUNCH_HOLE` (with `KEEP_SIZE`) and, outside tmpfs (`shmem_fallocate` has no zeroing),
+  `ZERO_RANGE` to the host, which reserves, frees or zeroes the storage; a host filesystem
+  without the mode falls back to writing zeros and lengthening the file. Other modes
+  `EOPNOTSUPP`.
 - `sendfile` and `copy_file_range` between distinct regular store files use host `sendfile`
   without the BKL; they fall back to chunked copies for `O_APPEND` output, the same inode, a
   sealed output file, tmpfs output, or host `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`.
@@ -387,8 +394,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 ### Metadata and namespace syscalls
 
 - Stat: asm-generic `struct stat` with uid/gid mapped into the caller's user namespace; `st_dev`
-  from the mount; `st_blksize` 4096; `st_blocks` from size (no holes; short symlinks and sysfs
-  files 0); directories report size 4096 on the root filesystem. statx always reports
+  from the mount; `st_blksize` 4096 (1024 for procfs and devpts nodes, as their superblocks);
+  `st_blocks` of regular store and tmpfs files (and host fds) as the host allocated them, of
+  other nodes from the size (short symlinks and sysfs files 0); directories report size 4096 on
+  the root filesystem. statx always reports
   `STATX_BASIC_STATS` (no btime, mount id or attributes). statfs: the store reports ext4's magic
   with the host's `statvfs` of the objects directory, tmpfs its own magic and limits (recounted),
   synthetic filesystems their magic with zero sizes; `f_flags` from the mount.
@@ -411,7 +420,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `RLIMIT_FSIZE`, leases; ftruncate `EINVAL` unless writable and regular, `EBADF` on `O_PATH`.
 - mknodat: regular, char, block, FIFO, socket (directory `EPERM`); devices need `CAP_MKNOD` and
   pass the device filter (whiteouts exempt). renameat2: `RENAME_NOREPLACE`, `RENAME_EXCHANGE`
-  (`RENAME_WHITEOUT` `EINVAL`); `EXDEV` before the `.`/`..` checks. linkat: `AT_EMPTY_PATH`
+  (`RENAME_WHITEOUT` `EINVAL`); `EXDEV` before the `.`/`..` checks (a source `.`/`..` `EBUSY`, a
+  destination one `EEXIST` with `RENAME_NOREPLACE`, else `EBUSY`). In synthetic filesystems
+  (6.1's `vfs_rename` order): read-only mount `EROFS`, missing source `ENOENT` (in procfs a
+  missing destination too), `RENAME_NOREPLACE` onto an existing name `EEXIST`, a name onto itself
+  0; otherwise the mqueue root and cgroup2 `EPERM`, others `EACCES` without write and search
+  permission on the source directory and `EPERM` with it. linkat: `AT_EMPTY_PATH`
   without `CAP_DAC_READ_SEARCH` is `ENOENT` (6.1's `do_linkat`); `EXDEV` for synthetic nodes or
   different mounts, then `protected_hardlinks` (judged on the database row), then directory write
   permission; a magic link followed with `AT_SYMLINK_FOLLOW` reaches the same store node, a deleted
@@ -420,8 +434,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - getdents64 takes the listing (with `.` and `..`) on the first call and refreshes it only on a
   seek to 0; `d_off` is index+1. `O_PATH` fds are `EBADF`, a removed directory `ENOENT`, a count
   above `INT_MAX` `EINVAL`; entries are copied out one by one, so a buffer running into memory that
-  cannot be written returns the whole entries before it (`EFAULT` when none). chdir/fchdir/chroot check search only on store directories.
-  umask lives in the fs context.
+  cannot be written returns the whole entries before it (`EFAULT` when none). lseek on a
+  directory takes `SEEK_SET` and `SEEK_CUR` everywhere; `SEEK_END`, `SEEK_DATA` and `SEEK_HOLE`
+  count from the end as the filesystem's `llseek` does: store directories end at the largest
+  position (ext4's hashed directories), procfs, sysfs and cgroup2 ones at 0, and tmpfs, devpts and
+  mqueue directories refuse them (`EINVAL`). chdir/fchdir/chroot check search only on store
+  directories. umask lives in the fs context.
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
   `protected_fifos` do not.
 
@@ -556,7 +574,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   then `IN_OPEN`), mkdir/mknod/symlink/AF_UNIX bind, link (`IN_ATTRIB` on the source, then
   `IN_CREATE`), unlink/rmdir (`IN_ATTRIB`, delete-self, `IN_DELETE`), rename (cookie pair, then
   `IN_MOVE_SELF`; exchange reported both ways), attribute changes (`IN_ATTRIB`, also for
-  utimensat whichever times change), writes,
+  utimensat changing both times; `IN_ACCESS` or `IN_MODIFY` when only the access or the
+  modification time changes, as `fsnotify_change`), writes,
   truncation and fallocate (`IN_MODIFY`), reads and getdents (`IN_ACCESS`), last close of an open
   file (`IN_CLOSE_*` to the directory and name it was opened through).
 - `IN_DELETE_SELF` waits until the last open file of the removed name closes. Renames update the
@@ -672,15 +691,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **`system.*` xattrs are unprotected:** any user who can resolve a file can set or remove its
   `system.*` attributes, including POSIX ACL names, which are stored raw and never enforced (Linux
   requires the owner or `CAP_FOWNER` and validates ACLs); root in a user namespace cannot set file
-  caps at all.
+  caps at all (`setcap` in a rootless podman build is `EPERM`).
 - **File position races:** lseek and `O_APPEND` writes change the position without the
   `pos_busy` lock, so a concurrent unlocked read or write on the same open file can overwrite the
   new position (Linux takes `f_pos_lock` in lseek too).
 - **umount ignores mappings and executables:** a mount whose files are only mapped, being executed
   or held by mqueue fds is not busy, so `umount2` succeeds where Linux returns `EBUSY` (and a tmpfs
   instance can then be reclaimed while still mapped).
-- **utimensat always reports `IN_ATTRIB`:** Linux reports `IN_ACCESS` for atime-only and
-  `IN_MODIFY` for mtime-only changes.
 - **Locks on inode-less files are no-ops:** `flock` and `F_SETLK` on anonymous pipes, sockets and
   PTYs succeed without locking, although processes sharing an inherited fd could use them to
   coordinate on Linux.
@@ -712,10 +729,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   ioctls are `EINVAL` where Linux answers `ENOTTY` or `EOPNOTSUPP`; `BLKGETDISKSEQ` advances
   only when a device is created or bound, not when it is unbound.
 - **Fidelity gaps:** statx never reports btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`; no
-  `protected_regular`/`protected_fifos`; no `O_TMPFILE`; no holes (`SEEK_DATA`/`SEEK_HOLE`,
-  fallocate writes zeros; with tmpfs's size accounting a sparse file can fill an instance: LTP
-  fallocate04, fallocate05, openat02; and a fault on a mapping of a full tmpfs never raises
-  Linux's `SIGBUS`); `RLIMIT_NOFILE`
+  `protected_regular`/`protected_fifos`; no `O_TMPFILE`; a fault on a mapping of a full tmpfs
+  never raises Linux's `SIGBUS`, and writes through shared mappings are counted only when the
+  instance is recounted; `RLIMIT_NOFILE`
   set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
   access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
   emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
@@ -762,19 +778,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   events of an unlinked name, on both watches.
 - **Executing a file reports no inotify events:** execve opens and reads the program (and a
   script's interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
-- **`SEEK_END` on directories is `EINVAL`:** every directory refuses it, where Linux allows it on
-  procfs and ext4 directories (which the store stands in for) and refuses it only on tmpfs-like
-  ones.
 - **Scoped openat2 never returns `EAGAIN`:** with `RESOLVE_BENEATH` or `RESOLVE_IN_ROOT`, a `..`
   walked while another thread mounts or renames is never `EAGAIN`, because the whole walk is
   atomic under the BKL; Linux returns it so callers retry. Safe, but callers never see the retry
   signal.
-- **renameat2 ignores `RENAME_NOREPLACE` for `.`/`..`:** such a destination is `EBUSY` even with
-  the flag, where Linux 6.1 returns `EEXIST`.
-- **rename in synthetic filesystems is `EACCES` first:** renameat2 needs store directories before
-  any other check, so in procfs, sysfs or devpts a rename of a path to itself fails where Linux
-  returns 0, a `.`/`..` target is `EACCES` instead of `EBUSY`, and other renames are `EACCES`
-  where Linux says `EPERM`.
 - **Anonymous pipes and sockets cannot change owner:** fchown on them always succeeds and changes
   nothing, even for an unprivileged caller that Linux refuses with `EPERM`, and fstat shows the
   caller as owner rather than the creator.

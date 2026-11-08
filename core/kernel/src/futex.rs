@@ -220,21 +220,9 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     if !addr.is_multiple_of(4) {
         return;
     }
-    // A copy-on-write page not written since fork, or one without an entry yet, is made writable
-    // first, as for any kernel write (Mm::write)
-    let need = prot::READ | prot::WRITE;
-    let host = match mm.translate(addr, need) {
-        Some(host) => host,
-        None if mm.cow_break(addr) || mm.fault_in(addr, need) => {
-            let Some(host) = mm.translate(addr, need) else {
-                return;
-            };
-            host
-        }
-        None => return,
+    let Some(lock) = writable_word(mm, addr) else {
+        return;
     };
-    // SAFETY: 4-byte-aligned, writable guest memory; the host memory is held by the address space
-    let lock = unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) };
     let mut cur = lock.load(Ordering::SeqCst);
     // As Linux's handle_futex_death, a shared wake (glibc's robust mutexes use shared operations
     // for this reason)
@@ -262,6 +250,22 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     if !pi && cur & FUTEX_WAITERS != 0 {
         wake(futexes);
     }
+}
+
+/// The futex word at `addr` (4-byte aligned) for the kernel to change atomically while guest
+/// threads may be changing it too, or None when it cannot be written. A copy-on-write page not
+/// written since fork, or one without an entry yet, is made writable first, as for any kernel
+/// write (`Mm::write`), and as Linux faults it in.
+pub(crate) fn writable_word(mm: &Mm, addr: u64) -> Option<&AtomicU32> {
+    let need = prot::READ | prot::WRITE;
+    let host = match mm.translate(addr, need) {
+        Some(host) => host,
+        None if mm.cow_break(addr) || mm.fault_in(addr, need) => mm.translate(addr, need)?,
+        None => return None,
+    };
+    // SAFETY: 4-byte-aligned, writable guest memory; the host memory is held by the address space,
+    // which the caller borrows for as long as it uses the word
+    Some(unsafe { AtomicU32::from_ptr(host.as_ptr().cast()) })
 }
 
 #[cfg(test)]

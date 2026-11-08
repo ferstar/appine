@@ -904,6 +904,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     }
     k.tasks.remove(&tid);
     k.release_pid(tid);
+    // Its address space's attachments no longer count: a segment marked for removal goes with
+    // its last one (Linux's exit_mmap closes them)
+    crate::ipc::reap_shm(&mut k);
     let last = {
         let mut g = group.borrow_mut();
         g.threads.retain(|&t| t != tid);

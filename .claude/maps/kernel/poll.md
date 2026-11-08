@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps and counting; module references; loop devices; eventfd readv; test-suite findings; pipe write edges, fasync kinds; host edges; `F_SETOWN` owners and their rights last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness last)
 
 ## Responsibilities
 
@@ -59,7 +59,8 @@ signal delivery (`kernel/signal`).
 ### The readiness contract
 
 - `readiness(file)` is one `match` over `FileKind` returning known events and, for host-backed
-  files (host stdio, inet sockets other than ICMP), the host fd: pipes and eventfd inline; timerfd
+  files (host stdio, inet sockets other than ICMP), the host fd: pipes (a write end `POLLOUT` with
+  `PIPE_BUF` free, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
   seccomp notify, kmsg; `O_PATH` files `POLLNVAL`; everything else (regular files, directories,
@@ -81,7 +82,8 @@ signal delivery (`kernel/signal`).
 
 - ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`) and, as
   in every timed wait here, saturated at `KTIME_MAX` (the `kernel/process` map); each fd
-  looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted.
+  looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted,
+  also when the wait is interrupted (zeros, before the error is returned, as `do_sys_poll`).
 - pselect6: `nfds` negative `EINVAL`, otherwise clamped to Linux's fd table size computed from
   the highest open fd (64, then `alloc_fdtable`'s 128 · 2^k), so bits above it are neither read
   nor written back; sets read in 64-bit words; read → `IN|RDNORM|HUP|ERR|NVAL`, write →
@@ -97,15 +99,19 @@ signal delivery (`kernel/signal`).
 ### epoll
 
 - `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`).
-- `epoll_ctl` checks: epfd (`EBADF`, `EINVAL` if not an epoll); target (`EBADF`, `O_PATH`
-  `EBADF`); self `EINVAL`; regular files, directories, synthetic files,
-  `/dev/null|zero|full`, loop devices and `/dev/loop-control` `EPERM`; on ADD loops or depth over 4 `ELOOP`; `EPOLLEXCLUSIVE` only on ADD,
-  not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`). Interests are keyed by (fd, open file);
+- `epoll_ctl` checks in Linux 6.1's order: the event is copied first except for DEL (`EFAULT`);
+  epfd, then the target (`EBADF`; `O_PATH` `EBADF`); a target that cannot be polled — regular
+  files, directories, synthetic files, `/dev/null|zero|full`, loop devices and
+  `/dev/loop-control` — `EPERM`; epfd not an epoll, or the target itself, `EINVAL`;
+  `EPOLLEXCLUSIVE` only on ADD, not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`); on ADD
+  loops or depth over 4 `ELOOP`. Interests are keyed by (fd, open file);
   ADD `EEXIST`, MOD replaces (re-arms; MOD of an exclusive interest `EINVAL`), DEL, missing
   `ENOENT`. Every call prunes dead interests and wakes the epoll's waiters.
 - Interests hold weak references: they live while any fd or fork copy holds the open file and are
   skipped once it is gone (removed at the next `epoll_ctl`). Fork shares the epoll.
-- `epoll_pwait`/`epoll_pwait2`: `maxevents` ≤ 0 or too large `EINVAL`; scan from the cursor (O(n),
+- `epoll_pwait`/`epoll_pwait2`: `maxevents` ≤ 0 or too large `EINVAL`; an events buffer reaching
+  past the user address space (2^48) `EFAULT` before epfd is looked at (`access_ok`; whether it
+  is mapped is seen only at the copy-out); scan from the cursor (O(n),
   no ready list); return if anything is ready or past the deadline; interrupted → `EINTR` (never
   restarted; the temporary mask is kept); otherwise wait. Reports are marked (ONESHOT disarmed,
   exclusive claim taken) before the events are copied out.
@@ -187,21 +193,12 @@ signal delivery (`kernel/signal`).
 - **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
   claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
   partial count.
-- **Readiness details differ:** a pipe write end without readers reports `POLLERR` but not
-  `POLLOUT`; ppoll leaves revents unwritten when interrupted; an epoll fd reports only `POLLIN`.
+- **An epoll fd reports only `POLLIN`.**
 - **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
   `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
   buffers partly used, poll and epoll report a pipe writable earlier than Linux.
-- **epoll_wait does not check the event buffer up front:** an events pointer outside the user
-  address space is only noticed when events are copied out, so with nothing ready epoll_wait
-  returns 0 or sleeps where Linux fails at once with `EFAULT`.
 - **Per-scan cost:** every scan holds the BKL and makes one zero-timeout host poll per host fd (and
   computes readiness twice per file); epoll has no ready list.
-- **epoll_ctl reports errors in a different order:** epfd's type is checked before the target fd
-  and the event is read after the fd checks, so a non-epoll epfd gives `EINVAL` where Linux 6.1
-  gives `EBADF` or `EPERM` for a bad or unpollable target, and a bad event pointer gives `EBADF`
-  or `EPERM` where Linux (which copies the event first, except for `EPOLL_CTL_DEL`) gives
-  `EFAULT`. Only the error codes of invalid calls differ.
 
 ## Open questions
 

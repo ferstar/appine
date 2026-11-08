@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits; futex keys, id-map openers; sched_setattr, kcmp last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping last)
 
 ## Responsibilities
 
@@ -158,7 +158,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   that stage panics, vfork completion and leaving the users run again on their own (both are
   idempotent) before the process is killed, so no stale user is kicked and no vfork parent waits;
   remove
-  the task and its pid; hand this thread's children to another live thread (non-last) or finish
+  the task and its pid, and reap SysV shm segments marked for removal whose last attachment that
+  was (`kernel/ipc`); hand this thread's children to another live thread (non-last) or finish
   the group (last); drop references under the BKL; request an `EXITED` wake. The engine CPU state is
   freed after the BKL is released.
 - `finish_group`: release AIO; reparent children to the nearest `PR_SET_CHILD_SUBREAPER` ancestor
@@ -210,8 +211,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   the tgid. Then: enter the time namespace for children, unshare and close-on-exec the fd table,
   release locks, sample RSS, record the new `exe_file`, apply dumpable/pdeathsig rules and
   credentials, clear POSIX timers and AIO, unshare and reset signal handlers, release the old
-  address space, reset the CPU state for the new page table (re-kicking if interrupted), and set
-  PC and SP. The run loop then re-attaches the translator.
+  address space (reaping shm segments marked for removal it held last), reset the CPU state for
+  the new page table (re-kicking if interrupted), and set PC and SP. The run loop then re-attaches the translator.
 
 ### ELF loader
 
@@ -259,12 +260,12 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### Fast path (`syscall::fast`)
 
-- Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms on a 4-byte-aligned
-  address that translates writable and is not in a writable shared file mapping), `nanosleep`,
-  `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks or its own CPU
-  clock), `clock_getres`, `gettimeofday`, and `newfstatat`/`statx` (when the root and cwd are in the
-  store's metadata cache, no synthetic filesystem or other mount is crossed, and the credentials can
-  skip search-permission checks).
+- Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms, `FUTEX_CLOCK_REALTIME`
+  only with WAIT_BITSET, on a 4-byte-aligned address that translates writable and is not in a
+  writable shared file mapping), `nanosleep`, `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME),
+  `clock_gettime` (host clocks or its own CPU clock), `clock_getres`, `gettimeofday`, and
+  `newfstatat`/`statx` (when the root and cwd are in the store's metadata cache, no synthetic
+  filesystem or other mount is crossed, and the credentials can skip search-permission checks).
 - It is off while strace-tracing, under `PTRACE_SYSCALL`, single-stepping, or with a pending
   `ivau_page`; with seccomp only for numbers the filter always allows (vDSO clock stubs always).
 - Per-thread state (root, cwd, credentials, time offsets, the vDSO address) is cached under the BKL
@@ -318,8 +319,19 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   meet. Kernel wakes (robust list, `clear_child_tid`) are shared operations. The no-BKL path
   handles only writable private pages outside the address space's writable shared mappings. The
   single waiter list is scanned linearly.
-- Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, `futex_waitv`; WAKE_OP and
-  the PI operations return `ENOSYS`.
+- Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET, WAKE_BITSET, `futex_waitv`;
+  the PI operations return `ENOSYS`. As in 6.1's `sys_futex`/`do_futex`: the command is everything
+  but `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME` (unknown bits `ENOSYS`); the timeout of a
+  command taking one is read and checked first (`EFAULT`, `EINVAL`), then `FUTEX_CLOCK_REALTIME`
+  with anything but the absolute waits is `ENOSYS`. Wake counts are ints that stop after the
+  first waiter, so 0 and negative counts wake one.
+- WAKE_OP (`futex_wake_op`): the word at the second address must be writable (`EFAULT`; a page
+  not written since fork or without an entry is made writable first) and is changed atomically
+  (set, add, or, and-not, xor; `FUTEX_OP_OPARG_SHIFT` makes the argument a shift count; another
+  operation `ENOSYS` before the change); up to the first count of waiters on the first address
+  are woken and, when the old value compares as asked with the 12-bit argument (`EQ`, `NE`, `LT`,
+  `LE`, `GT`, `GE`; another comparison `ENOSYS` after the change), up to the fourth argument's
+  count on the second.
 - Wait: compare and enqueue under the futex lock, then wait alone (no channels); dequeued means
   woken; timeouts are `ETIMEDOUT`; interruptions restart (with a restart block when timed).
 - Wake removes up to n matching waiters in FIFO order and signals their events directly. The robust
@@ -491,9 +503,14 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   open for writing succeeds where Linux returns `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **Minor futex deviations:** `FUTEX_CLOCK_REALTIME` is accepted with any operation, unknown high op
-  bits are masked off instead of `ENOSYS`, and `FUTEX_WAKE` with a count ≤ 0 wakes none or all
-  instead of one; WAKE_OP and PI operations are `ENOSYS`.
+- **The same-owner checks count `CAP_SYS_NICE` only in the initial user namespace:**
+  sched_setaffinity, sched_setscheduler/sched_setattr and setpriority let a caller act on a thread
+  of another user only with `CAP_SYS_NICE` in the initial namespace, where Linux's
+  `check_same_owner` and `set_one_prio` accept it over the target's user namespace; root in a
+  rootless container gets `EPERM` (crun setting the CPU set of `podman run --userns keep-id`).
+- **No PI futexes:** `FUTEX_LOCK_PI`, `LOCK_PI2`, `UNLOCK_PI`, `TRYLOCK_PI` and the requeue-PI
+  pair are `ENOSYS`, so glibc's and musl's `PTHREAD_PRIO_INHERIT` mutexes fail to initialize
+  (`ENOTSUP`).
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; Starnix findings; private-file `MADV_DONTNEED`; truncation; idle checks, shared NORESERVE; futex keys; OOM choice last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping last)
 
 ## Responsibilities
 
@@ -150,7 +150,8 @@ dumps and the host abstraction layer (`core/hal`).
   `Cx::write_user_partial` and `/proc/<pid>/mem`.
 - **Kernel access to guest memory**: `read`, `write` (breaks CoW per page), `translate` (does not
   break CoW), `read_cstr`, `write_kernel`, `write_force` (ptrace and `/proc/<pid>/mem` writes),
-  `check_mapped`, `populate`.
+  `check_mapped`, `can_write` (whether a range lies in writable mappings, for a write that must not
+  fail halfway), `populate`.
 - **Threads and processes**: `add_user`, `remove_user`, `sync` (after every BKL syscall),
   `quiesce`, `generations`, `code_space`, `invalidate_code`, `fork`, `futex_key`, `shared_maps`,
   `id`.
@@ -293,7 +294,14 @@ signals may still be delivered).
   and the rest (partial host pages on 16 KB hosts, or a mapping copied into anonymous memory when it
   became writable) as `Reread`s that the syscall reads from the store object (zeros past EOF, or
   for an object that cannot be opened) and stores with `fill_private`. Executable ranges are queued
-  for code invalidation; shared mappings and unwritten or `cow` ones are left alone.
+  for code invalidation; shared mappings and unwritten or `cow` ones are left alone. The vDSO is
+  refilled from the kernel's image after its pages are discarded (Linux's special mapping faults
+  its pages back), so its code survives.
+- `MADV_REMOVE` (`remove`): the range must be fully mapped; locked pages or private anonymous
+  memory `EINVAL`, other private or never-writable mappings `EACCES`; the shared mappings' parts
+  before EOF are freed through the host's `MADV_REMOVE` (a hole in the host file or shared
+  memory), with the partial host pages at the ends, or everything when the host refuses, zeroed
+  instead.
 
 ### Stack and heap growth
 
@@ -393,8 +401,9 @@ signals may still be delivered).
 - mprotect over CoW pages stops other threads first, so none can write into a lent page between
   granting and removing write permission.
 - Futex keys of private memory are the address space's id and the address, so a futex on a
-  borrowed page does not copy it; shared anonymous memory is keyed by host address and shared file
-  mappings by file and offset (`kernel/process`).
+  borrowed page does not copy it; a private operation's key needs no mapping at all (Linux checks
+  only that it is a user address); shared anonymous memory is keyed by host address and shared
+  file mappings by file and offset (`kernel/process`).
 - Kernel writes: `Mm::write` breaks CoW per page; `write_kernel` and `write_force` settle CoW
   (`cow_settle`) and ignore VMA permissions. No-BKL fast-path writes go through the CPU's
   `translate(WRITE)` and fall back to the BKL path on failure.
@@ -529,7 +538,9 @@ signals may still be delivered).
 - `appine_hal`: host `mmap`/`munmap`/`madvise` wrappers, file mapping with host-page alignment,
   `fstat`, `msync`, `mincore`-based residency, pagemap reads (`touched_pages`), `ram_and_swap`,
   `page_size`.
-- vfs (file kinds, mount flags, seals), credentials (`CAP_IPC_LOCK`), rlimits.
+- vfs (file kinds, mount flags, seals), credentials (`CAP_IPC_LOCK`), rlimits; SysV IPC
+  (`reap_shm` after munmap, mremap and `MAP_FIXED` mmap, so a removed segment goes with its last
+  attachment).
 - OOM killer: `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`),
   `appine_engine` (`written_code_bytes`, `unmap_written_code`), cgroups (`memory_limits`,
   `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
@@ -585,8 +596,6 @@ signals may still be delivered).
 
 - **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
   but do nothing.
-- **`MADV_REMOVE` frees no storage:** it zero-fills through the host mapping rather than punching
-  a hole.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
 - **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before

@@ -168,6 +168,7 @@ impl MqDir {
             atime_ns: self.atime_ns,
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
+            blocks: None,
         }
     }
 
@@ -255,6 +256,7 @@ impl MessageQueue {
             atime_ns: self.atime_ns,
             mtime_ns: self.mtime_ns,
             ctime_ns: self.ctime_ns,
+            blocks: None,
         }
     }
 
@@ -364,7 +366,8 @@ pub(super) fn mq_open(cx: &mut Cx<'_>, name: u64, flags: u32, perm: u32, attr: u
 /// already; `size` is the limit of (message count, message length), with `msg_default` and
 /// `msgsize_default` when None. When the queue count has reached `queues_max`, it is ENOSPC without
 /// `CAP_SYS_RESOURCE`. Not registered in the name table yet (mq_open registers it only after
-/// installing the fd).
+/// installing the fd). The defaults are capped by `msg_max` and `msgsize_max`
+/// (`mqueue_get_inode`).
 pub(crate) fn new_queue(
     ipc: &crate::ipc::Ipc,
     ns: u64,
@@ -376,7 +379,10 @@ pub(crate) fn new_queue(
     if ipc.mqueues.len() as u64 >= limits.queues_max && !cred.capable(cap::SYS_RESOURCE) {
         return Err(Errno::ENOSPC);
     }
-    let (maxmsg, msgsize) = size.unwrap_or((limits.msg_default, limits.msgsize_default));
+    let (maxmsg, msgsize) = size.unwrap_or((
+        limits.msg_default.min(limits.msg_max),
+        limits.msgsize_default.min(limits.msgsize_max),
+    ));
     let now = crate::tty::wall_ns();
     Ok(Rc::new(RefCell::new(MessageQueue {
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),

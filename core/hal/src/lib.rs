@@ -82,6 +82,20 @@ pub unsafe fn discard(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
     Ok(())
 }
 
+/// Frees the storage behind a piece of a shared mapping (`MADV_REMOVE`): the host punches a hole
+/// in the file or shared memory behind it, and later reads return zeros.
+///
+/// # Safety
+///
+/// `ptr` and `len` are aligned to host pages and lie within a writable shared mapping not yet
+/// released.
+pub unsafe fn remove(ptr: NonNull<u8>, len: usize) -> Result<(), i32> {
+    if unsafe { libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_REMOVE) } != 0 {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// A host file mapping: `ptr` points at the requested file offset, and `base`/`len` are the range
 /// actually mapped, passed to [`unmap`] on release.
 pub struct FileMapping {
@@ -407,6 +421,22 @@ pub fn pwrite(fd: i32, buf: &[u8], offset: u64) -> Result<usize, i32> {
         let n = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), offset as libc::off_t) };
         if n >= 0 {
             return Ok(n as usize);
+        }
+        let errno = last_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
+/// Allocates, punches or zeroes a range of a host file (`mode` takes the Linux `FALLOC_FL_*`
+/// bits, the same on both hosts). Retries automatically on `EINTR`; a host filesystem without
+/// the mode answers `EOPNOTSUPP`.
+pub fn fallocate(fd: i32, mode: i32, offset: u64, len: u64) -> Result<(), i32> {
+    loop {
+        let rc = unsafe { libc::fallocate(fd, mode, offset as libc::off_t, len as libc::off_t) };
+        if rc == 0 {
+            return Ok(());
         }
         let errno = last_errno();
         if errno != libc::EINTR {

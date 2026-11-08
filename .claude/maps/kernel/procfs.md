@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; vmstat; names; test-suite findings; `user/max_*`; fd access, cgroup ids, zombies; write opens, opener credentials; cgroup migration rights last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; names; test-suite findings; fd access; cgroup ids, migration rights; write opens; fd link modes, block sizes, affinity, bpf rights last)
 
 ## Responsibilities
 
@@ -82,10 +82,14 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Inode numbers hash the node (low bit set); roots are 1; nodes under a pid mix in the thread
   group's serial, so a reused pid gets new inodes; nsfs files use the namespace id. Inodes are
   stable within one run, not across runs.
-- Modes: directories 0555 (0755 on sysfs and cgroup), symlinks 0777, `mem` 0600, recorded
-  sysctls Linux's (`vm.drop_caches` 0200, `vm.mmap_rnd_bits` 0600), other writable files 0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`, `fdinfo/`, `ns/` are 0555,
+- Modes: directories 0555 (0755 on sysfs and cgroup), `fd/<n>` links by the open mode as
+  `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`), other symlinks
+  0777, `mem` 0600, recorded sysctls Linux's (`vm.drop_caches` 0200, `vm.mmap_rnd_bits` 0600),
+  other writable files 0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`,
+  `fdinfo/`, `ns/` are 0555,
   `environ` 0444, `comm` and `projid_map` read-only); cgroup files use their own table modes,
-  `NetSysctl` files theirs, devpts nodes the terminal's mode and `ptmxmode`. Owners: per-process
+  `NetSysctl` files theirs, devpts nodes the terminal's mode and `ptmxmode`. Stat reports
+  `st_blksize` 1024 for procfs and devpts nodes (their superblocks' block size), 4096 elsewhere. Owners: per-process
   entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the process's
   euid/egid, or the root of its credentials' user namespace when not dumpable; the entries inside
   `fdinfo/`, `ns/` and `net/`, reopened open files and everything else belong to root.
@@ -141,7 +145,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
   `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,
   exe/lib/PTE/swap 0; omitted with no live task); `FDSize` rounded to 64;
-  `Cpus_allowed_list` lists every guest CPU. `maps` and `smaps` escape a newline in a mapped
+  `Cpus_allowed_list` is the thread's affinity (the main thread's in the process's `status`)
+  within the online CPUs. `maps` and `smaps` escape a newline in a mapped
   file's path as `\012` (Linux's `seq_file_path`).
   `statm` is `size rss 0 0 0 rss 0`.
 - `cmdline`/`environ` copy the argument and environment ranges of the current mm (empty over
@@ -178,7 +183,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `cpuinfo`: one block per guest CPU with the guest-visible hwcaps and MIDR, BogoMIPS 100.
   `stat`: guest threads' CPU time (plus exited threads') with idle derived from uptime, split
   evenly over CPUs; `procs_running` counts threads in guest code (at least 1); `intr`, `ctxt`,
-  `softirq`, `procs_blocked` are 0; `processes` counts new processes (not threads). `uptime`
+  `softirq`, `procs_blocked` are 0; `processes` counts every new task, threads included (Linux's `total_forks`). `uptime`
   includes the reader's
   boottime offset. `loadavg` comes from the guest's own load average. `filesystems` is a fixed
   list; `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
@@ -316,8 +321,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 - Commands: program load, attach, detach, query, get-fd-by-id, info by fd (no maps or links).
   When `unprivileged_bpf_disabled` is nonzero (default 2) every command needs `CAP_BPF` or
-  `CAP_SYS_ADMIN`; loading a device program always needs one of them (Linux 6.1 also wants
-  `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` for this type); query needs `CAP_NET_ADMIN`, get-fd-by-id
+  `CAP_SYS_ADMIN`; loading a device program always needs one of them and also `CAP_NET_ADMIN` or
+  `CAP_SYS_ADMIN` (6.1's `is_net_admin_prog_type`, `EPERM`); query needs `CAP_NET_ADMIN`, get-fd-by-id
   `CAP_SYS_ADMIN`; attach and detach check nothing on the target cgroup fd (any cgroup directory
   fd, `O_PATH` included), and detaching a non-multi program needs no program fd.
 - Only `BPF_PROG_TYPE_CGROUP_DEVICE`. The verifier allows forward jumps only and requires every
@@ -371,22 +376,19 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   so runtimes that wait for `cgroup.events` to report frozen (runc pause) can wait until thaw.
 - **Namespace root cannot write its network sysctls:** root of a child user namespace that owns a
   network namespace cannot write that namespace's `net.*` sysctls (Linux 6.1 grants it per
-  namespace); rootless container runtimes setting sysctls fail with `EACCES`.
+  namespace); rootless container runtimes setting sysctls fail with `EACCES` (slirp4netns's
+  `accept_dad`, `podman unshare unshare -n` writing `net.*`).
 - **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
   the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
   looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another
   namespace shows that namespace's value.
-- **bpf load capability:** loading a device program accepts `CAP_BPF` alone; Linux 6.1 also requires
-  `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` for this program type.
 - **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555, `comm`
   read-only, `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
   `/sys/class/net` follows the reader rather than the mounter's network namespace; procfs mount
   options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
-  standard files are absent; `kernel/pid_max` writes are ignored; `processes` in `/proc/stat`
-  excludes threads; `Cpus_allowed_list` ignores task affinity; `fd/<n>` links are 0777 instead
-  of encoding the open mode (0500, 0300, 0700, 0 for `O_PATH`); `st_blksize` is 4096 instead of
-  1024; cgroup directories are always 0755, ignoring the mkdir mode, so a private 0700 cgroup is
-  searchable by everyone.
+  standard files are absent; `kernel/pid_max` writes are ignored; `status` has no
+  `Cpus_allowed` mask line; cgroup directories are always 0755, ignoring the mkdir mode, so a
+  private 0700 cgroup is searchable by everyone.
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.

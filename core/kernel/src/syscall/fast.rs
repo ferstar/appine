@@ -302,6 +302,10 @@ fn futex(
 ) -> Option<SysResult> {
     let (uaddr, op, val, timeout, val3) = (a[0], a[1] as u32, a[2] as u32, a[3], a[5] as u32);
     let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    // FUTEX_CLOCK_REALTIME with another command is ENOSYS, which the BKL path answers
+    if op & FUTEX_CLOCK_REALTIME != 0 && cmd != FUTEX_WAIT_BITSET {
+        return None;
+    }
     let bitset = match cmd {
         FUTEX_WAIT | FUTEX_WAKE => u32::MAX,
         FUTEX_WAIT_BITSET | FUTEX_WAKE_BITSET if val3 != 0 => val3,
@@ -320,7 +324,9 @@ fn futex(
         shared: op & FUTEX_PRIVATE_FLAG == 0,
     };
     if cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET {
-        let woken = shared.futexes().wake(key, val, bitset);
+        let woken = shared
+            .futexes()
+            .wake(key, super::misc::wake_count(val), bitset);
         crate::kernel::flush_signals();
         return Some(Ok(woken as u64));
     }

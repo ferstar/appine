@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 13 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: master-side `TIOCGPGRP`/`TIOCGSID`/`TIOCNOTTY`; `TIOCSTI` rules; the line discipline follows n_tty; `/dev/tty` identity; taking a controlling terminal; the console's end of file; VMIN reads, background ioctls and leader exit last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: master-side ioctls; `TIOCSTI`; the line discipline follows n_tty; `/dev/tty` identity; controlling terminals; the console's end of file; VMIN reads, background ioctls; echoes bounded by the output room last)
 
 ## Responsibilities
 
@@ -149,9 +149,12 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
   `toupper`), tab expansion with `XTABS`; control characters take no column, UTF-8 continuation
   bytes none with `IUTF8`. Without `OPOST` bytes pass unchanged and the column is not followed.
   `EIO` without a master; `TOSTOP` background check.
-- While output is stopped, slave writes block and echoes wait; restarting writes them. TCIOFF and
-  TCION on the slave send their character even through a ^S stop (reporting `STOP` again in packet
-  mode); under TCOOFF it is lost, as Linux's `pty_write` refuses it.
+- While output is stopped, slave writes block and echoes wait; restarting writes them. Echoes also
+  go out only while the output queue has room for each whole one (`__process_echoes`); the rest
+  wait for the next commit, at most 4096 of them (the oldest dropped, as n_tty's echo buffer).
+  TCIOFF and TCION on the slave send their character even through a ^S stop (reporting `STOP`
+  again in packet mode); under TCOOFF, or with the output queue full, it is lost, as Linux's
+  `pty_write` refuses it.
 - Master reads: a pending packet status byte is returned alone; otherwise `TIOCPKT_DATA` (in
   packet mode) plus the output. Once the slave has been opened and all slaves closed, master reads
   return `EIO` after draining and poll reports `POLLHUP`; a never-opened slave does not count, so
@@ -291,9 +294,8 @@ exit-time orphan signals (`kernel/process`); the Android terminal UI (`android`)
 
 ## Confirmed bugs / technical debt
 
-- **Echo can grow output without limit:** echoes and `send_xchar` ignore the output limit, so a
-  master that never reads while the slave reads input lets the output queue grow unbounded
-  (Linux drops echoes when full); one write can also overshoot by `ONLCR` expansion.
+- **One slave write can overshoot the output limit** by its `ONLCR` and tab expansion (the write is
+  clamped to the room before output processing).
 - **Non-canonical reads differ:** `VTIME` with `VMIN>0` is a total instead of an inter-byte timer;
   a zero-length master write (or a blocked writer retrying) produces EPOLLET edges with no data.
 - **`TIOCSPGRP` error codes:** `EPERM` instead of `ESRCH` for unknown groups, `ENOTTY` instead of

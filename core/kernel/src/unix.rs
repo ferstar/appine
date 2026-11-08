@@ -111,6 +111,9 @@ pub(crate) struct UnixSocket {
     /// The new network namespace it was created in, if any (abstract addresses are kept apart by
     /// it, and interface ioctls look at its lo).
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
+    /// The generic `SOL_SOCKET` options it only records (buffer sizes among them: the capacity
+    /// stays [`CAPACITY`]).
+    pub opts: crate::net::SockOpts,
 }
 
 impl UnixSocket {
@@ -127,6 +130,7 @@ impl UnixSocket {
             shut_wr: false,
             connections: 0,
             net: None,
+            opts: crate::net::SockOpts::default(),
         }
     }
 
@@ -190,12 +194,15 @@ impl UnixSocket {
         server
     }
 
-    /// FIONREAD: for streams the buffered bytes, for datagrams the length of the next datagram.
-    pub fn unread(&self) -> usize {
+    /// FIONREAD: for streams and seqpacket connections the buffered bytes, for datagrams the length
+    /// of the next datagram; None on a listener.
+    pub fn unread(&self) -> Option<usize> {
+        // unix_inq_len: none on a listener (EINVAL), every byte queued on a stream or
+        // seqpacket connection, the next datagram's length
         match &self.link {
-            Link::Stream { rx, .. } if self.ty == crate::net::SOCK_STREAM => rx.borrow().bytes,
-            Link::Stream { rx, .. } => rx.borrow().packets.front().map_or(0, |p| p.data.len()),
-            _ => self.rx.borrow().packets.front().map_or(0, |p| p.data.len()),
+            Link::Listening { .. } => None,
+            Link::Stream { rx, .. } => Some(rx.borrow().bytes),
+            _ => Some(self.rx.borrow().packets.front().map_or(0, |p| p.data.len())),
         }
     }
 

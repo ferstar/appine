@@ -8,12 +8,6 @@
 # Cannot be compared: Appine hands the malformed destination to the host socket, and in this VM
 # the host's AppArmor answers EAFNOSUPPORT before Linux's own EINVAL check
 SKIP="IPUnboundSockets/IPUnboundSocketTest.InsufficientBufferTOS/*"
-# kernel/net: netlink socket options misreport (unbound sockets keep nl_pid 0, getsockopt answers
-# 0 or 4 zero bytes, SO_PASSCRED has no effect)
-SKIP="$SKIP:ProtocolTest/NetlinkTest.ConnectBinds/*:ProtocolTest/NetlinkTest.GetSendTimeout/*"
-SKIP="$SKIP:NetlinkRouteTest/SockOptTest.GetSockOpt/0:NetlinkRouteTest/SockOptTest.GetSockOpt/1"
-SKIP="$SKIP:NetlinkRouteTest/SockOptTest.GetSockOpt/2:NetlinkRouteTest/SockOptTest.GetSockOpt/3"
-SKIP="$SKIP:NetlinkRouteTest.ListMemberships*:NetlinkRouteTest.PasscredCreds"
 # kernel/net D3: host interfaces, addresses and routes in the initial namespace cannot be changed,
 # and no netlink multicast notifications are sent; unsupported change requests (rules) answer
 # EOPNOTSUPP; netlink destination addresses are ignored (LinkMulticastGroupCapNetAdmin)
@@ -40,10 +34,6 @@ SKIP="$SKIP:NetlinkRouteTest.NewRouteGatewayOnLink:NetlinkRouteTest.NewRouteLink
 SKIP="$SKIP:$R.RouteMulticastGroupReplace/*:$R.NewRouteWithoutOif/1:$R.NewRouteViaAddress/1"
 # kernel/net D7: the SNMP error counters are always 0
 SKIP="$SKIP:ProcNetSnmp.TcpEstab:ProcNetSnmp.TcpReset:ProcNetSnmp.UdpNoPorts"
-# kernel/poll: epoll_ctl reports errors in a different order; a pipe write end without readers
-# lacks POLLOUT
-SKIP="$SKIP:EpollTest.BadEventPointerCheckedFirst:EpollTest.TargetCheckedBeforeEpollType"
-SKIP="$SKIP:PollTest.NonBlockingEventPOLLERR"
 sh /tmp/difftest-files/gtest/run.sh gvisor "$SKIP" tcp_socket_test bind_test \
     socket_ip_unbound_test socket_netlink_test socket_netlink_route_test proc_net_test epoll_test \
     poll_test

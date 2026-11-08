@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts last)
 
 ## Responsibilities
 
@@ -80,7 +80,8 @@ provider and rootfs installation UI (`android`).
 - Each regular file's data is `objects/<ino>` (mode 0600), always opened by number relative to an
   `O_PATH` directory fd, never by path. Directories, symlinks, device nodes, FIFOs and sockets
   exist only in the database.
-- Regular files take size, mtime, atime and ctime from the host object; a metadata change to a
+- Regular files take size, mtime, atime, ctime and the allocated block count (`Stat::blocks`, so
+  holes take no storage) from the host object; a metadata change to a
   regular file chmods the object back to 0600 so the host bumps its ctime (one clock per file); the
   database ctime column is still written for regular files but never reported. Time changes use
   the host's `utimensat` on the object by number, except an empty-path change on a (non-`O_PATH`)

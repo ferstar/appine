@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets; onlink, limit and quota last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets; onlink, limit and quota; no TUN device last)
 
 ## Responsibilities
 
@@ -279,6 +279,10 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Confirmed bugs / technical debt
 
+- **No TUN/TAP device:** `/dev/net/tun` does not exist (there is no network stack to attach a tap
+  device to), so pasta and slirp4netns cannot start: rootless podman's default network, its port
+  publishing and `--network slirp4netns` fail, and rootless containers work only with
+  `--network host`.
 - **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
   xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
   trigger; byte limits and quotas count headers only, so they let through more than Linux.

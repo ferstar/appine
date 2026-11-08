@@ -113,7 +113,13 @@ pub(super) fn ppoll(
     let r = wait_ready(cx, &wanted, deadline, false);
     restore_mask(cx, &r);
     let r = write_back_timeout(cx, timeout, deadline.filter(|_| !zero), r);
-    let mut ready = r?.into_iter();
+    // As Linux's do_sys_poll, revents are written back whatever the outcome: zeros when the wait
+    // was interrupted
+    let mut ready = match &r {
+        Ok(ready) => ready.clone(),
+        Err(_) => vec![0; wanted.len()],
+    }
+    .into_iter();
     let mut n = 0;
     for ((_, _, skip), out) in items.iter().zip(raw.chunks_exact_mut(8)) {
         let ev = if *skip { 0 } else { ready.next().unwrap() };
@@ -121,7 +127,7 @@ pub(super) fn ppoll(
         out[6..8].copy_from_slice(&ev.to_le_bytes());
     }
     cx.mm().write(UserSlice::new(fds, raw.len()), &raw)?;
-    Ok(n)
+    r.map(|_| n)
 }
 
 pub(super) fn pselect6(
@@ -521,18 +527,22 @@ pub(super) fn epoll_create1(cx: &mut Cx<'_>, flags: u32) -> SysResult {
 }
 
 pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64) -> SysResult {
-    let epf = cx.fds().get(epfd)?;
-    let FileKind::Epoll(ep) = &epf.borrow().kind else {
-        return Err(Errno::EINVAL);
+    // Linux 6.1's order: the event is copied first (every operation but DEL), then both fds are
+    // looked up (EBADF), the target must support poll (EPERM), and only then is epfd checked to
+    // be another file and an epoll (EINVAL)
+    let (events, data) = if op == EPOLL_CTL_DEL {
+        (0, 0)
+    } else {
+        let b: [u8; 16] = get(cx, event)?;
+        (
+            u32::from_le_bytes(b[..4].try_into().unwrap()),
+            u64::from_le_bytes(b[8..].try_into().unwrap()),
+        )
     };
-    let ep = ep.clone();
-    let key = wake::of(&ep);
+    let epf = cx.fds().get(epfd)?;
     let file = cx.fds().get(fd)?;
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
-    }
-    if Rc::ptr_eq(&epf, &file) {
-        return Err(Errno::EINVAL);
     }
     // Regular files, directories and devices like /dev/null do not support poll, and Linux does
     // not allow adding them to an epoll
@@ -552,19 +562,14 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     ) {
         return Err(Errno::EPERM);
     }
-    // Adding another epoll: no loops, and nesting no deeper than EP_MAX_NESTS levels
-    if op == EPOLL_CTL_ADD && nesting(&file, &ep, 0).is_none_or(|d| d > MAX_NESTS) {
-        return Err(Errno::ELOOP);
-    }
-    let (events, data) = if op == EPOLL_CTL_DEL {
-        (0, 0)
-    } else {
-        let b: [u8; 16] = get(cx, event)?;
-        (
-            u32::from_le_bytes(b[..4].try_into().unwrap()),
-            u64::from_le_bytes(b[8..].try_into().unwrap()),
-        )
+    let FileKind::Epoll(ep) = &epf.borrow().kind else {
+        return Err(Errno::EINVAL);
     };
+    let ep = ep.clone();
+    let key = wake::of(&ep);
+    if Rc::ptr_eq(&epf, &file) {
+        return Err(Errno::EINVAL);
+    }
     // As on Linux: EPOLLEXCLUSIVE can be used only when adding, not on epolls, and not with other
     // flags
     if events & EPOLLEXCLUSIVE != 0
@@ -574,6 +579,10 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
                     || events & !EXCLUSIVE_OK != 0))
     {
         return Err(Errno::EINVAL);
+    }
+    // Adding another epoll: no loops, and nesting no deeper than EP_MAX_NESTS levels
+    if op == EPOLL_CTL_ADD && nesting(&file, &ep, 0).is_none_or(|d| d > MAX_NESTS) {
+        return Err(Errno::ELOOP);
     }
     if op != EPOLL_CTL_DEL {
         if events & (EPOLLET | EPOLLEXCLUSIVE) != 0 || ep.borrow().edge_watched.get() {
@@ -724,6 +733,15 @@ pub(super) fn epoll_pwait(
 ) -> SysResult {
     if maxevents <= 0 || maxevents > i32::MAX / 16 {
         return Err(Errno::EINVAL);
+    }
+    // access_ok: the events buffer must lie below arm64's TASK_SIZE_MAX (48-bit addresses),
+    // mapped or not; before the epoll is looked at
+    const TASK_SIZE_MAX: u64 = 1 << 48;
+    if events
+        .checked_add(maxevents as u64 * 16)
+        .is_none_or(|end| end > TASK_SIZE_MAX)
+    {
+        return Err(Errno::EFAULT);
     }
     // Borrow the open file for this statement only: when `let … else` binds a reference
     // borrowed from it, the borrow lives until the end of the function, and another thread
@@ -1275,11 +1293,14 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         FileKind::Pipe(end) => {
             let p = end.pipe.borrow();
             let mut ev = 0;
+            // pipe_poll: writable while not full, also with no readers left (when writing
+            // raises EPIPE), which adds POLLERR
             if end.write {
+                if p.space() >= PIPE_BUF {
+                    ev |= POLLOUT | POLLWRNORM;
+                }
                 if p.readers == 0 {
                     ev |= POLLERR;
-                } else if p.space() >= PIPE_BUF {
-                    ev |= POLLOUT | POLLWRNORM;
                 }
             }
             if end.read {

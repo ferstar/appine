@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order, timeouts; blocking connect; raw rebinds last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind checks; dump size; UDP read shutdown; accept, connect; raw rebinds; netlink options, peers, socketpair last)
 
 ## Responsibilities
 
@@ -42,8 +42,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   guest shut it down for reading). Guest `O_NONBLOCK` lives on the open file.
 - `Message` (one recv result), `Routed` (connect/sendto routing result: namespace map, nat,
   filter verdict, original destinations).
-- `NetlinkSocket` — protocol, `nl_pid`, datagram queue, arrival counter, `rcvtimeo`, namespace,
-  `ext_ack`/`cap_ack`; `Host` trait / `KernelHost` (interfaces, links, tables, routes, stats,
+- `NetlinkSocket` — protocol, type, `nl_pid`, datagram queue, arrival counter,
+  `rcvtimeo`/`sndtimeo`, namespace, `ext_ack`/`cap_ack`, joined groups, the other recorded
+  `SOL_NETLINK` flags, `passcred`, `SockOpts`; `Host` trait / `KernelHost` (interfaces, links, tables, routes, stats,
   configure, netfilter, all scoped to the socket's namespace); `Link` (host or virtual).
 - `route::Entry` — one route (`host` marks entries whose source the host chooses).
 - `RawIcmp` (per raw socket: last guest echo id, `ICMP_FILTER`, guest option flags, its `Tap`),
@@ -54,6 +55,13 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   (RAII refcount on an entry), `ListenEvent`.
 - `Traffic` (per-interface `IfStats`, address table, `Protocols` counters), `traffic::Route`.
 - `origdst::Table` (host 4-tuple → original destinations per namespace, with age and a cap).
+- `SockOpts` — the generic `SOL_SOCKET` options netlink and AF_UNIX sockets only record (debug,
+  reuse, dontroute, broadcast, keepalive, oobinline, no_check, buffer sizes, priority, rcvlowat,
+  linger), set and read back by Linux's `sk_setsockopt`/`sk_getsockopt` rules: an int needed
+  (`EINVAL`), buffer sizes capped at 212992 unless the `FORCE` form (`CAP_NET_ADMIN`), then
+  doubled with Linux's minimums, `SO_DEBUG` on needs `CAP_NET_ADMIN` (`EACCES`), priorities
+  outside 0..6 `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace owner, the read-only ones
+  `ENOPROTOOPT`.
 
 ## Public entry points
 
@@ -83,8 +91,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `SOCK_RAW`/`SOCK_DGRAM` with ROUTE, NETFILTER, KOBJECT_UEVENT or GENERIC (others
   `EPROTONOSUPPORT`, other types `ESOCKTNOSUPPORT`). AF_UNIX goes to `kernel/unix`. Other
   families (AF_PACKET, AF_VSOCK, …) `EAFNOSUPPORT`.
-- `socketpair` is AF_UNIX only (inet and netlink `EOPNOTSUPP`, others `EAFNOSUPPORT`/
-  `EPROTONOSUPPORT`).
+- `socketpair` is AF_UNIX only: inet first creates the socket as Linux does (a type of
+  `SOCK_MAX` or more `EINVAL`, one no inet protocol has `ESOCKTNOSUPPORT`, a protocol the type
+  lacks `EPROTONOSUPPORT`, raw without `CAP_NET_RAW` `EPERM`), then `EOPNOTSUPP`; netlink
+  `EOPNOTSUPP`; others `EAFNOSUPPORT`/`EPROTONOSUPPORT`.
 
 ### Binding, listening, connecting, accepting
 
@@ -108,7 +118,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   (restarted under `SA_RESTART`, the restarted call waiting again) or `EINTR` when there is a
   timeout; then it reads `SO_ERROR` and connects again, so the host reports `EISCONN` after a
   success and, after a failure, has reset the socket so that the guest's next connect sends a new
-  SYN. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released.
+  SYN. TCP connects register `SO_ORIGINAL_DST` records before the BKL is released. The peer
+  getpeername reports is recorded at connect as Linux reports it: an IPv4 address given to an IPv6
+  socket IPv4-mapped, the wildcard as the loopback (IPv4-mapped when the IPv6 socket's local
+  address is), no IPv6 flow information, a scope only for link-local addresses.
 - accept4 (Linux's `__sys_accept4_file` order): bad flags `EINVAL`; no free fd `EMFILE` before a
   connection is taken; host accept with waits bounded by the listener's `SO_RCVTIMEO` (`EAGAIN` on
   timeout); the new socket inherits protocol, local port map, namespace state, mark, the claimed
@@ -157,7 +170,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ### Options and ioctls
 
-- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (the old numbers, Linux 6.1's `sock_set_timeout`: a short
+- `SO_RCVTIMEO_NEW`/`SO_SNDTIMEO_NEW` are taken as the old numbers for every socket kind (the same
+  16-byte timeval on a 64-bit kernel).
+- Emulated: `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux 6.1's `sock_set_timeout`: a short
   buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a negative time zero (no waiting,
   `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read back as 0 like Linux's
   `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way), `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the namespace
@@ -168,9 +183,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF` (filter pointer rewritten, 1..4096 instructions),
   `IPV6_V6ONLY` in new namespaces, `IP_TTL`/`IP_RECVERR` on UDP (raw ICMP taps),
   `SO_ORIGINAL_DST` (section 7). Everything else (including `SO_PEERCRED`, `SO_BINDTODEVICE` —
-  resolved against host interface names —, `SO_PRIORITY`, `IP_TRANSPARENT`, `TCP_*`,
-  `SO_RCVTIMEO_NEW`/`SO_SNDTIMEO_NEW`, and `SO_ATTACH_BPF` with its guest fd number) goes to the
-  host and is checked against the app's host credentials.
+  resolved against host interface names —, `SO_PRIORITY`, `IP_TRANSPARENT`, `TCP_*`, and
+  `SO_ATTACH_BPF` with its guest fd number) goes to the host and is checked against the app's host
+  credentials. Netlink and AF_UNIX sockets keep their options in process (`SockOpts`).
 - ioctls: `FIONREAD`/`SIOCINQ` (stub answers emulated) and `SIOCATMARK` pass through;
   `SIOCGIF*` getters pass through (hardware address fixed up), setters `EPERM`; `SIOCGIFCONF`
   appends virtual devices; interface ioctls also work on AF_UNIX and netlink sockets through a
@@ -260,18 +275,35 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 
 ### Netlink
 
-- bind takes `nl_pid` (0 → the caller's tgid in its pid namespace; explicit ids unchecked;
-  rebinding allowed; groups ignored); unbound sockets keep id 0 (no autobind); connect and
-  shutdown do nothing; listen and accept `EOPNOTSUPP`.
+- bind (Linux's `netlink_bind`): a whole `sockaddr_nl` of `AF_NETLINK` (`EINVAL`); groups need a
+  protocol anyone may join (all but `NETLINK_NETFILTER`) or `CAP_NET_ADMIN` over the namespace
+  owner, as do rtnetlink's multicast-routing groups (`EPERM`), and are cut to the protocol's
+  count (36 for `NETLINK_ROUTE`, 32 for the others); a bound socket must keep its `nl_pid`
+  (`EINVAL`); an unbound one takes the given id or, for 0, the caller's tgid in its pid namespace
+  (ids are not checked for uniqueness); the groups replace the first 32 joined, and getsockname
+  reports them. connect (`netlink_connect`): `AF_UNSPEC` does nothing, otherwise a whole
+  `sockaddr_nl` (`EINVAL`), a port or group needing `CAP_NET_ADMIN` (`EPERM`); connect and send
+  autobind an unbound socket to the tgid. shutdown does nothing; listen and accept `EOPNOTSUPP`.
 - send handles each message synchronously and queues reply datagrams; recv pops one datagram
   (`MSG_PEEK` clones; oversized datagrams are truncated with `MSG_TRUNC` and the rest lost);
-  source `{AF_NETLINK, 0, 0}`; waits honour `SO_RCVTIMEO`. Only `SO_RCVTIMEO`, `NETLINK_CAP_ACK`
-  and `NETLINK_EXT_ACK` have effects (the ack flags apply to device-layer change errors and to
-  nftables, not to query or generic-netlink errors); other options are accepted, and getsockopt
-  returns 0 for everything but `SO_RCVTIMEO` (`SO_TYPE`, `SO_DOMAIN`, `SO_RCVBUF` read 0). No
-  multicast notifications are ever sent (mq_notify cookies are the only asynchronous messages).
+  source `{AF_NETLINK, 0, 0}`; with `NETLINK_PKTINFO` a pktinfo control message (group 0), then
+  with `SO_PASSCRED` the kernel's credentials (pid 0, uid and gid 0 as the receiver sees them),
+  cut as `put_cmsg` cuts them; waits honour `SO_RCVTIMEO`.
+- Options: `SOL_SOCKET` reports the type, protocol, `AF_NETLINK`, `SO_PASSCRED`, the timeouts
+  (`SO_SNDTIMEO` only recorded), `SO_ERROR`/`SO_ACCEPTCONN` 0, `SO_PEERCRED` pid 0 and uid/gid -1,
+  and the `SockOpts` ones; other names are accepted and ignored by setsockopt and `ENOPROTOOPT` to
+  getsockopt. `SOL_NETLINK` (value read only when a whole int): `NETLINK_ADD_MEMBERSHIP`/`DROP`
+  (permission as for bind; the set is allocated first, then group 0 or beyond the count
+  `EINVAL`), `NETLINK_LIST_MEMBERSHIPS` (32-bit words while they fit, optlen the whole set's size,
+  0 before any group), and the flags `NETLINK_PKTINFO`, `BROADCAST_ERROR`, `NO_ENOBUFS`,
+  `LISTEN_ALL_NSID` (`CAP_NET_BROADCAST` over the namespace owner), `CAP_ACK`, `EXT_ACK`,
+  `GET_STRICT_CHK` (reading one needs room for an int, `EINVAL`); only `NETLINK_CAP_ACK` and
+  `NETLINK_EXT_ACK` have effects (on device-layer change errors and nftables, not on query or
+  generic-netlink errors); other names and levels `ENOPROTOOPT`. No multicast notifications are
+  ever sent (mq_notify cookies are the only asynchronous messages).
 - `NETLINK_ROUTE`: change requests (`NEW`/`DEL`/`SET` for links, addresses, routes) need
-  `CAP_NET_ADMIN` over the namespace owner and go to `kernel/netns`'s device layer (host
+  `CAP_NET_ADMIN` over the namespace owner and go to `kernel/netns`'s device layer; other change
+  types Linux 6.1 knows (up to `RTM_MAX`) are `EPERM` without it and `EOPNOTSUPP` with it (host
   interfaces cannot be changed; requests that change nothing succeed). Queries: link dumps
   (filtered by master and kind), single links by index or name (`EINVAL`, `ENODEV`), address
   dumps (per family, IPv4 first), route dumps (per family) and `ip route get`, rule dumps (one
@@ -339,17 +371,15 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
   most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
   sizes later datagrams to the reader's buffer and continues the dump on the next recv.
-- **Netlink socket options misreport:** getsockopt returns 0 for `SO_TYPE`, `SO_DOMAIN`,
-  `SO_SNDBUF`, `SO_RCVBUF`, `NETLINK_LIST_MEMBERSHIPS` and the ack flags, and answers
-  `SO_SNDTIMEO` with 4 zero bytes instead of a timeval; unknown options and
-  `NETLINK_ADD_MEMBERSHIP` succeed silently, so monitors subscribe and never hear anything;
-  `SO_PASSCRED` has no effect; `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
-  generic-netlink errors; unbound sockets keep `nl_pid` 0 (no autobind on connect or send) and
-  explicit ids are not checked for uniqueness.
+- **Netlink memberships and ids are only recorded:** joined groups never receive anything, so
+  monitors subscribe and wait forever; `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
+  generic-netlink errors; ids are not checked for uniqueness, so a second socket of a process
+  autobinds to the same tgid (Linux picks a negative number) and an explicit id another socket
+  holds is not `EADDRINUSE`.
 - **Option passthrough uses host semantics:** privileged options (`SO_PRIORITY` above 6,
   `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
   `SO_BINDTODEVICE` names are resolved against host interfaces; `SO_ATTACH_BPF` passes a guest fd
-  number to the host; `SO_RCVTIMEO_NEW`/`SO_SNDTIMEO_NEW` have no effect.
+  number to the host.
 - **Raw ICMP keeps one echo id per socket:** every reply is rewritten to the last id sent, so
   programs using several ids on one socket (liboping) see them collapse; the queue cap ignores
   `SO_RCVBUF` and drops silently.
@@ -367,22 +397,13 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   checked, so a bad state or type, a missing or wrong-size `NDA_DST` (`EINVAL`), an unknown family
   (`EAFNOSUPPORT`) and an unknown interface index (`ENODEV`) are all reported as "not found", and
   `ip neigh get` with a wrong device or address family prints a misleading error.
-- **Unsupported rtnetlink change requests skip the capability check:** only link, address and route
-  changes check `CAP_NET_ADMIN`; other change messages (`RTM_NEWRULE`, `RTM_NEWNEIGH`, qdiscs,
-  nexthops and the like) answer `EOPNOTSUPP` even to unprivileged callers, where Linux answers
-  `EPERM` first, so an unprivileged `ip rule add` reports "Operation not supported" instead of
-  "Operation not permitted".
 - **Netlink destination addresses are ignored:** sendto/sendmsg on a netlink socket never looks at
   `msg_name`, so a message addressed to another port or to multicast groups is handled as a kernel
   request, without `netlink_sendmsg`'s checks (`EINVAL` for a short or non-`AF_NETLINK` address,
   `EPERM` for sending to a group or port without `CAP_NET_ADMIN` on rtnetlink).
-- **getpeername echoes the connect address:** an inet socket reports the sockaddr it was connected
-  with, so an `AF_INET6` socket connected with a `sockaddr_in` reports a 16-byte `AF_INET` peer
-  (Linux: a v4-mapped `sockaddr_in6`) and a connect to `0.0.0.0` or `::` reports the wildcard
-  (Linux: `127.0.0.1` or `::1`).
-- **socketpair reports unknown inet types as protocol errors:** `socketpair(AF_INET/AF_INET6)`
-  with a type that has no inet protocol is `EPROTONOSUPPORT`, where Linux answers
-  `ESOCKTNOSUPPORT`.
+- **A wildcard connect from a bound IPv4 socket reports the loopback:** connecting to `0.0.0.0`
+  gives getpeername `127.0.0.1` even when the socket is bound to an address of its own, which
+  Linux's route lookup would take instead.
 - **A raw ICMP socket shut down for reading still waits in recv:** the aggregation point's receive
   path does not look at the read shutdown, so a blocking recv with nothing queued sleeps until a
   reply, a timeout or a signal, where Linux's `skb_recv_datagram` returns 0 at once (and wakes

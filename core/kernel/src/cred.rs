@@ -40,6 +40,7 @@ pub(crate) mod cap {
     pub const SETPCAP: u32 = 8;
     pub const LINUX_IMMUTABLE: u32 = 9;
     pub const NET_BIND_SERVICE: u32 = 10;
+    pub const NET_BROADCAST: u32 = 11;
     pub const NET_ADMIN: u32 = 12;
     pub const NET_RAW: u32 = 13;
     pub const IPC_LOCK: u32 = 14;
@@ -1018,6 +1019,7 @@ mod tests {
             atime_ns: 0,
             mtime_ns: 0,
             ctime_ns: 0,
+            blocks: None,
         }
     }
 

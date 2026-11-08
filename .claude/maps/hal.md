@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random` uses getrandom; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno and the stop pipe; Linux and Android only, other targets a `compile_error!`, last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE` last)
 
 ## Responsibilities
 
@@ -13,9 +13,10 @@
 layer. It wraps the host syscalls the kernel needs, with one implementation for Android (bionic)
 and Linux (glibc), the only hosts it builds for, returning raw host errnos:
 
-- memory: anonymous and reserved mappings, file mappings, discard, msync, residency queries;
+- memory: anonymous and reserved mappings, file mappings, discard and hole punching, msync,
+  residency queries;
 - files and storage: `*at` calls on the object directory, positional and plain I/O, `sendfile`
-  copies, the fsync family, `flock`, `ioctl`, `statvfs`, fd limits, randomness;
+  copies, `fallocate`, the fsync family, `flock`, `ioctl`, `statvfs`, fd limits, randomness;
 - host statistics: process memory usage, host meminfo, CPU set and sysfs, per-thread CPU time and
   context switches;
 - waiting: `poll`/`ppoll`, `Event` (eventfd), `Edges` (edge-triggered host epoll on one fd), `Watch`
@@ -52,14 +53,15 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 ## Public entry points
 
-- Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `map_file`,
+- Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `remove`,
+  `map_file`,
   `map_file_read_only`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
   `touched_pages`, `has_private_pages`, `cachestat`.
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`, `statvfs`,
   `fd_limit`, `raise_fd_limit`, `host_cpus`, `cpu_sysfs`, `thread_cpu_clock`,
   `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`.
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
-  `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `lseek`, `copy_file`, `fsync`,
+  `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `fallocate`, `lseek`, `copy_file`, `fsync`,
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
 - Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
@@ -88,7 +90,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - `map_file` maps shared or private file ranges (private mappings are always RW copy-on-write;
   only shared read-only ones are read-only), rounding the offset down to the host page (16K on some
   devices) and the length up; `map_file_read_only` serves shared read-only mappings.
-- `discard` is `MADV_DONTNEED`; residency comes from `mincore` (`resident_pages`, `page_residency`)
+- `discard` is `MADV_DONTNEED` and `remove` `MADV_REMOVE` (the host punches the hole in the file or
+  shared memory behind a writable shared mapping), both on host-page-aligned ranges; residency
+  comes from `mincore` (`resident_pages`, `page_residency`)
   or `/proc/self/pagemap` (`touched_pages`, present or swapped bits — zram pages count as touched;
   `has_private_pages`, whether a private file mapping has a page present without the file bit or
   swapped, a copy written since it was mapped), all in 4K units (pages within one 16K host page
@@ -103,7 +107,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - The store opens its object directory with `open_dir` (`O_PATH`) and addresses objects with
   `open_at` (always `O_CLOEXEC`, follows symlinks, applies the umask), `stat_at`, `chmod_at`,
   `set_times_*`, `unlink_at`; `flock` and a shared mapping of the `lock` file coordinate store users.
-- `read`/`write`/`pread`/`pwrite`/`copy_file`/`flock` retry `EINTR`; others do not; partial
+- `fallocate` passes the Linux `FALLOC_FL_*` mode through (a host filesystem without it answers
+  `EOPNOTSUPP`).
+- `read`/`write`/`pread`/`pwrite`/`fallocate`/`copy_file`/`flock` retry `EINTR`; others do not; partial
   transfers are returned as is. `copy_file` seeks the output fd and calls `sendfile` (callers fall
   back to chunked copies on `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`).
 - Durability: `fsync(data_only)`, `sync_file_range` (raw syscall, arm64 argument order), `syncfs`,

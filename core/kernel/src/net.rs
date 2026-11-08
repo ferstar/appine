@@ -385,7 +385,10 @@ pub const NETLINK_NETFILTER: i32 = 12;
 /// other protocols cannot be created (`syscall::net::socket`).
 pub(crate) struct NetlinkSocket {
     pub protocol: i32,
-    /// `nl_pid`: assigned on bind.
+    /// `SOCK_RAW` or `SOCK_DGRAM`, as created (`SO_TYPE`).
+    pub ty: i32,
+    /// `nl_pid`: assigned on bind, or by the first connect or send (Linux's autobind); 0 until
+    /// then.
     pub pid: u32,
     /// Answers waiting for the guest to read them, one datagram per item.
     pub queue: VecDeque<Vec<u8>>,
@@ -400,12 +403,29 @@ pub(crate) struct NetlinkSocket {
     pub ext_ack: bool,
     /// `NETLINK_CAP_ACK`: error acks carry only the request's message header.
     pub cap_ack: bool,
+    /// The multicast groups joined by bind or `NETLINK_ADD_MEMBERSHIP` (bit `n - 1` for group
+    /// `n`), None until the first one (Linux allocates the set then, and
+    /// `NETLINK_LIST_MEMBERSHIPS` reports nothing before). Only recorded: no notifications are
+    /// ever sent.
+    pub groups: Option<u64>,
+    /// The `SOL_NETLINK` flags that are only recorded and read back (`NETLINK_PKTINFO`,
+    /// `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`, `NETLINK_LISTEN_ALL_NSID`,
+    /// `NETLINK_GET_STRICT_CHK`): bit `n` for option `n`. With `NETLINK_PKTINFO` every message
+    /// received carries a pktinfo control message (group 0: answers are unicast).
+    pub flags: u32,
+    /// `SO_PASSCRED`: every message received carries the kernel's credentials.
+    pub passcred: bool,
+    /// `SO_SNDTIMEO`: recorded only (sending to the kernel never waits).
+    pub sndtimeo: Option<Duration>,
+    /// The generic `SOL_SOCKET` options it only records.
+    pub opts: SockOpts,
 }
 
 impl NetlinkSocket {
-    pub fn new(protocol: i32) -> NetlinkSocket {
+    pub fn new(protocol: i32, ty: i32) -> NetlinkSocket {
         NetlinkSocket {
             protocol,
+            ty,
             pid: 0,
             queue: VecDeque::new(),
             arrivals: 0,
@@ -413,6 +433,21 @@ impl NetlinkSocket {
             net: None,
             ext_ack: false,
             cap_ack: false,
+            groups: None,
+            flags: 0,
+            passcred: false,
+            sndtimeo: None,
+            opts: SockOpts::default(),
+        }
+    }
+
+    /// How many multicast groups the protocol has (Linux's `nl_table[].groups`: at least 32,
+    /// and `RTNLGRP_MAX` for `NETLINK_ROUTE` on 6.1).
+    pub fn ngroups(&self) -> u32 {
+        if self.protocol == NETLINK_ROUTE {
+            36
+        } else {
+            32
         }
     }
 
@@ -657,8 +692,9 @@ impl NetlinkSocket {
             // always empty
             RTM_GETNEIGH if dump => vec![done()],
             RTM_GETNEIGH => vec![ack(req, ENOENT, self.pid)],
-            // Unsupported requests: EOPNOTSUPP; control messages are acked only when an ack is
-            // asked for
+            // Unsupported requests: EOPNOTSUPP, after rtnetlink_rcv_msg's checks (a type it knows
+            // that changes something needs CAP_NET_ADMIN over the namespace owner: EPERM);
+            // control messages are acked only when an ack is asked for
             _ if flags & NLM_F_REQUEST != 0 => {
                 if ty < NLMSG_MIN_TYPE {
                     if flags & NLM_F_ACK != 0 {
@@ -666,6 +702,11 @@ impl NetlinkSocket {
                     } else {
                         Vec::new()
                     }
+                } else if (RTM_BASE..=RTM_MAX).contains(&ty)
+                    && (ty - RTM_BASE) & 3 != 2
+                    && !host.net_admin()
+                {
+                    vec![ack(req, EPERM, self.pid)]
                 } else {
                     vec![ack(req, EOPNOTSUPP, self.pid)]
                 }
@@ -679,6 +720,8 @@ impl NetlinkSocket {
         let mut b = vec![0u8; 12];
         b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
         b[4..8].copy_from_slice(&self.pid.to_le_bytes());
+        // nl_groups: the first 32 groups
+        b[8..12].copy_from_slice(&(self.groups.unwrap_or(0) as u32).to_le_bytes());
         b
     }
 }
@@ -739,6 +782,11 @@ pub(crate) trait Host {
     }
     /// This is the boot namespace: `ip route get` may let the host choose the source address.
     fn init_net(&self) -> bool {
+        true
+    }
+    /// Whether the requester has `CAP_NET_ADMIN` over the namespace's owner (requests that
+    /// change something).
+    fn net_admin(&self) -> bool {
         true
     }
     /// One datagram on `NETLINK_NETFILTER` ([`crate::nft::handle`]); returns the answer
@@ -1007,6 +1055,10 @@ fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
 const GENL_ID_CTRL: u16 = 0x10;
 /// Message types below this are netlink's own control messages (`NLMSG_NOOP` and so on).
 const NLMSG_MIN_TYPE: u16 = 0x10;
+/// The rtnetlink message types Linux 6.1 knows (`RTM_BASE` to `RTM_MAX`): their lowest two bits
+/// tell new, delete, get and set apart.
+const RTM_BASE: u16 = 16;
+const RTM_MAX: u16 = 123;
 /// The ack carries only the request's message header.
 const NLM_F_CAPPED: u16 = 0x100;
 const CTRL_CMD_NEWFAMILY: u8 = 1;
@@ -1745,7 +1797,7 @@ mod tests {
 
     #[test]
     fn dumps_links_and_addresses() {
-        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
         s.pid = 42;
         let mut req = message(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 7, 0, &[0, 0, 0, 0]);
         req.extend(message(
@@ -1875,7 +1927,7 @@ mod tests {
     /// run, addresses per family, then NLMSG_DONE alone.
     #[test]
     fn splits_large_dumps_into_page_sized_datagrams() {
-        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
         let host = Many(64);
         let mut dump = |ty: u16| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(
@@ -1921,7 +1973,7 @@ mod tests {
     /// acks attach only the message header.
     #[test]
     fn dumps_routes_rules_and_neighbours() {
-        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
@@ -1970,7 +2022,7 @@ mod tests {
 
     #[test]
     fn netns_ids_are_never_assigned() {
-        let mut s = NetlinkSocket::new(NETLINK_ROUTE);
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
         s.pid = 42;
         let mut ask = |attrs: &[(u16, &[u8])]| -> Vec<(u16, Vec<u8>)> {
             let mut p = vec![0u8; 4];
@@ -2010,7 +2062,7 @@ mod tests {
 
     #[test]
     fn generic_netlink_has_only_nlctrl() {
-        let mut s = NetlinkSocket::new(NETLINK_GENERIC);
+        let mut s = NetlinkSocket::new(NETLINK_GENERIC, SOCK_RAW);
         s.pid = 42;
         // The answer's datagrams, each parsed into messages
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
@@ -2200,5 +2252,191 @@ mod tests {
             Some(EPERM)
         );
         assert_eq!(ask(msg(RTM_GETLINK, 0, 1, (0, 0), &[])), None);
+    }
+}
+
+// ---- Generic socket options ----
+
+/// `SO_SNDBUF` and `SO_RCVBUF` before any change and at most without the `FORCE` forms: Linux's
+/// `net.core.wmem_default`, `rmem_default`, `wmem_max` and `rmem_max` (which can be written, but
+/// keep these values here).
+const BUF_DEFAULT: i32 = 212992;
+/// The smallest buffer sizes Linux 6.1 keeps on arm64 (`SOCK_MIN_SNDBUF`, `SOCK_MIN_RCVBUF`).
+const MIN_SNDBUF: i32 = 4608;
+const MIN_RCVBUF: i32 = 2304;
+
+/// The `SOL_SOCKET` options every Linux socket keeps (`sk_setsockopt`, `sk_getsockopt`) that
+/// netlink and AF_UNIX sockets only record: they are set and read back as Linux does, without
+/// effect (buffer sizes do not limit what is queued in process; lingering, keepalives, routing
+/// and priorities mean nothing there).
+#[derive(Clone, Debug)]
+pub(crate) struct SockOpts {
+    debug: bool,
+    reuseaddr: bool,
+    reuseport: bool,
+    dontroute: bool,
+    broadcast: bool,
+    keepalive: bool,
+    oobinline: bool,
+    no_check: bool,
+    sndbuf: i32,
+    rcvbuf: i32,
+    priority: i32,
+    rcvlowat: i32,
+    /// `SO_LINGER`: whether it is on, and the seconds (kept when it is turned off, as Linux keeps
+    /// `sk_lingertime`).
+    linger: (bool, i32),
+}
+
+impl Default for SockOpts {
+    fn default() -> SockOpts {
+        SockOpts {
+            debug: false,
+            reuseaddr: false,
+            reuseport: false,
+            dontroute: false,
+            broadcast: false,
+            keepalive: false,
+            oobinline: false,
+            no_check: false,
+            sndbuf: BUF_DEFAULT,
+            rcvbuf: BUF_DEFAULT,
+            priority: 0,
+            rcvlowat: 1,
+            linger: (false, 0),
+        }
+    }
+}
+
+impl SockOpts {
+    const DEBUG: i32 = 1;
+    const REUSEADDR: i32 = 2;
+    const TYPE: i32 = 3;
+    const ERROR: i32 = 4;
+    const DONTROUTE: i32 = 5;
+    const BROADCAST: i32 = 6;
+    const SNDBUF: i32 = 7;
+    const RCVBUF: i32 = 8;
+    const KEEPALIVE: i32 = 9;
+    const OOBINLINE: i32 = 10;
+    const NO_CHECK: i32 = 11;
+    const PRIORITY: i32 = 12;
+    const LINGER: i32 = 13;
+    const BSDCOMPAT: i32 = 14;
+    const REUSEPORT: i32 = 15;
+    const RCVLOWAT: i32 = 18;
+    const SNDLOWAT: i32 = 19;
+    const SNDBUFFORCE: i32 = 32;
+    const RCVBUFFORCE: i32 = 33;
+    const PROTOCOL: i32 = 38;
+    const DOMAIN: i32 = 39;
+
+    /// setsockopt at `SOL_SOCKET`; None when `name` is not one of these options. `admin` is
+    /// `CAP_NET_ADMIN` in the initial user namespace (`SO_DEBUG`, the `FORCE` forms), `net_admin`
+    /// `CAP_NET_RAW` or `CAP_NET_ADMIN` over the owner of the socket's network namespace
+    /// (priorities above 6).
+    pub fn set(
+        &mut self,
+        name: i32,
+        value: &[u8],
+        admin: bool,
+        net_admin: bool,
+    ) -> Option<Result<(), crate::errno::Errno>> {
+        use crate::errno::Errno;
+        let known = matches!(
+            name,
+            Self::DEBUG
+                | Self::REUSEADDR
+                | Self::TYPE
+                | Self::ERROR
+                | Self::DONTROUTE
+                | Self::BROADCAST
+                | Self::SNDBUF
+                | Self::RCVBUF
+                | Self::KEEPALIVE
+                | Self::OOBINLINE
+                | Self::NO_CHECK
+                | Self::PRIORITY
+                | Self::LINGER
+                | Self::BSDCOMPAT
+                | Self::REUSEPORT
+                | Self::RCVLOWAT
+                | Self::SNDBUFFORCE
+                | Self::RCVBUFFORCE
+                | Self::PROTOCOL
+                | Self::DOMAIN
+        );
+        if !known {
+            return None;
+        }
+        // Each of them takes an int
+        let Some(b) = value.get(..4) else {
+            return Some(Err(Errno::EINVAL));
+        };
+        let val = i32::from_le_bytes(b.try_into().unwrap());
+        let on = val != 0;
+        // sock_set_sndbuf, __sock_set_rcvbuf: at most half of INT_MAX, then doubled
+        let sndbuf = |v: i32| v.min(i32::MAX / 2).saturating_mul(2).max(MIN_SNDBUF);
+        let rcvbuf = |v: i32| v.min(i32::MAX / 2).saturating_mul(2).max(MIN_RCVBUF);
+        // The plain forms are capped at the maximum, comparing as unsigned (a negative size is
+        // the maximum)
+        let capped = |v: i32| (v as u32).min(BUF_DEFAULT as u32) as i32;
+        match name {
+            Self::DEBUG if on && !admin => return Some(Err(Errno::EACCES)),
+            Self::DEBUG => self.debug = on,
+            Self::REUSEADDR => self.reuseaddr = on,
+            Self::REUSEPORT => self.reuseport = on,
+            Self::DONTROUTE => self.dontroute = on,
+            Self::BROADCAST => self.broadcast = on,
+            Self::KEEPALIVE => self.keepalive = on,
+            Self::OOBINLINE => self.oobinline = on,
+            Self::NO_CHECK => self.no_check = on,
+            Self::SNDBUF => self.sndbuf = sndbuf(capped(val)),
+            Self::RCVBUF => self.rcvbuf = rcvbuf(capped(val)),
+            Self::SNDBUFFORCE | Self::RCVBUFFORCE if !admin => return Some(Err(Errno::EPERM)),
+            Self::SNDBUFFORCE => self.sndbuf = sndbuf(val.max(0)),
+            Self::RCVBUFFORCE => self.rcvbuf = rcvbuf(val.max(0)),
+            Self::PRIORITY if !(0..=6).contains(&val) && !net_admin => {
+                return Some(Err(Errno::EPERM));
+            }
+            Self::PRIORITY => self.priority = val,
+            Self::LINGER => match value.get(4..8) {
+                None => return Some(Err(Errno::EINVAL)),
+                Some(_) if !on => self.linger.0 = false,
+                Some(secs) => self.linger = (true, i32::from_le_bytes(secs.try_into().unwrap())),
+            },
+            Self::RCVLOWAT => self.rcvlowat = if val < 0 { i32::MAX } else { val.max(1) },
+            Self::BSDCOMPAT => {}
+            // Read-only
+            _ => return Some(Err(Errno::ENOPROTOOPT)),
+        }
+        Some(Ok(()))
+    }
+
+    /// getsockopt at `SOL_SOCKET`; None when `name` is not one of these options.
+    pub fn get(&self, name: i32) -> Option<Vec<u8>> {
+        let int = |v: i32| Some(v.to_le_bytes().to_vec());
+        match name {
+            Self::DEBUG => int(self.debug as i32),
+            Self::REUSEADDR => int(self.reuseaddr as i32),
+            Self::REUSEPORT => int(self.reuseport as i32),
+            Self::DONTROUTE => int(self.dontroute as i32),
+            Self::BROADCAST => int(self.broadcast as i32),
+            Self::KEEPALIVE => int(self.keepalive as i32),
+            Self::OOBINLINE => int(self.oobinline as i32),
+            Self::NO_CHECK => int(self.no_check as i32),
+            Self::SNDBUF => int(self.sndbuf),
+            Self::RCVBUF => int(self.rcvbuf),
+            Self::PRIORITY => int(self.priority),
+            Self::RCVLOWAT => int(self.rcvlowat),
+            Self::SNDLOWAT => int(1),
+            Self::BSDCOMPAT => int(0),
+            Self::LINGER => {
+                let mut b = (self.linger.0 as i32).to_le_bytes().to_vec();
+                b.extend_from_slice(&self.linger.1.to_le_bytes());
+                Some(b)
+            }
+            _ => None,
+        }
     }
 }

@@ -1878,11 +1878,11 @@ impl Vfs {
 
     /// Parameters and usage (pages, inodes) of tmpfs instance `dev`. Usage is counted as in
     /// Linux's tmpfs: the root directory and every name take one inode each (hard links too;
-    /// Linux's `shmem_link` takes another for each link), regular files by page count (treated
-    /// as having no holes, like Appine's `st_blocks`), long symlinks one page. With `fresh` it
-    /// recounts (statfs, remount: changes that bypass the accounting, such as direct changes to
-    /// the store or writes through shared mappings, are included too); otherwise it uses the
-    /// recorded usage and counts only when none is recorded.
+    /// Linux's `shmem_link` takes another for each link), regular files by the pages their
+    /// objects take on the host (holes take none, as in Linux's tmpfs), long symlinks one page.
+    /// With `fresh` it recounts (statfs, remount: changes that bypass the accounting, such as
+    /// direct changes to the store or writes through shared mappings, are included too);
+    /// otherwise it uses the recorded usage and counts only when none is recorded.
     pub(crate) fn tmpfs_usage(
         &self,
         dev: u64,
@@ -2539,11 +2539,14 @@ fn on_entry(m: &Mount, (ino, dir, name): (Ino, Ino, &[u8])) -> bool {
             .is_none_or(|(d, n)| d.ino() == Some(dir) && n == name)
 }
 
-/// Pages one inode takes in tmpfs: regular files by size, symlinks one page when the target is
-/// 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`; short ones live in the inode), others none.
+/// Pages one inode takes in tmpfs: regular files by the storage their object takes (holes take
+/// none), symlinks one page when the target is 128 bytes or more (Linux's `SHORT_SYMLINK_LEN`;
+/// short ones live in the inode), others none.
 pub(crate) fn tmpfs_pages(st: &Stat) -> u64 {
     match st.kind() {
-        mode::S_IFREG => st.size.div_ceil(TMPFS_PAGE),
+        mode::S_IFREG => st.blocks.map_or(st.size.div_ceil(TMPFS_PAGE), |b| {
+            b.div_ceil(TMPFS_PAGE / 512)
+        }),
         mode::S_IFLNK => u64::from(st.size >= 128),
         _ => 0,
     }
@@ -3320,11 +3323,12 @@ mod tests {
         };
         // Only the root directory
         assert_eq!(usage(true), (0, 1));
-        // A directory, a two-page file and another link to it, and a long symlink: one inode per
-        // name, and pages counted once per file
+        // A directory, a file of two written pages and another link to it, and a long symlink:
+        // one inode per name, and pages counted once per file as its object takes them (holes
+        // would take none)
         let sub = vfs.store().mkdir(root, b"sub", 0o755, 0, 0).unwrap();
         let (f, file) = vfs.store().create_file(sub, b"f", 0o644, 0, 0).unwrap();
-        file.set_len(5000).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&file, &[1; 5000], 0).unwrap();
         vfs.store().link(root, b"g", f).unwrap();
         vfs.store().symlink(root, b"s", &[b'x'; 200], 0, 0).unwrap();
         assert_eq!(

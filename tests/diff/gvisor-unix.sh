@@ -4,12 +4,10 @@
 # and abstract names, blocking or not), and bind, listen, accept and connect with both kinds of
 # name. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a reason
 # recorded in a map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/unix: buffer sizes are fixed (SO_SNDBUF and SO_RCVBUF are accepted and ignored)
-SKIP="AllUnixDomainSockets/StreamUnixSocketPairTest.SetSocketSendBuf/*"
-SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.SendBufferOverflow/*"
+# kernel/unix: buffer sizes are only recorded (a send buffer does not limit what is queued)
+SKIP="AllUnixDomainSockets/StreamUnixSocketPairTest.SendBufferOverflow/*"
 SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/*"
-# kernel/unix: SO_LINGER and the other generic SOL_SOCKET options do not exist; no ECONNRESET
-SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/*"
+# kernel/unix: no ECONNRESET
 SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/*"
 # kernel/unix: connections carry no sender address; abstract names ignore the socket type
 # (variants 4 to 7 are the abstract ones)
