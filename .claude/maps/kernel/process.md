@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces last)
 
 ## Responsibilities
 
@@ -401,6 +401,11 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   back by `sched_getattr`); the deadline flags are accepted unused. Without `CAP_SYS_NICE`,
   leaving `SCHED_IDLE` needs the `RLIMIT_NICE` that allows the current nice value, and
   reset-on-fork cannot be cleared (`EPERM`, for sched_setscheduler too).
+- Changing another user's thread: setpriority and sched_setaffinity need the same effective user
+  ID or `CAP_SYS_NICE` over the target's user namespace (`set_one_prio`, `sched_setaffinity`), so
+  root of a container may change its processes'; sched_setscheduler and sched_setattr need the same
+  owner or `CAP_SYS_NICE` in the initial namespace (`__sched_setscheduler`), as does raising
+  priority beyond `RLIMIT_NICE` (`can_nice`).
 - Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` returns at once.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
@@ -503,11 +508,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   open for writing succeeds where Linux returns `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **The same-owner checks count `CAP_SYS_NICE` only in the initial user namespace:**
-  sched_setaffinity, sched_setscheduler/sched_setattr and setpriority let a caller act on a thread
-  of another user only with `CAP_SYS_NICE` in the initial namespace, where Linux's
-  `check_same_owner` and `set_one_prio` accept it over the target's user namespace; root in a
-  rootless container gets `EPERM` (crun setting the CPU set of `podman run --userns keep-id`).
 - **No PI futexes:** `FUTEX_LOCK_PI`, `LOCK_PI2`, `UNLOCK_PI`, `TRYLOCK_PI` and the requeue-PI
   pair are `ENOSYS`, so glibc's and musl's `PTHREAD_PRIO_INHERIT` mutexes fail to initialize
   (`ENOTSUP`).

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; names; test-suite findings; fd access; cgroup ids, migration rights; write opens; fd link modes, block sizes, affinity, bpf rights last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line last)
 
 ## Responsibilities
 
@@ -88,7 +88,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   other writable files 0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`,
   `fdinfo/`, `ns/` are 0555,
   `environ` 0444, `comm` and `projid_map` read-only); cgroup files use their own table modes,
-  `NetSysctl` files theirs, devpts nodes the terminal's mode and `ptmxmode`. Stat reports
+  `NetSysctl` files theirs, devpts nodes the terminal's mode and `ptmxmode`; `net.*` sysctls belong
+  to root of the user namespace owning the network namespace when it maps one
+  (`net_ctl_set_ownership`). Stat reports
   `st_blksize` 1024 for procfs and devpts nodes (their superblocks' block size), 4096 elsewhere. Owners: per-process
   entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the process's
   euid/egid, or the root of its credentials' user namespace when not dumpable; the entries inside
@@ -106,7 +108,12 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `EACCES`), as Linux's `proc_fd_permission` and `proc_fd_access_allowed` do; writing `setgroups`
   needs `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts
   nodes on nodev mounts `EACCES`, then the cgroup device filter; write modes on ro mounts
-  `EROFS`; namespace files are immutable (any write mode or `O_TRUNC` is `EPERM`, before DAC). A
+  `EROFS`; namespace files are immutable (any write mode or `O_TRUNC` is `EPERM`, before DAC);
+  `/proc/sys` decides as `proc_sys_permission`/`test_perm` do, not by DAC: the owner bits for euid
+  0, the group bits for a member of group 0, the others' otherwise, capabilities aside, and a
+  `net.*` entry gives its owner bits to anyone with `CAP_NET_ADMIN` over the owner of the reader's
+  network namespace (`net_ctl_permissions`, so root of a container writes its namespace's);
+  `user/max_*` keep their own rule (`CAP_SYS_RESOURCE` in the user namespace). A
   node that is not writable still opens for writing when DAC passes (root) if it is a procfs file
   outside `/proc/sys`, and each write then fails: `EIO` for the files of proc entries (global files
   such as `cpuinfo` and `kmsg`, `/proc/sysvipc/*`, the single-record `netstat`, `snmp`,
@@ -183,7 +190,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `cpuinfo`: one block per guest CPU with the guest-visible hwcaps and MIDR, BogoMIPS 100.
   `stat`: guest threads' CPU time (plus exited threads') with idle derived from uptime, split
   evenly over CPUs; `procs_running` counts threads in guest code (at least 1); `intr`, `ctxt`,
-  `softirq`, `procs_blocked` are 0; `processes` counts every new task, threads included (Linux's `total_forks`). `uptime`
+  `softirq` (the total and Linux's 10 types), `procs_blocked` are 0; `processes` counts every new task, threads included (Linux's `total_forks`). `uptime`
   includes the reader's
   boottime offset. `loadavg` comes from the guest's own load average. `filesystems` is a fixed
   list; `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
@@ -204,7 +211,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `CAP_SYS_RAWIO`).
 - Several writable sysctls are recorded without effect (`kernel.panic`, every
   `NetSysctl` entry, `ping_group_range`, `somaxconn`, `ip_local_port_range`; of the port sysctls
-  only `ip_unprivileged_port_start` is used, by bind); `kernel/pid_max` accepts writes and ignores
+  only `ip_unprivileged_port_start` is used, by bind); `ping_group_range` keeps kernel group IDs,
+  shown in the reader's user namespace (65534 when unmapped) and written from the writer's (an
+  unmapped one is `EINVAL`); `kernel/pid_max` accepts writes and ignores
   them. The `RECORDED` table adds 40 more with Linux 6.1's modes, defaults and accepted ranges
   (`overflowuid`/`gid`, `vm.dirty_*`, `drop_caches`, `swappiness`, `overcommit_ratio`,
   `page-cluster`, `watermark_scale_factor`, `mmap_rnd_*bits`, `kernel.sysrq`,
@@ -374,10 +383,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   signalled; libmount monitors, systemd and containerd's OOM watching rely on them.
 - **`frozen 1` never appears while a vfork parent waits:** the waiting parent never counts as frozen,
   so runtimes that wait for `cgroup.events` to report frozen (runc pause) can wait until thaw.
-- **Namespace root cannot write its network sysctls:** root of a child user namespace that owns a
-  network namespace cannot write that namespace's `net.*` sysctls (Linux 6.1 grants it per
-  namespace); rootless container runtimes setting sysctls fail with `EACCES` (slirp4netns's
-  `accept_dad`, `podman unshare unshare -n` writing `net.*`).
 - **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
   the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
   looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another
@@ -396,11 +401,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   first process (lowest tid) holding the socket in its fd table, where Linux shows the creator's
   (`sock_i_uid`); sockets passed on, or whose creator closed its copy, show another uid, and
   sockets only in `SCM_RIGHTS` messages show 0.
-- **`/proc/sys` permissions follow ordinary DAC:** a non-root writer with `CAP_DAC_OVERRIDE` can
-  open every writable sysctl (`core_pattern`, `hostname`, `pid_max`, `net.*`), whereas Linux 6.1
-  decides by euid 0 / egid 0 alone and ignores capabilities; and a non-root process with
-  `CAP_NET_ADMIN` cannot write `net.*` sysctls (Linux gives it root's access), so network daemons
-  that drop root but keep `CAP_NET_ADMIN` get `EACCES`.
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.

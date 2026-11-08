@@ -78,9 +78,10 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
     for (t, g) in targets(cx, which, who)? {
         let g = g.borrow();
         let current = t.as_ref().map_or(0, |t| t.nice.get());
-        // Another's process needs the same effective user ID; raising priority (lowering nice)
-        // must be within the target's RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice)
-        if !same_owner(&cred, &g.cred) {
+        // Another's process needs the same effective user ID or CAP_SYS_NICE over its user
+        // namespace (set_one_prio); raising priority (lowering nice) must be within the target's
+        // RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice, in the initial namespace)
+        if !owner_or_nice_over(&cred, &g.cred) {
             result = Err(Errno::EPERM);
         } else if nice < current
             && (20 - nice) as u64 > g.rlimits[RLIMIT_NICE as usize].0
@@ -663,7 +664,7 @@ pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
         .read(crate::uaccess::UserSlice::new(mask, n), &mut b[..n])?;
     let task = affinity_target(cx, pid)?;
     let new = u64::from_le_bytes(b) & online_cpus();
-    if !same_owner(&cx.cred(), &cred_of(cx, task.as_ref())) {
+    if !owner_or_nice_over(&cx.cred(), &cred_of(cx, task.as_ref())) {
         return Err(Errno::EPERM);
     }
     if new == 0 {
@@ -822,9 +823,18 @@ fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
 }
 
 /// Whether the scheduling parameters of a process with credentials `target` may be changed
-/// (`check_same_owner`).
+/// (`__sched_setscheduler`: `check_same_owner`, or `CAP_SYS_NICE` in the initial namespace).
 fn same_owner(cred: &Cred, target: &Cred) -> bool {
     cred.euid == target.euid || cred.euid == target.ruid || cred.capable(cap::SYS_NICE)
+}
+
+/// Whether the nice value or CPU affinity of a process with credentials `target` may be changed
+/// (`set_one_prio`, `sched_setaffinity`): the same owner, or `CAP_SYS_NICE` over the target's user
+/// namespace, so root of a container may change its own processes'.
+fn owner_or_nice_over(cred: &Cred, target: &Cred) -> bool {
+    cred.euid == target.euid
+        || cred.euid == target.ruid
+        || cred.ns_capable(&target.user_ns, cap::SYS_NICE)
 }
 
 /// The mask for the host's CPU count (at most 64).

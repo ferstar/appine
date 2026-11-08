@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access last)
 
 ## Responsibilities
 
@@ -247,8 +247,8 @@ procfs.
 - The name expands `core_pattern` (`%%`, `%p`, `%P`, `%i`, `%I`, `%u`, `%g`, `%s`, `%t`, `%h`, `%e`,
   `%E`, `%c`, `%d` the dumpable mode, 1); `core_uses_pid` appends `.pid` when the pattern has no pid. The file is
   created relative to the cwd (any old file unlinked first) with `O_CREAT|O_EXCL|O_NOFOLLOW`, mode
-  0600. `core_pattern` itself (at most 127 bytes) is a root-owned 0644 file guarded only by the
-  normal open-time permission check. `dumpable` is a flag (`PR_SET_DUMPABLE` 0 or 1; no
+  0600. `core_pattern` itself (at most 127 bytes) is a root-owned 0644 sysctl, writable by euid 0
+  only (`kernel/procfs`'s `/proc/sys` rule). `dumpable` is a flag (`PR_SET_DUMPABLE` 0 or 1; no
   `suid_dumpable`).
 - Format: arm64 Linux ELF core — `PT_NOTE` with per-thread `NT_PRSTATUS`, `NT_PRFPREG`,
   `NT_ARM_TLS`, `NT_ARM_HW_BREAK`, `NT_ARM_HW_WATCH`, `NT_ARM_SYSTEM_CALL`, plus `NT_PRPSINFO`,
@@ -346,8 +346,7 @@ procfs.
   ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
   where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
   gdb or strace sees a duplicate stop.
-- **Minor divergences:** `core_pattern` access follows file DAC with `CAP_DAC_OVERRIDE` instead of
-  Linux's euid-only sysctl rule; `settimeofday` skips argument validation and `clock_settime`
+- **Minor divergences:** `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits
   Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full;
   `process_vm_readv`/`writev` with a non-empty local vector but no remote bytes look up the pid and

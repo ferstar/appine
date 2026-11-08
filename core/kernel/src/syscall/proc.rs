@@ -790,7 +790,7 @@ fn exec(
     let fcaps = if nosuid {
         None
     } else {
-        file_caps(&vfs, st.ino)?
+        file_caps(&vfs, st.ino, &cred)?
     };
     let ptraced = {
         let t = cx.task.trace.borrow();
@@ -996,15 +996,16 @@ fn parse_shebang(file: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
     Some((interp.to_vec(), (!rest.is_empty()).then(|| rest.to_vec())))
 }
 
-/// The program file's capabilities (`security.capability`); None when absent, and execve fails
-/// (EINVAL) when malformed.
-fn file_caps(vfs: &Vfs, ino: Ino) -> Result<Option<FileCaps>, Errno> {
+/// The program file's capabilities (`security.capability`) for `cred`; None when absent or
+/// belonging to a root that does not own `cred`'s namespace, and execve fails (EINVAL) when
+/// malformed.
+fn file_caps(vfs: &Vfs, ino: Ino, cred: &Cred) -> Result<Option<FileCaps>, Errno> {
     let store = vfs.store();
     if !store.has_file_caps(ino)? {
         return Ok(None);
     }
     match store.get_xattr(ino, XATTR_NAME_CAPS) {
-        Ok(v) => FileCaps::parse(&v),
+        Ok(v) => FileCaps::parse(&v, cred),
         Err(Errno::ENODATA) => Ok(None),
         Err(e) => Err(e),
     }

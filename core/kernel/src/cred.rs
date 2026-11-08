@@ -721,6 +721,19 @@ impl Cred {
         }
     }
 
+    /// Whether kernel user ID `root` is the root of our user namespace or of one of its ancestors
+    /// (Linux's `rootid_owns_currentns`): file capabilities with that root apply to us.
+    pub fn root_owns(&self, root: u32) -> bool {
+        let mut ns = Some(&self.user_ns);
+        while let Some(n) = ns {
+            if n.uid_map.borrow().up(root) == Some(0) {
+                return true;
+            }
+            ns = n.parent.as_ref();
+        }
+        false
+    }
+
     /// Whether there is capability `c` over a file whose owner and group are `st`'s (Linux's
     /// `capable_wrt_inode_uidgid`): it is held in our own namespace, and the owner and group are
     /// both mapped in it.
@@ -773,22 +786,25 @@ pub(crate) struct FileCaps {
 }
 
 impl FileCaps {
-    /// Parses the extended attribute of the program being execve'd as Linux's
+    /// Parses the extended attribute of the program being execve'd by `cred` as Linux's
     /// `get_vfs_caps_from_disk` does: a length or version mismatch is EINVAL (execve fails), and
-    /// a v3 rootid other than 0 (belonging to another user namespace) gives no capabilities. Bits
-    /// beyond [`CAP_FULL`] are dropped.
-    pub fn parse(v: &[u8]) -> Result<Option<FileCaps>, Errno> {
+    /// capabilities whose root (kernel uid 0 for v1 and v2, the rootid for v3) does not own the
+    /// caller's user namespace ([`Cred::root_owns`]) give none. Bits beyond [`CAP_FULL`] are
+    /// dropped.
+    pub fn parse(v: &[u8], cred: &Cred) -> Result<Option<FileCaps>, Errno> {
         if v.len() < 4 {
             return Err(Errno::EINVAL);
         }
         let magic = le32(v, 0);
-        let words = match (magic & VFS_CAP_REVISION_MASK, v.len()) {
-            (VFS_CAP_REVISION_1, XATTR_CAPS_SZ_1) => 1,
-            (VFS_CAP_REVISION_2, XATTR_CAPS_SZ_2) => 2,
-            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) if le32(v, 20) == 0 => 2,
-            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) => return Ok(None),
+        let (words, root) = match (magic & VFS_CAP_REVISION_MASK, v.len()) {
+            (VFS_CAP_REVISION_1, XATTR_CAPS_SZ_1) => (1, 0),
+            (VFS_CAP_REVISION_2, XATTR_CAPS_SZ_2) => (2, 0),
+            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) => (2, le32(v, 20)),
             _ => return Err(Errno::EINVAL),
         };
+        if !cred.root_owns(root) {
+            return Ok(None);
+        }
         let mut caps = FileCaps {
             effective: magic & VFS_CAP_FLAGS_EFFECTIVE != 0,
             ..FileCaps::default()
@@ -810,26 +826,61 @@ impl FileCaps {
             || v.len() == XATTR_CAPS_SZ_3 && revision(VFS_CAP_REVISION_3)
     }
 
-    /// The value getxattr reads (`cap_inode_getsecurity`): a v3 with rootid 0 is returned as v2,
-    /// v2 and v3 with other rootids are returned as is, and a stored value that is neither v2 nor
-    /// v3 (a zero-length value can be written without checks) is EINVAL.
-    pub fn xattr_for_reader(v: &[u8]) -> Result<Vec<u8>, Errno> {
+    /// The value setxattr stores for a valid `v` ([`FileCaps::valid_xattr`]) written by `cred`
+    /// (Linux's `cap_convert_nscap`, after its `CAP_SETFCAP` check): a v2 written by a holder of
+    /// `CAP_SETFCAP` in the initial namespace (the store's) is kept; anything else becomes a v3
+    /// whose rootid is the kernel ID of the root the value names in the writer's namespace (uid 0
+    /// for v2, its rootid for v3), so the capabilities apply only in namespaces that root owns.
+    /// EINVAL when that root is not mapped.
+    pub fn xattr_to_store(v: &[u8], cred: &Cred) -> Result<Vec<u8>, Errno> {
+        if v.len() == XATTR_CAPS_SZ_2 && cred.capable(cap::SETFCAP) {
+            return Ok(v.to_vec());
+        }
+        let root = if v.len() == XATTR_CAPS_SZ_3 {
+            le32(v, 20)
+        } else {
+            0
+        };
+        let root = cred.uid_in(root).ok_or(Errno::EINVAL)?;
+        Ok(Self::v3(v, root))
+    }
+
+    /// The value getxattr reads (`cap_inode_getsecurity`) for `cred`: when the capabilities' root
+    /// (uid 0 for v2, the rootid for v3) is mapped in the reader's namespace to an ID other than 0,
+    /// a v3 with that rootid; otherwise, when that root owns the reader's namespace, a v2; else
+    /// EOVERFLOW. A stored value that is neither v2 nor v3 (a zero-length value can be written
+    /// without checks) is EINVAL.
+    pub fn xattr_for_reader(v: &[u8], cred: &Cred) -> Result<Vec<u8>, Errno> {
         let revision = if v.len() >= 4 {
             le32(v, 0) & VFS_CAP_REVISION_MASK
         } else {
             0
         };
-        match (revision, v.len()) {
-            (VFS_CAP_REVISION_2, XATTR_CAPS_SZ_2) => Ok(v.to_vec()),
-            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) if le32(v, 20) == 0 => {
-                let magic = VFS_CAP_REVISION_2 | le32(v, 0) & VFS_CAP_FLAGS_EFFECTIVE;
-                let mut out = magic.to_le_bytes().to_vec();
-                out.extend_from_slice(&v[4..XATTR_CAPS_SZ_2]);
-                Ok(out)
-            }
-            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) => Ok(v.to_vec()),
-            _ => Err(Errno::EINVAL),
+        let root = match (revision, v.len()) {
+            (VFS_CAP_REVISION_2, XATTR_CAPS_SZ_2) => 0,
+            (VFS_CAP_REVISION_3, XATTR_CAPS_SZ_3) => le32(v, 20),
+            _ => return Err(Errno::EINVAL),
+        };
+        match cred.user_ns.uid_map.borrow().up(root) {
+            Some(mapped) if mapped != 0 => return Ok(Self::v3(v, mapped)),
+            _ => {}
         }
+        if !cred.root_owns(root) {
+            return Err(Errno::EOVERFLOW);
+        }
+        let magic = VFS_CAP_REVISION_2 | le32(v, 0) & VFS_CAP_FLAGS_EFFECTIVE;
+        let mut out = magic.to_le_bytes().to_vec();
+        out.extend_from_slice(&v[4..XATTR_CAPS_SZ_2]);
+        Ok(out)
+    }
+
+    /// `v` (v2 or v3) as a v3 with rootid `root`, keeping the effective flag and the sets.
+    fn v3(v: &[u8], root: u32) -> Vec<u8> {
+        let magic = VFS_CAP_REVISION_3 | le32(v, 0) & VFS_CAP_FLAGS_EFFECTIVE;
+        let mut out = magic.to_le_bytes().to_vec();
+        out.extend_from_slice(&v[4..XATTR_CAPS_SZ_2]);
+        out.extend_from_slice(&root.to_le_bytes());
+        out
     }
 }
 
@@ -1341,25 +1392,30 @@ mod tests {
                 .flat_map(|w| w.to_le_bytes())
                 .collect()
         };
-        let parsed = FileCaps::parse(&v2(0x0200_0001, 1 << 13, 0))
+        let root = Cred::root();
+        let parsed = FileCaps::parse(&v2(0x0200_0001, 1 << 13, 0), &root)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.permitted, NET_RAW | 1 << 32);
         assert!(parsed.effective);
-        // v1 has only the low 32 bits; a wrong length or version is EINVAL; a v3 rootid other
-        // than 0 gives no capabilities
+        // v1 has only the low 32 bits; a wrong length or version is EINVAL; a v3 whose rootid is
+        // not the root of the caller's namespace (or an ancestor's) gives no capabilities
         let v1: Vec<u8> = [0x0100_0000u32, 1, 0]
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        assert_eq!(FileCaps::parse(&v1).unwrap().unwrap().permitted, 1);
-        assert_eq!(FileCaps::parse(&v1[..8]), Err(Errno::EINVAL));
-        assert_eq!(FileCaps::parse(&v2(0x0400_0000, 0, 0)), Err(Errno::EINVAL));
+        assert_eq!(FileCaps::parse(&v1, &root).unwrap().unwrap().permitted, 1);
+        assert_eq!(FileCaps::parse(&v1[..8], &root), Err(Errno::EINVAL));
+        assert_eq!(
+            FileCaps::parse(&v2(0x0400_0000, 0, 0), &root),
+            Err(Errno::EINVAL)
+        );
         let mut v3 = v2(0x0300_0001, 1, 0);
         v3.extend_from_slice(&1000u32.to_le_bytes());
-        assert_eq!(FileCaps::parse(&v3), Ok(None));
+        assert_eq!(FileCaps::parse(&v3, &root), Ok(None));
         assert!(FileCaps::valid_xattr(&v3) && !FileCaps::valid_xattr(&v1));
-        assert_eq!(FileCaps::xattr_for_reader(&v3).unwrap(), v3);
+        // Read from the initial namespace, rootid 1000 is mapped there to itself: v3 as stored
+        assert_eq!(FileCaps::xattr_for_reader(&v3, &root).unwrap(), v3);
         // A v3 with rootid 0 reads back as v2
         v3[20..].copy_from_slice(&0u32.to_le_bytes());
         let one = FileCaps {
@@ -1367,12 +1423,17 @@ mod tests {
             inheritable: 0,
             effective: true,
         };
-        assert_eq!(FileCaps::parse(&v3), Ok(Some(one)));
+        assert_eq!(FileCaps::parse(&v3, &root), Ok(Some(one)));
         assert_eq!(
-            FileCaps::xattr_for_reader(&v3).unwrap(),
+            FileCaps::xattr_for_reader(&v3, &root).unwrap(),
             v2(0x0200_0001, 1, 0)
         );
-        assert_eq!(FileCaps::xattr_for_reader(&[]), Err(Errno::EINVAL));
+        assert_eq!(FileCaps::xattr_for_reader(&[], &root), Err(Errno::EINVAL));
+        // Written by root of the initial namespace, a v2 stays v2
+        assert_eq!(
+            FileCaps::xattr_to_store(&v2(0x0200_0001, 1, 0), &root).unwrap(),
+            v2(0x0200_0001, 1, 0)
+        );
     }
 
     #[test]

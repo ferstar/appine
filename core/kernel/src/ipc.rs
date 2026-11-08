@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-use crate::cred::{Cred, cap};
+use crate::cred::{Cred, UserNs, cap};
 use crate::errno::Errno;
 use crate::kernel::{Kernel, Tid, request_wake};
 use crate::mm::SharedMemory;
@@ -150,8 +150,9 @@ pub(crate) struct Perm {
 
 impl Perm {
     /// `ipcperms`: `flag` is the permission required (`S_IRUGO`, `S_IWUGO`, or the permission bits
-    /// of msgget and the like).
-    pub fn check(&self, cred: &Cred, flag: u32) -> Result<(), Errno> {
+    /// of msgget and the like); `owner` is the user namespace owning the IPC namespace, over which
+    /// `CAP_IPC_OWNER` counts.
+    pub fn check(&self, cred: &Cred, owner: &UserNs, flag: u32) -> Result<(), Errno> {
         let want = (flag >> 6 | flag >> 3 | flag) & 7;
         let granted = if cred.euid == self.cuid || cred.euid == self.uid {
             self.mode >> 6
@@ -160,15 +161,17 @@ impl Perm {
         } else {
             self.mode
         };
-        if want & !granted & 7 != 0 && !cred.capable(cap::IPC_OWNER) {
+        if want & !granted & 7 != 0 && !cred.ns_capable(owner, cap::IPC_OWNER) {
             return Err(Errno::EACCES);
         }
         Ok(())
     }
 
-    /// IPC_SET, IPC_RMID: the creator, the owner, or a holder of `CAP_SYS_ADMIN`.
-    pub fn may_change(&self, cred: &Cred) -> Result<(), Errno> {
-        if cred.euid == self.cuid || cred.euid == self.uid || cred.capable(cap::SYS_ADMIN) {
+    /// IPC_SET, IPC_RMID: the creator, the owner, or a holder of `CAP_SYS_ADMIN` over `owner`, the
+    /// user namespace owning the IPC namespace (`ipcctl_obtain_check`).
+    pub fn may_change(&self, cred: &Cred, owner: &UserNs) -> Result<(), Errno> {
+        if cred.euid == self.cuid || cred.euid == self.uid || cred.ns_capable(owner, cap::SYS_ADMIN)
+        {
             Ok(())
         } else {
             Err(Errno::EPERM)
@@ -226,7 +229,7 @@ impl<T> Table<T> {
         &mut self,
         key: i32,
         flags: i32,
-        cred: &Cred,
+        (cred, owner): (&Cred, &UserNs),
         max: u64,
         existing: impl FnOnce(&T) -> Result<(), Errno>,
         create: impl FnOnce() -> Result<T, Errno>,
@@ -238,7 +241,7 @@ impl<T> Table<T> {
                 }
                 let (perm, obj) = self.get(id)?;
                 existing(obj)?;
-                perm.check(cred, flags as u32 & 0o777)?;
+                perm.check(cred, owner, flags as u32 & 0o777)?;
                 return Ok(id);
             }
             if flags & IPC_CREAT == 0 {
@@ -709,34 +712,42 @@ mod tests {
     #[test]
     fn ids_are_reused_with_a_new_sequence() {
         let root = Cred::root();
+        let ns = root.user_ns.clone();
         let mut t: Table<()> = Table::default();
         let a = t
-            .get_or_create(IPC_PRIVATE, 0o600, &root, 4, |_| Ok(()), || Ok(()))
+            .get_or_create(IPC_PRIVATE, 0o600, (&root, &ns), 4, |_| Ok(()), || Ok(()))
             .unwrap();
         assert_eq!(
-            t.get_or_create(7, 0o600, &root, 4, |_| Ok(()), || Ok(())),
+            t.get_or_create(7, 0o600, (&root, &ns), 4, |_| Ok(()), || Ok(())),
             Err(Errno::ENOENT)
         );
         let b = t
-            .get_or_create(7, IPC_CREAT | 0o640, &root, 4, |_| Ok(()), || Ok(()))
+            .get_or_create(7, IPC_CREAT | 0o640, (&root, &ns), 4, |_| Ok(()), || Ok(()))
             .unwrap();
         assert_eq!(
-            t.get_or_create(7, IPC_CREAT | IPC_EXCL, &root, 4, |_| Ok(()), || Ok(())),
+            t.get_or_create(
+                7,
+                IPC_CREAT | IPC_EXCL,
+                (&root, &ns),
+                4,
+                |_| Ok(()),
+                || Ok(())
+            ),
             Err(Errno::EEXIST)
         );
         assert_eq!(
-            t.get_or_create(7, 0, &root, 4, |_| Ok(()), || Ok(())),
+            t.get_or_create(7, 0, (&root, &ns), 4, |_| Ok(()), || Ok(())),
             Ok(b)
         );
         // Another user: no read permission
         assert_eq!(
-            t.get_or_create(7, 0o400, &user(1000), 4, |_| Ok(()), || Ok(())),
+            t.get_or_create(7, 0o400, (&user(1000), &ns), 4, |_| Ok(()), || Ok(())),
             Err(Errno::EACCES)
         );
         t.remove(a);
         assert_eq!(t.get(a).err(), Some(Errno::EINVAL));
         let c = t
-            .get_or_create(IPC_PRIVATE, 0o600, &root, 4, |_| Ok(()), || Ok(()))
+            .get_or_create(IPC_PRIVATE, 0o600, (&root, &ns), 4, |_| Ok(()), || Ok(()))
             .unwrap();
         assert_ne!(c, a);
         assert_eq!(c % IPCMNI, a % IPCMNI);
@@ -764,7 +775,14 @@ mod tests {
         let root = Cred::root();
         let id = ipc
             .sem
-            .get_or_create(IPC_PRIVATE, 0o600, &root, 4, |_| Ok(()), || SemSet::new(2))
+            .get_or_create(
+                IPC_PRIVATE,
+                0o600,
+                (&root, &root.user_ns),
+                4,
+                |_| Ok(()),
+                || SemSet::new(2),
+            )
             .unwrap();
         let mut undo = Vec::new();
         let set = &mut ipc.sem.get_mut(id).unwrap().1;

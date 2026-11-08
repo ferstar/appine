@@ -638,10 +638,11 @@ t = time.clock_gettime(time.CLOCK_MONOTONIC)
 print("clock after", t > 0, ctypes.string_at(start, 4))
 PY
 
-# procfs: processes in /proc/stat counting threads; Cpus_allowed_list following the affinity;
-# the modes of /proc/<pid>/fd links; procfs and devpts block sizes; loading a device program
-# needing CAP_NET_ADMIN or CAP_SYS_ADMIN besides CAP_BPF. Credentials: PRIO_USER's user ID in the
-# caller's user namespace; seccomp notifications reporting the pid as the agent's namespace sees it
+# procfs: the fields of each /proc/stat line (softirq has the total and 10 types) and processes
+# counting threads; Cpus_allowed_list following the affinity; the modes of /proc/<pid>/fd links;
+# procfs and devpts block sizes; loading a device program needing CAP_NET_ADMIN or CAP_SYS_ADMIN
+# besides CAP_BPF. Credentials: PRIO_USER's user ID in the caller's user namespace; seccomp
+# notifications reporting the pid as the agent's namespace sees it
 python3 - <<'PY'
 import array, ctypes, errno, os, socket, struct, sys, threading
 libc = ctypes.CDLL(None, use_errno=True)
@@ -661,6 +662,13 @@ if pid == 0:
     os._exit(0)
 os.waitpid(pid, 0)
 print("forks counted", forks() - before)
+# intr has a count for every interrupt number, which differ
+fields = {}
+for l in open("/proc/stat"):
+    w = l.split()
+    if w[0] != "intr":
+        fields.setdefault("cpuN" if w[0][3:].isdigit() else w[0], set()).add(len(w))
+print("stat fields", sorted((k, sorted(v)) for k, v in fields.items()))
 
 def allowed(path="/proc/self/status"):
     return [l.split()[1] for l in open(path) if l.startswith("Cpus_allowed_list")][0]

@@ -16,5 +16,9 @@ step info; docker info --format '{{.Driver}} {{.CgroupDriver}} {{.CgroupVersion}
 docker image inspect alpine:3.24 >/dev/null 2>&1 || docker pull -q alpine:3.24 >/dev/null
 step run; docker run --rm --network host alpine:3.24 sh -c 'echo hello; cat /etc/alpine-release'
 echo "exit=$?"
+# BuildKit reads /proc/stat (prometheus/procfs) while building
+step build; mkdir -p /tmp/ctx && printf 'FROM alpine:3.24\nRUN echo built >/built\nCMD cat /built\n' >/tmp/ctx/Dockerfile
+docker build -q --network host -t ddemo /tmp/ctx >/dev/null && docker run --rm --network host ddemo
+echo "exit=$?"; docker rmi -f ddemo >/dev/null; rm -rf /tmp/ctx
 step dockerd errors; grep -E 'level=(error|fatal)' /tmp/dockerd.log | sed 's/^time="[^"]*" //; s/ id=[0-9a-f]*//' | cut -c1-300 | sort -u | head -10
 kill $(pidof dockerd); sleep 3

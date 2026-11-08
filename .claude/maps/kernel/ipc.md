@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments; mqueue timeouts; sysctl bounds, fallible allocations; restarted mqueue waits; registrations ended by close; shm reaping, capped mqueue defaults last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments; mqueue timeouts; sysctl bounds, fallible allocations; restarted mqueue waits; registrations ended by close; shm reaping, capped mqueue defaults; SysV capabilities over the namespace owner last)
 
 ## Responsibilities
 
@@ -105,9 +105,10 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   `EINVAL`. A waiting loop that has slept once turns a failed lookup into `EIDRM`.
 - `Perm::check` is `ipcperms` (owner, group through fsgid and supplementary groups, other;
   `CAP_IPC_OWNER` bypasses it). `may_change` (IPC_SET, IPC_RMID) needs the owner, the creator or
-  `CAP_SYS_ADMIN`. These and the other SysV capability checks (`CAP_SYS_RESOURCE` for raising
-  `qbytes`, `CAP_IPC_LOCK` for SHM_LOCK) use `Cred::capable`, which counts only capabilities held in
-  the initial user namespace; `IpcNs.owner` is used only by the mqueue mount.
+  `CAP_SYS_ADMIN`. These and `CAP_IPC_LOCK` for SHM_LOCK count over `IpcNs.owner`, the user
+  namespace owning the IPC namespace (Linux's `ns_capable(ns->user_ns, …)`), so root of a
+  container's user namespace has them over its own IPC namespace; raising `qbytes` above `msgmnb`
+  needs `CAP_SYS_RESOURCE` in the initial namespace.
 - The `*ctl` calls strip `IPC_64` from cmd. `IPC_STAT` and the `*_STAT`/`*_STAT_ANY` forms encode
   the 64-bit layouts with ids mapped into the caller's user namespace and pids into its pid
   namespace; the `*_STAT` forms take an index and return the full id, and `*_STAT_ANY` skips the
@@ -266,11 +267,6 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 
 ## Confirmed bugs / technical debt
 
-- **SysV capabilities ignore user namespaces:** `CAP_IPC_OWNER`, `CAP_SYS_ADMIN` (IPC_SET,
-  IPC_RMID) and `CAP_IPC_LOCK` count only in the initial user namespace, so root in a container's
-  user namespace cannot bypass permissions on, change or remove other users' objects in its own IPC
-  namespace (Linux checks them over the user namespace owning the IPC namespace; root of a rootless
-  podman container with `--cap-add SYS_ADMIN,IPC_OWNER` cannot ipcrm another user's queue).
 - **unshare and setns drop sibling threads' undo:** undo records are per process, so one thread's
   `unshare(CLONE_SYSVSEM|CLONE_NEWIPC)` or IPC setns applies and discards the `SEM_UNDO`
   adjustments of every thread in the process (Linux applies a shared undo list only when its last

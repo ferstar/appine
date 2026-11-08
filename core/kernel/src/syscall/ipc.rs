@@ -10,7 +10,7 @@
 use appine_engine::{PAGE_SIZE, prot};
 
 use super::{SysResult, get, put, read_timespec};
-use crate::cred::{Cred, cap};
+use crate::cred::{Cred, UserNs, cap};
 use crate::errno::Errno;
 use crate::ipc::{
     IPC_NOWAIT, Ipc, Msg, MsgQueue, Perm, SHM_DEST, SHM_LOCKED, SemOp, SemSet, ShmSeg, limits,
@@ -63,13 +63,14 @@ const WRITE: u32 = 0o222;
 
 pub(super) fn msgget(cx: &mut Cx<'_>, key: i32, flags: i32) -> SysResult {
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let ipc = &mut cx.ipc_mut();
     let t = ipc.tunables;
     ipc.msg
         .get_or_create(
             key,
             flags,
-            &cred,
+            (&cred, &owner),
             t.msgmni,
             |_| Ok(()),
             || Ok(MsgQueue::new(t.msgmnb)),
@@ -90,6 +91,7 @@ pub(super) fn msgsnd(cx: &mut Cx<'_>, id: i32, msgp: u64, size: u64, flags: i32)
     let mut text = crate::ipc::zeroed(len)?;
     cx.mm().read(UserSlice::new(msgp + 8, len), &mut text)?;
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let tgid = cx.tgid();
     let mut waited = false;
     loop {
@@ -98,7 +100,7 @@ pub(super) fn msgsnd(cx: &mut Cx<'_>, id: i32, msgp: u64, size: u64, flags: i32)
             Err(_) if waited => return Err(Errno::EIDRM),
             Err(e) => return Err(e),
         };
-        perm.check(&cred, WRITE)?;
+        perm.check(&cred, &owner, WRITE)?;
         if q.fits(len) {
             q.cbytes += len as u64;
             q.msgs.push_back(Msg { mtype, text });
@@ -135,6 +137,7 @@ pub(super) fn msgrcv(
         return Err(Errno::ENOSYS);
     }
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let tgid = cx.tgid();
     let mut waited = false;
     let msg = loop {
@@ -143,7 +146,7 @@ pub(super) fn msgrcv(
             Err(_) if waited => return Err(Errno::EIDRM),
             Err(e) => return Err(e),
         };
-        perm.check(&cred, READ)?;
+        perm.check(&cred, &owner, READ)?;
         if let Some(i) = q.select(mtype, flags & MSG_EXCEPT != 0) {
             if q.msgs[i].text.len() > max && flags & MSG_NOERROR == 0 {
                 return Err(Errno::E2BIG);
@@ -173,6 +176,7 @@ pub(super) fn msgrcv(
 pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
     let cmd = cmd & !IPC_64;
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     match cmd {
         IPC_INFO | MSG_INFO => {
             let tun = cx.ipc().tunables;
@@ -201,7 +205,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let ns = cx.pid_ns();
             let t = &cx.ipc().msg;
             let (full, (perm, q)) =
-                stat_target(t, &cred, id, cmd != IPC_STAT, cmd == MSG_STAT_ANY)?;
+                stat_target(t, (&cred, &owner), id, cmd != IPC_STAT, cmd == MSG_STAT_ANY)?;
             let b = encode_msqid(perm, &cred, q, |p| ns.vnr(p).unwrap_or(0));
             put(cx, buf, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
@@ -211,7 +215,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let qbytes = u64::from_le_bytes(b[88..96].try_into().unwrap());
             let msgmnb = cx.ipc().tunables.msgmnb;
             let (perm, q) = cx.ipc_mut().msg.get_mut(id)?;
-            perm.may_change(&cred)?;
+            perm.may_change(&cred, &owner)?;
             if qbytes > msgmnb && !cred.capable(cap::SYS_RESOURCE) {
                 return Err(Errno::EPERM);
             }
@@ -223,7 +227,7 @@ pub(super) fn msgctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
         }
         IPC_RMID => {
             let t = &mut cx.ipc_mut().msg;
-            t.get(id)?.0.may_change(&cred)?;
+            t.get(id)?.0.may_change(&cred, &owner)?;
             t.remove(id);
             Ok(0)
         }
@@ -262,12 +266,13 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
         .filter(|&n| n as u64 <= semmsl)
         .ok_or(Errno::EINVAL)?;
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     cx.ipc_mut()
         .sem
         .get_or_create(
             key,
             flags,
-            &cred,
+            (&cred, &owner),
             semmni,
             |s| {
                 if n > s.vals.len() {
@@ -290,6 +295,7 @@ pub(super) fn semget(cx: &mut Cx<'_>, key: i32, nsems: i32, flags: i32) -> SysRe
 pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> SysResult {
     let cmd = cmd & !IPC_64;
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let tgid = cx.tgid();
     match cmd {
         IPC_INFO | SEM_INFO => {
@@ -327,7 +333,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
         IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
             let t = &cx.ipc().sem;
             let (full, (perm, s)) =
-                stat_target(t, &cred, id, cmd != IPC_STAT, cmd == SEM_STAT_ANY)?;
+                stat_target(t, (&cred, &owner), id, cmd != IPC_STAT, cmd == SEM_STAT_ANY)?;
             let b = encode_semid(perm, &cred, s);
             put(cx, arg, b)?;
             Ok(if cmd == IPC_STAT { 0 } else { full as u64 })
@@ -335,21 +341,21 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
         IPC_SET => {
             let b: [u8; 88] = get(cx, arg)?;
             let (perm, s) = cx.ipc_mut().sem.get_mut(id)?;
-            perm.may_change(&cred)?;
+            perm.may_change(&cred, &owner)?;
             perm.set(&b[..48], &cred)?;
             s.ctime = now();
             Ok(0)
         }
         IPC_RMID => {
             let ipc = &mut cx.ipc_mut();
-            ipc.sem.get(id)?.0.may_change(&cred)?;
+            ipc.sem.get(id)?.0.may_change(&cred, &owner)?;
             ipc.remove_sem(id);
             Ok(0)
         }
         GETVAL | GETPID | GETNCNT | GETZCNT => {
             let ns = cx.pid_ns();
             let (perm, s) = cx.ipc().sem.get(id)?;
-            perm.check(&cred, READ)?;
+            perm.check(&cred, &owner, READ)?;
             let i = usize::try_from(num)
                 .ok()
                 .filter(|&i| i < s.vals.len())
@@ -363,7 +369,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
         }
         GETALL => {
             let (perm, s) = cx.ipc().sem.get(id)?;
-            perm.check(&cred, READ)?;
+            perm.check(&cred, &owner, READ)?;
             let b: Vec<u8> = s
                 .vals
                 .iter()
@@ -383,7 +389,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
                 .ok()
                 .filter(|&i| i < s.vals.len())
                 .ok_or(Errno::EINVAL)?;
-            perm.check(&cred, WRITE)?;
+            perm.check(&cred, &owner, WRITE)?;
             s.vals[i] = val;
             s.pids[i] = tgid;
             s.ctime = now();
@@ -394,7 +400,7 @@ pub(super) fn semctl(cx: &mut Cx<'_>, id: i32, num: i32, cmd: i32, arg: u64) -> 
         SETALL => {
             let n = {
                 let (perm, s) = cx.ipc().sem.get(id)?;
-                perm.check(&cred, WRITE)?;
+                perm.check(&cred, &owner, WRITE)?;
                 s.vals.len()
             };
             let mut b = vec![0u8; n * 2];
@@ -464,6 +470,7 @@ pub(super) fn semtimedop(
         None
     };
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let tgid = cx.tgid();
     let alter = ops.iter().any(|o| o.op != 0);
     let mut waited = false;
@@ -477,7 +484,7 @@ pub(super) fn semtimedop(
         if ops.iter().any(|o| o.num as usize >= set.vals.len()) {
             return Err(Errno::EFBIG);
         }
-        perm.check(&cred, if alter { WRITE } else { READ })?;
+        perm.check(&cred, &owner, if alter { WRITE } else { READ })?;
         let adj = undo.entry((tgid, id)).or_default();
         let blocked = set.apply(&ops, adj, tgid)?;
         if adj.iter().all(|&a| a == 0) {
@@ -520,6 +527,7 @@ pub(super) fn semtimedop(
 
 pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysResult {
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let tgid = cx.tgid();
     reap_shm(cx.k());
     let t = cx.ipc().tunables;
@@ -528,7 +536,7 @@ pub(super) fn shmget(cx: &mut Cx<'_>, key: i32, size: u64, flags: i32) -> SysRes
         .get_or_create(
             key,
             flags,
-            &cred,
+            (&cred, &owner),
             t.shmmni,
             |s| {
                 if size > s.size {
@@ -585,9 +593,10 @@ pub(super) fn shmat(cx: &mut Cx<'_>, id: i32, addr: u64, flags: i32) -> SysResul
         prot |= prot::EXEC;
     }
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     let mem = {
         let (perm, seg) = cx.ipc().shm.get(id)?;
-        perm.check(&cred, want)?;
+        perm.check(&cred, &owner, want)?;
         seg.mem.clone()
     };
     let ns = cx.task.ns.borrow().ipc.id;
@@ -627,6 +636,7 @@ pub(super) fn shmdt(cx: &mut Cx<'_>, addr: u64) -> SysResult {
 pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult {
     let cmd = cmd & !IPC_64;
     let cred = cx.cred();
+    let owner = ipc_owner(cx);
     reap_shm(cx.k());
     match cmd {
         IPC_INFO => {
@@ -660,7 +670,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
             let k = cx.kr();
             let (full, (perm, s)) = stat_target(
                 &k.ipc(ipc_ns).shm,
-                &cred,
+                (&cred, &owner),
                 id,
                 cmd != IPC_STAT,
                 cmd == SHM_STAT_ANY,
@@ -673,7 +683,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
         IPC_SET => {
             let b: [u8; 112] = get(cx, buf)?;
             let (perm, s) = cx.ipc_mut().shm.get_mut(id)?;
-            perm.may_change(&cred)?;
+            perm.may_change(&cred, &owner)?;
             perm.set(&b[..48], &cred)?;
             s.ctime = now();
             Ok(0)
@@ -681,7 +691,7 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
         IPC_RMID => {
             let ns = cx.task.ns.borrow().ipc.id;
             let k = cx.k();
-            k.ipc(ns).shm.get(id)?.0.may_change(&cred)?;
+            k.ipc(ns).shm.get(id)?.0.may_change(&cred, &owner)?;
             // While mappings remain, mark it first, the key becomes private, and free it after the
             // last mapping goes away
             let attached = nattch(k, (ns, id));
@@ -695,8 +705,8 @@ pub(super) fn shmctl(cx: &mut Cx<'_>, id: i32, cmd: i32, buf: u64) -> SysResult 
         }
         SHM_LOCK | SHM_UNLOCK => {
             let (perm, _) = cx.ipc_mut().shm.get_mut(id)?;
-            let owner = cred.euid == perm.uid || cred.euid == perm.cuid;
-            if !owner && !cred.capable(cap::IPC_LOCK) {
+            let is_owner = cred.euid == perm.uid || cred.euid == perm.cuid;
+            if !is_owner && !cred.ns_capable(&owner, cap::IPC_LOCK) {
                 return Err(Errno::EPERM);
             }
             if cmd == SHM_LOCK {
@@ -738,7 +748,7 @@ fn encode_shmid(
 /// when `any`. Returns the id.
 fn stat_target<'t, T>(
     table: &'t crate::ipc::Table<T>,
-    cred: &Cred,
+    (cred, owner): (&Cred, &UserNs),
     id: i32,
     by_index: bool,
     any: bool,
@@ -749,7 +759,7 @@ fn stat_target<'t, T>(
         (id, table.get(id)?)
     };
     if !any {
-        entry.0.check(cred, READ)?;
+        entry.0.check(cred, owner, READ)?;
     }
     Ok((id, entry))
 }
@@ -760,4 +770,11 @@ fn words(out: &mut [u8], at: usize, values: &[u64], width: usize) {
         let off = at + i * width;
         out[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
     }
+}
+
+/// The user namespace owning the caller's IPC namespace, over which the SysV capabilities count
+/// (`CAP_IPC_OWNER`, `CAP_SYS_ADMIN`, `CAP_IPC_LOCK`; Linux checks them with `ns_capable` on
+/// `ns->user_ns`).
+fn ipc_owner(cx: &Cx<'_>) -> std::rc::Rc<UserNs> {
+    cx.task.ns.borrow().ipc.owner.clone()
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; faulting I/O; timerfd clocks; test-suite findings; mounts; splice; open flags, modes, owners; remounts; holes, directory seeks, renames, utimensat events last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; faulting I/O; timerfd clocks; test-suite findings; mounts; splice; open flags, modes, owners; holes, seeks, renames, utimensat events; namespaced file caps; mount propagation last)
 
 ## Responsibilities
 
@@ -450,10 +450,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   stored raw with no ACL semantics and no permission check of its own, so anyone who can resolve
   a file can set or remove them; unprivileged `trusted.*` reads `ENODATA`, writes `EPERM` and is
   hidden from listings.
-- `security.capability`: writes accept v2/v3 (the magic is checked under a mask, so stray flag
-  bits pass) and need `CAP_SETFCAP` in the initial namespace, so root in a user namespace cannot
-  set file caps; values are stored without rootid conversion; reads turn v3 with rootid 0 into
-  v2. Synthetic nodes: get `ENODATA`, set/remove `EOPNOTSUPP`
+- `security.capability` (6.1's `cap_convert_nscap`, `cap_inode_getsecurity`): writes accept
+  v2/v3 (the magic is checked under a mask, so stray flag bits pass) and need `CAP_SETFCAP` over
+  the file (in the writer's namespace, owner and group mapped there; removal too); a v2 written
+  with `CAP_SETFCAP` in the initial namespace is stored as is, anything else as a v3 whose rootid
+  is the kernel ID of the writer's namespace root (or of the rootid it gave; `EINVAL` unmapped).
+  Reads: a root mapped to a nonzero ID in the reader's namespace gives a v3 with that rootid, a
+  root owning the reader's namespace (or an ancestor's) a v2, any other `EOVERFLOW`. Synthetic nodes: get `ENODATA`, set/remove `EOPNOTSUPP`
   (`EROFS` first on ro), empty list; pipes and sockets `EOPNOTSUPP`.
 
 ### Pipes and FIFOs
@@ -690,8 +693,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   file's group without `CAP_FSETID`; since 6.2 Linux's writes do the same as its chown.
 - **`system.*` xattrs are unprotected:** any user who can resolve a file can set or remove its
   `system.*` attributes, including POSIX ACL names, which are stored raw and never enforced (Linux
-  requires the owner or `CAP_FOWNER` and validates ACLs); root in a user namespace cannot set file
-  caps at all (`setcap` in a rootless podman build is `EPERM`).
+  requires the owner or `CAP_FOWNER` and validates ACLs).
 - **File position races:** lseek and `O_APPEND` writes change the position without the
   `pos_busy` lock, so a concurrent unlocked read or write on the same open file can overwrite the
   new position (Linux takes `f_pos_lock` in lseek too).
@@ -785,6 +787,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Anonymous pipes and sockets cannot change owner:** fchown on them always succeeds and changes
   nothing, even for an unprivileged caller that Linux refuses with `EPERM`, and fstat shows the
   caller as owner rather than the creator.
+- **mountinfo shows no propagation:** propagation types are not even recorded, so there are no
+  `shared:N`/`master:N` fields. dockerd bind-mounts its data root onto itself and makes it shared
+  when it is not on a shared mount, and unmounts it at shutdown only if mountinfo shows that mount
+  shared; under Appine the bind stays until the next boot, so removing the data root is `EBUSY`
+  (a restarted dockerd reuses it). podman warns that `/` is not a shared mount, as it does
+  natively without systemd.
 
 ## Open questions
 

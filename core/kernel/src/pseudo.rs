@@ -1692,7 +1692,16 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         _ => None,
     };
     let (atime_ns, mtime_ns, ctime_ns) = times.unwrap_or((now, now, now));
-    let (uid, gid) = owner_of(ps.k, node);
+    // net.* sysctls belong to root of the user namespace owning the network namespace, when it
+    // maps one (net_ctl_set_ownership)
+    let (uid, gid) = if is_net_sysctl(node) {
+        let owner = ps.ns().net.owner.clone();
+        let uid = owner.uid_map.borrow().down(0).unwrap_or(0);
+        let gid = owner.gid_map.borrow().down(0).unwrap_or(0);
+        (uid, gid)
+    } else {
+        owner_of(ps.k, node)
+    };
     // As in Linux's proc_task_getattr, the task directory's link count adds the number of
     // threads: Chromium's sandbox uses it to tell whether it is single-threaded, and the zygote
     // checks before fork that it is at least 3, crashing otherwise
@@ -1739,6 +1748,25 @@ pub(crate) fn fs_of(node: &PseudoNode) -> Fs {
         PseudoNode::NsFile(..) => Fs::Nsfs,
         PseudoNode::MqRoot(_) | PseudoNode::Mq(..) => Fs::Mqueue,
         _ => Fs::Proc,
+    }
+}
+
+/// For a node under `/proc/sys`, whether it is a `net.*` one of the reader's network namespace;
+/// `None` for the rest of procfs. Opening one follows `proc_sys_permission`'s rules.
+pub(crate) fn sysctl_kind(node: &PseudoNode) -> Option<bool> {
+    match node {
+        PseudoNode::Static(p) if p.starts_with(b"sys/") => Some(is_net_sysctl(node)),
+        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => Some(true),
+        _ => None,
+    }
+}
+
+/// A `net.*` sysctl (or directory) of the reader's network namespace.
+fn is_net_sysctl(node: &PseudoNode) -> bool {
+    match node {
+        PseudoNode::Static(p) => p.starts_with(b"sys/net/"),
+        PseudoNode::NetSysctl(_) | PseudoNode::NetConf(..) => true,
+        _ => false,
     }
 }
 
@@ -2245,8 +2273,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 format!("{}\n", ps.ns().net.devs.borrow().conf.prot_sock)
             }
             b"sys/net/ipv4/ping_group_range" => {
+                // Kernel IDs, shown in the reader's namespace (65534 when unmapped)
                 let (lo, hi) = ps.ns().net.devs.borrow().conf.ping_group;
-                format!("{lo}\t{hi}\n")
+                let r = ps.reader();
+                format!("{}\t{}\n", r.gid_out(lo as u32), r.gid_out(hi as u32))
             }
             b"sys/kernel/core_pattern" => {
                 format!("{}\n", String::from_utf8_lossy(&ps.k.core_pattern))
@@ -3491,10 +3521,13 @@ fn global_stat(ps: &View<'_>) -> String {
         .unwrap();
     }
     writeln!(s, "intr 0\nctxt 0\nbtime {btime}\nprocesses {}", ps.k.forks).unwrap();
+    // softirq is the total and then one count for each of Linux's 10 softirq types (show_stat);
+    // parsers such as prometheus/procfs, which BuildKit reads it with, refuse fewer
     writeln!(
         s,
-        "procs_running {}\nprocs_blocked 0\nsoftirq 0",
-        running.max(1)
+        "procs_running {}\nprocs_blocked 0\nsoftirq 0{}",
+        running.max(1),
+        " 0".repeat(10)
     )
     .unwrap();
     s
@@ -3975,7 +4008,7 @@ pub(crate) fn write(
             return Ok(());
         }
         PseudoNode::Static(b"sys/net/ipv4/ping_group_range") => {
-            let r = crate::netconf::parse_ping_group(data)?;
+            let r = crate::netconf::parse_ping_group(data, cred)?;
             ns.net.devs.borrow_mut().conf.ping_group = r;
             return Ok(());
         }

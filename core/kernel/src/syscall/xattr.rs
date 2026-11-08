@@ -55,15 +55,19 @@ pub(super) fn setxattr(
     let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
-    // Program file capabilities: only v2 and v3 are accepted, and CAP_SETFCAP is needed
-    // (cap_convert_nscap, before the other checks; Linux does not check when the length is 0)
+    // Program file capabilities: only v2 and v3 are accepted, CAP_SETFCAP is needed over the file
+    // (in the writer's namespace, with its owner and group mapped there), and the value is stored
+    // with the root of the writer's namespace (cap_convert_nscap, before the other checks; Linux
+    // does not check when the length is 0)
     if name == XATTR_NAME_CAPS && size > 0 {
         if !FileCaps::valid_xattr(&v) {
             return Err(Errno::EINVAL);
         }
-        if !cx.cred().capable(cap::SETFCAP) {
+        let cred = cx.cred();
+        if !cred.capable_wrt(&store.attrs(ino)?, cap::SETFCAP) {
             return Err(Errno::EPERM);
         }
+        v = FileCaps::xattr_to_store(&v, &cred)?;
     }
     permission(cx, &store.attrs(ino)?, &name, true)?;
     store.set_xattr(
@@ -90,7 +94,7 @@ pub(super) fn getxattr(
     permission(cx, &vfs.store().attrs(ino)?, &name, false)?;
     let mut v = vfs.store().get_xattr(ino, &name)?;
     if name == XATTR_NAME_CAPS {
-        v = FileCaps::xattr_for_reader(&v)?;
+        v = FileCaps::xattr_for_reader(&v, &cx.cred())?;
     }
     reply(cx, value, size, &v)
 }
@@ -118,8 +122,12 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     let ino = writable_ino(cx, node_of(cx, target)?)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
-    // Removing program file capabilities needs CAP_SETFCAP (cap_inode_removexattr)
-    if name == XATTR_NAME_CAPS && !cx.cred().capable(cap::SETFCAP) {
+    // Removing program file capabilities needs CAP_SETFCAP over the file (cap_inode_removexattr)
+    if name == XATTR_NAME_CAPS
+        && !cx
+            .cred()
+            .capable_wrt(&vfs.store().attrs(ino)?, cap::SETFCAP)
+    {
         return Err(Errno::EPERM);
     }
     vfs.store().remove_xattr(ino, &name)?;

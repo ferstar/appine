@@ -1,8 +1,9 @@
 //! Network namespace sysctls (`/proc/sys/net`): the interface settings `ipv4/conf/<interface>`
 //! and `ipv6/conf/<interface>` (including `all` and `default`), plus `ipv4/ip_forward`,
 //! `ipv4/ip_local_port_range`, `ipv4/ip_unprivileged_port_start` (binding a port below it needs
-//! `CAP_NET_BIND_SERVICE`), `ipv4/ping_group_range` (only recorded: ping sockets are handed to
-//! the host, and Android allows all groups) and `core/somaxconn`.
+//! `CAP_NET_BIND_SERVICE`), `ipv4/ping_group_range` (kernel group IDs, shown and written in the
+//! caller's user namespace, but only recorded: ping sockets are handed to the host, and Android
+//! allows all groups) and `core/somaxconn`.
 //!
 //! Entries and defaults as in Linux 6.1 (`devinet_sysctl_table`, `ipv4_devconf_dflt`;
 //! `addrconf_sysctl`, `ipv6_devconf_dflt`). All values are integers (except `stable_secret`,
@@ -20,6 +21,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::cred::Cred;
 use crate::errno::Errno;
 
 /// One interface setting: name, default value (of `default` and of interfaces), value of `all`.
@@ -302,15 +304,23 @@ pub(crate) fn parse_prot_sock(data: &[u8], range_low: i64) -> Result<i64, Errno>
     Ok(v)
 }
 
-/// Writes `ipv4/ping_group_range`: two group IDs (`ipv4_ping_group_range`); when the second is
-/// less than the first, they become 1, 0, which allows nobody.
-pub(crate) fn parse_ping_group(data: &[u8]) -> Result<(i64, i64), Errno> {
+/// Writes `ipv4/ping_group_range`: two group IDs of `cred`'s user namespace, stored as kernel
+/// IDs (`ipv4_ping_group_range`); one not mapped there is EINVAL, and when the second is less
+/// than the first, they become 1, 0, which allows nobody.
+pub(crate) fn parse_ping_group(data: &[u8], cred: &Cred) -> Result<(i64, i64), Errno> {
     let (lo, hi) = parse_pair(data)?;
     let gid = 0..=i64::from(u32::MAX - 1);
     if !gid.contains(&lo) || !gid.contains(&hi) {
         return Err(Errno::EINVAL);
     }
-    Ok(if hi < lo { (1, 0) } else { (lo, hi) })
+    let (Some(klo), Some(khi)) = (cred.gid_in(lo as u32), cred.gid_in(hi as u32)) else {
+        return Err(Errno::EINVAL);
+    };
+    Ok(if hi < lo || khi < klo {
+        (1, 0)
+    } else {
+        (klo.into(), khi.into())
+    })
 }
 
 /// Parses a written integer as `proc_dointvec` does: leading whitespace and a sign are allowed,
@@ -687,8 +697,12 @@ mod tests {
         assert_eq!(parse_port_range(b"2000 1001", 0), Err(Errno::EINVAL));
         assert_eq!(parse_prot_sock(b"0", 32768), Ok(0));
         assert_eq!(parse_prot_sock(b"40000", 32768), Err(Errno::EINVAL));
-        assert_eq!(parse_ping_group(b"0 2147483647"), Ok((0, 2_147_483_647)));
-        assert_eq!(parse_ping_group(b"5 2"), Ok((1, 0)));
+        let root = Cred::root();
+        assert_eq!(
+            parse_ping_group(b"0 2147483647", &root),
+            Ok((0, 2_147_483_647))
+        );
+        assert_eq!(parse_ping_group(b"5 2", &root), Ok((1, 0)));
         assert_eq!(show_secret(None), Err(Errno::EIO));
     }
 

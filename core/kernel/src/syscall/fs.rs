@@ -630,6 +630,31 @@ fn open_pseudo(
         if mask & MAY_WRITE != 0 && !cred.capable_here(cap::SYS_RESOURCE) {
             return Err(Errno::EACCES);
         }
+    } else if let Some(net) = pseudo::sysctl_kind(&node) {
+        // The rest of /proc/sys (proc_sys_permission, sysctl_perm, test_perm): the mode's owner
+        // bits for euid 0, its group bits for a member of group 0, the others' otherwise, whatever
+        // the capabilities; a net.* sysctl gives its owner bits to anyone with CAP_NET_ADMIN over
+        // the network namespace's owner (net_ctl_permissions), so root of a container's user
+        // namespace may write its own namespace's
+        let st = pseudo::stat(&cx.view(vfs), &node)?;
+        let mut m = st.mode & 0o777;
+        if net {
+            let owner = cx.task.ns.borrow().net.owner.clone();
+            if cred.ns_capable(&owner, cap::NET_ADMIN) {
+                let o = m >> 6;
+                m = o << 6 | o << 3 | o;
+            }
+        }
+        let bits = if cred.euid == 0 {
+            m >> 6
+        } else if cred.egid == 0 || cred.groups.binary_search(&0).is_ok() {
+            m >> 3
+        } else {
+            m
+        } & 7;
+        if mask & 7 & !bits != 0 {
+            return Err(Errno::EACCES);
+        }
     } else if !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_)) {
         cred.permission(&pseudo::stat(&cx.view(vfs), &node)?, mask)?;
     }

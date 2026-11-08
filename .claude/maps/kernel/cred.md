@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials; seccomp notification and TSYNC pids last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities last)
 
 ## Responsibilities
 
@@ -101,7 +101,8 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - Inputs: the final interpreter's stat; setuid/setgid apply only with the mode bit, no
   no_new_privs, a mount without nosuid, owner and group mapped in the caller's namespace (setgid
   also needs group exec); file caps are read unless the mount is nosuid (parse errors fail exec with
-  `EINVAL`); "traced" means a tracer whose credentials when tracing began (Linux's
+  `EINVAL`) and apply only when their root (kernel uid 0 for v1/v2, the rootid for v3) is the root
+  of the caller's user namespace or an ancestor's (`rootid_owns_currentns`); "traced" means a tracer whose credentials when tracing began (Linux's
   `ptracer_cred`) lack `CAP_SYS_PTRACE` over the caller's user namespace (`ptracer_capable`).
 - `Cred::exec` (Linux 6.1 `bprm_fill_uid` + `cap_bprm_creds_from_file`): euid/egid from the file;
   permitted = (bounding ∩ file permitted) | (inheritable ∩ file inheritable), `EPERM` when the file's
@@ -235,8 +236,6 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 - Are per-thread-group credentials a permanent simplification even for raw per-thread id
   syscalls (threaded file servers using `setfsuid`, Go's `AllThreadsSyscall`)?
-- Should v3 file capabilities whose rootid maps to 0 in the current namespace apply, now that user
-  namespaces exist?
 
 ## To verify
 
