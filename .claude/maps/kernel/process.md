@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; the vDSO in time namespaces last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; the vDSO in time namespaces; scripts' ETXTBSY last)
 
 ## Responsibilities
 
@@ -208,7 +208,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   nosuid is noted.
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
   relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`).
-- `ETXTBSY` if a writable open file refers to the final executable.
+- `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
+  interpreter is opened) or to the final executable.
 - Credentials: setuid/setgid apply unless `no_new_privs`, nosuid, or the owner/group are unmapped;
   file capabilities come from the xattr. A secure exec clamps the stack limit to 8 MB (written back
   to `RLIMIT_STACK`).

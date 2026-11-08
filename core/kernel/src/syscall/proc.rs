@@ -734,6 +734,11 @@ fn exec(
         (None, None) => process::open_node(&vfs, &cred, &node)?,
     };
     let script = parse_shebang(file.head()).is_some();
+    // A file open for writing cannot be executed, a script included (do_open_execat's
+    // deny_write_access, before its interpreter is looked at)
+    if script && super::fs::open_for_write(cx, st.ino) {
+        return Err(Errno::ETXTBSY);
+    }
 
     // `#!` scripts: switch to the interpreter, and argv becomes [interpreter, argument, script
     // path, original argv[1..]]

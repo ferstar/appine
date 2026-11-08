@@ -1,7 +1,8 @@
 # docker-run-options: --privileged
 # The sequel to compat6.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): process_mrelease, /proc/<pid>/oom_score, /proc/swaps, /proc/locks, and ss
-# reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries
+# reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries, and ETXTBSY for running a
+# `#!` script that is open for writing
 set -e
 cd /tmp
 # Linux's swap_show header, then the host's swap areas, which a container sees too
@@ -231,3 +232,19 @@ for args, col in [(["-tlnH"], 3), (["-xlH"], 4)]:
     print("ss", *args, mine, "stderr", repr(p.stderr), "exit", p.returncode)
 os.unlink("/tmp/ss.sock")
 PY
+
+# A script open for writing cannot be run (do_open_execat's deny_write_access on the script itself,
+# before its interpreter is looked at)
+printf '#!/bin/sh\necho ran\n' > /tmp/etxt.sh
+chmod 755 /tmp/etxt.sh
+python3 - <<'PY'
+import os
+fd = os.open("/tmp/etxt.sh", os.O_WRONLY)
+try:
+    os.execv("/tmp/etxt.sh", ["etxt.sh"])
+except OSError as e:
+    print("script open for writing:", e.strerror)
+os.close(fd)
+PY
+/tmp/etxt.sh
+rm /tmp/etxt.sh
