@@ -2255,7 +2255,7 @@ fn checked_offset(offset: i64) -> Result<Option<u64>, Errno> {
 /// file position unchanged (Linux's generic_write_checks, the BUGS section of pwrite(2)); only
 /// pwritev2's `RWF_NOAPPEND` writes at the given offset. Such writes are done with the BKL held
 /// ([`write_bytes`]), so they never write at the same place as other appends.
-fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
+pub(super) fn append_offset(file: &FileRef, offset: Option<u64>) -> Result<Option<u64>, Errno> {
     let f = file.borrow();
     match &f.kind {
         FileKind::Regular { file, .. } if offset.is_some() && f.flags & oflags::O_APPEND != 0 => {
@@ -3291,7 +3291,7 @@ pub(super) fn write_file(
 /// generic_write_sync). Data, length and times are all in the host object, so the host flushes
 /// them, waited for with the BKL released; names are not among them, and on Linux the directory
 /// also needs a separate fsync.
-fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
+pub(super) fn write_sync(cx: &mut Cx<'_>, file: &FileRef, rwf: u32) -> Result<(), Errno> {
     use oflags::{O_DSYNC, O_SYNC_BIT};
     const RWF_DSYNC: u32 = 2;
     const RWF_SYNC: u32 = 4;
@@ -4302,6 +4302,9 @@ pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
+    if !has_fsync(&file.borrow()) {
+        return Err(Errno::EINVAL);
+    }
     // A loop device flushes by syncing its backing file, which may be another loop device
     loop {
         let next = match &file.borrow().kind {
@@ -4318,11 +4321,11 @@ pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
     let host = {
         let f = file.borrow();
         match &f.kind {
-            // Only regular files and directories can be synced (host fds are left to the host)
+            // A regular file syncs its host object; a directory has only the store's metadata
+            // (host fds are left to the host)
             FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
-            FileKind::Directory { .. } => None,
             FileKind::Host(_) => return Ok(0),
-            _ => return Err(Errno::EINVAL),
+            _ => None,
         }
     };
     // The open file is kept alive by file and not touched while the BKL is released
@@ -4331,6 +4334,19 @@ pub(super) fn fsync(cx: &mut Cx<'_>, fd: i32, data_only: bool) -> SysResult {
             .map_err(Errno)?;
     }
     durable(cx, false)
+}
+
+/// Whether a file can be synced, which on Linux is having an fsync operation: regular files,
+/// directories, loop devices and host fds (left to the host). For anything else fsync is EINVAL
+/// (vfs_fsync_range), and so is submitting an AIO fsync of it (aio_fsync).
+pub(super) fn has_fsync(f: &OpenFile) -> bool {
+    matches!(
+        f.kind,
+        FileKind::Regular { .. }
+            | FileKind::Directory { .. }
+            | FileKind::Host(_)
+            | FileKind::Device { block: Some(_), .. }
+    )
 }
 
 /// sync(2): commits the deferred write transaction and writes the whole host filesystem holding

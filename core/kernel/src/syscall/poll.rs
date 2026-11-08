@@ -962,6 +962,41 @@ impl Waits {
     }
 }
 
+/// AIO's io_getevents: waits as ppoll would on `polls` (the files of the context's pending
+/// `IOCB_CMD_POLL`s, each with the events it waits for), so that host sockets and timerfds are
+/// watched too, and on `context`, which is woken when an event is queued or the context is
+/// destroyed; until then, `deadline` or a signal.
+pub(super) fn wait_aio_polls(
+    cx: &mut Cx<'_>,
+    polls: &[(FileRef, i16)],
+    context: wake::Object,
+    deadline: Option<Instant>,
+) -> Result<(), Errno> {
+    let mut waits = Waits::default();
+    for (file, events) in polls {
+        waits.add(&file.borrow(), *events, 0);
+    }
+    waits.objects.push(context);
+    waits.wait(cx, deadline)
+}
+
+/// The timer thread watching a pending AIO poll for its eventfd: adds the host fds of `f` to
+/// poll for `events` and its timerfd expiration. Changes to in-process objects need nothing more:
+/// the timer thread listens on every channel while such polls exist.
+pub(super) fn watch_aio_poll(
+    f: &OpenFile,
+    events: i16,
+    host: &mut Vec<(i32, i16, i16)>,
+    timer: &mut Option<Instant>,
+) {
+    let mut waits = Waits::default();
+    waits.add(f, events, 0);
+    host.append(&mut waits.host);
+    if let Some(t) = waits.timer {
+        *timer = Some(timer.map_or(t, |e| e.min(t)));
+    }
+}
+
 /// The current edge of `EPOLLEXCLUSIVE` interest `int` (of the epoll at address `owner`) has
 /// already been reported by another epoll: Linux wakes only one exclusive waiter per wakeup, and
 /// those whose turn it is not do not report. An edge-triggered interest also does not report

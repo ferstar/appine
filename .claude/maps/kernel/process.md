@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces; AIO in the timer thread last)
 
 ## Responsibilities
 
@@ -296,8 +296,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   signalled after unlocking, so woken threads do not immediately sleep on the BKL.
 - Objects: waiters register what they wait on (pipes, PTYs, eventfd, timerfd, inotify, signalfd,
   epoll, socket queues, message queues, seccomp notifications, kernel log); poll/select/epoll
-  register each watched file's objects. SysV IPC, AIO, SIGCONT of a stopped group, a host terminal
-  closing and machine teardown still wake everyone.
+  register each watched file's objects, and AIO's io_getevents its context and its pending polls'
+  files. SysV IPC, SIGCONT of a stopped group, a host terminal closing and machine teardown still
+  wake everyone.
 - Signals: waking a task kicks its CPU (so running guest code exits) and signals its event (so a
   sleeper wakes); a signal blocked everywhere only requests `SIGNAL`.
 - `/proc/<pid>/stat` shows S while a thread waits and R once its event is signalled, before it
@@ -347,9 +348,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   jump, run `clock_jumped` (bump the jump count, signal every task's event: BKL waiters, futex
   waiters and no-BKL sleepers alike look at their deadlines again); expire interval timers, POSIX
   timers and CPU-time limits; run the OOM check, the translator code-view release, load-average sampling, deferred
-  store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks, DNS stub answers (`kernel/net`) and raw
-  ICMP taps; then wait (BKL released) until the earliest deadline or its event. It listens on
-  `OTHER` (or all channels while `O_ASYNC` files or exclusive gates exist).
+  store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks, AIO polls that signal eventfds
+  (`kernel/vfs`), DNS stub answers (`kernel/net`) and raw ICMP taps; then wait (BKL released) until
+  the earliest deadline (timerfds of those AIO polls included) or its event. It listens on `OTHER`
+  (or all channels while `O_ASYNC` files, exclusive gates or such AIO polls exist).
 - Setting a timer writes the deadline into the thread group and signals the timer thread's event.
   POSIX timers on wall clocks keep an `Expiry`, so absolute realtime and boottime timers fire by
   their own clock; the watch's fd is in the timer thread's poll.

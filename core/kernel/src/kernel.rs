@@ -274,6 +274,9 @@ pub(crate) struct Kernel {
     pub ex_gates: Vec<crate::syscall::ExGate>,
     /// Open files with `O_ASYNC` set (the fasync of `syscall::poll`).
     pub fasync: Vec<crate::syscall::Fasync>,
+    /// AIO contexts with a pending poll that signals an eventfd, completed by the timer thread
+    /// (`syscall::aio`).
+    pub aio_polls: Vec<Weak<RefCell<crate::syscall::AioContext>>>,
     /// The ICMP taps of the network namespaces ([`crate::rawicmp`]), watched by the timer thread.
     pub icmp_taps: Vec<std::rc::Weak<crate::cell::RefCell<crate::rawicmp::Tap>>>,
     /// DNS stub queries being resolved by host threads: the socket each answer goes to
@@ -399,6 +402,7 @@ impl Kernel {
             edge_waiters: Vec::new(),
             ex_gates: Vec::new(),
             fasync: Vec::new(),
+            aio_polls: Vec::new(),
             icmp_taps: Vec::new(),
             dns_queries: HashMap::new(),
             dns_last: 0,

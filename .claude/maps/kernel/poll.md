@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness; anonymous fd bits last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness; anonymous fd bits; AIO waits last)
 
 ## Responsibilities
 
@@ -49,7 +49,8 @@ signal delivery (`kernel/signal`).
 - Syscalls: `ppoll` (73), `pselect6` (72), `epoll_create1` (20), `epoll_ctl` (21), `epoll_pwait`
   (22), `epoll_pwait2` (441), `eventfd2` (19); eventfd read/write through `IoPath::EventFd`.
 - Shared helpers: `readiness`, `poll_once`, `poll_now`, `arrivals`, `wake_objects`, `host_fd`,
-  `set_temp_mask`/`restore_mask`, `deadline_ms`/`deadline_ts` (also used by AIO).
+  `set_temp_mask`/`restore_mask`, `deadline_ms`/`deadline_ts` (also used by AIO); for AIO's
+  pending polls, `wait_aio_polls` (io_getevents) and `watch_aio_poll` (the timer thread).
 - Hooks: `drained` (from the dispatcher after read-like and write-like syscalls), `arrived` (pipe
   writes to a non-empty pipe), `register_fasync` (fcntl/ioctl), `check_exclusive` and
   `check_fasync` (timer thread), `send_to_owner`, `Epoll::fdinfo`, `Epoll::target` (kcmp).
@@ -79,6 +80,9 @@ signal delivery (`kernel/signal`).
   fd; the timeout is the earliest of the deadline and any timerfd deadline; pidfd and signalfd
   waits also listen on the CHILD and SIGNAL channels. Spurious wakeups just rescan. The BKL is held
   for every scan.
+- AIO uses the same `Waits`: io_getevents waits on its pending polls' files plus the context's wake
+  object (`wait_aio_polls`), and the timer thread takes each eventfd-signalling poll's host fds and
+  timerfd expiration (`watch_aio_poll`), relying on its all-channel interest for the rest.
 
 ### ppoll and pselect6
 
@@ -164,9 +168,9 @@ signal delivery (`kernel/signal`).
 
 ### Inbound
 
-- The syscall dispatcher (also the drain hook after I/O syscalls); AIO (`poll_once`, masks, resfd
-  eventfds); the timer thread (`check_exclusive`, `check_fasync`); fcntl/ioctl (`register_fasync`);
-  pipe writes (`arrived`); fdinfo and kcmp.
+- The syscall dispatcher (also the drain hook after I/O syscalls); AIO (`poll_once`,
+  `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
+  `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); fdinfo and kcmp.
 
 ### Outbound
 

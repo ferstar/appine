@@ -30,7 +30,7 @@ mod tty;
 mod unix;
 mod xattr;
 
-pub(crate) use aio::{AioContext, released as aio_released};
+pub(crate) use aio::{AioContext, check_polls as check_aio_polls, released as aio_released};
 pub(crate) use fs::ENTROPY;
 pub(crate) use fs::{create_exclusive, unlink_path, write_at};
 pub(crate) use inotify::{Inotify, Opened, Registry, host_change};

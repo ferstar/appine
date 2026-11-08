@@ -801,7 +801,8 @@ impl Drop for Machine {
 
 /// The timer thread: waits until the earliest deadline and sends the signals of due interval
 /// timers, POSIX timers and CPU-time limits ([`crate::itimer::expire`]); checks signal-driven
-/// I/O, `EPOLLEXCLUSIVE` gates and raw ICMP taps; while guest threads are running, periodically
+/// I/O, `EPOLLEXCLUSIVE` gates, AIO polls that signal eventfds and raw ICMP taps; while guest
+/// threads are running, periodically
 /// checks the memory limit, unmaps the pages the code cache wrote through its writable views
 /// ([`crate::oom`]) and samples the load average ([`crate::loadavg`]); commits the inode store's
 /// deferred write transactions when due; until the Machine shuts down.
@@ -875,6 +876,22 @@ fn timers(shared: Arc<Shared>) {
                 }
             }
         }
+        // AIO polls that signal an eventfd: completed once ready, as Linux does from the file's
+        // wake-up, since the program may wait on the eventfd rather than in io_getevents
+        match crate::bug::catch(|| crate::syscall::check_aio_polls(&mut k)) {
+            Some((fds, due)) => {
+                host.extend(fds);
+                if let Some(due) = due {
+                    next = Some(next.map_or(due, |n| n.min(due)));
+                }
+            }
+            None => {
+                crate::bug::report(format_args!(
+                    "kernel panic in AIO polls; their eventfds are signalled only by io_getevents"
+                ));
+                k.aio_polls.clear();
+            }
+        }
         // DNS stub answers resolved by host threads: queue them on their sockets
         if crate::bug::catch(|| crate::syscall::deliver_dns(&mut k, &shared.dns_answers)).is_none()
         {
@@ -891,8 +908,8 @@ fn timers(shared: Arc<Shared>) {
             host.push((w.fd(), 1, 0));
         }
         // Setting a timer is not a change on an open file; every change needs watching only while
-        // signal-driven I/O or exclusive gates exist
-        let interest = if k.fasync.is_empty() && k.ex_gates.is_empty() {
+        // signal-driven I/O, exclusive gates or AIO polls with eventfds exist
+        let interest = if k.fasync.is_empty() && k.ex_gates.is_empty() && k.aio_polls.is_empty() {
             wake::OTHER
         } else {
             wake::ALL
