@@ -9,13 +9,6 @@
 SKIP="ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
 # kernel/process: PI operations are ENOSYS
 SKIP="$SKIP:FutexTest.LockPi*"
-# kernel/process: sched_setattr accepts SCHED_RESET_ON_FORK inside sched_policy, validates the
-# clamps without the current values, changes the policy under SCHED_FLAG_KEEP_PARAMS and answers
-# EACCES instead of EPERM beyond RLIMIT_NICE
-SKIP="$SKIP:SchedSetattrGetattrTest.StructSizesAndBoundsValidation"
-SKIP="$SKIP:SchedSetattrGetattrTest.UtilClampAndUint32MaxReset"
-SKIP="$SKIP:SchedSetattrGetattrTest.KeepPolicyAndKeepParams"
-SKIP="$SKIP:SchedSetattrGetattrTest.NonRootNiceRLimitAndPermissions"
 # kernel/vfs: splice into a file stops quietly at RLIMIT_FSIZE
 SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileTruncatedByFSize"
 SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileWithExplicitOffset"

@@ -88,6 +88,12 @@ proxy() {
     printf -- '--env no_proxy=127.0.0.1,localhost'
 }
 
+# A store whose creation did not finish (the import or apk add failed, or the run was stopped) is
+# marked by $store.partial and made again
+if [ -e "$store.partial" ]; then
+    echo "removing the unfinished $store"
+    rm -rf "$store"
+fi
 if [ ! -d "$store" ]; then
     tarball=$(ls target/rootfs/alpine-minirootfs-*-aarch64.tar.gz 2>/dev/null | sort -V | tail -n 1)
     [ -n "$tarball" ] || {
@@ -95,10 +101,12 @@ if [ ! -d "$store" ]; then
         exit 1
     }
     echo "creating $store"
+    touch "$store.partial"
     "$run" --rootfs "$store" --import "$tarball" >/dev/null
     # shellcheck disable=SC2046
     "$run" --tier 1 --rootfs "$store" --env PATH=/usr/sbin:/usr/bin:/sbin:/bin $(proxy) \
         -- /bin/sh -c "apk add -q $(echo $packages)"
+    rm -f "$store.partial"
 fi
 
 mkdir -p "$out"

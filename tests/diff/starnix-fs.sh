@@ -7,11 +7,10 @@
 # are skipped, with the reason above them.
 # kernel/vfs: AIO contexts belong to the thread group, not the address space
 SKIP="AioWriteTest.WriteCompletesAfterSubmittingProcessExits"
-# kernel/vfs: F_SETFL takes O_NOATIME with no ownership check; getdents64 copies all or nothing;
-# no inode flags (FS_IOC_SETFLAGS is ENOTTY); no O_TMPFILE, and open(2) does not validate it
-SKIP="$SKIP:FcntlTest.NoatimePermission:FsTest.GetdentsLazyAndUnmappedBuffer"
+# kernel/vfs: F_SETFL takes O_NOATIME with no ownership check; no inode flags (FS_IOC_SETFLAGS is
+# ENOTTY)
+SKIP="$SKIP:FcntlTest.NoatimePermission"
 SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
-SKIP="$SKIP:OtmpfileTest.TmpFileFailWithRdOnlyAccessMode:OtmpfileTest.TmpFileWithOCreatShouldFail"
 # kernel/procfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
 # kernel/vfs: propagation is not emulated, and propagation changes on mounts outside the caller's

@@ -57,6 +57,7 @@ pub(crate) mod cap {
     pub const SETFCAP: u32 = 31;
     pub const MAC_OVERRIDE: u32 = 32;
     pub const SYSLOG: u32 = 34;
+    pub const WAKE_ALARM: u32 = 35;
     pub const BPF: u32 = 39;
     pub const CHECKPOINT_RESTORE: u32 = 40;
     /// The highest capability number.

@@ -6,8 +6,6 @@
 # recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/tty: TIOCSPGRP error codes; kernel/procfs fidelity gaps: the devpts root is 0555
 SKIP="JobControlTest.SetForegroundProcessGroupEmptyProcessGroup:SetModeTest.SetMode/*"
-# kernel/vfs: truncate on synthetic files is EACCES
-SKIP="$SKIP:PtyTrunc.Truncate"
 # kernel/vfs D6: mount propagation is not emulated; kernel/vfs: mounts copied into a less
 # privileged namespace are not locked
 SKIP="$SKIP:PivotRootTest.OnSharedNewRoot:PivotRootTest.OnSharedNewRootParent"
@@ -16,21 +14,17 @@ SKIP="$SKIP:PivotRootTest.OnSharedPutOldMountpoint:PivotRootTest.LockedNewRootFa
 # IN_EXCL_UNLINK filters the wrong events; executing a file reports no inotify events
 SKIP="$SKIP:Inotify.Utimensat:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
 SKIP="$SKIP:Inotify.ExcludeUnlink*:Inotify.Exec"
-# kernel/vfs: F_GETFL never shows O_DIRECT; O_PATH descriptors pass fcntl, flock and getdents64;
-# open with O_PATH keeps other status flags; locks on inode-less files (pipes) are no-ops
-SKIP="$SKIP:FcntlTest.GetAllFlags:FcntlTest.SetFileStatusFlagWithOpath:FcntlTest.BadFcntlsWithOpath"
-SKIP="$SKIP:GetdentsTest/0.OpathFile:GetdentsTest/0.OpathDirectory:FcntlTest.GetOpathFlag"
+# kernel/vfs: F_GETFL never shows O_DIRECT; open with O_PATH keeps other status flags; locks on
+# inode-less files (pipes) are no-ops
+SKIP="$SKIP:FcntlTest.GetAllFlags:FcntlTest.GetOpathFlag"
 SKIP="$SKIP:FlockTestNoFixture.FlockSymlink:FlockTestNoFixture.FlockPipe"
-# kernel/vfs: O_TRUNC with O_RDONLY is only half a write; O_DIRECT is never refused at open; access
-# mode 3 opens read-write; renameat2 ignores RENAME_NOREPLACE for . and ..; rename in synthetic
-# filesystems is EACCES first
+# kernel/vfs: O_TRUNC with O_RDONLY is only half a write; access mode 3 opens read-write;
+# renameat2 ignores RENAME_NOREPLACE for . and ..; rename in synthetic filesystems is EACCES first
 SKIP="$SKIP:OpenTest.OTrunc:OpenTest.OTruncAndReadOnlyDir:OpenTest.CanTruncateReadOnly"
-SKIP="$SKIP:OpenTest.DirectoryDirectFails:OpenTest.OpenWithStrangeFlags:Renameat2Test.NoReplaceDot"
+SKIP="$SKIP:OpenTest.OpenWithStrangeFlags:Renameat2Test.NoReplaceDot"
 SKIP="$SKIP:RenameTest.SysfsFileToSelf:RenameTest.SysfsDirectoryToSelf"
 SKIP="$SKIP:RenameTest.SysfsPathEndingWithDots"
-# kernel/vfs: getdents64 copies all or nothing and accepts counts above INT_MAX; SEEK_END on
-# directories is EINVAL
-SKIP="$SKIP:GetdentsTest/0.PartialBuffer:GetdentsTest/0.TooLargeSize"
+# kernel/vfs: SEEK_END on directories is EINVAL
 SKIP="$SKIP:GetdentsTest/0.Issue128ProcSeekEnd"
 # kernel/vfs: scoped openat2 never returns EAGAIN (the rename variants loop for minutes)
 SKIP="$SKIP:Openat2Test.BeneathRaceWithMount:Openat2Test.InRootRaceWithMount"

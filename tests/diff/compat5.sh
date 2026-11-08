@@ -5,7 +5,8 @@
 # process's open file; procfs content regenerated through the opener's credentials; futexes on
 # replaced memory, private and shared operations, and shared memory after fork; message-queue
 # registrations ended by closing a descriptor; CLONE_INTO_CGROUP permissions; onlink routes;
-# nftables limit and quota
+# nftables limit and quota; O_DIRECT, getdents64, copy_file_range, datagram shutdowns, KCMP_IO,
+# sigaction flags and raw rebinds
 set -e
 cd /tmp
 # Root may open read-only procfs files for writing (only the write fails: EIO for the files of proc
@@ -588,3 +589,117 @@ iptables --wait -A OUTPUT -p udp --dport 9004 -m limit --limit 2/second --limit-
 iptables --wait -A OUTPUT -p udp --dport 9004 -j DROP
 for p in 9001 9002 9003 9004 9005; do ./ratesend $p; done
 '
+# Small checks: O_DIRECT opens (store files only; not directories, devices or procfs);
+# getdents64 on a removed directory and with a count above INT_MAX; copy_file_range's order of
+# checks and across filesystems; datagram sends to a socket shut down for reading (EPIPE, no
+# SIGPIPE) and after SHUT_WR, and POLLHUP after both; kcmp's KCMP_IO; sigaction clearing unknown
+# flags; a raw socket bound twice to one address
+cat > smallchecks.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static const char *res(long r) {
+    return r < 0 ? strerror(errno) : "ok";
+}
+
+static void direct(const char *path, int flags) {
+    int fd = open(path, flags | O_DIRECT, 0600);
+    printf("O_DIRECT %s: %s\n", path, res(fd));
+    if (fd >= 0) close(fd);
+}
+
+static void sigpipe(int s) {
+    (void)s;
+    printf("SIGPIPE\n");
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    // tmpfs takes O_DIRECT from 6.6 on, where 6.1 refuses it: not compared
+    direct("/tmp/direct", O_RDWR | O_CREAT);
+    direct("/tmp", O_RDONLY);
+    direct("/tmp", O_WRONLY);
+    direct("/dev/null", O_RDONLY);
+    direct("/proc/self/status", O_RDONLY);
+    unlink("/tmp/direct");
+
+    mkdir("/tmp/gone", 0755);
+    int dir = open("/tmp/gone", O_RDONLY | O_DIRECTORY);
+    rmdir("/tmp/gone");
+    char buf[4096];
+    printf("getdents64 of a removed directory: %s\n",
+           res(syscall(SYS_getdents64, dir, buf, sizeof buf)));
+    close(dir);
+    dir = open("/tmp", O_RDONLY | O_DIRECTORY);
+    printf("getdents64 with a count above INT_MAX: %s\n",
+           res(syscall(SYS_getdents64, dir, buf, 0x80000000UL)));
+
+    int in = open("/tmp/cfr-in", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    write(in, "0123456789abcdef", 16);
+    int out = open("/tmp/cfr-out", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int shm = open("/dev/shm/cfr", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int pipes[2];
+    pipe(pipes);
+    loff_t a = 0, b = 0;
+    printf("copy_file_range to a directory: %s\n", res(copy_file_range(in, &a, dir, &b, 4, 0)));
+    printf("copy_file_range to a pipe's read end: %s\n",
+           res(copy_file_range(in, &a, pipes[0], NULL, 4, 0)));
+    b = 4;
+    printf("copy_file_range overlapping itself: %s\n", res(copy_file_range(in, &a, in, &b, 8, 0)));
+    b = 16;
+    printf("copy_file_range past its end onto itself: %ld\n",
+           (long)copy_file_range(in, &a, in, &b, 8, 0));
+    a = 0;
+    printf("copy_file_range to tmpfs: %s\n", res(copy_file_range(in, &a, shm, NULL, 4, 0)));
+    a = 0, b = 0x7fffffffffffffffLL;
+    printf("copy_file_range at the largest offset: %s\n",
+           res(copy_file_range(in, &a, out, &b, 4, 0)));
+    unlink("/tmp/cfr-in");
+    unlink("/tmp/cfr-out");
+    unlink("/dev/shm/cfr");
+
+    signal(SIGPIPE, sigpipe);
+    int s[2];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    shutdown(s[1], SHUT_RD);
+    printf("datagram to a socket shut down for reading: %s\n", res(send(s[0], "x", 1, 0)));
+    shutdown(s[0], SHUT_WR);
+    printf("datagram after SHUT_WR: %s\n", res(send(s[0], "x", 1, 0)));
+    shutdown(s[0], SHUT_RD);
+    struct pollfd p = {s[0], POLLIN | POLLOUT};
+    poll(&p, 1, 0);
+    printf("POLLHUP after both: %d\n", !!(p.revents & POLLHUP));
+
+    pid_t me = getpid();
+    printf("KCMP_IO with itself: %ld\n", (long)syscall(SYS_kcmp, me, me, 5, 0, 0));
+
+    struct sigaction sa = {.sa_handler = SIG_DFL, .sa_flags = 0x400 | SA_RESTART};
+    struct sigaction old;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR1, NULL, &old);
+    printf("SA_UNSUPPORTED kept: %d, SA_RESTART kept: %d\n", !!(old.sa_flags & 0x400),
+           !!(old.sa_flags & SA_RESTART));
+
+    int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (raw < 0) {
+        printf("raw socket: %s\n", strerror(errno));
+    } else {
+        struct sockaddr_in lo = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        printf("raw bind: %s\n", res(bind(raw, (struct sockaddr *)&lo, sizeof lo)));
+        printf("raw bind again: %s\n", res(bind(raw, (struct sockaddr *)&lo, sizeof lo)));
+    }
+    return 0;
+}
+C
+gcc -O1 -o smallchecks smallchecks.c && ./smallchecks

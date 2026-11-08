@@ -1600,10 +1600,20 @@ pub(super) fn kcmp(
             (fs(&t1), fs(&t2))
         }
         KCMP_SIGHAND => (sighand(&t1), sighand(&t2)),
-        // Unlike Linux, KCMP_IO always compares equal: threads have an I/O context
-        // (`Task::ioprio`, shared under `CLONE_IO`), but it is not compared. SysV semaphore undo
-        // tables are not shared between processes, so both sides count as empty
-        KCMP_IO | KCMP_SYSVSEM => (0, 0),
+        // The I/O context (`Task::ioprio`, shared under CLONE_IO); two threads without one compare
+        // equal, as Linux's NULL io_contexts do
+        KCMP_IO => {
+            let io = |t: &Task| {
+                t.ioprio
+                    .borrow()
+                    .as_ref()
+                    .map_or(0, |c| Rc::as_ptr(c) as usize)
+            };
+            (io(&t1), io(&t2))
+        }
+        // SysV semaphore undo tables are not shared between processes, so both sides count as
+        // empty
+        KCMP_SYSVSEM => (0, 0),
         // idx2 points at a `struct kcmp_epoll_slot { efd, tfd, toff }`: the toff-th interest for
         // fd tfd in t2's epoll
         KCMP_EPOLL_TFD => {

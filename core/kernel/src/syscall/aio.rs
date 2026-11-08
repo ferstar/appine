@@ -222,6 +222,14 @@ fn read_write(
     file.borrow_mut().flags = restored;
     match r {
         Ok(n) => n as i64,
+        // A request interrupted by a signal cannot be restarted with the others already done
+        // (Linux's aio_rw_done): EINTR
+        Err(
+            Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK,
+        ) => -(Errno::EINTR.0 as i64),
         Err(e) => -(e.0 as i64),
     }
 }

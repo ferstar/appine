@@ -364,7 +364,7 @@ pub(super) fn sched_setscheduler(cx: &mut Cx<'_>, pid: i32, policy: i32, param: 
     }
     let priority = read_priority(cx, param)?;
     let task = target(cx, pid)?;
-    set_policy(cx, task.as_ref(), policy, priority).map(|()| 0)
+    set_policy(cx, task.as_ref(), (policy, priority), true).map(|()| 0)
 }
 
 pub(super) fn sched_setparam(cx: &mut Cx<'_>, pid: i32, param: u64) -> SysResult {
@@ -374,7 +374,7 @@ pub(super) fn sched_setparam(cx: &mut Cx<'_>, pid: i32, param: u64) -> SysResult
     let priority = read_priority(cx, param)?;
     let task = target(cx, pid)?;
     let policy = task.as_ref().map_or(SCHED_OTHER, |t| t.sched.get().0);
-    set_policy(cx, task.as_ref(), policy, priority).map(|()| 0)
+    set_policy(cx, task.as_ref(), (policy, priority), true).map(|()| 0)
 }
 
 /// Reads the priority of a `struct sched_param`.
@@ -441,12 +441,14 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     // the current parameters (get_params)
     let (cur_policy, cur_priority) = task.as_ref().map_or((SCHED_OTHER, 0), |t| t.sched.get());
     let keep_policy = sched_flags & SCHED_FLAG_KEEP_POLICY != 0;
+    let keep_params = sched_flags & SCHED_FLAG_KEEP_PARAMS != 0;
     if keep_policy {
         policy = cur_policy & !SCHED_RESET_ON_FORK;
+    } else if policy & SCHED_RESET_ON_FORK != 0 {
+        // Only sched_setscheduler takes it inside the policy; here it is not a valid policy
+        return Err(Errno::EINVAL);
     }
-    if sched_flags & SCHED_FLAG_KEEP_PARAMS != 0
-        && let Some(t) = &task
-    {
+    if keep_params && let Some(t) = &task {
         nice = t.nice.get();
         priority = cur_priority;
         dl = t.deadline.get();
@@ -454,16 +456,27 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
     if sched_flags & !SCHED_FLAG_ALL != 0 {
         return Err(Errno::EINVAL);
     }
-    // uclamp_validate: each at most 1024, or -1 for the default; the minimum not above the maximum
+    // uclamp_validate: each at most 1024, or -1 for the default; a minimum and a maximum (each the
+    // one given, or the thread's current one) not crossing
     let (util_min, util_max) = (word(48), word(52));
     let given = |flag: u64, v: u32| (sched_flags & flag != 0 && v != u32::MAX).then_some(v);
     let (min, max) = (
         given(SCHED_FLAG_UTIL_CLAMP_MIN, util_min),
         given(SCHED_FLAG_UTIL_CLAMP_MAX, util_max),
     );
+    let (cur_min, cur_max) = task.as_ref().map_or((0, UCLAMP_MAX), |t| t.uclamp.get());
+    let effective = |flag: u64, v: Option<u32>, cur: u32| {
+        if sched_flags & flag != 0 {
+            v
+        } else {
+            Some(cur)
+        }
+    };
     if min.is_some_and(|v| v > UCLAMP_MAX)
         || max.is_some_and(|v| v > UCLAMP_MAX)
-        || min.zip(max).is_some_and(|(lo, hi)| lo > hi)
+        || effective(SCHED_FLAG_UTIL_CLAMP_MIN, min, cur_min)
+            .zip(effective(SCHED_FLAG_UTIL_CLAMP_MAX, max, cur_max))
+            .is_some_and(|(lo, hi)| lo > hi)
     {
         return Err(Errno::EINVAL);
     }
@@ -477,12 +490,25 @@ pub(super) fn sched_setattr(cx: &mut Cx<'_>, pid: i32, attr: u64, flags: u32) ->
         } else {
             0
         };
-        set_policy(cx, task.as_ref(), policy | reset, priority)?;
-        if !matches!(policy, SCHED_FIFO | SCHED_RR)
+        // With SCHED_FLAG_KEEP_PARAMS neither the parameters nor the policy change
+        // (__setscheduler_params is skipped); only reset-on-fork and the clamps do
+        set_policy(cx, task.as_ref(), (policy | reset, priority), !keep_params)?;
+        if keep_params && let Some(t) = &task {
+            t.sched
+                .set((cur_policy & !SCHED_RESET_ON_FORK | reset, cur_priority));
+        }
+        // Only SCHED_OTHER and SCHED_BATCH take the nice value (fair_policy): SCHED_IDLE keeps the
+        // one the thread had, which leaving it again is judged by
+        if !keep_params
+            && matches!(policy, SCHED_OTHER | SCHED_BATCH)
             && let Some(t) = &task
         {
             let tid = t.tid.get();
-            setpriority(cx, PRIO_PROCESS, tid, nice)?;
+            // A nice value beyond RLIMIT_NICE is EPERM here (setpriority answers EACCES)
+            setpriority(cx, PRIO_PROCESS, tid, nice).map_err(|e| match e {
+                Errno::EACCES => Errno::EPERM,
+                e => e,
+            })?;
         }
     }
     // __setscheduler_uclamp: -1 goes back to the default
@@ -534,8 +560,8 @@ fn set_deadline(
 fn set_policy(
     cx: &Cx<'_>,
     task: Option<&Rc<Task>>,
-    policy: i32,
-    priority: i32,
+    (policy, priority): (i32, i32),
+    apply: bool,
 ) -> Result<(), Errno> {
     let base = policy & !SCHED_RESET_ON_FORK;
     let rt = match base {
@@ -550,7 +576,29 @@ fn set_policy(
     if !same_owner(&cred, &cred_of(cx, task)) || rt && !cred.capable(cap::SYS_NICE) {
         return Err(Errno::EPERM);
     }
-    if let Some(t) = task {
+    // Without CAP_SYS_NICE (__sched_setscheduler): SCHED_IDLE counts as nice 20, so leaving it
+    // needs the RLIMIT_NICE that would allow the current nice value; and reset-on-fork, once set,
+    // cannot be cleared
+    if let Some(t) = task
+        && !cred.capable(cap::SYS_NICE)
+    {
+        let cur = t.sched.get().0;
+        let rlimit_nice = cx
+            .kr()
+            .groups
+            .get(&t.tgid)
+            .map_or(u64::MAX, |g| g.borrow().rlimits[RLIMIT_NICE as usize].0);
+        if cur & !SCHED_RESET_ON_FORK == SCHED_IDLE
+            && base != SCHED_IDLE
+            && (20 - t.nice.get()) as u64 > rlimit_nice
+        {
+            return Err(Errno::EPERM);
+        }
+        if cur & SCHED_RESET_ON_FORK != 0 && policy & SCHED_RESET_ON_FORK == 0 {
+            return Err(Errno::EPERM);
+        }
+    }
+    if let Some(t) = task.filter(|_| apply) {
         t.sched.set((policy, priority));
         apply_host(t);
     }

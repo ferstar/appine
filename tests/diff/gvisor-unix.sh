@@ -11,9 +11,8 @@ SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.IncreasedSocketSendBuf
 # kernel/unix: SO_LINGER and the other generic SOL_SOCKET options do not exist; no ECONNRESET
 SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/*"
 SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/*"
-# kernel/unix: stream sends ignore a destination address; connections carry no sender address;
-# abstract names ignore the socket type (variants 4 to 7 are the abstract ones)
-SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.Sendto/*"
+# kernel/unix: connections carry no sender address; abstract names ignore the socket type
+# (variants 4 to 7 are the abstract ones)
 SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BoundSenderAddr/*"
 SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BindAfterConnectSenderAddr/*"
 SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BindAfterAcceptSenderAddr/*"

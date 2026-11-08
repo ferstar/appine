@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, new-file modes; owners, procfs write opens; read-only remounts last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, modes; owners, procfs write opens, remounts; small-batch errno rules last)
 
 ## Responsibilities
 
@@ -291,7 +291,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   reference's `Drop` wakes lock and host-socket waiters and reports `IN_CLOSE_*`.
 - `OpenFile` keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC`, `__O_SYNC`
   and `O_LARGEFILE` from open, and with `O_PATH` only `O_PATH` (Linux's `build_open_how`) (so `F_GETFL` never shows `O_DIRECT`, `O_NOATIME` or `O_ASYNC` given
-  at open); `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
+  at open). An `O_PATH` fd takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and
+  `F_GETFL` (others `EBADF`, `check_fcntl_cmd`), and flock on it is `EBADF`. `F_SETFL` changes `O_APPEND|O_NONBLOCK|O_ASYNC|O_DIRECT|O_NOATIME` (registering fasync
   when `O_ASYNC` turns on for a file kind that has fasync, with no `O_NOATIME` ownership check).
   Access mode 3 (`O_WRONLY|O_RDWR`) needs read and write permission to open but makes the file
   neither readable nor writable (ioctls only, Linux's `OPEN_FMODE`). `F_SETOWN`/`F_GETOWN`,
@@ -326,9 +327,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   fail (`kernel/procfs`); content is generated at open, and the opener's credentials are kept for
   regeneration and id-map writes.
 - Every non-`O_PATH` store open records an inotify `Opened` (directory, name, close mask), whether
-  or not watches exist; `O_TMPFILE` is not implemented: openat2 rejects invalid combinations as
-  Linux does, but open/openat reach the directory branch (`EISDIR`, or a plain read-only open of
-  the directory without write access).
+  or not watches exist; `O_TMPFILE` is not implemented: openat and openat2 reject invalid
+  combinations as Linux does (with `O_CREAT`, or read-only, `EINVAL`), and a valid one reaches the
+  directory branch (`EISDIR`). `O_DIRECT` opens only store regular files outside tmpfs and loop
+  devices (6.1's `direct_IO` check, before the file's own open here): directories, tmpfs files,
+  character devices, FIFOs and synthetic files are `EINVAL`.
 
 ### Data I/O on regular files
 
@@ -347,7 +350,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `sendfile` and `copy_file_range` between distinct regular store files use host `sendfile`
   without the BKL; they fall back to chunked copies for `O_APPEND` output, the same inode, a
   sealed output file, tmpfs output, or host `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`.
-  `copy_file_range` rejects nonzero flags (`EINVAL`) and `O_APPEND` output (`EBADF`); `sendfile`
+  `copy_file_range` (fds, offsets, then flags `EINVAL`) checks in 6.1's `generic_copy_file_checks`
+  order: directories `EISDIR`, other non-regular files `EINVAL`, modes and `O_APPEND` `EBADF`,
+  different devices `EXDEV`, wrapping ranges `EOVERFLOW`, then the length cut to the input's end,
+  `RLIMIT_FSIZE` and the largest file size (`EFBIG`), overlap within one file `EINVAL`, negative
+  positions `EINVAL`; `sendfile`
   rejects `O_APPEND` output other than a pipe (`EINVAL`, as `do_splice_direct`). `splice`, `tee` and
   `vmsplice` copy through buffers (one side of `splice` must be a pipe; data leaves the pipe only
   after the write succeeds); a zero length returns 0 before anything else and unknown flags are
@@ -399,7 +406,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `UTIME_NOW` also accepts write permission; the both-`UTIME_OMIT` shortcut runs after path
   resolution. Writes and truncation call `remove_privs` (`CAP_FSETID` checked in the initial
   namespace).
-- truncate: `EROFS`, `EISDIR`, `EINVAL` for non-regular, write permission, `ETXTBSY`,
+- truncate (6.1's `vfs_truncate` order): `EISDIR`, `EINVAL` for non-regular, `EROFS`, write
+  permission (a synthetic regular file then succeeds without change), `ETXTBSY`,
   `RLIMIT_FSIZE`, leases; ftruncate `EINVAL` unless writable and regular, `EBADF` on `O_PATH`.
 - mknodat: regular, char, block, FIFO, socket (directory `EPERM`); devices need `CAP_MKNOD` and
   pass the device filter (whiteouts exempt). renameat2: `RENAME_NOREPLACE`, `RENAME_EXCHANGE`
@@ -410,7 +418,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   file's link the store node on the mount it was opened through, and a memfd's nothing (`EXDEV`);
   a source whose link count is 0 is `ENOENT` (the store refuses it); there is no `EMLINK` limit.
 - getdents64 takes the listing (with `.` and `..`) on the first call and refreshes it only on a
-  seek to 0; `d_off` is index+1. chdir/fchdir/chroot check search only on store directories.
+  seek to 0; `d_off` is index+1. `O_PATH` fds are `EBADF`, a removed directory `ENOENT`, a count
+  above `INT_MAX` `EINVAL`; entries are copied out one by one, so a buffer running into memory that
+  cannot be written returns the whole entries before it (`EFAULT` when none). chdir/fchdir/chroot check search only on store directories.
   umask lives in the fs context.
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
   `protected_fifos` do not.
@@ -522,7 +532,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - eventfd: counter or semaphore mode; writing `u64::MAX` is `EINVAL`; overflow blocks; every
   read/write wakes the object (the syscalls live in `kernel/poll`).
-- timerfd: realtime, monotonic, boottime and the alarm clocks; expirations are kept on the clock's
+- timerfd: realtime, monotonic, boottime and the alarm clocks (creating or setting an alarm timer
+  needs `CAP_WAKE_ALARM` in the initial namespace, `EPERM`); expirations are kept on the clock's
   base (`itimer::Expiry`: relative realtime and monotonic on the host's monotonic clock, absolute
   realtime on its realtime clock, boottime on its boottime clock); settime resets the expiration
   count. `TFD_TIMER_CANCEL_ON_SET` on an absolute realtime timer records the wall-clock jump count:
@@ -572,7 +583,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   nothing was submitted, otherwise the count so far.
 - PREAD, PWRITE, PREADV, PWRITEV, FSYNC and FDSYNC run synchronously inside io_submit through the
   regular read, write, vectored and fsync paths (blocking pipe or socket I/O blocks io_submit), and
-  their result or negative errno is queued at once. `aio_offset` is used only for positional files;
+  their result or negative errno is queued at once (an interrupted one as `-EINTR`, as
+  `aio_rw_done` turns restart codes into it). `aio_offset` is used only for positional files;
   `RWF_NOWAIT` and `RWF_APPEND` are set temporarily as `O_NONBLOCK`/`O_APPEND` on the shared open
   file.
 - `IOCB_CMD_POLL` completes at once when ready; otherwise it stays pending and is checked only by
@@ -686,16 +698,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `aio_offset` even with `RWF_APPEND` or an `O_APPEND` file, `RWF_DSYNC`/`RWF_SYNC` never sync
   (only the file's own `O_DSYNC`/`O_SYNC` do), and a negative offset is not rejected but cast and
   failed later.
-- **AIO results leak restart codes and can be lost:** an interrupted blocking read or write inside
-  io_submit stores `-ERESTARTSYS` (-512) in `io_event.res` instead of `-EINTR`, and io_getevents
-  drops the events it took when copying them out faults (Linux leaves them in the ring).
-- **`copy_file_range` checks differ from 6.1's `generic_copy_file_checks`:** a directory is `EBADF`
-  instead of `EISDIR` and a pipe `EBADF` instead of `EINVAL`; overlapping ranges in one file are
-  copied instead of `EINVAL`; a length that overflows the offset is `EINVAL` instead of
-  `EOVERFLOW`, and a range past the largest file size `EINVAL` instead of `EFBIG` (LTP
-  copy_file_range02, which also expects `EPERM` on an immutable file).
-- **getdents64 lists a removed directory:** an open directory that has been rmdir'ed still lists
-  entries; Linux returns `ENOENT` for a dead directory (LTP getdents02).
+- **AIO results can be lost:** io_getevents drops the events it took when copying them out faults
+  (Linux leaves them in the ring).
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are not supported on store or tmpfs
   files, while 6.1's tmpfs supports append-only, immutable, nodump and noatime (LTP unlink09,
   copy_file_range02).
@@ -732,20 +736,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   precedes the fault, where Linux commits only whole copied pages (a sub-page writev fails with
   `EFAULT` and writes nothing); and a write or vmsplice whose buffer faults after its first page
   fails with `EFAULT` instead of returning the pages copied.
-- **getdents64 copies all or nothing:** a buffer that runs into an unmapped page fails with
-  `EFAULT` even when whole entries fit before it, where Linux returns the entries written before
-  the fault.
-- **open(2) does not validate `O_TMPFILE`:** openat skips the `O_TMPFILE` checks openat2 makes, so
-  `O_TMPFILE` with `O_CREAT` is `EISDIR` instead of `EINVAL`, and a read-only `O_TMPFILE` open
-  succeeds as a plain open of the directory instead of `EINVAL`.
 - **`MFD_NOEXEC_SEAL` is accepted but not enforced:** memfd_create takes 6.3's
   `MFD_NOEXEC_SEAL`/`MFD_EXEC` and F_ADD_SEALS takes `F_SEAL_EXEC` (6.1 rejects all three with
   `EINVAL`), but chmod never checks the seal, so a memfd its creator sealed non-executable can be
   made executable again.
-- **Alarm timerfds need no capability:** timerfd_create and timerfd_settime accept
-  `CLOCK_REALTIME_ALARM`/`CLOCK_BOOTTIME_ALARM` without `CAP_WAKE_ALARM`, where Linux returns
-  `EPERM`, so programs that probe alarm clocks to learn whether they may wake the system are told
-  they can.
 - **pivot_root resolves both paths before checking them:** a non-directory `new_root` with a missing
   `put_old` is `ENOENT` instead of `ENOTDIR`.
 - **mountinfo loses the root of a bind whose source was removed:** the fourth column shows `/` once
@@ -760,9 +754,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
   kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
   root.
-- **truncate on synthetic files is `EACCES`:** truncate(2) needs a store inode before it checks
-  the file type, so devpts, procfs and sysfs files fail with `EACCES` (`EROFS` on a read-only
-  mount), where Linux returns `EINVAL` for a non-regular file before any permission check.
 - **`IN_EXCL_UNLINK` filters the wrong events:** the flag is honoured only by directory watches
   and keyed on the child's link count, so a file's own watch keeps reporting writes and closes
   after the file is unlinked, a directory watch keeps reporting I/O through an unlinked name while
@@ -771,13 +762,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   events of an unlinked name, on both watches.
 - **Executing a file reports no inotify events:** execve opens and reads the program (and a
   script's interpreter) without `IN_OPEN`, `IN_ACCESS` or `IN_CLOSE_NOWRITE`.
-- **`O_PATH` descriptors pass fcntl, flock and getdents64:** every fcntl command works on an
-  `O_PATH` fd (`F_SETFL`, owners, signals, leases), where Linux allows only dup, fd flags and
-  `F_GETFL` and returns `EBADF` otherwise; flock on one takes a real lock (Linux `EBADF`), so a
-  path-only fd can hold or contend locks and block real openers; getdents64 on one is `ENOTDIR`
-  instead of `EBADF`.
-- **getdents64 accepts counts above `INT_MAX`:** a count of 2^31 or more is taken as a huge buffer,
-  where Linux returns `EINVAL`.
 - **`SEEK_END` on directories is `EINVAL`:** every directory refuses it, where Linux allows it on
   procfs and ext4 directories (which the store stands in for) and refuses it only on tmpfs-like
   ones.
@@ -785,9 +769,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   walked while another thread mounts or renames is never `EAGAIN`, because the whole walk is
   atomic under the BKL; Linux returns it so callers retry. Safe, but callers never see the retry
   signal.
-- **`O_DIRECT` is never refused at open:** directories (and, from the code, tmpfs and synthetic
-  files) open with `O_DIRECT` where Linux 6.1 returns `EINVAL`, so programs probing for direct
-  I/O support (databases, `dd oflag=direct`, fio) are told it works.
 - **renameat2 ignores `RENAME_NOREPLACE` for `.`/`..`:** such a destination is `EBUSY` even with
   the flag, where Linux 6.1 returns `EEXIST`.
 - **rename in synthetic filesystems is `EACCES` first:** renameat2 needs store directories before

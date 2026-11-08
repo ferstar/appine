@@ -41,6 +41,13 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
     if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
         return Err(Errno::EINVAL);
     }
+    // The alarm clocks could wake the system, so they need CAP_WAKE_ALARM (in the initial
+    // namespace, Linux's capable)
+    if matches!(clock, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM)
+        && !cx.cred().capable(crate::cred::cap::WAKE_ALARM)
+    {
+        return Err(Errno::EPERM);
+    }
     let t = TimerFd {
         clock,
         deadline: None,
@@ -73,6 +80,14 @@ pub(super) fn timerfd_settime(
     let spec: [u8; 32] = get(cx, new)?;
     let interval = timespec(&spec[..16])?;
     let value = timespec(&spec[16..])?;
+    // Setting an alarm timer needs CAP_WAKE_ALARM too, even one created by a process that had it
+    let alarm = matches!(
+        timer.borrow().clock,
+        CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM
+    );
+    if alarm && !cx.cred().capable(crate::cred::cap::WAKE_ALARM) {
+        return Err(Errno::EPERM);
+    }
     let mut t = timer.borrow_mut();
     if old != 0 {
         put(cx, old, current(&mut t))?;

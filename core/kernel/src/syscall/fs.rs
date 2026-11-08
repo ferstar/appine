@@ -232,6 +232,16 @@ const MAX_HANDLE_SZ: u32 = 128;
 const AT_HANDLE_FID: u32 = 0x200;
 
 pub(super) fn openat(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32, perm: u32) -> SysResult {
+    // build_open_flags checks O_TMPFILE for open(2) as for openat2 (O_PATH has dropped it): it
+    // must come with O_DIRECTORY and without O_CREAT, and be writable
+    const O_TMPFILE_BIT: u32 = 0o20000000; // __O_TMPFILE
+    let o_tmpfile = O_TMPFILE_BIT | oflags::O_DIRECTORY;
+    if flags & (O_TMPFILE_BIT | oflags::O_PATH) == O_TMPFILE_BIT
+        && (flags & (o_tmpfile | oflags::O_CREAT) != o_tmpfile
+            || flags & oflags::O_ACCMODE == oflags::O_RDONLY)
+    {
+        return Err(Errno::EINVAL);
+    }
     let path = read_path(cx, path)?;
     let file = open_path(cx, dirfd, path, flags, perm)?;
     cx.fds_mut()
@@ -684,6 +694,15 @@ fn open_pseudo(
     if let Some(r) = rdev {
         super::bpf::check_device(cx, mode::S_IFCHR, r, device_access(mask))?;
     }
+    // No synthetic file supports direct I/O (do_dentry_open: EINVAL), terminals included; a
+    // directory opened for writing is EISDIR first. Files reopened through /proc/<pid>/fd are
+    // their own kind
+    if flags & oflags::O_DIRECT != 0
+        && !matches!(node, PseudoNode::OpenFd(..) | PseudoNode::OpenExe(_))
+        && (accmode == oflags::O_RDONLY || Pseudo::kind(&cx.view(vfs), &node)? != mode::S_IFDIR)
+    {
+        return Err(Errno::EINVAL);
+    }
     match node {
         PseudoNode::Pts(fs, n) => return tty::open_slave(cx, (fs, n, mnt, true), flags),
         PseudoNode::PtsPtmx(fs) => {
@@ -1016,6 +1035,13 @@ pub(super) fn open_by_handle_at(
 
 /// Opens a store inode reached through mount `mnt`. A file just created by this open
 /// (`created`) gets no permission check.
+/// A directory opened for writing, creating or truncating is EISDIR before O_DIRECT is looked at.
+fn direct_open_is_eisdir(st: &Stat, flags: u32) -> bool {
+    st.kind() == mode::S_IFDIR
+        && (flags & oflags::O_ACCMODE != oflags::O_RDONLY
+            || flags & (oflags::O_CREAT | oflags::O_TRUNC) != 0)
+}
+
 fn open_store(
     cx: &mut Cx<'_>,
     cred: &Cred,
@@ -1070,6 +1096,18 @@ fn open_store(
         if readonly && st.kind() == mode::S_IFREG && accmode != oflags::O_RDONLY {
             return Err(Errno::EROFS);
         }
+    }
+    // O_DIRECT needs a file whose pages support direct I/O (do_dentry_open's direct_IO check):
+    // regular files of the store (ext4's) and loop devices; directories, tmpfs files (shmem has
+    // none in 6.1), character devices and FIFOs are EINVAL. Linux checks after the file's own open
+    // (a FIFO waits for its peer first); here before it
+    let direct_io = || match st.kind() {
+        mode::S_IFREG => vfs.mount(mnt).is_none_or(|m| m.fs != Fs::Tmpfs),
+        mode::S_IFBLK | mode::S_IFSOCK => true,
+        _ => false,
+    };
+    if flags & oflags::O_DIRECT != 0 && !direct_io() && !direct_open_is_eisdir(&st, flags) {
+        return Err(Errno::EINVAL);
     }
     Ok(match st.kind() {
         mode::S_IFLNK => return Err(Errno::ELOOP),
@@ -1418,6 +1456,12 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
 
 pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
     let file = cx.fds().get(fd)?;
+    // An O_PATH descriptor allows only dup, the descriptor flags and F_GETFL (check_fcntl_cmd)
+    if file.borrow().flags & oflags::O_PATH != 0
+        && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL)
+    {
+        return Err(Errno::EBADF);
+    }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // A start not below RLIMIT_NOFILE is EINVAL; only having no free slot is EMFILE
@@ -1748,6 +1792,10 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     const LOCK_NB: u32 = 4;
     const LOCK_UN: u32 = 8;
     let file = cx.fds().get(fd)?;
+    // O_PATH descriptors are not found (fdget)
+    if file.borrow().flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
     // Files not in the store (pipes, sockets) have no lock to share: always succeeds
     let Some(ino) = file.borrow().ino() else {
         return Ok(0);
@@ -2759,41 +2807,31 @@ pub(super) fn copy_file_range(
     len: usize,
     flags: u32,
 ) -> SysResult {
+    // O_PATH descriptors are not found (fdget)
+    let open = |fd: i32| {
+        cx.fds()
+            .get(fd)
+            .and_then(|f| match f.borrow().flags & oflags::O_PATH {
+                0 => Ok(f.clone()),
+                _ => Err(Errno::EBADF),
+            })
+    };
+    let input = open(fd_in)?;
+    let output = open(fd_out)?;
+    let read_off = |addr: u64| -> Result<Option<i64>, Errno> {
+        match addr {
+            0 => Ok(None),
+            a => Ok(Some(i64::from_le_bytes(get(cx, a)?))),
+        }
+    };
+    let (src, dst) = (read_off(off_in)?, read_off(off_out)?);
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let input = cx.fds().get(fd_in)?;
-    let output = cx.fds().get(fd_out)?;
-    {
-        let (i, o) = (input.borrow(), output.borrow());
-        if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
-            return Err(Errno::EBADF);
-        }
-        for f in [&i, &o] {
-            match f.kind {
-                FileKind::Regular { .. } => {}
-                FileKind::Directory { .. } => return Err(Errno::EISDIR),
-                _ => return Err(Errno::EINVAL),
-            }
-        }
-    }
-    let read_off = |addr: u64| -> Result<Option<u64>, Errno> {
-        match addr {
-            0 => Ok(None),
-            a => Ok(Some(
-                u64::try_from(i64::from_le_bytes(get(cx, a)?)).map_err(|_| Errno::EINVAL)?,
-            )),
-        }
-    };
-    let (mut src, mut dst) = (read_off(off_in)?, read_off(off_out)?);
-    let same = input.borrow().ino() == output.borrow().ino();
-    if same {
-        // Two ranges in the same file must not overlap
-        let s = src.unwrap_or(input.borrow().pos);
-        let d = dst.unwrap_or(output.borrow().pos);
-        if s < d + len as u64 && d < s + len as u64 {
-            return Err(Errno::EINVAL);
-        }
+    let len = copy_range_checks(cx, (&input, src), (&output, dst), len)?;
+    let (mut src, mut dst) = (src.map(|s| s as u64), dst.map(|d| d as u64));
+    if len == 0 {
+        return Ok(0);
     }
     if let Some(r) = copy_regular(cx, &input, src, &output, dst, len) {
         let n = r? as u64;
@@ -2834,6 +2872,75 @@ pub(super) fn copy_file_range(
         put(cx, off_out, d.to_le_bytes())?;
     }
     Ok(done as u64)
+}
+
+/// copy_file_range's checks, in 6.1's `generic_copy_file_checks` and `rw_verify_area` order:
+/// directories `EISDIR`, other files that are not regular `EINVAL`; an input not open for reading
+/// or an output not open for writing or appending `EBADF`; files on different filesystems
+/// `EXDEV`; ranges whose end wraps around `EOVERFLOW`; then the length is cut to the input's end,
+/// and to `RLIMIT_FSIZE` (at or past it, `SIGXFSZ` and `EFBIG`) and the largest file size
+/// (`EFBIG`); overlapping ranges in one file `EINVAL`; negative positions `EINVAL`. Returns the
+/// length to copy. `src`/`dst` are the offsets given, None for the file positions.
+fn copy_range_checks(
+    cx: &Cx<'_>,
+    (input, src): (&FileRef, Option<i64>),
+    (output, dst): (&FileRef, Option<i64>),
+    len: usize,
+) -> Result<usize, Errno> {
+    let (i, o) = (input.borrow(), output.borrow());
+    for f in [&i, &o] {
+        match f.kind {
+            FileKind::Regular { .. } => {}
+            FileKind::Directory { .. } => return Err(Errno::EISDIR),
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
+        return Err(Errno::EBADF);
+    }
+    let vfs = cx.vfs()?;
+    let dev = |f: &OpenFile| vfs.mount(f.mnt).map(|m| m.dev);
+    if dev(&i) != dev(&o) {
+        return Err(Errno::EXDEV);
+    }
+    let pos_in = src.unwrap_or(i.pos as i64);
+    let pos_out = dst.unwrap_or(o.pos as i64);
+    let mut count = len as u64;
+    let wraps = |pos: i64| (pos as u64).wrapping_add(count) < pos as u64;
+    if wraps(pos_in) || wraps(pos_out) {
+        return Err(Errno::EOVERFLOW);
+    }
+    let FileKind::Regular { ino, file } = &i.kind else {
+        return Err(Errno::EINVAL);
+    };
+    let size_in = vfs.store().stat_open(*ino, file)?.size as i64;
+    count = if pos_in >= size_in {
+        0
+    } else {
+        count.min((size_in - pos_in) as u64)
+    };
+    // generic_write_check_limits
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
+    if limit != u64::MAX {
+        if pos_out as u64 >= limit {
+            return Err(file_too_big(cx));
+        }
+        count = count.min(limit - pos_out as u64);
+    }
+    // The largest file size (MAX_LFS_FILESIZE)
+    if pos_out == i64::MAX {
+        return Err(Errno::EFBIG);
+    }
+    count = count.min(i64::MAX.wrapping_sub(pos_out) as u64);
+    let end = |pos: i64| pos.wrapping_add(count as i64);
+    if i.ino() == o.ino() && end(pos_out) > pos_in && pos_out < end(pos_in) {
+        return Err(Errno::EINVAL);
+    }
+    // rw_verify_area
+    if pos_in < 0 || pos_out < 0 || end(pos_in) < 0 || end(pos_out) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(count as usize)
 }
 
 /// When sendfile and copy_file_range copy between two regular files, the copy is left to the
@@ -3742,13 +3849,26 @@ fn unlocked_io(
 
 // ---- Directories ----
 
+/// getdents64 (Linux's `iterate_dir` and `filldir64`): `O_PATH` descriptors are not found
+/// (`EBADF`); a removed directory is `ENOENT`; the count is an int, so one above `INT_MAX` fits no
+/// entry (`EINVAL`); entries are copied one by one, so a buffer running into memory that cannot be
+/// written returns the whole entries before it (`EFAULT` when there are none).
 pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> SysResult {
     let file = cx.fds().get(fd)?;
     let mut f = file.borrow_mut();
+    if f.flags & oflags::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
     let OpenFile { kind, pos, .. } = &mut *f;
     let FileKind::Directory { node, entries, .. } = kind else {
         return Err(Errno::ENOTDIR);
     };
+    if let Node::Store(_, ino) = node
+        && cx.vfs()?.store().stat(*ino)?.nlink == 0
+    {
+        return Err(Errno::ENOENT);
+    }
+    let count = count as u32 as usize;
     if entries.is_none() {
         let vfs = cx.vfs()?;
         let view = cx.view(&vfs);
@@ -3778,6 +3898,11 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
     let list = entries.as_ref().unwrap();
     let mut out = Vec::new();
     let mut next = *pos as usize;
+    if next < list.len() && count > i32::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    // Where each entry ends in `out`
+    let mut ends = Vec::new();
     while let Some(e) = list.get(next) {
         // struct linux_dirent64: d_ino, d_off, d_reclen, d_type, d_name, aligned to 8 bytes
         let reclen = (19 + e.name.len() + 1).next_multiple_of(8);
@@ -3791,12 +3916,21 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         out.push((e.mode >> 12) as u8 & 0xf); // DT_* is just S_IFMT >> 12
         out.extend_from_slice(&e.name);
         out.resize(start + reclen, 0);
+        ends.push(out.len());
         next += 1;
     }
     if out.is_empty() && next < list.len() {
         return Err(Errno::EINVAL);
     }
-    cx.mm().write(UserSlice::new(buf, out.len()), &out)?;
+    let written = cx.write_user_partial(buf, &out);
+    if written < out.len() {
+        let whole = ends.iter().take_while(|&&end| end <= written).count();
+        if whole == 0 {
+            return Err(Errno::EFAULT);
+        }
+        next -= ends.len() - whole;
+        out.truncate(ends[whole - 1]);
+    }
     *pos = next as u64;
     inotify::file_event(cx.kr(), &f, inotify::IN_ACCESS);
     Ok(out.len() as u64)
@@ -5576,11 +5710,31 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
     let path = read_path(cx, path)?;
     let vfs = cx.vfs()?;
     let node = lookup_at(cx, AT_FDCWD, &path, true)?;
-    let ino = store_ino(cx, &node)?;
+    // vfs_truncate: the type first (directories EISDIR, other non-regular files EINVAL), then a
+    // read-only mount, then write permission
+    if let Node::Pseudo(_, p) = &node {
+        let st = pseudo::stat(&cx.view(&vfs), p)?;
+        match st.kind() {
+            mode::S_IFDIR => return Err(Errno::EISDIR),
+            mode::S_IFREG => {}
+            _ => return Err(Errno::EINVAL),
+        }
+        if vfs.readonly(&node) {
+            return Err(Errno::EROFS);
+        }
+        cx.cred().permission(&st, MAY_WRITE)?;
+        // Synthetic files have no size of their own to change (proc_setattr and kernfs accept
+        // it and do nothing)
+        return Ok(0);
+    }
+    let ino = node.ino().ok_or(Errno::EACCES)?;
     let st = vfs.store().attrs(ino)?;
     match st.kind() {
         mode::S_IFDIR => Err(Errno::EISDIR),
         mode::S_IFREG => {
+            if vfs.readonly(&node) {
+                return Err(Errno::EROFS);
+            }
             cx.cred().permission(&st, MAY_WRITE)?;
             if executing(cx, ino) {
                 return Err(Errno::ETXTBSY);

@@ -6,8 +6,6 @@
 # map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/poll: epoll_wait does not check the event buffer up front
 SKIP="EpollTest.WaitInvalidParams"
-# kernel/vfs: alarm timerfds need no capability
-SKIP="$SKIP:TimerFD.NoWakeAlarmCap:TimerFD.NoWakeAlarmCapSetTime"
 # kernel/tty: /dev/tty cannot be told apart from the slave it opens
 SKIP="$SKIP:Pty.OpenDevTTY"
 # kernel/net: host interfaces cannot be changed (interface setters are EPERM, before the name is

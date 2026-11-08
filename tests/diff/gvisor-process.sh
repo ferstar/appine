@@ -28,9 +28,8 @@ SKIP="$SKIP:$F.PITryLock/*:$F.PIWaiters/*:$F.Wake0/*"
 SKIP="$SKIP:ExecTest.FileCapsAlreadyHeldKeptWithNoNewPrivs:ExecTest.FileCapsClearAmbient"
 SKIP="$SKIP:ExecTest.FileCapsClearAmbientWithNoNewPrivs:ExecTest.FileCapsNotGainedWithNoNewPrivs"
 SKIP="$SKIP:ExecTest.SUIDExecDoesntGainUIDWithSharedFSContext:ExecTest.ACLExecuteOnlyBinary"
-# kernel/signal: rt_sigqueueinfo to a zombie is ESRCH; queued siginfo keeps only code, pid, uid and
-# value
-SKIP="$SKIP:RtSignalTest.InvalidCodes:RtSignalTest.ValueDelivered"
+# kernel/signal: rt_sigqueueinfo to a zombie is ESRCH
+SKIP="$SKIP:RtSignalTest.InvalidCodes"
 # Hang on both sides until the 60 s timeout (only the timeout would be compared)
 SKIP="$SKIP:SigtimedwaitTest.NullTimeoutReturnsEINTR:PidfdTest.SendSignalToStoppedChildSucceeds"
 # Slow by design (they sleep 10 to 30 s each to show that nothing happens), left out for the time

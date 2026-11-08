@@ -287,6 +287,15 @@ pub(super) fn send(
     if ty == SOCK_DGRAM {
         return send_dgram(cx, sock, nonblock, deadline, data, addr, files, cred);
     }
+    // A stream socket takes no destination (unix_stream_sendmsg); seqpacket ignores it
+    if ty == SOCK_STREAM && !addr.is_empty() {
+        let connected = with(sock, |u| matches!(u.link, Link::Stream { .. }));
+        return Err(if connected {
+            Errno::EISCONN
+        } else {
+            Errno::EOPNOTSUPP
+        });
+    }
     let mut done = 0;
     loop {
         let tx = with(sock, |u| match &u.link {
@@ -427,8 +436,9 @@ fn send_dgram(
         };
         (Rc::downgrade(&u.rx), u.addr.clone(), connected, u.shut_wr)
     });
+    // Datagram sends never raise SIGPIPE (only unix_stream_sendmsg sends it)
     if shut_wr {
-        return Err(epipe(cx, 0));
+        return Err(Errno::EPIPE);
     }
     let rx: ChannelRef = if addr.is_empty() {
         connected
@@ -461,6 +471,10 @@ fn send_dgram(
             let mut c = rx.borrow_mut();
             if c.closed {
                 return Err(Errno::ECONNREFUSED);
+            }
+            // The receiver has shut down reading (RCV_SHUTDOWN): EPIPE, without SIGPIPE
+            if c.eof {
+                return Err(Errno::EPIPE);
             }
             if c.space() >= data.len() {
                 let files = files.take().unwrap_or_default();

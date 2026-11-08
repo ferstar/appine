@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: comments; kill by thread id; process-signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; sigqueue to zombies, core %d; adjtimex; ptracer credentials last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: comments; kill by thread id; process-signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; sigqueue to zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo last)
 
 ## Responsibilities
 
@@ -161,14 +161,18 @@ procfs.
 ### Signal syscalls
 
 - `rt_sigaction`: installing an action for `SIGKILL`/`SIGSTOP` is `EINVAL` (querying them works);
-  flags are stored and reported as given; any change that makes a signal ignored (`SIG_IGN`, or
-  `SIG_DFL` for a default-ignored signal) discards its pending instances.
+  flags outside Linux's `UAPI_SA_FLAGS` are cleared, so `SA_UNSUPPORTED` probing sees a 5.11+
+  kernel; any change that makes a signal ignored (`SIG_IGN`, or `SIG_DFL` for a default-ignored
+  signal) discards its pending instances.
 - `rt_sigsuspend` uses `saved_sigmask` and returns `ERESTARTNOHAND`; `rt_sigtimedwait` returns only
   signals from its set (`EINTR` for others); `rt_sigpending` reports pending ∩ blocked.
 - `sigaltstack`: `SS_DISABLE`, `SS_ONSTACK` reporting, `SS_AUTODISARM`.
 - `tkill`/`tgkill` use `SI_TKILL`. `kill(pid > 0)` and `rt_sigqueueinfo` accept any thread's tid
   and signal its process (Linux's `kill_pid_info`); both accept a zombie not yet reaped (nothing is
-  queued) and refuse pid 1 (`ESRCH` for `rt_sigqueueinfo`).
+  queued) and refuse pid 1 (`ESRCH` for `rt_sigqueueinfo`). A siginfo given to `rt_sigqueueinfo`,
+  `rt_tgsigqueueinfo` or `pidfd_send_signal` is delivered as given as far as `kernel_siginfo`
+  reaches (`si_errno` and the first 32 bytes of the union), si_pid and si_uid converted as for
+  sigqueue.
 - signalfd: reads dequeue matching signals of the calling thread and its group, in the Linux
   `signalfd_siginfo` layout; readiness also follows the calling thread.
 
@@ -332,8 +336,6 @@ procfs.
   pages Linux can read; `PTRACE_PEEKSIGINFO` is unsupported (`EIO`).
 - **`SIGILL` frames carry an `esr_context` with EC 0:** Linux 6.1 emits none for undefined
   instructions.
-- **`rt_sigaction` echoes unknown flag bits:** Linux 5.11+ clears them, so `SA_UNSUPPORTED` probing
-  reads as an older kernel (harmless while tag-bit exposure is unimplemented).
 - **`MADV_DONTNEED` wipes the vDSO:** the vDSO is a private anonymous copy, so discarding it (alone
   or inside a larger range) zeroes it and the next vDSO clock call or signal return through
   `__kernel_rt_sigreturn` raises `SIGILL`, where Linux refills the vDSO from the kernel image.
@@ -346,10 +348,6 @@ procfs.
   ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
   where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
   gdb or strace sees a duplicate stop.
-- **Queued siginfo keeps only code, pid, uid and value:** rt_sigqueueinfo, rt_tgsigqueueinfo and
-  pidfd_send_signal rebuild the caller's siginfo, dropping `si_errno` and every other union field,
-  where Linux 6.1 delivers it as given (only `si_signo` forced); `PTRACE_SETSIGINFO` is not
-  affected.
 - **Minor divergences:** `core_pattern` access follows file DAC with `CAP_DAC_OVERRIDE` instead of
   Linux's euid-only sysctl rule; `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits

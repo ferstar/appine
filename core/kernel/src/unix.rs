@@ -237,6 +237,10 @@ impl UnixSocket {
                 }
                 if r.eof {
                     ev |= POLLIN | POLLRDNORM | POLLRDHUP;
+                    // Both directions shut down (unix_dgram_poll's SHUTDOWN_MASK)
+                    if self.shut_wr {
+                        ev |= POLLHUP;
+                    }
                 }
                 let peer_full = match &self.link {
                     Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| !c.borrow().writable()),

@@ -284,15 +284,17 @@ fn signal_arg(sig: i32) -> Result<Option<Signal>, Errno> {
     Signal::new(sig).map(Some).ok_or(Errno::EINVAL)
 }
 
-/// The siginfo given by the caller (rt_sigqueueinfo, pidfd_send_signal).
+/// The siginfo given by the caller (rt_sigqueueinfo, pidfd_send_signal): delivered as given, as
+/// far as Linux's `kernel_siginfo` reaches (48 bytes; si_signo is the signal's).
 fn queue_info(b: &[u8; 128]) -> SigInfo {
     let word = |off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
     SigInfo {
         code: word(8),
-        fields: signal::InfoFields::Queue {
+        fields: signal::InfoFields::User {
+            errno: word(4),
             pid: word(16),
             uid: word(20) as u32,
-            value: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+            rest: b[24..48].try_into().unwrap(),
         },
         ..SigInfo::default()
     }
@@ -325,9 +327,22 @@ pub(super) fn rt_sigaction(
     let new = if act != 0 {
         let b: [u8; 32] = get(cx, act)?;
         let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        // Unknown flag bits are cleared (Linux 5.11+'s UAPI_SA_FLAGS), so programs probing with
+        // SA_UNSUPPORTED see which flags this kernel knows: SA_NOCLDSTOP, SA_NOCLDWAIT,
+        // SA_SIGINFO, SA_EXPOSE_TAGBITS, SA_RESTORER, SA_ONSTACK, SA_RESTART, SA_NODEFER and
+        // SA_RESETHAND
+        const UAPI_SA_FLAGS: u64 = 0x1
+            | 0x2
+            | 0x4
+            | 0x800
+            | 0x0400_0000
+            | 0x0800_0000
+            | 0x1000_0000
+            | 0x4000_0000
+            | 0x8000_0000;
         Some(SigAction {
             handler: word(0),
-            flags: word(1),
+            flags: word(1) & UAPI_SA_FLAGS,
             restorer: word(2),
             mask: word(3) & !UNBLOCKABLE,
             immutable: false,
@@ -589,6 +604,17 @@ fn encode_signalfd_siginfo(sig: Signal, info: &SigInfo) -> [u8; 128] {
             put32(84, syscall as u32);
             put32(96, arch);
             b[88..96].copy_from_slice(&call_addr.to_le_bytes());
+        }
+        InfoFields::User {
+            errno,
+            pid,
+            uid,
+            rest,
+        } => {
+            put32(4, errno as u32);
+            put32(12, pid as u32);
+            put32(16, uid);
+            value = Some(u64::from_le_bytes(rest[..8].try_into().unwrap()));
         }
         // Given by a tracer: most si_codes start with the sender's pid and uid
         InfoFields::Raw(rest) => {

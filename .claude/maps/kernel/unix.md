@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets; deviations found by gVisor's tests; SO_PASSCRED inherited at accept last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket timeouts share the inet parser; reads of nothing; shutdown of unconnected sockets; deviations found by gVisor's tests; SO_PASSCRED inherited at accept; send addresses and datagram shutdowns last)
 
 ## Responsibilities
 
@@ -104,12 +104,13 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 - Control messages on send: 16-byte headers, 8-byte alignment, at most 253 fds in total; other
   levels or types `EINVAL`; `SCM_CREDENTIALS` must match the sender (pid/uid/gid) unless
   privileged (`EINVAL`, `EPERM`, `ESRCH`); default credentials are tgid, real uid and real gid.
-- Stream send: peer gone → `EPIPE` + `SIGPIPE` (unless `MSG_NOSIGNAL`) or the partial count;
-  otherwise pushes what fits (files with the first chunk) and blocks for the rest. Seqpacket:
-  over the capacity `EMSGSIZE`, otherwise waits until the whole packet fits. Datagram: after
-  `SHUT_WR` `EPIPE`; dead or closed target `ECONNREFUSED` (a dead connected peer keeps failing
-  this way); a target connected to another socket `EPERM`; over the capacity `EMSGSIZE`; blocks
-  for room (bytes only, no queue-length limit).
+- Stream send: a destination address is `EISCONN` (`EOPNOTSUPP` unconnected; seqpacket ignores
+  it); peer gone → `EPIPE` + `SIGPIPE` (unless `MSG_NOSIGNAL`) or the partial count; otherwise
+  pushes what fits (files with the first chunk) and blocks for the rest. Seqpacket: over the
+  capacity `EMSGSIZE`, otherwise waits until the whole packet fits. Datagram (never `SIGPIPE`):
+  after `SHUT_WR` `EPIPE`; dead or closed target `ECONNREFUSED` (a dead connected peer keeps
+  failing this way); a target connected to another socket `EPERM`; a target shut down for reading
+  `EPIPE`; over the capacity `EMSGSIZE`; blocks for room (bytes only, no queue-length limit).
 - Stream receive merges packets in order, stopping after the first packet with files and before a
   packet whose credentials differ (even without `SO_PASSCRED`); a read of nothing returns 0 at
   once when something is queued, taking the first message's files (blocking or `EAGAIN` on an
@@ -133,7 +134,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   uid/gid 65534 without a peer, including listeners); others `ENOPROTOOPT`.
 - Readiness: `POLLIN` when data or EOF is readable, `POLLOUT` when the queue is under a quarter of
   the capacity (or the peer is gone, so writers get `EPIPE`), `POLLRDHUP`/`POLLHUP` from shutdown
-  state (`POLLHUP` only on stream and seqpacket sockets), never `POLLERR`; listeners are readable with pending connections. `FIONREAD`: complete
+  state (a datagram socket's `POLLHUP` once both directions are shut), never `POLLERR`; listeners are readable with pending connections. `FIONREAD`: complete
   stream bytes, the next packet's length for seqpacket/datagram, 0 on listeners; `SIOCOUTQ` is not
   implemented.
 - `/proc/net/unix`: sockets from fd tables plus in-flight ones, filtered by the reader's namespace;
@@ -180,11 +181,10 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 - **No `ECONNRESET`:** closing a socket with unread data (or a listener with pending connections)
   gives the peer only EOF and `EPIPE`; Linux sets `ECONNRESET` on the peer (its next read,
   `SO_ERROR` and `POLLERR`). `SO_ERROR` is always 0 and `POLLERR` never appears.
-- **Datagram sends raise `SIGPIPE`:** after `SHUT_WR` a datagram send raises `SIGPIPE` (ignoring
-  `MSG_NOSIGNAL`); Linux never sends `SIGPIPE` for datagram sends. A connected datagram socket
-  whose peer died keeps failing with `ECONNREFUSED` and keeps the stale peer (Linux disconnects
-  after the first error, then `ENOTCONN`); datagram connect and connected sends skip Linux's
-  may-send `EPERM` check.
+- **Connected datagram sends after the peer died:** a connected datagram socket whose peer died
+  keeps failing with `ECONNREFUSED` and keeps the stale peer (Linux disconnects after the first
+  error, then `ENOTCONN`); datagram connect and connected sends skip Linux's may-send `EPERM`
+  check.
 - **Stream reads split and merge at the wrong places:** reads stop at a change of sender
   credentials even without `SO_PASSCRED` (Linux merges), while `MSG_WAITALL` joins data from
   different writers across iterations and reports the first one's credentials even with
@@ -207,15 +207,6 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   getsockopt; buffer sizes are fixed at 212992, so `SO_SNDBUF`/`SO_RCVBUF` (and their `FORCE`
   forms) change nothing, a small send buffer does not make writes block and a larger one does
   not unblock them.
-- **Datagram sends ignore the receiver's read shutdown:** after the receiving socket does
-  `shutdown(SHUT_RD)`, datagrams to it are still queued and the send succeeds, where Linux 6.1
-  fails them with `EPIPE` (without `SIGPIPE`), so senders never learn that the peer stopped
-  reading.
-- **Datagram sockets never poll `POLLHUP`:** after `SHUT_RDWR` a datagram socket reports
-  `POLLIN|POLLOUT|POLLRDHUP` without the `POLLHUP` of Linux's `unix_dgram_poll`, so an event loop
-  waiting only for hangups on a datagram socket never wakes.
-- **Stream sends ignore a destination address:** sendto/sendmsg with an address on a stream socket
-  sends to the connected peer, where Linux fails with `EISCONN` (`EOPNOTSUPP` when unconnected).
 - **Credentials are attached to messages sent without `SO_PASSCRED`:** every message records the
   sender's pid, uid and gid, so a receiver that turns `SO_PASSCRED` on later gets real credentials
   for data sent earlier, where Linux delivers pid 0 and uid/gid 65534 for them (Linux attaches

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order, timeouts; blocking connect last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind's family checks; dump datagram size; UDP read shutdown; accept order, timeouts; blocking connect; raw rebinds last)
 
 ## Responsibilities
 
@@ -390,9 +390,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **Odd destinations reach the host unchecked:** sendto hands a guest address the layer does not
   understand to the host socket as is, so the host kernel's own checks answer instead of Linux
   6.1's; under AppArmor that is `EAFNOSUPPORT` for a bogus family where Linux says `EINVAL`.
-- **A raw socket cannot be bound again:** Linux's `raw_bind` lets a raw socket be bound any number
-  of times; the host ping socket that emulates a raw ICMP socket refuses a second bind with
-  `EINVAL`.
+- **A raw socket cannot be bound to another address:** Linux's `raw_bind` lets a raw socket be
+  bound any number of times; the host ping socket that emulates a raw ICMP socket refuses a second
+  bind, so binding it again succeeds only for the address it already has (`EINVAL` otherwise).
 
 ## Open questions
 

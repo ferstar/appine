@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits; futex keys, id-map openers last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, deadlines; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids, #! depth, stops; eventfd waits; futex keys, id-map openers; sched_setattr, kcmp last)
 
 ## Responsibilities
 
@@ -380,10 +380,15 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - nice, CPU affinity and I/O priority are per thread and applied to the host thread; raising
   priority floors at host nice -4 (never above Android's display threads); `SCHED_IDLE` maps to host
   nice 19; real-time policies are only recorded; a real-time I/O class becomes best-effort on the
-  host. `sched_setattr` takes Linux 6.1's flags: `SCHED_FLAG_KEEP_POLICY`/`KEEP_PARAMS` keep the
-  current policy or parameters, the utilization clamps are checked against 1024 and each other
-  (not the current values) and only recorded per thread (copied at clone, reset by `SCHED_RESET_ON_FORK`, read back by
-  `sched_getattr`), and the deadline flags are accepted unused.
+  host. `sched_setattr` takes Linux 6.1's flags: `SCHED_FLAG_KEEP_POLICY` keeps the current policy,
+  `SCHED_FLAG_KEEP_PARAMS` changes neither parameters nor policy (only reset-on-fork and the
+  clamps), `SCHED_RESET_ON_FORK` inside the policy is `EINVAL`, a nice value beyond `RLIMIT_NICE`
+  is `EPERM`, and only `SCHED_OTHER` and `SCHED_BATCH` take the nice value (`SCHED_IDLE` keeps the
+  thread's); the utilization clamps are checked against 1024 and, each given or current, against
+  each other, and only recorded per thread (copied at clone, reset by `SCHED_RESET_ON_FORK`, read
+  back by `sched_getattr`); the deadline flags are accepted unused. Without `CAP_SYS_NICE`,
+  leaving `SCHED_IDLE` needs the `RLIMIT_NICE` that allows the current nice value, and
+  reset-on-fork cannot be cleared (`EPERM`, for sched_setscheduler too).
 - Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` returns at once.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
@@ -492,9 +497,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.
-- **`kcmp(KCMP_IO)` always compares equal:** threads have an I/O context (`Task::ioprio`, shared
-  under `CLONE_IO`), but kcmp does not compare it, so two threads with different contexts compare
-  as the same, unlike Linux.
 - **The ELF loader disagrees with Linux on unusual program headers:** an executable with no
   `PT_LOAD` segment, or whose program header table lies outside every loaded segment and has no
   `PT_PHDR`, fails execve with `ENOEXEC`, where Linux 6.1 execs it (with `AT_PHDR` 0) and the new
@@ -507,13 +509,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   interpreter that is not an aarch64 ELF is `ENOEXEC` where Linux returns `ELIBBAD`. Only
   hand-made ELFs and unusual linker-script output are affected (gVisor's `exec_binary_test` builds
   its ELFs with the headers outside the only `PT_LOAD`, so most of it fails here).
-- **`sched_setattr` departs from `__sched_setscheduler` in four details:** `SCHED_RESET_ON_FORK`
-  inside `sched_policy` is accepted (Linux: `EINVAL`, not a valid policy); the clamps are compared
-  with each other only when both are given, not with the thread's current ones, so a minimum above
-  the current maximum is stored; `SCHED_FLAG_KEEP_PARAMS` keeps the parameters but still switches
-  the policy (Linux leaves both); and a nice value beyond `RLIMIT_NICE` returns setpriority's
-  `EACCES` instead of `EPERM`. Tools that set clamps one at a time or keep the parameters see
-  different results from Linux.
 
 ## Open questions
 

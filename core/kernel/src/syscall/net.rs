@@ -211,6 +211,18 @@ pub(super) fn socketpair(
 
 // ---- Binding, listening, connecting, accepting ----
 
+/// Whether two host socket addresses name the same address (family and address, not the port).
+fn same_host(a: &[u8], b: &[u8]) -> bool {
+    match (a.get(..2), b.get(..2)) {
+        (Some(fa), Some(fb)) if fa == fb => match u16::from_le_bytes([fa[0], fa[1]]) as i32 {
+            AF_INET => a.get(4..8) == b.get(4..8),
+            AF_INET6 => a.get(8..24) == b.get(8..24),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
     let (sock, _) = socket_of(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
@@ -347,6 +359,12 @@ pub(super) fn bind(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResult {
                     s.lease = Some(lease);
                     s.local_map = Some((port, host));
                 }
+                // A raw socket may be bound again (raw_bind), but its host ping socket refuses a
+                // second bind: binding the address it already has succeeds without one
+                None if s.icmp.is_some()
+                    && appine_hal::net::sockname(s.fd, false).is_ok_and(|cur| {
+                        port_of(&cur) != Some(0) && same_host(&cur, &host_addr)
+                    }) => {}
                 None => appine_hal::net::bind(s.fd, &host_addr).map_err(Errno)?,
             }
             if s.net.is_some() {

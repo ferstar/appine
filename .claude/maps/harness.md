@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; flag values; tarballs by version; Starnix and gVisor cases; image export; CI split; AppArmor; stop signals; no macOS host last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; flag values; tarballs by version; Starnix and gVisor cases; image export; CI split; AppArmor; stop signals; no macOS host; unfinished survey stores last)
 
 ## Responsibilities
 
@@ -210,7 +210,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ### Survey and crash
 
-- `survey` keeps a store with about 40 packages (network needed to build it); each workload script
+- `survey` keeps a store with about 40 packages (network needed to build it; one whose creation did
+  not finish, marked by `<store>.partial`, is made again); each workload script
   runs under `APPINE_LOG=1` and a timeout, and one line reports exit code, time, the count of
   internal errors and the unimplemented syscalls seen; `-n image` runs the same scripts in docker
   for comparison; with no names only the top-level scripts run (`glibc/`, `suites/`, `ai/` by name;
@@ -309,9 +310,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
   stops `appine-run` itself), line-buffers input and
   echoes it while the guest echoes into the pipe; the size stays 24×80.
-- **The survey keeps a half-built store.** Only the directory's existence is checked, so a failed
-  `apk add` leaves a store the next run uses as is.
-- LTP's BUG check greps a log that also holds the guest's output (theoretical misclassification).
 - **The `starnix-*` and `gvisor-*` cases pass vacuously without the built tests:** locally they
   only print that the tests are missing until `build-starnix-tests` / `build-gvisor-tests` has run
   (they need the network and about four and ten minutes); CI's `full.yml` builds them.

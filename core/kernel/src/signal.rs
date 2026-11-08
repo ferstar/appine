@@ -177,6 +177,16 @@ pub(crate) enum InfoFields {
     /// Given by a tracer with PTRACE_SETSIGINFO: the part of `siginfo_t` after si_code, delivered
     /// as is.
     Raw([u8; 112]),
+    /// Given by the sender (rt_sigqueueinfo, rt_tgsigqueueinfo, pidfd_send_signal): `si_errno`
+    /// and the fields Linux's `kernel_siginfo` keeps, delivered as given apart from si_pid and
+    /// si_uid, which are converted like a sigqueue's.
+    User {
+        errno: i32,
+        pid: Tid,
+        uid: u32,
+        /// Bytes 24 to 48 of `siginfo_t` (`si_value` first).
+        rest: [u8; 24],
+    },
 }
 
 /// The siginfo attached to a pending signal.
@@ -286,7 +296,8 @@ impl SigInfo {
         match self.fields {
             InfoFields::Kill { uid, .. }
             | InfoFields::Child { uid, .. }
-            | InfoFields::Queue { uid, .. } => Some(uid),
+            | InfoFields::Queue { uid, .. }
+            | InfoFields::User { uid, .. } => Some(uid),
             _ => None,
         }
     }
@@ -305,7 +316,8 @@ impl SigInfo {
         let v = target.uid_out(self.kuid);
         if let InfoFields::Kill { uid, .. }
         | InfoFields::Child { uid, .. }
-        | InfoFields::Queue { uid, .. } = &mut self.fields
+        | InfoFields::Queue { uid, .. }
+        | InfoFields::User { uid, .. } = &mut self.fields
         {
             *uid = v;
         }
@@ -316,7 +328,8 @@ impl SigInfo {
     fn hide_sender(&mut self) {
         if let InfoFields::Kill { pid, .. }
         | InfoFields::Child { pid, .. }
-        | InfoFields::Queue { pid, .. } = &mut self.fields
+        | InfoFields::Queue { pid, .. }
+        | InfoFields::User { pid, .. } = &mut self.fields
         {
             *pid = 0;
         }
@@ -372,6 +385,17 @@ impl SigInfo {
                 b[28..32].copy_from_slice(&arch.to_le_bytes());
             }
             InfoFields::Raw(rest) => b[16..].copy_from_slice(&rest),
+            InfoFields::User {
+                errno,
+                pid,
+                uid,
+                rest,
+            } => {
+                b[4..8].copy_from_slice(&errno.to_le_bytes());
+                b[16..20].copy_from_slice(&pid.to_le_bytes());
+                b[20..24].copy_from_slice(&uid.to_le_bytes());
+                b[24..48].copy_from_slice(&rest);
+            }
         }
         b
     }
