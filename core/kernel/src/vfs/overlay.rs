@@ -321,38 +321,6 @@ pub(crate) fn whiteout_at(store: &Store, dir: Ino, name: &[u8]) -> Result<bool, 
     }
 }
 
-/// Copies regular file `from`'s data (`len` bytes) into the empty file `to`, leaving holes where
-/// the host reports them (6.1's `ovl_copy_up_data` skips them too).
-fn copy_data(from: &std::fs::File, to: &std::fs::File, len: u64) -> Result<(), Errno> {
-    use std::os::fd::AsRawFd;
-    const SEEK_DATA: i32 = 3;
-    const SEEK_HOLE: i32 = 4;
-    let (i, o) = (from.as_raw_fd(), to.as_raw_fd());
-    let mut pos = 0;
-    while pos < len {
-        let data = match appine_hal::lseek(i, pos as i64, SEEK_DATA) {
-            Ok(data) => data,
-            Err(e) if e == Errno::ENXIO.0 => break,
-            // A host that cannot tell has data everywhere
-            Err(_) => pos,
-        };
-        let hole = appine_hal::lseek(i, data as i64, SEEK_HOLE)
-            .unwrap_or(len)
-            .min(len);
-        let mut at = data;
-        while at < hole {
-            let chunk = (hole - at).min(1 << 30) as usize;
-            match appine_hal::copy_file(i, at, o, at, chunk).map_err(Errno)? {
-                0 => break,
-                n => at += n as u64,
-            }
-        }
-        pos = hole.max(data + 1);
-    }
-    to.set_len(len)
-        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
-}
-
 /// What a copy-up copies (6.1's `ovl_copy_up_flags`): a file about to be truncated to 0 by
 /// `O_TRUNC` needs no data.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -617,10 +585,13 @@ impl Overlays {
             let perm = st.mode & 0o7777;
             let ino = match st.kind() {
                 mode::S_IFDIR => s.mkdir(dir, &name, perm, st.uid, st.gid)?,
+                // The data is not copied: the upper file shares the lower one's object until
+                // it is written (Store::share), as overlayfs on a filesystem with reflinks
+                // clones it (6.1's ovl_copy_up_data, through vfs_clone_file_range)
                 mode::S_IFREG => {
-                    let (ino, file) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
+                    let (ino, _) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
                     if what == CopyUp::All {
-                        copy_data(&s.open_object(lower, false)?, &file, st.size)?;
+                        s.share(lower, ino)?;
                     }
                     ino
                 }

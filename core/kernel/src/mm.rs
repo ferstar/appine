@@ -239,6 +239,14 @@ impl Vma {
     fn reserved(&self) -> bool {
         self.region.reserved
     }
+
+    /// A shared mapping of store file `ino` through host file `from`, which follows the file when
+    /// its data moves to another host file ([`Mm::file_moving`]).
+    fn moves_with(&self, ino: u64, from: (u64, u64)) -> bool {
+        self.backing == Backing::Shared
+            && self.ino == ino
+            && self.file_id.is_some_and(|(d, i, _)| (d, i) == from)
+    }
 }
 
 /// Whether VMA `b`, starting where `a` ends, is part of the same VMA on Linux. Linux merges
@@ -2842,6 +2850,91 @@ impl Mm {
                 && v.may_write
                 && v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino))
         })
+    }
+
+    /// Whether some mapping points at host file (`dev`, `ino`) (checked before a file's data is
+    /// replaced by another file's, `syscall::fs::clone_range`).
+    pub fn maps_file(&self, dev: u64, ino: u64) -> bool {
+        self.vmas
+            .values()
+            .any(|v| v.file_id.is_some_and(|(d, i, _)| (d, i) == (dev, ino)))
+    }
+
+    /// Store regular file `ino`'s data is moving from host file `from` to one of `len` bytes (the
+    /// inode store gave a file that shared its object one of its own, holding the same data up to
+    /// `len`): the pages of its shared mappings of `from` past `len` leave the page table first, as
+    /// for truncation, so the new host mapping is never touched past its end. Mappings of `from`
+    /// for other files are left alone. Returns whether anything changed; if so a shootdown is
+    /// needed ([`Mm::sync`]) before [`Mm::file_moved`].
+    pub fn file_moving(&mut self, ino: u64, from: (u64, u64), len: u64) -> bool {
+        let mut changed = false;
+        for (&s, v) in self.vmas.iter_mut() {
+            let Some((_, _, offset)) = v.file_id.filter(|_| v.moves_with(ino, from)) else {
+                continue;
+            };
+            let extent = len
+                .saturating_sub(offset)
+                .next_multiple_of(PAGE_SIZE)
+                .min(v.len);
+            if extent >= v.file_len {
+                continue;
+            }
+            // unmap fails only on invalid arguments, and this range comes from a VMA
+            let _ = self.mmu.unmap(s + extent, v.file_len - extent);
+            if v.prot & prot::EXEC != 0 {
+                self.code_ranges.push((s + extent, v.file_len - extent));
+            }
+            v.file_len = extent;
+            changed = true;
+        }
+        self.dirty |= changed;
+        changed
+    }
+
+    /// Every address space has gone through [`Mm::file_moving`]: the shared mappings of store
+    /// file `ino` still on host file `from` map `to` (host file `to_id`) instead, over the same
+    /// host addresses, so the page table and the TLBs stay valid and the mappings show what is
+    /// written to the file from now on, as Linux's mappings of the inode do. A host region shared
+    /// with other pieces or address spaces (splits, fork) is mapped once here, and again,
+    /// harmlessly, for another address space still pointing at `from`.
+    pub fn file_moved(
+        &mut self,
+        ino: u64,
+        from: (u64, u64),
+        to: &Rc<OwnedFd>,
+        to_id: (u64, u64),
+    ) -> Result<(), Errno> {
+        use std::os::fd::AsRawFd;
+        let mut done: Vec<*const HostRegion> = Vec::new();
+        for v in self.vmas.values_mut() {
+            let Some((_, _, offset)) = v.file_id.filter(|_| v.moves_with(ino, from)) else {
+                continue;
+            };
+            let region = &v.region;
+            if !done.contains(&Arc::as_ptr(region)) {
+                // The region starts at the host page holding the file offset its first piece was
+                // mapped from
+                let inside = v.host.as_ptr() as u64 - region.base.as_ptr() as u64;
+                let at = offset.checked_sub(inside).ok_or(Errno::EINVAL)?;
+                // SAFETY: the region is a host file mapping owned by these VMAs
+                unsafe {
+                    appine_hal::map_file_over(
+                        region.base,
+                        region.len,
+                        to.as_raw_fd(),
+                        at,
+                        v.may_write,
+                    )
+                }
+                .map_err(Errno)?;
+                done.push(Arc::as_ptr(region));
+            }
+            v.file_id = Some((to_id.0, to_id.1, offset));
+            if let Some((fd, _)) = &mut v.file {
+                *fd = to.clone();
+            }
+        }
+        Ok(())
     }
 
     /// Host file (`dev`, `ino`) was truncated to `size` bytes: pages past the new end in the VMAs

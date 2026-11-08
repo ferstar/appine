@@ -78,8 +78,9 @@ import two
 print("import", one.x, two.x)
 PY
 
-# FICLONE: the order of the checks and the error codes; when the filesystem does not support
-# reflink, Path.copy falls back to an ordinary copy
+# FICLONE: the order of the checks and the error codes; a clone has the source's data where the
+# filesystem has reflink (Appine's store) and is EOPNOTSUPP where it has none (ext4 natively), and
+# then Path.copy falls back to an ordinary copy
 python3 - <<'PY'
 import errno, fcntl, os, pathlib, struct
 FICLONE, FICLONERANGE = 0x40049409, 0x4020940d
@@ -89,6 +90,14 @@ def err(f):
         return "ok"
     except OSError as e:
         return errno.errorcode[e.errno]
+def clone(f):
+    try:
+        f()
+    except OSError as e:
+        return "cloned or EOPNOTSUPP" if e.errno == errno.EOPNOTSUPP else errno.errorcode[e.errno]
+    if open("/tmp/ts/dst").read() != "cloned data\n":
+        return "wrong data"
+    return "cloned or EOPNOTSUPP"
 with open("/tmp/ts/src", "w") as f:
     f.write("cloned data\n")
 src = os.open("/tmp/ts/src", os.O_RDONLY)
@@ -101,11 +110,12 @@ pipe = os.pipe()[0]
 # accept it, EBADF)
 path_src = os.open("/tmp/ts/src", os.O_PATH)
 path_dst = os.open("/tmp/ts/dst", os.O_PATH)
-for name, fd, arg in [("file", dst, src), ("rdonly", rdonly, src), ("append", append, src),
+print("ficlone file", clone(lambda: fcntl.ioctl(dst, FICLONE, src)))
+for name, fd, arg in [("rdonly", rdonly, src), ("append", append, src),
                       ("dir", dst, directory), ("pipe", dst, pipe), ("badfd", dst, 999),
                       ("path-src", dst, path_src), ("path-dst", path_dst, src)]:
     print("ficlone", name, err(lambda: fcntl.ioctl(fd, FICLONE, arg)))
-print("ficlonerange", err(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", src, 0, 0, 0))))
+print("ficlonerange", clone(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", src, 0, 0, 0))))
 print("ficlonerange path-src", err(lambda: fcntl.ioctl(dst, FICLONERANGE, struct.pack("qQQQ", path_src, 0, 0, 0))))
 print("fioclex path", err(lambda: fcntl.ioctl(path_src, 0x5451)))
 if hasattr(pathlib.Path, "copy"):

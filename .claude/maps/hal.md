@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE`; `host_swaps`; `thread_activity` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate`, `MADV_REMOVE`; `host_swaps`; `thread_activity`; `map_file_over` last)
 
 ## Responsibilities
 
@@ -55,7 +55,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 
 - Memory: `map_anonymous(len, reserve)`, `map_inaccessible`, `unmap`, `discard`, `remove`,
   `map_file`,
-  `map_file_read_only`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
+  `map_file_read_only`, `map_file_over`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
   `touched_pages`, `has_private_pages`, `cachestat`.
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`,
   `host_swaps`, `statvfs`,
@@ -90,7 +90,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   only by the kernel's bug-simulation test hook).
 - `map_file` maps shared or private file ranges (private mappings are always RW copy-on-write;
   only shared read-only ones are read-only), rounding the offset down to the host page (16K on some
-  devices) and the length up; `map_file_read_only` serves shared read-only mappings.
+  devices) and the length up; `map_file_read_only` serves shared read-only mappings;
+  `map_file_over` maps a file shared over an existing host range with `MAP_FIXED`, replacing the
+  old mapping in one step (the kernel moves a shared file mapping to another object this way).
 - `discard` is `MADV_DONTNEED` and `remove` `MADV_REMOVE` (the host punches the hole in the file or
   shared memory behind a writable shared mapping), both on host-page-aligned ranges; residency
   comes from `mincore` (`resident_pages`, `page_residency`)

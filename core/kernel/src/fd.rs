@@ -81,6 +81,10 @@ pub enum FileKind {
         ino: Ino,
         /// The host object file.
         file: File,
+        /// Opened for writing while the file was held (it shares its object with other files,
+        /// `Store::share`): `file` is then only open for reading, and the first change through
+        /// this description gives the file an object of its own (`syscall::fs::prepare_write`).
+        cow: bool,
     },
     /// A directory. Its entries are snapshotted on the first getdents and dropped on an lseek to
     /// 0.
@@ -185,6 +189,10 @@ pub struct OpenFile {
     /// copied-up one (`syscall::fs::follow_copy_up`): kept until the file is closed, since a read
     /// without the BKL may still be using it.
     pub ovl_lower: Option<std::fs::File>,
+    /// The objects a regular file was opened with before its data moved to another object
+    /// (`syscall::fs::rehome`): kept until the file is closed, as for
+    /// [`OpenFile::ovl_lower`].
+    pub retired: Vec<std::fs::File>,
     /// `F_SETOWN_EX`'s (type, pid) and `F_SETSIG`'s signal: with `O_ASYNC`, whom to signal on
     /// readiness and with which signal (0 is SIGIO); they are also signalled when a file lease is
     /// broken.
@@ -246,6 +254,7 @@ impl OpenFile {
             mnt: crate::vfs::ROOT_MOUNT,
             ovl: None,
             ovl_lower: None,
+            retired: Vec::new(),
             owner: (0, 0),
             owner_ids: (0, 0),
             sig: 0,

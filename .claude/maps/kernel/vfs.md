@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode; AIO; `/proc/locks`; FIONREAD on regular files, misses and driverless devices counted last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners, file caps; loop devices; timerfd; test-suite findings; mounts, propagation; splice; holes, seeks, renames; overlayfs; AIO; `/proc/locks`; FIONREAD, counted misses; clones last)
 
 ## Responsibilities
 
@@ -19,6 +19,8 @@ inode store and the synthetic filesystems). It provides:
   overlayfs instances, their nodes and copy-up;
 - fd tables and open file descriptions, open flags, `fcntl`, and data I/O on regular files (host
   `pread`/`pwrite` without the BKL), `sendfile`/`copy_file_range`/`splice`;
+- clones (FICLONE, FICLONERANGE, whole-file copy_file_range sharing the store's objects) and
+  giving a shared file an object of its own before anything changes it;
 - namespace and metadata syscalls (stat family, statfs, chmod/chown/utimensat/truncate/access,
   mkdir/mknod/unlink/rename/link/symlink, getdents64, getcwd/chdir) and extended attributes;
 - in-memory pipes and FIFOs, advisory locks (`flock`, POSIX, OFD) and leases, device nodes and
@@ -69,9 +71,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   display path, dentry, mount, owner/signal for `F_SETOWN*`, epoll/fasync bookkeeping, inotify
   `Opened` record, `pos_busy`, lock ownership, open_tree namespace, memfd data; `ovl`, the
   overlay node of a regular file, device or FIFO opened through an overlay (the kind holds the
-  store inode behind it).
+  store inode behind it); `retired`, the host handles it had before its file moved to another
+  object, kept until it closes.
 - `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Pty, Socket, Epoll, EventFd,
-  TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc.
+  TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc. Regular carries `cow`:
+  opened for writing while its file was held (sharing an object, kernel/store), so its host handle
+  only reads and its first change gives the file an object of its own.
 - `IoPath` — the route one I/O call takes, chosen so no borrow of the open file is held during I/O.
 - `Pipe` / `PipeEnd` — buffer, capacity, reader/writer counts and open counters; FIFOs keyed by
   inode in a weak map.
@@ -105,7 +110,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `pipe2`,
   `lseek`, `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
   `copy_file_range`, `splice`/`tee`/`vmsplice`, `ftruncate`, `fallocate`, `memfd_create`,
-  `timerfd_*`; ioctls `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`/`FIONREAD`, random ioctls, the
+  `timerfd_*`; ioctls `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`/`FIONREAD`/`FICLONE`/
+  `FICLONERANGE`, random ioctls, the
   block and loop ioctls on loop devices and the `LOOP_CTL_*` ioctls on `/dev/loop-control`.
 - **Metadata**: `newfstatat`/`fstat`/`statx`, `statfs`/`fstatfs`, `fchmod*`, `fchown*`,
   `utimensat`, `truncate`, `faccessat`/`faccessat2`, `umask`, `mkdirat`, `mknodat`, `unlinkat`,
@@ -122,7 +128,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **AIO**: `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents`;
   `aio_released` (execve, group exit).
 - **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps),
-  `FdTable::with_host_stdio` (boot).
+  `FdTable::with_host_stdio` (boot); `prepare_write` and `make_private` (before a regular file
+  changes, also from mmap).
 
 ## Data flow / lifecycle
 
@@ -341,8 +348,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `userxattr`) are `EOPNOTSUPP` to get or set (6.1's `ovl_own_xattr_get`/`_set`) and left out of
   listings. statfs reports overlayfs's magic with the store's capacity.
 - Copy-up (`Overlays::upper_of`, 6.1's `ovl_copy_up`): the parent directories first, then the
-  node as its topmost lower inode is (directory, file with its data and holes, symlink or special
-  file), with its mode (set-id bits included), owner, attributes other than the overlay's own and
+  node as its topmost lower inode is (directory, a regular file sharing the lower one's object as
+  6.1 clones it on filesystems with reflink, symlink or special file), with its mode (set-id bits included), owner, attributes other than the overlay's own and
   times, in one store transaction; the parent's times are put back. A file opened with `O_TRUNC`
   or truncated to 0 is copied without its data. chmod, chown and utimensat (`Attrs::Overlay`),
   setxattr and removexattr, truncate and opening a regular file for writing check `EROFS` and
@@ -370,8 +377,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` links give the
   overlay node, and fstat shows the node's inode number. A file opened before it was copied up
   switches to the upper object on its next read, fstat, lseek or copy out of it
-  (`follow_copy_up`, 6.1's `ovl_real_fdget`), keeping the lower object open until it is closed
-  (`OpenFile::ovl_lower`). Locks key on the node (`lock_ino`), leases on the store inode behind it.
+  (`follow_copy_up`, 6.1's `ovl_real_fdget`; a writable one marked `cow` while the upper file is
+  held), keeping the lower object open until it is closed (`OpenFile::ovl_lower`). Locks key on the node (`lock_ino`), leases on the store inode behind it.
 
 ### fd tables and open files
 
@@ -425,7 +432,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `O_TRUNC` on ro `EROFS`, else it adds `MAY_WRITE`; devices on nodev `EACCES`; permission; cgroup
   BPF device filter; `O_NOATIME` by a non-owner without `CAP_FOWNER` `EPERM`; write on ro
   `EROFS`; writing a file some task is executing `ETXTBSY`; break leases; `O_TRUNC` removes
-  set-id bits and truncates, with `O_RDONLY` too (through a writable handle of its own). Then dispatch by type: regular files open the host object, character
+  set-id bits and truncates, with `O_RDONLY` too (through a writable handle of its own), a held
+  file first getting an empty object of its own; any other open for writing of a held file gets a
+  read-only handle on the shared object and is marked `cow` (as is a reopen of one through
+  `/proc/<pid>/fd`). Then dispatch by type: regular files open the host object, character
   devices by device number (see Devices), block devices as loop devices (major 7; others `ENXIO`),
   FIFOs the shared pipe, sockets `ENXIO`.
 - Pseudo nodes: permission from the synthetic stat (`O_TRUNC` asking for write), ptrace checks
@@ -481,6 +491,30 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   the pipe's `O_NONBLOCK`. Room for these is the free space in whole pages, as Linux counts free
   page buffers.
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
+- Before a regular file changes (a write, through `write_bytes` or the host copy; ftruncate,
+  truncate and `O_TRUNC`; fallocate; a shared mapping from a descriptor open for writing),
+  `prepare_write` or `make_private` gives a held file an object of its own (kernel/store's
+  unshare), before set-id bits are removed: the copy (or what a truncation keeps) is made with the
+  BKL released while the file is in `Kernel::unsharing`, where other changes to it wait on the lock
+  channel. Then `rehome` gives every description of the file (fd tables, AF_UNIX messages in
+  flight, loop backing files) a handle on its object as it is now, read-only and `cow` while still
+  held, retires the old handles and forgets the cached executable. When the file moved to a new
+  object, its shared mappings move too (`move_mappings`, through kernel/mm's `file_moving` and
+  `file_moved`), or all stay on the old object when some address space is busy.
+- Clones: a copy_file_range of a whole non-empty input from offset 0 into an output no longer than
+  it, and FICLONE or FICLONERANGE doing the same, share the input's object (`try_share`), unless
+  either is a memfd, opened through an overlay or in tmpfs, the input is deleted, open for writing
+  in this kernel by a description not marked `cow`, or writably mapped shared, or the output is
+  mapped, sealed or being unshared; then they copy. The output's set-id bits go first and its
+  descriptions move to the shared object (`rehome`); copy_file_range returns the whole length at
+  once and advances the positions. FICLONE and FICLONERANGE check in 6.1's order: different mounts
+  (memfds on their own) `EXDEV`, directories `EISDIR`, other non-regular files `EINVAL`, modes and
+  `O_APPEND` `EBADF`, memfds, overlay and tmpfs files `EOPNOTSUPP` (no remap_file_range), negative
+  or wrapping ranges `EINVAL`; a length of 0 reaches the input's end (nothing to do at the end,
+  `EINVAL` past it); offsets not block-aligned, an input offset at or past the end, a length cut by
+  the end or `RLIMIT_FSIZE` (at or past it `SIGXFSZ` and `EFBIG`) or not aligned short of the end,
+  and ranges overlapping in one file are `EINVAL`. Any other range is copied. `FIDEDUPERANGE` is
+  `EOPNOTSUPP` for regular files.
 - readv and writev follow Linux's `read_iter`/`write_iter` split: pipes, terminals and sockets
   (and eventfd reads) do one read or write over all the iovecs (one read of up to 64 KiB scattered
   in order; writes in 64 KiB pieces across iovec boundaries until one is short; sockets through
@@ -776,7 +810,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (`permission`, `owns`, `capable_wrt`, `new_owner`, `FileCaps`); `appine_hal` (pread, pwrite,
   poll, lseek, fsync, `copy_file`, `statvfs`, `memory_info`, `fill_random`); the kernel's wake
   objects and `Cx::unlocked`; signals (`SIGPIPE`, `SIGIO`, `F_SETSIG`); `bpf::check_device`;
-  `kernel/ipc` (mqueue objects); `cgroup`; `pidns`/`nsproxy`; for AIO, `kernel/poll` (`poll_once`,
+  `kernel/ipc` (mqueue objects); `cgroup`; `pidns`/`nsproxy`; for clones, `kernel/mm`
+  (`writably_maps`, `maps_file`, `file_moving`, `file_moved`) and `kernel/unix` (files in
+  flight); for AIO, `kernel/poll` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, the temporary sigmask) and `kernel/mm` (the context page);
   `kernel/signal`'s `stub` for unimplemented fcntl commands, ioctl requests and devices.
 
@@ -816,6 +852,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   kernels or the host.
 - Every store open allocates an inotify `Opened` record and every rename that moves open files
   scans all open files, even with no watches.
+- A held file's object is shared and must never be written in place: every path that changes a
+  regular file calls `prepare_write` (or `make_private`) first, with no borrow of the open file
+  held, and takes the host fd only afterwards. A `cow` description's handle is read-only, so a
+  path that forgets fails with `EBADF` instead of writing the other files' data.
+- A description's host handle can be replaced (`rehome`, `follow_copy_up`) while a read or write
+  without the BKL still uses the old fd number: old handles are kept until the description closes.
 - Unlocked I/O snapshots the position before releasing the BKL and writes it back afterwards, so
   any other code that moves the position must take `pos_busy` or accept being overwritten.
 - `Node` comparisons in pivot_root's root/cwd rewrite include the mount id, so only tasks in the
@@ -934,11 +976,20 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (a restarted dockerd reuses it). podman warns that `/` is not a shared mount, as it does
   natively without systemd.
 
+- **Private mappings do not follow a file to its own object:** a private mapping made while its
+  file shared an object keeps the shared data in the pages it has not copied after the file is
+  written through another descriptor (Linux shows the writes there). Shared mappings follow,
+  unless an address space was busy at that moment.
+- **Clone fidelity:** FICLONE and FICLONERANGE work on the store although it reports ext4's magic
+  (ext4 has none: the native side of the differential tests says `EOPNOTSUPP`); ranges other than
+  whole files are copied rather than shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a whole-file
+  copy_file_range returns more than Linux's `MAX_RW_COUNT` in one call.
 - **Overlay gaps:** an overlay cannot be a layer (Linux accepts one as a lower layer); inotify on
   overlay nodes never reports; `/proc/<pid>/exe` of a program from an overlay is followed by its
   path; overlay nodes are never freed while mounted, so walking a large tree grows memory; the
-  no-BKL stat never serves paths in an overlay; copy-up copies data with the BKL held, so copying
-  up a large file stalls every process; origins are not recorded (no `trusted.overlay.origin`,
+  no-BKL stat never serves paths in an overlay; a copied-up file shares the lower object, so a
+  change made to the lower layer by another path before the upper file is written shows through
+  it (Linux leaves that undefined); origins are not recorded (no `trusted.overlay.origin`,
   `impure` or shared whiteout inode), so a copied-up file's inode number changes at the next mount
   and a hard link made through the overlay shows the upper inode's number; changes through an
   overlay whose upper layer is on a tmpfs are not counted against that tmpfs's limits; a mapping

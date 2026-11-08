@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping; `process_mrelease`, oom_score, vfork children last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO, shm; `process_mrelease`, oom_score; clones' file mappings last)
 
 ## Responsibilities
 
@@ -158,7 +158,9 @@ dumps and the host abstraction layer (`core/hal`).
 - **Threads and processes**: `add_user`, `remove_user`, `sync` (after every BKL syscall),
   `quiesce`, `generations`, `code_space`, `invalidate_code`, `fork`, `futex_key`, `shared_maps`,
   `id`.
-- **Files**: `file_truncated` (truncate, ftruncate, `O_TRUNC`), `writably_maps` (`F_SEAL_WRITE`),
+- **Files**: `file_truncated` (truncate, ftruncate, `O_TRUNC`), `writably_maps` (`F_SEAL_WRITE`,
+  and a clone's source), `maps_file` (a clone's destination, a deleted shared file's release),
+  `file_moving` and `file_moved` (a store file's data moving to another host object),
   `shared_file_ranges` (msync), `content_version`.
 - **SysV shm**: `SharedMemory::new`, `attach_shm`, `detach_shm`, `shm_attachments`.
 - **Introspection**: `regions`, `resident_in`, `cow_shared`, `residency`, `pagemap`, `size`,
@@ -460,6 +462,13 @@ signals may still be delivered).
   then shorten the host file: no thread can reach the dropped tail through a stale translation, so
   an access there faults into the kernel and gets the guest's `SIGBUS` once the BKL is free. A
   host truncation that then fails leaves the mappings' EOF at the requested length.
+- When a store file that shared its object gets one of its own (`kernel/vfs`'s `make_private`),
+  its shared mappings follow it, picked by store inode and old host file so other files' mappings
+  of the old object stay: `file_moving` first removes, in every address space, the entries past
+  the new object's length (as truncation does) and each changed one syncs; then `file_moved`
+  maps the new object over each of their host regions with `MAP_FIXED` at the same host
+  addresses, so entries and TLBs stay valid, and points the VMAs' file identity and fd at it.
+  Private mappings stay on the old object.
 
 ### Introspection
 
@@ -552,7 +561,7 @@ signals may still be delivered).
   `kernel.rs` (`Cx` stack growth, BKL hooks), `signal.rs` (signal frames).
 - Loader (`loader.rs`), ptrace (`write_force`), futexes (`futex_key`, `translate`, `id` and
   `shared_maps` on the fast path), membarrier (`quiesce`), SysV IPC, `syscall/fs.rs` (truncation, `ETXTBSY` via
-  `exe`, seals).
+  `exe`, seals, clones and files moving to objects of their own).
 - Observers: procfs (`pseudo.rs`), core dumps, rusage, cgroups.
 - `Machine` (initial `FileMaps`, `trim_memory`, the memory limit at start).
 - OOM killer: the timer thread (`check`, `unmap_code_views`), the run loop (`resume_checks`), the

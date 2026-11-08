@@ -475,6 +475,30 @@ fn core_files_have_the_linux_layout() {
 }
 
 #[test]
+fn clones_share_data_until_written() {
+    // FICLONE, FICLONERANGE and whole-file copy_file_range on store files (tests/guest/reflink.c):
+    // a clone keeps its contents when either side is written, truncated or mapped shared, its
+    // shared mappings made before follow it, it keeps its own times and outlives its source; the
+    // differential test cannot compare this, ext4 having no reflink
+    let (Some(store), Some(program)) = (store(), build_static("reflink")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/reflink && chmod +x /tmp/reflink && /tmp/reflink";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn unhandled_exceptions_are_reported_in_the_kernel_log() {
     // With debug.exception-trace set, each kind of synchronous exception that ends a process
     // unhandled is reported in the kernel log as arm64 Linux reports it, except under a handler

@@ -299,6 +299,13 @@ impl ExeCache {
         Ok(exe)
     }
 
+    /// Inode `ino`'s data moved to another object (`syscall::fs::rehome`): what was read from the
+    /// old one must not be used again, although that object did not change.
+    pub fn forget(&self, ino: u64) {
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|c| c.ino != ino);
+    }
+
     /// The identity and content version of host file `fd`; None when there is no trustworthy
     /// version.
     fn version(fd: i32) -> Option<(u64, u64, u64, u64)> {

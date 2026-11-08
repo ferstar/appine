@@ -111,10 +111,17 @@ pub(super) fn mmap(
         if low {
             return Err(Errno::EPERM);
         }
+        // A shared mapping that can be made writable writes the file's object in place, and a
+        // mapping does not follow a file to another object: a held file gets its own first
+        if kind == flags::MAP_SHARED && file.borrow().readable() && file.borrow().writable() {
+            super::fs::prepare_write(cx, &file, None)?;
+        }
         let f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
-            FileKind::Regular { file: host, ino } => {
+            FileKind::Regular {
+                file: host, ino, ..
+            } => {
                 if !f.readable() {
                     return Err(Errno::EACCES);
                 }

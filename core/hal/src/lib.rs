@@ -130,6 +130,41 @@ pub fn map_file(
     map_file_with(fd, offset, len, prot, flags)
 }
 
+/// Maps `[offset, offset + len)` of host file `fd` shared over the mapping at `base` (`offset`
+/// aligned to the host page), in one step: `MAP_FIXED` replaces the old mapping atomically, so a
+/// thread touching the range meanwhile sees the old file or the new one, never a hole.
+///
+/// # Safety
+///
+/// `[base, base + len)` is a mapping of this process that nothing uses as other memory.
+pub unsafe fn map_file_over(
+    base: NonNull<u8>,
+    len: usize,
+    fd: i32,
+    offset: u64,
+    writable: bool,
+) -> Result<(), i32> {
+    let prot = if writable {
+        libc::PROT_READ | libc::PROT_WRITE
+    } else {
+        libc::PROT_READ
+    };
+    let ptr = unsafe {
+        libc::mmap(
+            base.as_ptr().cast(),
+            len,
+            prot,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            offset as libc::off_t,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 /// A read-only private mapping: shared by several address spaces and writable by none
 /// ([`map_file`]).
 pub fn map_file_read_only(fd: i32, offset: u64, len: usize) -> Result<FileMapping, i32> {

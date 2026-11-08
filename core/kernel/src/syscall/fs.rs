@@ -878,7 +878,10 @@ fn reopen(
     let accmode = flags & oflags::O_ACCMODE;
     let file = cx.view(vfs).open_file(pid, fd).ok_or(Errno::ENOENT)?;
     let f = file.borrow();
-    if let FileKind::Regular { ino, file: host } = &f.kind {
+    if let FileKind::Regular {
+        ino, file: host, ..
+    } = &f.kind
+    {
         let ino = *ino;
         let st = vfs.store().stat_open(ino, host)?;
         let truncate = flags & oflags::O_TRUNC != 0;
@@ -890,8 +893,9 @@ fn reopen(
         // The host fd is always readable, and also writable when originally opened for write: if
         // that suffices, duplicate it (reads and writes are positional, with offsets kept by each
         // open file). Otherwise reopen it through the host's /proc/self/fd; deleted files cannot
-        // be opened that way on filesystems like virtiofs
-        let new = if accmode == oflags::O_RDONLY || f.writable() {
+        // be opened that way on filesystems like virtiofs. A held file's descriptions only read
+        // the shared object (open_store)
+        let new = if accmode == oflags::O_RDONLY || f.writable() || vfs.store().held(ino)? {
             host.try_clone()
         } else {
             std::fs::OpenOptions::new()
@@ -1207,9 +1211,20 @@ fn open_store(
                 let nonblock = flags & oflags::O_NONBLOCK != 0;
                 super::lease::break_leases(cx, ino, write, nonblock, None)?;
             }
+            // A held file shares its object: truncating it first gives it an empty one of its
+            // own; otherwise a description opened for writing gets a read-only handle on the
+            // shared object, and its first change gives the file its own copy (prepare_write)
+            let mut created = created;
+            if flags & oflags::O_TRUNC != 0 && store.held(ino)? {
+                make_private(cx, ino, Some(0))?;
+                if created.is_some() {
+                    created = Some(store.open_object(ino, accmode != oflags::O_RDONLY)?);
+                }
+            }
+            let cow = accmode != oflags::O_RDONLY && store.held(ino)?;
             let file = match created {
                 Some(f) => f,
-                None => store.open_object(ino, accmode != oflags::O_RDONLY)?,
+                None => store.open_object(ino, accmode != oflags::O_RDONLY && !cow)?,
             };
             // Even with O_RDONLY, as on Linux (do_open truncates whatever the access mode),
             // through a writable handle of its own then
@@ -1225,7 +1240,7 @@ fn open_store(
                 target.set_len(0).map_err(host_errno)?;
                 tmpfs_resized(vfs, tmpfs, target);
             }
-            FileKind::Regular { ino, file }
+            FileKind::Regular { ino, file, cow }
         }
         mode::S_IFCHR => match st.rdev {
             // /dev/tty, /dev/console: the caller's controlling terminal
@@ -1571,7 +1586,11 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
     path.extend_from_slice(&name);
     path.extend_from_slice(b" (deleted)");
     let file = OpenFile::with_path(
-        FileKind::Regular { ino, file },
+        FileKind::Regular {
+            ino,
+            file,
+            cow: false,
+        },
         oflags::O_RDWR | oflags::O_LARGEFILE,
         Some(Rc::from(path)),
     );
@@ -2003,14 +2022,17 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         }
         // Handled before the file type is looked at, as on Linux (do_vfs_ioctl)
         FICLONE | FICLONERANGE => {
-            let src = if request == FICLONE {
-                arg as i32
+            let (src, range) = if request == FICLONE {
+                (arg as i32, (0, 0, 0))
             } else {
-                // The first field of struct file_clone_range is the source fd (s64)
+                // struct file_clone_range: the source fd (s64), then the source offset, the
+                // length (0 is to the source's end) and the destination offset
                 let b: [u8; 32] = get(cx, arg)?;
-                i64::from_le_bytes(b[..8].try_into().unwrap()) as i32
+                let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+                (word(0) as i64 as i32, (word(1), word(2), word(3)))
             };
-            return clone_range(&io_file(cx, src)?, &file);
+            let src = io_file(cx, src)?;
+            return clone_range(cx, &src, &file, range);
         }
         FIDEDUPERANGE => {
             // Header of struct file_dedupe_range: two u64s, dest_count (u16) and two reserved
@@ -2163,32 +2185,125 @@ fn io_file(cx: &Cx<'_>, fd: i32) -> Result<FileRef, Errno> {
     Ok(file)
 }
 
-/// FICLONE, FICLONERANGE: checked in Linux's order (`ioctl_file_clone`,
-/// `generic_file_rw_checks`), and in the end, like ext4 and f2fs on the host, reflink is not
-/// supported (EOPNOTSUPP), so programs fall back to an ordinary copy (Python 3.14's
-/// `pathlib.Path.copy`, `cp --reflink=auto`). Files outside the store are not on the same mount
-/// point as those in it (EXDEV).
-fn clone_range(src: &FileRef, dst: &FileRef) -> SysResult {
-    let (src, dst) = (src.borrow(), dst.borrow());
-    let in_store = |f: &OpenFile| {
-        matches!(
-            f.kind,
-            FileKind::Regular { .. } | FileKind::Directory { .. }
-        )
-    };
-    if !in_store(&src) || !in_store(&dst) {
-        return Err(Errno::EXDEV);
-    }
-    if [&src, &dst]
-        .iter()
-        .any(|f| matches!(f.kind, FileKind::Directory { .. }))
+/// FICLONE, FICLONERANGE: checked in Linux 6.1's order (`ioctl_file_clone`,
+/// `do_clone_file_range`, `generic_remap_file_range_prep`, `generic_remap_checks`), with the
+/// store's regular files cloning as those of btrfs and XFS do: `len` 0 is to the source's end,
+/// offsets must be block-aligned, and so must the length unless it reaches the source's end. A
+/// clone of a whole file into the start of one no longer than it shares the object
+/// ([`try_share`]); any other range, or a file that cannot share now, is copied, which leaves the
+/// same contents. tmpfs, overlay files and memfds have no reflink (EOPNOTSUPP), as in Linux
+/// (shmem has none, and an overlay on ext4 has none either); files not on the same mount are
+/// EXDEV.
+fn clone_range(
+    cx: &mut Cx<'_>,
+    input: &FileRef,
+    output: &FileRef,
+    (pos_in, len, pos_out): (u64, u64, u64),
+) -> SysResult {
+    const BLOCK: u64 = 4096;
+    let vfs = cx.vfs()?;
     {
-        return Err(Errno::EISDIR);
+        let (i, o) = (input.borrow(), output.borrow());
+        // A memfd is on the internal shm mount
+        let mount = |f: &OpenFile| match f.pseudo {
+            true => None,
+            false => f.node().map(|n| n.mnt()),
+        };
+        if i.pseudo != o.pseudo || mount(&i) != mount(&o) {
+            return Err(Errno::EXDEV);
+        }
+        // generic_file_rw_checks
+        if [&i, &o]
+            .iter()
+            .any(|f| matches!(f.kind, FileKind::Directory { .. }))
+        {
+            return Err(Errno::EISDIR);
+        }
+        if [&i, &o]
+            .iter()
+            .any(|f| !matches!(f.kind, FileKind::Regular { .. }))
+        {
+            return Err(Errno::EINVAL);
+        }
+        if !i.readable() || !o.writable() || o.flags & oflags::O_APPEND != 0 {
+            return Err(Errno::EBADF);
+        }
+        let tmpfs = |f: &OpenFile| {
+            f.data_ino()
+                .is_some_and(|ino| vfs.tmpfs_dev(&Node::Store(f.mnt, ino)).is_some())
+        };
+        if i.pseudo || i.ovl.is_some() || o.ovl.is_some() || tmpfs(&i) {
+            return Err(Errno::EOPNOTSUPP);
+        }
     }
-    if !src.readable() || !dst.writable() || dst.flags & oflags::O_APPEND != 0 {
-        return Err(Errno::EBADF);
+    // remap_verify_area
+    let fits = |pos: u64| {
+        pos as i64 >= 0 && len as i64 >= 0 && pos.checked_add(len).is_some_and(|e| e as i64 >= 0)
+    };
+    if !fits(pos_in) || !fits(pos_out) {
+        return Err(Errno::EINVAL);
     }
-    Err(Errno::EOPNOTSUPP)
+    let size = |f: &FileRef| -> Result<u64, Errno> {
+        match &f.borrow().kind {
+            FileKind::Regular { ino, file, .. } => Ok(vfs.store().stat_open(*ino, file)?.size),
+            _ => Err(Errno::EINVAL),
+        }
+    };
+    let (size_in, size_out) = (size(input)?, size(output)?);
+    let mut len = len;
+    if len == 0 {
+        if pos_in == size_in {
+            return Ok(0);
+        }
+        if pos_in > size_in {
+            return Err(Errno::EINVAL);
+        }
+        len = size_in - pos_in;
+    }
+    if pos_in % BLOCK != 0 || pos_out % BLOCK != 0 || pos_in >= size_in {
+        return Err(Errno::EINVAL);
+    }
+    let mut count = len.min(size_in - pos_in);
+    // generic_write_check_limits
+    let limit = cx.t.group.borrow().rlimits[RLIMIT_FSIZE as usize].0;
+    if limit != u64::MAX {
+        if pos_out >= limit {
+            return Err(file_too_big(cx));
+        }
+        count = count.min(limit - pos_out);
+    }
+    count = count.min(i64::MAX as u64 - pos_out);
+    let bcount = if pos_in + count == size_in {
+        size_in.next_multiple_of(BLOCK) - pos_in
+    } else if count % BLOCK != 0 {
+        return Err(Errno::EINVAL);
+    } else {
+        count
+    };
+    let same = input.borrow().data_ino() == output.borrow().data_ino();
+    if same && pos_out + bcount > pos_in && pos_out < pos_in + bcount {
+        return Err(Errno::EINVAL);
+    }
+    // A request cut short is bounced back (no REMAP_FILE_CAN_SHORTEN)
+    if count != len {
+        return Err(Errno::EINVAL);
+    }
+    let whole = pos_in == 0 && pos_out == 0 && count == size_in && size_out <= size_in;
+    if whole && try_share(cx, input, output)? {
+        inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+        inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+        return Ok(0);
+    }
+    let mut done = 0;
+    while done < count {
+        let n = (count - done).min(MAX_COPY as u64) as usize;
+        let at = (Some(pos_in + done), Some(pos_out + done));
+        match copy_data(cx, input, at.0, output, at.1, n)? {
+            0 => return Err(Errno::EIO),
+            k => done += k as u64,
+        }
+    }
+    Ok(0)
 }
 
 // ---- Reading and writing ----
@@ -2991,29 +3106,62 @@ pub(super) fn copy_file_range(
         return Err(Errno::EINVAL);
     }
     let len = copy_range_checks(cx, (&input, src), (&output, dst), len)?;
-    let (mut src, mut dst) = (src.map(|s| s as u64), dst.map(|d| d as u64));
+    let (src, dst) = (src.map(|s| s as u64), dst.map(|d| d as u64));
     if len == 0 {
         return Ok(0);
     }
-    if let Some(r) = copy_regular(cx, &input, src, &output, dst, len) {
-        let n = r? as u64;
-        if let Some(s) = src {
-            put(cx, off_in, (s + n).to_le_bytes())?;
+    // A copy of the whole input into an output no longer than it shares the input's object, as
+    // Linux's vfs_copy_file_range tries remap_file_range first on filesystems with reflinks. All
+    // of it is shared at once, beyond the MAX_RW_COUNT Linux remaps per call: copying the rest
+    // would first make a private copy of the part already shared
+    let pos_in = src.unwrap_or_else(|| input.borrow().pos);
+    let pos_out = dst.unwrap_or_else(|| output.borrow().pos);
+    let n = if whole_copy(cx, &input, pos_in, &output, pos_out, len as u64)?
+        && try_share(cx, &input, &output)?
+    {
+        for (f, given) in [(&input, src), (&output, dst)] {
+            if given.is_none() {
+                f.borrow_mut().pos += len as u64;
+            }
         }
-        if let Some(d) = dst {
-            put(cx, off_out, (d + n).to_le_bytes())?;
-        }
-        return Ok(n);
+        inotify::file_event(cx.kr(), &input.borrow(), inotify::IN_ACCESS);
+        inotify::file_event(cx.kr(), &output.borrow(), inotify::IN_MODIFY);
+        len
+    } else {
+        copy_data(cx, &input, src, &output, dst, len)?
+    };
+    if let Some(s) = src {
+        put(cx, off_in, (s + n as u64).to_le_bytes())?;
+    }
+    if let Some(d) = dst {
+        put(cx, off_out, (d + n as u64).to_le_bytes())?;
+    }
+    Ok(n as u64)
+}
+
+/// Copies up to `len` bytes from `input` to `output` (at `src`/`dst`, or the file positions,
+/// which advance), returning how many were copied: between two regular files through the host
+/// ([`copy_regular`]), otherwise block by block.
+fn copy_data(
+    cx: &mut Cx<'_>,
+    input: &FileRef,
+    mut src: Option<u64>,
+    output: &FileRef,
+    mut dst: Option<u64>,
+    len: usize,
+) -> Result<usize, Errno> {
+    if let Some(r) = copy_regular(cx, input, src, output, dst, len) {
+        return r;
     }
     let mut chunk = vec![0u8; len.min(IO_CHUNK)];
     let mut done = 0;
     while done < len {
         let n = (len - done).min(IO_CHUNK);
-        let got = read_bytes(cx, &input, &mut chunk[..n], src)?;
+        let got = read_bytes(cx, input, &mut chunk[..n], src)?;
         if got == 0 {
             break;
         }
-        let wrote = write_bytes(cx, &output, &chunk[..got], dst)?;
+        let wrote = write_bytes(cx, output, &chunk[..got], dst)?;
         if let Some(s) = &mut src {
             *s += wrote as u64;
         } else {
@@ -3027,13 +3175,104 @@ pub(super) fn copy_file_range(
             break;
         }
     }
-    if let Some(s) = src {
-        put(cx, off_in, s.to_le_bytes())?;
+    Ok(done)
+}
+
+/// Whether copying `len` bytes of `input` at `pos_in` to `output` at `pos_out` leaves the output
+/// a copy of the whole input: both from the start, all of a non-empty input, and an output no
+/// longer than it.
+fn whole_copy(
+    cx: &Cx<'_>,
+    input: &FileRef,
+    pos_in: u64,
+    output: &FileRef,
+    pos_out: u64,
+    len: u64,
+) -> Result<bool, Errno> {
+    if pos_in != 0 || pos_out != 0 {
+        return Ok(false);
     }
-    if let Some(d) = dst {
-        put(cx, off_out, d.to_le_bytes())?;
+    let vfs = cx.vfs()?;
+    let size = |f: &FileRef| -> Result<Option<u64>, Errno> {
+        match &f.borrow().kind {
+            FileKind::Regular { ino, file, .. } => {
+                Ok(Some(vfs.store().stat_open(*ino, file)?.size))
+            }
+            _ => Ok(None),
+        }
+    };
+    let (Some(size_in), Some(size_out)) = (size(input)?, size(output)?) else {
+        return Ok(false);
+    };
+    Ok(size_in > 0 && len == size_in && size_out <= size_in)
+}
+
+/// FICLONE, FICLONERANGE and a whole-file copy_file_range: when `output` is to end up a copy of
+/// all of `input`, makes it share `input`'s object instead ([`Store::share`]), as btrfs and XFS
+/// share extents; returns whether it did. Not done when the two are not regular files of one
+/// store outside tmpfs (Linux's shmem has no reflink), when one was opened through an overlay or
+/// is a memfd, when something could still change the input's object in place (a description
+/// open for writing it that is not marked `cow`, a shared mapping that can be made writable) or
+/// the output is mapped, sealed or being copied: a mapping does not follow a file to another
+/// object.
+fn try_share(cx: &mut Cx<'_>, input: &FileRef, output: &FileRef) -> Result<bool, Errno> {
+    use std::os::unix::fs::MetadataExt;
+    let vfs = cx.vfs()?;
+    let (src, dst, src_host, dst_host) = {
+        let (i, o) = (input.borrow(), output.borrow());
+        let (
+            FileKind::Regular {
+                ino: src, file: si, ..
+            },
+            FileKind::Regular {
+                ino: dst, file: so, ..
+            },
+        ) = (&i.kind, &o.kind)
+        else {
+            return Ok(false);
+        };
+        let tmpfs = |f: &OpenFile, ino: Ino| vfs.tmpfs_dev(&Node::Store(f.mnt, ino)).is_some();
+        if i.pseudo || o.pseudo || i.ovl.is_some() || o.ovl.is_some() || src == dst {
+            return Ok(false);
+        }
+        if tmpfs(&i, *src) || tmpfs(&o, *dst) {
+            return Ok(false);
+        }
+        let host = |f: &std::fs::File| f.metadata().map(|m| (m.dev(), m.ino()));
+        (
+            *src,
+            *dst,
+            host(si).map_err(host_errno)?,
+            host(so).map_err(host_errno)?,
+        )
+    };
+    // A deleted source's object may already be on its way to the reaper
+    let k = cx.kr();
+    if k.unsharing.contains(&dst)
+        || k.seals.contains_key(&dst)
+        || vfs.store().attrs(src)?.nlink == 0
+    {
+        return Ok(false);
     }
-    Ok(done as u64)
+    let writer = |f: &FileRef| {
+        f.try_borrow()
+            .is_ok_and(|f| f.writable() && matches!(f.kind, FileKind::Regular { cow: false, .. }))
+    };
+    if opens_of(k, src).iter().any(writer) {
+        return Ok(false);
+    }
+    let mapped = k.tasks.values().any(|t| {
+        let res = t.res.borrow();
+        let mm = res.mm.borrow();
+        mm.writably_maps(src_host.0, src_host.1) || mm.maps_file(dst_host.0, dst_host.1)
+    });
+    if mapped {
+        return Ok(false);
+    }
+    remove_privs(cx, dst)?;
+    vfs.store().share(src, dst)?;
+    rehome(cx, &vfs, dst);
+    Ok(true)
 }
 
 /// copy_file_range's checks, in 6.1's `generic_copy_file_checks` and `rw_verify_area` order:
@@ -3072,7 +3311,7 @@ fn copy_range_checks(
     if wraps(pos_in) || wraps(pos_out) {
         return Err(Errno::EOVERFLOW);
     }
-    let FileKind::Regular { ino, file } = &i.kind else {
+    let FileKind::Regular { ino, file, .. } = &i.kind else {
         return Err(Errno::EINVAL);
     };
     let size_in = vfs.store().stat_open(*ino, file)?.size as i64;
@@ -3122,6 +3361,11 @@ fn copy_regular(
     len: usize,
 ) -> Option<Result<usize, Errno>> {
     if let Err(e) = follow_copy_up(cx, input) {
+        return Some(Err(e));
+    }
+    if len > 0
+        && let Err(e) = prepare_write(cx, output, None)
+    {
         return Some(Err(e));
     }
     let (fd_in, fd_out, ino) = {
@@ -3729,6 +3973,7 @@ pub(super) fn write_bytes(
                 _ => None,
             };
             if let Some(ino) = ino.filter(|_| !data.is_empty()) {
+                prepare_write(cx, file, None)?;
                 remove_privs(cx, ino)?;
             }
             // Regular files are written without the BKL; O_APPEND ones are still written with
@@ -3982,14 +4227,166 @@ pub(super) fn follow_copy_up(cx: &Cx<'_>, file: &FileRef) -> Result<(), Errno> {
         return Ok(());
     }
     let writable = file.borrow().writable();
-    let object = vfs.store().open_object(real, writable)?;
+    // The copied-up file shares the lower one's object until written (open_store)
+    let held = vfs.store().held(real)?;
+    let object = vfs.store().open_object(real, writable && !held)?;
     let mut f = file.borrow_mut();
-    if let FileKind::Regular { ino, file } = &mut f.kind {
+    if let FileKind::Regular { ino, file, cow } = &mut f.kind {
         *ino = real;
+        *cow = writable && held;
         let lower = std::mem::replace(file, object);
         f.ovl_lower = Some(lower);
     }
     Ok(())
+}
+
+/// Before regular file `file` is changed (written, truncated to `keep` bytes, given space, mapped
+/// shared): a description opened for writing while its file was held gives the file an object of
+/// its own first ([`make_private`]). The caller holds no borrow of `file`.
+pub(super) fn prepare_write(
+    cx: &mut Cx<'_>,
+    file: &FileRef,
+    keep: Option<u64>,
+) -> Result<(), Errno> {
+    let ino = match &file.borrow().kind {
+        FileKind::Regular { ino, cow: true, .. } => *ino,
+        _ => return Ok(()),
+    };
+    make_private(cx, ino, keep)
+}
+
+/// Gives held file `ino` an object of its own ([`Store::unshare`]), copying the data (up to
+/// `keep` bytes) with the BKL released, as copy_file_range does: copying a large file would
+/// otherwise stop every process for seconds. Meanwhile others wanting to change the file wait
+/// for it ([`Kernel::unsharing`](crate::kernel::Kernel::unsharing)). Then every description of
+/// the file moves to its object ([`rehome`]).
+pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Result<(), Errno> {
+    use std::os::unix::fs::MetadataExt;
+    let vfs = cx.vfs()?;
+    let mut moved_from = None;
+    loop {
+        if cx.kr().unsharing.contains(&ino) {
+            cx.wait_on(None, &mut [], crate::kernel::wake::LOCK)?;
+            continue;
+        }
+        let Some(job) = vfs.store().unshare(ino, keep)? else {
+            break;
+        };
+        cx.k().unsharing.insert(ino);
+        let copied = cx.unlocked(|| crate::vfs::store::copy_object(&job.from, &job.to, job.len));
+        cx.k().unsharing.remove(&ino);
+        request_wake_locks();
+        if let Err(e) = copied {
+            vfs.store().abandon_unshare(job);
+            return Err(e);
+        }
+        let from = job.from.metadata().map(|m| (m.dev(), m.ino()));
+        match vfs.store().finish_unshare(job) {
+            Err(Errno::EAGAIN) => continue,
+            r => r?,
+        }
+        moved_from = from.ok();
+        break;
+    }
+    rehome(cx, &vfs, ino);
+    if let Some(from) = moved_from {
+        move_mappings(cx, &vfs, ino, from);
+    }
+    Ok(())
+}
+
+/// Held file `ino` moved from host object `from` to an object of its own: its shared mappings
+/// follow it ([`crate::mm::Mm::file_moving`], [`crate::mm::Mm::file_moved`]), so they show what
+/// is written to the file from now on. Pages past the new object's end leave the page tables, and
+/// every address space that had some syncs, before any host mapping changes. When an address
+/// space is busy the mappings all stay on the old object, unchanged but safe: re-mapping a host
+/// region it shares (after fork) without clipping it could let a thread touch the new object past
+/// its end.
+fn move_mappings(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, from: (u64, u64)) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(object) = vfs.store().open_object(ino, true) else {
+        return;
+    };
+    let Ok(meta) = object.metadata() else {
+        return;
+    };
+    let mut mms: Vec<Rc<RefCell<crate::mm::Mm>>> = Vec::new();
+    for t in cx.kr().tasks.values() {
+        let mm = t.res.borrow().mm.clone();
+        if !mms.iter().any(|m| Rc::ptr_eq(m, &mm)) {
+            mms.push(mm);
+        }
+    }
+    if mms.iter().any(|m| m.try_borrow_mut().is_err()) {
+        crate::debug::log(format_args!(
+            "move_mappings: an address space is busy; inode {ino}'s mappings stay"
+        ));
+        return;
+    }
+    let sync = cx.task.sync.clone();
+    for mm in &mms {
+        let mut m = mm.borrow_mut();
+        if m.file_moving(ino, from, meta.len()) {
+            m.sync(&sync);
+        }
+    }
+    let to = Rc::new(std::os::fd::OwnedFd::from(object));
+    for mm in &mms {
+        if let Err(e) = mm
+            .borrow_mut()
+            .file_moved(ino, from, &to, (meta.dev(), meta.ino()))
+        {
+            crate::debug::log(format_args!("move_mappings: inode {ino}: {e:?}"));
+        }
+    }
+}
+
+/// Store regular file `ino` changed objects, or stopped being held: every description of it
+/// takes a handle on its object as it is now, only for reading (and marked `cow`) while the file
+/// is held, and the recorded program file of it goes. The old handles stay with the descriptions
+/// until they are closed, since a read or write without the BKL may still be using them. A
+/// description borrowed at this moment keeps its handle; one opened for writing then fails to
+/// write (EBADF, its handle being read-only) rather than writing the shared object, or comes back
+/// here before writing when still marked.
+fn rehome(cx: &Cx<'_>, vfs: &Vfs, ino: Ino) {
+    let store = vfs.store();
+    let held = store.held(ino).unwrap_or(true);
+    for file in opens_of(cx.kr(), ino) {
+        let Ok(mut f) = file.try_borrow_mut() else {
+            crate::debug::log(format_args!("rehome: an open file of inode {ino} is busy"));
+            continue;
+        };
+        let write = f.writable() && !held;
+        let Ok(object) = store.open_object(ino, write) else {
+            continue;
+        };
+        let f = &mut *f;
+        let cow_now = f.writable() && held;
+        if let FileKind::Regular { file, cow, .. } = &mut f.kind {
+            f.retired.push(std::mem::replace(file, object));
+            *cow = cow_now;
+        }
+    }
+    vfs.forget_executable(ino);
+}
+
+/// Every description of store regular file `ino` in this kernel: in fd tables, in AF_UNIX
+/// messages in flight and behind loop devices, each once. Those borrowed at this moment (by the
+/// caller) are left out.
+fn opens_of(k: &crate::kernel::Kernel, ino: Ino) -> Vec<FileRef> {
+    let mut all = k.open_files();
+    all.extend(crate::unix::inflight_files(k));
+    all.extend(k.loops.backing_files());
+    let mut out: Vec<FileRef> = Vec::new();
+    for f in all {
+        let ours = f
+            .try_borrow()
+            .is_ok_and(|f| matches!(f.kind, FileKind::Regular { ino: i, .. } if i == ino));
+        if ours && !out.iter().any(|o| Rc::ptr_eq(o, &f)) {
+            out.push(f);
+        }
+    }
+    out
 }
 
 fn regular_fd(f: &OpenFile) -> Option<i32> {
@@ -4943,7 +5340,7 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
             // compares it with that of /dev/pts/<n>)
             Ok(encode_stat(&st, t.fs))
         }
-        FileKind::Regular { ino, file } => {
+        FileKind::Regular { ino, file, .. } => {
             let vfs = cx.vfs()?;
             let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
             let mut st = vfs.store().stat_open(*ino, file)?;
@@ -5222,8 +5619,10 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         may_delete(store, &cred, dir, name)?;
         let gone = not_mount_point(cx, &store_vfs, dir, name)?;
         let tmpfs = tmpfs_victim(&store_vfs, (mnt, dir), name)?;
+        let held = gone.filter(|&ino| store.held(ino).unwrap_or(false));
         store.unlink(dir, name)?;
         tmpfs_removed(&store_vfs, tmpfs);
+        release_if_closed(cx, &store_vfs, held);
         detach_points(cx, &store_vfs, gone, (dir, name));
         if let Some(ino) = victim {
             unlinked_events(cx, store, ino, (dir, name));
@@ -5676,6 +6075,7 @@ pub(super) fn renameat2(
         _ => None,
     };
     let moving = vfs.store().lookup(old_dir, old_name)?;
+    let held = overwritten.filter(|&ino| vfs.store().held(ino).unwrap_or(false));
     vfs.store().rename(
         old_dir,
         old_name,
@@ -5687,6 +6087,7 @@ pub(super) fn renameat2(
     tmpfs_removed(&vfs, replaced);
     // Detach the mounts of other namespaces on the overwritten target
     if !exchange && overwritten != moving {
+        release_if_closed(cx, &vfs, held);
         detach_points(cx, &vfs, overwritten, (new_dir, new_name));
     }
     // Files open through the moved name follow the rename
@@ -5832,6 +6233,35 @@ fn not_mount_point(cx: &Cx<'_>, vfs: &Vfs, dir: Ino, name: &[u8]) -> Result<Opti
     match vfs.store().lookup(dir, name)? {
         Some(ino) if vfs.is_store_point((ino, dir, name), cx.mnt_ns()) => Err(Errno::EBUSY),
         found => Ok(found),
+    }
+}
+
+/// A held file (`ino`, looked at before the unlink, while its row was still cached) that has just
+/// lost its last link stops sharing its object at once when nothing in this kernel has it open or
+/// mapped ([`Store::release`]), rather than at the next boot: its object can go, and another file
+/// still sharing it need not copy it before a write.
+fn release_if_closed(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>) {
+    use std::os::unix::fs::MetadataExt;
+    let Some(ino) = ino else {
+        return;
+    };
+    let store = vfs.store();
+    if !store.attrs(ino).is_ok_and(|st| st.nlink == 0) || !opens_of(cx.kr(), ino).is_empty() {
+        return;
+    }
+    let Ok(meta) = store
+        .open_object(ino, false)
+        .and_then(|f| f.metadata().map_err(host_errno))
+    else {
+        return;
+    };
+    let mapped = cx
+        .kr()
+        .tasks
+        .values()
+        .any(|t| t.res.borrow().mm.borrow().maps_file(meta.dev(), meta.ino()));
+    if !mapped {
+        let _ = store.release(ino);
     }
 }
 
@@ -6331,6 +6761,7 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             }
             check_fsize(cx, len)?;
             super::lease::break_leases(cx, ino, true, false, None)?;
+            make_private(cx, ino, Some(len))?;
             remove_privs(cx, ino)?;
             let host = vfs.store().open_object(ino, true)?;
             let tmpfs = tmpfs_size(&vfs, &node, &host)?;
@@ -6356,9 +6787,10 @@ pub(super) fn ftruncate(cx: &mut Cx<'_>, fd: i32, len: i64) -> SysResult {
     {
         super::lease::break_leases(cx, ino, true, false, Some(&file))?;
     }
+    prepare_write(cx, &file, Some(len))?;
     let f = file.borrow();
     match &f.kind {
-        FileKind::Regular { ino, file } if f.writable() => {
+        FileKind::Regular { ino, file, .. } if f.writable() => {
             check_fsize(cx, len)?;
             check_seals(cx, &f, false, |_| len)?;
             remove_privs(cx, *ino)?;
@@ -6391,12 +6823,13 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
         .filter(|&e| e <= i64::MAX as u64)
         .ok_or(Errno::EFBIG)?;
     let file = cx.fds().get(fd)?;
+    prepare_write(cx, &file, None)?;
     let f = file.borrow();
     if !f.writable() {
         return Err(Errno::EBADF);
     }
     let (ino, host) = match &f.kind {
-        FileKind::Regular { ino, file } => (*ino, file),
+        FileKind::Regular { ino, file, .. } => (*ino, file),
         FileKind::Directory { .. } => return Err(Errno::EISDIR),
         FileKind::Pipe(_) | FileKind::Socket(_) => return Err(Errno::ESPIPE),
         _ => return Err(Errno::ENODEV),
@@ -6855,7 +7288,7 @@ fn tmpfs_write_room(
     offset: Option<u64>,
     len: usize,
 ) -> Result<(usize, Option<(u64, u64)>), Errno> {
-    let FileKind::Regular { ino, file } = &f.kind else {
+    let FileKind::Regular { ino, file, .. } = &f.kind else {
         return Ok((len, None));
     };
     let vfs = cx.vfs()?;
@@ -7047,7 +7480,7 @@ fn check_seals(
     write: bool,
     grow_to: impl FnOnce(u64) -> u64,
 ) -> Result<(), Errno> {
-    let FileKind::Regular { ino, file } = &f.kind else {
+    let FileKind::Regular { ino, file, .. } = &f.kind else {
         return Ok(());
     };
     let Some(&seals) = cx.kr().seals.get(ino) else {

@@ -415,10 +415,12 @@ pub fn open_write(
     changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
     let (ino, parent) = writable_file(store, top, path)?;
-    let file = store.open_object_append(ino, append)?;
+    // Truncated first: a file sharing its object then gets an empty one of its own rather than a
+    // copy (Store::make_private)
     if truncate {
         store.truncate(ino, 0)?;
     }
+    let file = store.open_object_append(ino, append)?;
     changes.push(Change::Opened {
         ino,
         parent,

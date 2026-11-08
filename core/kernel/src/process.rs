@@ -704,7 +704,7 @@ pub(crate) fn open_open_file(
     cred: &Cred,
     f: &crate::fd::OpenFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let crate::fd::FileKind::Regular { ino, file } = &f.kind else {
+    let crate::fd::FileKind::Regular { ino, file, .. } = &f.kind else {
         return Err(Errno::EACCES);
     };
     let st = vfs.store().stat_open(*ino, file)?;

@@ -218,6 +218,10 @@ pub(crate) struct Kernel {
     pub loops: crate::syscall::Loops,
     /// memfd seals (F_ADD_SEALS), keyed by inode; files not in here cannot be sealed.
     pub seals: BTreeMap<Ino, u32>,
+    /// Held files whose data is being copied to an object of their own with the BKL released
+    /// (`syscall::fs::make_private`): others wanting to change them wait
+    /// ([`wake::LOCK`]).
+    pub unsharing: std::collections::BTreeSet<Ino>,
     /// `/proc/sys/kernel/core_pattern`, `core_uses_pid` (`crate::coredump`).
     pub core_pattern: Vec<u8>,
     pub core_uses_pid: bool,
@@ -386,6 +390,7 @@ impl Kernel {
             fifos: BTreeMap::new(),
             loops: crate::syscall::Loops::new(),
             seals: BTreeMap::new(),
+            unsharing: Default::default(),
             core_pattern: b"core".to_vec(),
             core_uses_pid: false,
             // The default configuration of CONSOLE_LOGLEVEL_DEFAULT, MESSAGE_LOGLEVEL_DEFAULT and

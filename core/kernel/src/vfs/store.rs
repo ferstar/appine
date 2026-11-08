@@ -17,6 +17,17 @@
 //! that fds that have it open can still fstat it; it is cleaned up the next time the store is
 //! opened.
 //!
+//! Several regular files can share one object ([`Store::share`]: FICLONE, a whole-file
+//! copy_file_range, an overlay copy-up), the reflink of filesystems such as btrfs and XFS at the
+//! granularity of whole files. The `shared` table records each file whose data is not simply its
+//! own `objects/<ino>`: the object's number, and while the object is or was shared since the file
+//! was last written, the file's access time (its mtime and ctime are then the row's), since the
+//! object's host times belong to no one file. Such a file is held: writing, truncating or
+//! mapping it shared for write first gives it an object of its own ([`Store::unshare`]: a copy
+//! when others still share the object), and only then do its times come from the object again.
+//! A number some row uses as its object keeps its inode row at boot, so it is never given to a new
+//! file while the object lives.
+//!
 //! Write transactions are committed late ([`COMMIT_DELAY`]): every commit writes the changed
 //! pages into the WAL, ten times as expensive as the change itself, so metadata operations within
 //! a few milliseconds are committed together; each operation is a savepoint in the transaction
@@ -205,6 +216,23 @@ pub struct DirEntry {
     pub mode: u32,
 }
 
+/// A held file getting an object of its own while others still share its old one
+/// ([`Store::unshare`]): the caller copies `len` bytes of `from` into `to` (holes kept,
+/// [`copy_object`]), with the BKL released if it likes, and then calls [`Store::finish_unshare`],
+/// or [`Store::abandon_unshare`] when the copy fails.
+pub struct Unshare {
+    /// The file.
+    pub ino: Ino,
+    /// The shared object, open for reading.
+    pub from: File,
+    /// Its new object, empty, open for writing.
+    pub to: File,
+    /// How much of the data to copy (all of it, or what a truncation keeps).
+    pub len: u64,
+    /// The numbers of the two objects.
+    objects: (Ino, Ino),
+}
+
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS inodes (
         ino      INTEGER PRIMARY KEY,
@@ -235,6 +263,15 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS detached_roots (
         ino INTEGER PRIMARY KEY
     );
+    -- Regular files whose data is in objects/<object> rather than their own objects/<ino>, or
+    -- whose object other files share (module docs); atime_ns is set while the file is held: its
+    -- times are then the database's (mtime and ctime in inodes)
+    CREATE TABLE IF NOT EXISTS shared (
+        ino      INTEGER PRIMARY KEY,
+        object   INTEGER NOT NULL,
+        atime_ns INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS shared_object ON shared (object);
 ";
 
 /// An inode store.
@@ -435,7 +472,7 @@ impl Store {
         let range = lo.load(Ordering::SeqCst)..=hi.load(Ordering::SeqCst);
         if *range.start() != 0 {
             for ino in range {
-                if self.query_stat_row(ino) == Err(Errno::ENOENT) {
+                if self.query_row(ino) == Err(Errno::ENOENT) {
                     self.remove_object(ino)?;
                 }
             }
@@ -490,17 +527,51 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes the inodes left with no links by the last run, and their objects. Deleted files
+    /// first stop sharing objects (none is open now); the rows whose numbers other files still use
+    /// as their objects stay, so the numbers are not given to new files, and the objects nothing
+    /// uses any more go.
     fn remove_orphans(&self) -> Result<(), Errno> {
-        let orphans: Vec<(Ino, u32)> = {
-            let mut stmt = self
-                .db()
-                .prepare("SELECT ino, mode FROM inodes WHERE nlink = 0")
-                .map_err(db_err)?;
+        let query = |sql: &str| -> Result<Vec<(Ino, u32)>, Errno> {
+            let mut stmt = self.db().prepare(sql).map_err(db_err)?;
             let rows = stmt
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(db_err)?;
-            rows.collect::<Result<_, _>>().map_err(db_err)?
+            rows.collect::<Result<_, _>>().map_err(db_err)
         };
+        let released = query(
+            "SELECT s.object, 0 FROM shared s LEFT JOIN inodes i ON i.ino = s.ino
+             WHERE i.nlink IS NULL OR i.nlink = 0",
+        )?;
+        self.exec("DELETE FROM shared WHERE ino NOT IN (SELECT ino FROM inodes WHERE nlink > 0)")?;
+        if !released.is_empty() {
+            self.update(|c| c.clear(c.generation));
+        }
+        let orphans = query(
+            "SELECT ino, mode FROM inodes
+             WHERE nlink = 0 AND ino NOT IN (SELECT object FROM shared)",
+        )?;
+        // Emptying the volatile directories and detached trees just before queued objects for the
+        // background thread; those deleted here are gone now, and their numbers are free for new
+        // files
+        let mut removed: HashSet<Ino> = orphans.iter().map(|&(ino, _)| ino).collect();
+        for &(object, _) in &released {
+            if removed.contains(&object) || self.object_used(object)? {
+                continue;
+            }
+            // An object no file uses any more: an orphan's goes with it below; a live file whose
+            // number it is uses an object of its own (a number becomes a shared object only along
+            // with a row for its own file, so it is never a plain file's data)
+            let garbage = match self.query_row(object) {
+                Ok((st, d)) => st.nlink > 0 && d.listed(object),
+                Err(Errno::ENOENT) => true,
+                Err(e) => return Err(e),
+            };
+            if garbage {
+                self.remove_object(object)?;
+                removed.insert(object);
+            }
+        }
         for &(ino, m) in &orphans {
             // Not handed to the background thread: once the row is deleted, its number may be
             // given to a newly created file, and a background thread deleting a bit later would
@@ -520,9 +591,6 @@ impl Store {
                 .map_err(db_err)?;
             self.touch_file_caps();
         }
-        // Emptying the volatile directories and detached trees just before queued their objects
-        // for the background thread; they are gone now, and their numbers are free for new files
-        let removed: HashSet<Ino> = orphans.iter().map(|&(ino, _)| ino).collect();
         self.doomed
             .borrow_mut()
             .retain(|ino| !removed.contains(ino));
@@ -618,11 +686,12 @@ impl Store {
         Ok(found)
     }
 
-    /// Reads metadata. A regular file's size and mtime are taken from the host object file.
+    /// Reads metadata. A regular file's size and mtime are taken from the host object file (its
+    /// times from the database while it is held).
     pub fn stat(&self, ino: Ino) -> Result<Stat, Errno> {
-        let mut st = self.stat_row(ino)?;
+        let (mut st, data) = self.row(ino)?;
         if st.kind() == mode::S_IFREG {
-            fill_from_host(&mut st, &self.meta.objects_dir, ino)?;
+            fill_from_host(&mut st, &self.meta.objects_dir, data)?;
         }
         Ok(st)
     }
@@ -630,9 +699,15 @@ impl Store {
     /// Metadata of an open regular file: size and mtime are taken from the open object, which also
     /// works after the file is deleted.
     pub fn stat_open(&self, ino: Ino, file: &File) -> Result<Stat, Errno> {
-        let mut st = self.stat_row(ino)?;
-        fill_from_object(&mut st, &file.metadata().map_err(io_err)?);
+        let (mut st, data) = self.row(ino)?;
+        fill_from_object(&mut st, &file.metadata().map_err(io_err)?, data.held);
         Ok(st)
+    }
+
+    /// Whether regular file `ino` is held: it shares its object, or did since it was last
+    /// written, so it must get an object of its own before it is changed ([`Store::unshare`]).
+    pub fn held(&self, ino: Ino) -> Result<bool, Errno> {
+        Ok(self.row(ino)?.1.held.is_some())
     }
 
     /// Metadata in the database (without touching the host; a regular file's size and times are
@@ -649,48 +724,64 @@ impl Store {
 
     /// Metadata in the database (a regular file's size and mtime are not filled in yet).
     fn stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
+        Ok(self.row(ino)?.0)
+    }
+
+    /// Where regular file `ino`'s data and times are.
+    fn data(&self, ino: Ino) -> Result<Data, Errno> {
+        Ok(self.row(ino)?.1)
+    }
+
+    /// The database row of inode `ino` ([`Store::stat_row`], [`Store::data`]).
+    fn row(&self, ino: Ino) -> Result<(Stat, Data), Errno> {
         let generation = self.cache_generation();
         if let Some(hit) = self.cached(|c| c.rows.get(&ino).copied()) {
             return Ok(hit);
         }
         self.begin_read()?;
-        let st = self.query_stat_row(ino)?;
+        let row = self.query_row(ino)?;
         if generation.is_some_and(|g| self.may_fill(g)) {
             self.update(|c| {
                 c.entries += 1;
-                c.rows.insert(ino, st);
+                c.rows.insert(ino, row);
             });
         }
-        Ok(st)
+        Ok(row)
     }
 
-    fn query_stat_row(&self, ino: Ino) -> Result<Stat, Errno> {
+    fn query_row(&self, ino: Ino) -> Result<(Stat, Data), Errno> {
         let row = self
             .db()
             .prepare_cached(
-                "SELECT mode, nlink, uid, gid, rdev, mtime_ns, ctime_ns, length(target)
-                 FROM inodes WHERE ino = ?1",
+                "SELECT i.mode, i.nlink, i.uid, i.gid, i.rdev, i.mtime_ns, i.ctime_ns,
+                        length(i.target), s.object, s.atime_ns
+                 FROM inodes i LEFT JOIN shared s ON s.ino = i.ino WHERE i.ino = ?1",
             )
             .and_then(|mut st| {
                 st.query_row(params![ino], |r| {
                     Ok((
-                        r.get::<_, u32>(0)?,
-                        r.get::<_, u32>(1)?,
-                        r.get::<_, u32>(2)?,
-                        r.get::<_, u32>(3)?,
-                        r.get::<_, u64>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, Option<u64>>(7)?,
+                        (
+                            r.get::<_, u32>(0)?,
+                            r.get::<_, u32>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, u32>(3)?,
+                            r.get::<_, u64>(4)?,
+                        ),
+                        (
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, Option<u64>>(7)?,
+                        ),
+                        (r.get::<_, Option<Ino>>(8)?, r.get::<_, Option<i64>>(9)?),
                     ))
                 })
             })
             .optional()
             .map_err(db_err)?
             .ok_or(Errno::ENOENT)?;
-        let (mode, nlink, uid, gid, rdev, mtime_ns, ctime_ns, target_len) = row;
+        let ((mode, nlink, uid, gid, rdev), (mtime_ns, ctime_ns, target_len), (object, held)) = row;
         let size = target_len.unwrap_or(0);
-        Ok(Stat {
+        let st = Stat {
             ino,
             mode,
             nlink,
@@ -698,11 +789,16 @@ impl Store {
             gid,
             rdev,
             size,
-            atime_ns: mtime_ns,
+            atime_ns: held.unwrap_or(mtime_ns),
             mtime_ns,
             ctime_ns,
             blocks: None,
-        })
+        };
+        let data = Data {
+            object: object.unwrap_or(ino),
+            held,
+        };
+        Ok((st, data))
     }
 
     /// Reads a symlink's target.
@@ -1025,7 +1121,7 @@ impl Store {
     /// Creates an empty object for a new inode. An existing one was left by an inode lost before
     /// it could be committed (the inode number was allocated again), and is emptied and reused.
     fn new_object(&self, ino: Ino) -> Result<File, Errno> {
-        self.object(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
+        self.open_number(ino, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)
     }
 
     /// Changes the permission bits (keeping the type bits).
@@ -1278,11 +1374,15 @@ impl Store {
         self.touch_name(parent, name);
         self.touch_ino(ino);
         self.dir_changed(parent)?;
-        let st = self.stat_row(ino)?;
+        let (st, data) = self.row(ino)?;
         if st.nlink == 0 && st.kind() == mode::S_IFREG {
             // Deleted after the commit: if the app is killed before the commit, the dentry is
-            // still there, so the object must be too
-            self.doomed.borrow_mut().push(ino);
+            // still there, so the object must be too. A held file keeps sharing its object while
+            // it may still be open: its descriptors still hold the shared object, and a write
+            // through them must find what to copy ([`Store::release`])
+            if data.held.is_none() {
+                self.drop_object(ino, data)?;
+            }
         } else {
             self.object_changed(ino);
         }
@@ -1479,11 +1579,15 @@ impl Store {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
-        if self.kind(ino)? == mode::S_IFREG {
+        let (st, data) = self.row(ino)?;
+        if st.kind() == mode::S_IFREG && data.held.is_some() {
+            return self.set_held_times(ino, atime, mtime);
+        }
+        if st.kind() == mode::S_IFREG {
             let mut name = [0u8; 21];
             return appine_hal::set_times_at(
                 self.meta.objects_dir.as_raw_fd(),
-                object_name(ino, &mut name),
+                object_name(data.object, &mut name),
                 atime.map(FileTime::host),
                 mtime.map(FileTime::host),
             )
@@ -1514,12 +1618,49 @@ impl Store {
         atime: Option<FileTime>,
         mtime: Option<FileTime>,
     ) -> Result<(), Errno> {
+        if self.held(ino)? {
+            return self.set_held_times(ino, atime, mtime);
+        }
         appine_hal::set_times_fd(
             file.as_raw_fd(),
             atime.map(FileTime::host),
             mtime.map(FileTime::host),
         )
         .map_err(|e| object_err(ino, e))
+    }
+
+    /// The times of held regular file `ino` are the database's; ctime becomes now.
+    fn set_held_times(
+        &self,
+        ino: Ino,
+        atime: Option<FileTime>,
+        mtime: Option<FileTime>,
+    ) -> Result<(), Errno> {
+        let now = now_ns();
+        let ns = |t: Option<FileTime>| {
+            t.map(|t| match t {
+                FileTime::Now => now,
+                FileTime::At(ns) => ns,
+            })
+        };
+        let (atime, mtime) = (ns(atime), ns(mtime));
+        self.transaction(|s| {
+            s.db()
+                .prepare_cached(
+                    "UPDATE inodes SET mtime_ns = coalesce(?2, mtime_ns), ctime_ns = ?3
+                     WHERE ino = ?1",
+                )
+                .and_then(|mut st| st.execute(params![ino, mtime, now]))
+                .map_err(db_err)?;
+            s.db()
+                .prepare_cached(
+                    "UPDATE shared SET atime_ns = coalesce(?2, atime_ns) WHERE ino = ?1",
+                )
+                .and_then(|mut st| st.execute(params![ino, atime]))
+                .map_err(db_err)?;
+            s.touch_ino(ino);
+            Ok(())
+        })
     }
 
     // ---- Transactions and deferred commits ----
@@ -1849,41 +1990,266 @@ impl Store {
 
     // ---- Objects ----
 
-    /// Opens a regular file's object.
+    /// Opens a regular file's object. Opening a held file for writing gives it an object of its own
+    /// first ([`Store::make_private`]); the kernel does that itself beforehand, moving the file's
+    /// other open descriptions along, so this is for the host's own writes.
     pub fn open_object(&self, ino: Ino, write: bool) -> Result<File, Errno> {
+        if write {
+            self.make_private(ino, None)?;
+        }
         self.object(ino, if write { libc::O_RDWR } else { libc::O_RDONLY })
     }
 
     /// Opens a regular file's object for reading and writing, with `O_APPEND` under `append` (for
     /// writes when the host browses the store).
     pub fn open_object_append(&self, ino: Ino, append: bool) -> Result<File, Errno> {
+        self.make_private(ino, None)?;
         let append = if append { libc::O_APPEND } else { 0 };
         self.object(ino, libc::O_RDWR | append)
     }
 
     /// Truncates a regular file.
     pub fn truncate(&self, ino: Ino, len: u64) -> Result<(), Errno> {
+        self.make_private(ino, Some(len))?;
         self.open_object(ino, true)?.set_len(len).map_err(io_err)
     }
 
-    /// Opens an object (relative to the `objects` directory, without resolving the whole path);
-    /// `flags` are host open flags.
+    /// Opens regular file `ino`'s object (its own, or the one it shares); `flags` are host open
+    /// flags.
     fn object(&self, ino: Ino, flags: i32) -> Result<File, Errno> {
+        self.open_number(self.data(ino)?.object, flags)
+    }
+
+    /// Opens object `object` (relative to the `objects` directory, without resolving the whole
+    /// path); `flags` are host open flags.
+    fn open_number(&self, object: Ino, flags: i32) -> Result<File, Errno> {
         let mut name = [0u8; 21];
         let dir = self.meta.objects_dir.as_raw_fd();
-        appine_hal::open_at(dir, object_name(ino, &mut name), flags, OBJECT_MODE)
-            .map_err(|e| object_err(ino, e))
+        appine_hal::open_at(dir, object_name(object, &mut name), flags, OBJECT_MODE)
+            .map_err(|e| object_err(object, e))
     }
 
     /// The database changed the metadata of inode `ino`: for a regular file, chmod the object so
-    /// that the host updates its ctime (see the module docs). Ignored if the object is gone (still
-    /// open after deletion) or cannot be changed; the ctime is then just not updated.
+    /// that the host updates its ctime (see the module docs); a held file's ctime is the
+    /// database's, which the change set already. Ignored if the object is gone (still open after
+    /// deletion) or cannot be changed; the ctime is then just not updated.
     fn object_changed(&self, ino: Ino) {
-        if self.kind(ino) == Ok(mode::S_IFREG) {
+        if let Ok((st, data)) = self.row(ino)
+            && st.kind() == mode::S_IFREG
+            && data.held.is_none()
+        {
             let mut name = [0u8; 21];
             let dir = self.meta.objects_dir.as_raw_fd();
-            let _ = appine_hal::chmod_at(dir, object_name(ino, &mut name), OBJECT_MODE);
+            let _ = appine_hal::chmod_at(dir, object_name(data.object, &mut name), OBJECT_MODE);
         }
+    }
+
+    /// Makes regular file `dst`'s data the same object as `src`'s (FICLONE, a whole-file
+    /// copy_file_range, an overlay copy-up): both are held from then on, `dst`'s modification and
+    /// change times become now, and its old object goes once no other file uses it. The caller
+    /// makes sure nothing writes `src`'s object in place meanwhile (no descriptor open for
+    /// writing it, no writable shared mapping of it) and that nothing maps `dst`. ENOENT for a
+    /// deleted `src`, whose object may already be on its way to the reaper.
+    pub fn share(&self, src: Ino, dst: Ino) -> Result<(), Errno> {
+        if src == dst {
+            return Err(Errno::EINVAL);
+        }
+        self.transaction(|s| {
+            let (sst, sdata) = s.row(src)?;
+            let (dst_st, ddata) = s.row(dst)?;
+            if sst.kind() != mode::S_IFREG || dst_st.kind() != mode::S_IFREG {
+                return Err(Errno::EINVAL);
+            }
+            // A deleted source's object may already be on its way to the reaper
+            if sst.nlink == 0 {
+                return Err(Errno::ENOENT);
+            }
+            // The source's times move into the database as they are
+            if sdata.held.is_none() {
+                let o = s.object_stat(sdata.object)?;
+                s.hold(src, sdata.object, (o.atime_ns, o.mtime_ns, o.ctime_ns))?;
+            }
+            // The destination keeps its access time (Linux's file_modified changes the other two)
+            let atime = match ddata.held {
+                Some(atime) => atime,
+                None => s.object_stat(ddata.object).map_or(now_ns(), |o| o.atime_ns),
+            };
+            s.drop_object(dst, ddata)?;
+            let now = now_ns();
+            s.hold(dst, sdata.object, (atime, now, now))
+        })
+    }
+
+    /// Gives held file `ino` an object of its own before it is changed. When no other file shares
+    /// its object any more, it simply takes the object's times back ([`Store::settle`]) and None is
+    /// returned. Otherwise a new object is made, numbered by an inode row with no links that only
+    /// holds it, and returned for the caller to copy into ([`Unshare`]); `keep` is the length a
+    /// truncation is about to leave (None: all of it). Does nothing to a file that is not held.
+    pub fn unshare(&self, ino: Ino, keep: Option<u64>) -> Result<Option<Unshare>, Errno> {
+        let (st, data) = self.row(ino)?;
+        let Some(atime) = data.held else {
+            return Ok(None);
+        };
+        if self.users_of(data.object)? <= 1 {
+            self.transaction(|s| s.settle(ino, data.object, (atime, st.mtime_ns)))?;
+            return Ok(None);
+        }
+        let from = self.open_number(data.object, libc::O_RDONLY)?;
+        let len = from.metadata().map_err(io_err)?.len();
+        let (number, to) = self.transaction(|s| {
+            let number = s.new_inode(mode::S_IFREG, 0, 0, 0, 0)?;
+            Ok((number, s.new_object(number)?))
+        })?;
+        Ok(Some(Unshare {
+            ino,
+            from,
+            to,
+            len: keep.map_or(len, |k| k.min(len)),
+            objects: (data.object, number),
+        }))
+    }
+
+    /// The copy of [`Store::unshare`] is done: the file uses its new object (with the times it had
+    /// in the database) and leaves the shared one to the others. The new object's data reaches
+    /// disk before the commit that records it, as a replacing rename's does
+    /// ([`Store::flush_replaced`]). EAGAIN when the file no longer uses the object it was copied
+    /// from (it changed while the copy was made without the BKL): the new object goes, and the
+    /// caller starts over.
+    pub fn finish_unshare(&self, job: Unshare) -> Result<(), Errno> {
+        let (from, to) = job.objects;
+        let r = self.transaction(|s| {
+            let (st, data) = s.row(job.ino)?;
+            let (Some(atime), true) = (data.held, data.object == from) else {
+                return Err(Errno::EAGAIN);
+            };
+            s.settle(job.ino, to, (atime, st.mtime_ns))?;
+            if !s.object_used(from)? {
+                s.doomed.borrow_mut().push(from);
+            }
+            s.replaced.borrow_mut().push(job.ino);
+            Ok(())
+        });
+        r.inspect_err(|_| self.abandon_unshare(job))
+    }
+
+    /// The copy of [`Store::unshare`] failed: the new object goes (its row, which nothing uses,
+    /// goes at the next boot).
+    pub fn abandon_unshare(&self, job: Unshare) {
+        let _ = self.remove_object(job.objects.1);
+    }
+
+    /// Gives held file `ino` an object of its own ([`Store::unshare`]), copying the data with the
+    /// BKL held. `keep` as for unshare.
+    pub fn make_private(&self, ino: Ino, keep: Option<u64>) -> Result<(), Errno> {
+        loop {
+            let Some(job) = self.unshare(ino, keep)? else {
+                return Ok(());
+            };
+            if let Err(e) = copy_object(&job.from, &job.to, job.len) {
+                self.abandon_unshare(job);
+                return Err(e);
+            }
+            match self.finish_unshare(job) {
+                Err(Errno::EAGAIN) => continue,
+                r => return r,
+            }
+        }
+    }
+
+    /// Deleted regular file `ino` is not open any more: if it was held, it stops sharing its
+    /// object, which goes when no other file uses it (otherwise the next boot does this).
+    pub fn release(&self, ino: Ino) -> Result<(), Errno> {
+        let (st, data) = self.row(ino)?;
+        if st.nlink != 0 || st.kind() != mode::S_IFREG || !data.listed(ino) {
+            return Ok(());
+        }
+        self.transaction(|s| s.drop_object(ino, data))
+    }
+
+    /// Regular file `ino` becomes held, using `object`, with times (atime, mtime, ctime).
+    fn hold(
+        &self,
+        ino: Ino,
+        object: Ino,
+        (atime, mtime, ctime): (i64, i64, i64),
+    ) -> Result<(), Errno> {
+        self.db()
+            .prepare_cached("UPDATE inodes SET mtime_ns = ?2, ctime_ns = ?3 WHERE ino = ?1")
+            .and_then(|mut st| st.execute(params![ino, mtime, ctime]))
+            .map_err(db_err)?;
+        self.db()
+            .prepare_cached(
+                "INSERT OR REPLACE INTO shared (ino, object, atime_ns) VALUES (?1, ?2, ?3)",
+            )
+            .and_then(|mut st| st.execute(params![ino, object, atime]))
+            .map_err(db_err)?;
+        self.touch_ino(ino);
+        Ok(())
+    }
+
+    /// Held file `ino`, from now on the only user of `object`, takes its times back: they are set
+    /// on the object, whose ctime becomes now (the file is about to change anyway), and its row in
+    /// `shared` goes when the object is the file's own.
+    fn settle(&self, ino: Ino, object: Ino, (atime, mtime): (i64, i64)) -> Result<(), Errno> {
+        let mut name = [0u8; 21];
+        appine_hal::set_times_at(
+            self.meta.objects_dir.as_raw_fd(),
+            object_name(object, &mut name),
+            Some(FileTime::At(atime).host()),
+            Some(FileTime::At(mtime).host()),
+        )
+        .map_err(|e| object_err(object, e))?;
+        let r = if object == ino {
+            self.db()
+                .prepare_cached("DELETE FROM shared WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino]))
+        } else {
+            self.db()
+                .prepare_cached("UPDATE shared SET object = ?2, atime_ns = NULL WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino, object]))
+        };
+        r.map_err(db_err)?;
+        self.touch_ino(ino);
+        Ok(())
+    }
+
+    /// Regular file `ino` (described by `data`) stops using its object, which is deleted after the
+    /// commit when no other file uses it.
+    fn drop_object(&self, ino: Ino, data: Data) -> Result<(), Errno> {
+        // A plain file's object is its own: no row uses its number (module invariant), and
+        // deleting files need not query for it
+        if data.listed(ino) {
+            self.db()
+                .prepare_cached("DELETE FROM shared WHERE ino = ?1")
+                .and_then(|mut st| st.execute(params![ino]))
+                .map_err(db_err)?;
+            self.touch_ino(ino);
+            if self.object_used(data.object)? {
+                return Ok(());
+            }
+        }
+        self.doomed.borrow_mut().push(data.object);
+        Ok(())
+    }
+
+    /// Whether some file in the `shared` table uses object `object`.
+    fn object_used(&self, object: Ino) -> Result<bool, Errno> {
+        Ok(self.users_of(object)? > 0)
+    }
+
+    /// How many files in the `shared` table use object `object`.
+    fn users_of(&self, object: Ino) -> Result<u64, Errno> {
+        self.db()
+            .prepare_cached("SELECT count(*) FROM shared WHERE object = ?1")
+            .and_then(|mut st| st.query_row(params![object], |r| r.get(0)))
+            .map_err(db_err)
+    }
+
+    /// The host's times of object `object`.
+    fn object_stat(&self, object: Ino) -> Result<Stat, Errno> {
+        let mut st = Stat::default();
+        fill_from_host(&mut st, &self.meta.objects_dir, Data { object, held: None })?;
+        Ok(st)
     }
 
     /// Deletes an object; not an error if it is already gone.
@@ -1985,7 +2351,7 @@ impl Drop for Op<'_> {
                             c.dentries.entry(dir).or_default().insert(name, Some(ino));
                         }
                         Fill::Row(st) => {
-                            c.rows.insert(st.ino, st);
+                            c.rows.insert(st.ino, (st, Data::own(st.ino)));
                         }
                     }
                 }
@@ -2113,7 +2479,7 @@ impl Reader<'_> {
 
     /// [`Store::kind`].
     pub fn kind(&self, ino: Ino) -> Option<u32> {
-        Some(self.cache.rows.get(&ino)?.kind())
+        Some(self.cache.rows.get(&ino)?.0.kind())
     }
 
     /// [`Store::readlink`]: None if it is not a symlink.
@@ -2130,25 +2496,27 @@ impl Reader<'_> {
     /// reused after deletion, the result is not half from the old file and half from the new one.
     /// None on a host error.
     pub fn stat(&self, ino: Ino) -> Option<Stat> {
-        let mut st = *self.cache.rows.get(&ino)?;
+        let (mut st, data) = *self.cache.rows.get(&ino)?;
         if st.kind() == mode::S_IFREG {
-            fill_from_host(&mut st, self.objects_dir, ino).ok()?;
+            fill_from_host(&mut st, self.objects_dir, data).ok()?;
         }
         Some(st)
     }
 }
 
 /// A regular file's size and times are taken from the host object file (for ctime see the module
-/// docs).
-fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, ino: Ino) -> Result<(), Errno> {
+/// docs), except that a held file keeps the times of its row.
+fn fill_from_host(st: &mut Stat, objects_dir: &OwnedFd, data: Data) -> Result<(), Errno> {
     let mut name = [0u8; 21];
-    let o =
-        appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(ino, &mut name)).map_err(Errno)?;
+    let o = appine_hal::stat_at(objects_dir.as_raw_fd(), object_name(data.object, &mut name))
+        .map_err(Errno)?;
     st.size = o.st_size as u64;
-    st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
-    st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
-    st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
     st.blocks = Some(o.st_blocks as u64);
+    if data.held.is_none() {
+        st.mtime_ns = o.st_mtime * 1_000_000_000 + o.st_mtime_nsec;
+        st.atime_ns = o.st_atime * 1_000_000_000 + o.st_atime_nsec;
+        st.ctime_ns = o.st_ctime * 1_000_000_000 + o.st_ctime_nsec;
+    }
     Ok(())
 }
 
@@ -2198,6 +2566,31 @@ impl std::hash::Hasher for FxHasher {
 
 type Map<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
 
+/// Where a regular file's data and times are (module docs): `object` is the number of the object
+/// holding its data, its own unless it uses another's, and `held` its access time while it is held
+/// (its other times are then the row's too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Data {
+    object: Ino,
+    held: Option<i64>,
+}
+
+impl Data {
+    /// Of a file in no row of `shared`, and of every other kind of inode.
+    fn own(ino: Ino) -> Data {
+        Data {
+            object: ino,
+            held: None,
+        }
+    }
+
+    /// Whether inode `ino`, so described, has a row in `shared` (one that would only repeat
+    /// [`Data::own`] is never kept).
+    fn listed(&self, ino: Ino) -> bool {
+        *self != Data::own(ino)
+    }
+}
+
 /// The metadata cache. Its entries correspond to the database contents at commit count
 /// `generation`.
 #[derive(Default)]
@@ -2206,7 +2599,7 @@ struct Cache {
     entries: usize,
     /// Directory → name → inode (None means it does not exist).
     dentries: Map<Ino, Map<Vec<u8>, Option<Ino>>>,
-    rows: Map<Ino, Stat>,
+    rows: Map<Ino, (Stat, Data)>,
     targets: Map<Ino, Vec<u8>>,
     parents: Map<Ino, Ino>,
     /// Directory → inode → one name in the directory pointing at it ([`Store::name_of`]; None
@@ -2502,12 +2895,45 @@ fn now_ns() -> i64 {
         .unwrap_or(0)
 }
 
-fn fill_from_object(st: &mut Stat, meta: &fs::Metadata) {
+/// [`fill_from_host`] from an open object; `held` is the file's access time if it is held.
+fn fill_from_object(st: &mut Stat, meta: &fs::Metadata, held: Option<i64>) {
     st.size = meta.len();
-    st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
-    st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
-    st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
     st.blocks = Some(meta.blocks());
+    if held.is_none() {
+        st.mtime_ns = meta.modified().map(to_ns).unwrap_or(st.mtime_ns);
+        st.atime_ns = meta.accessed().map(to_ns).unwrap_or(st.mtime_ns);
+        st.ctime_ns = meta.ctime() * 1_000_000_000 + meta.ctime_nsec();
+    }
+}
+
+/// Copies `len` bytes of object `from` into the empty object `to`, leaving holes where the host
+/// reports them, and makes `to` that long ([`Unshare`], overlay copy-up).
+pub(crate) fn copy_object(from: &File, to: &File, len: u64) -> Result<(), Errno> {
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+    let (i, o) = (from.as_raw_fd(), to.as_raw_fd());
+    let mut pos = 0;
+    while pos < len {
+        let data = match appine_hal::lseek(i, pos as i64, SEEK_DATA) {
+            Ok(data) => data.min(len),
+            Err(e) if e == Errno::ENXIO.0 => break,
+            // A host that cannot tell has data everywhere
+            Err(_) => pos,
+        };
+        let hole = appine_hal::lseek(i, data as i64, SEEK_HOLE)
+            .unwrap_or(len)
+            .min(len);
+        let mut at = data;
+        while at < hole {
+            let chunk = (hole - at).min(1 << 30) as usize;
+            match appine_hal::copy_file(i, at, o, at, chunk).map_err(Errno)? {
+                0 => break,
+                n => at += n as u64,
+            }
+        }
+        pos = hole.max(data + 1);
+    }
+    to.set_len(len).map_err(io_err)
 }
 
 fn to_ns(t: SystemTime) -> i64 {
@@ -3234,6 +3660,148 @@ mod tests {
         // still stays with nlink = 0)
         let s = Store::open(&dir, &[]).unwrap();
         assert_eq!(s.meta.syncs.load(Ordering::Relaxed), 1);
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Files sharing an object ([`Store::share`]) read the same data from it and keep their own
+    /// times in the database; the first change of one gives it an object of its own with those
+    /// times (a copy while others still share it, flushed before the commit; only what a
+    /// truncation keeps), and the last one takes the object back as its own.
+    #[test]
+    fn shared_objects_until_written() {
+        use std::io::Read;
+        use std::os::unix::fs::FileExt;
+        let (s, dir) = temp_store("share");
+        let objects = || fs::read_dir(dir.join("objects")).unwrap().count();
+        let read = |s: &Store, ino| {
+            let mut v = Vec::new();
+            s.open_object(ino, false)
+                .unwrap()
+                .read_to_end(&mut v)
+                .unwrap();
+            v
+        };
+        let at = FileTime::At;
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        fa.write_all(b"shared data").unwrap();
+        s.set_times(a, Some(at(1_000_000_000)), Some(at(2_000_000_000)))
+            .unwrap();
+        let (b, _) = s.create_file(ROOT, b"b", 0o600, 0, 0).unwrap();
+        let (c, _) = s.create_file(ROOT, b"c", 0o600, 0, 0).unwrap();
+        s.share(a, b).unwrap();
+        s.share(b, c).unwrap();
+        s.commit().unwrap();
+        s.reaped();
+        // b's and c's own objects are gone, and all three read a's
+        assert_eq!(objects(), 1);
+        for ino in [a, b, c] {
+            assert!(s.held(ino).unwrap());
+            assert_eq!(read(&s, ino), b"shared data");
+            assert_eq!(s.stat(ino).unwrap().size, 11);
+        }
+        // a keeps its times; a clone's modification time is now
+        let st = s.stat(a).unwrap();
+        assert_eq!((st.atime_ns, st.mtime_ns), (1_000_000_000, 2_000_000_000));
+        assert!(s.stat(b).unwrap().mtime_ns > 2_000_000_000);
+        s.set_times(b, Some(at(5_000_000_000)), Some(at(6_000_000_000)))
+            .unwrap();
+        let st = s.stat(b).unwrap();
+        assert_eq!((st.atime_ns, st.mtime_ns), (5_000_000_000, 6_000_000_000));
+        assert_eq!(s.stat(a).unwrap().mtime_ns, 2_000_000_000);
+        // Writing b: a copy of its own, with its times, on disk before the commit recording it
+        let flushes = s.meta.flushes.load(Ordering::Relaxed);
+        s.make_private(b, None).unwrap();
+        assert!(!s.held(b).unwrap());
+        let st = s.stat(b).unwrap();
+        assert_eq!(
+            (st.atime_ns, st.mtime_ns, st.size),
+            (5_000_000_000, 6_000_000_000, 11)
+        );
+        s.open_object(b, true)
+            .unwrap()
+            .write_all_at(b"B", 0)
+            .unwrap();
+        assert_eq!(read(&s, b), b"Bhared data");
+        assert_eq!(read(&s, a), b"shared data");
+        s.commit().unwrap();
+        assert_eq!(s.meta.flushes.load(Ordering::Relaxed), flushes + 1);
+        // Truncating c copies only what it keeps
+        s.truncate(c, 6).unwrap();
+        assert_eq!(read(&s, c), b"shared");
+        assert_eq!(read(&s, a), b"shared data");
+        // a, the last one, takes the object back with its times, without a copy
+        s.make_private(a, None).unwrap();
+        assert_eq!(s.data(a).unwrap(), Data::own(a));
+        let st = s.stat(a).unwrap();
+        assert_eq!((st.atime_ns, st.mtime_ns), (1_000_000_000, 2_000_000_000));
+        s.commit().unwrap();
+        s.reaped();
+        assert_eq!(objects(), 3);
+        drop((fa, s));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A deleted file that shared an object keeps using it while it may still be open, until it
+    /// is released or the next boot; numbers other files use as objects keep their rows at boot,
+    /// so no new file gets them, and objects nothing uses go.
+    #[test]
+    fn shared_objects_outlive_their_first_file() {
+        let (s, dir) = temp_store("share-boot");
+        let (b, _) = s.create_file(ROOT, b"b", 0o644, 0, 0).unwrap();
+        let (c, _) = s.create_file(ROOT, b"c", 0o644, 0, 0).unwrap();
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        fa.write_all(b"data").unwrap();
+        s.share(a, b).unwrap();
+        s.share(a, c).unwrap();
+        s.unlink(ROOT, b"a").unwrap();
+        s.release(a).unwrap();
+        // c is deleted but not released: still open somewhere
+        s.unlink(ROOT, b"c").unwrap();
+        s.commit().unwrap();
+        s.reaped();
+        let object = dir.join("objects").join(a.to_string());
+        assert_eq!(fs::read(&object).unwrap(), b"data");
+        drop((fa, s));
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(fs::read(&object).unwrap(), b"data");
+        assert!(s.query_row(a).is_ok());
+        assert_eq!(s.query_row(c).err(), Some(Errno::ENOENT));
+        let (d, _) = s.create_file(ROOT, b"d", 0o644, 0, 0).unwrap();
+        assert_ne!(d, a);
+        // b, the last user, goes: so does the object, and a's row at the next boot
+        s.unlink(ROOT, b"b").unwrap();
+        s.release(b).unwrap();
+        s.commit().unwrap();
+        s.reaped();
+        assert!(!object.exists());
+        drop(s);
+        let s = Store::open(&dir, &[]).unwrap();
+        assert_eq!(s.query_row(a).err(), Some(Errno::ENOENT));
+        drop(s);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An object copied for a file that stops sharing is lost with an uncommitted transaction
+    /// like any new object: the next boot deletes it, and the file still reads the shared one.
+    #[test]
+    fn unshared_copies_lost_before_commit_are_deleted() {
+        let (s, dir) = temp_store("share-crash");
+        let (a, mut fa) = s.create_file(ROOT, b"a", 0o644, 0, 0).unwrap();
+        fa.write_all(b"data").unwrap();
+        let (b, _) = s.create_file(ROOT, b"b", 0o644, 0, 0).unwrap();
+        s.share(a, b).unwrap();
+        s.commit().unwrap();
+        s.make_private(b, None).unwrap();
+        let copy = s.data(b).unwrap().object;
+        assert_ne!(copy, a);
+        assert!(dir.join("objects").join(copy.to_string()).exists());
+        s.crash();
+        drop(fa);
+        let s = Store::open(&dir, &[]).unwrap();
+        assert!(!dir.join("objects").join(copy.to_string()).exists());
+        assert!(s.held(b).unwrap());
+        assert_eq!(s.data(b).unwrap().object, a);
         drop(s);
         let _ = fs::remove_dir_all(&dir);
     }

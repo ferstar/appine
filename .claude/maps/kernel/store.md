@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects last)
 
 ## Responsibilities
 
@@ -15,6 +15,8 @@ provides:
 
 - namespace and metadata operations (lookup, stat, create, link, unlink, rename, xattrs, times,
   tmpfs trees, memfd-style anonymous files);
+- regular files sharing one object until one of them is changed (the whole-file reflink behind
+  FICLONE, copy_file_range and overlay copy-up);
 - atomic operations, deferred commits, and power-loss ordering that mimics ext4;
 - an in-memory metadata cache readable without the BKL;
 - sharing one store between the kernel and host-side callers (the app's DocumentsProvider);
@@ -38,8 +40,12 @@ provider and rootfs installation UI (`android`).
 - `Stat`, `DirEntry`, `FileTime` (`Now` or `At(ns)`), the `mode` constants; `Ino = u64`, `ROOT = 1`.
 - `Commits` — 32 bytes of the `lock` file mapped shared: commit counter, number of open
   connections (`users`), and the range of inode numbers allocated by uncommitted transactions.
-- `Cache` — dentries (including negative entries), database rows, symlink targets, `..` parents,
-  names (for getcwd), directory listings, and the set of inodes with file capabilities.
+- `Cache` — dentries (including negative entries), database rows with where each regular file's
+  data and times are (`Data`: the object's number, and the access time while the file is held),
+  symlink targets, `..` parents, names (for getcwd), directory listings, and the set of inodes with
+  file capabilities.
+- `Unshare` — a held file's private copy in the making: the shared object open for reading, the
+  new one open for writing, the length to copy, and both numbers.
 - `Fill` — an entry created by an operation, inserted into the cache only if the operation
   succeeds (at most 64 per operation).
 - `Op` — savepoint guard; rolls back and discards fills on failure or unwinding.
@@ -54,7 +60,11 @@ provider and rootfs installation UI (`android`).
 - **Reads**: `lookup`, `name_of`, `stat`, `stat_open`, `attrs`, `kind`, `readlink`, `parent`,
   `readdir`, xattr reads, `has_file_caps`, `fs_stats`; `snapshot` (one read transaction);
   `Meta::reader` (no-BKL).
-- **Objects**: `open_object`, `open_object_append`, `truncate`.
+- **Objects**: `open_object`, `open_object_append`, `truncate` (each makes a held file private
+  first when it writes), `copy_object` (data with holes).
+- **Shared objects**: `share`, `held`, `unshare` with `finish_unshare` or `abandon_unshare` (the
+  copy in between is the caller's, so the kernel can release the BKL), `make_private` (all three
+  in one, the BKL held), `release`.
 - **Changes**: `mkdir`, `create_file`, `create_anonymous`, `symlink`, `mknod`, `link`, `unlink`,
   `rmdir`, `rename` (no-replace, exchange), `create_detached_dir`/`remove_detached_dir`,
   `set_mode`, `set_owner`, `set_owner_mode`, `remove_privs`, xattr writes, `set_mtime`,
@@ -70,16 +80,19 @@ provider and rootfs installation UI (`android`).
 
 - A store directory holds `meta.db` (SQLite, WAL mode), `objects/` and `lock`.
 - Tables: `inodes` (mode, owner, nlink, `..` parent for directories, rdev, mtime/ctime, symlink
-  targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots). Only primary keys are indexed.
+  targets), `dentries`, `xattrs`, `detached_roots` (tmpfs roots), `shared` (regular files whose data
+  is not plainly their own object: the object's number and, while held, the access time). Only
+  primary keys are indexed, and `shared` by object. Tables are created with `IF NOT EXISTS`, so
+  older stores gain `shared` when opened.
 - Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `journal_size_limit = 8 MB`, a 10 s busy
   timeout, a statement cache.
 - `Store::create` writes the root directory (0755, its own parent).
 
 ### Objects and metadata ownership
 
-- Each regular file's data is `objects/<ino>` (mode 0600), always opened by number relative to an
-  `O_PATH` directory fd, never by path. Directories, symlinks, device nodes, FIFOs and sockets
-  exist only in the database.
+- Each regular file's data is `objects/<ino>` (mode 0600), or the object `shared` names for it,
+  always opened by number relative to an `O_PATH` directory fd, never by path. Directories,
+  symlinks, device nodes, FIFOs and sockets exist only in the database.
 - Regular files take size, mtime, atime, ctime and the allocated block count (`Stat::blocks`, so
   holes take no storage) from the host object; a metadata change to a
   regular file chmods the object back to 0600 so the host bumps its ctime (one clock per file); the
@@ -90,6 +103,30 @@ provider and rootfs installation UI (`android`).
   Symlinks report the target length as size and mode 0777.
 - Reads and writes go straight to the host fd (`pread`/`pwrite`); copies between two regular files
   use the host's `sendfile`.
+
+### Shared objects
+
+- `share(src, dst)` makes `dst` use `src`'s object, in one operation: a source not yet held moves
+  its host times into the database (atime into `shared`, mtime and ctime into its row); the
+  destination keeps its access time, its modification and change times become now, and its old
+  object is doomed when no row uses it. Both rows are then held. A deleted source is `ENOENT` (its
+  object may already be queued for the reaper). The caller guarantees nothing writes the source's
+  object in place and nothing maps the destination.
+- A held file reports its times from the database (set by `set_times`/`set_times_open` there, ctime
+  now), its size and blocks from the shared object; metadata changes do not chmod the object, whose
+  host times belong to no one file.
+- `unshare(ino, keep)` before a held file changes: when no other row uses its object, the file
+  settles in place (the object's atime and mtime set from the database, the row deleted when the
+  object is its own number, else its access time cleared) and nothing is returned; otherwise an
+  inode row with no links is inserted only to number a new empty object, returned with the length
+  to copy (all, or what a truncation keeps). `finish_unshare` then points the row at the new object,
+  settles its times, dooms the old object if unused and queues the file in `replaced`, so its data
+  is flushed before the commit that records it; it is `EAGAIN` (the copy removed) when the row no
+  longer uses the object it was copied from. `make_private` loops over the three with the copy done
+  in place.
+- `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
+  callers (the browse API, `write_file`) never write a shared object; they do not move the kernel's
+  open descriptions (`kernel/vfs` does that for its own unsharing).
 
 ### Namespace operations
 
@@ -103,7 +140,10 @@ provider and rootfs installation UI (`android`).
 - Inode numbers are allocated by SQLite (`max(rowid) + 1`, no AUTOINCREMENT); a leftover object
   under a reused number is truncated and reused.
 - Removing a regular file's last link leaves the row with nlink 0 and queues the object for deletion
-  after commit (open host fds keep working); rmdir likewise leaves an nlink-0 row. Rows stay until
+  after commit when no other row uses it (open host fds keep working); a held file instead keeps
+  its row in `shared` until `release` (called by the kernel when nothing has it open or mapped) or
+  the next boot, since its descriptions still read the shared object and a write through them must
+  find it. rmdir likewise leaves an nlink-0 row. Rows stay until
   the next boot cleanup, so numbers are not reused while the store runs; after boot, numbers above
   the highest surviving row (and numbers of rolled-back inserts) are reused.
 - tmpfs trees are detached directories (their own parent) recorded in `detached_roots`; their files
@@ -142,6 +182,8 @@ provider and rootfs installation UI (`android`).
     and the first `fdatasync` error skips the remaining files.
   - The reaper syncs the WAL before deleting an object, so an object is never deleted before the
     commit that removed its last link is on disk.
+  - A held file's private copy is flushed before the commit that points it there, through the same
+    `replaced` list as a rename-over.
 - New regular files' objects exist immediately; the `lock` header records the uncommitted inode
   range so the next boot can delete objects without rows.
 
@@ -160,15 +202,18 @@ provider and rootfs installation UI (`android`).
 - Every connection takes a shared `flock` on `lock`. If it can get the lock exclusively (nobody else
   has the store open), it runs boot cleanup: reset `users`, delete objects in the recorded
   uncommitted range that have no row, empty the volatile directories passed in (the kernel passes
-  `/dev/shm` and `/run`; host-side openers pass none), remove detached tmpfs trees, sync, delete
-  nlink-0 rows and their objects (taking those numbers back out of the doomed list the emptying
-  filled), commit. Then it downgrades to shared and increments `users`; if
+  `/dev/shm` and `/run`; host-side openers pass none), remove detached tmpfs trees, sync, drop the
+  `shared` rows of deleted files, delete nlink-0 rows no `shared` row uses as an object and their
+  objects, delete the objects those dropped rows used that no row uses any more (unless one is a
+  live file's own data), taking all those numbers back out of the doomed list the emptying filled,
+  commit. Then it downgrades to shared and increments `users`; if
   others are open it waits (`BEGIN IMMEDIATE; COMMIT`) for their deferred transaction.
 
 ### Metadata cache
 
-- Caches dentries (including names that do not exist), database rows, symlink targets, `..`
-  parents, names, directory listings and the file-capability set; xattr values, emptiness checks
+- Caches dentries (including names that do not exist), database rows (with the `shared` row
+  joined in), symlink targets, `..` parents, names, directory listings and the file-capability
+  set; xattr values, emptiness checks
   and regular-file sizes and times are not cached.
 - Reads hit the cache first; on a miss the database is queried and the result inserted only if the
   commit counter did not move. Inside a `snapshot` all misses share one lazily started read
@@ -250,6 +295,12 @@ provider and rootfs installation UI (`android`).
 - Inode numbers are reused only after boot cleanup has deleted their rows. Boot cleanup therefore
   deletes those objects itself and must hand none of their numbers to the reaper, which unlinks
   `objects/<ino>` without checking whose it is.
+- A number some `shared` row uses as its object keeps its inode row (live, deleted, or one that only
+  numbers a copy) at boot, so no new file gets it while the object lives.
+- When two or more rows use one object, every one of them is held, and nothing may write that
+  object in place; a row never just repeats a plain file (object its own number, not held).
+- A number becomes a shared object only along with a `shared` row for its own file, so a plain
+  file's object is never used by another row.
 - A crash that leaves `users` too high disables deferred commits until the next exclusive open.
 
 - A failed `COMMIT` loses every deferred operation already reported as successful (the documented
@@ -258,6 +309,18 @@ provider and rootfs installation UI (`android`).
   stale; every current caller uses only the file-type bits.
 
 ## Confirmed bugs / technical debt
+
+- **Shared objects across connections:** a Files app write to a held file makes it private without
+  moving the running kernel's open descriptions, which keep reading the shared object until the
+  kernel next moves them; and a file the Files app holds open for writing, cloned by the guest at
+  that moment, has its later writes land in the clone too (only the kernel's own writers are
+  checked).
+- **Shared objects of deleted files:** a held file deleted while open keeps its share until boot,
+  so the next write to another file sharing the object copies it although nobody reads the deleted
+  one any more.
+- **Held files' access times:** reads never update them; only utimensat does.
+- **Whole-file sharing:** the first change to a file sharing its object copies all of it, where
+  btrfs and XFS copy only the extents written.
 
 - **Storage leaks:** objects created inside a rolled-back savepoint (an operation that fails after
   creating a regular file) are dropped from the uncommitted range by the next commit and stay on

@@ -1668,7 +1668,7 @@ impl View<'_> {
         Some(match &f.kind {
             // A deleted file cannot be reopened by inode (its object in the store is already
             // deleted): point at the open file itself, and copy the host file on reopen
-            FileKind::Regular { ino, file }
+            FileKind::Regular { ino, file, .. }
                 if self
                     .vfs
                     .store()

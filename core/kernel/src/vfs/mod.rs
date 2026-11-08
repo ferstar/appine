@@ -932,6 +932,11 @@ impl Vfs {
             .open(ino, || self.store.open_object(ino, false))
     }
 
+    /// Inode `ino`'s data moved to another object: the recorded program file of it goes.
+    pub(crate) fn forget_executable(&self, ino: Ino) {
+        self.executables.forget(ino);
+    }
+
     /// Drops the recorded program files (when host memory is tight).
     pub(crate) fn trim(&self) {
         self.executables.clear();

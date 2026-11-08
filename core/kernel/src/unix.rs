@@ -613,6 +613,17 @@ pub(crate) fn inflight_sockets(k: &Kernel) -> Vec<Rc<RefCell<Socket>>> {
     out
 }
 
+/// The open files carried by messages in flight (each as many times as it is carried).
+pub(crate) fn inflight_files(k: &Kernel) -> Vec<FileRef> {
+    let mut out = Vec::new();
+    for c in k.unix_inflight.iter().filter_map(Weak::upgrade) {
+        for p in &c.borrow().packets {
+            out.extend(p.fds.iter().cloned());
+        }
+    }
+    out
+}
+
 /// `/proc/net/unix`: all AF_UNIX sockets. Abstract addresses start with `@`, and the NULs in them
 /// are shown as `@` too.
 pub(crate) fn proc_listing(sockets: &[(crate::syscall::SocketRef, u32)]) -> String {
