@@ -1079,6 +1079,7 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
             Ok(old) => {
                 let old: Vec<_> = old.into_iter().collect();
                 crate::locks::closed(cx.k(), &fds, &old);
+                crate::syscall::mqueue_closed(cx.tgid(), &old);
                 crate::unix::released(cx.k(), old);
                 Ok(newfd as i32)
             }

@@ -281,7 +281,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     if let Some(dst) = args.cgroup {
         let src = cx.t.group.borrow().cgroup;
         let ns_root = cx.ns().cgroup.root;
-        crate::cgroup::may_enter(cx.kr(), src, dst, ns_root)?;
+        crate::cgroup::may_enter(cx.kr(), &cx.cred(), (src, dst), ns_root)?;
         if thread && dst != src {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -870,6 +870,7 @@ fn exec(
     let closed = cx.fds_mut().close_on_exec();
     let fds = cx.t.fds.clone();
     crate::locks::closed(cx.k(), &fds, &closed);
+    super::mqueue_closed(cx.tgid(), &closed);
     crate::unix::released(cx.k(), closed);
     {
         let group = cx.t.group.clone();

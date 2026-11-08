@@ -950,6 +950,23 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     if last && crate::bug::catch(|| crate::process::finish_group(&mut k, &group)).is_none() {
         failed(&k, "finishing the process");
     }
+    // The fd table goes with its last thread (each holds two references): its message-queue
+    // registrations end as its descriptors close (Linux's mqueue_flush_file at exit)
+    let mq_flush = || {
+        let fds = task.res.borrow().fds.clone();
+        if Rc::strong_count(&fds) <= 3 {
+            let t = fds.borrow();
+            let files: Vec<_> = t
+                .open_fds()
+                .into_iter()
+                .filter_map(|fd| t.get(fd).ok())
+                .collect();
+            crate::syscall::mqueue_closed(tgid, &files);
+        }
+    };
+    if crate::bug::catch(mq_flush).is_none() {
+        failed(&k, "closing message queues");
+    }
     // Release the thread's resources while holding the BKL: the address space, the fd table
     // (closing pipes wakes the other end)... The thread object may still be held elsewhere, so
     // release the namespaces first

@@ -251,8 +251,12 @@ enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_c
                                   struct appine_cpu *cpu);
 
 /* Just took a lock (a pthread_rwlock_t when rw is true, otherwise a pthread_mutex_t): released by
- * appine_guard_run() if a fault occurs under the guard */
+ * appine_guard_run() if a fault occurs under the guard. Holds and drops nest; beyond four held at
+ * once the inner ones are not released after a fault */
 void appine_guard_hold(void *lock, bool rw);
+
+/* The same for locks that `release(lock)` releases (several taken together) */
+void appine_guard_hold_fn(void *lock, void (*release)(void *));
 
 /* About to release the most recently registered lock */
 void appine_guard_drop(void);

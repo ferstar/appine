@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, new-file modes; owners and procfs write opens last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `O_SYNC`; locks; set-id chown; AIO; loop devices; vectored and faulting I/O; timerfd clocks; linkat, sendfile; test-suite findings; mounts; splice; open flags, new-file modes; owners, procfs write opens; read-only remounts last)
 
 ## Responsibilities
 
@@ -200,7 +200,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   caller's namespace).
 - Remount needs the exact mount root; flags change on this mount only (atime bits are kept if
   none are given); clearing a locked ro, nodev, nosuid or noexec or changing locked atime flags
-  is `EPERM` before anything changes (`can_change_locked_flags`). A tmpfs remount without
+  is `EPERM` before anything changes (`can_change_locked_flags`); going read-only while regular
+  or synthetic files are open for writing (in fd tables, or backing a loop device) is `EBUSY`:
+  through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`), through any mount of
+  the same device without it (`sb_prepare_remount_readonly`). A tmpfs remount without
   `MS_BIND` reconfigures the shared instance (`size=`/`nr_inodes=`/`inode32|64` per
   `shmem_reconfigure`).
 - Propagation flags are validated (one type, plus `MS_REC`/`MS_SILENT`) and have no effect;
@@ -743,10 +746,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `CLOCK_REALTIME_ALARM`/`CLOCK_BOOTTIME_ALARM` without `CAP_WAKE_ALARM`, where Linux returns
   `EPERM`, so programs that probe alarm clocks to learn whether they may wake the system are told
   they can.
-- **Remounting read-only ignores open writers:** a remount to read-only (bind or not) succeeds while
-  files on the mount are open for writing, where Linux returns `EBUSY`, and those fds keep writing
-  afterwards because only opens check the flag, so a mount made read-only (before shutdown, or a
-  sandbox's remount-ro) can still change.
 - **pivot_root resolves both paths before checking them:** a non-directory `new_root` with a missing
   `put_old` is `ENOENT` instead of `ENOTDIR`.
 - **mountinfo loses the root of a bind whose source was removed:** the fourth column shows `/` once

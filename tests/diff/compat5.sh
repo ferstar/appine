@@ -3,7 +3,9 @@
 # not exceed 128 KB): write opens of read-only procfs files; who signal-driven I/O may reach;
 # ptrace memory requests on processes made non-dumpable; id maps written through another
 # process's open file; procfs content regenerated through the opener's credentials; futexes on
-# replaced memory, private and shared operations, and shared memory after fork
+# replaced memory, private and shared operations, and shared memory after fork; message-queue
+# registrations ended by closing a descriptor; CLONE_INTO_CGROUP permissions; onlink routes;
+# nftables limit and quota
 set -e
 cd /tmp
 # Root may open read-only procfs files for writing (only the write fails: EIO for the files of proc
@@ -404,3 +406,185 @@ int main(void) {
 }
 C
 gcc -O1 -pthread -o futexkeys futexkeys.c && ./futexkeys
+# A message-queue registration ends when its process closes any descriptor of the queue, so
+# another process may register; cancelling a SIGEV_THREAD registration ends musl's helper thread
+# (the cookie comes marked removed)
+cat > mqflush.c <<'C'
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int threads(void) {
+    int n = 0;
+    DIR *d = opendir("/proc/self/task");
+    for (struct dirent *e; (e = readdir(d));)
+        n += e->d_name[0] != '.';
+    closedir(d);
+    return n;
+}
+
+static void try_register(const char *what) {
+    pid_t p = fork();
+    if (p == 0) {
+        mqd_t q = mq_open("/flush", O_RDWR);
+        struct sigevent ev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+        printf("%s: %s\n", what, mq_notify(q, &ev) ? strerror(errno) : "ok");
+        mq_notify(q, NULL);
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+}
+
+static void thread_fn(union sigval v) {
+    (void)v;
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    mq_unlink("/flush");
+    mqd_t q = mq_open("/flush", O_CREAT | O_RDWR, 0600, NULL);
+    int other = dup(q);
+    struct sigevent ev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+    printf("register: %s\n", mq_notify(q, &ev) ? strerror(errno) : "ok");
+    try_register("another process while registered");
+    close(other);
+    try_register("another process after closing a duplicate");
+
+    struct sigevent th = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = thread_fn};
+    printf("SIGEV_THREAD: %s, threads %d\n", mq_notify(q, &th) ? strerror(errno) : "ok",
+           threads());
+    mq_notify(q, NULL);
+    for (int i = 0; i < 100 && threads() > 1; i++)
+        usleep(10000);
+    printf("after cancelling: threads %d\n", threads());
+    mq_close(q);
+    mq_unlink("/flush");
+    return 0;
+}
+C
+gcc -O1 -pthread -o mqflush mqflush.c && ./mqflush
+# clone3's CLONE_INTO_CGROUP checks write permission on the destination's cgroup.procs and on the
+# common ancestor's, as a migration would: another user cannot place a child into root's cgroups
+cat > intocgroup.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct clone_args {
+    uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid,
+        set_tid_size, cgroup;
+};
+#define CLONE_INTO_CGROUP 0x200000000ULL
+
+static const char *into(int dirfd) {
+    struct clone_args a = {.flags = CLONE_INTO_CGROUP, .exit_signal = 17, .cgroup = dirfd};
+    long pid = syscall(435, &a, sizeof a);
+    if (pid == 0) _exit(0);
+    if (pid < 0) return strerror(errno);
+    waitpid(pid, NULL, 0);
+    return "ok";
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    rmdir("/sys/fs/cgroup/t5a");
+    rmdir("/sys/fs/cgroup/t5b");
+    if (mkdir("/sys/fs/cgroup/t5a", 0755) || mkdir("/sys/fs/cgroup/t5b", 0755)) {
+        printf("mkdir: %s\n", strerror(errno));
+        return 0;
+    }
+    pid_t p = fork();
+    if (p == 0) {
+        int procs = open("/sys/fs/cgroup/t5a/cgroup.procs", O_WRONLY);
+        write(procs, "0", 1);
+        close(procs);
+        int b = open("/sys/fs/cgroup/t5b", O_PATH | O_DIRECTORY);
+        printf("root into t5b: %s\n", into(b));
+        if (setgid(4321) || setuid(4321)) _exit(1);
+        printf("another user into t5b: %s\n", into(b));
+        int a = open("/sys/fs/cgroup/t5a", O_PATH | O_DIRECTORY);
+        printf("another user into its own t5a: %s\n", into(a));
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+    rmdir("/sys/fs/cgroup/t5a");
+    rmdir("/sys/fs/cgroup/t5b");
+    return 0;
+}
+C
+gcc -O1 -o intocgroup intocgroup.c && ./intocgroup
+# Routes through a gateway outside every subnet are accepted with onlink, which needs a device that
+# is up and, for IPv4, a scope below link and a unicast gateway; dumps show the flag
+unshare -n sh -c '
+ip link set lo up
+ip link add d0 type dummy
+ip link set d0 up
+ip addr add 10.10.0.2/24 dev d0
+ip route add default via 10.20.0.1 2>&1 | sed "s/^/without onlink: /"
+ip route add default via 10.20.0.1 dev d0 onlink && echo "onlink: ok"
+ip route add 10.30.0.0/16 via 10.20.0.2 onlink 2>&1 | sed "s/^/without a device: /"
+ip route add 10.31.0.0/16 via 10.20.0.2 dev d0 onlink scope link 2>&1 | sed "s/^/scope link: /"
+ip route add 10.32.0.0/16 via 224.0.0.9 dev d0 onlink 2>&1 | sed "s/^/multicast gateway: /"
+ip link add d1 type dummy
+ip route add 10.33.0.0/16 via 10.20.0.3 dev d1 onlink 2>&1 | sed "s/^/device down: /"
+ip route
+ip route get 10.40.1.1
+'
+# limit and quota keep state: "limit rate over" drops beyond the rate (after a burst of 5),
+# "limit rate" accepts within it, "quota over" drops once the bytes reach the quota (headers only:
+# empty datagrams of 28 bytes), and iptables' -m limit matches within its rate
+cat > ratesend.c <<'C'
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+
+int main(int argc, char **argv) {
+    int port = atoi(argv[1]);
+    int r = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int sent = 0, refused = 0, err = 0;
+    for (int i = 0; i < 10; i++) {
+        if (sendto(s, "", 0, 0, (struct sockaddr *)&a, sizeof a) == 0)
+            sent++;
+        else {
+            refused++;
+            err = errno;
+        }
+    }
+    printf("port %d: sent %d, refused %d%s%s\n", port, sent, refused, refused ? ": " : "",
+           refused ? strerror(err) : "");
+    return 0;
+}
+C
+gcc -O1 -o ratesend ratesend.c
+unshare -n sh -c '
+ip link set lo up
+nft add table ip t
+nft add chain ip t out "{ type filter hook output priority 0; }"
+nft add rule ip t out udp dport 9001 limit rate over 2/second drop
+nft add rule ip t out udp dport 9002 limit rate 2/second accept
+nft add rule ip t out udp dport 9002 drop
+nft add rule ip t out udp dport 9003 quota over 100 bytes drop
+iptables --wait -A OUTPUT -p udp --dport 9004 -m limit --limit 2/second --limit-burst 3 -j ACCEPT
+iptables --wait -A OUTPUT -p udp --dport 9004 -j DROP
+for p in 9001 9002 9003 9004 9005; do ./ratesend $p; done
+'

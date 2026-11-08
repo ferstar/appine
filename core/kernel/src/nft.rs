@@ -24,8 +24,14 @@
 //!   (the built-in DNS rules docker writes into containers, podman's port forwarding); filter
 //!   chains run on OUTPUT and along the path on PREROUTING, INPUT and FORWARD (IPv4). POSTROUTING
 //!   and arp, bridge and netdev tables are only recorded, not executed; unknown expressions count
-//!   as the rule not matching.
+//!   as the rule not matching. `limit`, `quota` and xt's `limit` keep their state with the rule;
+//!   a packet's length is that of its headers, as `meta len` gives it.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::Instant;
+
+use crate::cell::RefCell;
 use crate::cred::{Cred, cap};
 use crate::errno::Errno;
 use crate::net::{attr, message};
@@ -220,6 +226,22 @@ struct Rule {
     /// Contents of `NFTA_RULE_EXPRESSIONS` (a series of `NFTA_LIST_ELEM`).
     exprs: Vec<u8>,
     userdata: Option<Vec<u8>>,
+    /// The state of its rate expressions, by their position in the rule; shared with the copies
+    /// a batch makes of the rule.
+    rates: Rates,
+}
+
+/// See [`Rule::rates`].
+type Rates = Rc<RefCell<HashMap<usize, Rate>>>;
+
+/// The running state of one rate expression.
+#[derive(Debug, Clone, Copy)]
+enum Rate {
+    /// A token bucket (`nft_limit`, xt's `limit_mt`): nanoseconds of credit, and when it was last
+    /// topped up.
+    Bucket { tokens: u64, last: Instant },
+    /// Bytes counted against a quota (`nft_quota`).
+    Used(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -803,6 +825,7 @@ impl Nft {
             handle: table.hgen,
             exprs,
             userdata,
+            rates: Rc::new(RefCell::new(HashMap::new())),
         };
         let rules = &mut table.chains[c].rules;
         match (replace, position) {
@@ -1696,6 +1719,8 @@ impl Nft {
                 mark,
                 dnat: None,
                 reject: None,
+                rates: None,
+                at: 0,
             };
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
@@ -1742,6 +1767,8 @@ impl Nft {
                 mark,
                 dnat: None,
                 reject: None,
+                rates: None,
+                at: 0,
             };
             let v = run_chain(&mut e, t, c);
             mark = e.mark;
@@ -1868,7 +1895,9 @@ fn run_chain(e: &mut Eval<'_>, t: &Table, base: &Chain) -> i32 {
         next += 1;
         e.verdict = NFT_CONTINUE;
         e.chain = None;
-        for (name, data) in exprs(&rule.exprs) {
+        e.rates = Some(rule.rates.clone());
+        for (at, (name, data)) in exprs(&rule.exprs).into_iter().enumerate() {
+            e.at = at;
             e.expr(t, &name, &data);
             if e.verdict != NFT_CONTINUE {
                 break;
@@ -1921,6 +1950,9 @@ struct Eval<'a> {
     dnat: Option<(Vec<u8>, Option<u16>)>,
     /// The reject error code (the verdict is NF_DROP at the same time).
     reject: Option<i32>,
+    /// The running rule's rate state and the position of the running expression in it.
+    rates: Option<Rates>,
+    at: usize,
 }
 
 impl Eval<'_> {
@@ -1930,8 +1962,10 @@ impl Eval<'_> {
         let a = crate::route::attrs(data);
         let u = |t: u16| get_be32(&a, t).unwrap_or(0);
         let ok = match name {
-            b"counter" | b"log" | b"limit" | b"quota" | b"notrack" | b"dynset" | b"objref"
-            | b"last" | b"masq" | b"connlimit" | b"dup" => true,
+            b"counter" | b"log" | b"notrack" | b"dynset" | b"objref" | b"last" | b"masq"
+            | b"connlimit" | b"dup" => true,
+            b"limit" => self.limit(&a),
+            b"quota" => self.quota(&a),
             b"reject" => {
                 self.reject = Some(reject_errno(
                     u(1),
@@ -2351,6 +2385,78 @@ impl Eval<'_> {
 
     /// xt matches: comment, mark, owner, conntrack, state, addrtype, tcp, udp; others count as not
     /// matching.
+    /// `limit` (`nft_limit_init`, `nft_limit_eval`): `rate` packets (or bytes) per `unit` seconds,
+    /// with room for `burst` more (5 packets when 0); within the rate it matches and beyond it
+    /// not, or the reverse with `NFT_LIMIT_F_INV` (`limit rate over`).
+    fn limit(&mut self, a: &[(u16, &[u8])]) -> bool {
+        let (Some(rate), Some(unit)) = (get_be64(a, 1), get_be64(a, 2)) else {
+            return false;
+        };
+        let burst = u64::from(get_be32(a, 3).unwrap_or(0));
+        let bytes = get_be32(a, 4) == Some(1);
+        let invert = get_be32(a, 5).unwrap_or(0) & 1 != 0;
+        let Some(nsecs) = unit.checked_mul(1_000_000_000).filter(|_| rate != 0) else {
+            return false;
+        };
+        let (cost, max) = if bytes {
+            let len = (self.nh.len() + self.th.len()) as u64;
+            (
+                nsecs.saturating_mul(len) / rate,
+                nsecs.saturating_mul(rate.saturating_add(burst)) / rate,
+            )
+        } else {
+            let burst = if burst == 0 { 5 } else { burst };
+            (nsecs / rate, (nsecs / rate).saturating_mul(burst))
+        };
+        self.take_tokens(cost, max) != invert
+    }
+
+    /// Takes `cost` nanoseconds of credit from the running expression's bucket, which fills at one
+    /// per nanosecond up to `max` and starts full: whether there was enough.
+    fn take_tokens(&mut self, cost: u64, max: u64) -> bool {
+        let Some(rates) = &self.rates else {
+            return true;
+        };
+        let now = Instant::now();
+        let mut rates = rates.borrow_mut();
+        let rate = rates.entry(self.at).or_insert(Rate::Bucket {
+            tokens: max,
+            last: now,
+        });
+        let Rate::Bucket { tokens, last } = rate else {
+            return true;
+        };
+        let t = tokens
+            .saturating_add(now.duration_since(*last).as_nanos() as u64)
+            .min(max);
+        *last = now;
+        *tokens = t.checked_sub(cost).unwrap_or(t);
+        t >= cost
+    }
+
+    /// `quota` (`nft_quota_do_eval`): the packet's bytes are counted (from `NFTA_QUOTA_CONSUMED`);
+    /// it matches until the count reaches the quota, or only from then on with `NFT_QUOTA_F_INV`
+    /// (`quota over`).
+    fn quota(&mut self, a: &[(u16, &[u8])]) -> bool {
+        let Some(quota) = get_be64(a, 1) else {
+            return false;
+        };
+        let invert = get_be32(a, 2).unwrap_or(0) & 1 != 0;
+        let len = (self.nh.len() + self.th.len()) as u64;
+        let Some(rates) = &self.rates else {
+            return !invert;
+        };
+        let mut rates = rates.borrow_mut();
+        let rate = rates
+            .entry(self.at)
+            .or_insert(Rate::Used(get_be64(a, 3).unwrap_or(0)));
+        let Rate::Used(used) = rate else {
+            return !invert;
+        };
+        *used = used.saturating_add(len);
+        (*used >= quota) == invert
+    }
+
     fn xt_match(&mut self, a: &[(u16, &[u8])]) -> bool {
         let (Some(name), Some(info)) = (get_str(a, 1), get(a, 3)) else {
             return false;
@@ -2366,6 +2472,15 @@ impl Eval<'_> {
         };
         match name {
             b"comment" => true,
+            // xt_rateinfo (limit_mt): avg, the average time between packets in 1/10000 s, and
+            // burst; a bucket of avg × burst, each packet taking avg
+            b"limit" => {
+                let (Some(avg), Some(burst)) = (ne32(0), ne32(4)) else {
+                    return false;
+                };
+                let cost = u64::from(avg) * 100_000;
+                self.take_tokens(cost, cost.saturating_mul(u64::from(burst)))
+            }
             // xt_mark_mtinfo1: mark, mask and invert; revision 0's xt_mark_info is two unsigned
             // longs
             b"mark" => {

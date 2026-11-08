@@ -3916,6 +3916,7 @@ pub(crate) fn write(
                 tid,
                 pid_ns,
                 ns_root: ns.cgroup.root,
+                opener,
             };
             return crate::cgroup::write(k, &writer, (*id, name), data);
         }

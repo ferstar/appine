@@ -26,8 +26,8 @@ SKIP="$SKIP:$R.RouteMulticastGroup/*:$R.RouteMulticastGroupSameDestination/*"
 # of ip route get are skipped)
 SKIP="$SKIP:NetlinkRouteTest.GetRouteOversizedDestination:NetlinkRouteTest.GetRouteFamilyMismatch"
 # kernel/netns: routes are unicast only and lo cannot be a next hop; route requests insist on
-# exact address sizes; gateways resolve to the last matching subnet; next-hop checks ignore onlink
-# and Linux's special cases; IPv6 over virtual devices is unusable
+# exact address sizes; gateways resolve to the last matching subnet; next-hop checks miss Linux's
+# special cases; IPv6 over virtual devices is unusable
 SKIP="$SKIP:$R.NewDefaultRouteWithoutGateway/*:$R.DeleteDefaultRouteWithoutGateway/*"
 SKIP="$SKIP:NetlinkRouteTest.DeleteIpv6RouteIgnoresType:NetlinkRouteTest.NewRouteUnsupportedType"
 SKIP="$SKIP:NetlinkRouteTest.NewRouteUnspecType:NetlinkRouteTest.NewRouteTypeOutOfRange"

@@ -999,7 +999,8 @@ mod tests {
 
     /// A failed internal check (an engine bug found without a host fault) under the guard ends
     /// the run as a host fault with SIGABRT, so only the guest process is ended, instead of
-    /// aborting the app.
+    /// aborting the app; the registered locks are released, nested ones beyond the four recorded
+    /// included in the pairing.
     #[test]
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),

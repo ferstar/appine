@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations; restarted mqueue waits last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments count as attachments; mqueue timeouts follow the wall clock; int sysctl bounds and fallible allocations; restarted mqueue waits; registrations ended by close last)
 
 ## Responsibilities
 
@@ -207,9 +207,13 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - Senders, receivers and poll/epoll wait on the queue object; both directions wake it.
 - mq_notify validates the sigevent before the fd; NULL cancels the caller's own registration;
   `SIGEV_THREAD` takes a netlink socket fd and a 32-byte cookie. While the registrant's process is
-  alive, any new registration is `EBUSY`, the registrant's own included; a registration ends only
-  when it fires, when its registrant cancels it, or when another process registers after the
-  registrant is gone or a zombie. mq_getsetattr changes only the fd's `O_NONBLOCK`.
+  alive, any new registration is `EBUSY`, the registrant's own included; a registration ends when
+  it fires, when its registrant cancels it, when the registrant's process closes any descriptor of
+  the queue (close, dup3 over it, close_range, close-on-exec, seccomp addfd replacing it, or its fd
+  table going with its last thread; Linux's `mqueue_flush_file`), or when another process registers
+  after the registrant is gone or a zombie. A `SIGEV_THREAD` registration that ends without firing
+  queues its cookie marked `NOTIFY_REMOVED`, which ends musl's helper thread. mq_getsetattr changes
+  only the fd's `O_NONBLOCK`.
 - mq_unlink and filesystem unlink remove only the name (the queue's owner, the root directory's
   owner, or `CAP_FOWNER`); open fds keep the queue.
 
@@ -275,12 +279,9 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   masks the mode with `0o1777`, hiding `SHM_LOCKED`.
 - **`semmns` and `shmall` are not enforced:** semget and shmget never fail with `ENOSPC` for the
   total number of semaphores or shm pages; both values are only reported.
-- **mqueue notifications outlive their owner's fds:** closing a queue fd never removes the
-  registration (Linux's `mqueue_flush_file` does when the registrant closes any fd), so another
-  process gets `EBUSY` while the registrant lives and `NOTIFY_PID` stays stale; it is keyed by tgid
-  alone, so a reused tgid looks alive and would get the signal. Cancelling or replacing a
-  `SIGEV_THREAD` registration sends no `NOTIFY_REMOVED` cookie, so musl's helper thread stays
-  blocked in recv forever.
+- **mqueue registrations are keyed by tgid alone:** one whose process exited while its fd table
+  lives on in another process (`CLONE_FILES`) stays registered, and a reused tgid looks alive and
+  would get the signal (Linux holds the registrant's `struct pid`).
 - **mqueue limits and root permissions are partly missing:** without an attr a queue gets
   `msg_default`/`msgsize_default` uncapped by `msg_max`/`msgsize_max`; `RLIMIT_MSGQUEUE` is not
   enforced; mq_open and mq_unlink skip the root directory's permission check that the filesystem

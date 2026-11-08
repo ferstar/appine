@@ -20,12 +20,8 @@ SKIP="$SKIP:MountTest.BasicSharing:MountTest.InheritShared:MountTest.PropagateOn
 SKIP="$SKIP:MountTest.PropagateOvermount:MountTest.PropagateUnmount:MountTest.QuizAMountMove"
 SKIP="$SKIP:MountTest.QuizCPropagation:DetachedMountTest.ChangePropagationSucceeds"
 # kernel/vfs: umount ignores mappings; pivot_root resolves both paths before checking them;
-# mountinfo loses the root of a bind whose source was removed; remounting read-only ignores open
-# writers
+# mountinfo loses the root of a bind whose source was removed
 SKIP="$SKIP:MountTest.BusyWithMmap:MountTest.PivotRootErrors:MountTest.ProcMountInfoRoot"
-SKIP="$SKIP:MountTest.RemountReadWriteToReadOnlyWithOpenWriterFails"
-SKIP="$SKIP:MountTest.RemountBindReadWriteToReadOnlyWithOpenWriterToBindFails"
-SKIP="$SKIP:MountTest.RemountFilesystemReadWriteToReadOnlyWithOpenWriterToBindFails"
 # kernel/vfs: a filesystem has no superblock flags of its own (a tmpfs mounted read-only becomes
 # writable through a bind remount, and mountinfo's super options are always rw)
 SKIP="$SKIP:MountTest.RemountReadOnlyToReadWriteIgnored:MountTest.RemountBindReadOnlyFlagInheritance"

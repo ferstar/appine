@@ -65,6 +65,9 @@ pub(crate) struct Oom {
     next: Option<Instant>,
     /// The process ended most recently, and when it was ended.
     victim: Option<(Weak<RefCell<ThreadGroup>>, Instant)>,
+    /// Victims still not done exiting after [`VICTIM_TIMEOUT`] (stuck in host I/O): never waited
+    /// for or picked again.
+    stuck: Vec<Weak<RefCell<ThreadGroup>>>,
     /// When the code cache's writable view is next torn down; None means all threads are waiting
     /// and it has stopped.
     code_views: Option<Instant>,
@@ -77,6 +80,7 @@ impl Default for Oom {
             peak: Cell::new(0),
             next: None,
             victim: None,
+            stuck: Vec::new(),
             code_views: None,
         }
     }
@@ -207,16 +211,24 @@ pub(crate) fn app_memory() -> Option<appine_hal::MemoryUsage> {
 /// `limit`: picks a process below it and ends it (Linux's `out_of_memory`, `oom_kill_process`),
 /// together with that group under `memory.oom.group`. While the process picked last time has not
 /// finished exiting it waits for it (its memory will be back soon); one still not done after the
-/// timeout (stuck in host I/O) is no longer waited for, nor picked again.
+/// timeout (stuck in host I/O) is no longer waited for, nor picked again, however many others are
+/// picked after it.
 pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u64)) {
     let now = Instant::now();
     if waiting_for_victim(k, now) {
         return;
     }
-    // One still not done exiting after the timeout is not picked again
-    let stuck = k.oom.victim.as_ref().and_then(|(v, _)| v.upgrade());
-    let stuck = stuck.filter(|g| !g.borrow().threads.is_empty());
-    let Some((victim, rss)) = select(k, stuck.as_ref(), (domain, limit)) else {
+    let alive = |w: &Weak<RefCell<ThreadGroup>>| {
+        w.upgrade().is_some_and(|g| !g.borrow().threads.is_empty())
+    };
+    if let Some((v, _)) = k.oom.victim.take()
+        && alive(&v)
+    {
+        k.oom.stuck.push(v);
+    }
+    k.oom.stuck.retain(alive);
+    let stuck: Vec<_> = k.oom.stuck.iter().filter_map(Weak::upgrade).collect();
+    let Some((victim, rss)) = select(k, &stuck, (domain, limit)) else {
         return;
     };
     crate::cgroup::memory_event(k, domain, |e| e.oom += 1);
@@ -284,14 +296,16 @@ pub(crate) fn out_of_memory(k: &mut Kernel, (domain, used, limit): (u64, u64, u6
     }
 }
 
-/// Picks the process to end (skipping `skip`): the OOM scope is cgroup `domain` (the root being the
-/// whole app), and the pick is among the processes below it, by Linux's oom_badness: resident pages
-/// plus `oom_score_adj` converted into pages against the limit `limit` (for the root, the larger
-/// of physical memory and the limit; 1000 equals everything, so such a process is always picked
-/// first). Returns the process and its resident 4K page count.
+/// Picks the process to end (skipping those in `skip`): the OOM scope is cgroup `domain` (the root
+/// being the whole app), and the pick is among the processes below it, by Linux 6.1's oom_badness:
+/// resident pages plus `oom_score_adj` times a thousandth of the limit `limit` in pages (for the
+/// root, the larger of physical memory and the limit; 1000 equals everything, so such a process is
+/// always picked first), unclamped; on equal scores the later process wins, as
+/// `oom_evaluate_task` keeps the last one not below the best. Returns the process and its resident
+/// 4K page count.
 fn select(
     k: &Kernel,
-    skip: Option<&Rc<RefCell<ThreadGroup>>>,
+    skip: &[Rc<RefCell<ThreadGroup>>],
     (domain, limit): (u64, u64),
 ) -> Option<(Rc<RefCell<ThreadGroup>>, u64)> {
     let total = if domain == ROOT {
@@ -302,7 +316,7 @@ fn select(
     let total = (total / PAGE_SIZE) as i64;
     let mut best: Option<(Rc<RefCell<ThreadGroup>>, i64, u64)> = None;
     for group in k.groups.values() {
-        if skip.is_some_and(|s| Rc::ptr_eq(s, group)) {
+        if skip.iter().any(|s| Rc::ptr_eq(s, group)) {
             continue;
         }
         let g = group.borrow();
@@ -316,8 +330,8 @@ fn select(
             continue;
         };
         let rss = task.res.borrow().mm.borrow().resident_pages();
-        let points = (rss as i64 + g.oom_score_adj as i64 * total / 1000).max(1);
-        if best.as_ref().is_none_or(|b| points > b.1) {
+        let points = rss as i64 + g.oom_score_adj as i64 * (total / 1000);
+        if best.as_ref().is_none_or(|b| points >= b.1) {
             best = Some((group.clone(), points, rss));
         }
     }

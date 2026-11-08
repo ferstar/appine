@@ -9,7 +9,9 @@
 //! the same fd as mq_open. Messages are ordered by priority, first in first out within a priority.
 //! mq_notify notifies once when a message arrives in an empty queue and nobody is waiting to
 //! receive it: it sends a signal, or delivers the 32-byte cookie given at registration to a
-//! netlink socket (which is how musl implements `SIGEV_THREAD`). Limits follow
+//! netlink socket (which is how musl implements `SIGEV_THREAD`). A registration also ends when its
+//! process cancels it or closes any descriptor of the queue (exit included); a `SIGEV_THREAD` one
+//! then gets the cookie marked removed, which ends musl's helper thread. Limits follow
 //! `/proc/sys/fs/mqueue/*`.
 
 use std::collections::VecDeque;
@@ -40,8 +42,9 @@ const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
 /// The si_code of message queue notifications.
 const SI_MESGQ: i32 = -3;
-/// The last byte of a netlink notification cookie.
+/// The last byte of a netlink notification cookie: a message arrived, or the registration ended.
 const NOTIFY_WOKENUP: u8 = 1;
+const NOTIFY_REMOVED: u8 = 2;
 
 /// `/proc/sys/fs/mqueue/*`.
 pub(crate) struct Limits {
@@ -531,18 +534,7 @@ pub(super) fn mq_timedsend(
             .sent_by(&cred);
             signal::send_to_group(cx.kr(), tgid, sig, info);
         }
-        Some(Notify::Socket {
-            sock, mut cookie, ..
-        }) => {
-            if let Some(sock) = sock.upgrade()
-                && let Socket::Netlink(n) = &mut *sock.borrow_mut()
-            {
-                cookie[31] = NOTIFY_WOKENUP;
-                n.queue.push_back(cookie.to_vec());
-                n.arrivals += 1;
-                request_wake_object(wake::of(&sock));
-            }
-        }
+        Some(Notify::Socket { sock, cookie, .. }) => send_cookie(&sock, cookie, NOTIFY_WOKENUP),
         _ => {}
     }
     // Wake only those waiting for this queue (poll, epoll, blocking receives): this used to wake
@@ -636,7 +628,7 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
         // Cancel one's own registration
         let mut q = q.borrow_mut();
         if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
-            q.notify = None;
+            remove_notification(&mut q);
             q.touch_read();
         }
         return Ok(0);
@@ -677,9 +669,45 @@ pub(super) fn mq_notify(cx: &mut Cx<'_>, fd: i32, sev: u64) -> SysResult {
     {
         return Err(Errno::EBUSY);
     }
+    remove_notification(&mut q);
     q.notify = Some(notify);
     q.touch_read();
     Ok(0)
+}
+
+/// Files that process `tgid` closed (close, dup3 over a descriptor, close_range, close-on-exec,
+/// its last thread's exit): its registrations on their queues end, whatever other descriptors
+/// remain (Linux's `mqueue_flush_file`).
+pub(crate) fn closed(tgid: Tid, files: &[crate::fd::FileRef]) {
+    for f in files {
+        if let FileKind::MessageQueue(q) = &f.borrow().kind {
+            let mut q = q.borrow_mut();
+            if q.notify.as_ref().is_some_and(|n| n.tgid() == tgid) {
+                remove_notification(&mut q);
+            }
+        }
+    }
+}
+
+/// Ends a queue's registration (Linux's `remove_notification`): a `SIGEV_THREAD` one gets its
+/// cookie marked `NOTIFY_REMOVED` on the netlink socket, so musl's helper thread, blocked
+/// receiving there, ends instead of waiting forever.
+fn remove_notification(q: &mut MessageQueue) {
+    if let Some(Notify::Socket { sock, cookie, .. }) = q.notify.take() {
+        send_cookie(&sock, cookie, NOTIFY_REMOVED);
+    }
+}
+
+/// Queues a `SIGEV_THREAD` cookie, its last byte set to `code`, on the registrant's netlink socket.
+fn send_cookie(sock: &Weak<RefCell<Socket>>, mut cookie: [u8; 32], code: u8) {
+    if let Some(sock) = sock.upgrade()
+        && let Socket::Netlink(n) = &mut *sock.borrow_mut()
+    {
+        cookie[31] = code;
+        n.queue.push_back(cookie.to_vec());
+        n.arrivals += 1;
+        request_wake_object(wake::of(&sock));
+    }
 }
 
 /// The queue of an mq fd, and the open file's access mode.

@@ -301,6 +301,13 @@ impl Cgroups {
         format!("/{}", parts.join("/"))
     }
 
+    /// The nearest cgroup that `a` and `b` are both within.
+    pub fn common_ancestor(&self, a: u64, b: u64) -> u64 {
+        self.ancestors(a)
+            .find(|&c| self.is_within(b, c))
+            .unwrap_or(ROOT)
+    }
+
     /// `id` and its ancestors, starting with itself.
     fn ancestors(&self, id: u64) -> impl Iterator<Item = u64> + '_ {
         std::iter::successors(Some(id), |&c| self.map.get(&c).and_then(|g| g.parent))
@@ -595,11 +602,13 @@ fn memory_stat_with(anon: u64, shmem: u64) -> String {
 // ---- Writing ----
 
 /// The writing process: its thread, its pid namespace (ids in cgroup.procs are in it, and 0 is
-/// itself) and the root of its cgroup namespace.
+/// itself) and the root of its cgroup namespace; and the credentials the file was opened with
+/// (migrations are checked with them, as Linux's `__cgroup_procs_write` does).
 pub(crate) struct Writer<'a> {
     pub tid: Tid,
     pub pid_ns: &'a crate::pidns::PidNs,
     pub ns_root: u64,
+    pub opener: &'a Cred,
 }
 
 /// Writes `<name>` in cgroup `id` (Linux 6.1's `cgroup_file_write` and each cftype's `write`).
@@ -640,7 +649,7 @@ pub(crate) fn write(
                 n if n < 0 => return Err(Errno::EINVAL),
                 n => w.pid_ns.find(n).ok_or(Errno::ESRCH)?,
             };
-            migrate(k, tid, (id, w.ns_root), name == b"cgroup.procs")
+            migrate(k, (tid, w.opener), (id, w.ns_root), name == b"cgroup.procs")
         }
         b"cgroup.subtree_control" => subtree_control(k, id, text),
         // An integer; anything other than 1 is ERANGE (Linux's cgroup_kill_write)
@@ -697,18 +706,26 @@ pub(crate) fn write(
 }
 
 /// Migrates the process of thread `tid` (`procs`) or the thread itself to cgroup `dst` (Linux's
-/// `__cgroup_procs_write`, `cgroup_attach_permissions`): a missing process is ESRCH; the source
-/// and the destination must both be under the root `ns_root` of the writer's cgroup namespace
-/// (ENOENT); a destination with controllers enabled (other than the root) cannot have processes
-/// (EBUSY); migrating a single thread between domain cgroups is EOPNOTSUPP. The write permission
-/// that writing `cgroup.procs` needs is checked when the file is opened.
-fn migrate(k: &mut Kernel, tid: Tid, (dst, ns_root): (u64, u64), procs: bool) -> Result<(), Errno> {
+/// `__cgroup_procs_write`, `cgroup_attach_permissions`): a missing process is ESRCH; `cred`, the
+/// file opener's, must be allowed to write the `cgroup.procs` of the nearest cgroup above both the
+/// source and the destination (EACCES), so the owner of a delegated cgroup cannot pull in processes
+/// from outside it; the source and the destination must both be under the root `ns_root` of the
+/// writer's cgroup namespace (ENOENT); a destination with controllers enabled (other than the root)
+/// cannot have processes (EBUSY); migrating a single thread between domain cgroups is EOPNOTSUPP.
+/// The write permission on the destination's own file is checked when it is opened.
+fn migrate(
+    k: &mut Kernel,
+    (tid, cred): (Tid, &Cred),
+    (dst, ns_root): (u64, u64),
+    procs: bool,
+) -> Result<(), Errno> {
     let tgid = k.tasks.get(&tid).ok_or(Errno::ESRCH)?.tgid;
     if tgid == INIT {
         return Err(Errno::EINVAL);
     }
     let g = k.groups.get(&tgid).cloned().ok_or(Errno::ESRCH)?;
     let src = g.borrow().cgroup;
+    may_write_procs(k, cred, k.cgroups.common_ancestor(src, dst))?;
     if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
         return Err(Errno::ENOENT);
     }
@@ -949,12 +966,21 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
 
 // ---- Fork ----
 
-/// Whether a child forked from cgroup `src` may be placed into cgroup `dst` (clone3's
-/// `CLONE_INTO_CGROUP`, Linux's `cgroup_css_set_fork`): an already removed one is ENODEV; both
+/// Whether a child forked from cgroup `src` may be placed into cgroup `dst` by a caller with
+/// credentials `cred` (clone3's `CLONE_INTO_CGROUP`, Linux's `cgroup_css_set_fork`): an already
+/// removed one is ENODEV; the caller must be allowed to write the `cgroup.procs` of `dst` and of
+/// the nearest cgroup above both (EACCES), as a migration through `cgroup.procs` would need; both
 /// must be under the root `ns_root` of the caller's cgroup namespace (ENOENT); one with
 /// controllers enabled (other than the root) cannot have processes (EBUSY).
-pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<(), Errno> {
+pub(crate) fn may_enter(
+    k: &Kernel,
+    cred: &Cred,
+    (src, dst): (u64, u64),
+    ns_root: u64,
+) -> Result<(), Errno> {
     let g = k.cgroups.get(dst).ok_or(Errno::ENODEV)?;
+    may_write_procs(k, cred, dst)?;
+    may_write_procs(k, cred, k.cgroups.common_ancestor(src, dst))?;
     if !k.cgroups.is_within(src, ns_root) || !k.cgroups.is_within(dst, ns_root) {
         return Err(Errno::ENOENT);
     }
@@ -962,6 +988,19 @@ pub(crate) fn may_enter(k: &Kernel, src: u64, dst: u64, ns_root: u64) -> Result<
         return Err(Errno::EBUSY);
     }
     Ok(())
+}
+
+/// Whether `cred` may write cgroup `id`'s `cgroup.procs`, judged by the file's mode and owner as
+/// an open for writing would be (Linux's `cgroup_may_write`).
+fn may_write_procs(k: &Kernel, cred: &Cred, id: u64) -> Result<(), Errno> {
+    let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
+    let st = crate::vfs::store::Stat {
+        mode: crate::vfs::store::mode::S_IFREG | file_mode(b"cgroup.procs").unwrap_or(0o644),
+        uid: g.uid,
+        gid: g.gid,
+        ..Default::default()
+    };
+    cred.permission(&st, crate::cred::MAY_WRITE)
 }
 
 /// Before a forked task is placed into cgroup `dst` (Linux's `pids_can_fork`): the task count of

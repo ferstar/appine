@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; vmstat; names; test-suite findings; `user/max_*`; fd access, cgroup ids, zombies; write opens, opener credentials last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; sysctls; vmstat; names; test-suite findings; `user/max_*`; fd access, cgroup ids, zombies; write opens, opener credentials; cgroup migration rights last)
 
 ## Responsibilities
 
@@ -277,16 +277,20 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   rmdir: write and search on the parent; children or live processes `EBUSY`; the root `EBUSY`.
 - Membership: every process starts in the root; fork places the child in the parent's cgroup or a
   `clone3(CLONE_INTO_CGROUP)` target after `pids_charge` (`EAGAIN`) and starts it frozen if the
-  target is freezing; the target only has to exist (`ENODEV`), lie with the parent's cgroup inside
-  the caller's cgroup-namespace root (`ENOENT`) and have no controllers enabled for children
-  (`EBUSY`) — there is no permission check. Zombies stay until reaped; `CLONE_NEWCGROUP`/unshare
+  target is freezing; the target has to exist (`ENODEV`), the caller must be allowed to write its
+  `cgroup.procs` and that of the nearest cgroup above both it and the parent's (`EACCES`, judged
+  by mode and owner as an open would be), both must lie inside the caller's cgroup-namespace root
+  (`ENOENT`), and the target must have no controllers enabled for children (`EBUSY`). Zombies stay
+  until reaped; `CLONE_NEWCGROUP`/unshare
   roots the new namespace at the current cgroup. The BKL is held from the charge until the child
   is registered, so no fork escapes a concurrent `cgroup.kill`.
 - `cgroup.procs` writes: pid 0 is the caller; pids resolve in the writer's pid namespace
-  (`ESRCH`); kernel init `EINVAL`; source or destination outside the writer's cgroup-namespace
-  root `ENOENT`; a non-root destination with controllers enabled for children `EBUSY`; then the
-  group moves and freezing is re-evaluated. Only the destination file's open permission is
-  checked (no common-ancestor check as in Linux's `cgroup_procs_write_permission`). Reads of
+  (`ESRCH`); kernel init `EINVAL`; the opener's credentials must allow writing the `cgroup.procs`
+  of the nearest cgroup above both source and destination (`EACCES`, Linux's
+  `cgroup_procs_write_permission`; the destination's own was checked at open); source or
+  destination outside the writer's cgroup-namespace root `ENOENT`; a non-root destination with
+  controllers enabled for children `EBUSY`; then the group moves and freezing is re-evaluated.
+  Reads of
   `cgroup.procs`/`cgroup.threads` print ids in the reader's pid namespace, 0 for ones it cannot see
   (Linux's task_pid_vnr). Any write to a file of a removed cgroup is `ENODEV`. `cgroup.threads` only accepts
   moves within the same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain`.
@@ -358,14 +362,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 ## Confirmed bugs / technical debt
 
-- **`CLONE_INTO_CGROUP` has no permission check:** any process can `clone3` a child into any cgroup
-  inside its cgroup namespace through an `O_PATH` directory fd, escaping its own cgroup's
-  `pids.max`, `memory.max`, freezer and device programs (Linux 6.1 requires write permission on
-  the target's `cgroup.procs` and the migration permission rules).
-- **Delegated cgroups can capture other users' processes:** writing `cgroup.procs` checks only the
-  destination file, so the owner of a cgroup (one created for them by a privileged process) can
-  move any process, root's included, into it and then freeze or kill it through `cgroup.freeze` /
-  `cgroup.kill` (Linux requires write access to the common ancestor's `cgroup.procs`).
 - **Per-thread fd views are wrong:** `task/<tid>/fd` and `fdinfo` show the group leader's table even
   when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
 - **No change notifications:** synthetic files cannot be added to epoll (`EPERM`) and always poll

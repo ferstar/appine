@@ -1284,6 +1284,7 @@ pub(super) fn close(cx: &mut Cx<'_>, fd: i32) -> SysResult {
     let file = r?;
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, std::slice::from_ref(&file));
+    super::mqueue_closed(cx.tgid(), std::slice::from_ref(&file));
     crate::unix::released(cx.k(), vec![file]);
     Ok(0)
 }
@@ -1306,6 +1307,7 @@ pub(super) fn close_range(cx: &mut Cx<'_>, first: u32, last: u32, flags: u32) ->
     );
     let fds = cx.t.fds.clone();
     locks::closed(cx.k(), &fds, &closed);
+    super::mqueue_closed(cx.tgid(), &closed);
     crate::unix::released(cx.k(), closed);
     Ok(0)
 }
@@ -1324,6 +1326,7 @@ pub(super) fn dup3(cx: &mut Cx<'_>, old: i32, new: i32, flags: u32) -> SysResult
     let fds = cx.t.fds.clone();
     let replaced: Vec<_> = replaced?.into_iter().collect();
     locks::closed(cx.k(), &fds, &replaced);
+    super::mqueue_closed(cx.tgid(), &replaced);
     crate::unix::released(cx.k(), replaced);
     Ok(new as u64)
 }

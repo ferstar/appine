@@ -3062,6 +3062,7 @@ static void *template_alloc(size_t bytes)
 {
     void *p = NULL;
     pthread_mutex_lock(&templates.arena_lock);
+    appine_guard_hold(&templates.arena_lock, false);
     if (!templates.arena) {
         void *m = mmap(NULL, TEMPLATE_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         templates.arena = m == MAP_FAILED ? NULL : m;
@@ -3072,8 +3073,18 @@ static void *template_alloc(size_t bytes)
     } else if (templates.arena) {
         templates.full = true;
     }
+    appine_guard_drop();
     pthread_mutex_unlock(&templates.arena_lock);
     return p;
+}
+
+/* Release every template lock, as template_clear takes them (also after a host fault) */
+static void template_unlock_all(void *unused)
+{
+    (void)unused;
+    pthread_mutex_unlock(&templates.arena_lock);
+    for (unsigned i = TEMPLATE_SHARDS; i-- > 0;)
+        pthread_mutex_unlock(&templates.shards[i].lock);
 }
 
 /* Discard all translation templates: the template arena is full (`if_full`; not cleared again if
@@ -3084,14 +3095,14 @@ static void template_clear(bool if_full)
     for (unsigned i = 0; i < TEMPLATE_SHARDS; i++)
         pthread_mutex_lock(&templates.shards[i].lock);
     pthread_mutex_lock(&templates.arena_lock);
+    appine_guard_hold_fn(NULL, template_unlock_all);
     if (templates.full || !if_full) {
         memset(templates.buckets, 0, sizeof(templates.buckets));
         templates.used = 0;
         templates.full = false;
     }
-    pthread_mutex_unlock(&templates.arena_lock);
-    for (unsigned i = TEMPLATE_SHARDS; i-- > 0;)
-        pthread_mutex_unlock(&templates.shards[i].lock);
+    appine_guard_drop();
+    template_unlock_all(NULL);
 }
 
 /* Store a just-translated block whose links have not been patched yet as a template */
@@ -3162,6 +3173,7 @@ static void perf_map(const void *code, size_t bytes, uint64_t pc)
     if (__atomic_load_n(&enabled, __ATOMIC_RELAXED) == 0)
         return;
     pthread_mutex_lock(&lock);
+    appine_guard_hold(&lock, false);
     if (__atomic_load_n(&enabled, __ATOMIC_RELAXED) < 0) {
         int on = getenv("APPINE_PERF_MAP") != NULL;
         if (on) {
@@ -3176,6 +3188,7 @@ static void perf_map(const void *code, size_t bytes, uint64_t pc)
                 (unsigned long)pc);
         fflush(file);
     }
+    appine_guard_drop();
     pthread_mutex_unlock(&lock);
 }
 
@@ -3548,10 +3561,14 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
     /* Read the table only after the sequence number has become odd: an stlr and a later ldar are
      * ordered */
     emit_seq_step(x);
-    /* Misaligned pcs and pcs beyond 48 bits go to the dispatcher; see table_find_for */
+    /* Misaligned pcs and pcs beyond 48 bits go to the dispatcher; see table_find_for. So does pc
+     * 0: the ldp below reads key and code in no particular order, and racing an insertion it can
+     * pair the new code with the empty slot's key 0, which only pc 0 would match */
     emit(x, enc_and_ror(2, T0, 2 + 64 - TAG_SHIFT, 64 - TAG_SHIFT));
     uint32_t *invalid = here(x);
     emit(x, enc_cbnz_x(2));
+    uint32_t *zero = here(x);
+    emit(x, enc_cbz_x(T0));
     /* x1 = this member's tag << TAG_SHIFT: an entry whose key XOR pc is 0 is a shared block, and
      * one where it equals x1 is this member's private block */
     emit(x, enc_ldr_w(1, CTX, offsetof(struct appine_cpu, dbt_tag)));
@@ -3595,6 +3612,7 @@ static uint32_t *emit_lookup(struct xlate *x, struct appine_dbt *d)
 
     patch_branch(x->wdelta, miss, here(x));
     patch_branch(x->wdelta, invalid, here(x));
+    patch_branch(x->wdelta, zero, here(x));
     emit_seq_step(x);
     emit(x, enc_ldp_x(0, 1, CTX, (int)x0));
     emit(x, enc_ldp_x(2, 3, CTX, (int)x0 + 16));

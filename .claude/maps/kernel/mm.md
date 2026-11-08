@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; the OOM killer; VMA boundaries, stack growth; smaps, RSS; fork; Starnix findings; private-file `MADV_DONTNEED`; truncation; idle checks, shared NORESERVE; futex keys last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; Starnix findings; private-file `MADV_DONTNEED`; truncation; idle checks, shared NORESERVE; futex keys; OOM choice last)
 
 ## Responsibilities
 
@@ -486,11 +486,11 @@ signals may still be delivered).
   ago, still has threads; otherwise it records a `max` event and calls `out_of_memory`. Lowering a
   child's `memory.max` below its usage calls `out_of_memory` once at once, without a `max` event.
 - `select` considers every process except tgid 1 (the built-in init), `oom_score_adj` -1000,
-  processes outside the over-limit cgroup, zombies, and the last victim while it is still recorded
-  and has outlived its second. The score is `max(1, resident_pages + adj * total / 1000)` with
-  `total` the larger of RAM and the limit for the root, the cgroup's limit otherwise; a strictly
-  greater score wins, so ties go to the lowest tgid. With no eligible process nothing is killed or
-  logged.
+  processes outside the over-limit cgroup, zombies, and every victim that outlived its second and
+  still has threads (kept in a list until it exits). The score is `resident_pages + adj * (total /
+  1000)`, unclamped, with `total` the larger of RAM and the limit for the root, the cgroup's limit
+  otherwise; on equal scores the later (higher tgid) wins, as `oom_evaluate_task` keeps the last
+  one not below the best. With no eligible process nothing is killed or logged.
 - The kill records `oom` on the domain and the victim; a victim already exiting is only waited for.
   Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and ancestors count `oom_kill`, host
   stderr gets a line, the kernel log gets Linux's memcg lines (`memory: usage …`,
@@ -598,11 +598,8 @@ signals may still be delivered).
   would stay in the owner's `lent` set without a loan; a fork in that state would give the child a
   loan-less borrowed entry and the owner's next write would show in the child. Unreachable today,
   and the guard's comment cites a path (`recall`) that never reaches it.
-- **OOM victim choice differs from Linux and can stall:** scores omit swap and page tables, so a
-  mostly swapped-out process ranks low although the root counts VmSwap; negative scores clamp to 1
-  and ties go to the lowest tgid (Linux 6.1 compares raw scores and lets a later equal one win). A
-  victim that outlived its second is skipped only until another is recorded; picked again, it is
-  only waited for, so the killer stalls another second without killing.
+- **OOM scores omit swap and page tables:** a mostly swapped-out process ranks low although the
+  root's usage counts VmSwap (Linux adds swap entries and page-table pages to `oom_badness`).
 - **Linux VMA boundaries are approximated:** anonymous memory that has been writable counts as
   having an anon_vma although Linux creates one only at the first write fault, and anonymous pieces
   join regardless of Linux's page offsets (a VMA moved by mremap joins its new neighbours), so

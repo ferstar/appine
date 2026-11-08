@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles at the edges; panics caught in VtNative; kill reports inside strings last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles; panics caught in VtNative; kill reports last)
 
 ## Responsibilities
 
@@ -394,6 +394,10 @@ libghostty-vt with Zig (`android/native`).
 
 ## Invariants and gotchas
 
+- A kill report opens its room with line feeds before moving back up, so the cursor's line moves
+  down with the cursor; this needs the parser at ground, which the CAN ensures. A program that died
+  in the middle of a UTF-8 sequence leaves a U+FFFD at its last output position (the decoder's
+  state is not visible through the C API).
 - libghostty-vt's mouse encoder forgets its last reported cell (its motion deduplication)
   whenever `setopt_from_terminal` or the size option is set, which `appine_vt_mouse` does for
   every event; so vt.c keeps the last cell itself, updated only when an event was encoded.
@@ -543,10 +547,6 @@ libghostty-vt with Zig (`android/native`).
     neither does vt.c;
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
     the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
-- **A kill report pushes the cursor's line down:** no room is scrolled open, so the inserted lines
-  push the cursor's line down by the report's height (off the screen when it was the bottom row)
-  while the cursor goes back to its old row, now another line; after a partial UTF-8 sequence, a
-  U+FFFD is printed first. Read from the parser, not reproduced.
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels): `MainActivity` handles `density` itself and
   builds its views once in `onCreate`, so the new sizes apply only once the activity is created

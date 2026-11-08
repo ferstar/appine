@@ -149,7 +149,9 @@ const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_HOST: u8 = 254;
 const RT_SCOPE_NOWHERE: u8 = 255;
-/// rtm_flags: the next hop's interface has no carrier (`ip route`'s linkdown).
+/// rtm_flags: the gateway is taken as on the link without a route covering it (`ip route`'s
+/// onlink), and the next hop's interface has no carrier (linkdown).
+const RTNH_F_ONLINK: u32 = 4;
 const RTNH_F_LINKDOWN: u32 = 0x10;
 /// IPv6 route metrics: for routes added per address, and when none is given
 /// (`IP6_RT_PRIO_ADDRCONF`, `IP6_RT_PRIO_USER`).
@@ -326,6 +328,8 @@ pub(crate) struct Rt {
     pub gateway: Option<Vec<u8>>,
     pub dev: Weak<RefCell<Dev>>,
     pub metric: u32,
+    /// Added with `RTNH_F_ONLINK`.
+    pub onlink: bool,
     /// The address it was added for (local for IPv4, the address for IPv6), or added during IPv6
     /// configuration (empty); None means added over netlink.
     pub owner: Option<Vec<u8>>,
@@ -1528,6 +1532,7 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
     let m = req.get(16..28).ok_or(Errno::EINVAL)?;
     let (family, dst_len, tos, table, proto, scope, rtype) =
         (i32::from(m[0]), m[1], m[3], m[4], m[5], m[6], m[7]);
+    let onlink = u32::from_le_bytes(m[8..12].try_into().unwrap()) & RTNH_F_ONLINK != 0;
     let attrs = crate::route::attrs(&req[28..]);
     let table = match get_u32(&attrs, RTA_TABLE) {
         Some(t) if t > 255 => return Err(Errno::EOPNOTSUPP.into()),
@@ -1608,7 +1613,8 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
     if v4 && scope > RT_SCOPE_HOST {
         return Err(fail(Errno::EINVAL, "Invalid scope"));
     }
-    let dev = nexthop(ns, family, gw.as_deref(), oif, scope)?;
+    let dev = nexthop(ns, (family, scope), gw.as_deref(), oif, onlink)?;
+    let onlink = onlink && gw.is_some();
     if let Some(src) = &prefsrc {
         let local = interfaces(ns)
             .iter()
@@ -1634,6 +1640,7 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
         } else {
             metric
         },
+        onlink,
         owner: None,
     };
     let mut d = devs(ns);
@@ -1682,13 +1689,16 @@ fn route_request(ns: &Rc<NetNs>, req: &[u8]) -> Result<(), Fail> {
 
 /// A next hop (`fib_check_nh`, `fib6_nh_init`): the interface must be a virtual device (host
 /// interfaces and lo are EOPNOTSUPP) and up. With a gateway, the subnet it is in is looked up in
-/// this namespace's routes.
+/// this namespace's routes, unless `onlink` (`RTNH_F_ONLINK`, as CNI plugins and VPN scripts add
+/// default routes): then the gateway is taken as on the given interface, which is required
+/// (ENODEV) and must be up (ENETDOWN); for IPv4 the route's scope must be below link and the
+/// gateway must not be a local, broadcast or multicast address (EINVAL, `fib_check_nh_v4_gw`).
 fn nexthop(
     ns: &Rc<NetNs>,
-    family: i32,
+    (family, scope): (i32, u8),
     gw: Option<&[u8]>,
     oif: Option<u32>,
-    scope: u8,
+    onlink: bool,
 ) -> Result<DevRef, Fail> {
     let v4 = family == AF_INET;
     let not_up = if v4 {
@@ -1697,8 +1707,8 @@ fn nexthop(
         "Nexthop device is not up"
     };
     let oif = oif.filter(|&i| i != 0);
-    let Some(gw) = gw else {
-        let i = oif.ok_or(Errno::ENODEV)?;
+    let device = |i: Option<u32>, missing: Fail, not_up: &'static str| -> Result<DevRef, Fail> {
+        let i = i.ok_or(missing)?;
         let dev = devs(ns).by_index(i);
         let Some(dev) = dev else {
             return Err(if base(ns).iter().any(|b| b.index == i) {
@@ -1711,8 +1721,36 @@ fn nexthop(
         if !dev.borrow().up {
             return Err(fail(Errno::ENETDOWN, not_up));
         }
-        return Ok(dev);
+        Ok(dev)
     };
+    let Some(gw) = gw else {
+        return device(oif, Errno::ENODEV.into(), not_up);
+    };
+    if onlink {
+        if v4 && scope >= RT_SCOPE_LINK {
+            return Err(fail(Errno::EINVAL, "Nexthop has invalid scope"));
+        }
+        let dev = device(
+            oif,
+            fail(Errno::ENODEV, "Nexthop device required for onlink"),
+            "Nexthop device is not up",
+        )?;
+        // inet_addr_type_dev_table: 0.x and 255.255.255.255 are broadcast, 224 to 239 multicast,
+        // 127.x and the namespace's own addresses local
+        let special = || {
+            gw[0] == 0
+                || gw == [255; 4]
+                || (224..240).contains(&gw[0])
+                || gw[0] == 127
+                || interfaces(ns)
+                    .iter()
+                    .any(|i| i.addrs.iter().any(|(f, a, _)| *f == family && a == gw))
+        };
+        if v4 && special() {
+            return Err(fail(Errno::EINVAL, "Nexthop has invalid gateway"));
+        }
+        return Ok(dev);
+    }
     // The gateway's subnet: the longest prefix in the local and main tables through oif (when
     // given) with a scope not less than link
     let want = if v4 {
@@ -2720,6 +2758,7 @@ fn kernel_route(
         gateway: None,
         dev: Rc::downgrade(dev),
         metric,
+        onlink: false,
         owner: Some(owner),
     }
 }
@@ -2962,7 +3001,8 @@ pub(crate) fn entries(ns: &NetNs) -> Vec<Entry> {
                 iface: String::from_utf8_lossy(&x.name).into_owned(),
                 index: x.index,
                 metric: r.metric,
-                flags: if linkdown { RTNH_F_LINKDOWN } else { 0 },
+                flags: if linkdown { RTNH_F_LINKDOWN } else { 0 }
+                    | if r.onlink { RTNH_F_ONLINK } else { 0 },
                 host: false,
             })
         })

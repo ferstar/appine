@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; which template locks the guard misses; failed internal checks under the guard; the stale kicker after an exit panic, fixed in the kernel, last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; failed internal checks under the guard; the stale kicker after an exit panic, fixed in the kernel; guard lock registration and pc 0 lookups last)
 
 ## Responsibilities
 
@@ -291,7 +291,8 @@ Tier 1, only CPUID advertised).
   writes tombstones (never reused, except that relinking a parked block reuses its own tombstone),
   and readers announce themselves with a per-CPU sequence count so a replaced table is freed only
   after they finish. The C reader loads code with acquire before the key; the generated lookup
-  routine loads both with one plain `ldp`.
+  routine loads both with one plain `ldp` and leaves pc 0 to the dispatcher, since a torn read can
+  pair new code with an empty slot's key 0.
 - Sizing: a new or emptied instance starts at 2^12 slots (a kept pooled instance keeps its size).
   At 3/4 occupancy the table doubles up to 2^19, or is rebuilt at the same size when tombstones are
   at least half of the occupied slots or it is already at 2^19; if load is still at 3/4 a full flush
@@ -380,8 +381,11 @@ Tier 1, only CPUID advertised).
 - `install_fault_guard` installs SIGSEGV, SIGBUS and SIGILL handlers (chained after ART's); the
   machine installs it only when kernel bugs are contained (release builds by default, or
   `APPINE_ON_BUG`). During a guarded run, a host fault with `si_code > 0` long-jumps back: the host
-  FPCR is restored, registered locks (at most 4) are released newest first, the signal is
-  unblocked, and the run returns `HostFault`. Other faults are reported to stderr and passed to the
+  FPCR is restored, registered locks are released newest first (the outer four of those held;
+  deeper ones are counted so drops still pair), the signal is unblocked, and the run returns
+  `HostFault`. The locks taken during a run are registered: the instance lock, the template
+  shard of a bucket, the template arena lock, all template locks together while `template_clear`
+  holds them (one entry with a release function), the native-stub lock and the perf-map lock. Other faults are reported to stderr and passed to the
   previous handler. If the per-thread guard cannot be allocated, the run proceeds unguarded.
 - Guarded code must not allocate or call back into the kernel layer; the one documented exception
   is the opt-in perf map (`APPINE_PERF_MAP`), which writes `/tmp/perf-<pid>.map` from `install`.
@@ -451,11 +455,6 @@ Tier 1, only CPUID advertised).
 
 ## Confirmed bugs / technical debt
 
-- **Generated table lookup can enter the wrong block for target 0:** the in-cache lookup routine
-  reads a slot's key and code with one unordered `ldp`, so racing another thread's insert it can
-  pair new code with the empty slot's key 0; an indirect branch to address 0 (a NULL function
-  pointer call) then runs an unrelated block instead of faulting, and the jump cache keeps the
-  wrong entry.
 - **`ic ivau` on guest page 0 is lost:** page 0 doubles as "no page recorded" in Tier 1, and the
   kernel's invalidation also drops page 0, so rewritten code mapped at address 0 (possible through
   `MAP_FIXED`) keeps running its stale translation.
@@ -463,11 +462,6 @@ Tier 1, only CPUID advertised).
   serialized with `attach`, and the kernel attaches new threads and code-group members without
   stopping running ones, so a conditional branch can be rewritten while another thread executes it
   (architecturally unpredictable; in practice old and new targets behave the same).
-- **Locks taken inside guarded code are not all registered:** the template arena lock, the shard
-  locks `template_clear` takes all at once (the per-bucket `template_lock` is registered) and the
-  perf-map lock are not released on host-fault recovery, so a fault while holding one
-  deadlocks later users. Registering more than 4 locks is silently ignored while drops still
-  decrement, mis-pairing later releases (not reached today).
 - **Unallocated ID registers read 0:** `mrs` of CRm=1 and unallocated CRm=0 registers returns 0
   where Linux 6.1 delivers `SIGILL`.
 - **Test-only API:** `Dbt::recheck` is called only by the engine tests (`tests/dbt.rs`); the

@@ -7,10 +7,9 @@
  * guard is "armed": when a fault happens then, the handler siglongjmps back to
  * appine_guard_run(), which returns APPINE_EXIT_HOST_FAULT. So during that time the engine does
  * not call back into the kernel layer and does not call malloc (except for writing the perf map
- * file when profiling with APPINE_PERF_MAP), and every lock it holds is meant to be registered
- * with appine_guard_hold() and released after jumping back. Not registered yet: dbt.c's template
- * arena lock, the template shard locks taken all at once by template_clear(), and the perf-map
- * lock.
+ * file when profiling with APPINE_PERF_MAP), and every lock it holds is registered with
+ * appine_guard_hold() (or, for a set of locks taken together, appine_guard_hold_fn()) and
+ * released after jumping back.
  *
  * Other faults (the kernel layer's own, other host threads') first write a one-line report to
  * stderr and are then passed to the original handler (on Android, debuggerd, which produces a
@@ -36,10 +35,13 @@ struct guard {
     sigjmp_buf env;
     volatile sig_atomic_t armed; /* the handler reads it on the same thread */
     uint64_t fpcr;               /* the host's FPCR when armed: translated code holds the guest's */
+    /* Locks held, innermost last: the first MAX_LOCKS are recorded (nlocks), deeper ones only
+     * counted, so that drops still pair with the right holds */
+    unsigned depth;
     unsigned nlocks;
     struct {
         void *lock;
-        bool rw;
+        void (*release)(void *);
     } locks[MAX_LOCKS];
     struct appine_host_fault fault;
 };
@@ -203,21 +205,42 @@ static struct guard *current(void)
     return pthread_getspecific(key);
 }
 
-void appine_guard_hold(void *lock, bool rw)
+static void unlock_mutex(void *lock)
+{
+    pthread_mutex_unlock(lock);
+}
+
+static void unlock_rwlock(void *lock)
+{
+    pthread_rwlock_unlock(lock);
+}
+
+void appine_guard_hold_fn(void *lock, void (*release)(void *))
 {
     struct guard *g = current();
-    if (g && g->armed && g->nlocks < MAX_LOCKS) {
-        g->locks[g->nlocks].lock = lock;
-        g->locks[g->nlocks].rw = rw;
-        g->nlocks++;
+    if (g && g->armed) {
+        if (g->nlocks == g->depth && g->nlocks < MAX_LOCKS) {
+            g->locks[g->nlocks].lock = lock;
+            g->locks[g->nlocks].release = release;
+            g->nlocks++;
+        }
+        g->depth++;
     }
+}
+
+void appine_guard_hold(void *lock, bool rw)
+{
+    appine_guard_hold_fn(lock, rw ? unlock_rwlock : unlock_mutex);
 }
 
 void appine_guard_drop(void)
 {
     struct guard *g = current();
-    if (g && g->armed && g->nlocks)
-        g->nlocks--;
+    if (g && g->armed && g->depth) {
+        g->depth--;
+        if (g->nlocks > g->depth)
+            g->nlocks = g->depth;
+    }
 }
 
 _Noreturn void appine_guard_fail(void)
@@ -238,11 +261,38 @@ _Noreturn void appine_guard_fail(void)
 
 /* For the engine's unit test: a run whose function fails an internal check returns
  * APPINE_EXIT_HOST_FAULT with SIGABRT recorded; returns that signal (-1 when the run returned
- * otherwise). Only with the guard installed: without it the check aborts the process */
+ * otherwise, -2 when the locks held were not released as registered). Only with the guard
+ * installed: without it the check aborts the process */
+static pthread_mutex_t test_locks[5] = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+                                        PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+                                        PTHREAD_MUTEX_INITIALIZER};
+static int test_released;
+
+static void test_release(void *unused)
+{
+    (void)unused;
+    test_released++;
+}
+
+/* Three locks and a released set are registered; two more locks nested inside them, beyond
+ * MAX_LOCKS, are taken and given back before the check fails: the four registered are released */
 static enum appine_exit fail_check(void *ctx, struct appine_cpu *cpu)
 {
     (void)ctx;
     (void)cpu;
+    for (unsigned i = 0; i < 3; i++) {
+        pthread_mutex_lock(&test_locks[i]);
+        appine_guard_hold(&test_locks[i], false);
+    }
+    appine_guard_hold_fn(NULL, test_release);
+    for (unsigned i = 3; i < 5; i++) {
+        pthread_mutex_lock(&test_locks[i]);
+        appine_guard_hold(&test_locks[i], false);
+    }
+    for (unsigned i = 5; i-- > 3;) {
+        appine_guard_drop();
+        pthread_mutex_unlock(&test_locks[i]);
+    }
     appine_guard_fail();
 }
 
@@ -250,6 +300,13 @@ int appine_guard_selftest(void)
 {
     if (appine_guard_run(fail_check, NULL, NULL) != APPINE_EXIT_HOST_FAULT)
         return -1;
+    for (unsigned i = 0; i < 5; i++) {
+        if (pthread_mutex_trylock(&test_locks[i]) != 0)
+            return -2;
+        pthread_mutex_unlock(&test_locks[i]);
+    }
+    if (test_released != 1)
+        return -2;
     struct appine_host_fault f;
     appine_host_fault_last(&f);
     return f.signo;
@@ -263,11 +320,9 @@ static enum appine_exit recover(struct guard *g)
     write_fpcr(g->fpcr);
     while (g->nlocks) {
         g->nlocks--;
-        if (g->locks[g->nlocks].rw)
-            pthread_rwlock_unlock(g->locks[g->nlocks].lock);
-        else
-            pthread_mutex_unlock(g->locks[g->nlocks].lock);
+        g->locks[g->nlocks].release(g->locks[g->nlocks].lock);
     }
+    g->depth = 0;
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, g->fault.signo);
@@ -300,6 +355,7 @@ enum appine_exit appine_guard_run(enum appine_exit (*fn)(void *, struct appine_c
     if (sigsetjmp(g->env, 0))
         return recover(g);
     g->fpcr = read_fpcr();
+    g->depth = 0;
     g->nlocks = 0;
     g->armed = 1;
     enum appine_exit r = fn(ctx, cpu);

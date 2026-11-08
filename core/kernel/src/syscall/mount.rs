@@ -413,7 +413,9 @@ fn bind_ns(
 /// Remount: changes the mount's flags (without `MS_BIND` Linux also changes the superblock's,
 /// which is shared between several mounts; here only this one mount changes). Without `MS_BIND`
 /// `data` holds options: tmpfs changes its superblock's size and inode count accordingly
-/// ([`remount_tmpfs`]).
+/// ([`remount_tmpfs`]). Going read-only while files are open for writing is EBUSY: through this
+/// mount for `MS_BIND` (`mnt_make_readonly`), through any mount of the same filesystem otherwise
+/// (`sb_prepare_remount_readonly`).
 fn remount(
     cx: &mut Cx<'_>,
     target: &Node,
@@ -434,6 +436,19 @@ fn remount(
     // before the superblock is touched)
     if !m.keeps_locked(flags) {
         return Err(Errno::EPERM);
+    }
+    if flags & ms::RDONLY != 0 && m.flags & ms::RDONLY == 0 {
+        let writers = writers(cx.kr());
+        let busy = if data.is_some() {
+            vfs.mounts()
+                .iter()
+                .any(|o| o.dev == m.dev && writers.contains(&o.id))
+        } else {
+            writers.contains(&id)
+        };
+        if busy {
+            return Err(Errno::EBUSY);
+        }
     }
     // Without MS_BIND the superblock changes too: a tmpfs's size and inode count; on error the
     // mount's flags do not change either
@@ -860,13 +875,24 @@ pub(super) fn mount_setattr(
         }
         f
     };
-    // Every mount is checked before any changes (mount_setattr_prepare): locked flags stay
+    // Every mount is checked before any changes (mount_setattr_prepare): locked flags stay, and
+    // a mount with files open for writing cannot become read-only (EBUSY, mnt_hold_writers)
     if targets
         .iter()
         .filter_map(|&t| vfs.mount(t))
         .any(|m| !m.keeps_locked(changed(&m)))
     {
         return Err(Errno::EPERM);
+    }
+    if set_ms & ms::RDONLY != 0 {
+        let writers = writers(cx.kr());
+        if targets
+            .iter()
+            .filter_map(|&t| vfs.mount(t))
+            .any(|m| m.flags & ms::RDONLY == 0 && writers.contains(&m.id))
+        {
+            return Err(Errno::EBUSY);
+        }
     }
     for t in targets {
         vfs.update_mount(t, |m| m.flags = changed(m));
@@ -1073,6 +1099,41 @@ fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
         }
     }
     used
+}
+
+/// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and
+/// synthetic files opened with write access in some process's fd table, or backing a loop device
+/// opened writable; devices, FIFOs and sockets do not count (`special_file`).
+fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
+    let writes = |f: &crate::fd::OpenFile| {
+        f.writable()
+            && matches!(
+                f.kind,
+                crate::fd::FileKind::Regular { .. } | crate::fd::FileKind::Proc { .. }
+            )
+    };
+    let mut mounts = HashSet::new();
+    for task in k.tasks.values() {
+        let res = task.res.borrow();
+        let fds = res.fds.borrow();
+        for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
+            let f = file.borrow();
+            if writes(&f)
+                && let Some(node) = f.node()
+            {
+                mounts.insert(node.mnt());
+            }
+        }
+    }
+    for file in k.loops.backing_files() {
+        let f = file.borrow();
+        if writes(&f)
+            && let Some(node) = f.node()
+        {
+            mounts.insert(node.mnt());
+        }
+    }
+    mounts
 }
 
 // ---- Shared helpers ----

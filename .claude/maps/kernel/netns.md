@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets; onlink, limit and quota last)
 
 ## Responsibilities
 
@@ -152,7 +152,9 @@ structure (`kernel/procfs`); host sockets (`hal`).
   route always, subnet and broadcast routes while up; deleting a primary deletes its secondaries.
   IPv6 addresses: `EACCES` with IPv6 disabled; removed on down unless `keep_addr_on_down`.
 - Routes: unicast only, table ≤ 255, next hop an up virtual device (host interfaces and lo
-  `EOPNOTSUPP`), gateways must be on-link (`ENETUNREACH`), flags as `fib_table_insert`; deleting a
+  `EOPNOTSUPP`), gateways must be on-link (`ENETUNREACH`) unless `RTNH_F_ONLINK`, which needs a
+  device that is up (`ENODEV`, `ENETDOWN`) and, for IPv4, a scope below link and a gateway that is
+  not local, broadcast or multicast (`EINVAL`), and shows in dumps; flags as `fib_table_insert`; deleting a
   missing route `EOPNOTSUPP` in the initial namespace, `ESRCH` elsewhere; dumps merge with the host
   or lo routes.
 - Sysctls: 33 IPv4 and 58 IPv6 settings per device plus `all`/`default`; effective are
@@ -205,10 +207,13 @@ structure (`kernel/procfs`); host sockets (`hal`).
   nfproto, l4proto, pkttype), `payload`, `cmp`, `bitwise`, `lookup`, `immediate`, `ct` (state is
   NEW, or ESTABLISHED for UDP to a peer already heard from; others no match), `fib` (address type
   only), `nat` (DNAT, range minimum; SNAT no-op), `redir` (127.0.0.1/`::1` on OUTPUT, the input
-  interface's address on PREROUTING), `reject`, `queue` (drop). `counter`, `log`, `limit`,
-  `quota`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
+  interface's address on PREROUTING), `reject`, `queue` (drop), `limit` (a token bucket per rule
+  expression, packets or bytes, `over` inverting) and `quota` (bytes counted per rule expression,
+  `over` inverting); a packet's length, for them as for `meta len`, is its headers only. `counter`,
+  `log`, `notrack`, `dynset`, `objref`, `last`, `masq`, `connlimit`, `dup` always match without
   effect. xt targets DNAT, REDIRECT, MARK, ACCEPT, DROP, REJECT (others no-ops) and matches
-  comment, mark, owner, conntrack, state, addrtype, tcp, udp (others never match). Unknown or
+  comment, mark, owner, conntrack, state, addrtype, tcp, udp, limit (the same bucket from avg and
+  burst; others never match). Unknown or
   unevaluable expressions break the rule. Jumps to missing chains or deeper than 16 drop; 100,000
   steps accept; chains end in their policy.
 - Effects: a nat drop or reject is `EPERM` at connect/sendto (also for drops in a remote
@@ -274,10 +279,9 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Confirmed bugs / technical debt
 
-- **`limit` and `quota` ignore "over":** the expressions always match, so `limit rate over N drop`
-  and `quota over N drop` (and meters) drop every packet, while `limit rate N accept` accepts
-  everything; the xt `limit`, `hashlimit` and `recent` matches never match (ufw's `limit` rules
-  never trigger; firewalld rich-rule limits fail open).
+- **Per-key rate limits do nothing:** meters (`dynset` with a limit per key) always match, and the
+  xt `hashlimit` and `recent` matches never match, so ufw's `limit` rules (built on `recent`) never
+  trigger; byte limits and quotas count headers only, so they let through more than Linux.
 - **Namespace isolation is guest-side only:** the initial namespace passes 127.x through, so its
   guests (and other apps on the device) reach a container's host sockets directly, including
   services bound only to the container's 127.0.0.1.
@@ -318,10 +322,8 @@ structure (`kernel/procfs`); host sockets (`hal`).
   device of the last longest-prefix route covering the gateway, where Linux takes the first
   (lowest index); with two devices on one subnet the route lands on the other device, and a later
   duplicate naming the first device is accepted instead of `EEXIST`.
-- **Next-hop checks ignore `onlink` and Linux's special cases:** route requests never read
-  `rtm_flags`, so `RTNH_F_ONLINK` (`ip route add … via GW dev X onlink`, used by CNI and VPN
-  setups) still requires a route covering the gateway and fails with `ENETUNREACH`; an all-zero
-  `RTA_GATEWAY` counts as a gateway instead of none; IPv6 link-local gateways are looked up in the
+- **Next-hop checks miss Linux's special cases:** an all-zero `RTA_GATEWAY` counts as a gateway
+  instead of none; IPv6 link-local gateways are looked up in the
   table (failing while the device has no carrier) where Linux accepts them with a device; and an
   unreachable IPv6 gateway is `ENETUNREACH` where Linux says `EHOSTUNREACH`.
 

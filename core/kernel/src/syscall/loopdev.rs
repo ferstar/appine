@@ -667,6 +667,14 @@ pub(crate) struct Loops {
 }
 
 impl Loops {
+    /// The open files the bound devices read and write.
+    pub fn backing_files(&self) -> Vec<FileRef> {
+        self.devices
+            .values()
+            .filter_map(|l| l.borrow().backing.clone())
+            .collect()
+    }
+
     /// The devices that exist from boot, `loop0` to `loop7`.
     pub(crate) fn new() -> Loops {
         let mut loops = Loops {

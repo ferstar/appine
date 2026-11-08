@@ -38,7 +38,9 @@ pub(crate) use lease::Lease;
 pub(crate) use loopdev::{LoopOpen, Loops};
 pub(crate) use misc::Restart;
 pub(crate) use mount::collect_namespaces;
-pub(crate) use mqueue::{Limits as MqLimits, MessageQueue, MqDir, find as mqueue_find};
+pub(crate) use mqueue::{
+    Limits as MqLimits, MessageQueue, MqDir, closed as mqueue_closed, find as mqueue_find,
+};
 pub(crate) use net::{SocketRef, deliver_dns, unmap_addr};
 pub(crate) use poll::{Epoll, ExGate, Fasync, check_exclusive, check_fasync};
 pub(crate) use proc::{interp_label, label_image};
