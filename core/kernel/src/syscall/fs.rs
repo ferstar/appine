@@ -109,6 +109,7 @@ const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 /// Device number of the PTY master device (`/dev/ptmx`).
 const PTMX_RDEV: u64 = rdev(5, 2);
 
@@ -502,8 +503,13 @@ fn open_path_with(
     let was_created = created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
     let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
-    // Files in the store record the mount they were reached through ([`OpenFile::mnt`])
+    // Files in the store record the mount they were reached through ([`OpenFile::mnt`]), and
+    // those in an overlay their overlay node too ([`OpenFile::ovl`])
     let store_mnt = node.ino().map(|_| node.mnt());
+    let overlay = match &node {
+        Node::Overlay(mnt, o) => Some((*mnt, *o)),
+        _ => None,
+    };
     let kind = if flags & oflags::O_PATH != 0 {
         if flags & oflags::O_DIRECTORY != 0 && !vfs.is_dir(&cx.view(&vfs), &node)? {
             return Err(Errno::ENOTDIR);
@@ -527,6 +533,10 @@ fn open_path_with(
                 open_mq(cx, &cred, (ns, ino), flags, mq_created)?
             }
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
+            Node::Overlay(mnt, o) => {
+                let beside = parent.as_ref().map(|(dir, _)| dir);
+                open_overlay(cx, &cred, &vfs, (mnt, o), flags, beside)?
+            }
         }
     };
     // A device node like /dev/tty opens a specific slave: its path is the one in devpts (fd links
@@ -538,9 +548,20 @@ fn open_path_with(
     {
         display = None;
     }
+    let overlay = overlay.filter(|_| {
+        matches!(
+            kind,
+            FileKind::Regular { .. } | FileKind::Device { .. } | FileKind::Pipe(_)
+        )
+    });
     let file = OpenFile::with_path(kind, flags & kept(flags) | largefile(flags), display);
     if let Some(mnt) = store_mnt {
         file.borrow_mut().mnt = mnt;
+    }
+    if let Some((mnt, o)) = overlay {
+        let mut f = file.borrow_mut();
+        f.mnt = mnt;
+        f.ovl = Some(o);
     }
     file.borrow_mut().dentry = parent.clone();
     if let Some(ino) = opened_ino {
@@ -1213,6 +1234,42 @@ fn open_store(
     })
 }
 
+/// Opens overlay node `o` reached through mount `mnt` (Linux's `ovl_open`): the store inode
+/// behind it is opened as a store file would be, and a directory is listed through the overlay.
+/// Without an upper layer nothing can be changed: opening a regular file for writing is EROFS,
+/// also through a bind mount remounted read-write.
+fn open_overlay(
+    cx: &mut Cx<'_>,
+    cred: &Cred,
+    vfs: &Vfs,
+    (mnt, o): (MountId, crate::vfs::overlay::OvlId),
+    flags: u32,
+    beside: Option<&Node>,
+) -> Result<FileKind, Errno> {
+    let (real, has_upper) = {
+        let ovl = vfs.overlay();
+        let dev = ovl.node(o).dev;
+        let upper = ovl.instance(dev).is_some_and(|i| i.upper.is_some());
+        (ovl.node(o).real(), upper)
+    };
+    // A read-only filesystem refuses writing before permission is checked (6.1's
+    // sb_permission)
+    let write = flags & oflags::O_ACCMODE != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
+    if write && !has_upper && vfs.store().kind(real)? == mode::S_IFREG {
+        return Err(Errno::EROFS);
+    }
+    Ok(
+        match open_store(cx, cred, vfs, (mnt, real), flags, (None, beside))? {
+            FileKind::Directory { process, .. } => FileKind::Directory {
+                node: Node::Overlay(mnt, o),
+                entries: None,
+                process,
+            },
+            kind => kind,
+        },
+    )
+}
+
 /// The access permissions open requires (`MAY_*`).
 fn open_mask(flags: u32) -> u32 {
     match flags & oflags::O_ACCMODE {
@@ -1674,7 +1731,7 @@ fn record_lock(cx: &mut Cx<'_>, file: &FileRef, cmd: u32, arg: u64) -> SysResult
         if !getlk && !unlock && !(if write { f.writable() } else { f.readable() }) {
             return Err(Errno::EBADF);
         }
-        let Some(ino) = f.ino() else {
+        let Some(ino) = f.lock_ino() else {
             // Files not in the store (pipes, sockets): other processes cannot see their locks
             if getlk {
                 b[..2].copy_from_slice(&F_UNLCK.to_le_bytes());
@@ -1822,7 +1879,7 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         return Err(Errno::EBADF);
     }
     // Files not in the store (pipes, sockets) have no lock to share: always succeeds
-    let Some(ino) = file.borrow().ino() else {
+    let Some(ino) = file.borrow().lock_ino() else {
         return Ok(0);
     };
     let me = Rc::downgrade(&file);
@@ -2958,7 +3015,7 @@ fn copy_range_checks(
     }
     count = count.min(i64::MAX.wrapping_sub(pos_out) as u64);
     let end = |pos: i64| pos.wrapping_add(count as i64);
-    if i.ino() == o.ino() && end(pos_out) > pos_in && pos_out < end(pos_in) {
+    if i.data_ino() == o.data_ino() && end(pos_out) > pos_in && pos_out < end(pos_in) {
         return Err(Errno::EINVAL);
     }
     // rw_verify_area
@@ -2986,7 +3043,7 @@ fn copy_regular(
 ) -> Option<Result<usize, Errno>> {
     let (fd_in, fd_out, ino) = {
         let (i, o) = (input.borrow(), output.borrow());
-        if o.flags & oflags::O_APPEND != 0 || i.ino() == o.ino() {
+        if o.flags & oflags::O_APPEND != 0 || i.data_ino() == o.data_ino() {
             return None;
         }
         (regular_fd(&i)?, regular_fd(&o)?, o.ino()?)
@@ -3896,25 +3953,27 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
         let vfs = cx.vfs()?;
         let view = cx.view(&vfs);
         let ino_of = |n: &Node| match n {
-            Node::Store(_, i) => *i,
-            Node::Pseudo(_, p) => pseudo::node_ino(view.k, p),
+            Node::Store(_, i) => Ok(*i),
+            Node::Pseudo(_, p) => Ok(pseudo::node_ino(view.k, p)),
+            Node::Overlay(_, o) => vfs.overlay_stat(*o).map(|st| st.ino),
         };
         let parent = vfs.parent(&view, node)?;
         let mut list = vec![
             DirEntry {
                 name: b".".to_vec(),
-                ino: ino_of(node),
+                ino: ino_of(node)?,
                 mode: mode::S_IFDIR,
             },
             DirEntry {
                 name: b"..".to_vec(),
-                ino: ino_of(&parent),
+                ino: ino_of(&parent)?,
                 mode: mode::S_IFDIR,
             },
         ];
         match node {
             Node::Store(_, ino) => list.extend(vfs.store().readdir(*ino)?),
             Node::Pseudo(id, p) => list.extend(pseudo::readdir(&view, *id, p)?),
+            Node::Overlay(_, o) => list.extend(vfs.overlay_readdir(*o)?),
         }
         *entries = Some(list);
     }
@@ -4299,12 +4358,23 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
     if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
     }
-    if let Node::Store(_, ino) = node {
-        cx.cred().permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
+    if let Some(st) = searched_attrs(&vfs, &node)? {
+        cx.cred().permission(&st, MAY_EXEC)?;
     }
     cx.t.fs.borrow_mut().cwd = node;
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// The attributes chdir and chroot check search permission on: a store directory's, or those of
+/// the store directory behind an overlay one; None for synthetic directories, which are always
+/// searchable.
+fn searched_attrs(vfs: &Vfs, node: &Node) -> Result<Option<Stat>, Errno> {
+    Ok(match node {
+        Node::Store(_, ino) => Some(vfs.store().attrs(*ino)?),
+        Node::Overlay(_, o) => Some(vfs.store().attrs(vfs.overlay().node(*o).real())?),
+        Node::Pseudo(..) => None,
+    })
 }
 
 /// chroot: the target must be a searchable directory; requires `CAP_SYS_CHROOT`. The current
@@ -4317,8 +4387,8 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
     let cred = cx.cred();
-    if let Node::Store(_, ino) = node {
-        cred.permission(&vfs.store().attrs(ino)?, MAY_EXEC)?;
+    if let Some(st) = searched_attrs(&vfs, &node)? {
+        cred.permission(&st, MAY_EXEC)?;
     }
     if !cred.capable_here(cap::SYS_CHROOT) {
         return Err(Errno::EPERM);
@@ -4550,7 +4620,10 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
         ..Default::default()
     };
     let vfs = cx.vfs()?;
-    let flags = vfs.mount_flags(node).unwrap_or(0);
+    // The mount's flags plus the filesystem's read-only one (Linux's flags_by_mnt and
+    // flags_by_sb)
+    let flags =
+        vfs.mount_flags(node).unwrap_or(0) | if vfs.readonly(node) { ms::RDONLY } else { 0 };
     // tmpfs reports by pages and inodes (Linux's shmem_statfs): an unlimited item is all 0s;
     // usage is counted afresh
     if let Some(dev) = vfs.tmpfs_dev(node) {
@@ -4568,6 +4641,9 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
     }
     Ok(match node {
         Node::Store(..) => encode_statfs(EXT4_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
+        // The capacity of the filesystem the layers are in (Linux's ovl_statfs asks the upper
+        // layer's, or the topmost lower one's)
+        Node::Overlay(..) => encode_statfs(OVERLAYFS_SUPER_MAGIC, &vfs.store().fs_stats()?, flags),
         Node::Pseudo(_, PseudoNode::NsFile(..)) => encode_statfs(NSFS_MAGIC, &empty, 0),
         Node::Pseudo(_, p) => {
             let magic = match pseudo::fs_of(p) {
@@ -4579,6 +4655,7 @@ fn statfs_of(cx: &Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
                 Fs::Cgroup => CGROUP2_SUPER_MAGIC,
                 Fs::Nsfs => NSFS_MAGIC,
                 Fs::Mqueue => MQUEUE_MAGIC,
+                Fs::Overlay => OVERLAYFS_SUPER_MAGIC,
             };
             encode_statfs(magic, &empty, flags)
         }
@@ -4632,6 +4709,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
     let view = cx.view(&vfs);
     match node {
         Node::Store(_, ino) => Ok(encode_stat(&vfs.store().stat(*ino)?, vfs.dev_of(node))),
+        Node::Overlay(_, o) => Ok(encode_stat(&vfs.overlay_stat(*o)?, vfs.dev_of(node))),
         // Namespaces are in nsfs
         Node::Pseudo(_, p @ PseudoNode::NsFile(..)) => {
             Ok(encode_stat(&pseudo::stat(&view, p)?, Fs::Nsfs.dev()))
@@ -5167,7 +5245,9 @@ pub(super) fn linkat(
             let f = file.borrow();
             match &f.kind {
                 // A memfd is on no mount of the caller's (Linux's internal shm mount): EXDEV
-                FileKind::Regular { ino, .. } if !f.pseudo => Node::Store(f.mnt, *ino),
+                FileKind::Regular { ino, .. } if !f.pseudo && f.ovl.is_none() => {
+                    Node::Store(f.mnt, *ino)
+                }
                 _ => Node::Pseudo(f.mnt, PseudoNode::OpenFd(pid, fd)),
             }
         }
@@ -5176,6 +5256,15 @@ pub(super) fn linkat(
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, &newpath)?;
     if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
         return Err(Errno::EEXIST);
+    }
+    // Within one overlay: a link is a change to it
+    if let (Node::Overlay(src_mnt, _), Node::Overlay(mnt, _)) = (&src, &dir)
+        && src_mnt == mnt
+    {
+        if vfs.has_child(&cx.view(&vfs), &dir, name) {
+            return Err(Errno::EEXIST);
+        }
+        return overlay_change(&vfs, &dir).map(|_| 0);
     }
     // A synthetic filesystem is another "device": hard links cannot cross devices
     let (Node::Store(src_mnt, src), Node::Store(mnt, dir)) = (src, dir) else {
@@ -5824,6 +5913,14 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
         // it and do nothing)
         return Ok(0);
     }
+    if let Node::Overlay(_, o) = &node {
+        let st = vfs.store().attrs(vfs.overlay().node(*o).real())?;
+        return match st.kind() {
+            mode::S_IFDIR => Err(Errno::EISDIR),
+            mode::S_IFREG => overlay_change(&vfs, &node).map(|_| 0),
+            _ => Err(Errno::EINVAL),
+        };
+    }
     let ino = node.ino().ok_or(Errno::EACCES)?;
     let st = vfs.store().attrs(ino)?;
     match st.kind() {
@@ -6090,7 +6187,9 @@ pub(super) fn create_parent_at<'p>(
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
-    if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
+    if matches!(dir, Node::Pseudo(..) | Node::Overlay(..))
+        && vfs.has_child(&cx.view(&vfs), &dir, name)
+    {
         return Err(Errno::EEXIST);
     }
     let (mnt, dir) = store_dir(&vfs, &dir)?;
@@ -6127,10 +6226,19 @@ pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Er
 fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
+        Node::Overlay(..) => overlay_change(vfs, dir),
         Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
         Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) => Err(Errno::EPERM),
         Node::Pseudo(..) => Err(Errno::EACCES),
     }
+}
+
+/// The store inode in the upper layer a change to overlay node `node` goes to. Only overlays
+/// without an upper layer can be mounted so far, so every change is EROFS (Linux's
+/// `mnt_want_write` on a read-only superblock).
+fn overlay_change(vfs: &Vfs, node: &Node) -> Result<(MountId, Ino), Errno> {
+    debug_assert!(vfs.readonly(node));
+    Err(Errno::EROFS)
 }
 
 /// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted

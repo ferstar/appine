@@ -89,7 +89,7 @@ pub(super) fn getxattr(
     size: usize,
 ) -> SysResult {
     let name = read_name(cx, name)?;
-    let ino = store_ino(node_of(cx, target)?, Errno::ENODATA)?;
+    let ino = readable_ino(cx, node_of(cx, target)?, &name)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, false)?;
     let mut v = vfs.store().get_xattr(ino, &name)?;
@@ -103,6 +103,14 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
     let names = match node_of(cx, target)? {
         Node::Store(_, ino) => cx.vfs()?.store().list_xattr(ino)?,
         Node::Pseudo(..) => Vec::new(),
+        // The overlay's own attributes are not listed (Linux's ovl_listxattr)
+        Node::Overlay(_, o) => {
+            let vfs = cx.vfs()?;
+            let ovl = vfs.overlay();
+            let mut names = vfs.store().list_xattr(ovl.node(o).real())?;
+            names.retain(|n| !ovl.is_private_xattr(o, n));
+            names
+        }
     };
     // As in Linux's trusted handler, trusted.* is not listed without CAP_SYS_ADMIN
     let trusted = cx.cred().capable(cap::SYS_ADMIN);
@@ -182,6 +190,23 @@ fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
 /// The inode in the store; `pseudo` for nodes of synthetic filesystems.
 fn store_ino(node: Node, pseudo: Errno) -> Result<Ino, Errno> {
     node.ino().ok_or(pseudo)
+}
+
+/// The inode whose attribute `name` is read: a store node's own, or the one behind an overlay
+/// node, whose overlay keeps the attributes with its private prefix to itself (EOPNOTSUPP, as
+/// 6.1's `ovl_own_xattr_get`); ENODATA for nodes of synthetic filesystems.
+fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
+    match node {
+        Node::Overlay(_, o) => {
+            let vfs = cx.vfs()?;
+            let ovl = vfs.overlay();
+            if ovl.is_private_xattr(o, name) {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Ok(ovl.node(o).real())
+        }
+        node => store_ino(node, Errno::ENODATA),
+    }
 }
 
 /// Permission to read (`write` false) or write the extended attribute named `name`:

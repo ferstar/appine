@@ -176,6 +176,11 @@ pub struct OpenFile {
     /// ([`OpenFile::node`]): flags such as read-only and noexec are taken from it. Directory and
     /// `O_PATH` nodes carry their mount already.
     pub mnt: crate::vfs::MountId,
+    /// A regular file, device node or FIFO opened through an overlay: the overlay node (in
+    /// mount [`OpenFile::mnt`]), while the kind holds the store inode reads and writes go to.
+    /// Changes to the file's metadata go through the node ([`OpenFile::node`]), never to that
+    /// inode directly.
+    pub ovl: Option<crate::vfs::overlay::OvlId>,
     /// `F_SETOWN_EX`'s (type, pid) and `F_SETSIG`'s signal: with `O_ASYNC`, whom to signal on
     /// readiness and with which signal (0 is SIGIO); they are also signalled when a file lease is
     /// broken.
@@ -235,6 +240,7 @@ impl OpenFile {
             path,
             dentry: None,
             mnt: crate::vfs::ROOT_MOUNT,
+            ovl: None,
             owner: (0, 0),
             owner_ids: (0, 0),
             sig: 0,
@@ -272,6 +278,9 @@ impl OpenFile {
 
     /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).
     pub fn node(&self) -> Option<Node> {
+        if let Some(o) = self.ovl {
+            return Some(Node::Overlay(self.mnt, o));
+        }
         match &self.kind {
             FileKind::Pipe(end) => end.pipe.borrow().fifo.map(|ino| Node::Store(self.mnt, ino)),
             FileKind::Host(_)
@@ -297,6 +306,25 @@ impl OpenFile {
     /// The inode in the store (chmod, chown and the like only make sense for these).
     pub fn ino(&self) -> Option<Ino> {
         self.node()?.ino()
+    }
+
+    /// The store inode whose data a regular file reads and writes: for a file opened through an
+    /// overlay, the one behind its overlay node.
+    pub fn data_ino(&self) -> Option<Ino> {
+        match &self.kind {
+            FileKind::Regular { ino, .. } => Some(*ino),
+            _ => self.ino(),
+        }
+    }
+
+    /// What locks are keyed by ([`crate::locks`]): the store inode, or for a file opened through
+    /// an overlay its overlay node (Linux locks the overlay's inode, which copying up does not
+    /// change), with the top bit set so it is never a store inode's number.
+    pub fn lock_ino(&self) -> Option<Ino> {
+        match self.ovl {
+            Some(o) => Some(1 << 63 | o),
+            None => self.ino(),
+        }
     }
 
     /// Whether it was opened nonblocking.

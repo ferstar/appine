@@ -23,8 +23,9 @@ use crate::errno::Errno;
 use crate::kernel::Cx;
 use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
+use crate::vfs::store::{Ino, mode};
 use crate::vfs::{
-    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, lock, ms,
+    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, lock, ms, overlay,
 };
 
 const MS_REMOUNT: u64 = 0x20;
@@ -207,6 +208,19 @@ fn new_mount(
     } else {
         None
     };
+    if fs == Fs::Overlay {
+        let (layers, options) = overlay_layers(cx, &vfs, data)?;
+        room_for(cx, &vfs, target.mnt(), 1)?;
+        vfs.new_overlay(
+            (target, at),
+            flags,
+            source.unwrap_or_default(),
+            layers,
+            options,
+        );
+        cx.shared.fast_changed();
+        return Ok(0);
+    }
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
@@ -261,6 +275,51 @@ fn new_mount(
     }
     cx.shared.fast_changed();
     Ok(0)
+}
+
+/// The layers of a new overlay as 6.1's `ovl_fill_super` finds them: the options, then each
+/// lower directory resolved from the caller's root and current directory, topmost first (an empty
+/// or missing `lowerdir`, more than 500 layers, an unknown option or a layer that is not a
+/// directory in the store are EINVAL; resolution errors are its own). Without an upper layer at
+/// least two lower ones are needed (EINVAL).
+fn overlay_layers(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    data: &[u8],
+) -> Result<(overlay::Layers, overlay::Options), Errno> {
+    let options = overlay::Options::parse(data)?;
+    let paths = options.lower_paths()?;
+    if options.upperdir.is_some() {
+        crate::debug::log(format_args!(
+            "mount: overlays with an upper layer are not supported yet"
+        ));
+        return Err(Errno::EINVAL);
+    }
+    if paths.len() < 2 {
+        return Err(Errno::EINVAL);
+    }
+    let lower = paths
+        .iter()
+        .map(|p| overlay_dir(cx, vfs, p))
+        .collect::<Result<_, _>>()?;
+    Ok(((None, lower), options))
+}
+
+/// The store directory an overlay layer's path names (Linux's `ovl_mount_dir_noesc`): EINVAL
+/// when it is not a directory, and for a directory in a synthetic filesystem or in another
+/// overlay (Linux accepts an overlay as a lower layer; Appine does not).
+fn overlay_dir(cx: &Cx<'_>, vfs: &Vfs, path: &[u8]) -> Result<Ino, Errno> {
+    let view = cx.view(vfs);
+    match vfs.resolve(&view, &cx.cred(), &cx.root(), &cx.cwd(), path, true)? {
+        Node::Store(_, ino) if vfs.store().kind(ino)? == mode::S_IFDIR => Ok(ino),
+        Node::Overlay(..) => {
+            crate::debug::log(format_args!(
+                "mount: overlay layers in an overlay are not supported"
+            ));
+            Err(Errno::EINVAL)
+        }
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 /// Linux's `mount_too_revealing` for a new proc or sysfs mount with flags `flags`: in a mount
@@ -449,6 +508,17 @@ fn remount(
         if busy {
             return Err(Errno::EBUSY);
         }
+    }
+    // An overlay without an upper layer stays read-only (6.1's ovl_remount)
+    if data.is_some()
+        && m.fs == Fs::Overlay
+        && flags & ms::RDONLY == 0
+        && vfs
+            .overlay()
+            .instance(m.dev)
+            .is_some_and(|i| i.upper.is_none())
+    {
+        return Err(Errno::EROFS);
     }
     // Without MS_BIND the superblock changes too: a tmpfs's size and inode count; on error the
     // mount's flags do not change either

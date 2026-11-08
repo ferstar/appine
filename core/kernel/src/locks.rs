@@ -174,7 +174,7 @@ impl Locks {
     pub fn closed(&mut self, fds: &Rc<RefCell<FdTable>>, files: &[FileRef]) {
         let owner = Owner::Posix(Rc::downgrade(fds));
         for file in files {
-            let Some(ino) = file.borrow().ino() else {
+            let Some(ino) = file.borrow().lock_ino() else {
                 continue;
             };
             if let Some(locks) = self.by_ino.get_mut(&ino) {

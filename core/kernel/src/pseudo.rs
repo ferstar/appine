@@ -1557,6 +1557,11 @@ impl View<'_> {
         };
         let file = self.open_file(*pid, *fd)?;
         let f = file.borrow();
+        // A file opened through an overlay leads back to its overlay node, never to the store
+        // inode behind it (which may be in a lower layer)
+        if let Some(o) = f.ovl {
+            return Some(Node::Overlay(f.mnt, o));
+        }
         Some(match &f.kind {
             // A deleted file cannot be reopened by inode (its object in the store is already
             // deleted): point at the open file itself, and copy the host file on reopen
@@ -2178,7 +2183,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
             self::Global::Filesystems => {
-                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tmqueue\n"
+                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\n"
                     .to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
@@ -3223,6 +3228,7 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
                 &m.source
             },
             options: ps.vfs.sb_options(&m),
+            sb_readonly: ps.vfs.sb_readonly(&m),
         }
         .write(&mut out, info);
     }
@@ -3242,12 +3248,16 @@ struct MountLine<'a> {
     source: &'a [u8],
     /// Superblock options ([`crate::vfs::Vfs::sb_options`]).
     options: String,
+    /// The filesystem itself is read-only ([`crate::vfs::Vfs::sb_readonly`]): mountinfo shows
+    /// it in the superblock options, mounts with the mount's.
+    sb_readonly: bool,
 }
 
 impl MountLine<'_> {
     fn write(&self, out: &mut Vec<u8>, info: bool) {
-        let opts = mount_options(self.flags);
+        use crate::vfs::ms;
         let (fstype, options) = (self.fstype, &self.options);
+        let sb = if self.sb_readonly { "ro" } else { "rw" };
         if info {
             let (id, parent) = (self.id, self.parent);
             let (major, minor) = (self.dev >> 8, self.dev & 0xff);
@@ -3255,10 +3265,13 @@ impl MountLine<'_> {
             out.extend(mangle(&self.fs_root));
             out.push(b' ');
             out.extend(mangle(&self.point));
+            let opts = mount_options(self.flags);
             out.extend_from_slice(format!(" {opts} - {fstype} ").as_bytes());
             out.extend(mangle(self.source));
-            out.extend_from_slice(format!(" rw{options}\n").as_bytes());
+            out.extend_from_slice(format!(" {sb}{options}\n").as_bytes());
         } else {
+            let ro = if self.sb_readonly { ms::RDONLY } else { 0 };
+            let opts = mount_options(self.flags | ro);
             out.extend(mangle(self.source));
             out.push(b' ');
             out.extend(mangle(&self.point));

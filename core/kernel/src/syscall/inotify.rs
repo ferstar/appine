@@ -188,6 +188,8 @@ impl Inotify {
                 // 8:1, procfs 0:4
                 Node::Store(_, ino) => (*ino, 0x80_0001),
                 Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
+                // Watches on overlay nodes are accepted and never report, as on synthetic nodes
+                Node::Overlay(..) => (0, 0),
             };
             out += &format!(
                 "inotify wd:{wd:x} ino:{ino:x} sdev:{sdev:x} mask:{:x} ignored_mask:0",

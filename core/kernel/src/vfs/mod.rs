@@ -16,6 +16,7 @@
 pub mod browse;
 pub mod dev;
 pub mod import;
+pub mod overlay;
 pub mod store;
 
 use std::collections::VecDeque;
@@ -42,6 +43,9 @@ pub(crate) enum Node {
     Store(MountId, Ino),
     /// A node in a synthetic filesystem.
     Pseudo(MountId, PseudoNode),
+    /// A node in an overlay ([`overlay`]): the store inodes behind it are looked up through
+    /// [`Vfs::overlay`].
+    Overlay(MountId, overlay::OvlId),
 }
 
 impl Node {
@@ -51,15 +55,16 @@ impl Node {
     /// The mount reached through.
     pub(crate) fn mnt(&self) -> MountId {
         match self {
-            Node::Store(id, _) | Node::Pseudo(id, _) => *id,
+            Node::Store(id, _) | Node::Pseudo(id, _) | Node::Overlay(id, _) => *id,
         }
     }
 
-    /// The store inode; None for nodes in synthetic filesystems.
+    /// The store inode; None for nodes in synthetic filesystems and overlays (an overlay node's
+    /// store inodes are in lower layers that must not change, see [`Vfs::overlay`]).
     pub(crate) fn ino(&self) -> Option<Ino> {
         match self {
             Node::Store(_, ino) => Some(*ino),
-            Node::Pseudo(..) => None,
+            Node::Pseudo(..) | Node::Overlay(..) => None,
         }
     }
 
@@ -68,6 +73,7 @@ impl Node {
         match self {
             Node::Store(_, ino) => Node::Store(id, ino),
             Node::Pseudo(_, p) => Node::Pseudo(id, p),
+            Node::Overlay(_, o) => Node::Overlay(id, o),
         }
     }
 }
@@ -148,6 +154,9 @@ pub(crate) enum Fs {
     /// process that mounts it. One instance per namespace (Linux's `get_tree_keyed`); the mount
     /// keeps that namespace alive.
     Mqueue,
+    /// overlayfs ([`overlay`]): store directories merged into one tree, a new instance on every
+    /// mount.
+    Overlay,
 }
 
 impl Fs {
@@ -160,6 +169,7 @@ impl Fs {
             b"cgroup2" => Some(Fs::Cgroup),
             b"tmpfs" => Some(Fs::Tmpfs),
             b"mqueue" => Some(Fs::Mqueue),
+            b"overlay" => Some(Fs::Overlay),
             _ => None,
         }
     }
@@ -175,6 +185,7 @@ impl Fs {
             Fs::Cgroup => "cgroup2",
             Fs::Nsfs => "nsfs",
             Fs::Mqueue => "mqueue",
+            Fs::Overlay => "overlay",
         }
     }
 
@@ -184,7 +195,7 @@ impl Fs {
         match self {
             Fs::Store => ROOT_DEV,
             // No boot instance; allocated separately on each mount
-            Fs::Tmpfs => 0,
+            Fs::Tmpfs | Fs::Overlay => 0,
             Fs::Proc => 0x17,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
@@ -201,33 +212,40 @@ impl Fs {
     /// be mounted at the same place. sysfs and cgroup2 have only one instance per namespace, and
     /// mounting again on the root of the same mount is EBUSY.
     pub(crate) const fn new_instance(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs)
+        matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs | Fs::Overlay)
     }
 
     /// Newly mounted instances have their own device numbers: procfs, tmpfs, and devpts (each
     /// instance has its own set of terminals, and the device number is the instance number,
     /// [`crate::tty::PtsOptions`]).
     pub(crate) const fn own_dev(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Tmpfs | Fs::Pts)
+        matches!(self, Fs::Proc | Fs::Tmpfs | Fs::Pts | Fs::Overlay)
     }
 
     /// Superblock options (the part after `rw` in the last column of mountinfo).
     pub(crate) const fn options(self) -> &'static str {
         match self {
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            // Per instance for tmpfs and devpts ([`Vfs::sb_options`])
-            Fs::Store | Fs::Tmpfs | Fs::Pts | Fs::Proc | Fs::Sys | Fs::Nsfs | Fs::Mqueue => "",
+            // Per instance for tmpfs, devpts and overlays ([`Vfs::sb_options`])
+            Fs::Store
+            | Fs::Tmpfs
+            | Fs::Pts
+            | Fs::Proc
+            | Fs::Sys
+            | Fs::Nsfs
+            | Fs::Mqueue
+            | Fs::Overlay => "",
         }
     }
 
     /// The filesystem's root directory (mount id 0, replaced by the new mount's when mounted).
-    /// tmpfs's root is a directory created at mount time ([`Vfs::new_tmpfs`]) and nsfs cannot
-    /// be mounted; neither uses this.
+    /// The roots of tmpfs and overlay instances are created at mount time ([`Vfs::new_tmpfs`],
+    /// [`Vfs::new_overlay`]) and nsfs cannot be mounted; none of them uses this.
     pub(crate) fn root(self) -> Node {
         Node::Pseudo(
             0,
             match self {
-                Fs::Store | Fs::Tmpfs => return Node::Store(0, ROOT),
+                Fs::Store | Fs::Tmpfs | Fs::Overlay => return Node::Store(0, ROOT),
                 Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
                 // Replaced by the new instance's when mounted
                 Fs::Pts => PseudoNode::PtsRoot(crate::tty::BOOT_PTS),
@@ -408,6 +426,8 @@ pub struct Vfs {
     /// Mount namespaces created later: once all references to one are gone, cleanup detaches
     /// its mounts.
     namespaces: RefCell<Vec<std::rc::Weak<MntNs>>>,
+    /// Overlay instances and their nodes.
+    overlays: RefCell<overlay::Overlays>,
 }
 
 struct Mounts {
@@ -898,6 +918,7 @@ impl Vfs {
                 anon: false,
             }),
             namespaces: Default::default(),
+            overlays: Default::default(),
         })
     }
 
@@ -1069,7 +1090,7 @@ impl Vfs {
                 let magic = matches!(&node, Node::Pseudo(_, p) if ps.magic(p));
                 let jump = match &node {
                     Node::Pseudo(id, p) => ps.follow(*id, p).transpose()?,
-                    Node::Store(..) => None,
+                    Node::Store(..) | Node::Overlay(..) => None,
                 };
                 if magic {
                     if flags & resolve::NO_MAGICLINKS != 0 {
@@ -1120,6 +1141,10 @@ impl Vfs {
         match dir {
             Node::Store(_, ino) if !cred.searches_all() => {
                 cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
+            }
+            Node::Overlay(_, o) if !cred.searches_all() => {
+                let real = self.overlays.borrow().node(*o).real();
+                cred.permission(&self.store.attrs(real)?, MAY_EXEC)
             }
             _ => Ok(()),
         }
@@ -1378,6 +1403,17 @@ impl Vfs {
                         break;
                     }
                 },
+                Node::Overlay(id, o) => {
+                    let ovl = self.overlays.borrow();
+                    let up = ovl.parent(o);
+                    // The root of an instance whose mount is not this one
+                    if up == o {
+                        reached = false;
+                        break;
+                    }
+                    names.push(ovl.node(o).name.clone());
+                    cur = Node::Overlay(id, up);
+                }
             }
         }
         let mut out = Vec::new();
@@ -1401,6 +1437,7 @@ impl Vfs {
         match node {
             Node::Store(_, ino) => self.store.kind(*ino),
             Node::Pseudo(_, p) => ps.kind(p),
+            Node::Overlay(_, o) => self.store.kind(self.overlays.borrow().node(*o).real()),
         }
     }
 
@@ -1417,6 +1454,10 @@ impl Vfs {
                 Node::Store(*id, self.store.lookup(*ino, name)?.ok_or(Errno::ENOENT)?)
             }
             Node::Pseudo(id, p) => Node::Pseudo(*id, ps.lookup(*id, p, name)?),
+            Node::Overlay(id, o) => Node::Overlay(
+                *id,
+                self.overlays.borrow_mut().lookup(&self.store, *o, name)?,
+            ),
         };
         Ok(self.mounted(child))
     }
@@ -1445,6 +1486,7 @@ impl Vfs {
         match node {
             Node::Store(_, ino) => self.store.readlink(*ino),
             Node::Pseudo(id, p) => ps.readlink(*id, p),
+            Node::Overlay(_, o) => self.store.readlink(self.overlays.borrow().node(*o).real()),
         }
     }
 
@@ -1495,6 +1537,7 @@ impl Vfs {
         Ok(match dir {
             Node::Store(id, ino) => Node::Store(*id, self.store.parent(*ino)?),
             Node::Pseudo(id, p) => ps.parent(p).map_or(dir.clone(), |up| Node::Pseudo(*id, up)),
+            Node::Overlay(id, o) => Node::Overlay(*id, self.overlays.borrow().parent(*o)),
         })
     }
 
@@ -1813,6 +1856,7 @@ impl Vfs {
             .unwrap_or_else(|| match node {
                 Node::Store(..) => ROOT_DEV,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p).dev(),
+                Node::Overlay(_, o) => self.overlays.borrow().node(*o).dev,
             })
     }
 
@@ -1828,6 +1872,7 @@ impl Vfs {
             .unwrap_or_else(|| match node {
                 Node::Store(..) => Fs::Store,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p),
+                Node::Overlay(..) => Fs::Overlay,
             })
     }
 
@@ -1935,6 +1980,11 @@ impl Vfs {
     pub(crate) fn sb_options(&self, m: &Mount) -> String {
         match m.fs {
             Fs::Pts => self.devpts_options(m.dev).show(),
+            Fs::Overlay => self
+                .overlays
+                .borrow()
+                .instance(m.dev)
+                .map_or_else(String::new, |i| i.options.show()),
             Fs::Tmpfs => self
                 .mounts
                 .borrow()
@@ -1966,9 +2016,21 @@ impl Vfs {
         self.with_mount(node.mnt(), |m| m.flags)
     }
 
-    /// `node` is in a read-only mount: changing it is EROFS.
+    /// `node` is in a read-only mount or filesystem: changing it is EROFS.
     pub(crate) fn readonly(&self, node: &Node) -> bool {
         self.mount_flags(node).is_some_and(|f| f & ms::RDONLY != 0)
+            || self.with_mount(node.mnt(), |m| self.sb_readonly(m)) == Some(true)
+    }
+
+    /// Mount `m`'s filesystem itself is read-only (Linux's `sb_rdonly`), whatever the mount's
+    /// flags: an overlay without an upper layer.
+    pub(crate) fn sb_readonly(&self, m: &Mount) -> bool {
+        m.fs == Fs::Overlay
+            && self
+                .overlays
+                .borrow()
+                .instance(m.dev)
+                .is_some_and(|i| i.upper.is_none())
     }
 
     /// The path in the filesystem of the part the mount sees (the fourth column of mountinfo:
@@ -2013,6 +2075,14 @@ impl Vfs {
                     cur = up;
                 }
             }
+            Node::Overlay(_, o) => {
+                let ovl = self.overlays.borrow();
+                let mut cur = *o;
+                while ovl.parent(cur) != cur {
+                    names.push(ovl.node(cur).name.clone());
+                    cur = ovl.parent(cur);
+                }
+            }
         }
         if names.is_empty() {
             return b"/".to_vec();
@@ -2049,6 +2119,44 @@ impl Vfs {
             },
         );
         Ok(id)
+    }
+
+    /// Mounts a new overlay instance of lower layers `lower` (topmost first) and upper layer
+    /// `upper` (store directories) with options `options`, returning the new mount's id. An
+    /// overlay without an upper layer is read-only ([`Vfs::sb_readonly`]).
+    pub(crate) fn new_overlay(
+        &self,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        (upper, lower): overlay::Layers,
+        options: overlay::Options,
+    ) -> MountId {
+        let id = self.add_mount(Fs::Overlay, Node::ROOT, point, flags, source, None);
+        let dev = self.with_mount(id, |m| m.dev).unwrap_or(0);
+        let root = self
+            .overlays
+            .borrow_mut()
+            .add_instance(dev, upper, lower, options);
+        self.update_mount(id, |m| m.root = Node::Overlay(id, root));
+        self.mounts_changed();
+        id
+    }
+
+    /// The overlay instances and their nodes (an overlay node's store inodes, its instance's
+    /// layers and options).
+    pub(crate) fn overlay(&self) -> crate::cell::Ref<'_, overlay::Overlays> {
+        self.overlays.borrow()
+    }
+
+    /// Metadata of overlay node `o` ([`overlay::Overlays::stat`]).
+    pub(crate) fn overlay_stat(&self, o: overlay::OvlId) -> Result<Stat, Errno> {
+        self.overlays.borrow().stat(&self.store, o)
+    }
+
+    /// The entries of overlay directory `o` ([`overlay::Overlays::readdir`]).
+    pub(crate) fn overlay_readdir(&self, o: overlay::OvlId) -> Result<Vec<store::DirEntry>, Errno> {
+        self.overlays.borrow().readdir(&self.store, o)
     }
 
     /// Mounts `root` in filesystem `fs` ([`Fs::root`], or a node reached through another mount)
@@ -2270,6 +2378,19 @@ impl Vfs {
                 .map(|m| m.dev)
                 .collect();
             mounts.devpts.retain(|dev, _| pts.contains(dev));
+            let overlays: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Overlay)
+                .map(|m| m.dev)
+                .collect();
+            let mut ovl = self.overlays.borrow_mut();
+            for dev in ovl.devs() {
+                if !overlays.contains(&dev) {
+                    ovl.remove_instance(dev);
+                }
+            }
             dead.iter()
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)
@@ -2874,7 +2995,7 @@ mod tests {
                         )
                         .and_then(|n| match n {
                             Node::Store(_, ino) => vfs.store().stat(ino),
-                            Node::Pseudo(..) => unreachable!(),
+                            Node::Pseudo(..) | Node::Overlay(..) => unreachable!(),
                         });
                     // Normal resolution filled everything needed into the cache; afterwards the
                     // cache alone gives the same result
@@ -3009,7 +3130,7 @@ mod tests {
         let cached = vfs.cached();
         let ino = |n: &Node| match n {
             Node::Store(_, i) => *i,
-            Node::Pseudo(..) => unreachable!(),
+            Node::Pseudo(..) | Node::Overlay(..) => unreachable!(),
         };
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin", true), None);
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin/../usr", true), None);

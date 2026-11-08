@@ -762,8 +762,11 @@ pub(crate) fn open_node(
     cred: &Cred,
     node: &Node,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let Node::Store(_, ino) = *node else {
-        return Err(Errno::EACCES);
+    // A program in an overlay runs from the store inode behind it
+    let ino = match *node {
+        Node::Store(_, ino) => ino,
+        Node::Overlay(_, o) => vfs.overlay().node(o).real(),
+        Node::Pseudo(..) => return Err(Errno::EACCES),
     };
     let st = vfs.store().stat(ino)?;
     match st.kind() {
