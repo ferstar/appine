@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping; `process_mrelease` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping; `process_mrelease`, oom_score, vfork children last)
 
 ## Responsibilities
 
@@ -19,6 +19,7 @@ address layer), but it implements Linux mm semantics for every guest process:
 - multi-thread consistency (TLB shootdown) and the code-change log that Tier 1 translations consume;
 - `fork` with page-granular copy-on-write implemented only in the soft page tables;
 - read-only views for procfs, core dumps, rusage, cgroups and the OOM killer;
+- `process_mrelease`, freeing an exiting process's private memory before its threads are gone;
 - the OOM killer, which keeps the app under a memory limit by ending guest processes, and the
   periodic release of Tier 1 code written through the writable view.
 
@@ -27,7 +28,8 @@ Root:
 - `core/kernel/src/mm.rs` — almost everything (address space, host backing, CoW, code groups,
   accounting, unit tests).
 - `core/kernel/src/syscall/mem.rs` — argument validation for mmap, mremap, remap_file_pages,
-  msync, munmap, mprotect, madvise, mlock/mlock2/munlock, mlockall/munlockall, mincore.
+  msync, munmap, mprotect, madvise, mlock/mlock2/munlock, mlockall/munlockall, mincore, and
+  process_mrelease.
 - `core/engine/src/c/mmu.c` and the `Mmu` wrapper in `core/engine/src/lib.rs` — the radix page table.
 - `core/engine/src/c/cpu.c` and `core/engine/src/c/internal.h` — the per-thread software TLB and
   Tier 0 refill.
@@ -138,8 +140,9 @@ dumps and the host abstraction layer (`core/hal`).
 
 - **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `munmap`, `protect` (mprotect), `mremap` (including
   `MREMAP_DONTUNMAP` via `mremap_dontunmap`), `remap_file_pages` (emulated as a shared fixed
-  mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`, `mlockall`/`munlockall`, `mincore`.
-  `brk` calls `Mm::brk` directly.
+  mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`, `mlockall`/`munlockall`, `mincore`,
+  `release` (process_mrelease, on another process's address space). `brk` calls `Mm::brk`
+  directly.
 - **execve / loader**: `Mm::new`, `share_files`, `set_layout`, `map_anonymous`, `find_free`
   (interpreter and vDSO placement), `set_brk`, `map_stack`, `set_start_stack`, `label`,
   `write_kernel` (segments, `.bss`), plus the public layout fields.
@@ -166,7 +169,7 @@ dumps and the host abstraction layer (`core/hal`).
 - **Machine**: `FileMaps::clear` from `Machine::trim_memory`.
 - **OOM killer**: `oom::check` and `oom::unmap_code_views` (timer thread), `out_of_memory` (also
   from a lowered cgroup `memory.max`), `Oom::{measure, recheck}`, `default_limit`, `app_memory`;
-  `Shared::resume_checks` from the run loop.
+  `Shared::resume_checks` from the run loop; `oom::proc_score` for `/proc/<pid>/oom_score`.
 
 ## Data flow / lifecycle
 
@@ -428,6 +431,25 @@ signals may still be delivered).
   graveyard.
 - The OOM killer skips a round while `UNMAPPING` is nonzero.
 
+### process_mrelease
+
+- The syscall (Linux 6.1's `mm/oom_kill.c`): any flag is `EINVAL`; the fd must be a pidfd (a
+  `/proc/<pid>` directory is `EBADF`, unlike pidfd_send_signal), whose process has not been
+  reaped and still has a thread in the task table (`ESRCH` otherwise: zombies, Linux's
+  `find_lock_task_mm`); that process must be exiting (`ThreadGroup::exiting` set: exit_group, a
+  fatal signal taken or SIGKILL sent, or every thread in the exit path) and not writing a core
+  file, and so must every other process whose first live thread uses the same address space
+  (`task_will_free_mem`), else `EINVAL`. It succeeds again on a second call. The process's peak
+  resident memory is sampled first, so its `ru_maxrss` keeps what it used.
+- `Mm::release` (Linux's `__oom_reap_task_mm` over anonymous and private VMAs) leaves the VMAs, and
+  so maps, unchanged and skips executable mappings (their translations, the vDSO) and `PROT_NONE`
+  reservations. Borrowed pages are re-pointed at the VMA's own page and returned without copying
+  (one shootdown, the owners getting write permission back); lent pages stay for their borrowers;
+  the other pages of written private anonymous VMAs go back to the host (reading zero); written
+  private file VMAs go back to the file in whole host pages of a host file mapping (partial host
+  pages kept) or, copied into anonymous memory, to zeros. A thread of the process still running
+  reads what is left; on Linux any fault there is `SIGBUS` (`MMF_UNSTABLE`).
+
 ### Files: EOF and truncation
 
 - Whole pages past EOF have no entries. A shared mapping whose file grew picks up the new content on
@@ -495,11 +517,17 @@ signals may still be delivered).
   ago, still has threads; otherwise it records a `max` event and calls `out_of_memory`. Lowering a
   child's `memory.max` below its usage calls `out_of_memory` once at once, without a `max` event.
 - `select` considers every process except tgid 1 (the built-in init), `oom_score_adj` -1000,
-  processes outside the over-limit cgroup, zombies, and every victim that outlived its second and
-  still has threads (kept in a list until it exits). The score is `resident_pages + adj * (total /
-  1000)`, unclamped, with `total` the larger of RAM and the limit for the root, the cgroup's limit
-  otherwise; on equal scores the later (higher tgid) wins, as `oom_evaluate_task` keeps the last
-  one not below the best. With no eligible process nothing is killed or logged.
+  processes outside the over-limit cgroup, zombies, a vfork child whose parent thread still waits
+  for it with the same address space (Linux's `in_vfork`: ending it frees nothing, and with its
+  parent's memory and a higher tgid it would win), and every victim that outlived its second and
+  still has threads (kept in a list until it exits). The score (`badness`, Linux's `oom_badness`)
+  is `resident_pages + adj * (total / 1000)`, unclamped, with `total` the larger of RAM and the
+  limit for the root, the cgroup's limit otherwise; on equal scores the later (higher tgid) wins,
+  as `oom_evaluate_task` keeps the last one not below the best. With no eligible process nothing
+  is killed or logged.
+- `/proc/<pid>/oom_score` (`proc_score`, Linux's `proc_oom_score`) is the same badness with
+  `total` the host's RAM plus swap, as `(1000 + badness * 1000 / total) * 2 / 3` (0 to 2000), and
+  0 for the processes `select` never takes (init, -1000, no live thread, a vfork child).
 - The kill records `oom` on the domain and the victim; a victim already exiting is only waited for.
   Otherwise the group gets `SIGKILL` (`group_exit`), its cgroup and ancestors count `oom_kill`, host
   stderr gets a line, the kernel log gets Linux's memcg lines (`memory: usage …`,
@@ -626,14 +654,12 @@ signals may still be delivered).
   a forked child does not break copy-on-write (Linux 6.1 copies the pages at mlock time) but
   touches the child's own, still unused host pages, so smaps counts the range twice until the
   pages are written.
-- **`process_mrelease` is `ENOSYS`:** Linux 6.1 lets a caller free the private memory of an
-  exiting process (`EINVAL` while it is not exiting or is writing a core, or while a process
-  sharing its address space is not exiting; `ESRCH` once no thread holds the address space), so
-  earlyoom 1.8 and later logs a warning after each kill and Starnix's `process_mrelease_test`
-  fails. It needs a release path of its own: `discard` makes every borrower copy a lent page first
-  and settles borrowed pages by copying, so lent pages must be left alone, borrowed ones returned
-  without copying and the rest of the written private anonymous memory freed, with the page table
-  and VMAs unchanged (docs/starnix.md).
+- **process_mrelease judges "exiting" by `ThreadGroup::exiting`:** a fatal signal other than
+  SIGKILL sets it only when a thread takes the signal (Linux's `complete_signal` starts the group
+  exit when it is sent), so a release right after kill with SIGTERM is `EINVAL`; and when a main
+  thread has exited on its own, the last thread calling exit(2) counts as exiting, where Linux,
+  still seeing the zombie leader in the thread list, answers `EINVAL`. The OOM killer does not
+  release its victims' memory itself (Linux's oom_reaper does).
 
 ## Open questions
 

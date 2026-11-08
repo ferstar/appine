@@ -379,8 +379,12 @@ pub const NETLINK_KOBJECT_UEVENT: i32 = 15;
 pub const NETLINK_GENERIC: i32 = 16;
 /// The protocol number of NETLINK_NETFILTER (nftables, [`crate::nft`]).
 pub const NETLINK_NETFILTER: i32 = 12;
+/// The protocol number of NETLINK_SOCK_DIAG (`NETLINK_INET_DIAG`): socket queries, answered as by
+/// a kernel without its diag modules ([`sock_diag_request`]).
+pub const NETLINK_SOCK_DIAG: i32 = 4;
 
-/// A netlink socket emulated in process. Only `NETLINK_ROUTE` answers queries; a
+/// A netlink socket emulated in process. `NETLINK_ROUTE` answers queries, `NETLINK_GENERIC` only
+/// for nlctrl, `NETLINK_NETFILTER` for nftables and `NETLINK_SOCK_DIAG` only with errors; a
 /// `NETLINK_KOBJECT_UEVENT` socket never receives anything (the uevents mdev listens for), and
 /// other protocols cannot be created (`syscall::net::socket`).
 pub(crate) struct NetlinkSocket {
@@ -469,7 +473,10 @@ impl NetlinkSocket {
             }
             return;
         }
-        if !matches!(self.protocol, NETLINK_ROUTE | NETLINK_GENERIC) {
+        if !matches!(
+            self.protocol,
+            NETLINK_ROUTE | NETLINK_GENERIC | NETLINK_SOCK_DIAG
+        ) {
             return;
         }
         let mut off = 0;
@@ -479,10 +486,10 @@ impl NetlinkSocket {
             if len < 16 || off + len > data.len() {
                 break;
             }
-            let answers = if self.protocol == NETLINK_GENERIC {
-                generic_request(&h[..len], self.pid)
-            } else {
-                self.route_request(&h[..len], host)
+            let answers = match self.protocol {
+                NETLINK_GENERIC => generic_request(&h[..len], self.pid),
+                NETLINK_SOCK_DIAG => sock_diag_request(&h[..len], self.pid, self.cap_ack),
+                _ => self.route_request(&h[..len], host),
             };
             for d in answers {
                 self.queue.push_back(d);
@@ -1221,6 +1228,47 @@ pub(crate) fn message(ty: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -
     b.extend_from_slice(payload);
     align4(&mut b);
     b
+}
+
+// ---- NETLINK_SOCK_DIAG ----
+//
+// Answered as by a Linux 6.1 kernel built with sock_diag but none of its family modules (inet,
+// unix, netlink, packet diag): every query is refused, as `sock_diag_rcv_msg` and
+// `__sock_diag_cmd` refuse it without a handler. iproute2's ss takes ENOENT and EOPNOTSUPP on this
+// protocol quietly as "not supported" and reads /proc/net instead; before, the socket itself was
+// EPROTONOSUPPORT, and ss printed "Cannot open netlink socket" for every table it listed.
+
+/// `TCPDIAG_GETSOCK` and `DCCPDIAG_GETSOCK`: the old inet_diag requests.
+const TCPDIAG_GETSOCK: u16 = 18;
+const DCCPDIAG_GETSOCK: u16 = 19;
+/// `SOCK_DIAG_BY_FAMILY` and `SOCK_DESTROY`, which start with a `sock_diag_req` (family, protocol).
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
+const SOCK_DESTROY: u16 = 21;
+/// Linux 6.1's `AF_MAX`.
+const AF_MAX: u8 = 46;
+
+/// Answers one request `req` (the whole message) on `NETLINK_SOCK_DIAG` (Linux's
+/// `sock_diag_rcv_msg` under `netlink_rcv_skb`): the old inet_diag requests `EOPNOTSUPP`, family
+/// requests with a short body or a family at or past `AF_MAX` `EINVAL` and otherwise `ENOENT` (no
+/// family handler), other types `EINVAL`; non-requests and control messages are acked only when
+/// asked. `cap` is `NETLINK_CAP_ACK`.
+fn sock_diag_request(req: &[u8], pid: u32, cap: bool) -> Vec<Vec<u8>> {
+    let ty = u16::from_le_bytes([req[4], req[5]]);
+    let flags = u16::from_le_bytes([req[6], req[7]]);
+    let err = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE {
+        0
+    } else {
+        match ty {
+            TCPDIAG_GETSOCK | DCCPDIAG_GETSOCK => EOPNOTSUPP,
+            SOCK_DIAG_BY_FAMILY | SOCK_DESTROY if req.len() < 18 || req[16] >= AF_MAX => EINVAL,
+            SOCK_DIAG_BY_FAMILY | SOCK_DESTROY => ENOENT,
+            _ => EINVAL,
+        }
+    };
+    if err == 0 && flags & NLM_F_ACK == 0 {
+        return Vec::new();
+    }
+    vec![ack_ext(req, err, pid, None, cap)]
 }
 
 /// The ack or error for request `req` (the whole message) (Linux's `netlink_ack`): on success only
@@ -2145,6 +2193,51 @@ mod tests {
         assert_eq!(r.len(), 1);
         let types: Vec<u16> = r[0].iter().map(|m| m.0).collect();
         assert_eq!(types, [GENL_ID_CTRL, NLMSG_DONE]);
+    }
+
+    #[test]
+    fn sock_diag_refuses_every_query() {
+        let mut s = NetlinkSocket::new(NETLINK_SOCK_DIAG, SOCK_RAW);
+        s.pid = 42;
+        let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
+            s.handle(req, &NOTHING);
+            s.queue.drain(..).map(|d| parse(&d)).collect()
+        };
+        let dump = NLM_F_REQUEST | NLM_F_DUMP;
+        // ss's inet_diag_req_v2 for TCP over IPv4, a unix_diag_req, the old TCPDIAG_GETSOCK, a
+        // short family request, a family past AF_MAX and an unknown type: each one error with the
+        // whole request attached
+        let mut inet = vec![AF_INET as u8, IPPROTO_TCP as u8, 0, 0];
+        inet.extend_from_slice(&u32::MAX.to_le_bytes());
+        inet.resize(56, 0);
+        let cases = [
+            (message(SOCK_DIAG_BY_FAMILY, dump, 1, 0, &inet), -ENOENT),
+            (
+                message(SOCK_DIAG_BY_FAMILY, dump, 2, 0, &[AF_UNIX as u8; 24]),
+                -ENOENT,
+            ),
+            (message(TCPDIAG_GETSOCK, dump, 3, 0, &[0; 72]), -EOPNOTSUPP),
+            (message(SOCK_DIAG_BY_FAMILY, dump, 4, 0, &[2]), -EINVAL),
+            (
+                message(SOCK_DESTROY, NLM_F_REQUEST, 5, 0, &[AF_MAX, 0]),
+                -EINVAL,
+            ),
+            (message(30, NLM_F_REQUEST, 6, 0, &[]), -EINVAL),
+        ];
+        for (req, err) in cases {
+            let r = ask(&req);
+            assert_eq!(r.len(), 1);
+            let (ty, e) = &r[0][0];
+            assert_eq!(*ty, NLMSG_ERROR);
+            assert_eq!(e[..4], err.to_le_bytes());
+            // The request as long as its header says, without the padding after it
+            let len = u32::from_le_bytes(req[..4].try_into().unwrap()) as usize;
+            assert_eq!(&e[4..], &req[..len]);
+        }
+        // Control messages and non-requests are acked only when asked
+        assert!(ask(&message(NLMSG_DONE, NLM_F_REQUEST, 7, 0, &[])).is_empty());
+        let r = ask(&message(NLMSG_DONE, NLM_F_ACK, 8, 0, &[]));
+        assert_eq!(r[0][0].1[..4], 0i32.to_le_bytes());
     }
 
     #[test]

@@ -552,3 +552,51 @@ pub(super) fn mincore(cx: &mut Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResu
         .write(crate::uaccess::UserSlice::new(vec, out.len()), &out)?;
     Ok(0)
 }
+
+/// process_mrelease (Linux 6.1's `mm/oom_kill.c`): frees the private memory of a process that is
+/// exiting before its threads have all gone (lmkd and earlyoom call it right after SIGKILL). Flags
+/// are `EINVAL`; anything but a pidfd is `EBADF` (a `/proc/<pid>` directory too, unlike
+/// pidfd_send_signal); a process with no thread left holding its address space (a zombie, or
+/// reaped) is `ESRCH` (`find_lock_task_mm`); unless it is exiting as a whole (exit_group, a fatal
+/// signal, or its last thread's exit) and writing no core file, and so is every other process
+/// sharing its address space (`task_will_free_mem`), `EINVAL`.
+pub(super) fn process_mrelease(cx: &mut Cx<'_>, pidfd: i32, flags: u32) -> SysResult {
+    use std::rc::Rc;
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.fds().get(pidfd)?;
+    let group = match &file.borrow().kind {
+        FileKind::Pidfd(p) => p.group(cx.kr()).ok_or(Errno::ESRCH)?,
+        _ => return Err(Errno::EBADF),
+    };
+    let k = cx.kr();
+    let mm_of = |g: &crate::process::ThreadGroup| {
+        g.threads
+            .iter()
+            .find_map(|t| k.tasks.get(t))
+            .map(|t| t.res.borrow().mm.clone())
+    };
+    let mm = mm_of(&group.borrow()).ok_or(Errno::ESRCH)?;
+    let dying = |g: &crate::process::ThreadGroup| g.exiting.is_some() && g.core.is_none();
+    let sharers_dying = k
+        .groups
+        .values()
+        .filter(|g| !Rc::ptr_eq(g, &group))
+        .all(|g| {
+            let g = g.borrow();
+            mm_of(&g).is_none_or(|m| !Rc::ptr_eq(&m, &mm)) || dying(&g)
+        });
+    if !dying(&group.borrow()) || !sharers_dying {
+        return Err(Errno::EINVAL);
+    }
+    // The peak resident memory (ru_maxrss of the process's wait) is taken before the memory goes
+    group.borrow_mut().sample_rss(&mm.borrow());
+    // No thread holds an address space borrowed across a BKL release, and the caller's own (the
+    // target when another of its threads called exit_group) is not borrowed here: checked rather
+    // than assumed
+    if let Ok(mut m) = mm.try_borrow_mut() {
+        m.release();
+    }
+    Ok(0)
+}

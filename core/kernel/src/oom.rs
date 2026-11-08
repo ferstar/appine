@@ -320,22 +320,47 @@ fn select(
             continue;
         }
         let g = group.borrow();
-        if g.tgid == INIT
-            || g.oom_score_adj == OOM_SCORE_ADJ_MIN
-            || !k.cgroups.is_within(g.cgroup, domain)
-        {
+        if !k.cgroups.is_within(g.cgroup, domain) {
             continue;
         }
-        let Some(task) = g.threads.first().and_then(|t| k.tasks.get(t)) else {
+        let Some((points, rss)) = badness(k, &g, total) else {
             continue;
         };
-        let rss = task.res.borrow().mm.borrow().resident_pages();
-        let points = rss as i64 + g.oom_score_adj as i64 * (total / 1000);
         if best.as_ref().is_none_or(|b| points >= b.1) {
             best = Some((group.clone(), points, rss));
         }
     }
     best.map(|(g, _, rss)| (g, rss))
+}
+
+/// Linux's `oom_badness` for process `g` against `total` pages: its resident pages plus its
+/// `oom_score_adj` times a thousandth of `total`, and the resident pages; None for a process never
+/// picked (the built-in init, `oom_score_adj` -1000, no live thread, a vfork child still sharing
+/// its parent's address space). Unlike Linux, swap and page tables are not counted.
+fn badness(k: &Kernel, g: &ThreadGroup, total: i64) -> Option<(i64, u64)> {
+    if g.tgid == INIT || g.oom_score_adj == OOM_SCORE_ADJ_MIN {
+        return None;
+    }
+    let task = g.threads.first().and_then(|t| k.tasks.get(t))?;
+    let mm = task.res.borrow().mm.clone();
+    // Linux's in_vfork: ending it frees nothing, and with the same memory and score it would win
+    // over its parent as the later process (posix_spawn's child before it execs)
+    let parent = k.tasks.get(&g.parent_thread);
+    if task.vfork.get() && parent.is_some_and(|p| Rc::ptr_eq(&p.res.borrow().mm, &mm)) {
+        return None;
+    }
+    let rss = mm.borrow().resident_pages();
+    Some((rss as i64 + g.oom_score_adj as i64 * (total / 1000), rss))
+}
+
+/// `/proc/<pid>/oom_score` (Linux's `proc_oom_score`): the badness against the host's RAM plus swap,
+/// scaled into 0 to 2000 (1000 + badness × 1000 / total, times 2/3), and 0 for a process never
+/// picked.
+pub(crate) fn proc_score(k: &Kernel, g: &ThreadGroup) -> u64 {
+    let total = (appine_hal::ram_and_swap() / PAGE_SIZE).max(1) as i64;
+    badness(k, g, total).map_or(0, |(b, _)| {
+        ((1000 + b * 1000 / total) * 2 / 3).max(0) as u64
+    })
 }
 
 /// Writes to the kernel log when ending a process ([`crate::klog`]): to the guest, the app's limit

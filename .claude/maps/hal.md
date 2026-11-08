@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE`; `host_swaps` last)
 
 ## Responsibilities
 
@@ -57,7 +57,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `map_file`,
   `map_file_read_only`, `msync`, `populate`, `page_size`, `resident_pages`, `page_residency`,
   `touched_pages`, `has_private_pages`, `cachestat`.
-- Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`, `statvfs`,
+- Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`,
+  `host_swaps`, `statvfs`,
   `fd_limit`, `raise_fd_limit`, `host_cpus`, `cpu_sysfs`, `thread_cpu_clock`,
   `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`.
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
@@ -99,7 +100,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   share a result, so `resident_pages` may count 4K pages just outside the range); `cachestat` maps
   the file in chunks to count cached pages.
 - `memory_usage` reads `/proc/self/status`; `host_meminfo` copies host `/proc/meminfo` (falling
-  back to `sysinfo`); `host_vmstat` returns host `/proc/vmstat` when readable (None otherwise);
+  back to `sysinfo`); `host_vmstat` and `host_swaps` return host `/proc/vmstat` and `/proc/swaps`
+  when readable and not empty (None otherwise);
   long-lived fds for `/proc/self/status` and pagemap are kept in `OnceLock`s.
 
 ### Files and storage
@@ -170,7 +172,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 ### Outbound
 
 - `libc` (syscalls, epoll, eventfd, getifaddrs, termios, sigaction), `libandroid` on Android (DNS),
-  host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/net/route*`,
+  host files (`/proc/self/status`, `/proc/self/pagemap`, `/proc/meminfo`, `/proc/vmstat`,
+  `/proc/swaps`, `/proc/net/route*`,
   `/proc/self/task/*`, `/sys/devices/system/cpu`, `/sys/class/net`, `/etc/resolv.conf`), Rust std
   (`available_parallelism`).
 

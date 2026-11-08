@@ -2238,6 +2238,77 @@ impl Mm {
         }
     }
 
+    /// process_mrelease: every process using this address space is exiting, so its private memory
+    /// goes back to the host now, as Linux's `__oom_reap_task_mm` unmaps the pages of every VMA
+    /// that is anonymous or not shared, while the VMAs (and `/proc/<pid>/maps`) stay as they are.
+    /// Written private anonymous memory reads zero afterwards; borrowed pages are returned without
+    /// copying, their entries pointing at the VMA's own (zero) page; lent pages stay for their
+    /// borrowers; the written pages of a private file mapping go back to the file (whole host
+    /// pages of a host file mapping, the rest kept) or, copied into anonymous memory, to zeros.
+    /// On Linux a later fault anywhere in a reaped address space is `SIGBUS` (`MMF_UNSTABLE`), so
+    /// what the dying threads would see is never relied on. Executable and `PROT_NONE`-reserved
+    /// mappings are left alone: the former's translations would have to be invalidated (the vDSO
+    /// among them), the latter hold nothing.
+    pub fn release(&mut self) {
+        let kept = |v: &Vma| v.prot & prot::EXEC != 0 || v.reserved();
+        let pages: Vec<u64> = self
+            .cow
+            .borrow()
+            .borrowed
+            .keys()
+            .copied()
+            .filter(|&p| self.anon_vma(p).is_some_and(|(_, v)| !kept(v)))
+            .collect();
+        let returned: Vec<(u64, Borrowed)> = {
+            let mut c = self.cow.borrow_mut();
+            pages
+                .into_iter()
+                .filter_map(|p| Some((p, c.borrowed.remove(&p)?)))
+                .collect()
+        };
+        for &(page, _) in &returned {
+            if let Some((s, v)) = self.anon_vma(page) {
+                // As in materialize, but without the copy: the page reads zero once discarded
+                // below
+                // SAFETY: the host page belongs to this VMA
+                let _ = unsafe {
+                    self.mmu.map_shared(
+                        page,
+                        Self::own_page(s, v, page),
+                        PAGE_SIZE,
+                        mmu_prot(v.prot),
+                    )
+                };
+            }
+        }
+        // Threads still running guest code flush before the owners get their pages back
+        self.give_back(returned);
+        let lent = self.cow.borrow().lent.clone();
+        for (&s, v) in self
+            .vmas
+            .iter()
+            .filter(|(_, v)| !kept(v) && v.written.get())
+        {
+            match v.backing {
+                Backing::Anonymous => Self::discard_unlent_in(s, v, &lent),
+                // Only written pages differ from the file (a `cow` mapping never is), and whole
+                // pages past its end have no entries
+                Backing::PrivateFile if !v.cow => {
+                    let len = page_up(v.file_len).unwrap_or(v.len).min(v.len) as usize;
+                    // SAFETY: [host, host + len) is this VMA's own private host memory
+                    unsafe {
+                        if v.region.anonymous.is_none() {
+                            let _ = discard_file_host(v.host, len);
+                        } else {
+                            discard_host(v.host, len);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// `MADV_DONTDUMP`, `MADV_DODUMP`: whether `[addr, addr + len)` is written to core files; the
     /// range must be fully mapped.
     pub fn set_dontdump(&mut self, addr: u64, len: u64, dontdump: bool) -> Result<(), Errno> {
@@ -4234,16 +4305,21 @@ impl Mm {
             .iter()
             .filter(|(_, v)| v.backing == Backing::Anonymous && v.written.get())
         {
-            let end = s + v.len;
-            let mut cursor = s;
-            for page in lent.range(s..end).copied().chain([end]) {
-                if page > cursor {
-                    // SAFETY: [cursor, page) is inside this private anonymous VMA and no longer
-                    // used by anyone
-                    unsafe { discard_host(Self::own_page(s, v, cursor), (page - cursor) as usize) };
-                }
-                cursor = page + PAGE_SIZE;
+            Self::discard_unlent_in(s, v, lent);
+        }
+    }
+
+    /// The pages of private anonymous VMA `v` (at `s`) that are not in `lent` go back to the host.
+    fn discard_unlent_in(s: u64, v: &Vma, lent: &BTreeSet<u64>) {
+        let end = s + v.len;
+        let mut cursor = s;
+        for page in lent.range(s..end).copied().chain([end]) {
+            if page > cursor {
+                // SAFETY: [cursor, page) is inside this private anonymous VMA, whose contents
+                // nobody needs any more
+                unsafe { discard_host(Self::own_page(s, v, cursor), (page - cursor) as usize) };
             }
+            cursor = page + PAGE_SIZE;
         }
     }
 
@@ -6249,6 +6325,51 @@ mod tests {
         assert_eq!(byte(&child, a + 2 * PAGE_SIZE), b'p');
         poke(&child, a + 2 * PAGE_SIZE, b'c');
         assert_eq!(byte(&parent, moved), b'q');
+    }
+
+    #[test]
+    fn release_frees_private_memory_but_keeps_vmas_and_lent_pages() {
+        let parent = Mm::new().into_shared();
+        let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
+        let a = parent
+            .borrow_mut()
+            .mmap(0, 4 * PAGE_SIZE, RW, anon, None)
+            .unwrap();
+        for i in 0..4 {
+            poke(&parent, a + i * PAGE_SIZE, b'p');
+        }
+        let regions = |mm: &Rc<RefCell<Mm>>| -> Vec<(u64, u64, u32)> {
+            let m = mm.borrow();
+            m.regions()
+                .iter()
+                .map(|r| (r.start, r.end, r.prot))
+                .collect()
+        };
+        // The child copies page 0 and borrows pages 1 to 3
+        let child = parent.borrow_mut().fork().unwrap();
+        poke(&child, a, b'c');
+        let maps = regions(&child);
+        child.borrow_mut().release();
+        // Its own page and its borrowed ones read zero, without copying: the parent is the only
+        // user of its pages again and can write them, contents unchanged
+        assert_eq!(regions(&child), maps);
+        for i in 0..4 {
+            assert_eq!(byte(&child, a + i * PAGE_SIZE), 0);
+            assert_eq!(byte(&parent, a + i * PAGE_SIZE), b'p');
+            assert!(writable(&parent, a + i * PAGE_SIZE));
+        }
+        assert!(child.borrow().cow.borrow().borrowed.is_empty());
+        assert!(parent.borrow().cow.borrow().lent.is_empty());
+        // Releasing a lender leaves the pages it lent: the borrower still reads them, while the
+        // pages it had copied for itself read zero
+        let child = parent.borrow_mut().fork().unwrap();
+        poke(&parent, a, b'q');
+        parent.borrow_mut().release();
+        assert_eq!((byte(&parent, a), byte(&child, a)), (0, b'p'));
+        assert_eq!(byte(&child, a + PAGE_SIZE), b'p');
+        assert_eq!(byte(&parent, a + PAGE_SIZE), b'p');
+        poke(&child, a + PAGE_SIZE, b'c');
+        assert_eq!(byte(&parent, a + PAGE_SIZE), b'p');
     }
 
     #[test]

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay module parameters; `debug.exception-trace` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay parameters; exception-trace; oom_score, swaps, locks, task oom files last)
 
 ## Responsibilities
 
@@ -38,7 +38,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   procfs (`Global`, `SelfLink`, `ThreadSelf`, `Static`, `Pid`, `Entry`, `Net`, `Fd`, `OpenFd`,
   `OpenExe`, `FdInfo`, `Ns`, `NetConf`, `NetSysctl`), sysfs (`SysRoot`, `Sys`, `SysCpu`, `SysNet`,
   `SysBrif`, `SysBlock`), `Cgroup`, `NsFile(kind, id)`, mqueue nodes.
-- `Global`/`GLOBALS` (13 top-level files), `Entry`/`ENTRIES` (32 per-process entries),
+- `Global`/`GLOBALS` (15 top-level files), `Entry`/`ENTRIES` (33 per-process entries),
   `TASK_ENTRIES` (27 per-thread entries), `NsKind`, `STATIC` (90 fixed `/proc/sys` and
   `/proc/sysvipc` paths), `SYS_STATIC` and the sysfs file tables, `PROC_NET` (18 files).
 - `View` — a read-only view of the kernel for one reader thread, taken under the BKL; implements
@@ -139,11 +139,15 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 - Entries: `auxv`, `stat`, `status`, `statm`, `cmdline`, `comm`, `environ`, `limits`, `maps`,
   `mem`, `smaps`, `smaps_rollup`, `pagemap`, `mounts`, `mountinfo`, `cwd`, `exe`, `root`, `fd/`,
-  `fdinfo/`, `task/`, `net/`, `oom_score_adj`, `coredump_filter`, `cgroup`, `ns/`, `uid_map`,
-  `gid_map`, `projid_map`, `setgroups`, `timens_offsets`; `task/<tid>` has the same minus `task`,
-  `pagemap`, `oom_score_adj`, `coredump_filter`, `timens_offsets`, plus `children`. Absent:
-  `oom_score`, `oom_adj`, `io`, `wchan`, `sched*`, `personality`, `loginuid`/`sessionid`,
-  `attr/`, `stack`, `syscall`, `cpuset`, `mountstats`, `timerslack_ns`.
+  `fdinfo/`, `task/`, `net/`, `oom_score`, `oom_score_adj`, `coredump_filter`, `cgroup`, `ns/`,
+  `uid_map`, `gid_map`, `projid_map`, `setgroups`, `timens_offsets`; `task/<tid>` has the same
+  minus `task`, `pagemap`, `coredump_filter`, `timens_offsets`, plus `children` (its `oom_score`
+  and `oom_score_adj` are the process's, and writing the latter sets the process's, as Linux's
+  tid_base_stuff). Absent: `oom_adj`, `io`, `wchan`, `sched*`, `personality`,
+  `loginuid`/`sessionid`, `attr/`, `stack`, `syscall`, `cpuset`, `mountstats`, `timerslack_ns`.
+- `oom_score` is the OOM killer's badness scaled against the host's RAM plus swap (`kernel/mm`'s
+  `proc_score`): 0 to 2000, 0 for the built-in init, `oom_score_adj` -1000, a process without
+  live threads and a vfork child its parent still waits for.
 - `stat`: all 52 fields; fault counters, code/stack addresses, `wchan`, `processor`, priority and
   policy are 0; start time in clock ticks plus the reader's time-namespace boottime offset; the
   thread's or the group's CPU times depending on the view; `tty_nr` from the controlling terminal.
@@ -163,8 +167,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `fd/` lists the fds of the group leader's table (also under `task/<tid>`, even for a thread with
   its own table); `fd/N` links show the
   path stored at open with ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags`
-  (octal, with `O_CLOEXEC`), `mnt_id`, `ino` and per-kind lines (eventfd count, inotify watches,
-  epoll `tfd:` lines, timerfd clock and times, signalfd mask, pidfd pids).
+  (octal, with `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that
+  open file (`kernel/vfs`'s `fd_locks`; only for files or fd tables that have taken locks) and
+  per-kind lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times,
+  signalfd mask, pidfd pids).
 - `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
   thread has none: `EINVAL` at open, as `mounts_open_common`); `cgroup` is the path relative to the reader's
   cgroup-namespace root; `net/` uses the target's network namespace.
@@ -194,9 +200,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   includes the reader's
   boottime offset. `loadavg` comes from the guest's own load average. `filesystems` is a fixed
   list; `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
-  `self`.
-- Absent: `swaps`, `partitions`, `devices`, `locks`, `sys/fs/file-nr`,
-  `protected_regular`/`protected_fifos`, Yama.
+  `self`. `swaps` is the host's file when the app may read it (as meminfo's swap lines are the
+  host's), otherwise Linux's header line alone; `locks` lists every lock and lease
+  (`kernel/vfs`'s `proc_locks`) with pids in the instance's pid namespace.
+- Absent: `partitions`, `devices`, `sys/fs/file-nr`, `protected_regular`/`protected_fifos`,
+  Yama.
 - Sysctl scoping: SysV IPC limits and `fs/mqueue/*` per the writer's IPC namespace; `hostname`/
   `domainname` per UTS namespace (one trailing newline stripped, over 64 bytes `EINVAL`);
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
@@ -367,9 +375,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
   `loadavg`, the VFS (`mounts_from`, `reach`, `path_of`, devpts options, the loop devices'
-  `Loops`).
-- Host: `appine_hal` (`host_meminfo`, `host_cpus`, `cpu_sysfs`, `clock_gettime`, `fill_random`,
-  `thread_ctxt_switches`, routes, `tx_queue_len`); the engine (`guest_hwcap*`, `guest_midr`).
+  `Loops`, `proc_locks` and `fd_locks`), the OOM killer (`proc_score`).
+- Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
+  `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine
+  (`guest_hwcap*`, `guest_midr`).
 
 ## Invariants and gotchas
 

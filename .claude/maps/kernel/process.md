@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces; AIO in the timer thread last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces; AIO in the timer thread; the vfork mark last)
 
 ## Responsibilities
 
@@ -37,9 +37,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 ### Tasks and processes
 
 - `Task` — one guest thread: tid, `killed`, `pdeathsig`, exit status, CPU-clock bookkeeping, nice,
-  affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`; thread-private
-  `TaskState` (address space, fd table and `FsContext`, each shared or not per clone flags; thread
-  group; alternate stack; `clear_child_tid`; vfork completion).
+  affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`, `vfork` (its
+  vfork completion is still pending, for the OOM killer); thread-private `TaskState` (address
+  space, fd table and `FsContext`, each shared or not per clone flags; thread group; alternate
+  stack; `clear_child_tid`; vfork completion).
 - `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mm` shootdowns).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
@@ -133,7 +134,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Registration: the pid is registered (in every pid-namespace level), the parent/child tid and pidfd
   are written, then `task::start` queues the host thread and inserts the task into the group, the
   address space's users and the kernel's task table. A failure releases the pid and the pidfd.
-- vfork: the parent waits (interest none) until the child execs or exits, or it is killed.
+- vfork: the parent waits (interest none) until the child execs or exits, or it is killed; until
+  the completion is signalled (`release_mm`, at execve or exit) the child's `Task::vfork` is set,
+  so the OOM killer can pass it over (`kernel/mm`).
 
 ### Run loop
 

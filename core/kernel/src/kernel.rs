@@ -147,8 +147,8 @@ type Waiter = (Arc<Event>, u32, Option<Box<[wake::Object]>>);
 type HeldReaper = (Rc<crate::pidns::PidNs>, Rc<RefCell<ThreadGroup>>, Vec<Tid>);
 
 /// An open file holding a flock(2) lock (a weak reference; the lock is released with it when it is
-/// closed), and whether the lock is exclusive.
-pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool);
+/// closed), whether the lock is exclusive, and the process that took it (`/proc/locks`).
+pub(crate) type FlockHolder = (std::rc::Weak<RefCell<crate::fd::OpenFile>>, bool, Tid);
 
 /// The kernel layer's global state.
 pub(crate) struct Kernel {

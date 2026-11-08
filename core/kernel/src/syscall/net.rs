@@ -14,8 +14,8 @@ use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
-    NETLINK_NETFILTER, NETLINK_ROUTE, NetlinkSocket, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, Socket,
-    is_stub, servfail, stub_addr,
+    NETLINK_NETFILTER, NETLINK_ROUTE, NETLINK_SOCK_DIAG, NetlinkSocket, SOCK_DGRAM, SOCK_RAW,
+    SOCK_STREAM, Socket, is_stub, servfail, stub_addr,
 };
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
@@ -137,14 +137,19 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         AF_NETLINK if base == SOCK_RAW || base == SOCK_DGRAM => {
             // NETLINK_ROUTE answers queries for interfaces and addresses, NETLINK_GENERIC has
             // only the nlctrl family (which Linux always has), NETLINK_NETFILTER is a subset of
-            // nftables (crate::nft); NETLINK_KOBJECT_UEVENT is only for listening to hotplug
-            // events (mdev, udev), and there are none here. Other protocols are
+            // nftables (crate::nft), NETLINK_SOCK_DIAG refuses every query as without its diag
+            // modules (ss then reads /proc/net); NETLINK_KOBJECT_UEVENT is only for listening to
+            // hotplug events (mdev, udev), and there are none here. Other protocols are
             // EPROTONOSUPPORT, as for subsystems not built into a Linux kernel: before, they were
             // created anyway and never answered requests, so libaudit waited 40 seconds for an
             // ACK and failed, and PAM then refused logins (Debian's sshd, login)
             if !matches!(
                 protocol,
-                NETLINK_ROUTE | NETLINK_GENERIC | NETLINK_KOBJECT_UEVENT | NETLINK_NETFILTER
+                NETLINK_ROUTE
+                    | NETLINK_GENERIC
+                    | NETLINK_KOBJECT_UEVENT
+                    | NETLINK_NETFILTER
+                    | NETLINK_SOCK_DIAG
             ) {
                 return Err(Errno::EPROTONOSUPPORT);
             }

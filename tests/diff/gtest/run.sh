@@ -17,8 +17,8 @@
 # - they act on the development VM itself with the native side's privileges: reboot_test,
 #   sysfs_power_test (suspends), time_test and timerfd_mutable_test (set the clock);
 # - Appine does not implement what they test: bpf_test (bpf(2) has only cgroup device programs,
-#   which the bpf-devices case covers), perf_event_open_test, process_mrelease_test and
-#   userfaultfd_test (ENOSYS), tun_test;
+#   which the bpf-devices case covers), perf_event_open_test and userfaultfd_test (ENOSYS),
+#   tun_test;
 # - devices neither side has: input_test, uinput_test, udev_test, touch_standby_test,
 #   custom_artifact_test, ext4_write_test;
 # - nothing to compare: cache_flush_test has no tests on arm64, and uio_test's one test is

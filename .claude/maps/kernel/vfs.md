@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode; AIO last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode; AIO; `/proc/locks` last)
 
 ## Responsibilities
 
@@ -74,8 +74,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `IoPath` — the route one I/O call takes, chosen so no borrow of the open file is held during I/O.
 - `Pipe` / `PipeEnd` — buffer, capacity, reader/writer counts and open counters; FIFOs keyed by
   inode in a weak map.
-- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, byte ranges, waiters),
-  `FlockHolder`, `Lease`.
+- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, byte ranges, the taker's
+  pid, waiters), `FlockHolder` (open file, exclusive, taker's pid), `Lease` (with its setter's
+  pid).
 - `Device` — Null, Zero, Full, Random, Kmsg, LoopControl, Loop (tty, ptmx and pts are routed
   separately); a Loop open file also carries its `LoopOpen` (the device and whether it was opened
   `O_EXCL`), whose drop is the device's release.
@@ -110,7 +111,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `getdents64`, `getcwd`, `chdir`/`fchdir`,
   xattr calls.
 - **Locks**: `flock`, fcntl lock commands, `F_SETLEASE`/`F_GETLEASE`; `locks::closed`,
-  `lease::break_leases`.
+  `lease::break_leases`; `locks::proc_locks` and `locks::fd_locks` (`/proc/locks` and fdinfo's
+  `lock:` lines, for `kernel/procfs`).
 - **Devices**: `dev::ensure_dev_nodes` (store `/dev`), `dev::populate` (boot `/dev` tmpfs);
   `Loops::numbers`, `sysfs_exists` and `sysfs_read` (the `/sys/block` view for `kernel/procfs`).
 - **inotify**: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, read; hooks `active`,
@@ -588,6 +590,16 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   the owner unless the file already has one, as `lease_setup` does); a nonblocking open returns `EAGAIN`,
   others wait until the holder downgrades or `lease-break-time` (45 s) forces it. `F_NOTIFY`
   (dnotify) is `EINVAL`.
+- Listing (Linux 6.1's `lock_get_status`, which lives in fs/locks.c): every flock lock, POSIX and
+  OFD lock and lease, in that order and by inode, gets `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `,
+  `OFDLCK ADVISORY  ` or `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken
+  shows the type it goes down to), the taker's pid (the caller's tgid at flock, F_SETLK or
+  F_SETLEASE; -1 for OFD locks), the device and inode numbers fstat shows through the open file
+  holding it (an overlay node's shown inode), and the byte range with an inclusive end (`EOF` from
+  `OFFSET_MAX`) or `0 EOF`. `/proc/locks` numbers the lines by position, leaving out (numbers
+  included) locks whose pid the reader's procfs instance cannot see; fdinfo numbers from 1 the
+  locks held through that open file, a POSIX lock through the open file of its table's lowest fd
+  on the file.
 
 ### Devices
 
@@ -735,7 +747,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 ### Inbound
 
-- The syscall dispatcher; `kernel/process` (clone/unshare/setns, execve's fd-table handling and
+- The syscall dispatcher; `kernel/procfs` (`/proc/locks`, fdinfo `lock:` lines); `kernel/process`
+  (clone/unshare/setns, execve's fd-table handling and
   mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver, AIO release at execve
   and exit, the timer thread's check of AIO polls with eventfds); `kernel/mm` (mmap `PROT_EXEC` on noexec); `kernel/procfs` (mountinfo, fd links,
   fdinfo, sysctls for pipes, leases, inotify, AIO and `protected_*`, the `/sys/block` view of the
@@ -826,6 +839,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Locks on inode-less files are no-ops:** `flock` and `F_SETLK` on anonymous pipes, sockets and
   PTYs succeed without locking, although processes sharing an inherited fd could use them to
   coordinate on Linux.
+- **Lock listings differ in order and detail:** `/proc/locks` goes by kind and inode where Linux
+  lists newest first (so lslocks prints in another order) and leaves out the requests waiting in
+  `F_SETLKW` (Linux's `->` lines); a POSIX lock appears in the fdinfo of the open file of its
+  table's lowest fd on the file, not of the open file that took it.
 - **Small inotify leaks and ordering:** a delayed delete-self entry is never removed if every
   watch disappears before the last close; an event identical to the last one is merged even when
   the queue is full, where Linux queues `IN_Q_OVERFLOW`.

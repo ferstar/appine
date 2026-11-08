@@ -53,12 +53,16 @@ pub(crate) enum Global {
     Cgroups,
     /// Memory counters, the host's when it can be read.
     Vmstat,
+    /// Swap areas: the host's when it can be read, else none.
+    Swaps,
+    /// File locks and leases ([`crate::locks::proc_locks`]).
+    Locks,
     /// syslog reading ([`crate::klog`]): the contents are not generated at open but taken at read
     /// time.
     Kmsg,
 }
 
-const GLOBALS: [(&[u8], Global); 13] = [
+const GLOBALS: [(&[u8], Global); 15] = [
     (b"cpuinfo", Global::Cpuinfo),
     (b"meminfo", Global::Meminfo),
     (b"stat", Global::Stat),
@@ -72,6 +76,8 @@ const GLOBALS: [(&[u8], Global); 13] = [
     (b"cgroups", Global::Cgroups),
     (b"kmsg", Global::Kmsg),
     (b"vmstat", Global::Vmstat),
+    (b"swaps", Global::Swaps),
+    (b"locks", Global::Locks),
 ];
 
 /// Entries under `/proc/<pid>`.
@@ -103,6 +109,8 @@ pub(crate) enum Entry {
     Task,
     /// Files of the process's network namespace ([`PROC_NET`]).
     Net,
+    /// The OOM killer's score ([`crate::oom::proc_score`]).
+    OomScore,
     OomScoreAdj,
     CoredumpFilter,
     /// The cgroup it is in ([`crate::cgroup`]).
@@ -220,7 +228,7 @@ impl NsKind {
     }
 }
 
-const ENTRIES: [(&[u8], Entry); 32] = [
+const ENTRIES: [(&[u8], Entry); 33] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
@@ -244,6 +252,7 @@ const ENTRIES: [(&[u8], Entry); 32] = [
     (b"fdinfo", Entry::FdInfo),
     (b"task", Entry::Task),
     (b"net", Entry::Net),
+    (b"oom_score", Entry::OomScore),
     (b"oom_score_adj", Entry::OomScoreAdj),
     (b"coredump_filter", Entry::CoredumpFilter),
     (b"cgroup", Entry::Cgroup),
@@ -862,8 +871,9 @@ const NET_CONF4: &[u8] = b"sys/net/ipv4/conf/";
 const NET_CONF6: &[u8] = b"sys/net/ipv6/conf/";
 
 /// The entries in `/proc/<pid>/task/<tid>`: the thread's own, and those the same as the
-/// process's (debuggers read a thread's maps and mem).
-const TASK_ENTRIES: [Entry; 27] = [
+/// process's (debuggers read a thread's maps and mem; `oom_score_adj` there sets the process's, as
+/// Linux's tid_base_stuff has it).
+const TASK_ENTRIES: [Entry; 29] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
@@ -885,6 +895,8 @@ const TASK_ENTRIES: [Entry; 27] = [
     Entry::Fd,
     Entry::FdInfo,
     Entry::Cgroup,
+    Entry::OomScore,
+    Entry::OomScoreAdj,
     Entry::Net,
     Entry::Ns,
     Entry::UidMap,
@@ -2078,8 +2090,8 @@ pub(crate) fn writable(node: &PseudoNode) -> bool {
     }
     matches!(
         node,
-        PseudoNode::Entry(_, None, Entry::OomScoreAdj | Entry::CoredumpFilter)
-            | PseudoNode::Entry(_, None, Entry::TimensOffsets)
+        PseudoNode::Entry(_, None, Entry::CoredumpFilter | Entry::TimensOffsets)
+            | PseudoNode::Entry(_, _, Entry::OomScoreAdj)
             | PseudoNode::Entry(_, _, Entry::Mem)
             | PseudoNode::Entry(_, _, Entry::UidMap | Entry::GidMap | Entry::Setgroups)
             | PseudoNode::Static(
@@ -2187,6 +2199,12 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             self::Global::Vmstat => {
                 vmstat(appine_hal::host_vmstat(), &appine_hal::host_meminfo())
             }
+            // Like meminfo's swap lines, the host's (a container sees its host's); the guest cannot
+            // swap on anything itself. Linux's swap_show header alone when the host hides it
+            self::Global::Swaps => appine_hal::host_swaps().unwrap_or_else(|| {
+                "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_owned()
+            }),
+            self::Global::Locks => crate::locks::proc_locks(ps.k, ps.vfs, &ns),
             self::Global::Stat => global_stat(ps),
             // Truncated to hundredths of a second, as in Linux's uptime_proc_show (rounding would
             // write x.996 seconds as the next second, more than sysinfo reports right after)
@@ -2467,6 +2485,10 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                         (fs.root.clone(), fs.mnt_ns.id)
                     };
                     return Ok(mounts(ps, &root, ns, *e == self::Entry::MountInfo));
+                }
+                self::Entry::OomScore => {
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    format!("{}\n", crate::oom::proc_score(ps.k, &g.borrow()))
                 }
                 self::Entry::OomScoreAdj => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
@@ -3360,8 +3382,8 @@ fn id_map(reader: &Cred, ns: &Rc<crate::cred::UserNs>, e: Entry) -> String {
 }
 
 /// `/proc/<pid>/fdinfo/<n>`: position, flags (plus close-on-exec; files opened with open carry
-/// `O_LARGEFILE`), mount id, inode, and the extra lines of eventfd, inotify, pidfd, epoll,
-/// timerfd and signalfd.
+/// `O_LARGEFILE`), mount id, inode, the locks held through it, and the extra lines of eventfd,
+/// inotify, pidfd, epoll, timerfd and signalfd.
 fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno> {
     let task = ps.leader(pid).ok_or(Errno::ENOENT)?;
     let res = task.res.borrow();
@@ -3380,6 +3402,10 @@ fn fdinfo(ps: &View<'_>, ns: &PidNs, pid: Tid, fd: i32) -> Result<String, Errno>
         f.flags | cloexec,
         f.ino().unwrap_or(0)
     );
+    // Only files and tables that have taken locks can hold any (most fds have none)
+    if f.holds_locks || fds.holds_locks {
+        s += &crate::locks::fd_locks(ps.k, ps.vfs, ns, &res.fds, &file);
+    }
     match &f.kind {
         FileKind::EventFd(e) => s += &format!("eventfd-count: {:16x}\n", e.borrow().count),
         FileKind::Inotify(i) => s += &i.borrow().fdinfo(),

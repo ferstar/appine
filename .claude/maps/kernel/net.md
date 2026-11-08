@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind checks; dump size; UDP read shutdown; accept, connect; raw rebinds; netlink options, peers, socketpair last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind checks; dump size; UDP read shutdown; accept, connect; raw rebinds; netlink options, peers, socketpair; sock_diag last)
 
 ## Responsibilities
 
@@ -16,7 +16,8 @@
 - raw ICMP and ICMPv6 sockets emulated on unprivileged host ping sockets, including traceroute's
   ICMP errors;
 - in-process netlink (`NETLINK_ROUTE`, `NETLINK_GENERIC`'s `nlctrl`, the `NETLINK_NETFILTER`
-  entry point, `NETLINK_KOBJECT_UEVENT`) and the routing table;
+  entry point, `NETLINK_SOCK_DIAG` refusing every query, `NETLINK_KOBJECT_UEVENT`) and the routing
+  table;
 - the DNS stub at `127.0.0.53:53`;
 - low-port mapping on the host and hiding it from the guest;
 - traffic counters for interfaces and protocols;
@@ -88,7 +89,7 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   AF_INET/AF_INET6: `SOCK_RAW` with a protocol 1..255 is `EPERM` unless it is ICMP/ICMPv6 and the
   caller has `CAP_NET_RAW` over the network namespace's owner (raw ICMP becomes a host ping
   socket); every other type/protocol goes to the host, which validates it. AF_NETLINK
-  `SOCK_RAW`/`SOCK_DGRAM` with ROUTE, NETFILTER, KOBJECT_UEVENT or GENERIC (others
+  `SOCK_RAW`/`SOCK_DGRAM` with ROUTE, SOCK_DIAG, NETFILTER, KOBJECT_UEVENT or GENERIC (others
   `EPROTONOSUPPORT`, other types `ESOCKTNOSUPPORT`). AF_UNIX goes to `kernel/unix`. Other
   families (AF_PACKET, AF_VSOCK, …) `EAFNOSUPPORT`.
 - `socketpair` is AF_UNIX only: inet first creates the socket as Linux does (a type of
@@ -316,6 +317,12 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   namespaces see only their own devices.
 - `NETLINK_GENERIC`: `nlctrl` only, modelled on 6.8 (unknown families `ENOENT`, `GETPOLICY`
   `EOPNOTSUPP`). `NETLINK_NETFILTER` goes to nftables. `NETLINK_KOBJECT_UEVENT` never receives.
+- `NETLINK_SOCK_DIAG` answers as 6.1 does without any family diag module (`sock_diag_rcv_msg`):
+  the old `TCPDIAG_GETSOCK`/`DCCPDIAG_GETSOCK` `EOPNOTSUPP`; `SOCK_DIAG_BY_FAMILY` and
+  `SOCK_DESTROY` `EINVAL` for a body under two bytes or a family at or past `AF_MAX` (46), else
+  `ENOENT`; other types `EINVAL`; each as an error ack honouring `NETLINK_CAP_ACK`, non-requests
+  and control messages acked only on `NLM_F_ACK`. iproute2's ss takes `ENOENT`/`EOPNOTSUPP` there
+  silently and reads `/proc/net` instead.
 
 ### Routing table
 

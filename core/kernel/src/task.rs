@@ -145,6 +145,10 @@ pub(crate) struct Task {
     pub exit_status: Cell<ExitStatus>,
     /// Has entered the exit path (may still be stopped at PTRACE_EVENT_EXIT).
     exit_started: Cell<bool>,
+    /// A vfork child whose parent still waits for it to exec or exit (`TaskState::vfork_done`
+    /// pending), readable by other threads: the OOM killer passes it over while it shares its
+    /// parent's address space (Linux's `in_vfork`, [`crate::oom`]).
+    pub vfork: Cell<bool>,
     /// seccomp state ([`crate::seccomp`]), accessed only while holding the BKL.
     pub seccomp: RefCell<crate::seccomp::Seccomp>,
     /// The thread has seccomp: syscalls must be checked first (`syscall::fast` reads it without
@@ -205,6 +209,7 @@ impl Task {
         comm: [u8; 16],
     ) -> Result<Rc<Task>, Errno> {
         let event = Event::new().map_err(|_| Errno::EAGAIN)?;
+        let vfork = state.vfork_done.is_some();
         let res = TaskRes {
             mm: state.mm.clone(),
             fds: state.fds.clone(),
@@ -246,6 +251,7 @@ impl Task {
             syscall_traced: AtomicBool::new(false),
             exit_status: Cell::new(ExitStatus::Exited(0)),
             exit_started: Cell::new(false),
+            vfork: Cell::new(vfork),
             seccomp: RefCell::default(),
             seccomp_on: AtomicBool::new(false),
             seccomp_allow: [const { AtomicU64::new(0) }; crate::seccomp::CACHE_WORDS],
@@ -915,6 +921,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             let mut st = task.state.borrow_mut();
             if let Some((done, parent)) = st.vfork_done.take() {
                 done.set(true);
+                task.vfork.set(false);
                 crate::kernel::signal_later(&parent);
             }
             st.mm.borrow_mut().remove_user(&task.sync);
@@ -1077,6 +1084,7 @@ pub(crate) fn release_mm(shared: &Shared, task: &Task, st: &mut TaskState) {
     // parked in poll
     if let Some((done, parent)) = st.vfork_done.take() {
         done.set(true);
+        task.vfork.set(false);
         crate::kernel::signal_later(&parent);
     }
     st.mm.borrow_mut().remove_user(&task.sync);

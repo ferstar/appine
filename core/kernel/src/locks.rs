@@ -7,12 +7,15 @@
 //! lapse by themselves once their owner is gone (process exit, open file dropped). Locks of one
 //! owner never overlap, and adjacent locks of the same type are merged, as on Linux.
 
+use std::fmt::Write as _;
 use std::rc::{Rc, Weak};
 
 use crate::cell::RefCell;
 use crate::fd::{FdTable, FileRef, OpenFile};
 use crate::kernel::{Kernel, Tid, request_wake_locks};
+use crate::pidns::PidNs;
 use crate::vfs::store::Ino;
+use crate::vfs::{Node, Vfs};
 
 /// The owner of a lock.
 #[derive(Clone)]
@@ -196,6 +199,203 @@ pub(crate) fn closed(k: &mut Kernel, fds: &Rc<RefCell<FdTable>>, files: &[FileRe
     if !files.is_empty() {
         k.locks.closed(fds, files);
     }
+}
+
+// ---- /proc/locks ----
+
+/// `/proc/locks` (Linux 6.1's `locks_show` and `lock_get_status`): a line for every flock lock,
+/// POSIX and OFD lock and lease, numbered by position, giving the process that took it as the
+/// reader's pid namespace `ns` sees it (-1 for OFD locks; the locks of processes `ns` cannot see
+/// are left out, their numbers skipped), the device and inode numbers stat shows for the file and,
+/// for record locks, the byte range. Linux lists them newest first and the requests waiting for
+/// each below it (`->` lines); here they come by kind and inode, and waiting requests are not
+/// listed.
+pub(crate) fn proc_locks(k: &Kernel, vfs: &Vfs, ns: &PidNs) -> String {
+    let mut out = String::new();
+    for (i, s) in shown(k, None).iter().enumerate() {
+        let pid = match s.pid {
+            -1 => Some(-1),
+            // As Linux's locks_translate_pid: the initial namespace shows the number as recorded
+            p if ns.level == 0 => Some(p),
+            p => ns.vnr(p).filter(|&p| p != 0),
+        };
+        if let Some(pid) = pid
+            && let Some(line) = s.status(vfs, pid)
+        {
+            writeln!(out, "{}: {line}", i + 1).unwrap();
+        }
+    }
+    out
+}
+
+/// The `lock:` lines of `/proc/<pid>/fdinfo/<n>` (Linux's `show_fd_locks`), which lslocks reads to
+/// tell who holds an OFD lock: the flock lock, OFD locks and lease held through open file `file`
+/// and the POSIX locks of fd table `fds` held through it, numbered from 1, with the pid as `ns`
+/// sees it (0 when it cannot). A POSIX lock records its table, not the open file that took it, so
+/// it is shown with the table's first open file on the inode.
+pub(crate) fn fd_locks(
+    k: &Kernel,
+    vfs: &Vfs,
+    ns: &PidNs,
+    fds: &Rc<RefCell<FdTable>>,
+    file: &FileRef,
+) -> String {
+    let Some(ino) = file.borrow().lock_ino() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut n = 0;
+    for s in shown(k, Some(ino)).iter().filter(|s| {
+        Rc::ptr_eq(&s.file, file)
+            && s.table
+                .as_ref()
+                .is_none_or(|t| std::ptr::eq(t.as_ptr(), Rc::as_ptr(fds)))
+    }) {
+        let pid = match s.pid {
+            -1 => -1,
+            p if ns.level == 0 => p,
+            p => ns.vnr(p).unwrap_or(0),
+        };
+        if let Some(line) = s.status(vfs, pid) {
+            n += 1;
+            writeln!(out, "lock:\t{n}: {line}").unwrap();
+        }
+    }
+    out
+}
+
+/// One lock or lease as `/proc/locks` and fdinfo show it.
+struct Shown {
+    /// The kind and mode columns, padded as `lock_get_status` pads them.
+    kind: &'static str,
+    /// A write lock or lease, a read one, or None for `F_UNLCK` (a lease being broken to none).
+    write: Option<bool>,
+    /// The process that took it (-1 for OFD locks).
+    pid: Tid,
+    /// The open file it is held through (Linux's `fl_file`).
+    file: FileRef,
+    /// The last column: the byte range of a record lock, `0 EOF` otherwise.
+    range: String,
+    /// A POSIX lock's owner (`fl_owner`); the others are owned by `file`.
+    table: Option<Weak<RefCell<FdTable>>>,
+}
+
+impl Shown {
+    /// The line after the number, with `pid` as the reader sees it; None when the file has no
+    /// inode to show.
+    fn status(&self, vfs: &Vfs, pid: Tid) -> Option<String> {
+        let (dev, ino) = shown_id(vfs, &self.file.borrow())?;
+        let ty = match self.write {
+            Some(true) => "WRITE",
+            Some(false) => "READ",
+            None => "UNLCK",
+        };
+        // glibc's major() and minor() of the dev_t stat reports
+        let major = (dev >> 8 & 0xfff) | (dev >> 32 & !0xfff);
+        let minor = (dev & 0xff) | (dev >> 12 & !0xff);
+        let (kind, range) = (self.kind, &self.range);
+        Some(format!(
+            "{kind}{ty} {pid} {major:02x}:{minor:02x}:{ino} {range}"
+        ))
+    }
+}
+
+/// Every lock and lease (only those on `only` when given), in the order Linux keeps an inode's:
+/// flock locks, then POSIX and OFD locks, then leases.
+fn shown(k: &Kernel, only: Option<Ino>) -> Vec<Shown> {
+    let wanted = |ino: &Ino| only.is_none_or(|o| o == *ino);
+    let mut out = Vec::new();
+    for (_, holders) in k.flocks.iter().filter(|(i, _)| wanted(i)) {
+        for (file, exclusive, pid) in holders {
+            if let Some(file) = file.upgrade() {
+                out.push(Shown {
+                    kind: "FLOCK  ADVISORY  ",
+                    write: Some(*exclusive),
+                    pid: *pid,
+                    file,
+                    range: "0 EOF".into(),
+                    table: None,
+                });
+            }
+        }
+    }
+    for (&ino, locks) in k.locks.by_ino.iter().filter(|(i, _)| wanted(i)) {
+        for l in locks.iter().filter(|l| l.owner.alive()) {
+            let Some(file) = l.owner.file(ino) else {
+                continue;
+            };
+            // Linux's inclusive end, OFFSET_MAX meaning to the end
+            let last = l.end.wrapping_sub(1);
+            let range = if last >= i64::MAX as u64 {
+                format!("{} EOF", l.start)
+            } else {
+                format!("{} {last}", l.start)
+            };
+            let (kind, table) = match &l.owner {
+                Owner::Posix(t) => ("POSIX  ADVISORY  ", Some(t.clone())),
+                Owner::Ofd(_) => ("OFDLCK ADVISORY  ", None),
+            };
+            out.push(Shown {
+                kind,
+                write: Some(l.write),
+                pid: l.pid,
+                file,
+                range,
+                table,
+            });
+        }
+    }
+    // Leases are keyed by the store inode, also behind an overlay node
+    for lease in k.leases.values().flatten() {
+        let Some((file, write, breaking, pid)) = lease.shown() else {
+            continue;
+        };
+        if only.is_some() && file.borrow().lock_ino() != only {
+            continue;
+        }
+        out.push(Shown {
+            kind: if breaking {
+                "LEASE  BREAKING  "
+            } else {
+                "LEASE  ACTIVE    "
+            },
+            write,
+            pid,
+            file,
+            range: "0 EOF".into(),
+            table: None,
+        });
+    }
+    out
+}
+
+impl Owner {
+    /// An open file the lock on `ino` is held through: an OFD lock's own, or for a POSIX lock one
+    /// in its fd table that refers to the file (any close of which would release the lock).
+    fn file(&self, ino: Ino) -> Option<FileRef> {
+        match self {
+            Owner::Ofd(f) => f.upgrade(),
+            Owner::Posix(t) => {
+                let t = t.upgrade()?;
+                let t = t.borrow();
+                t.open_fds()
+                    .into_iter()
+                    .filter_map(|fd| t.get(fd).ok())
+                    .find(|f| f.borrow().lock_ino() == Some(ino))
+            }
+        }
+    }
+}
+
+/// The device and inode numbers stat shows for `file` (`/proc/locks` prints the inode's): those of
+/// its node, with an overlay node's shown inode number.
+fn shown_id(vfs: &Vfs, file: &OpenFile) -> Option<(u64, u64)> {
+    let node = file.node()?;
+    let ino = match &node {
+        Node::Overlay(_, o) => vfs.overlay().shown_ino(*o),
+        n => n.ino()?,
+    };
+    Some((vfs.dev_of(&node), ino))
 }
 
 #[cfg(test)]

@@ -845,6 +845,13 @@ pub fn host_vmstat() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// The host's `/proc/swaps`, when the host lets the app read it.
+pub fn host_swaps() -> Option<String> {
+    std::fs::read_to_string("/proc/swaps")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
 /// The host's memory state, read from `/proc/meminfo`. When it cannot be read (the host does not
 /// allow it), only the few fields sysinfo can give, with the available amount estimated as free
 /// plus buffers.

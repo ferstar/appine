@@ -518,6 +518,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             ),
             Err(e) => Err(e),
         },
+        448 => mem::process_mrelease(cx, a[0] as i32, a[1] as u32),
         449 => misc::futex_waitv(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32),
         451 => fs::cachestat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         _ => {

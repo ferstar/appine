@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files and lock; suite tarballs, skips and leftovers; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; overlay cases last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files and lock; suite tarballs, skips and leftovers; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; overlay cases; process_mrelease_test last)
 
 ## Responsibilities
 
@@ -177,7 +177,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - difftest installs each suite's tarball into its store at `/usr/lib/<suite>-tests` whenever the
   tarball's `VERSION` differs from the installed one or from the image's, and then exports the
   image again, removing the image it replaced.
-- Seven Starnix cases cover 64 of its 81 built programs by subsystem (`starnix-mm`, `-process`,
+- Seven Starnix cases cover 65 of its 81 built programs by subsystem (`starnix-mm`, `-process`,
   `-signal`, `-fs`, `-proc`, `-io`, and `-overlay`, which runs overlayfs_test and fs_test's
   `OverlayFs` tests with `TEST_TMPDIR` on a tmpfs, since Linux refuses docker's overlay root as an
   upper layer), and four gVisor cases a first set of its programs (`gvisor-process`, `-fs`,
@@ -198,8 +198,7 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   time; the four gVisor cases still take about 6.5 minutes per side).
   The runner's header lists the programs in no case and why: those that would reboot, suspend or
   set the clock of the VM, features Appine does not have (bpf maps and other program types, perf,
-  process_mrelease, userfaultfd, tun), devices neither side has, and two with nothing
-  to compare.
+  userfaultfd, tun), devices neither side has, and two with nothing to compare.
 - Without the tarball difftest reports the cases as `SKIP` (the runner itself would print the same
   "not installed" line on both sides).
 

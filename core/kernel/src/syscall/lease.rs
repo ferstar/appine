@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, OpenFile};
-use crate::kernel::{Cx, Kernel, request_wake_locks, wake};
+use crate::kernel::{Cx, Kernel, Tid, request_wake_locks, wake};
 use crate::process::Signal;
 use crate::signal::{InfoFields, SigInfo};
 use crate::vfs::store::Ino;
@@ -32,11 +32,24 @@ pub(crate) struct Lease {
     ty: i16,
     /// Being broken: the type to downgrade to (`F_RDLCK` or `F_UNLCK`) and the deadline.
     breaking: Option<(i16, Instant)>,
+    /// The process that set it (Linux's `lease_init` records the tgid, which a later change of
+    /// type keeps), for `/proc/locks`.
+    pid: Tid,
 }
 
 impl Lease {
     fn is(&self, file: &FileRef) -> bool {
         self.file.as_ptr() == Rc::as_ptr(file)
+    }
+
+    /// What `/proc/locks` shows ([`crate::locks::proc_locks`]): the open file while it lives, a
+    /// write lease (or, while being broken, whether the type it goes down to is one, Linux's
+    /// `target_leasetype`; None for `F_UNLCK`), whether it is being broken, and who set it.
+    pub(crate) fn shown(&self) -> Option<(FileRef, Option<bool>, bool, Tid)> {
+        let file = self.file.upgrade()?;
+        let ty = self.breaking.map_or(self.ty, |(target, _)| target);
+        let write = (ty != F_UNLCK).then_some(ty == F_WRLCK);
+        Some((file, write, self.breaking.is_some(), self.pid))
     }
 }
 
@@ -119,6 +132,7 @@ pub(super) fn set(cx: &mut Cx<'_>, file: &FileRef, fd: i32, arg: i16) -> Result<
                 fd,
                 ty: arg,
                 breaking: None,
+                pid: tgid,
             });
         }
     }

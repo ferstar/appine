@@ -1921,12 +1921,13 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
         return Ok(0);
     };
     let me = Rc::downgrade(&file);
+    let tgid = cx.tgid();
     let exclusive = match op & !LOCK_NB {
         LOCK_SH => false,
         LOCK_EX => true,
         LOCK_UN => {
             if let Some(locks) = cx.k().flocks.get_mut(&ino) {
-                locks.retain(|(f, _)| !f.ptr_eq(&me));
+                locks.retain(|(f, ..)| !f.ptr_eq(&me));
             }
             request_wake_locks();
             return Ok(0);
@@ -1935,20 +1936,21 @@ pub(super) fn flock(cx: &mut Cx<'_>, fd: i32, op: u32) -> SysResult {
     };
     loop {
         let locks = cx.k().flocks.entry(ino).or_default();
-        locks.retain(|(f, _)| f.strong_count() > 0);
+        locks.retain(|(f, ..)| f.strong_count() > 0);
         // Locking the same open file again converts the lock type
         let conflict = locks
             .iter()
-            .any(|(f, ex)| !f.ptr_eq(&me) && (exclusive || *ex));
+            .any(|(f, ex, _)| !f.ptr_eq(&me) && (exclusive || *ex));
         if !conflict {
             // When converting the lock type, release the old one first (as on Linux): when an
             // exclusive lock becomes shared, those waiting for a shared lock can take it
             let before = locks.len();
-            locks.retain(|(f, _)| !f.ptr_eq(&me));
+            locks.retain(|(f, ..)| !f.ptr_eq(&me));
             if locks.len() != before {
                 request_wake_locks();
             }
-            locks.push((me, exclusive));
+            // The caller's tgid, as Linux's flock_make_lock records it (a conversion too)
+            locks.push((me, exclusive, tgid));
             file.borrow_mut().holds_locks = true;
             return Ok(0);
         }

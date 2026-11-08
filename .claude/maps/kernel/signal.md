@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd; unhandled-exception reports last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd; unhandled-exception reports, the ENOSYS list last)
 
 ## Responsibilities
 
@@ -296,7 +296,8 @@ procfs.
   generic-netlink `nlctrl` replies (6.8).
 - Unimplemented syscalls (including io_uring) return `ENOSYS` from the dispatcher's default arm and
   never crash; with `APPINE_LOG=1` a local debug line is written to the host's stderr. The list of
-  `ENOSYS` numbers is kept in round 139 (`docs/rounds/139-unimplemented-syscalls.md`).
+  `ENOSYS` numbers is kept in round 139 (`docs/rounds/139-unimplemented-syscalls.md`), less
+  process_mrelease (448), implemented since (`kernel/mm`).
 - The guest cannot change host time: `settimeofday` is `EPERM` without reading its arguments;
   `clock_settime` validates the timespec, then is `EPERM` for `CLOCK_REALTIME` and `EINVAL` for every
   other clock; any modifying `adjtimex`/`clock_adjtime` is `EPERM` (as without `CAP_SYS_TIME`);

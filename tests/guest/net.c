@@ -362,13 +362,31 @@ static void test_netlink(void)
 
     /* Unimplemented protocols cannot be created, like subsystems not compiled into the kernel:
      * from this libaudit takes auditing to be absent and does not wait for an ACK that will never
-     * come, and ss falls back to reading /proc/net. uevent only listens, so it can be created;
-     * generic has one family, nlctrl (the replies' contents are compared by the differential test
-     * compat) */
+     * come. sock_diag refuses every query as without its family modules (ENOENT), so ss falls
+     * back to reading /proc/net quietly. uevent only listens, so it can be created; generic has
+     * one family, nlctrl (the replies' contents are compared by the differential test compat) */
     CHECK(socket(AF_NETLINK, SOCK_RAW, 9 /* NETLINK_AUDIT */) < 0 && errno == EPROTONOSUPPORT,
           "audit netlink socket");
-    CHECK(socket(AF_NETLINK, SOCK_RAW, 4 /* NETLINK_SOCK_DIAG */) < 0 && errno == EPROTONOSUPPORT,
-          "sock_diag netlink socket");
+    int sd = socket(AF_NETLINK, SOCK_RAW, 4 /* NETLINK_SOCK_DIAG */);
+    CHECK(sd >= 0, "sock_diag netlink socket");
+    /* struct nlmsghdr (musl-gcc has no kernel headers), then a sock_diag_req for AF_UNIX; the
+     * answer is an NLMSG_ERROR (2) whose payload starts with the negative errno */
+    struct {
+        uint32_t len;
+        uint16_t type, flags;
+        uint32_t seq, pid;
+        unsigned char family, protocol;
+    } q = {sizeof q, 20 /* SOCK_DIAG_BY_FAMILY */, 1 | 0x300 /* NLM_F_REQUEST | NLM_F_DUMP */,
+           1, 0, AF_UNIX, 0};
+    CHECK(send(sd, &q, sizeof q, 0) == (ssize_t)sizeof q, "sock_diag send");
+    union {
+        char b[256];
+        uint32_t w[64];
+    } ans;
+    ssize_t n = recv(sd, ans.b, sizeof ans, 0);
+    CHECK(n >= 20 && (ans.w[1] & 0xffff) == 2 && (int32_t)ans.w[4] == -ENOENT,
+          "sock_diag query refused with ENOENT");
+    close(sd);
     int ue = socket(AF_NETLINK, SOCK_DGRAM, 15 /* NETLINK_KOBJECT_UEVENT */);
     CHECK(ue >= 0, "uevent netlink socket");
     close(ue);
