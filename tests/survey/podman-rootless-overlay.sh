@@ -1,9 +1,11 @@
 # podman run by an ordinary user (rootless) with its overlay storage driver on Appine's overlayfs:
 # the kernel's overlay mounted in the user's own user and mount namespaces with `userxattr`, the
-# opaque directories and whiteouts that layer extraction and containers make as that user, diff,
-# commit, a build that deletes what an earlier step made, volumes, and how long starting a
-# container takes. Its storage root is its own, so podman-rootless.sh's vfs images stay. Uses the
-# podman store: scripts/survey -s target/survey/podman podman-rootless-overlay. Native comparison:
+# opaque directories and whiteouts that layer extraction and containers make as that user, an
+# overlay volume (`:O`), diff, commit, a build that deletes what an earlier step made, volumes,
+# and how long starting a container takes. Its storage root is its own, so podman-rootless.sh's
+# vfs images stay. Uses the podman store:
+#   scripts/survey -s target/survey/podman podman-rootless-overlay
+# Native comparison:
 # SURVEY_DOCKER_OPTS=--privileged scripts/survey -n appine-podman-native podman-rootless-overlay
 # (there the storage is on a tmpfs: docker's overlay root cannot be an upper layer)
 exec 2>&1
@@ -38,6 +40,7 @@ step "changes over the image" "$P run --rm --network host alpine:3.24 sh -c 'id;
 step "diff and commit" "$P run --name c1 --network host alpine:3.24 sh -c 'echo x > /made; rm /etc/motd' >/dev/null; $P diff c1 | sort; $P commit -q c1 rdemo-ovl >/dev/null && $P run --rm --network host rdemo-ovl sh -c 'cat /made; ls /etc/motd 2>&1'; $P rm c1 >/dev/null"
 step build "mkdir -p ctx-ovl && printf 'FROM alpine:3.24\nRUN echo one > /one && mkdir /d && echo f > /d/f\nRUN rm /one /d/f && rm /etc/motd\nCMD ls -a /d; ls /one /etc/motd 2>&1; true\n' > ctx-ovl/Containerfile && $P build -q --network host -t rbuild-ovl ctx-ovl >/dev/null && $P run --rm --network host rbuild-ovl"
 step volume "mkdir -p vol-ovl && echo from-host > vol-ovl/a && $P run --rm --network host -v ./vol-ovl:/data alpine:3.24 sh -c 'cat /data/a; echo x > /data/b' && cat vol-ovl/b"
+step "overlay volume" "mkdir -p ovol && echo host > ovol/a && echo keep > ovol/k && $P run --rm --network host -v ./ovol:/data:O alpine:3.24 sh -c 'cat /data/a; echo changed > /data/a; echo new > /data/b; rm /data/k; mkdir /data/d; ls /data; grep \" /data \" /proc/self/mountinfo | sed \"s/.* - //; s/lowerdir=[^,]*/lowerdir=…/; s/upperdir=[^,]*/upperdir=…/; s/workdir=[^,]*/workdir=…/\"'; echo \"host after: \$(cat ovol/a) \$(ls ovol | tr '\\n' ' ')\"; rm -rf ovol"
 step "upper layer seen from outside" "$P run --name c2 --network host alpine:3.24 sh -c 'rm /etc/motd; rm -r /etc/apk/keys; mkdir /etc/apk/keys' >/dev/null; d=\$($P inspect --format '{{.GraphDriver.Data.UpperDir}}' c2); ls -ln \$d/etc/motd | cut -c1-10,30-40; $P unshare getfattr -n user.overlay.opaque --only-values \$d/etc/apk/keys 2>&1; echo; $P rm c2 >/dev/null"
 step "start time" "for i in 1 2 3; do s=\$(cut -d' ' -f1 /proc/uptime); $P run --rm --network host alpine:3.24 true; e=\$(cut -d' ' -f1 /proc/uptime); echo \"run: \$(awk -v s=\$s -v e=\$e 'BEGIN { printf \"%.2f\", e - s }') s\"; done"
 step cleanup "$P rm -af >/dev/null; $P rmi -af >/dev/null; echo ok"

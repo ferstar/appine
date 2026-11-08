@@ -1,8 +1,9 @@
 # podman with its overlay storage driver on Appine's overlayfs (rootful): what containers/storage
 # concludes from its probes, writes, deletions and renames inside containers over the image's
-# layers, diff and commit, a build whose later step deletes what an earlier one made, save and
-# load, and how long starting a container takes. Host networking and no cgroups, as podman.sh. Its
-# storage root is its own, so podman.sh's vfs images stay:
+# layers, an overlay volume (`:O`, whose changes stay out of the host directory), diff and commit,
+# a build whose later step deletes what an earlier one made, save and load, and how long starting
+# a container takes. Host networking and no cgroups, as podman.sh. Its storage root is its own, so
+# podman.sh's vfs images stay:
 #   scripts/survey -s target/survey/podman podman-overlay
 # Native comparison: scripts/survey -n <an alpine:3.24 image with podman installed> podman-overlay,
 # SURVEY_DOCKER_OPTS=--privileged (its storage must not be on docker's own overlay root, so it is
@@ -42,6 +43,11 @@ $P run --name c1 --network host --cgroups disabled alpine:3.24 sh -c 'echo x > /
 $P diff c1 | sort
 $P commit -q c1 demo-ovl >/dev/null && $P run $R demo-ovl sh -c 'cat /made; ls /etc/motd 2>&1; ls -d /etc/apk/sub'
 $P rm c1 >/dev/null
+step overlay volume
+mkdir -p /root/ovol && echo host > /root/ovol/a && echo keep > /root/ovol/k
+$P run $R -v /root/ovol:/data:O alpine:3.24 sh -c 'cat /data/a; echo changed > /data/a; echo new > /data/b; rm /data/k; mkdir /data/d; ls /data; grep " /data " /proc/self/mountinfo | sed "s/.* - //; s/lowerdir=[^,]*/lowerdir=…/; s/upperdir=[^,]*/upperdir=…/; s/workdir=[^,]*/workdir=…/"'
+echo "host after: $(cat /root/ovol/a) $(ls /root/ovol | tr '\n' ' ')"
+rm -rf /root/ovol
 step mount a container; id=$($P create --network host --cgroups disabled alpine:3.24 true)
 m=$($P mount $id) && ls $m/etc/alpine-release && $P umount $id >/dev/null; $P rm $id >/dev/null
 step build
