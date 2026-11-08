@@ -253,6 +253,8 @@ In `gvisor-fs`, the native side of `PtyTest.TCFLSHWakesReplicaPolloutAfterMaster
 
 In `starnix-io`, the native side of `Pty.EchoModes` failed once on 2026-11-08 in a full run with four lanes (`-j 4`), while Appine's side passed, and the group passed when rerun alone. The cause was not investigated.
 
+In `mount-locks`, Appine's side failed once on 2026-11-08 in a full Tier 0 run with four lanes: right after `waitpid` returned for a child that had entered a new user and mount namespace and sent an fd into it, a listing through that fd still showed the mount over `hidden` (`['secret']`), which Linux has taken down by then. The group passed 3 of 3 reruns alone. Presumably the dead namespace's mounts are sometimes collected only after the parent's wait returns (the vfs map's collection at task exit); the cause was not investigated.
+
 
 ## R1 measurements
 

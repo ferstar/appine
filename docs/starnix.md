@@ -124,13 +124,14 @@ in the module maps, not here.
 | 99b4216 | Unimplemented paths counted as `track_stub!` and `not_found` count them: the `ENOSYS` arm, the default arms of prctl, fcntl, ioctl, madvise and futex, names Linux would have that are missing under `/proc`, `/sys` and `/dev`, and devices without a driver; the 10 called most go into kernel-bug reports and the app's copied report, and first hits into `APPINE_LOG` and the survey. Also `FIONREAD` on regular files, the first gap the counters showed |
 | 64a6107 | A BKL watchdog: a host thread that never takes the BKL reports a hold over 10 s (`APPINE_BKL_WATCHDOG`) with the guest process, thread, syscall or exception and pc, and whether the holder's host thread is running or in which host syscall; on stderr and in a notification with the bug report at once, and in the kernel log with its length once it ends. Each holder records itself on taking the lock, with no visible cost on the BKL path |
 | df6ee70 | Store reflinks: `FICLONE`, `FICLONERANGE` over a whole file, a whole-file `copy_file_range` and overlay copy-up make files share one store object, and the first change to one (any write, truncation, `fallocate`, a writable shared mapping) gives it its own, copied without the BKL; its open descriptions and shared mappings move along. Other clone ranges are copied; tmpfs, overlay files and memfds stay `EOPNOTSUPP` |
+| 16364c0 | vDSO clock reads, from the host kernel's own vDSO rather than a vvar page of Appine's (whose parameters would drift from the host's NTP-adjusted clocks): its code is copied into each process with the host's vvar data mapped read-only below it as `[vvar]`, after a check in the interpreter at first use, with the svc-stub image as fallback; `clock_gettime` at Tier 1 went from 90 to 28 ns (19 natively). Time namespaces with offsets get svc stubs at the clock entries; tracers and seccomp see only the clocks Linux's vDSO leaves to the kernel; ECV's `CNTVCTSS_EL0` |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
 b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead), except
-7b7f73b, 39ea702, 99b4216, 64a6107 and df6ee70, which take ideas from the list below.
+7b7f73b, 39ea702, 99b4216, 64a6107, df6ee70 and 16364c0, which take ideas from the list below.
 
 ## Not yet taken
 
@@ -139,7 +140,6 @@ Ordered by value for effort.
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
 | Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
-| vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
 | FUSE | INIT negotiation, about 25 opcodes, interrupts, no page cache | A new node kind, waiting on the daemon with the BKL released, private mappings of FUSE files; sshfs and rclone mount are the users | 3–5k lines |
 
 ## Not worth taking
