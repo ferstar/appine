@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap and mlock edges; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO refill, shm reaping; `process_mrelease` last)
 
 ## Responsibilities
 
@@ -626,6 +626,14 @@ signals may still be delivered).
   a forked child does not break copy-on-write (Linux 6.1 copies the pages at mlock time) but
   touches the child's own, still unused host pages, so smaps counts the range twice until the
   pages are written.
+- **`process_mrelease` is `ENOSYS`:** Linux 6.1 lets a caller free the private memory of an
+  exiting process (`EINVAL` while it is not exiting or is writing a core, or while a process
+  sharing its address space is not exiting; `ESRCH` once no thread holds the address space), so
+  earlyoom 1.8 and later logs a warning after each kill and Starnix's `process_mrelease_test`
+  fails. It needs a release path of its own: `discard` makes every borrower copy a lent page first
+  and settles borrowed pages by copying, so lent pages must be left alone, borrowed ones returned
+  without copying and the rest of the written private anonymous memory freed, with the page table
+  and VMAs unchanged (docs/starnix.md).
 
 ## Open questions
 

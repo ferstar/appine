@@ -119,12 +119,14 @@ in the module maps, not here.
 | 5530624 | splice, tee and vmsplice wait as Linux 6.1 does (seven skipped Starnix pipe and vmsplice tests now pass) |
 | 6d05aa9 | Mounts inherited by a less privileged namespace are locked; proc and sysfs mounts check owner and visibility; `max_*_namespaces` enforced |
 | 2a244d2, 4b4af75 | overlayfs with several lower layers and an upper one, after Linux 6.1 rather than Starnix's single-lower module; its `overlayfs_test`, fs_test's overlay tests and gVisor's overlay mount tests run |
+| 7b7f73b | Unhandled exceptions reported in the kernel log as arm64's `arm64_show_signal` does; `debug.exception-trace` starts at arm64's 0 (the recorded 1 was x86's), the app's kernels at 1 |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
-b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead).
+b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead), except
+7b7f73b, which takes an idea from the list below.
 
 ## Not yet taken
 
@@ -139,8 +141,7 @@ Ordered by value for effort.
 | Small procfs and netlink files | Has `vmstat`, `swaps`, `locks`, `io`, `oom_score` (some as stubs) | `oom_score` from the OOM killer's score, `swaps` header, `locks` from the lock table; `NETLINK_SOCK_DIAG` that answers `ENOENT` so `ss` falls back to `/proc` quietly | Small each |
 | vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
 | FUSE | INIT negotiation, about 25 opcodes, interrupts, no page cache | A new node kind, waiting on the daemon with the BKL released, private mappings of FUSE files; sshfs and rclone mount are the users | 3–5k lines |
-| `process_mrelease`, `process_madvise` | `process_mrelease` implemented for lmkd | Revisits the decision to wait for a user (round 139) | About 100 lines |
-| Guest crash lines | Keeps the last 64 fatal signals with throttling per program | `debug.exception-trace` is only recorded (42d2ffe). While it is non-zero, one rate-limited kernel log line per unhandled fault signal, as arm64's `arm64_show_signal` does | Small |
+| `process_mrelease` | For lmkd: zeroes an exiting process's private anonymous memory, after copying what `vmsplice` put in pipes | Its one Linux user found, earlyoom (1.8 and later), only warns when it fails, and on Appine cannot pick a victim anyway (no `/proc/<pid>/oom_score`, and it watches the whole phone's `meminfo`); a killed process's memory already goes back to the host as soon as its threads stop. Would bring Starnix's `process_mrelease_test` (10 tests, all passing natively). Needs its own release path around fork's copy-on-write (kernel/mm map); worth doing with `oom_score` if earlyoom is wanted | 150–250 lines |
 
 ## Not worth taking
 
@@ -148,6 +149,12 @@ Ordered by value for effort.
   are CRIU and VM migration, and docker's default seccomp profile blocks it.
 - **perf_event_open:** Starnix builds it on a Zircon job sampler and stubs the counters; perf and
   async-profiler fall back to itimers without it.
+- **process_madvise:** Linux 6.1 takes only hints (`MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED`,
+  `MADV_COLLAPSE`) that Appine's own madvise ignores or refuses (no swap, no transparent huge
+  pages), so it would only check arguments and permissions (ptrace read access, `CAP_SYS_NICE`).
+  It was made for Android's ActivityManager and no Linux userspace caller was found; Starnix
+  itself answers `ENOSYS` (at 33c46967, 2026-11-08), docker's default seccomp makes it `EPERM`,
+  and LTP's `process_madvise01` needs `CONFIG_SWAP`.
 - **PSI beyond empty files:** Starnix has real data only for memory. A zero-filled
   `/proc/pressure` would at most quiet the tools that refuse to start without it.
 - **Alarm clocks through AlarmManager, and a `CLOCK_MONOTONIC` that counts suspend:** the first
