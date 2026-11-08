@@ -122,13 +122,14 @@ in the module maps, not here.
 | 7b7f73b | Unhandled exceptions reported in the kernel log as arm64's `arm64_show_signal` does; `debug.exception-trace` starts at arm64's 0 (the recorded 1 was x86's), the app's kernels at 1 |
 | 39ea702 | `process_mrelease`, releasing around fork's copy-on-write (Starnix's `process_mrelease_test` runs in `starnix-mm`); `/proc/<pid>/oom_score`, also in thread directories, with vfork children at 0 and no longer picked by the OOM killer; `/proc/swaps`; `/proc/locks` and fdinfo's `lock:` lines, which lslocks needs for OFD locks; `NETLINK_SOCK_DIAG` refusing every query, so ss reads `/proc/net` quietly |
 | 99b4216 | Unimplemented paths counted as `track_stub!` and `not_found` count them: the `ENOSYS` arm, the default arms of prctl, fcntl, ioctl, madvise and futex, names Linux would have that are missing under `/proc`, `/sys` and `/dev`, and devices without a driver; the 10 called most go into kernel-bug reports and the app's copied report, and first hits into `APPINE_LOG` and the survey. Also `FIONREAD` on regular files, the first gap the counters showed |
+| 64a6107 | A BKL watchdog: a host thread that never takes the BKL reports a hold over 10 s (`APPINE_BKL_WATCHDOG`) with the guest process, thread, syscall or exception and pc, and whether the holder's host thread is running or in which host syscall; on stderr and in a notification with the bug report at once, and in the kernel log with its length once it ends. Each holder records itself on taking the lock, with no visible cost on the BKL path |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
 b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead), except
-7b7f73b, 39ea702 and 99b4216, which take ideas from the list below.
+7b7f73b, 39ea702, 99b4216 and 64a6107, which take ideas from the list below.
 
 ## Not yet taken
 
@@ -136,7 +137,6 @@ Ordered by value for effort.
 
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
-| BKL watchdog | A lockup detector that names threads stuck in one syscall | A thread that takes no BKL, records holder, syscall and pc after 10 s, and reports through the kernel log and the bug report | Small to medium |
 | Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
 | Store reflinks | — | `FICLONE` and whole-file `copy_file_range` share a store object until written: coreutils' `cp` and Python's `Path.copy` try `FICLONE` first, and an overlay copy-up of a large file would no longer copy its data | 600–1000 lines |
 | vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
