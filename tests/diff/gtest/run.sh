@@ -7,15 +7,18 @@
 # /usr/lib/<suite>-tests. Each test runs in its own process (one crash does not take the rest with
 # it) under a 60 s timeout (SIGKILL), and only "<test> ok|failed|skipped|exit <code>" is printed.
 # <skip> is a gtest filter of tests not to run, ':'-separated (empty for none); the cases keep the
-# reason beside each name. Without the installed suite the case prints that it is missing.
+# reason beside each name. The environment variable ONLY, when set, is a gtest filter of the only
+# tests to run. Without the installed suite the case prints that it is missing.
+#
+# overlayfs_test, and fs_test's OverlayFs tests, run in the starnix-overlay case, with their
+# layers on a tmpfs.
 #
 # Built Starnix programs in no case, and why:
 # - they act on the development VM itself with the native side's privileges: reboot_test,
 #   sysfs_power_test (suspends), time_test and timerfd_mutable_test (set the clock);
 # - Appine does not implement what they test: bpf_test (bpf(2) has only cgroup device programs,
 #   which the bpf-devices case covers), perf_event_open_test, process_mrelease_test and
-#   userfaultfd_test (ENOSYS), overlayfs_test (no overlayfs; it fails natively too, docker's root
-#   being an overlay), tun_test;
+#   userfaultfd_test (ENOSYS), tun_test;
 # - devices neither side has: input_test, uinput_test, udev_test, touch_standby_test,
 #   custom_artifact_test, ext4_write_test;
 # - nothing to compare: cache_flush_test has no tests on arm64, and uio_test's one test is
@@ -36,7 +39,7 @@ rm -f /tmp/exec-only-*
 ulimit -c 0
 for bin in "$@"; do
     # Disabled tests do not run even when named in a filter
-    $T/bin/$bin --gtest_list_tests --gtest_filter="-$skip" |
+    $T/bin/$bin --gtest_list_tests --gtest_filter="${ONLY:-*}-$skip" |
         awk '/^[^ ]/ { s = $1 } /^  / { print s $1 }' | grep -v DISABLED_ | while read -r t; do
         # SIGKILL, and the output in a file: a test that ignores SIGTERM, or a child of it that
         # keeps the output open, would otherwise hold the case (and its difftest lane) forever.

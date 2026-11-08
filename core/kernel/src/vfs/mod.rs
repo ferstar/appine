@@ -2121,15 +2121,16 @@ impl Vfs {
         Ok(id)
     }
 
-    /// Mounts a new overlay instance of lower layers `lower` (topmost first) and upper layer
-    /// `upper` (store directories) with options `options`, returning the new mount's id. An
-    /// overlay without an upper layer is read-only ([`Vfs::sb_readonly`]).
+    /// Mounts a new overlay instance of `layers` (store directories) with options `options` for
+    /// a mounter with filesystem IDs `mounter`, returning the new mount's id; `pins` are the tmpfs
+    /// instances the layers are in, which stay while it does. An overlay without an upper layer is
+    /// read-only ([`Vfs::sb_readonly`]).
     pub(crate) fn new_overlay(
         &self,
         point: (Node, Option<Dentry>),
         flags: u64,
         source: Vec<u8>,
-        (upper, lower): overlay::Layers,
+        (layers, mounter, pins): (overlay::Layers, (u32, u32), Vec<u64>),
         options: overlay::Options,
     ) -> MountId {
         let id = self.add_mount(Fs::Overlay, Node::ROOT, point, flags, source, None);
@@ -2137,7 +2138,7 @@ impl Vfs {
         let root = self
             .overlays
             .borrow_mut()
-            .add_instance(dev, upper, lower, options);
+            .add_instance(dev, layers, (mounter, pins), options);
         self.update_mount(id, |m| m.root = Node::Overlay(id, root));
         self.mounts_changed();
         id
@@ -2152,6 +2153,67 @@ impl Vfs {
     /// Metadata of overlay node `o` ([`overlay::Overlays::stat`]).
     pub(crate) fn overlay_stat(&self, o: overlay::OvlId) -> Result<Stat, Errno> {
         self.overlays.borrow().stat(&self.store, o)
+    }
+
+    /// Overlay node `o`'s upper inode, copied up first if needed ([`overlay::Overlays::upper_of`]).
+    pub(crate) fn overlay_upper(
+        &self,
+        o: overlay::OvlId,
+        what: overlay::CopyUp,
+    ) -> Result<Ino, Errno> {
+        self.overlays.borrow_mut().upper_of(&self.store, o, what)
+    }
+
+    /// Removes `name` from overlay directory `dir` ([`overlay::Overlays::remove`]).
+    pub(crate) fn overlay_remove(
+        &self,
+        dir: overlay::OvlId,
+        name: &[u8],
+        rmdir: bool,
+    ) -> Result<(), Errno> {
+        self.overlays
+            .borrow_mut()
+            .remove(&self.store, dir, name, rmdir)
+    }
+
+    /// Renames within one overlay ([`overlay::Overlays::rename`]).
+    pub(crate) fn overlay_rename(
+        &self,
+        old: (overlay::OvlId, &[u8]),
+        new: (overlay::OvlId, &[u8]),
+        flags: (bool, bool),
+    ) -> Result<(), Errno> {
+        self.overlays
+            .borrow_mut()
+            .rename(&self.store, old, new, flags)
+    }
+
+    /// The node named `name` in overlay directory `dir` reached through mount `mnt` (not lifted
+    /// to what is mounted on it).
+    pub(crate) fn overlay_child(
+        &self,
+        (mnt, dir): (MountId, overlay::OvlId),
+        name: &[u8],
+    ) -> Result<Node, Errno> {
+        let o = self.overlays.borrow_mut().lookup(&self.store, dir, name)?;
+        Ok(Node::Overlay(mnt, o))
+    }
+
+    /// When mount `mnt` is an overlay, the prefix of the attributes it keeps for itself
+    /// ([`overlay::Options::private_prefix`]).
+    pub(crate) fn overlay_prefix(&self, mnt: MountId) -> Option<&'static [u8]> {
+        let dev = self.with_mount(mnt, |m| (m.fs == Fs::Overlay).then_some(m.dev))??;
+        let ovl = self.overlays.borrow();
+        Some(ovl.instance(dev)?.options.private_prefix())
+    }
+
+    /// Some mount of namespace `ns` is on `node` (Linux's `is_local_mountpoint`).
+    pub(crate) fn is_point_in(&self, node: &Node, ns: u64) -> bool {
+        self.mounts
+            .borrow()
+            .list
+            .iter()
+            .any(|m| m.ns == ns && m.point.as_ref() == Some(node))
     }
 
     /// The entries of overlay directory `o` ([`overlay::Overlays::readdir`]).
@@ -2349,13 +2411,29 @@ impl Vfs {
         let gone: Vec<Ino> = {
             let mut mounts = self.mounts.borrow_mut();
             keep_used(&mut mounts.detached, in_use);
+            // Overlays without a mount go, and the tmpfs instances the others' layers are in stay
+            let overlays: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Overlay)
+                .map(|m| m.dev)
+                .collect();
+            let mut ovl = self.overlays.borrow_mut();
+            for dev in ovl.devs() {
+                if !overlays.contains(&dev) {
+                    ovl.remove_instance(dev);
+                }
+            }
             let live: std::collections::HashSet<u64> = mounts
                 .list
                 .iter()
                 .chain(&mounts.detached)
                 .filter(|m| m.fs == Fs::Tmpfs)
                 .map(|m| m.dev)
+                .chain(ovl.pinned())
                 .collect();
+            drop(ovl);
             let dead: Vec<u64> = mounts
                 .tmpfs
                 .keys()
@@ -2378,19 +2456,6 @@ impl Vfs {
                 .map(|m| m.dev)
                 .collect();
             mounts.devpts.retain(|dev, _| pts.contains(dev));
-            let overlays: std::collections::HashSet<u64> = mounts
-                .list
-                .iter()
-                .chain(&mounts.detached)
-                .filter(|m| m.fs == Fs::Overlay)
-                .map(|m| m.dev)
-                .collect();
-            let mut ovl = self.overlays.borrow_mut();
-            for dev in ovl.devs() {
-                if !overlays.contains(&dev) {
-                    ovl.remove_instance(dev);
-                }
-            }
             dead.iter()
                 .filter_map(|dev| mounts.tmpfs.remove(dev))
                 .map(|t| t.root)

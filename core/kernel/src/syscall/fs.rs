@@ -444,10 +444,17 @@ fn open_path_with(
                 {
                     return Err(Errno::EACCES);
                 }
-                let (mnt, dir) = store_dir(&vfs, &dir)?;
-                if let Some(ino) = vfs.store().lookup(dir, name)?
+                // A dangling symlink under the name (in an overlay, as the overlay shows it)
+                let link = match &dir {
+                    Node::Overlay(mnt, o) => vfs.overlay_child((*mnt, *o), name).ok(),
+                    _ => {
+                        let (mnt, d) = store_dir(&vfs, &dir)?;
+                        vfs.store().lookup(d, name)?.map(|i| Node::Store(mnt, i))
+                    }
+                };
+                if let Some(link) = link
                     && follow
-                    && vfs.store().attrs(ino)?.kind() == mode::S_IFLNK
+                    && vfs.kind(&cx.view(&vfs), &link)? == mode::S_IFLNK
                 {
                     links += 1;
                     if links > crate::vfs::MAX_SYMLINKS {
@@ -458,34 +465,49 @@ fn open_path_with(
                     // mount as the root
                     if res & resolve::NO_SYMLINKS != 0
                         || vfs
-                            .mount_flags(&Node::Store(mnt, ino))
+                            .mount_flags(&link)
                             .is_some_and(|f| f & ms::NOSYMFOLLOW != 0)
                     {
                         return Err(Errno::ELOOP);
                     }
-                    path = vfs.store().readlink(ino)?;
+                    path = vfs.readlink(&cx.view(&vfs), &link)?;
                     // Whether resolution has taken the root: approximated from the original path
                     // (absolute, scoped, containing `..`, or a jump already made here); those in
                     // earlier symlinks do not count
                     if path.first() == Some(&b'/')
                         && res & resolve::NO_XDEV != 0
-                        && (!root_set || mnt != root.mnt())
+                        && (!root_set || dir.mnt() != root.mnt())
                     {
                         return Err(Errno::EXDEV);
                     }
                     root_set |= path.first() == Some(&b'/');
-                    start = Node::Store(mnt, dir);
+                    start = dir;
                     continue;
                 }
-                let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
+                let (mnt, d) = create_dir(&vfs, &dir)?;
+                let dir_st = may_create(&vfs, &cred, (mnt, d), name)?;
                 let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), false);
-                let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
-                let (ino, file) = vfs.store().create_file(dir, name, perm, uid, gid)?;
+                let tmpfs = tmpfs_reserve(&vfs, (mnt, d), 0)?;
+                let (ino, file) = create_in(
+                    &vfs,
+                    (mnt, d),
+                    name,
+                    || vfs.store().create_file(d, name, perm, uid, gid),
+                    |(ino, _)| *ino,
+                )?;
                 tmpfs_created(&vfs, tmpfs, 0);
+                // In an overlay the new file is the overlay's node of that name
+                if let Node::Overlay(mnt, o) = dir {
+                    break (
+                        vfs.overlay_child((mnt, o), name)?,
+                        Some(file),
+                        Some((dir.clone(), name.to_vec())),
+                    );
+                }
                 break (
                     Node::Store(mnt, ino),
                     Some(file),
-                    Some((Node::Store(mnt, dir), name.to_vec())),
+                    Some((Node::Store(mnt, d), name.to_vec())),
                 );
             }
         }
@@ -534,8 +556,13 @@ fn open_path_with(
             }
             Node::Pseudo(mnt, p) => open_pseudo(cx, &cred, &vfs, mnt, p, flags)?,
             Node::Overlay(mnt, o) => {
+                let flags = if was_created {
+                    flags & !oflags::O_TRUNC
+                } else {
+                    flags
+                };
                 let beside = parent.as_ref().map(|(dir, _)| dir);
-                open_overlay(cx, &cred, &vfs, (mnt, o), flags, beside)?
+                open_overlay(cx, &cred, &vfs, (mnt, o), flags, (created, beside))?
             }
         }
     };
@@ -1236,30 +1263,41 @@ fn open_store(
 
 /// Opens overlay node `o` reached through mount `mnt` (Linux's `ovl_open`): the store inode
 /// behind it is opened as a store file would be, and a directory is listed through the overlay.
-/// Without an upper layer nothing can be changed: opening a regular file for writing is EROFS,
-/// also through a bind mount remounted read-write.
+/// A regular file opened for writing is copied up first (without its data for `O_TRUNC`), after
+/// the checks open makes on the overlay's file: a read-only filesystem (EROFS, before permission
+/// as 6.1's `sb_permission`), permission, and a program being executed (ETXTBSY). A file this
+/// open just created (`created`) is already in the upper layer.
 fn open_overlay(
     cx: &mut Cx<'_>,
     cred: &Cred,
     vfs: &Vfs,
     (mnt, o): (MountId, crate::vfs::overlay::OvlId),
     flags: u32,
-    beside: Option<&Node>,
+    (created, beside): (Option<std::fs::File>, Option<&Node>),
 ) -> Result<FileKind, Errno> {
-    let (real, has_upper) = {
-        let ovl = vfs.overlay();
-        let dev = ovl.node(o).dev;
-        let upper = ovl.instance(dev).is_some_and(|i| i.upper.is_some());
-        (ovl.node(o).real(), upper)
-    };
-    // A read-only filesystem refuses writing before permission is checked (6.1's
-    // sb_permission)
+    use crate::vfs::overlay::CopyUp;
+    let mut real = vfs.overlay().node(o).real();
+    let st = vfs.store().attrs(real)?;
     let write = flags & oflags::O_ACCMODE != oflags::O_RDONLY || flags & oflags::O_TRUNC != 0;
-    if write && !has_upper && vfs.store().kind(real)? == mode::S_IFREG {
-        return Err(Errno::EROFS);
+    if write && created.is_none() && st.kind() == mode::S_IFREG {
+        if vfs.readonly(&Node::Overlay(mnt, o)) {
+            return Err(Errno::EROFS);
+        }
+        let truncate = flags & oflags::O_TRUNC != 0;
+        let mask = open_mask(flags) | if truncate { MAY_WRITE } else { 0 };
+        cred.permission(&st, mask)?;
+        if executing(cx, real) {
+            return Err(Errno::ETXTBSY);
+        }
+        let what = if truncate {
+            CopyUp::NoData
+        } else {
+            CopyUp::All
+        };
+        real = vfs.overlay_upper(o, what)?;
     }
     Ok(
-        match open_store(cx, cred, vfs, (mnt, real), flags, (None, beside))? {
+        match open_store(cx, cred, vfs, (mnt, real), flags, (created, beside))? {
             FileKind::Directory { process, .. } => FileKind::Directory {
                 node: Node::Overlay(mnt, o),
                 entries: None,
@@ -3041,6 +3079,9 @@ fn copy_regular(
     dst: Option<u64>,
     len: usize,
 ) -> Option<Result<usize, Errno>> {
+    if let Err(e) = follow_copy_up(cx, input) {
+        return Some(Err(e));
+    }
     let (fd_in, fd_out, ino) = {
         let (i, o) = (input.borrow(), output.borrow());
         if o.flags & oflags::O_APPEND != 0 || i.data_ino() == o.data_ino() {
@@ -3322,6 +3363,7 @@ pub(super) fn read_bytes(
             Ok(n)
         }
         IoPath::Local => {
+            follow_copy_up(cx, file)?;
             let regular = regular_fd(&file.borrow());
             let n = match regular {
                 Some(fd) => unlocked_io(cx, file, fd, offset, |fd, pos| {
@@ -3878,6 +3920,36 @@ fn io_path(f: &OpenFile) -> IoPath {
 
 /// The host fd of a regular file: the BKL can be released while reading or writing it
 /// ([`unlocked_io`]).
+/// A regular file opened through an overlay before it was copied up still holds the lower
+/// inode's object: reads, fstat, seeks and copies out of it then switch to the upper one, as
+/// 6.1's `ovl_real_fdget` does, so they see what was changed through the overlay since (a
+/// mapping keeps what it mapped). The lower object stays open with the file
+/// ([`OpenFile::ovl_lower`]): a read without the BKL may still be using it.
+pub(super) fn follow_copy_up(cx: &Cx<'_>, file: &FileRef) -> Result<(), Errno> {
+    let (o, ino) = match &*file.borrow() {
+        OpenFile {
+            ovl: Some(o),
+            kind: FileKind::Regular { ino, .. },
+            ..
+        } => (*o, *ino),
+        _ => return Ok(()),
+    };
+    let vfs = cx.vfs()?;
+    let real = vfs.overlay().node(o).real();
+    if real == ino {
+        return Ok(());
+    }
+    let writable = file.borrow().writable();
+    let object = vfs.store().open_object(real, writable)?;
+    let mut f = file.borrow_mut();
+    if let FileKind::Regular { ino, file } = &mut f.kind {
+        *ino = real;
+        let lower = std::mem::replace(file, object);
+        f.ovl_lower = Some(lower);
+    }
+    Ok(())
+}
+
 fn regular_fd(f: &OpenFile) -> Option<i32> {
     match &f.kind {
         FileKind::Regular { file, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(file)),
@@ -4020,6 +4092,7 @@ pub(super) fn getdents64(cx: &mut Cx<'_>, fd: i32, buf: u64, count: usize) -> Sy
 
 pub(super) fn lseek(cx: &mut Cx<'_>, fd: i32, offset: i64, whence: u32) -> SysResult {
     let file = cx.fds().get(fd)?;
+    follow_copy_up(cx, &file)?;
     let mut f = file.borrow_mut();
     let OpenFile { kind, pos, .. } = &mut *f;
     let base = match kind {
@@ -4740,6 +4813,7 @@ fn node_stat(cx: &Cx<'_>, node: &Node) -> Result<[u8; 128], Errno> {
 }
 
 pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno> {
+    follow_copy_up(cx, file)?;
     let f = file.borrow();
     let anon = |ino: u64, mode: u32, rdev: u64, dev: u64| {
         let st = Stat {
@@ -4814,7 +4888,12 @@ pub(super) fn file_stat(cx: &Cx<'_>, file: &FileRef) -> Result<[u8; 128], Errno>
         FileKind::Regular { ino, file } => {
             let vfs = cx.vfs()?;
             let dev = vfs.dev_of(&Node::Store(f.mnt, *ino));
-            Ok(encode_stat(&vfs.store().stat_open(*ino, file)?, dev))
+            let mut st = vfs.store().stat_open(*ino, file)?;
+            // Through an overlay: the inode number stat shows for its node
+            if let Some(o) = f.ovl {
+                st.ino = vfs.overlay().shown_ino(o);
+            }
+            Ok(encode_stat(&st, dev))
         }
         _ => {
             let node = f.node().ok_or(Errno::EBADF)?;
@@ -4925,7 +5004,13 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, perm) = cred.new_owner(&dir_st, perm, cx.umask(), true);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
-    vfs.store().mkdir(dir, name, perm, uid, gid)?;
+    create_in(
+        &vfs,
+        (mnt, dir),
+        name,
+        || vfs.store().mkdir(dir, name, perm, uid, gid),
+        |&ino| ino,
+    )?;
     tmpfs_created(&vfs, tmpfs, 0);
     inotify::dir_event(
         cx.kr(),
@@ -4981,7 +5066,7 @@ pub(super) fn mknodat(
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
-    reject_trailing_slash(vfs.store(), dir, name, &path)?;
+    reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     // A whiteout (character device 0:0) needs no CAP_MKNOD and does not go through the device
     // filter (Linux's vfs_mknod)
@@ -4992,14 +5077,23 @@ pub(super) fn mknodat(
         }
         super::bpf::check_device(cx, kind, dev & 0xffff_ffff, crate::bpf::ACC_MKNOD)?;
     }
+    // An overlay does not make whiteouts for others (6.1's ovl_mknod)
+    if whiteout && vfs.overlay_prefix(mnt).is_some() {
+        return Err(Errno::EPERM);
+    }
     let (uid, gid, perm) = cred.new_owner(&dir_st, mode_arg, cx.umask(), false);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), 0)?;
-    if kind == 0 || kind == mode::S_IFREG {
-        vfs.store().create_file(dir, name, perm, uid, gid)?;
-    } else {
-        vfs.store()
-            .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)?;
-    }
+    let made = || {
+        if kind == 0 || kind == mode::S_IFREG {
+            vfs.store()
+                .create_file(dir, name, perm, uid, gid)
+                .map(|(ino, _)| ino)
+        } else {
+            vfs.store()
+                .mknod(dir, name, kind | perm, dev & 0xffff_ffff, uid, gid)
+        }
+    };
+    create_in(&vfs, (mnt, dir), name, made, |&ino| ino)?;
     tmpfs_created(&vfs, tmpfs, 0);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
@@ -5018,6 +5112,9 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         return r;
     }
     if let Some(r) = cgroup_unlink(cx, dirfd, &path, flags) {
+        return r;
+    }
+    if let Some(r) = unlink_overlay(cx, dirfd, &path, flags) {
         return r;
     }
     let (mnt, dir, name) = parent_at(cx, dirfd, &path)?;
@@ -5076,6 +5173,68 @@ fn unlink(cx: &mut Cx<'_>, dirfd: i32, path: Vec<u8>, flags: u32) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// unlink and rmdir in an overlay directory: returns Some when the parent is an overlay
+/// directory. Linux's do_unlinkat and do_rmdir order: `.` and `..`, the read-only filesystem,
+/// not found, a name ending in `/` on something that is not a directory, then `may_delete` on
+/// what the overlay shows (search, then write permission and the sticky bit, then the type),
+/// a mount point (EBUSY), a directory that the overlay does not show empty (ENOTEMPTY); then the
+/// overlay's own removal ([`crate::vfs::overlay::Overlays::remove`]).
+fn unlink_overlay(
+    cx: &mut Cx<'_>,
+    dirfd: i32,
+    path: &[u8],
+    flags: u32,
+) -> Option<Result<(), Errno>> {
+    let start = start_dir(cx, dirfd, path).ok()?;
+    let vfs = cx.vfs().ok()?;
+    let cred = cx.cred();
+    let (dir, name) = vfs
+        .resolve_parent(&cx.view(&vfs), &cred, &cx.root(), &start, path)
+        .ok()?;
+    let Node::Overlay(mnt, d) = dir else {
+        return None;
+    };
+    let rmdir = flags & AT_REMOVEDIR != 0;
+    Some((|| {
+        match name {
+            b"." if rmdir => return Err(Errno::EINVAL),
+            b".." if rmdir => return Err(Errno::ENOTEMPTY),
+            b"." | b".." => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        if vfs.readonly(&dir) {
+            return Err(Errno::EROFS);
+        }
+        let child = vfs.overlay_child((mnt, d), name)?;
+        let Node::Overlay(_, c) = child else {
+            return Err(Errno::EIO);
+        };
+        let st = vfs.overlay_stat(c)?;
+        if !rmdir && path.ends_with(b"/") {
+            return Err(if st.is_dir() {
+                Errno::EISDIR
+            } else {
+                Errno::ENOTDIR
+            });
+        }
+        let dir_st = vfs.store().attrs(vfs.overlay().node(d).real())?;
+        cred.permission(&dir_st, MAY_EXEC)?;
+        cred.may_delete(&dir_st, &st)?;
+        match (rmdir, st.is_dir()) {
+            (true, false) => return Err(Errno::ENOTDIR),
+            (false, true) => return Err(Errno::EISDIR),
+            _ => {}
+        }
+        if vfs.is_point_in(&child, cx.mnt_ns()) {
+            return Err(Errno::EBUSY);
+        }
+        if rmdir && !vfs.overlay_readdir(c)?.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        vfs.overlay_remove(d, name, rmdir)
+    })())
 }
 
 /// Deletes a queue in the mqueue filesystem (as mq_unlink does): returns Some when the parent
@@ -5195,13 +5354,19 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
     }
     let vfs = cx.vfs()?;
     let cred = cx.cred();
-    reject_trailing_slash(vfs.store(), dir, name, &path)?;
+    reject_trailing_slash(&vfs, (mnt, dir), name, &path)?;
     let dir_st = may_create(&vfs, &cred, (mnt, dir), name)?;
     let (uid, gid, _) = cred.new_owner(&dir_st, 0o777, 0, false);
     // A long symlink takes an extra page in tmpfs (Linux's SHORT_SYMLINK_LEN)
     let pages = u64::from(target.len() >= 128);
     let tmpfs = tmpfs_reserve(&vfs, (mnt, dir), pages)?;
-    vfs.store().symlink(dir, name, &target, uid, gid)?;
+    create_in(
+        &vfs,
+        (mnt, dir),
+        name,
+        || vfs.store().symlink(dir, name, &target, uid, gid),
+        |&ino| ino,
+    )?;
     tmpfs_created(&vfs, tmpfs, pages);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
     Ok(0)
@@ -5257,14 +5422,8 @@ pub(super) fn linkat(
     if matches!(dir, Node::Pseudo(..)) && vfs.has_child(&cx.view(&vfs), &dir, name) {
         return Err(Errno::EEXIST);
     }
-    // Within one overlay: a link is a change to it
-    if let (Node::Overlay(src_mnt, _), Node::Overlay(mnt, _)) = (&src, &dir)
-        && src_mnt == mnt
-    {
-        if vfs.has_child(&cx.view(&vfs), &dir, name) {
-            return Err(Errno::EEXIST);
-        }
-        return overlay_change(&vfs, &dir).map(|_| 0);
+    if let (Node::Overlay(..), Node::Overlay(..)) = (&src, &dir) {
+        return link_overlay(cx, &vfs, (&src, &dir), name, &newpath);
     }
     // A synthetic filesystem is another "device": hard links cannot cross devices
     let (Node::Store(src_mnt, src), Node::Store(mnt, dir)) = (src, dir) else {
@@ -5273,7 +5432,7 @@ pub(super) fn linkat(
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
-    reject_trailing_slash(vfs.store(), dir, name, &newpath)?;
+    reject_trailing_slash(&vfs, (mnt, dir), name, &newpath)?;
     // Two sides reached through different mounts (even one filesystem bound in two places) are
     // EXDEV, after the existing name and the read-only mount and before the directory being
     // writable (Linux's do_linkat)
@@ -5303,6 +5462,61 @@ pub(super) fn linkat(
     tmpfs_created(&vfs, tmpfs, 0);
     inotify::path_event(cx.kr(), src, None, inotify::IN_ATTRIB);
     inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
+    Ok(0)
+}
+
+/// linkat within an overlay (6.1's `ovl_link`, after `do_linkat`'s checks in the same order as
+/// for the store, made on what the overlay shows): the file is copied up and linked in the upper
+/// directory, replacing a whiteout of the name.
+fn link_overlay(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    (src, dir): (&Node, &Node),
+    name: &[u8],
+    newpath: &[u8],
+) -> SysResult {
+    let (&Node::Overlay(src_mnt, so), &Node::Overlay(mnt, d)) = (src, dir) else {
+        return Err(Errno::EXDEV);
+    };
+    if name == b"." || name == b".." || vfs.has_child(&cx.view(vfs), dir, name) {
+        return Err(Errno::EEXIST);
+    }
+    if newpath.ends_with(b"/") {
+        return Err(Errno::ENOENT);
+    }
+    let cred = cx.cred();
+    let dir_st = vfs.store().attrs(vfs.overlay().node(d).real())?;
+    cred.permission(&dir_st, MAY_EXEC)?;
+    if vfs.readonly(dir) {
+        return Err(Errno::EROFS);
+    }
+    if src_mnt != mnt {
+        return Err(Errno::EXDEV);
+    }
+    let st = vfs.store().attrs(vfs.overlay().node(so).real())?;
+    if cx.kr().protected_hardlinks {
+        let setgid_exec = mode::S_ISGID | 0o010;
+        let safe = st.mode & mode::S_IFMT == mode::S_IFREG
+            && st.mode & mode::S_ISUID == 0
+            && st.mode & setgid_exec != setgid_exec
+            && cred.permission(&st, MAY_READ | MAY_WRITE).is_ok();
+        if !safe && !cred.owns(&st) {
+            return Err(Errno::EPERM);
+        }
+    }
+    cred.permission(&dir_st, MAY_WRITE | MAY_EXEC)?;
+    if st.is_dir() {
+        return Err(Errno::EPERM);
+    }
+    let file = vfs.overlay_upper(so, crate::vfs::overlay::CopyUp::All)?;
+    let (mnt, up) = create_dir(vfs, dir)?;
+    create_in(
+        vfs,
+        (mnt, up),
+        name,
+        || vfs.store().link(up, name, file).map(|()| file),
+        |&ino| ino,
+    )?;
     Ok(0)
 }
 
@@ -5353,6 +5567,10 @@ pub(super) fn renameat2(
             flags,
             &old_parent,
         );
+    }
+    if let (Node::Overlay(mnt, od), Node::Overlay(_, nd)) = (&old_parent, &new_parent) {
+        let slashes = oldpath.ends_with(b"/") || newpath.ends_with(b"/");
+        return rename_overlay(cx, *mnt, (*od, old_name), (*nd, new_name), (flags, slashes));
     }
     let vfs = cx.vfs()?;
     let (old_mnt, old_dir) = store_dir(&vfs, &old_parent)?;
@@ -5459,6 +5677,70 @@ pub(super) fn renameat2(
     Ok(0)
 }
 
+/// renameat2 within an overlay mount (after the mount and `.`/`..` checks): the read-only
+/// filesystem, a trailing `/` on something that is not a directory, then [`may_rename`]'s checks
+/// and mount points (EBUSY) on what the overlay shows, then the overlay's own rename
+/// ([`crate::vfs::overlay::Overlays::rename`]).
+fn rename_overlay(
+    cx: &Cx<'_>,
+    mnt: MountId,
+    (od, old_name): (crate::vfs::overlay::OvlId, &[u8]),
+    (nd, new_name): (crate::vfs::overlay::OvlId, &[u8]),
+    (flags, slashes): (u32, bool),
+) -> SysResult {
+    let vfs = cx.vfs()?;
+    let attrs = |o| vfs.store().attrs(vfs.overlay().node(o).real());
+    let old_parent = Node::Overlay(mnt, od);
+    if vfs.readonly(&old_parent) {
+        return Err(Errno::EROFS);
+    }
+    let cred = cx.cred();
+    let od_st = attrs(od)?;
+    cred.permission(&od_st, MAY_EXEC)?;
+    let Node::Overlay(m, src) = vfs.overlay_child((mnt, od), old_name)? else {
+        return Err(Errno::EIO);
+    };
+    let src_st = attrs(src)?;
+    if slashes && !src_st.is_dir() {
+        return Err(Errno::ENOTDIR);
+    }
+    cred.may_delete(&od_st, &src_st)?;
+    let nd_st = attrs(nd)?;
+    let dst = match vfs.overlay_child((m, nd), new_name) {
+        Ok(Node::Overlay(_, d)) => {
+            let st = attrs(d)?;
+            cred.permission(&nd_st, MAY_EXEC)?;
+            cred.may_delete(&nd_st, &st)?;
+            Some((d, st))
+        }
+        _ => {
+            cred.permission(&nd_st, MAY_WRITE | MAY_EXEC)?;
+            None
+        }
+    };
+    let exchange = flags & RENAME_EXCHANGE != 0;
+    if od != nd {
+        let moved = [
+            Some(&src_st),
+            dst.as_ref().map(|d| &d.1).filter(|_| exchange),
+        ];
+        for st in moved.iter().flatten().filter(|st| st.is_dir()) {
+            cred.permission(st, MAY_WRITE)?;
+        }
+    }
+    let ns = cx.mnt_ns();
+    let busy = |o| vfs.is_point_in(&Node::Overlay(m, o), ns);
+    if busy(src) || dst.as_ref().is_some_and(|d| busy(d.0)) {
+        return Err(Errno::EBUSY);
+    }
+    vfs.overlay_rename(
+        (od, old_name),
+        (nd, new_name),
+        (flags & RENAME_NOREPLACE != 0, exchange),
+    )?;
+    Ok(0)
+}
+
 /// Checks before rename: both directories must be writable and obey the sticky bit; when a
 /// directory changes parent, it must itself be writable too (its `..` is modified).
 fn may_rename(
@@ -5522,6 +5804,9 @@ fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8
 /// filesystems cannot be modified.
 enum Attrs {
     Store(Ino),
+    /// A node in an overlay: checked as what the overlay shows, changed in the upper layer
+    /// after a copy-up (6.1's `ovl_setattr`).
+    Overlay(crate::vfs::overlay::OvlId),
     Pts(Rc<RefCell<Tty>>),
     /// An fd of a socket or anonymous pipe: on Linux this changes their own inode in sockfs or
     /// pipefs, owned by the process that created it (libuv's `uv_pipe_chmod` fchmods the
@@ -5548,6 +5833,8 @@ impl Attrs {
             }
             Node::Pseudo(_, PseudoNode::MqRoot(ns)) => Ok(Attrs::MqDir(*ns)),
             Node::Pseudo(_, PseudoNode::Mq(ns, ino)) => mq_queue(cx, *ns, *ino).map(Attrs::Mq),
+            Node::Overlay(..) if cx.vfs()?.readonly(node) => Err(Errno::EROFS),
+            Node::Overlay(_, o) => Ok(Attrs::Overlay(*o)),
             _ => store_ino(cx, node).map(Attrs::Store),
         }
     }
@@ -5563,6 +5850,18 @@ impl Attrs {
             FileKind::Socket(_) => Ok(Attrs::Anon),
             FileKind::Pipe(end) if end.pipe.borrow().fifo.is_none() => Ok(Attrs::Anon),
             FileKind::MessageQueue(q) => Ok(Attrs::Mq(q.clone())),
+            _ if matches!(f.node(), Some(Node::Overlay(..))) => {
+                let Some(node @ Node::Overlay(_, o)) = f.node() else {
+                    return Err(Errno::EBADF);
+                };
+                if f.flags & oflags::O_PATH != 0 {
+                    return Err(Errno::EBADF);
+                }
+                if cx.vfs()?.readonly(&node) {
+                    return Err(Errno::EROFS);
+                }
+                Ok(Attrs::Overlay(o))
+            }
             _ => {
                 drop(f);
                 file_ino(cx, fd).map(Attrs::Store)
@@ -5573,6 +5872,10 @@ impl Attrs {
     fn stat(&self, cx: &Cx<'_>) -> Result<Stat, Errno> {
         match self {
             Attrs::Store(ino) => cx.vfs()?.store().attrs(*ino),
+            Attrs::Overlay(o) => {
+                let vfs = cx.vfs()?;
+                vfs.store().attrs(vfs.overlay().node(*o).real())
+            }
             Attrs::Pts(t) => {
                 let t = t.borrow();
                 Ok(Stat {
@@ -5630,6 +5933,11 @@ fn chmod(cx: &Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
     }
     match target {
         Attrs::Store(ino) => cx.vfs()?.store().set_mode(*ino, perm)?,
+        Attrs::Overlay(o) => {
+            let vfs = cx.vfs()?;
+            let ino = vfs.overlay_upper(*o, crate::vfs::overlay::CopyUp::All)?;
+            vfs.store().set_mode(ino, perm)?;
+        }
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
             t.mode = perm;
@@ -5702,7 +6010,7 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     // CAP_FOWNER may make (notify_change adds ATTR_MODE, checked by inode_owner_or_capable).
     // Otherwise anyone could disable root's set-id programs (su, doas)
     let keep_sgid = cred.in_group(st.gid) || cred.capable_wrt(&st, cap::FSETID);
-    if let Attrs::Store(_) = target
+    if let Attrs::Store(_) | Attrs::Overlay(_) = target
         && !st.is_dir()
         && (st.mode & mode::S_ISUID != 0
             || st.mode & mode::S_ISGID != 0 && (st.mode & 0o010 != 0 || !keep_sgid))
@@ -5712,6 +6020,11 @@ fn chown(cx: &Cx<'_>, target: &Attrs, uid: u32, gid: u32) -> SysResult {
     }
     match target {
         Attrs::Store(ino) => cx.vfs()?.store().set_owner(*ino, uid, gid, keep_sgid)?,
+        Attrs::Overlay(o) => {
+            let vfs = cx.vfs()?;
+            let ino = vfs.overlay_upper(*o, crate::vfs::overlay::CopyUp::All)?;
+            vfs.store().set_owner(ino, uid, gid, keep_sgid)?;
+        }
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
             t.owner = (uid.unwrap_or(t.owner.0), gid.unwrap_or(t.owner.1));
@@ -5792,6 +6105,9 @@ pub(super) fn utimensat(
     }
     let ino = match target {
         Attrs::Store(ino) => ino,
+        Attrs::Overlay(o) => cx
+            .vfs()?
+            .overlay_upper(o, crate::vfs::overlay::CopyUp::All)?,
         // A terminal's times are kept on the terminal (changeable, as with Linux's devpts)
         Attrs::Pts(t) => {
             let mut t = t.borrow_mut();
@@ -5837,8 +6153,10 @@ pub(super) fn utimensat(
         _ => None,
     };
     let vfs = cx.vfs()?;
+    // (not one opened through an overlay, whose open object may be the lower inode's)
     if let Some(f) = open.as_ref().map(|f| f.borrow())
         && let FileKind::Regular { file, .. } = &f.kind
+        && f.ovl.is_none()
     {
         vfs.store().set_times_open(ino, file, atime, mtime)?;
     } else {
@@ -5913,14 +6231,34 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
         // it and do nothing)
         return Ok(0);
     }
-    if let Node::Overlay(_, o) = &node {
-        let st = vfs.store().attrs(vfs.overlay().node(*o).real())?;
-        return match st.kind() {
-            mode::S_IFDIR => Err(Errno::EISDIR),
-            mode::S_IFREG => overlay_change(&vfs, &node).map(|_| 0),
-            _ => Err(Errno::EINVAL),
-        };
-    }
+    // In an overlay the checks are made on what the overlay shows; then the file is copied up
+    // (without its data when truncated to 0) and truncated there
+    let node = match node {
+        Node::Overlay(mnt, o) => {
+            let real = vfs.overlay().node(o).real();
+            let st = vfs.store().attrs(real)?;
+            match st.kind() {
+                mode::S_IFDIR => return Err(Errno::EISDIR),
+                mode::S_IFREG => {}
+                _ => return Err(Errno::EINVAL),
+            }
+            if vfs.readonly(&Node::Overlay(mnt, o)) {
+                return Err(Errno::EROFS);
+            }
+            cx.cred().permission(&st, MAY_WRITE)?;
+            if executing(cx, real) {
+                return Err(Errno::ETXTBSY);
+            }
+            use crate::vfs::overlay::CopyUp;
+            let what = if len == 0 {
+                CopyUp::NoData
+            } else {
+                CopyUp::All
+            };
+            Node::Store(mnt, vfs.overlay_upper(o, what)?)
+        }
+        node => node,
+    };
     let ino = node.ino().ok_or(Errno::EACCES)?;
     let st = vfs.store().attrs(ino)?;
     match st.kind() {
@@ -6192,7 +6530,7 @@ pub(super) fn create_parent_at<'p>(
     {
         return Err(Errno::EEXIST);
     }
-    let (mnt, dir) = store_dir(&vfs, &dir)?;
+    let (mnt, dir) = create_dir(&vfs, &dir)?;
     Ok((mnt, dir, name))
 }
 
@@ -6226,19 +6564,30 @@ pub(super) fn start_dir(cx: &Cx<'_>, dirfd: i32, path: &[u8]) -> Result<Node, Er
 fn store_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
     match dir {
         Node::Store(mnt, ino) => Ok((*mnt, *ino)),
-        Node::Overlay(..) => overlay_change(vfs, dir),
+        // Changing an overlay directory goes through its upper one ([`create_dir`]) or the
+        // overlay's own removal and rename; never straight to a store inode
+        Node::Overlay(..) => Err(Errno::EXDEV),
         Node::Pseudo(..) if vfs.readonly(dir) => Err(Errno::EROFS),
         Node::Pseudo(_, PseudoNode::MqRoot(_) | PseudoNode::Cgroup(..)) => Err(Errno::EPERM),
         Node::Pseudo(..) => Err(Errno::EACCES),
     }
 }
 
-/// The store inode in the upper layer a change to overlay node `node` goes to. Only overlays
-/// without an upper layer can be mounted so far, so every change is EROFS (Linux's
-/// `mnt_want_write` on a read-only superblock).
-fn overlay_change(vfs: &Vfs, node: &Node) -> Result<(MountId, Ino), Errno> {
-    debug_assert!(vfs.readonly(node));
-    Err(Errno::EROFS)
+/// The store directory something is created in: a store directory as [`store_dir`] gives it,
+/// or the upper directory of an overlay one, copied up first (EROFS in a read-only overlay).
+fn create_dir(vfs: &Vfs, dir: &Node) -> Result<(MountId, Ino), Errno> {
+    match dir {
+        Node::Overlay(mnt, o) => {
+            if vfs.readonly(dir) {
+                return Err(Errno::EROFS);
+            }
+            Ok((
+                *mnt,
+                vfs.overlay_upper(*o, crate::vfs::overlay::CopyUp::All)?,
+            ))
+        }
+        _ => store_dir(vfs, dir),
+    }
 }
 
 /// The queue with inode number `ino` in the mqueue filesystem of IPC namespace `ns`; a deleted
@@ -6274,7 +6623,7 @@ fn may_create_name(
     let store = vfs.store();
     let st = store.stat(dir)?;
     cred.permission(&st, MAY_EXEC)?;
-    if store.lookup(dir, name)?.is_some() {
+    if exists_in(vfs, (mnt, dir), name)? {
         return Err(Errno::EEXIST);
     }
     if vfs.readonly(&Node::Store(mnt, dir)) {
@@ -6294,13 +6643,59 @@ fn writable_dir(vfs: &Vfs, (mnt, dir): (MountId, Ino)) -> Result<(), Errno> {
 
 /// What is being created is not a directory but its name ends in `/`: EEXIST when it exists,
 /// otherwise ENOENT (as in Linux's `filename_create`).
-fn reject_trailing_slash(store: &Store, dir: Ino, name: &[u8], path: &[u8]) -> Result<(), Errno> {
+fn reject_trailing_slash(
+    vfs: &Vfs,
+    dir: (MountId, Ino),
+    name: &[u8],
+    path: &[u8],
+) -> Result<(), Errno> {
     if !path.ends_with(b"/") {
         return Ok(());
     }
-    Err(match store.lookup(dir, name)? {
-        Some(_) => Errno::EEXIST,
-        None => Errno::ENOENT,
+    Err(if exists_in(vfs, dir, name)? {
+        Errno::EEXIST
+    } else {
+        Errno::ENOENT
+    })
+}
+
+/// Whether `name` exists in store directory `dir` of mount `mnt`; in an overlay's upper
+/// directory a whiteout does not count (it hides a name, [`create_in`] replaces it).
+fn exists_in(vfs: &Vfs, (mnt, dir): (MountId, Ino), name: &[u8]) -> Result<bool, Errno> {
+    let store = vfs.store();
+    match store.lookup(dir, name)? {
+        Some(_) if vfs.fs_of(&Node::Store(mnt, dir)) == Fs::Overlay => {
+            Ok(!crate::vfs::overlay::whiteout_at(store, dir, name)?)
+        }
+        found => Ok(found.is_some()),
+    }
+}
+
+/// Creates `name` in store directory `dir` of mount `mnt` with `make`, which returns what `made`
+/// takes the new inode from. In an overlay's upper directory a whiteout of the name is replaced
+/// in the same transaction, and a directory made there is opaque, so what the lower layers have
+/// under the name stays hidden (6.1's `ovl_create_over_whiteout`).
+pub(super) fn create_in<T>(
+    vfs: &Vfs,
+    (mnt, dir): (MountId, Ino),
+    name: &[u8],
+    make: impl FnOnce() -> Result<T, Errno>,
+    made: impl Fn(&T) -> Ino,
+) -> Result<T, Errno> {
+    let Some(prefix) = vfs.overlay_prefix(mnt) else {
+        return make();
+    };
+    vfs.store().transaction(|s| {
+        let whiteout = crate::vfs::overlay::whiteout_at(s, dir, name)?;
+        if whiteout {
+            s.unlink(dir, name)?;
+        }
+        let new = make()?;
+        let ino = made(&new);
+        if whiteout && s.kind(ino)? == mode::S_IFDIR {
+            s.set_xattr(ino, &[prefix, b"opaque"].concat(), b"y", false, false)?;
+        }
+        Ok(new)
     })
 }
 

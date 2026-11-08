@@ -43,6 +43,8 @@ SKIP="$SKIP:VmspliceTest.UnmapBufferInPipeThenMapInPlace"
 SKIP="$SKIP:VmspliceTest/VmspliceUnmapBufferAfterVmsplicingRemappedBufferTest.*"
 # kernel/poll: pipe POLLOUT counts bytes, not buffers
 SKIP="$SKIP:PipeTest.PolloutFragmentation"
+# fs_test's tests on an overlay run in the starnix-overlay case (natively they need a tmpfs)
+SKIP="$SKIP:OverlayFs/*"
 # Fail on the native side, which runs in docker: its pid namespace turns a dead lock owner's pid
 # into 0; its device cgroup refuses mknod of a character device; its newer kernel answers ENOENT
 # where the test expects EINVAL for operations on a lazily unmounted mount

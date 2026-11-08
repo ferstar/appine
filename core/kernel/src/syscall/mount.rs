@@ -209,13 +209,14 @@ fn new_mount(
         None
     };
     if fs == Fs::Overlay {
-        let (layers, options) = overlay_layers(cx, &vfs, data)?;
+        let ((layers, pins), options) = overlay_layers(cx, &vfs, data)?;
         room_for(cx, &vfs, target.mnt(), 1)?;
+        let cred = cx.cred();
         vfs.new_overlay(
             (target, at),
             flags,
             source.unwrap_or_default(),
-            layers,
+            (layers, (cred.fsuid, cred.fsgid), pins),
             options,
         );
         cx.shared.fast_changed();
@@ -277,41 +278,88 @@ fn new_mount(
     Ok(0)
 }
 
-/// The layers of a new overlay as 6.1's `ovl_fill_super` finds them: the options, then each
-/// lower directory resolved from the caller's root and current directory, topmost first (an empty
-/// or missing `lowerdir`, more than 500 layers, an unknown option or a layer that is not a
-/// directory in the store are EINVAL; resolution errors are its own). Without an upper layer at
-/// least two lower ones are needed (EINVAL).
+/// The layers of a new overlay as 6.1's `ovl_fill_super` finds them, each resolved from the
+/// caller's root and current directory: the options (EINVAL as [`overlay::Options::parse`]); the
+/// upper layer and the work directory, which must both be given, be on one mount that is not
+/// read-only and be outside each other (EINVAL); the lower layers, topmost first (at least two
+/// without an upper layer, EINVAL), none of which may be inside the upper layer or the work
+/// directory (ELOOP). Every layer must be a directory in the store (EINVAL); resolution errors are
+/// their own. The work directory then gets an empty `work` directory (mode 0, the mounter's), as
+/// Linux's `ovl_make_workdir` leaves.
 fn overlay_layers(
     cx: &Cx<'_>,
     vfs: &Vfs,
     data: &[u8],
-) -> Result<(overlay::Layers, overlay::Options), Errno> {
+) -> Result<((overlay::Layers, Vec<u64>), overlay::Options), Errno> {
     let options = overlay::Options::parse(data)?;
+    // The tmpfs instances the layers are in
+    let mut pins = Vec::new();
+    let mut pin = |(mnt, ino): (MountId, Ino)| {
+        if let Some(dev) = vfs.tmpfs_dev(&Node::Store(mnt, ino)) {
+            pins.push(dev);
+        }
+        (mnt, ino)
+    };
     let paths = options.lower_paths()?;
-    if options.upperdir.is_some() {
-        crate::debug::log(format_args!(
-            "mount: overlays with an upper layer are not supported yet"
-        ));
+    let store = vfs.store();
+    let upper = match (options.upper_path(), options.work_path()) {
+        (None, _) => None,
+        (Some(_), None) => return Err(Errno::EINVAL),
+        (Some(upper), Some(work)) => {
+            if upper.is_empty() || work.is_empty() {
+                return Err(Errno::EINVAL);
+            }
+            let (mnt, upper) = pin(overlay_dir(cx, vfs, &upper)?);
+            if vfs.readonly(&Node::Store(mnt, upper)) {
+                return Err(Errno::EINVAL);
+            }
+            let (work_mnt, work) = pin(overlay_dir(cx, vfs, &work)?);
+            if work_mnt != mnt || under(store, upper, work)? || under(store, work, upper)? {
+                return Err(Errno::EINVAL);
+            }
+            Some((upper, work))
+        }
+    };
+    if upper.is_none() && paths.len() < 2 {
         return Err(Errno::EINVAL);
     }
-    if paths.len() < 2 {
-        return Err(Errno::EINVAL);
+    let mut lower = Vec::new();
+    for p in &paths {
+        lower.push(pin(overlay_dir(cx, vfs, p)?).1);
     }
-    let lower = paths
-        .iter()
-        .map(|p| overlay_dir(cx, vfs, p))
-        .collect::<Result<_, _>>()?;
-    Ok(((None, lower), options))
+    if let Some((up, work)) = upper {
+        for &l in &lower {
+            if under(store, l, up)? || under(store, l, work)? {
+                return Err(Errno::ELOOP);
+            }
+        }
+        let cred = cx.cred();
+        store.transaction(|s| {
+            if s.lookup(work, b"work")?.is_some() {
+                remove_tree(s, work, b"work")?;
+            }
+            s.mkdir(work, b"work", 0, cred.fsuid, cred.fsgid)
+                .map(|_| ())
+        })?;
+    }
+    Ok((((upper.map(|(up, _)| up), lower), pins), options))
 }
 
-/// The store directory an overlay layer's path names (Linux's `ovl_mount_dir_noesc`): EINVAL
-/// when it is not a directory, and for a directory in a synthetic filesystem or in another
-/// overlay (Linux accepts an overlay as a lower layer; Appine does not).
-fn overlay_dir(cx: &Cx<'_>, vfs: &Vfs, path: &[u8]) -> Result<Ino, Errno> {
+/// The mount and store directory an overlay layer's path names (Linux's `ovl_mount_dir_noesc`,
+/// then `clone_private_mount`): EINVAL when it is not a directory, for a directory in a synthetic
+/// filesystem or in another overlay (Linux accepts an overlay as a lower layer; Appine does not),
+/// on a mount of another mount namespace, and with a mount locked in place under it (the overlay
+/// would uncover what that mount hides).
+fn overlay_dir(cx: &Cx<'_>, vfs: &Vfs, path: &[u8]) -> Result<(MountId, Ino), Errno> {
     let view = cx.view(vfs);
     match vfs.resolve(&view, &cx.cred(), &cx.root(), &cx.cwd(), path, true)? {
-        Node::Store(_, ino) if vfs.store().kind(ino)? == mode::S_IFDIR => Ok(ino),
+        node @ Node::Store(mnt, ino) if vfs.store().kind(ino)? == mode::S_IFDIR => {
+            check_mnt(cx, vfs, mnt)?;
+            if has_locked_children(vfs, &view, &node) {
+                return Err(Errno::EINVAL);
+            }
+            Ok((mnt, ino))
+        }
         Node::Overlay(..) => {
             crate::debug::log(format_args!(
                 "mount: overlay layers in an overlay are not supported"
@@ -320,6 +368,33 @@ fn overlay_dir(cx: &Cx<'_>, vfs: &Vfs, path: &[u8]) -> Result<Ino, Errno> {
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Store directory `ino` is `top` or inside it.
+fn under(store: &crate::vfs::store::Store, ino: Ino, top: Ino) -> Result<bool, Errno> {
+    let mut cur = ino;
+    loop {
+        if cur == top {
+            return Ok(true);
+        }
+        let up = store.parent(cur)?;
+        if up == cur {
+            return Ok(false);
+        }
+        cur = up;
+    }
+}
+
+/// Removes `name` from store directory `dir` with everything in it.
+fn remove_tree(s: &crate::vfs::store::Store, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+    let ino = s.lookup(dir, name)?.ok_or(Errno::ENOENT)?;
+    if s.kind(ino)? != mode::S_IFDIR {
+        return s.unlink(dir, name);
+    }
+    for e in s.readdir(ino)? {
+        remove_tree(s, ino, &e.name)?;
+    }
+    s.rmdir(dir, name)
 }
 
 /// Linux's `mount_too_revealing` for a new proc or sysfs mount with flags `flags`: in a mount

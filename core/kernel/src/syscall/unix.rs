@@ -120,10 +120,17 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             let dir_st = super::fs::may_create(&vfs, &cred, (mnt, dir), name).map_err(in_use)?;
             let (uid, gid, perm) = cred.new_owner(&dir_st, 0o777, cx.umask(), false);
             let tmpfs = super::fs::tmpfs_reserve(&vfs, (mnt, dir), 0)?;
-            let ino = vfs
-                .store()
-                .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
-                .map_err(in_use)?;
+            let ino = super::fs::create_in(
+                &vfs,
+                (mnt, dir),
+                name,
+                || {
+                    vfs.store()
+                        .mknod(dir, name, mode::S_IFSOCK | perm, 0, uid, gid)
+                },
+                |&ino| ino,
+            )
+            .map_err(in_use)?;
             super::fs::tmpfs_created(&vfs, tmpfs, 0);
             super::inotify::dir_event(cx.kr(), dir, name, super::inotify::IN_CREATE, 0);
             cx.k().unix.insert(Name::Path(ino), sock);
@@ -806,7 +813,15 @@ fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> 
             let node = lookup_at(cx, AT_FDCWD, p, true)?;
             let vfs = cx.vfs()?;
             match node {
-                Node::Store(_, ino) if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK => {
+                Node::Store(..) | Node::Overlay(..)
+                    if vfs.kind(&cx.view(&vfs), &node)? == mode::S_IFSOCK =>
+                {
+                    // The socket file behind an overlay's node (in the upper layer when it was
+                    // bound through the overlay)
+                    let ino = match node {
+                        Node::Overlay(_, o) => vfs.overlay().node(o).real(),
+                        _ => node.ino().unwrap_or(0),
+                    };
                     // Connecting to a path address requires write permission on the socket file
                     cx.cred()
                         .permission(&vfs.store().stat(ino)?, crate::cred::MAY_WRITE)?;

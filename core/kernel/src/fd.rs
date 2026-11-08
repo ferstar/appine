@@ -181,6 +181,10 @@ pub struct OpenFile {
     /// Changes to the file's metadata go through the node ([`OpenFile::node`]), never to that
     /// inode directly.
     pub ovl: Option<crate::vfs::overlay::OvlId>,
+    /// The lower inode's object such a file was opened with, once its reads have moved to the
+    /// copied-up one (`syscall::fs::follow_copy_up`): kept until the file is closed, since a read
+    /// without the BKL may still be using it.
+    pub ovl_lower: Option<std::fs::File>,
     /// `F_SETOWN_EX`'s (type, pid) and `F_SETSIG`'s signal: with `O_ASYNC`, whom to signal on
     /// readiness and with which signal (0 is SIGIO); they are also signalled when a file lease is
     /// broken.
@@ -241,6 +245,7 @@ impl OpenFile {
             dentry: None,
             mnt: crate::vfs::ROOT_MOUNT,
             ovl: None,
+            ovl_lower: None,
             owner: (0, 0),
             owner_ids: (0, 0),
             sig: 0,

@@ -52,7 +52,7 @@ pub(super) fn setxattr(
     }
     let mut v = vec![0u8; size];
     cx.mm().read(UserSlice::new(value, size), &mut v)?;
-    let ino = writable_ino(cx, node_of(cx, target)?)?;
+    let ino = writable_ino(cx, node_of(cx, target)?, &name)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
     // Program file capabilities: only v2 and v3 are accepted, CAP_SETFCAP is needed over the file
@@ -127,7 +127,7 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
 
 pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResult {
     let name = read_name(cx, name)?;
-    let ino = writable_ino(cx, node_of(cx, target)?)?;
+    let ino = writable_ino(cx, node_of(cx, target)?, &name)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
     // Removing program file capabilities needs CAP_SETFCAP over the file (cap_inode_removexattr)
@@ -178,11 +178,26 @@ fn node_of(cx: &Cx<'_>, target: Target) -> Result<Node, Errno> {
     }
 }
 
-/// The inode whose extended attributes are about to change: EROFS on a read-only mount (Linux's
-/// `mnt_want_write`, before the other checks).
-fn writable_ino(cx: &Cx<'_>, node: Node) -> Result<Ino, Errno> {
-    if cx.vfs()?.readonly(&node) {
+/// The inode whose extended attribute `name` is about to change: EROFS on a read-only mount
+/// (Linux's `mnt_want_write`, before the other checks). In an overlay the attribute changes in
+/// the upper layer, after a copy-up that needs the permission to change it on what the overlay
+/// shows; the overlay's own attributes cannot be changed (EOPNOTSUPP, 6.1's
+/// `ovl_own_xattr_set`).
+fn writable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
+    let vfs = cx.vfs()?;
+    if vfs.readonly(&node) {
         return Err(Errno::EROFS);
+    }
+    if let Node::Overlay(_, o) = node {
+        let real = {
+            let ovl = vfs.overlay();
+            if ovl.is_private_xattr(o, name) {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            ovl.node(o).real()
+        };
+        permission(cx, &vfs.store().attrs(real)?, name, true)?;
+        return vfs.overlay_upper(o, crate::vfs::overlay::CopyUp::All);
     }
     store_ino(node, Errno::EOPNOTSUPP)
 }

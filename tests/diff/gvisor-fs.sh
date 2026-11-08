@@ -40,16 +40,8 @@ SKIP="$SKIP:$M.RecursiveBindPropagation:$M.SetMountPropagationOfStackedMounts"
 SKIP="$SKIP:$M.SetPropagationRecursive:$M.SlaveMaster:$M.UmountIgnoresPeersWithChildren"
 SKIP="$SKIP:$M.UmountPropagatedSubtreeFromPrivilegedNS:$M.UmountReparentsCoveredMounts"
 SKIP="$SKIP:$M.MaxMounts:$M.MaxMountsWithSlave:$M.FailedBindDoesNotBreakPropagation"
-# No overlayfs (kernel/vfs: other filesystem types are ENODEV); sysfs has no /sys/kernel
-# (kernel/procfs)
-SKIP="$SKIP:$M.LockedMountStopsOverlayLowerdir:$M.LockedMountStopsOverlayUpperdir"
-SKIP="$SKIP:$M.OverlayRefusesLayerFromAnotherMountNamespace:$M.OverlayfsDirectoryRenameInUserNamespace"
-SKIP="$SKIP:$M.OverlayfsRejectsEmptyOptions:$M.OverlayfsRelativePaths"
-SKIP="$SKIP:$M.OverlayfsRenameFromDeletedDirFails:$M.OverlayfsRenameOverWhiteoutInStickyDir"
-SKIP="$SKIP:$M.OverlayfsRenameWhiteoutOnlyWhenLowerExists"
-SKIP="$SKIP:$M.OverlayfsSecurityCapabilityRequiresSetFcap"
-SKIP="$SKIP:$M.OverlayfsSecurityCapabilityTranslatesRootID:$M.OverlayfsSgidBitIsCopiedUp"
-SKIP="$SKIP:$M.OverlayfsUnlinkInDeletedDirFails:$M.LockedMountStopsOverlayOfSysfs"
+# kernel/procfs: sysfs has no /sys/kernel
+SKIP="$SKIP:$M.LockedMountStopsOverlayOfSysfs"
 SKIP="$SKIP:$M.UserNamespaceSysfsMountRevealingLockedMount"
 # kernel/vfs: mounts copied into a less privileged namespace are not locked (flags, submounts);
 # proc and sysfs mounts in a user namespace skip Linux's owner and visibility checks

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; AIO; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; read-only overlayfs last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; AIO; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs last)
 
 ## Responsibilities
 
@@ -16,7 +16,7 @@ inode store and the synthetic filesystems). It provides:
   mounts, search permission, `protected_symlinks`, magic links and openat2's `RESOLVE_*`;
 - the global mount table, boot mounts, `mount(2)`/`umount2`/`pivot_root`/`chroot` and the new mount
   API subset, mount namespaces' tables and their cleanup, tmpfs instances and their accounting,
-  overlayfs instances (lower layers only so far) and their nodes;
+  overlayfs instances, their nodes and copy-up;
 - fd tables and open file descriptions, open flags, `fcntl`, and data I/O on regular files (host
   `pread`/`pwrite` without the BKL), `sendfile`/`copy_file_range`/`splice`;
 - namespace and metadata syscalls (stat family, statfs, chmod/chown/utimensat/truncate/access,
@@ -57,10 +57,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `MntNs` — namespace id, owning user namespace, `anon` flag (open_tree clones). A task's
   namespace lives in its `FsContext` (root, cwd, umask, mount namespace), not in nsproxy.
 - `TmpfsParams` / `Tmpfs` — options and usage (`(pages, inodes)`, counted lazily).
-- `Overlays` (`vfs/overlay.rs`) — overlay `Instance`s by device number (upper layer root, parsed
-  `Options`) and every `OvlNode` by `OvlId`: instance, parent and name (Linux's overlay dentry),
-  the upper store inode and the lower ones (all merged lower directories for a directory, the
-  topmost for anything else), and the children already looked up.
+- `Overlays` (`vfs/overlay.rs`) — overlay `Instance`s by device number (upper layer root, the
+  mounter's filesystem IDs, the tmpfs instances its layers are in, parsed `Options`) and every
+  `OvlNode` by `OvlId`: instance, parent and name (Linux's overlay dentry), the upper store inode
+  and the lower ones (all merged lower directories for a directory, the topmost for anything else),
+  the lower inode it was copied up from (`origin`), and the children already looked up.
 - `Cached` / `Pending` — the lock-free resolver used by fast-path stat (64-component stack).
 - `FdTable` — slots (`FileRef` plus per-fd `cloexec`), the soft `RLIMIT_NOFILE`, `holds_locks`.
 - `OpenFile` (`FileRef = Rc<RefCell<OpenFile>>`) — kind, access mode and status flags, position,
@@ -93,7 +94,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `resolve_parent_with`, `found_path`, `path_of`, `reach`; `Cached::stat` (fast path).
 - **Mounts**: `Vfs::open` (boot mounts), `mounts`/`mounts_from`, `copy_ns`, `anon_ns`,
   `clone_mount`, `attach_tree`, `subtree`, `collect`, `readonly`, `sb_readonly`, `mount_flags`,
-  `dev_of`, `fs_of`, `tmpfs_*`, `new_overlay`, `overlay`, `overlay_stat`, `overlay_readdir`;
+  `dev_of`, `fs_of`, `tmpfs_*`, `new_overlay`, `overlay`, `overlay_stat`, `overlay_readdir`,
+  `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`, `overlay_prefix`,
+  `is_point_in`;
   syscalls `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `mount_setattr` (`fsopen`/`fsconfig`/`fsmount`/`fspick` have no handler: ENOSYS).
 - **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `pipe2`,
   `lseek`, `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
@@ -298,18 +301,23 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   commas a backslash does not escape, empty ones skipped, unknown ones or missing values `EINVAL`,
   the last of a repeated one wins; `workdir`, `index` and `volatile` without `upperdir` are
   ignored; conflicting `metacopy`, `nfs_export`, `index`, `redirect_dir` and `userxattr` are
-  `EINVAL`, while the accepted ones change nothing else. `lowerdir` splits at unescaped colons
-  (empty or missing `EINVAL`, at most 500); each layer resolves from the caller's root and cwd,
-  following links (its own errors), and must be a store directory (`EINVAL` otherwise, also for
-  a directory in a synthetic filesystem or another overlay). Without `upperdir` at least two
-  layers are needed (`EINVAL`); `upperdir` itself is `EINVAL` for now (logged).
+  `EINVAL`, while the accepted ones change nothing else. Each layer resolves from the caller's
+  root and cwd, following links (its own errors), and must be a store directory on a mount of the
+  caller's namespace with no mount locked in place under it (`EINVAL` otherwise, also for a
+  directory in a synthetic filesystem or another overlay; `clone_private_mount`'s checks). The
+  upper layer and the work directory come first: both or neither (`EINVAL`), not empty, the upper
+  one not on a read-only mount, both on one mount and neither inside the other (`EINVAL`). Then
+  `lowerdir` splits at unescaped colons (empty or missing `EINVAL`, at most 500), at least two
+  without an upper layer (`EINVAL`), none inside the upper layer or the work directory (`ELOOP`).
+  The work directory then gets an empty `work` (mode 0, the mounter's; an old one is removed). An
+  instance keeps the tmpfs instances its layers are in from being collected, as Linux's private
+  layer mounts do.
 - An overlay without an upper layer is read-only as a filesystem (`sb_readonly`): mountinfo shows
-  `ro` in the superblock options and the mount's own flags as given, `/proc/<pid>/mounts` shows
-  `ro`; every change is `EROFS` (`overlay_change`), after the `EEXIST` of creating an existing
-  name, also through a bind mount remounted read-write; opening a regular file for writing or
-  with `O_TRUNC` is `EROFS` before permission (6.1's `sb_permission`). Superblock options are
-  `lowerdir` as given, then what differs from 6.1's defaults (`ovl_show_options`), escaped as
-  `seq_show_option` does.
+  `ro` in the superblock options and the mount's own flags as given, `/proc/<pid>/mounts` and
+  statfs show it read-only; every change is `EROFS`, after the `EEXIST` of creating an existing
+  name, also through a bind mount remounted read-write, and remounting it read-write is `EROFS`.
+  Superblock options are `lowerdir`, `upperdir` and `workdir` as given, then what differs from
+  6.1's defaults (`ovl_show_options`), escaped as `seq_show_option` does.
 - Lookup (6.1's `ovl_lookup`): the upper inode, then each lower directory merged into the parent;
   a whiteout (character device 0:0) is `ENOENT`; anything that is not a directory ends the search,
   and below a directory it is not seen; an opaque directory (`trusted.overlay.opaque` = `y`, or
@@ -317,16 +325,45 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   and name give the same node, its inodes refreshed from the layers on each lookup. Mounts on
   directories inside a layer are not seen through the overlay.
 - readdir merges the layers' entries sorted by name, the highest layer's entry for each name,
-  whiteouts hiding the names below them. Stat is the topmost inode's with the overlay's device
-  number, and a merged directory (more than one layer has it) reports one link. Reads, readlink,
-  exec, search permission and xattr reads go to the topmost inode; the overlay's own attributes
-  (`trusted.overlay.*`, `user.overlay.*` with `userxattr`) are `EOPNOTSUPP` to get (6.1's
-  `ovl_own_xattr_get`) and left out of listings. statfs reports overlayfs's magic with the
-  store's capacity.
+  whiteouts hiding the names below them, each entry's inode number the one stat shows. Stat is the
+  topmost inode's with the overlay's device number and the inode number of the lower inode a
+  directory, or a file with one link, was copied up from (kept in memory only), and a merged
+  directory reports one link. Reads, readlink, exec, search permission and xattr reads go to the
+  topmost inode; the overlay's own attributes (`trusted.overlay.*`, `user.overlay.*` with
+  `userxattr`) are `EOPNOTSUPP` to get or set (6.1's `ovl_own_xattr_get`/`_set`) and left out of
+  listings. statfs reports overlayfs's magic with the store's capacity.
+- Copy-up (`Overlays::upper_of`, 6.1's `ovl_copy_up`): the parent directories first, then the
+  node as its topmost lower inode is (directory, file with its data and holes, symlink or special
+  file), with its mode (set-id bits included), owner, attributes other than the overlay's own and
+  times, in one store transaction; the parent's times are put back. A file opened with `O_TRUNC`
+  or truncated to 0 is copied without its data. chmod, chown and utimensat (`Attrs::Overlay`),
+  setxattr and removexattr, truncate and opening a regular file for writing check `EROFS` and
+  permission on what the overlay shows (the last two also `ETXTBSY` for a program being run from
+  the lower inode) and copy up only then; they change the upper inode. utimensat by fd goes by number, never through the open (possibly lower) object.
+- Creating (`create_dir`, `create_in`): the directory is copied up, a whiteout of the name does not
+  count as existing and is replaced in the same transaction, and a directory made in its place is
+  opaque (6.1's `ovl_create_over_whiteout`); this covers open with `O_CREAT` (whose new file is the
+  overlay's node, so it locks with later opens), mkdir, mknod, symlink, link (the file is copied up
+  and linked there) and AF_UNIX bind (connect finds the socket's upper inode). mknod of a whiteout
+  through an overlay is `EPERM` (6.1's `ovl_mknod`).
+- Removing (`unlink_overlay`, `Overlays::remove`; do_unlinkat's and do_rmdir's order, `may_delete`
+  on what the overlay shows, a mount of the caller's namespace on it `EBUSY`, rmdir of a directory
+  the overlay does not show empty `ENOTEMPTY`): the upper inode goes, with the whiteouts left in a
+  directory, and a whiteout owned by the mounter takes its place when a lower layer has the name.
+- Renaming (`rename_overlay`, `Overlays::rename`; may_rename's checks on what the overlay shows,
+  mount points `EBUSY`, then `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` on the merged
+  view): a directory with lower layers (merged or lower only) is `EXDEV` (6.1 without `redirect_dir`),
+  so tools fall back to copying; otherwise both sides are copied up and renamed in the upper layer,
+  a whiteout at the new name or left in a replaced directory is removed first, a whiteout is left
+  at the old name when a lower layer has it, and a directory moved into a merged one is made
+  opaque.
 - Opening goes through `open_store` on the topmost inode (its checks, devices, FIFOs); a directory
   stays an overlay node for getdents, fchdir and `*at` calls, and other kinds record the node in
   `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` links give the
-  overlay node. Locks key on the node (`lock_ino`), leases on the store inode behind it.
+  overlay node, and fstat shows the node's inode number. A file opened before it was copied up
+  switches to the upper object on its next read, fstat, lseek or copy out of it
+  (`follow_copy_up`, 6.1's `ovl_real_fdget`), keeping the lower object open until it is closed
+  (`OpenFile::ovl_lower`). Locks key on the node (`lock_ino`), leases on the store inode behind it.
 
 ### fd tables and open files
 
@@ -723,7 +760,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - An overlay node's store inodes may be in lower layers that must never change, so `Node::ino` is
   None for it and nothing may turn an overlay file's store inode back into a `Node::Store`: an
   open file reaches its node through `OpenFile::ovl` (`OpenFile::node`, `/proc/<pid>/fd`), and
-  every change goes through `overlay_change`.
+  every change goes through a copy-up (`create_dir`, `Attrs::Overlay`, the overlay's removal and
+  rename); `store_dir` refuses overlay directories (`EXDEV`) so no store path can reach a layer.
+  A `Node::Store` of an overlay mount and its upper inode is built only inside one call (truncate,
+  `may_create`), for mount flags.
 - Overlay nodes live until their instance's last mount is collected, one per directory and name
   ever looked up through it.
 - An fd's display path is frozen at open; later renames do not change `/proc/<pid>/fd/N`.
@@ -854,12 +894,17 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (a restarted dockerd reuses it). podman warns that `/` is not a shared mount, as it does
   natively without systemd.
 
-- **Overlay gaps:** no upper layer yet, so overlays are read-only (copy-up, whiteout and opaque
-  creation, rename and the container engines' use come next); an overlay cannot be a layer
-  (Linux accepts one as a lower layer); inotify on overlay nodes never reports; running a program
-  from an overlay records no store node, so `/proc/<pid>/exe` is followed by its path and writers
-  are not refused with `ETXTBSY`; overlay nodes are never freed while mounted, so walking a large
-  tree grows memory; the no-BKL stat never serves paths in an overlay.
+- **Overlay gaps:** an overlay cannot be a layer (Linux accepts one as a lower layer); inotify on
+  overlay nodes never reports; `/proc/<pid>/exe` of a program from an overlay is followed by its
+  path; overlay nodes are never freed while mounted, so walking a large tree grows memory; the
+  no-BKL stat never serves paths in an overlay; copy-up copies data with the BKL held, so copying
+  up a large file stalls every process; origins are not recorded (no `trusted.overlay.origin`,
+  `impure` or shared whiteout inode), so a copied-up file's inode number changes at the next mount
+  and a hard link made through the overlay shows the upper inode's number; changes through an
+  overlay whose upper layer is on a tmpfs are not counted against that tmpfs's limits; a mapping
+  made from a file opened before its copy-up keeps the lower object; parent directories are copied
+  up before a creation's permission check, so a refused creation still leaves them copied; mounts
+  of other namespaces on a removed or renamed overlay name are not detached.
 
 ## Open questions
 

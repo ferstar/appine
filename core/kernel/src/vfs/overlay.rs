@@ -8,6 +8,13 @@
 //! behind it ([`OvlNode`]) and reads go to the topmost of them. Nodes are created as names are
 //! looked up and kept per directory and name (Linux's overlay dentries), so the same path always
 //! gives the same node; they are dropped with their instance ([`Overlays::remove_instance`]).
+//!
+//! Changes go to the upper layer. What they change is first copied up ([`Overlays::upper_of`]):
+//! its parent directories, then itself with its data, attributes and times, each in one store
+//! transaction where Linux builds the copy in the work directory and renames it into place.
+//! Removing a name the lower layers have leaves a whiteout in its place, a directory made where
+//! one was removed is opaque, and a directory with lower layers cannot be renamed (EXDEV, Linux
+//! without `redirect_dir`).
 
 use std::collections::HashMap;
 
@@ -37,6 +44,12 @@ pub(crate) struct Overlays {
 pub(crate) struct Instance {
     /// The upper layer's root directory, where changes go; None for a read-only overlay.
     pub upper: Option<Ino>,
+    /// The mounter's filesystem user and group IDs (kernel IDs): whiteouts belong to them, as
+    /// Linux makes them with the mounter's credentials.
+    pub mounter: (u32, u32),
+    /// Device numbers of the tmpfs instances its layers are in: they stay while it does, as
+    /// Linux's overlay keeps private mounts of its layers.
+    pub pins: Vec<u64>,
     /// Options as given.
     pub options: Options,
 }
@@ -54,6 +67,10 @@ pub(crate) struct OvlNode {
     /// Inodes in the lower layers, topmost first: for a directory every lower directory merged
     /// into it, for anything else only the topmost one, and none when the upper inode hides them.
     pub lower: Vec<Ino>,
+    /// The lower inode it was copied up from, whose number stat keeps showing (6.1's
+    /// `ovl_getattr` keeps a directory's, and a file's with one link, while the mount lasts:
+    /// Linux records it in `trusted.overlay.origin`, here it is not recorded).
+    origin: Option<Ino>,
     /// Nodes already looked up in it, by name.
     children: HashMap<Vec<u8>, OvlId>,
 }
@@ -177,6 +194,16 @@ impl Options {
         Ok(paths)
     }
 
+    /// The upper layer's path, unescaped.
+    pub(crate) fn upper_path(&self) -> Option<Vec<u8>> {
+        self.upperdir.as_deref().map(unescape)
+    }
+
+    /// The work directory's path, unescaped.
+    pub(crate) fn work_path(&self) -> Option<Vec<u8>> {
+        self.workdir.as_deref().map(unescape)
+    }
+
     /// The superblock options mountinfo shows after `ro`/`rw` (6.1's `ovl_show_options`):
     /// `lowerdir`, `upperdir` and `workdir` as given, then what differs from the defaults
     /// (redirect_dir follow, index, nfs_export, metacopy and xino off).
@@ -286,6 +313,54 @@ fn is_whiteout(st: &Stat) -> bool {
     st.kind() == mode::S_IFCHR && st.rdev == 0
 }
 
+/// Store directory `dir` has a whiteout named `name`.
+pub(crate) fn whiteout_at(store: &Store, dir: Ino, name: &[u8]) -> Result<bool, Errno> {
+    match store.lookup(dir, name)? {
+        Some(ino) => Ok(is_whiteout(&store.attrs(ino)?)),
+        None => Ok(false),
+    }
+}
+
+/// Copies regular file `from`'s data (`len` bytes) into the empty file `to`, leaving holes where
+/// the host reports them (6.1's `ovl_copy_up_data` skips them too).
+fn copy_data(from: &std::fs::File, to: &std::fs::File, len: u64) -> Result<(), Errno> {
+    use std::os::fd::AsRawFd;
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+    let (i, o) = (from.as_raw_fd(), to.as_raw_fd());
+    let mut pos = 0;
+    while pos < len {
+        let data = match appine_hal::lseek(i, pos as i64, SEEK_DATA) {
+            Ok(data) => data,
+            Err(e) if e == Errno::ENXIO.0 => break,
+            // A host that cannot tell has data everywhere
+            Err(_) => pos,
+        };
+        let hole = appine_hal::lseek(i, data as i64, SEEK_HOLE)
+            .unwrap_or(len)
+            .min(len);
+        let mut at = data;
+        while at < hole {
+            let chunk = (hole - at).min(1 << 30) as usize;
+            match appine_hal::copy_file(i, at, o, at, chunk).map_err(Errno)? {
+                0 => break,
+                n => at += n as u64,
+            }
+        }
+        pos = hole.max(data + 1);
+    }
+    to.set_len(len)
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))
+}
+
+/// What a copy-up copies (6.1's `ovl_copy_up_flags`): a file about to be truncated to 0 by
+/// `O_TRUNC` needs no data.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyUp {
+    All,
+    NoData,
+}
+
 /// A directory entry that may be a whiteout (only character devices can be).
 fn maybe_whiteout(store: &Store, e: &DirEntry) -> Result<bool, Errno> {
     Ok(e.mode & mode::S_IFMT == mode::S_IFCHR && is_whiteout(&store.attrs(e.ino)?))
@@ -297,8 +372,8 @@ impl Overlays {
     pub(crate) fn add_instance(
         &mut self,
         dev: u64,
-        upper: Option<Ino>,
-        lower: Vec<Ino>,
+        (upper, lower): Layers,
+        (mounter, pins): ((u32, u32), Vec<u64>),
         options: Options,
     ) -> OvlId {
         let root = self.add_node(OvlNode {
@@ -307,10 +382,19 @@ impl Overlays {
             name: Vec::new(),
             upper,
             lower,
+            origin: None,
             children: HashMap::new(),
         });
         self.node_mut(root).parent = root;
-        self.instances.insert(dev, Instance { upper, options });
+        self.instances.insert(
+            dev,
+            Instance {
+                upper,
+                mounter,
+                pins,
+                options,
+            },
+        );
         root
     }
 
@@ -408,9 +492,13 @@ impl Overlays {
             return Err(Errno::ENOENT);
         }
         let dev = d.dev;
-        // The same name gives the same node again, brought up to date with the layers
+        // The same name gives the same node again, brought up to date with the layers (keeping
+        // what it was copied up from while its upper inode stays)
         if let Some(&id) = d.children.get(name) {
             let n = self.node_mut(id);
+            if n.upper != upper {
+                n.origin = None;
+            }
             n.upper = upper;
             n.lower = lower;
             return Ok(id);
@@ -421,6 +509,7 @@ impl Overlays {
             name: name.to_vec(),
             upper,
             lower,
+            origin: None,
             children: HashMap::new(),
         });
         self.node_mut(dir).children.insert(name.to_vec(), id);
@@ -439,7 +528,15 @@ impl Overlays {
                 if seen.contains_key(&e.name) {
                     continue;
                 }
-                let shown = (!maybe_whiteout(store, &e)?).then(|| e.clone());
+                let mut shown = (!maybe_whiteout(store, &e)?).then(|| e.clone());
+                // A copied-up entry shows the number stat shows
+                if let Some(shown) = &mut shown
+                    && let Some(c) = d.children.get(&e.name).map(|&c| self.node(c))
+                    && c.upper == Some(e.ino)
+                    && let Some(origin) = c.origin
+                {
+                    shown.ino = origin;
+                }
                 seen.insert(e.name, shown);
             }
         }
@@ -447,14 +544,253 @@ impl Overlays {
     }
 
     /// Metadata of node `id` (6.1's `ovl_getattr`): the topmost inode's, with the inode number
-    /// of the upper inode or else the topmost lower one, and one link for a merged directory.
+    /// of the upper inode or else the topmost lower one (of the lower one a copy-up came from,
+    /// [`OvlNode::origin`]), and one link for a merged directory.
     pub(crate) fn stat(&self, store: &Store, id: OvlId) -> Result<Stat, Errno> {
         let n = self.node(id);
         let mut st = store.stat(n.real())?;
         if st.is_dir() && n.merged() {
             st.nlink = 1;
         }
+        if let Some(origin) = n.origin {
+            st.ino = origin;
+        }
         Ok(st)
+    }
+
+    /// The inode number stat shows for node `id` ([`Overlays::stat`]).
+    pub(crate) fn shown_ino(&self, id: OvlId) -> Ino {
+        let n = self.node(id);
+        n.origin.unwrap_or(n.real())
+    }
+
+    /// The tmpfs instances (device numbers) the layers of live instances are in.
+    pub(crate) fn pinned(&self) -> impl Iterator<Item = u64> + '_ {
+        self.instances.values().flat_map(|i| i.pins.iter().copied())
+    }
+
+    /// The instance node `id` is in.
+    pub(crate) fn instance_of(&self, id: OvlId) -> &Instance {
+        &self.instances[&self.node(id).dev]
+    }
+
+    /// Whether a lower layer shows `name` in directory `dir` (6.1's `ovl_lower_positive`): the
+    /// topmost lower directory merged into `dir` that has the name decides, and a whiteout
+    /// there hides it.
+    pub(crate) fn lower_has(&self, store: &Store, dir: OvlId, name: &[u8]) -> Result<bool, Errno> {
+        for &l in &self.node(dir).lower {
+            if let Some(c) = store.lookup(l, name)? {
+                return Ok(!is_whiteout(&store.attrs(c)?));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Node `id`'s upper inode, copying it up first when it has none (6.1's `ovl_copy_up`):
+    /// its parent directories, then itself as the topmost lower inode is, with its mode, owner,
+    /// attributes other than the overlay's own, times and, unless `what` says otherwise, data;
+    /// the parent's times stay as they were. EROFS without an upper layer.
+    pub(crate) fn upper_of(
+        &mut self,
+        store: &Store,
+        id: OvlId,
+        what: CopyUp,
+    ) -> Result<Ino, Errno> {
+        if let Some(upper) = self.node(id).upper {
+            return Ok(upper);
+        }
+        if self.instance_of(id).upper.is_none() {
+            return Err(Errno::EROFS);
+        }
+        let parent = self.node(id).parent;
+        if parent == id {
+            return Err(Errno::EIO);
+        }
+        let dir = self.upper_of(store, parent, CopyUp::All)?;
+        let n = self.node(id);
+        let lower = *n.lower.first().ok_or(Errno::EIO)?;
+        let name = n.name.clone();
+        let prefix = self.options_of(id).private_prefix();
+        let st = store.stat(lower)?;
+        let upper = store.transaction(|s| {
+            let pst = s.stat(dir)?;
+            let perm = st.mode & 0o7777;
+            let ino = match st.kind() {
+                mode::S_IFDIR => s.mkdir(dir, &name, perm, st.uid, st.gid)?,
+                mode::S_IFREG => {
+                    let (ino, file) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
+                    if what == CopyUp::All {
+                        copy_data(&s.open_object(lower, false)?, &file, st.size)?;
+                    }
+                    ino
+                }
+                mode::S_IFLNK => s.symlink(dir, &name, &s.readlink(lower)?, st.uid, st.gid)?,
+                kind => s.mknod(dir, &name, kind | perm, st.rdev, st.uid, st.gid)?,
+            };
+            for x in s.list_xattr(lower)? {
+                if !x.starts_with(prefix) {
+                    s.set_xattr(ino, &x, &s.get_xattr(lower, &x)?, false, false)?;
+                }
+            }
+            let at = super::store::FileTime::At;
+            s.set_times(ino, Some(at(st.atime_ns)), Some(at(st.mtime_ns)))?;
+            s.set_times(dir, Some(at(pst.atime_ns)), Some(at(pst.mtime_ns)))?;
+            Ok(ino)
+        })?;
+        let n = self.node_mut(id);
+        n.upper = Some(upper);
+        if st.is_dir() || st.nlink == 1 {
+            n.origin = Some(lower);
+        }
+        if !st.is_dir() {
+            n.lower.clear();
+        }
+        Ok(upper)
+    }
+
+    /// Makes a whiteout named `name` in store directory `dir` for node `id`'s instance.
+    fn whiteout(&self, s: &Store, id: OvlId, dir: Ino, name: &[u8]) -> Result<(), Errno> {
+        let (uid, gid) = self.instance_of(id).mounter;
+        s.mknod(dir, name, mode::S_IFCHR, 0, uid, gid).map(|_| ())
+    }
+
+    /// Removes `name` from directory `dir` (6.1's `ovl_do_remove`), once the caller has checked
+    /// that it can go (with `rmdir`, an empty directory): the upper inode goes, with the
+    /// whiteouts left in a directory, and a whiteout takes its place when a lower layer has the
+    /// name.
+    pub(crate) fn remove(
+        &mut self,
+        store: &Store,
+        dir: OvlId,
+        name: &[u8],
+        rmdir: bool,
+    ) -> Result<(), Errno> {
+        let child = self.lookup(store, dir, name)?;
+        let lower = self.lower_has(store, dir, name)?;
+        let up = self.upper_of(store, dir, CopyUp::All)?;
+        let child_upper = self.node(child).upper;
+        store.transaction(|s| {
+            match child_upper {
+                Some(u) if rmdir => {
+                    for e in s.readdir(u)? {
+                        s.unlink(u, &e.name)?;
+                    }
+                    s.rmdir(up, name)?;
+                }
+                Some(_) => s.unlink(up, name)?,
+                None => {}
+            }
+            if lower {
+                self.whiteout(s, dir, up, name)?;
+            }
+            Ok(())
+        })?;
+        self.node_mut(dir).children.remove(name);
+        Ok(())
+    }
+
+    /// Renames `old_name` in directory `old` to `new_name` in directory `new` (6.1's
+    /// `ovl_rename`), once the caller has checked permissions: rules on the merged view first
+    /// (ENOENT, EEXIST with `noreplace`, ENOTDIR, EISDIR, ENOTEMPTY), then EXDEV for a
+    /// directory with lower layers, then everything involved is copied up and renamed in the
+    /// upper layer, a whiteout left at the old name when a lower layer has it, and a directory
+    /// moved into a merged one made opaque so it does not merge there.
+    pub(crate) fn rename(
+        &mut self,
+        store: &Store,
+        (old, old_name): (OvlId, &[u8]),
+        (new, new_name): (OvlId, &[u8]),
+        (noreplace, exchange): (bool, bool),
+    ) -> Result<(), Errno> {
+        let src = self.lookup(store, old, old_name)?;
+        let dst = match self.lookup(store, new, new_name) {
+            Ok(d) => Some(d),
+            Err(Errno::ENOENT) if !exchange => None,
+            Err(e) => return Err(e),
+        };
+        if dst == Some(src) {
+            return Ok(());
+        }
+        let is_dir = |o: &Self, id| -> Result<bool, Errno> {
+            Ok(store.kind(o.node(id).real())? == mode::S_IFDIR)
+        };
+        let src_dir = is_dir(self, src)?;
+        if let Some(d) = dst {
+            if noreplace {
+                return Err(Errno::EEXIST);
+            }
+            let dst_dir = is_dir(self, d)?;
+            if !exchange {
+                match (src_dir, dst_dir) {
+                    (true, false) => return Err(Errno::ENOTDIR),
+                    (false, true) => return Err(Errno::EISDIR),
+                    (true, true) if !self.readdir(store, d)?.is_empty() => {
+                        return Err(Errno::ENOTEMPTY);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let has_lower = |o: &Self, id| -> Result<bool, Errno> {
+            Ok(is_dir(o, id)? && !o.node(id).lower.is_empty())
+        };
+        if has_lower(self, src)? || (exchange && has_lower(self, dst.unwrap_or(src))?) {
+            return Err(Errno::EXDEV);
+        }
+        let old_up = self.upper_of(store, old, CopyUp::All)?;
+        let new_up = self.upper_of(store, new, CopyUp::All)?;
+        let src_up = self.upper_of(store, src, CopyUp::All)?;
+        let dst_up = match dst {
+            Some(d) if exchange => Some(self.upper_of(store, d, CopyUp::All)?),
+            Some(d) => self.node(d).upper,
+            None => None,
+        };
+        let old_lower = !exchange && self.lower_has(store, old, old_name)?;
+        // A directory moving into a merged one would merge with what the lower layers have under
+        // its new name
+        let opaque = [self.options_of(src).private_prefix(), b"opaque"].concat();
+        let merged = |o: &Self, id: OvlId| !o.node(id).lower.is_empty();
+        let src_opaque = src_dir && merged(self, new);
+        let dst_opaque =
+            exchange && dst.is_some_and(|d| is_dir(self, d).unwrap_or(false)) && merged(self, old);
+        store.transaction(|s| {
+            if dst.is_none() && whiteout_at(s, new_up, new_name)? {
+                s.unlink(new_up, new_name)?;
+            }
+            // The directory being replaced may still hold whiteouts
+            if !exchange
+                && src_dir
+                && let Some(du) = dst_up
+            {
+                for e in s.readdir(du)? {
+                    s.unlink(du, &e.name)?;
+                }
+            }
+            s.rename(old_up, old_name, new_up, new_name, false, exchange)?;
+            if old_lower {
+                self.whiteout(s, src, old_up, old_name)?;
+            }
+            if src_opaque {
+                s.set_xattr(src_up, &opaque, b"y", false, false)?;
+            }
+            if dst_opaque && let Some(du) = dst_up {
+                s.set_xattr(du, &opaque, b"y", false, false)?;
+            }
+            Ok(())
+        })?;
+        self.node_mut(old).children.remove(old_name);
+        let replaced = self.node_mut(new).children.remove(new_name);
+        let n = self.node_mut(src);
+        n.parent = new;
+        n.name = new_name.to_vec();
+        self.node_mut(new).children.insert(new_name.to_vec(), src);
+        if exchange && let Some(d) = replaced {
+            let n = self.node_mut(d);
+            n.parent = old;
+            n.name = old_name.to_vec();
+            self.node_mut(old).children.insert(old_name.to_vec(), d);
+        }
+        Ok(())
     }
 
     /// The node's parent directory (the root's is itself).
@@ -525,7 +861,12 @@ mod tests {
         s.create_file(a, b"g", 0o644, 0, 0).unwrap();
         s.mkdir(b, b"g", 0o755, 0, 0).unwrap();
         let mut o = Overlays::default();
-        let top = o.add_instance(0x30, None, vec![a, b], Options::default());
+        let top = o.add_instance(
+            0x30,
+            (None, vec![a, b]),
+            ((0, 0), Vec::new()),
+            Options::default(),
+        );
         let names = |o: &Overlays, d| -> Vec<Vec<u8>> {
             o.readdir(&s, d)
                 .unwrap()
