@@ -332,11 +332,11 @@ impl OpenFile {
     }
 
     /// What locks are keyed by ([`crate::locks`]): the store inode, or for a file opened through
-    /// an overlay its overlay node (Linux locks the overlay's inode, which copying up does not
-    /// change), with the top bit set so it is never a store inode's number.
+    /// an overlay its overlay node's key (Linux locks the overlay's inode, which copying up does
+    /// not change; [`crate::vfs::overlay::key`]).
     pub fn lock_ino(&self) -> Option<Ino> {
         match self.ovl {
-            Some(o) => Some(1 << 63 | o),
+            Some(o) => Some(crate::vfs::overlay::key(o)),
             None => self.ino(),
         }
     }

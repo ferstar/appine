@@ -7,7 +7,7 @@
 //!
 //! - Events on a file are also reported to the watches of its directory (with the name). For
 //!   path-based operations, the path is resolved a second time to find the directory only when
-//!   there are watches ([`watched_parent`]). For fd-based operations (reads, writes, truncation,
+//!   there are watches ([`watched_at`]). For fd-based operations (reads, writes, truncation,
 //!   close) the directory and name the open went through are used: every open store file carries
 //!   an [`Opened`] recording them, the equivalent of the dentry a Linux open file references. They
 //!   are updated when rename moves the dentry ([`renamed`]); after deletion they stay unchanged
@@ -19,6 +19,11 @@
 //!   same as Linux reporting it when the last reference to the dentry is released.
 //! - Events on directories carry `IN_ISDIR`; `IN_DELETE_SELF` and `IN_MOVE_SELF` do not, as
 //!   inotify always has (Linux leaves it out deliberately for compatibility with old programs).
+//! - In an overlay, watches and events are on the overlay's nodes (Linux's overlay inodes and
+//!   dentries), registered under their [`crate::vfs::overlay::key`]: what is done through the
+//!   overlay is reported to the node and its overlay directory, not to the layers' inodes behind
+//!   it, which copying up changes. Linux's overlay also changes the upper layer through the VFS,
+//!   which reports there too; here only creations are also reported to the upper directory.
 //! - Watches can be added on synthetic filesystems (procfs, devpts), but never get events.
 //! - As on Linux: an event identical to the unread event at the tail of the queue is merged; once
 //!   `max_queued_events` events are queued, new ones are dropped and one `IN_Q_OVERFLOW` is
@@ -36,7 +41,7 @@ use crate::fd::{FileKind, OpenFile, oflags};
 use crate::kernel::{Cx, Kernel, request_wake_object, wake};
 use crate::vfs::browse::Change;
 use crate::vfs::store::Ino;
-use crate::vfs::{Node, Vfs};
+use crate::vfs::{Node, Vfs, overlay};
 
 pub(crate) const IN_ACCESS: u32 = 0x1;
 pub(crate) const IN_MODIFY: u32 = 0x2;
@@ -75,6 +80,8 @@ const MAX_WATCHES: usize = 1 << 20;
 struct Watch {
     node: Node,
     mask: u32,
+    /// The inode number and device (the kernel's internal encoding) fdinfo shows.
+    shown: (Ino, u64),
 }
 
 #[derive(PartialEq)]
@@ -183,14 +190,7 @@ impl Inotify {
     pub fn fdinfo(&self) -> String {
         let mut out = String::new();
         for (wd, w) in &self.watches {
-            let (ino, sdev) = match &w.node {
-                // The kernel's internal device number encoding: (major << 20) | minor; the store is
-                // 8:1, procfs 0:4
-                Node::Store(_, ino) => (*ino, 0x80_0001),
-                Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
-                // Watches on overlay nodes are accepted and never report, as on synthetic nodes
-                Node::Overlay(..) => (0, 0),
-            };
+            let (ino, sdev) = w.shown;
             out += &format!(
                 "inotify wd:{wd:x} ino:{ino:x} sdev:{sdev:x} mask:{:x} ignored_mask:0",
                 w.mask
@@ -221,7 +221,7 @@ impl Drop for Inotify {
         user.0 = user.0.saturating_sub(1);
         user.1 = user.1.saturating_sub(self.watches.len());
         for w in self.watches.values() {
-            if let Node::Store(_, ino) = w.node
+            if let Some(ino) = key_of(&w.node)
                 && let Some(list) = r.by_ino.get_mut(&ino)
             {
                 // An instance being dropped has no strong references left, so all weak
@@ -274,9 +274,25 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
     if mask & IN_ONLYDIR != 0 && !vfs.is_dir(&view, &node)? {
         return Err(Errno::ENOTDIR);
     }
-    if let Node::Store(_, ino) = node {
-        cx.cred().permission(&vfs.store().stat(ino)?, MAY_READ)?;
-    }
+    // What fdinfo shows: the device in the kernel's internal encoding, (major << 20) | minor (the
+    // store is 8:1, procfs 0:4)
+    let internal = |dev: u64| {
+        let major = (dev >> 8) & 0xfff | (dev >> 32) & !0xfff;
+        let minor = dev & 0xff | (dev >> 12) & !0xff;
+        major << 20 | minor
+    };
+    let shown = match &node {
+        Node::Store(_, ino) => {
+            cx.cred().permission(&vfs.store().stat(*ino)?, MAY_READ)?;
+            (*ino, 0x80_0001)
+        }
+        Node::Overlay(_, o) => {
+            let st = vfs.overlay_stat(*o)?;
+            cx.cred().permission(&st, MAY_READ)?;
+            (st.ino, internal(vfs.dev_of(&node)))
+        }
+        Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
+    };
     let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
     let mut i = inotify.borrow_mut();
     // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
@@ -305,9 +321,10 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         Watch {
             node: node.clone(),
             mask: mask & keep,
+            shown,
         },
     );
-    if let Node::Store(_, ino) = node {
+    if let Some(ino) = key_of(&node) {
         r.vfs = Rc::downgrade(&vfs);
         r.by_ino
             .entry(ino)
@@ -324,7 +341,7 @@ pub(super) fn inotify_rm_watch(cx: &mut Cx<'_>, fd: i32, wd: i32) -> SysResult {
     i.push(wd, IN_IGNORED, 0, b"");
     let mut r = cx.kr().inotify.borrow_mut();
     r.uncharge(i.uid);
-    if let Node::Store(_, ino) = w.node
+    if let Some(ino) = key_of(&w.node)
         && let Some(list) = r.by_ino.get_mut(&ino)
     {
         list.retain(|(weak, w)| !(*w == wd && weak.ptr_eq(&Rc::downgrade(&inotify))));
@@ -397,8 +414,9 @@ type Watcher = (Weak<RefCell<Inotify>>, i32);
 
 /// All watches, by watched inode.
 pub struct Registry {
-    /// The (instance, wd) pairs on each inode. The weak references die once the instance is
-    /// closed and are cleared the next time they are come across.
+    /// The (instance, wd) pairs on each inode: a store inode number, or an overlay node's
+    /// [`overlay::key`]. The weak references die once the instance is closed and are cleared the
+    /// next time they are come across.
     by_ino: HashMap<Ino, Vec<Watcher>>,
     last_cookie: u32,
     /// The store the watches are in: `IN_EXCL_UNLINK` must check whether a child still has links.
@@ -459,10 +477,13 @@ impl Registry {
             return false;
         };
         let mut unlinked = None;
+        // An overlay node is unlinked once its directory no longer has it
         let mut is_unlinked = |child: Ino| {
             *unlinked.get_or_insert_with(|| {
-                vfs.upgrade()
-                    .is_some_and(|v| v.store().stat(child).map_or(true, |st| st.nlink == 0))
+                vfs.upgrade().is_some_and(|v| match overlay::of_key(child) {
+                    Some(o) => !v.overlay().linked(o),
+                    None => v.store().stat(child).map_or(true, |st| st.nlink == 0),
+                })
             })
         };
         let mut queued = false;
@@ -552,26 +573,43 @@ pub(crate) fn active(k: &Kernel) -> bool {
     !idle(k)
 }
 
-/// The directory and name of the object of a path-based operation (for the directory's watches).
-/// Not resolved when there are no watches at all.
-pub(crate) fn watched_parent(
+/// What events of node `node` are keyed by: a store inode's number, an overlay node's
+/// [`overlay::key`]; None for synthetic nodes, which never report.
+pub(crate) fn key_of(node: &Node) -> Option<Ino> {
+    match node {
+        Node::Store(_, ino) => Some(*ino),
+        Node::Overlay(_, o) => Some(overlay::key(*o)),
+        Node::Pseudo(..) => None,
+    }
+}
+
+/// What events of a path-based operation go to: `ino`, the store inode it changed, or the
+/// overlay node the path names (whose change went to its upper inode), and the directory and
+/// name (for the directory's watches). The path is resolved again only when there are watches.
+pub(crate) fn watched_at(
     cx: &Cx<'_>,
-    dirfd: i32,
-    path: &[u8],
+    ino: Ino,
+    (dirfd, path): (i32, &[u8]),
     follow: bool,
-) -> Option<(Ino, Vec<u8>)> {
+) -> (Ino, Option<(Ino, Vec<u8>)>) {
     if idle(cx.kr()) || path.is_empty() {
-        return None;
+        return (ino, None);
     }
-    let vfs = cx.vfs().ok()?;
-    let start = super::fs::start_dir(cx, dirfd, path).ok()?;
-    let (_, found) = vfs
-        .walk(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path, follow)
-        .ok()?;
-    match found? {
-        (Node::Store(_, dir), name) => Some((dir, name)),
-        _ => None,
-    }
+    let found = (|| {
+        let vfs = cx.vfs().ok()?;
+        let start = super::fs::start_dir(cx, dirfd, path).ok()?;
+        vfs.walk(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path, follow)
+            .ok()
+    })();
+    let Some((node, dentry)) = found else {
+        return (ino, None);
+    };
+    let target = match node {
+        Node::Overlay(_, o) => overlay::key(o),
+        _ => ino,
+    };
+    let parent = dentry.and_then(|(dir, name)| Some((key_of(&dir)?, name)));
+    (target, parent)
 }
 
 /// An event of the object `ino` itself in a path-based operation; `parent` is its directory and
@@ -587,14 +625,10 @@ pub(crate) fn file_event(k: &Kernel, f: &OpenFile, mask: u32) {
     if idle(k) {
         return;
     }
-    let (ino, mask) = match &f.kind {
-        FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => (*ino, mask),
-        FileKind::Directory {
-            node: Node::Store(_, ino),
-            ..
-        } => (*ino, mask | IN_ISDIR),
-        _ => return,
+    let Some((ino, dir)) = file_key(f) else {
+        return;
     };
+    let mask = mask | dir;
     let parent = f
         .watch
         .as_ref()
@@ -619,22 +653,23 @@ pub(crate) fn cookie(k: &Kernel) -> u32 {
     r.last_cookie
 }
 
-/// The [`Opened`] a newly opened store file carries. `parent` is the directory and name the open
-/// went through.
+/// What events of open file `f` are keyed by, and `IN_ISDIR` for a directory: its store inode,
+/// or the overlay node it was opened through (whose store inode copying up changes). None for
+/// other kinds of files.
+fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
+    match &f.kind {
+        FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
+            Some((f.ovl.map_or(*ino, overlay::key), 0))
+        }
+        FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
+        _ => None,
+    }
+}
+
+/// The [`Opened`] a newly opened store or overlay file carries. `parent` is the directory and name
+/// the open went through.
 pub(crate) fn opened(k: &Kernel, f: &OpenFile, parent: Option<(Ino, Vec<u8>)>) -> Option<Opened> {
-    let ino = match &f.kind {
-        FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => *ino,
-        FileKind::Directory {
-            node: Node::Store(_, ino),
-            ..
-        } => *ino,
-        _ => return None,
-    };
-    let dir = if matches!(f.kind, FileKind::Directory { .. }) {
-        IN_ISDIR
-    } else {
-        0
-    };
+    let (ino, dir) = file_key(f)?;
     Some(Opened {
         registry: Rc::downgrade(&k.inotify),
         ino,
@@ -802,6 +837,7 @@ mod tests {
             Watch {
                 node: Node::Store(crate::vfs::ROOT_MOUNT, ino),
                 mask,
+                shown: (ino, 0x80_0001),
             },
         );
         r.by_ino

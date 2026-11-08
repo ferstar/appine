@@ -19,12 +19,17 @@ cat > ino.c <<'C'
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int in, wd_dir, wd_file, wd_once;
+static int in, wd_dir, wd_file, wd_once, wd_src = -2, wd_target = -2;
 static unsigned last_cookie;
 
 static const char *who(int wd)
 {
-    return wd == wd_dir ? "dir" : wd == wd_file ? "file" : wd == wd_once ? "once" : "?";
+    return wd == wd_dir      ? "dir"
+           : wd == wd_file   ? "file"
+           : wd == wd_once   ? "once"
+           : wd == wd_src    ? "src"
+           : wd == wd_target ? "target"
+                             : "?";
 }
 
 static void print_mask(unsigned m)
@@ -103,8 +108,18 @@ int main(void)
     rename("d/f", "d/f2");
     syscall(SYS_renameat2, AT_FDCWD, "d/s", AT_FDCWD, "d/p", 2 /* RENAME_EXCHANGE */);
     drain("rename+exchange");
+    /* The moved name is watched too: fsnotify_move reports the replaced one's link count before
+     * the moved one's MOVE_SELF, and the replaced one's deletion after it */
+    wd_src = inotify_add_watch(in, "d/p", IN_ALL_EVENTS | IN_DONT_FOLLOW);
     rename("d/p", "d/f2");
     drain("rename over the watched file");
+    mkdir("d/x", 0755);
+    mkdir("d/y", 0755);
+    wd_src = inotify_add_watch(in, "d/x", IN_ALL_EVENTS);
+    wd_target = inotify_add_watch(in, "d/y", IN_ALL_EVENTS);
+    rename("d/x", "d/y");
+    rmdir("d/y");
+    drain("rename over the watched directory");
     unlink("d/f2");
     unlink("d/s");
     drain("unlink");

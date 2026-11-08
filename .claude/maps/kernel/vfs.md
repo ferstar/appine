@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners, file caps; loop devices; timerfd; test-suite findings; mounts, propagation; splice; holes, seeks, renames; overlayfs; AIO; `/proc/locks`; FIONREAD, counted misses; clones last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs; AIO; FIONREAD; clones; inotify through overlays last)
 
 ## Responsibilities
 
@@ -90,7 +90,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   open file (`None` when unbound), offset, size limit, size in bytes, flags, name, logical and soft
   block sizes, `BLKROSET` and disk read-only state, read-ahead, opener count and exclusive claim.
 - `EventFd`, `TimerFd`.
-- `Inotify`, `Event`, `Registry` (one per kernel, watches keyed by store inode), `Opened`.
+- `Inotify`, `Event`, `Registry` (one per kernel, watches keyed by store inode number or overlay
+  node key), `Opened`.
 - `AioContext` — one io_setup context: its capacity `nr`, completed `io_event`s, pending polls
   (each holding its open file and the eventfd `aio_resfd` named) and the `dead` mark set when it is
   released; held by the thread group (`ThreadGroup::aio`), keyed by its id.
@@ -124,7 +125,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `Loops::numbers`, `sysfs_exists` and `sysfs_read` (the `/sys/block` view for `kernel/procfs`).
 - **inotify**: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`, read; hooks `active`,
   `path_event`, `file_event`, `dir_event`, `cookie`, `opened`, `renamed`, `deleted`,
-  `watched_parent`; `host_change`.
+  `watched_at`, `key_of`; `host_change`.
 - **AIO**: `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents`, `io_pgetevents`;
   `aio_released` (execve, group exit).
 - **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps),
@@ -444,8 +445,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   fail (`kernel/procfs`); content is generated at open, and the opener's credentials are kept for
   regeneration and id-map writes.
 - Overlay nodes: see overlayfs.
-- Every non-`O_PATH` store open records an inotify `Opened` (directory, name, close mask), whether
-  or not watches exist (overlay opens record none); `O_TMPFILE` is not implemented: openat and
+- Every non-`O_PATH` store or overlay open records an inotify `Opened` (the file's key, the
+  directory's key and the name, the close mask), whether or not watches exist; `O_TMPFILE` is not implemented: openat and
   openat2 reject invalid combinations as Linux does (with `O_CREAT`, or read-only, `EINVAL`), and a valid one reaches the
   directory branch (`EISDIR`). `O_DIRECT` opens only store regular files outside tmpfs and loop
   devices (6.1's `direct_IO` check, before the file's own open here): directories, tmpfs files,
@@ -718,23 +719,36 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Instances: `inotify_init1` accepts `O_CLOEXEC|O_NONBLOCK`; per-user instance (`EMFILE`) and
   watch (`ENOSPC`) limits and the queue limit come from `/proc/sys/fs/inotify/*` (defaults 128
   instances, 2^20 watches, 16384 queued events).
-- Watches are keyed by store inode; watches on synthetic and overlay nodes are accepted, counted
-  and never report. `IN_MASK_ADD`/`IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW`,
+- Watches are keyed by store inode number, or for an overlay node by its key (its id with the
+  top bit set, `overlay::key`, also the lock tables' key); watches on synthetic nodes are accepted,
+  counted and never report. Adding one needs read permission on what the store or the overlay
+  shows; fdinfo gives the inode number and device stat shows. `IN_MASK_ADD`/`IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW`,
   `IN_EXCL_UNLINK`, `IN_ONESHOT`; store targets need read permission.
-- Reporting: with no store watches every hook costs one emptiness check. An event goes first to
+- Reporting: with no watches every hook costs one emptiness check. An event goes first to
   the parent directory's watches with the name (not for `*_SELF`), then to the inode's own.
   Identical consecutive events merge; a full queue drops events and queues one `IN_Q_OVERFLOW`.
   `IN_IGNORED` follows removal, `IN_DELETE_SELF` and a matching `IN_ONESHOT`.
 - Hooks follow the fsnotify call sites: open (`IN_CREATE` or `IN_MODIFY` for a truncating open,
   then `IN_OPEN`), mkdir/mknod/symlink/AF_UNIX bind, link (`IN_ATTRIB` on the source, then
   `IN_CREATE`), unlink/rmdir (`IN_ATTRIB`, delete-self, `IN_DELETE`), rename (cookie pair, then
-  `IN_MOVE_SELF`; exchange reported both ways), attribute changes (`IN_ATTRIB`, also for
+  as `fsnotify_move`: a replaced object's `IN_ATTRIB`, with `IN_ISDIR` for a directory, the moved
+  one's `IN_MOVE_SELF`, the replaced one's delete-self; exchange reported both ways), attribute
+  changes (`IN_ATTRIB`, also for
   utimensat changing both times; `IN_ACCESS` or `IN_MODIFY` when only the access or the
   modification time changes, as `fsnotify_change`), writes,
   truncation and fallocate (`IN_MODIFY`), reads and getdents (`IN_ACCESS`), last close of an open
   file (`IN_CLOSE_*` to the directory and name it was opened through).
 - `IN_DELETE_SELF` waits until the last open file of the removed name closes. Renames update the
   `Opened` records of open files (scanning all open files, even with no watches).
+- Through an overlay the same hooks report to the overlay's nodes, as Linux's VFS reports on
+  overlay inodes and dentries: the node and its overlay directory with its name (an open file's
+  events through the node it was opened through, whose upper inode copying up changes;
+  path-based attribute changes and truncation find the node by resolving the path again), not
+  the layers' inodes behind them, so changes made in a layer directly do not reach them. Removal
+  deletes the node when it was a directory or had one link; `IN_EXCL_UNLINK` takes a node its
+  directory no longer has as unlinked (`Overlays::linked`). Creations (open with `O_CREAT`, mkdir,
+  mknod, symlink, link, AF_UNIX bind) also report `IN_CREATE` to the upper directory first, where
+  Linux's overlay makes them through the VFS.
 - Files app changes (`host_change`, run under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; there are no
   access, close-nowrite, read-open or attribute events from the provider.
@@ -850,7 +864,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - An fd's display path is frozen at open; later renames do not change `/proc/<pid>/fd/N`.
 - Locks and leases are keyed by inode only and live in one kernel; they are not visible to other
   kernels or the host.
-- Every store open allocates an inotify `Opened` record and every rename that moves open files
+- inotify keys an overlay node by `overlay::key` (as the lock tables do): a hook given the store
+  inode behind something reached through an overlay reports to the layer, where no watch on the
+  overlay sees it, so overlay paths must pass the node's key (`key_of`, `file_key`).
+- Every store and overlay open allocates an inotify `Opened` record and every rename that moves
+  open files
   scans all open files, even with no watches.
 - A held file's object is shared and must never be written in place: every path that changes a
   regular file calls `prepare_write` (or `make_private`) first, with no borrow of the open file
@@ -984,8 +1002,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (ext4 has none: the native side of the differential tests says `EOPNOTSUPP`); ranges other than
   whole files are copied rather than shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a whole-file
   copy_file_range returns more than Linux's `MAX_RW_COUNT` in one call.
-- **Overlay gaps:** an overlay cannot be a layer (Linux accepts one as a lower layer); inotify on
-  overlay nodes never reports; `/proc/<pid>/exe` of a program from an overlay is followed by its
+- **Overlay gaps:** an overlay cannot be a layer (Linux accepts one as a lower layer); watches
+  on a layer's own directories and files see, of what is done through the overlay, only
+  creations (Linux's overlay changes the upper layer through the VFS, which reports copy-ups,
+  removals, renames and attribute changes there too); a hard link made through the overlay and
+  then removed leaves the file's watch reporting its deletion with its last name, where Linux's
+  overlay keeps the link counted on the file's inode and never does; `/proc/<pid>/exe` of a
+  program from an overlay is followed by its
   path; overlay nodes are never freed while mounted, so walking a large tree grows memory; the
   no-BKL stat never serves paths in an overlay; a copied-up file shares the lower object, so a
   change made to the lower layer by another path before the upper file is written shows through

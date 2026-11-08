@@ -24,6 +24,7 @@ use crate::signal::{self, SigInfo};
 use crate::tty::{PTS_MAJOR, Tty};
 use crate::uaccess::UserSlice;
 use crate::vfs::dev::{self, Device, rdev};
+use crate::vfs::overlay::{self, OvlId};
 use crate::vfs::store::{DirEntry, FileTime, Ino, Stat, Store, mode};
 use crate::vfs::{Dentry, Fs, MountId, Node, Pseudo, TMPFS_PAGE, Vfs, ms, normalize};
 
@@ -525,7 +526,7 @@ fn open_path_with(
     }
     let was_created = created.is_some();
     let via_devpts = matches!(node, Node::Pseudo(_, PseudoNode::Pts(..)));
-    let opened_ino = node.ino().filter(|_| flags & oflags::O_PATH == 0);
+    let opened_ino = inotify::key_of(&node).filter(|_| flags & oflags::O_PATH == 0);
     // Files in the store record the mount they were reached through ([`OpenFile::mnt`]), and
     // those in an overlay their overlay node too ([`OpenFile::ovl`])
     let store_mnt = node.ino().map(|_| node.mnt());
@@ -961,7 +962,8 @@ fn reopen_exe(
 }
 
 /// inotify events of open, in the same order as Linux: create (reported to the directory),
-/// truncation by `O_TRUNC`, open. Attaches an [`inotify::Opened`] to the open file.
+/// truncation by `O_TRUNC`, open. `ino` is the file's key ([`inotify::key_of`]). Attaches an
+/// [`inotify::Opened`] to the open file.
 fn open_events(
     cx: &Cx<'_>,
     file: &FileRef,
@@ -971,11 +973,19 @@ fn open_events(
     flags: u32,
 ) {
     let k = cx.kr();
-    let parent = match parent {
-        Some((Node::Store(_, dir), name)) => Some((dir, name)),
+    // A file created through an overlay was created in its upper directory first, which reports it
+    // too (Linux's overlay creates it there through the VFS)
+    let upper = match &parent {
+        Some((Node::Overlay(_, d), _)) if created => {
+            cx.vfs().ok().and_then(|v| v.overlay().node(*d).upper)
+        }
         _ => None,
     };
+    let parent = parent.and_then(|(dir, name)| Some((inotify::key_of(&dir)?, name)));
     if inotify::active(k) {
+        if let (Some(up), Some((_, name))) = (upper, &parent) {
+            inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
+        }
         open_notify(k, file, ino, parent.as_ref(), created, flags);
     }
     let watch = inotify::opened(k, &file.borrow(), parent);
@@ -5450,7 +5460,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     if let Some(r) = cgroup_mkdir(cx, dirfd, &path) {
         return r.map(|()| 0);
     }
-    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -5467,13 +5477,7 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
         |&ino| ino,
     )?;
     tmpfs_created(&vfs, tmpfs, 0);
-    inotify::dir_event(
-        cx.kr(),
-        dir,
-        name,
-        inotify::IN_CREATE | inotify::IN_ISDIR,
-        0,
-    );
+    created_events(cx.kr(), (dir, ovl), name, inotify::IN_ISDIR);
     Ok(0)
 }
 
@@ -5509,7 +5513,7 @@ pub(super) fn mknodat(
     dev: u64,
 ) -> SysResult {
     let path = read_path(cx, path)?;
-    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -5550,7 +5554,7 @@ pub(super) fn mknodat(
     };
     create_in(&vfs, (mnt, dir), name, made, |&ino| ino)?;
     tmpfs_created(&vfs, tmpfs, 0);
-    inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
+    created_events(cx.kr(), (dir, ovl), name, 0);
     Ok(0)
 }
 
@@ -5690,7 +5694,23 @@ fn unlink_overlay(
         if rmdir && !vfs.overlay_readdir(c)?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
-        vfs.overlay_remove(d, name, rmdir)
+        vfs.overlay_remove(d, name, rmdir)?;
+        // As the store's removals report: a file's link count changed, the node is deleted with
+        // its last link (once the files opened through it have closed), then the directory's
+        // entry goes
+        let k = cx.kr();
+        let (key, dir) = (overlay::key(c), overlay::key(d));
+        if rmdir {
+            inotify::deleted(k, key, dir, name);
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE | inotify::IN_ISDIR, 0);
+        } else {
+            inotify::path_event(k, key, None, inotify::IN_ATTRIB);
+            if st.nlink <= 1 {
+                inotify::deleted(k, key, dir, name);
+            }
+            inotify::dir_event(k, dir, name, inotify::IN_DELETE, 0);
+        }
+        Ok(())
     })())
 }
 
@@ -5805,7 +5825,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         return Err(Errno::ENOENT);
     }
     let path = read_path(cx, path)?;
-    let (mnt, dir, name) = create_parent_at(cx, dirfd, &path)?;
+    let (mnt, dir, name, ovl) = create_parent_at(cx, dirfd, &path)?;
     if name == b"." || name == b".." {
         return Err(Errno::EEXIST);
     }
@@ -5825,7 +5845,7 @@ pub(super) fn symlinkat(cx: &mut Cx<'_>, target: u64, dirfd: i32, path: u64) -> 
         |&ino| ino,
     )?;
     tmpfs_created(&vfs, tmpfs, pages);
-    inotify::dir_event(cx.kr(), dir, name, inotify::IN_CREATE, 0);
+    created_events(cx.kr(), (dir, ovl), name, 0);
     Ok(0)
 }
 
@@ -5974,6 +5994,12 @@ fn link_overlay(
         || vfs.store().link(up, name, file).map(|()| file),
         |&ino| ino,
     )?;
+    // The new name in the upper directory, then as 6.1's `fsnotify_link` reports the link through
+    // the overlay: the file's link count changed, then the name
+    let k = cx.kr();
+    inotify::dir_event(k, up, name, inotify::IN_CREATE, 0);
+    inotify::path_event(k, overlay::key(so), None, inotify::IN_ATTRIB);
+    inotify::dir_event(k, overlay::key(d), name, inotify::IN_CREATE, 0);
     Ok(0)
 }
 
@@ -6122,12 +6148,13 @@ pub(super) fn renameat2(
                 moved(dst.1, (new_dir, new_name), (old_dir, old_name));
                 inotify::path_event(k, dst.0, None, inotify::IN_MOVE_SELF);
             }
+            // fsnotify_move: the replaced object's link count changed, then the moved one moved
+            // itself; the replaced one is deleted with its last link
             Some((replaced, isdir)) => {
+                inotify::path_event(k, replaced, None, inotify::IN_ATTRIB | isdir);
                 inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF);
-                if isdir != 0 {
+                if isdir != 0 || vfs.store().stat(replaced).map_or(0, |st| st.nlink) == 0 {
                     inotify::deleted(k, replaced, new_dir, new_name);
-                } else {
-                    unlinked_events(cx, vfs.store(), replaced, (new_dir, new_name));
                 }
             }
             None => inotify::path_event(k, src.0, None, inotify::IN_MOVE_SELF),
@@ -6197,6 +6224,44 @@ fn rename_overlay(
         (nd, new_name),
         (flags & RENAME_NOREPLACE != 0, exchange),
     )?;
+    // Renaming a name to itself changes nothing
+    if dst.as_ref().is_some_and(|d| d.0 == src) {
+        return Ok(0);
+    }
+    // As the store's rename reports, on the overlay's nodes: files open through a moved name
+    // follow it, then fsnotify_move's order
+    let k = cx.kr();
+    let (old, new) = ((overlay::key(od), old_name), (overlay::key(nd), new_name));
+    inotify::renamed(k, old, new, || Some(overlay::key(src)));
+    if exchange && let Some(d) = dst.as_ref().map(|d| d.0) {
+        inotify::renamed(k, new, old, || Some(overlay::key(d)));
+    }
+    let isdir = |st: &Stat| {
+        if st.is_dir() { inotify::IN_ISDIR } else { 0 }
+    };
+    let moved = |isdir: u32, from: (Ino, &[u8]), to: (Ino, &[u8])| {
+        let cookie = inotify::cookie(k);
+        inotify::dir_event(k, from.0, from.1, inotify::IN_MOVED_FROM | isdir, cookie);
+        inotify::dir_event(k, to.0, to.1, inotify::IN_MOVED_TO | isdir, cookie);
+    };
+    let src = overlay::key(src);
+    moved(isdir(&src_st), old, new);
+    match dst {
+        Some((d, st)) if exchange => {
+            inotify::path_event(k, src, None, inotify::IN_MOVE_SELF);
+            moved(isdir(&st), new, old);
+            inotify::path_event(k, overlay::key(d), None, inotify::IN_MOVE_SELF);
+        }
+        Some((d, st)) => {
+            let d = overlay::key(d);
+            inotify::path_event(k, d, None, inotify::IN_ATTRIB | isdir(&st));
+            inotify::path_event(k, src, None, inotify::IN_MOVE_SELF);
+            if st.is_dir() || st.nlink <= 1 {
+                inotify::deleted(k, d, new.0, new.1);
+            }
+        }
+        None => inotify::path_event(k, src, None, inotify::IN_MOVE_SELF),
+    }
     Ok(0)
 }
 
@@ -6274,9 +6339,9 @@ fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[
     }
 }
 
-/// Link `name` of file `ino` was removed (unlink, overwritten by rename): the link count changed
-/// (IN_ATTRIB), and IN_DELETE_SELF when the last link is gone too. Both events are reported only
-/// to the file itself.
+/// Link `name` of file `ino` was unlinked: the link count changed (IN_ATTRIB), and
+/// IN_DELETE_SELF when the last link is gone too. Both events are reported only to the file
+/// itself.
 fn unlinked_events(cx: &Cx<'_>, store: &Store, ino: Ino, (dir, name): (Ino, &[u8])) {
     let k = cx.kr();
     inotify::path_event(k, ino, None, inotify::IN_ATTRIB);
@@ -6357,6 +6422,16 @@ impl Attrs {
         }
     }
 
+    /// The store inode a change by path went to, for inotify ([`attrib_at`], which finds an
+    /// overlay node again by its path): an overlay node's topmost inode.
+    fn ino(&self, cx: &Cx<'_>) -> Option<Ino> {
+        match self {
+            Attrs::Store(ino) => Some(*ino),
+            Attrs::Overlay(o) => Some(cx.vfs().ok()?.overlay().node(*o).real()),
+            _ => None,
+        }
+    }
+
     fn stat(&self, cx: &Cx<'_>) -> Result<Stat, Errno> {
         match self {
             Attrs::Store(ino) => cx.vfs()?.store().attrs(*ino),
@@ -6394,7 +6469,7 @@ pub(super) fn fchmodat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> Sys
     let path = read_path(cx, path)?;
     let target = Attrs::of(cx, &lookup_at(cx, dirfd, &path, true)?)?;
     chmod(cx, &target, perm)?;
-    if let Attrs::Store(ino) = target {
+    if let Some(ino) = target.ino(cx) {
         attrib_at(cx, ino, dirfd, &path, true);
     }
     Ok(0)
@@ -6461,7 +6536,7 @@ pub(super) fn fchownat(
     chown(cx, &target, uid, gid)?;
     if path.is_empty() {
         attrib_fd(cx, dirfd);
-    } else if let Attrs::Store(ino) = target {
+    } else if let Some(ino) = target.ino(cx) {
         attrib_at(cx, ino, dirfd, &path, follow);
     }
     Ok(0)
@@ -6670,16 +6745,17 @@ pub(super) fn attrib_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: 
     event_at(cx, ino, dirfd, path, follow, inotify::IN_ATTRIB);
 }
 
-/// Reports `event` for a change made by path (also to the containing directory).
+/// Reports `event` for a change made by path to store inode `ino` (also to the containing
+/// directory); through an overlay, to the overlay's node the path names.
 fn event_at(cx: &Cx<'_>, ino: Ino, dirfd: i32, path: &[u8], follow: bool, event: u32) {
     if inotify::active(cx.kr()) {
-        let parent = inotify::watched_parent(cx, dirfd, path, follow);
+        let (target, parent) = inotify::watched_at(cx, ino, (dirfd, path), follow);
         let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
         let dir = match cx.vfs().map(|v| v.store().kind(ino)) {
             Ok(Ok(mode::S_IFDIR)) => inotify::IN_ISDIR,
             _ => 0,
         };
-        inotify::path_event(cx.kr(), ino, parent, event | dir);
+        inotify::path_event(cx.kr(), target, parent, event | dir);
     }
 }
 
@@ -6769,9 +6845,9 @@ pub(super) fn truncate(cx: &mut Cx<'_>, path: u64, len: i64) -> SysResult {
             host.set_len(len).map_err(host_errno)?;
             tmpfs_resized(&vfs, tmpfs, &host);
             if inotify::active(cx.kr()) {
-                let parent = inotify::watched_parent(cx, AT_FDCWD, &path, true);
+                let (target, parent) = inotify::watched_at(cx, ino, (AT_FDCWD, &path), true);
                 let parent = parent.as_ref().map(|(d, n)| (*d, n.as_slice()));
-                inotify::path_event(cx.kr(), ino, parent, inotify::IN_MODIFY);
+                inotify::path_event(cx.kr(), target, parent, inotify::IN_MODIFY);
             }
             Ok(0)
         }
@@ -7004,15 +7080,20 @@ fn rename_synthetic(
     Err(Errno::EPERM)
 }
 
+/// Where a name is created ([`create_parent_at`]): the mount, the store directory, the name, and
+/// the overlay directory it was reached as, if any.
+pub(super) type CreateParent<'p> = (MountId, Ino, &'p [u8], Option<OvlId>);
+
 /// The parent directory of a name to create ([`parent_at`]): in a directory of a synthetic
 /// filesystem an existing name is EEXIST, ahead of the error that the directory cannot be
 /// modified (Linux's `filename_create`: `mkdir -p /sys/fs/cgroup/x` relies on `mkdir /sys/fs`
-/// being EEXIST).
+/// being EEXIST). In an overlay it is the upper directory, copied up, and the overlay's directory
+/// comes too (for [`created_events`]).
 pub(super) fn create_parent_at<'p>(
     cx: &Cx<'_>,
     dirfd: i32,
     path: &'p [u8],
-) -> Result<(MountId, Ino, &'p [u8]), Errno> {
+) -> Result<CreateParent<'p>, Errno> {
     let start = start_dir(cx, dirfd, path)?;
     let vfs = cx.vfs()?;
     let (dir, name) = vfs.resolve_parent(&cx.view(&vfs), &cx.cred(), &cx.root(), &start, path)?;
@@ -7021,8 +7102,27 @@ pub(super) fn create_parent_at<'p>(
     {
         return Err(Errno::EEXIST);
     }
+    let ovl = match dir {
+        Node::Overlay(_, o) => Some(o),
+        _ => None,
+    };
     let (mnt, dir) = create_dir(&vfs, &dir)?;
-    Ok((mnt, dir, name))
+    Ok((mnt, dir, name, ovl))
+}
+
+/// `name` was created in store directory `dir`: `IN_CREATE` (with `isdir`) to it, then to the
+/// overlay directory `ovl` it was created through, if any (Linux's overlay creates the name in its
+/// upper directory through the VFS, inside the creation through the overlay).
+pub(super) fn created_events(
+    k: &Kernel,
+    (dir, ovl): (Ino, Option<OvlId>),
+    name: &[u8],
+    isdir: u32,
+) {
+    inotify::dir_event(k, dir, name, inotify::IN_CREATE | isdir, 0);
+    if let Some(o) = ovl {
+        inotify::dir_event(k, overlay::key(o), name, inotify::IN_CREATE | isdir, 0);
+    }
 }
 
 /// Start directory of the `*at` family. An empty path is ENOENT at once (dirfd is not looked

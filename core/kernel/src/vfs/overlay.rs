@@ -21,8 +21,24 @@ use std::collections::HashMap;
 use super::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::errno::Errno;
 
-/// An overlay node's number (in [`super::Node::Overlay`]), unique across all instances.
+/// An overlay node's number (in [`super::Node::Overlay`]), unique across all instances and never
+/// reused.
 pub(crate) type OvlId = u64;
+
+/// The number that stands for node `id` in tables keyed by store inode number (locks, inotify
+/// watches): its id with the top bit set, which store inode numbers never have.
+pub(crate) const fn key(id: OvlId) -> Ino {
+    1 << 63 | id
+}
+
+/// The node a [`key`] stands for; None for a store inode number.
+pub(crate) const fn of_key(key: Ino) -> Option<OvlId> {
+    if key >> 63 == 1 {
+        Some(key & !(1 << 63))
+    } else {
+        None
+    }
+}
 
 /// An instance's layers: the upper layer's root directory (None for a read-only overlay) and the
 /// lower layers' root directories, topmost first.
@@ -769,6 +785,19 @@ impl Overlays {
         self.node(id).parent
     }
 
+    /// Whether node `id` is still where it was looked up (Linux's hashed dentry): its directory
+    /// still has it under its name. False once it was removed or replaced by a rename, and for a
+    /// node of an instance that is gone.
+    pub(crate) fn linked(&self, id: OvlId) -> bool {
+        self.nodes.get(&id).is_some_and(|n| {
+            n.parent == id
+                || self
+                    .nodes
+                    .get(&n.parent)
+                    .is_some_and(|p| p.children.get(&n.name) == Some(&id))
+        })
+    }
+
     /// Whether `name` is one of the attributes the instance of node `id` keeps for itself
     /// (`trusted.overlay.*`, or `user.overlay.*` with `userxattr`), which reads through the
     /// overlay never see.
@@ -863,6 +892,47 @@ mod tests {
         assert_eq!(o.lookup(&s, top, b"d").unwrap(), d);
         o.remove_instance(0x30);
         assert!(o.nodes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node stays linked while its directory has it: a rename moves it, removal and being
+    /// replaced by a rename unlink it (inotify's `IN_EXCL_UNLINK` asks).
+    #[test]
+    fn nodes_stay_linked_until_removed_or_replaced() {
+        let dir = std::env::temp_dir().join(format!("appine-ovl-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::create(&dir).unwrap();
+        let root = super::super::store::ROOT;
+        let l = s.mkdir(root, b"l", 0o755, 0, 0).unwrap();
+        let u = s.mkdir(root, b"u", 0o755, 0, 0).unwrap();
+        for name in [&b"f"[..], b"g", b"h"] {
+            s.create_file(l, name, 0o644, 0, 0).unwrap();
+        }
+        let mut o = Overlays::default();
+        let top = o.add_instance(
+            0x31,
+            (Some(u), vec![l]),
+            ((0, 0), Vec::new()),
+            Options::default(),
+        );
+        assert!(o.linked(top));
+        let f = o.lookup(&s, top, b"f").unwrap();
+        let g = o.lookup(&s, top, b"g").unwrap();
+        assert!(o.linked(f) && o.linked(g));
+        o.rename(&s, (top, b"f"), (top, b"f2"), (false, false))
+            .unwrap();
+        assert!(o.linked(f));
+        assert_eq!(o.node(f).name, b"f2");
+        o.rename(&s, (top, b"h"), (top, b"g"), (false, false))
+            .unwrap();
+        assert!(!o.linked(g));
+        o.remove(&s, top, b"f2", false).unwrap();
+        assert!(!o.linked(f));
+        // Keys never collide with store inode numbers, and give the node back
+        assert_eq!(of_key(key(f)), Some(f));
+        assert_eq!(of_key(f), None);
+        o.remove_instance(0x31);
+        assert!(!o.linked(top));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

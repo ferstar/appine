@@ -111,7 +111,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
                     e
                 }
             };
-            let (mnt, dir, name) = create_parent_at(cx, AT_FDCWD, p).map_err(in_use)?;
+            let (mnt, dir, name, ovl) = create_parent_at(cx, AT_FDCWD, p).map_err(in_use)?;
             if name == b"." || name == b".." {
                 return Err(Errno::EADDRINUSE);
             }
@@ -132,7 +132,7 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
             )
             .map_err(in_use)?;
             super::fs::tmpfs_created(&vfs, tmpfs, 0);
-            super::inotify::dir_event(cx.kr(), dir, name, super::inotify::IN_CREATE, 0);
+            super::fs::created_events(cx.kr(), (dir, ovl), name, 0);
             cx.k().unix.insert(Name::Path(ino), sock);
             bound.extend_from_slice(p);
             bound.push(0);
