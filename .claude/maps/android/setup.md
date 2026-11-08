@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refresh at root logins; admins recorded once; mirrors recorded after writing; downloads stop past the pinned length; resumed imports; rootless podman's network; podman and docker storage last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refresh at root logins; admins recorded once; mirrors recorded after writing; downloads stop past the pinned length; resumed imports; rootless podman's network; containers' storage left to the packages last)
 
 ## Responsibilities
 
@@ -79,16 +79,11 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - Before every start: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
-  reads that directory, and a user's own `containers.conf` overrides it); podman's
-  `/etc/containers/storage.conf` choosing the vfs driver when absent, or an active
-  `driver = "overlay"` line in it changed to vfs (Appine has neither overlayfs nor FUSE; written
-  before podman is installed, apk keeps it and puts the package's in `storage.conf.apk-new`, and
-  Debian ships only `/usr/share/containers/storage.conf`, which it overrides; rootless users
-  without their own storage.conf take its driver; a file that cannot be read, such as a symbolic
-  link, is left alone); `/etc/docker/daemon.json` choosing the native snapshotter when absent
-  (docker 29 keeps images in containerd, whose default overlayfs snapshotter does not fall back:
-  pulls work and every run fails; the packages ship no daemon.json); on Alpine the bundled
+  reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`; an unmodified old profile (with `cd "$HOME"`) replaced.
+  Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
+  snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
+  a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
 - Before boot (`PREFER_OSCLOCK`): with OpenRC installed and no clock service in any runlevel, add
   osclock to boot.
 
