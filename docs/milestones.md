@@ -249,6 +249,8 @@ In the differential tests (`scripts/difftest`), the native side of `loop` uses t
 
 In `gvisor-process`, Appine's side of `ExecTest.ExecuteOnlySpecialFiles` fails intermittently when the whole group runs: on 2026-11-08 it failed 2 of 5 runs with the binary under test and 3 of 3 with the previous commit's, while 30 runs of the test alone passed. The test calls setresuid on a thread (Appine changes the whole process's credentials, a deviation recorded in the kernel/cred map) and execs a FIFO, a socket and a device node under a 10 s alarm each. A failed run that is killed by the 60 s timeout leaves `/tmp/exec-only-*.<pid>` in the lane's store, and later runs whose test gets that pid failed at once on `EEXIST`; since 2026-11-08 `tests/diff/gtest/run.sh` deletes those files before running, so only the first failure is intermittent. The cause was not investigated.
 
+In `gvisor-fs`, the native side of `PtyTest.TCFLSHWakesReplicaPolloutAfterMasterInputFlush` failed once on 2026-11-08 while four groups ran in parallel (`-j 4`), and passed when the group was rerun alone; it waits for a replica's `POLLOUT` after the master flushes its input, and was presumably slowed by the load. The cause was not investigated.
+
 
 ## R1 measurements
 

@@ -538,8 +538,9 @@ fn recorded(path: &[u8]) -> Option<&'static (&'static [u8], u32, i64, i64, i64)>
 /// The fixed directories and files under `/sys` (paths relative to `/sys`, directories ending in
 /// `/`). CPU topology: busybox's `nproc --all`, lscpu and glibc's get_nprocs read them, and each
 /// `cpu<n>` is a [`PseudoNode::SysCpu`]; network interfaces (btop reads the traffic counters),
-/// each interface a [`PseudoNode::SysNet`].
-const SYS_STATIC: [&[u8]; 12] = [
+/// each interface a [`PseudoNode::SysNet`]; overlayfs's module parameters (containerd adds
+/// `index=off` when `index` exists, BuildKit `redirect_dir=off` when `redirect_dir` does).
+const SYS_STATIC: [&[u8]; 23] = [
     b"block/",
     b"class/",
     b"class/net/",
@@ -552,6 +553,17 @@ const SYS_STATIC: [&[u8]; 12] = [
     b"devices/system/cpu/present",
     b"fs/",
     b"fs/cgroup/",
+    b"module/",
+    b"module/overlay/",
+    b"module/overlay/parameters/",
+    b"module/overlay/parameters/check_copy_up",
+    b"module/overlay/parameters/index",
+    b"module/overlay/parameters/metacopy",
+    b"module/overlay/parameters/nfs_export",
+    b"module/overlay/parameters/redirect_always_follow",
+    b"module/overlay/parameters/redirect_dir",
+    b"module/overlay/parameters/redirect_max",
+    b"module/overlay/parameters/xino_auto",
 ];
 
 /// `/sys/class/net`: the interfaces are under it.
@@ -2487,6 +2499,11 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             | b"devices/system/cpu/possible"
             | b"devices/system/cpu/present" => cpu_list(0..cpus()),
             b"devices/system/cpu/offline" => "\n".to_owned(),
+            // The defaults of 6.1's Kconfig, which are what the overlay does: no index, redirects,
+            // metacopy, NFS export or xino
+            b"module/overlay/parameters/redirect_always_follow" => "Y\n".to_owned(),
+            b"module/overlay/parameters/redirect_max" => "256\n".to_owned(),
+            p if p.starts_with(b"module/overlay/parameters/") => "N\n".to_owned(),
             _ => return Err(Errno::EISDIR),
         },
         SysCpu(n, path) => cpu_file(*n as usize, path)?,

@@ -33,12 +33,14 @@ in the module maps, not here.
 - **PTY scenarios:** the 83 recorded scenarios are the `line-discipline` differential case. All of
   them pass since the line discipline follows n_tty.
 - **`tests/syscalls/cpp`:** `scripts/build-starnix-tests` builds 81 of its 93 gtest programs
-  statically against musl, and CI builds them too. 63 programs run in six differential cases by
-  subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`) through a shared runner,
-  each skipping by reason the tests that differ for a deviation recorded in a map or cannot be
-  compared. The other 18 are listed with their reasons in `tests/diff/gtest/run.sh`: they would
-  reboot, suspend or set the clock of the VM, test what Appine does not implement (bpf maps, perf,
-  process_mrelease, userfaultfd, overlayfs, tun), need devices, or have nothing to compare.
+  statically against musl, and CI builds them too. 64 programs run in seven differential cases by
+  subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`, `-overlay`) through a
+  shared runner, each skipping by reason the tests that differ for a deviation recorded in a map
+  or cannot be compared; `starnix-overlay` puts its layers on a tmpfs, since Linux refuses
+  docker's overlay root as an upper layer. The other 17 are listed with their reasons in
+  `tests/diff/gtest/run.sh`: they would reboot, suspend or set the clock of the VM, test what
+  Appine does not implement (bpf maps, perf, process_mrelease, userfaultfd, tun), need devices, or
+  have nothing to compare.
 - **Full run of the other programs (2026-11-07, at 8dc166b):**
   - About 70 more programs ran one test per process, as root, on native Linux 6.8 and on Appine.
     Of 2484 tests, 1186 passed on both sides, 532 passed only natively (203 of them in
@@ -116,6 +118,7 @@ in the module maps, not here.
 | b3e134a | A UDP socket shut down for reading returns 0 from a blocking recv instead of spinning (with netlink dumps that fit a page) |
 | 5530624 | splice, tee and vmsplice wait as Linux 6.1 does (seven skipped Starnix pipe and vmsplice tests now pass) |
 | 6d05aa9 | Mounts inherited by a less privileged namespace are locked; proc and sysfs mounts check owner and visibility; `max_*_namespaces` enforced |
+| 2a244d2, 4b4af75 | overlayfs with several lower layers and an upper one, after Linux 6.1 rather than Starnix's single-lower module; its `overlayfs_test`, fs_test's overlay tests and gVisor's overlay mount tests run |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
@@ -135,7 +138,6 @@ Ordered by value for effort.
 | Store reflinks | — | `FICLONE` and whole-file `copy_file_range` share a store object until written; podman's and docker's vfs storage driver try `FICLONE` first | 600–1000 lines |
 | Small procfs and netlink files | Has `vmstat`, `swaps`, `locks`, `io`, `oom_score` (some as stubs) | `oom_score` from the OOM killer's score, `swaps` header, `locks` from the lock table; `NETLINK_SOCK_DIAG` that answers `ENOENT` so `ss` falls back to `/proc` quietly | Small each |
 | vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
-| overlayfs | One lower layer only | Docker and podman need several; directories merged, other files given as the store nodes of either layer | 2–3k lines |
 | FUSE | INIT negotiation, about 25 opcodes, interrupts, no page cache | A new node kind, waiting on the daemon with the BKL released, private mappings of FUSE files; sshfs and rclone mount are the users | 3–5k lines |
 | `process_mrelease`, `process_madvise` | `process_mrelease` implemented for lmkd | Revisits the decision to wait for a user (round 139) | About 100 lines |
 | Guest crash lines | Keeps the last 64 fatal signals with throttling per program | `debug.exception-trace` is only recorded (42d2ffe). While it is non-zero, one rate-limited kernel log line per unhandled fault signal, as arm64's `arm64_show_signal` does | Small |

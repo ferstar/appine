@@ -904,7 +904,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   overlay whose upper layer is on a tmpfs are not counted against that tmpfs's limits; a mapping
   made from a file opened before its copy-up keeps the lower object; parent directories are copied
   up before a creation's permission check, so a refused creation still leaves them copied; mounts
-  of other namespaces on a removed or renamed overlay name are not detached.
+  of other namespaces on a removed or renamed overlay name are not detached; a
+  `trusted.overlay.redirect` in a lower layer is not followed, although sysfs shows
+  `redirect_always_follow` as Y (no tool Appine runs writes one: image layers come as tarballs).
 
 ## Open questions
 

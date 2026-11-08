@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay module parameters last)
 
 ## Responsibilities
 
@@ -15,7 +15,7 @@ stored:
 - procfs: the per-process and per-thread trees, system-wide files, `/proc/sys` (sysctls, many
   scoped by namespace) and `/proc/<pid>/net`;
 - sysfs: CPU topology (partly copied from the host), `/sys/class/net`, `/sys/block` (loop
-  devices), the cgroup mount point;
+  devices), overlayfs's module parameters, the cgroup mount point;
 - devpts as a filesystem (instances, nodes, owners and modes) and nsfs nodes;
 - the node views of the mqueue filesystem;
 - cgroup v2: the cgroup tree, its interface files, membership and migration, and the limits that
@@ -242,9 +242,12 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Tree: `block/`, `class/net/`, `devices/system/cpu/` (`online`, `possible`, `present`, `offline`, one
   `cpu<n>/` per guest CPU with synthesized `topology/` — each CPU its own core, one package — and
   `regs/identification/`), `cache/` and `cpufreq/` files copied from the host when the host lets
-  the app read them (CPU numbers translated, missing files absent), and the empty `fs/cgroup/`
-  mount point. No `kernel/`, `module/`, `dev/`, `bus/`, `firmware/`, `power/`, NUMA nodes,
-  other classes or `uevent` files.
+  the app read them (CPU numbers translated, missing files absent), the empty `fs/cgroup/`
+  mount point, and `module/overlay/parameters/` with 6.1's Kconfig defaults, which are what the
+  overlay does (`redirect_always_follow` Y, `redirect_max` 256, `check_copy_up`, `index`,
+  `metacopy`, `nfs_export`, `redirect_dir`, `xino_auto` N; containerd adds `index=off` and
+  BuildKit `redirect_dir=off` because the files exist). No `kernel/`, other modules, `dev/`,
+  `bus/`, `firmware/`, `power/`, NUMA nodes, other classes or `uevent` files.
 - `/sys/block/loop<n>/` exists for every loop device (`kernel/vfs`): `dev`, `removable`, `ro`,
   `size` (sectors), `queue/` (logical, physical, minimum and hardware sector sizes, optimal I/O 0,
   `dma_alignment` 511, `rotational`, `read_ahead_kb`, `max_sectors_kb`, `rq_affinity`), and while
