@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -61,15 +61,15 @@
 - **What**: Each app tab and each `appine-run` session is a console with a new session leader; when the host's input ends, the bridge waits until the program has read what was sent and then sends `VEOF` instead of hanging up.
 - **Why**: `printf 'make\n' | appine-run --pty sh -i` left the shell waiting for input forever; util-linux `script` behaves this way, and tests drive interactive shells through pipes.
 - **Tradeoffs**: Programs that ignore EOF keep running until the first process exits.
-- **Watch out**: Resend `VEOF` if the program left canonical mode before reading it.
-- **Source**: rounds 05 (`05-m3b`), 102 (`102-snmp-pty-eof`)
+- **Watch out**: An EOF still queued when the program leaves canonical mode must stay an EOF (D16).
+- **Source**: rounds 05 (`05-m3b`), 102 (`102-snmp-pty-eof`); 117f927
 
 ### D9: PTYs, the line discipline, job control and the host console are one kernel/tty module
 - **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
 - **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
 - **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them echoes growing the output without limit, non-canonical read timing, no `SIGTTOU` for background tcflush/tcflow/tcdrain, an extra `SIGCONT` at a session leader's exit and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
-- **Source**: 5d21cc4 (bug list since updated by 24ecd25 and 4e64e74)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `VTIME` timing the whole read when `VMIN` is above 0, one slave write overshooting the output limit by its expansion, `TIOCSPGRP` error codes and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
+- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297 and 5d7b936)
 
 ### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
 - **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
@@ -106,7 +106,43 @@
 - **Watch out**: `OpenFile::readable` treats access mode 3 as readable where Linux's `FMODE_READ` does not, so an ioctl-only open still takes a terminal.
 - **Source**: 838b5b4
 
+### D15: The parts of the line discipline adapted from Starnix keep its notice
+- **What**: tty.rs's module docs name the items adapted from Starnix's `lib/line_discipline` (`Echo` and `commit_echoes`, erasing and `echo_erased`, `output_char`), the Starnix commit 86962cb and The Fuchsia Authors' notice, pointing to `android/licenses/fuchsia-LICENSE`, and the map's gotchas say the notice moves with that code.
+- **Why**: The echo queue, erasing and output processing rewritten for D13 closely follow Starnix's BSD-licensed code, whose license requires keeping its copyright notice, and tty.rs did not name it.
+- **Tradeoffs**: tty.rs mixes Appine's AGPL code with BSD-derived parts, and the notice is kept by hand with nothing checking it.
+- **Watch out**: Moving those functions without the notice, or keeping it after a rewrite that no longer derives from Starnix, makes the attribution wrong, and the item list and year range are written by hand.
+- **Source**: f2d3264
+
+### D16: The console's end of file stays an EOF when the program leaves canonical mode
+- **What**: `Tty::inject_eof` queues an empty line ended by VEOF and marked `injected` when the terminal is canonical with nothing being edited (otherwise VEOF goes in as typed input), and `set_termios` turns a marked EOF into the old VEOF character instead of a NUL when leaving canonical mode, so the bridge sends its EOF once (D8).
+- **Why**: Since the n_tty port (D13), leaving canonical mode turned the queued EOF mark into a NUL as Linux does, which a shell's line editor inserted into its line, so `sh -i` fed through a pipe never exited, and the bridge's resend came too late.
+- **Tradeoffs**: The console's EOF behaves unlike a VEOF typed in canonical mode on Linux, which stays a NUL, on purpose, while util-linux `script` keeps Linux's behaviour and has the same hang.
+- **Watch out**: A program that leaves canonical mode with other lines queued before the EOF gets their data followed by the VEOF character, as it would have from the old resend.
+- **Source**: 117f927
+
+### D17: Non-canonical reads and readiness follow `input_available_p`
+- **What**: A nonblocking non-canonical read returns whatever input is there, and `poll_readable` waits for `VMIN` bytes only when `VTIME` is 0, as Linux decides for both read and poll.
+- **Why**: A nonblocking read below `VMIN` returned `EAGAIN` while `POLLIN` ignored `VMIN`, so event loops spun.
+- **Tradeoffs**: `VTIME` with `VMIN` above 0 is still a total timer rather than an inter-byte one.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D18: The flushing and line ioctls check for background callers, and a leader's exit sends only SIGHUP
+- **What**: TCFLSH, TCXONC, TCSBRK, TCSBRKP and TIOCSETD run the background check, and `release_ctty` at a session leader's exit sends only `SIGHUP`.
+- **Why**: Background jobs were not stopped for these ioctls, and a session leader's exit with a PTY as its controlling terminal sent an extra `SIGCONT`, unlike Linux.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D19: Echoes respect the output limit
+- **What**: `commit_echoes` outputs an echo only when it fits whole and keeps at most 4096 waiting (the oldest dropped), and `send_xchar` drops its character on a full queue.
+- **Why**: Echoes and `send_xchar` ignored the output limit, so a master that never read let the output grow without bound.
+- **Tradeoffs**: One slave write can still overshoot the limit by its output expansion.
+- **Watch out**: Echoes held while the output is full appear only after the master reads.
+- **Source**: 5d7b936
+
 ## Superseded
 
 - ~~Output stopped by ^S kept in the queue behind a mark (`held_from`, D7 in part, round 75)~~ → replaced by **D13** in 8dc166b (2026-11-07)
 - ~~The line-discipline subset described at the module split (5d21cc4)~~ → replaced by **D13** in 8dc166b (2026-11-07)
+- ~~The bridge resends `VEOF` when the program left canonical mode before reading it (D8 in part, rounds 05, 102)~~ → replaced by **D16** in 117f927 (2026-11-07)

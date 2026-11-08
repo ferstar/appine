@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -54,8 +54,8 @@
 - **What**: kernel/poll covers `syscall/poll.rs`: the readiness model, ppoll and pselect6, epoll, eventfd2 and signal-driven I/O.
 - **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions.
 - **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them signal-driven I/O signalling any process (no `sigio_perm` check, no `ESRCH`), `EPOLLEXCLUSIVE` timerfds that may never fire, edge-triggered host sockets stalling without host edges, epoll results lost on `EFAULT`, pipe `POLLOUT` counting bytes rather than buffers and epoll_wait not checking its event buffer first.
-- **Source**: c3df5d3 (bug list since updated by 09188ec and 4e64e74)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `EPOLLEXCLUSIVE` timerfds that may never fire, epoll results lost on `EFAULT` and pipe `POLLOUT` counting bytes rather than buffers.
+- **Source**: c3df5d3 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936)
 
 ### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
 - **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.
@@ -84,3 +84,38 @@
 - **Tradeoffs**: None.
 - **Watch out**: None known.
 - **Source**: b295644
+
+### D12: Pipe write ends count arrivals, and O_ASYNC registers only files with fasync
+- **What**: `Pipe::room` counts reads that make the pipe writable and is the write end's arrival count, and `register_fasync` registers only pipes, sockets, terminals, inotify and host fds.
+- **Why**: Without an arrival count on the write end, a writer draining with a short writev could miss `POLLOUT` under `EPOLLET`, and `O_ASYNC` raised `SIGIO` for file kinds without fasync (every read of a regular file).
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D13: Signal-driven I/O signals only processes its setter may signal
+- **What**: `OpenFile::owner_ids` keeps the uids of whoever set the owner, and `send_to_owner` sends only to processes whose real or saved uid matches one of them, or to any when the setter's euid is root, checking each process of a group.
+- **Why**: An unprivileged user could point a file at a root process and kill it with `SIGIO` or an `F_SETSIG` signal.
+- **Tradeoffs**: A group owner now scans the thread groups once for members and once more per member for the check.
+- **Watch out**: The uids are kernel ids, as Linux's are, and a setter that later changes its own ids keeps the rights it had at `F_SETOWN`, as on Linux.
+- **Source**: f6a82cc
+
+### D14: epoll and ppoll follow Linux 6.1's error order and write-backs
+- **What**: epoll_ctl copies the event first, then checks for `EBADF`, `EPERM`, `EINVAL` and `ELOOP`; epoll_wait checks its buffer with `access_ok` before the epoll fd; an interrupted ppoll writes zero revents back; and a pipe write end without readers reports `POLLOUT` when it has room, plus `POLLERR`.
+- **Why**: These differed from 6.1, so the matching gVisor tests had to be skipped.
+- **Tradeoffs**: None known.
+- **Watch out**: Edge-triggered waiters on reader-less pipes now see `POLLOUT` too.
+- **Source**: 5d7b936
+
+### D15: Anonymous fds report exactly their Linux poll bits
+- **What**: eventfd reports `POLLIN`/`POLLOUT`, timerfd and signalfd `POLLIN`, and an epoll fd `POLLIN|POLLRDNORM`, as their Linux poll operations do, and epoll.sh checks every anonymous fd kind's mode, poll bits and write result against native (kernel/vfs D41).
+- **Why**: eventfd, timerfd and signalfd reported `POLLRDNORM`/`POLLWRNORM`, which `eventfd_poll`, `timerfd_poll` and `signalfd_poll` never set, and an epoll fd lacked the `POLLRDNORM` that `ep_eventpoll_poll` reports, as a native 6.8 run confirmed.
+- **Tradeoffs**: A poll asking these fds only for `POLLRDNORM`/`POLLWRNORM` now waits, as on Linux.
+- **Watch out**: A nested epoll interest asking only for `POLLRDNORM` now fires on a ready inner epoll and takes the edge-wait path while it is not ready; watch nested-epoll users.
+- **Source**: e6bfdf8
+
+### D16: AIO polls wait through the same `Waits` as ppoll and epoll
+- **What**: Two helpers over the private `Waits` serve native AIO: `wait_aio_polls` for io_getevents (the polls' files plus the context's object) and `watch_aio_poll` for the timer thread (host fds and timerfd expirations) (kernel/vfs D42).
+- **Why**: AIO's waits need the same view of a file's readiness sources (in-process objects, host fds, timerfd deadlines) that ppoll and epoll build with `Waits`.
+- **Tradeoffs**: AIO waits inherit everything `Waits` does for nested epolls and exclusive gates, which AIO polls rarely need.
+- **Watch out**: `watch_aio_poll` drops `Waits`' gated files, so a poll on an epoll whose interests are all `EPOLLEXCLUSIVE` relies on the timer thread's all-channel wake-ups.
+- **Source**: fffe1c1

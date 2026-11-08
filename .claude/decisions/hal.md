@@ -2,17 +2,17 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
 
 ### D1: One implementation for Android and Linux hosts, passing host errnos through
-- **What**: The hal has a single implementation for bionic and glibc, with `cfg` branches only where the hosts differ; functions return the host's errno, which the kernel hands to the guest unchanged; no macOS hal is written; the core crates depend on no Android component.
-- **Why**: Development runs on Linux arm64 and production on Android, both Linux kernels whose errno numbering matches the guest's; keeping Android-specific code in the hal and the Kotlin shell lets 90% of the work happen in a Linux VM.
-- **Tradeoffs**: Other hosts are not supported; the hal's own comment promises only that they compile, and even that has lapsed (see the map's bugs).
+- **What**: The hal has a single implementation for bionic and glibc, with `cfg` branches only where the hosts differ and a `compile_error!` pointing to `scripts/dev` on any other target; functions return the host's errno, which the kernel hands to the guest unchanged; the core crates depend on no Android component.
+- **Why**: Development runs on Linux arm64 and production on Android, both Linux kernels whose errno numbering matches the guest's, so keeping Android-specific code in the hal and the Kotlin shell lets 90% of the work happen in a Linux VM; the fallbacks meant to keep other hosts compiling had been broken for two weeks unnoticed, and even a macOS build that compiled could not run a guest.
+- **Tradeoffs**: `appine-run` no longer builds natively on macOS and IDE analysis on a Mac must target Linux or Android or run in `scripts/dev`; an iOS port would need a Darwin hal written from scratch.
 - **Watch out**: A host-only behaviour (Android's app seccomp, missing `/proc` files) must be handled in the hal or its caller, not assumed from the Linux development host.
-- **Source**: design doc §3, §13.3; round 07 (`07-m5`)
+- **Source**: design doc §3, §13.3; round 07 (`07-m5`); 7c5e636
 
 ### D2: DNS goes to the host's resolver: `android_res_nsend` on Android
 - **What**: `dns_query` sends the guest's query packet through `android_res_nsend` on the default network (linked against libandroid) with a 30 s backstop, and on other hosts to the servers in the host's `/etc/resolv.conf`.
@@ -53,15 +53,15 @@
 - **What**: hal covers `core/hal` (`lib.rs`, `net.rs`), described in one map rather than inside each kernel map or left to design §3.
 - **Why**: Apart from the design doc's §3, nothing documented the host layer, and the user asked to map it with §11.
 - **Tradeoffs**: Its DNS entry (D2) overlaps kernel/net D5 and refers to it.
-- **Watch out**: Bugs confirmed at the split stay open in the map: macOS no longer compiles, contrary to the hal's own comment, and a signal makes a non-Android DNS lookup fail.
-- **Source**: 12c4afa
+- **Watch out**: The map records no open bugs: of the two confirmed at the split, a signal no longer fails a non-Android DNS lookup and the non-Linux fallbacks that no longer compiled were removed.
+- **Source**: 12c4afa (bug list since updated by 5d23297 and 7c5e636)
 
 ### D9: Random bytes come from getrandom(2), not `/dev/urandom`
-- **What**: On Linux and Android hosts `fill_random` calls getrandom(2) in a loop that retries `EINTR` and short results, while other hosts, which are not built, keep the `/dev/urandom` path.
+- **What**: `fill_random` calls getrandom(2) in a loop that retries `EINTR` and short results.
 - **Why**: Opening `/dev/urandom` per call needs a free fd in the table the guest shares with the app, so randomness failed exactly when the guest exhausted fds.
-- **Tradeoffs**: There are two implementations behind cfg; a held fd would also have worked but occupies a slot and must survive fd-closing code.
+- **Tradeoffs**: A held fd would also have worked but occupies a slot and must survive fd-closing code.
 - **Watch out**: getrandom blocks until the host's entropy pool is initialised, which a booted Android or Linux system already is.
-- **Source**: 9e72dbb
+- **Source**: 9e72dbb, 7c5e636
 
 ### D10: hal files read in the order of the map's responsibilities
 - **What**: lib.rs runs memory, files and storage, host statistics, waiting, threads, CPUs and time, the CLI's terminal helpers and errors (`last_errno` last), and net.rs runs host sockets, interfaces and routes and DNS with `sockaddr` last; cfg alternatives of one function stay adjacent.
@@ -90,3 +90,22 @@
 - **Tradeoffs**: None.
 - **Watch out**: None known.
 - **Source**: 60921b2
+
+### D14: Host waits retry interrupts, and the hal's signal handlers keep errno
+- **What**: `poll_until` retries `EINTR` up to a deadline set once per server (once in all on Android), the SIGWINCH handler saves and restores errno, and `stop_notifier` catches SIGINT, SIGTERM and SIGHUP into a pipe for the CLI, undoing itself when a sigaction fails.
+- **Why**: An interrupted poll failed a DNS lookup and mismatched answer IDs restarted the wait, the SIGWINCH handler could clobber errno and a failing sigaction leaked its pipe, and the CLI needed a stop-signal pipe.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D15: Sparse files and MADV_REMOVE go to the host's fallocate and madvise
+- **What**: `fallocate(fd, mode, offset, len)` passes Linux's `FALLOC_FL_*` modes to the host and retries `EINTR`, and `remove(ptr, len)` applies the host's `MADV_REMOVE` to host-page-aligned shared memory (kernel/vfs D37, kernel/mm D33).
+- **Why**: Sparse files and `MADV_REMOVE` need the host to allocate, punch and free storage.
+- **Tradeoffs**: A host filesystem without a mode answers `EOPNOTSUPP` and the callers fall back.
+- **Watch out**: Android's app seccomp is assumed to allow fallocate and `MADV_REMOVE`; bionic exposes both, but this was checked only by building for the target.
+- **Source**: 5d7b936
+
+## Superseded
+
+- ~~Other hosts keep fallbacks so that they at least compile (design doc §3, round 07)~~ → replaced by **D1** in 7c5e636 (2026-11-08)
+- ~~Other hosts read random bytes from `/dev/urandom` (D9, 9e72dbb)~~ → replaced by **D1** in 7c5e636 (2026-11-08)

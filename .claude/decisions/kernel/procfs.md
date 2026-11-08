@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -12,8 +12,8 @@
 - **What**: Nothing is stored; opening a procfs, sysfs or cgroup file generates its whole content, later reads use that snapshot, and a read from offset 0 generates it again.
 - **Why**: Linux's seq_file gives the same effect for a file read in one go, and generating from live kernel structures keeps every file consistent with the kernel layer without bookkeeping.
 - **Tradeoffs**: Large files are generated in full per open; files that change do not notify pollers (mountinfo, `cgroup.events`).
-- **Watch out**: Regeneration uses the current reader's view, not the opener's credentials.
-- **Source**: design review 2026-10-24 (§8.2)
+- **Watch out**: Regeneration uses the opener's credentials (D25) but the current reader's namespaces.
+- **Source**: design review 2026-10-24 (§8.2); f6a82cc
 
 ### D2: procfs and devpts mounts are new instances; sysfs and cgroup2 have one
 - **What**: Every procfs mount gets its own device (and the mounter's pid namespace), every devpts mount its own set of terminals and options; sysfs and cgroup2 always share the boot instance.
@@ -32,9 +32,9 @@
 ### D4: The root cgroup looks like a docker container's root
 - **What**: `/proc/<pid>/cgroup` paths are relative to the reader's cgroup-namespace root, the root offers cpuset, cpu, memory and pids, and only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable there; `memory.max`/`memory.current` at the root are the OOM killer's limit and measurement.
 - **Why**: JVMs and Node.js recognise cgroup v2 and size heaps from it ("No metrics available" before); dockerd, podman, runc, crun and systemd then needed a real hierarchy with migration, built after Linux 6.1's `kernel/cgroup/cgroup.c`.
-- **Tradeoffs**: No threaded cgroups, no chmod/chown delegation, no common-ancestor permission check on migration, no change notifications.
+- **Tradeoffs**: No threaded cgroups, no chmod/chown delegation, no change notifications.
 - **Watch out**: Mounts of cgroup2 are rooted at the caller's cgroup-namespace root.
-- **Source**: rounds 58 (`58-cgroup`), 159 (`159-cgroup2-rw-mount`), 163 (`163-cgroup-tree`)
+- **Source**: rounds 58 (`58-cgroup`), 159 (`159-cgroup2-rw-mount`), 163 (`163-cgroup-tree`); b43ff37
 
 ### D5: Only pids, memory, freeze, kill and the device filter are enforced
 - **What**: `pids.max` stops fork and thread creation, `memory.max` is enforced by the OOM killer's periodic check (and immediately when lowered), `cgroup.freeze` stops threads transparently, `cgroup.kill` kills the subtree; other limits are format-checked and stored.
@@ -44,11 +44,11 @@
 - **Source**: rounds 164 (`164-cgroup-limits`), 165 (`165-cgroup-freeze`)
 
 ### D6: bpf(2) supports only cgroup device programs, verified and interpreted
-- **What**: Program load, attach, detach, query, get-fd-by-id and info for `BPF_PROG_TYPE_CGROUP_DEVICE`, with a verifier and error codes after Linux 6.1 and an interpreter; no maps, links or other program types.
+- **What**: Program load, attach, detach, query, get-fd-by-id and info for `BPF_PROG_TYPE_CGROUP_DEVICE`, with a verifier and error codes after Linux 6.1 and an interpreter, loading needing `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` besides `bpf_capable()` as Linux's networking program types do; no maps, links or other program types.
 - **Why**: cgroup v2 has no `devices.allow`; runc and crun attach a device program to every container cgroup and cannot skip it when the rules contain denials, so docker stopped at `bpf_prog_query` and podman at `bpf create`.
 - **Tradeoffs**: Every other eBPF use (tracing, networking, maps) is unavailable.
 - **Watch out**: Feature probes by cilium/ebpf fail gracefully (no map → no program names; no CgroupSKB → no `BPF_F_REPLACE`).
-- **Source**: round 166 (`166-bpf-devices`)
+- **Source**: round 166 (`166-bpf-devices`); 5d7b936
 
 ### D7: devpts terminals keep their own owner, mode and times
 - **What**: A terminal's owner, group, mode and times live on the terminal and can be changed with chown, chmod and utimensat.
@@ -68,8 +68,8 @@
 - **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
 - **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
 - **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
-- **Watch out**: Bugs confirmed at the split or found by Starnix's tests stay open in the map, among them `CLONE_INTO_CGROUP` without a permission check, `cgroup.procs` migration without the common-ancestor check, no poll notifications, `/proc/<pid>/fd` open to everyone, `/proc/sys` permissions following plain DAC and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76 and 4e64e74)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, no poll notifications, regeneration in the current reader's namespaces, `stat` address fields ignoring the ptrace check and no zoneinfo, pressure or kallsyms files.
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936 and 2aca260)
 
 ### D10: `/proc/stat`'s btime is computed in nanoseconds on every read and follows the time namespace
 - **What**: Each read takes realtime in nanoseconds minus `with_boot_offset(uptime_ns())`, then whole seconds (no less than 0), so btime stays fixed and moves back by the reader's boottime offset.
@@ -121,11 +121,11 @@
 - **Source**: 42d2ffe
 
 ### D17: An exited main thread shows as a zombie until the process is reaped
-- **What**: The process directory no longer falls back to the first live thread: listing, link and thread counts, state (Z for the exited leader), comm and CPU time use `ThreadGroup::leader_exit` (kernel/process D21), exe is `ENOENT` without a live task, and `/proc/<tid>`'s state follows that thread.
+- **What**: The process directory no longer falls back to the first live thread: listing, link and thread counts, state (Z for the exited leader), comm and CPU time use `ThreadGroup::leader_exit` (kernel/process D21), exe is `ENOENT` without a live task, an exited thread's mounts and mountinfo are `EINVAL` and its mem and pagemap `ESRCH` at open (as native 6.8 gives), pagemap reads the thread it names, and `/proc/<tid>`'s state follows that thread.
 - **Why**: Linux keeps an exited main thread as a zombie until the group is reaped, while Appine dropped it and let the process directory describe another thread, which alone failed 35 Starnix tests.
 - **Tradeoffs**: Entries that need a task (cmdline, maps, fd/, the mount namespace) behave as for a zombie while the rest of the process runs, as on Linux.
 - **Watch out**: Code that reached a live thread's state through the process directory after the leader exited gets nothing (none was found in the kernel).
-- **Source**: 79a60cf
+- **Source**: 79a60cf, 70c1bc6, 5d23297
 
 ### D18: `/proc/vmstat` is the host's
 - **What**: `/proc/vmstat` copies the host's file read through hal (D13 there), or a 16-line fallback when it cannot be read.
@@ -147,3 +147,71 @@
 - **Tradeoffs**: statm and stat still use `resident_pages`, which can differ slightly from status.
 - **Watch out**: None known.
 - **Source**: 566da95
+
+### D21: `fs.mount-max` is a kernel-wide sysctl
+- **What**: `/proc/sys/fs/mount-max` reads and sets the kernel-wide mount limit, writable from 1 to `INT_MAX` (else `EINVAL`) as `proc_dointvec_minmax` with `SYSCTL_ONE`, and mounts and mountinfo are generated through `Vfs::mounts_from` (kernel/vfs D30).
+- **Why**: Linux lets fs.mount-max be read and set, and mountinfo must not rescan the mount table for every mount it lists.
+- **Tradeoffs**: As on Linux, the limit is global rather than per user namespace.
+- **Watch out**: None known beyond kernel/vfs's.
+- **Source**: 0a4712e
+
+### D22: `/proc/sys/user/max_*` are each user namespace's own limits
+- **What**: Reads and writes of `/proc/sys/user/max_*_namespaces` go to the reader's or writer's user namespace limits (0 to `INT_MAX`), and anyone may open them for reading and holders of `CAP_SYS_RESOURCE` in their user namespace for writing, whoever owns the files (kernel/process D28).
+- **Why**: The files were one kernel-wide table under plain DAC, so a child user namespace's root could not set its own limits (the files belong to an unmapped root) and a write in one namespace changed everyone's.
+- **Tradeoffs**: The files keep their root-owned 0644 stat, and the namespace is the reader's at read time, not the opener's (D1).
+- **Watch out**: None known.
+- **Source**: 6d05aa9
+
+### D23: `/proc/<pid>/fd` follows the ptrace-read rule and Linux's names and modes
+- **What**: `may_read` gates lookup and listing of fd/ and fdinfo/ and following fd links, numeric names accept only plain digits up to `i32::MAX`, and fd links take their modes from the open mode as `proc_fd_instantiate` does.
+- **Why**: fd/ and fdinfo/ skipped the ptrace-read check, so any process could list and follow another user's descriptors, numeric names accepted signs and wrapped (`/proc/self/fd/4294967296` was fd 0), and fd links were 0777.
+- **Tradeoffs**: fd/ is checked by the ptrace rule rather than its 0500 owner rule.
+- **Watch out**: Tools reading other users' `/proc/<pid>/fd` now get `EACCES`, as on Linux.
+- **Source**: 5d23297, 5d7b936
+
+### D24: cgroup files show ids in the reader's pid namespace
+- **What**: cgroup files get a `vnr` closure that shows ids in the reader's pid namespace (0 for an invisible process), and writes to a removed cgroup fail with `ENODEV`.
+- **Why**: `cgroup.procs` showed global ids to readers in a child pid namespace (a container), and writes through a removed cgroup's open files gave `ENOENT`.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D25: Write opens of read-only procfs files follow each file kind, and contents keep the opener's credentials
+- **What**: Root may open read-only system-wide proc files and `/proc/sysvipc` for writing and their writes fail with `EIO` (`EINVAL` for per-process and fdinfo files), `/proc/<pid>/net`'s seq files and sysfs refuse only a write mode, `/proc/sys` refuses `O_TRUNC` too and namespace files are `EPERM`, while `FileKind::Proc` keeps the opener's credentials and regeneration builds its view with them, namespaces still coming from the current reader.
+- **Why**: Linux lets root open read-only procfs files for writing (std::fstream and fopen "r+" on `/proc/cpuinfo` or status) and keeps the opener's credentials (`f_cred`) for regenerated content, while Appine refused the open and regenerated with the reader's credentials.
+- **Tradeoffs**: One more `Rc<Cred>` per open procfs file, and `/proc/sys` values regenerated through a passed descriptor still follow the reader's network and IPC namespaces.
+- **Watch out**: The per-kind errors were observed on native 6.8 and attributed to 6.1, and cgroup files keep their own rule (read-only ones open for root), which may not match `kernfs_fop_open`.
+- **Source**: f6a82cc
+
+### D26: cgroup migrations check the common ancestor, as Linux does
+- **What**: `may_write_procs` judges a cgroup's `cgroup.procs` by mode and owner, migrations through `cgroup.procs` check the common ancestor with the opener's credentials (`Writer::opener`) before the namespace check, and `CLONE_INTO_CGROUP` checks the target and the common ancestor with the caller's, after `cgroup_procs_write_permission` and `cgroup_css_set_fork`.
+- **Why**: Any process could clone3 a child into any cgroup in its namespace, and a cgroup's owner could pull other users' processes in through `cgroup.procs`, escaping or capturing limits, freezing and kill.
+- **Tradeoffs**: cgroups still cannot be chowned, so delegation stays limited to cgroups created under a non-root owner.
+- **Watch out**: Container runtimes that place children with `CLONE_INTO_CGROUP` as non-root into root-owned cgroups now get `EACCES`, as on Linux.
+- **Source**: b43ff37
+
+### D27: status's Cpus_allowed_list follows the thread's affinity
+- **What**: Cpus_allowed_list lists the online CPUs in the thread's affinity mask.
+- **Why**: The line ignored affinity.
+- **Tradeoffs**: There is still no Cpus_allowed mask line.
+- **Watch out**: None known.
+- **Source**: 5d7b936
+
+### D28: `/proc/sys` opens by `test_perm`, and net sysctls belong to the network namespace's owner
+- **What**: Opening a `/proc/sys` node uses `test_perm`'s bits (owner bits for euid 0, group bits for group 0; user/max_* keeps D22's rule), net.* sysctls are owned by root of the user namespace that owns the network namespace (`net_ctl_set_ownership`) and give the owner bits to holders of `CAP_NET_ADMIN` over it, ping_group_range shows its kernel group ids in the reader's namespace (65534 when unmapped, kernel/netns D14), and `/proc/stat`'s softirq line has the total and Linux's 10 per-type counts (all 0).
+- **Why**: Root of a user namespace could not write the sysctls of a network namespace it owns, `CAP_DAC_OVERRIDE` wrongly opened `/proc/sys`, and BuildKit refused `/proc/stat`'s one-number softirq line, failing every docker build.
+- **Tradeoffs**: `/proc/sys` now ignores capabilities other than `CAP_NET_ADMIN` on net.*, which can refuse callers that used to pass through `CAP_DAC_OVERRIDE`, as on Linux.
+- **Watch out**: Sysctls that need their own capability checks rely on the write path's checks, and a node classified by path prefix (`sys/net/`) must stay accurate as nodes are added.
+- **Source**: 2aca260
+
+### D29: sysfs shows overlay's module parameters, read-only
+- **What**: `/sys/module/overlay/parameters/` holds read-only files with 6.1's Kconfig defaults (`redirect_always_follow` Y, `redirect_max` 256, the others N), which describe what Appine's overlay does.
+- **Why**: containerd appends `index=off` and BuildKit `redirect_dir=off` only when the matching overlay module parameter exists in sysfs, as on Linux hosts where those features could be on.
+- **Tradeoffs**: The files cannot be written as on Linux (0644 there), `redirect_always_follow` says Y although lower-layer redirects are not followed, and no other module appears under `/sys/module`.
+- **Watch out**: A tool that writes the parameters, or relies on redirects being followed, finds a difference.
+- **Source**: 450fb00
+
+## Superseded
+
+- ~~Regenerated content uses the current reader's credentials, not the opener's (D1 in part, §8.2)~~ → replaced by **D25** in f6a82cc (2026-11-08)
+- ~~No common-ancestor permission check on cgroup migration (D4 in part, round 163)~~ → replaced by **D26** in b43ff37 (2026-11-08)

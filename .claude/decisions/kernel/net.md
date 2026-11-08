@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/net covers `net.rs`, `syscall/net.rs`, raw ICMP, the routing table, the port map, traffic counters and `SO_ORIGINAL_DST`, with host socket wrappers in hal and the namespace hooks described from kernel/netns's side.
 - **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits.
 - **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them accept4 leaking fds, an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, unsupported rtnetlink changes skipping the capability check, one echo id per raw ICMP socket and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df and 4e64e74)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, netlink memberships that never receive and destination addresses that are ignored, one echo id per raw ICMP socket, raw ICMP sockets that cannot be bound to another address or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297 and 5d7b936)
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -126,6 +126,48 @@
 - **Tradeoffs**: A dropped listen is reported only if the program listens on it again.
 - **Watch out**: None known.
 - **Source**: 6adbd6c
+
+### D18: Inet binds check their family before the host sees it
+- **What**: `inet_bind_addr` checks every inet bind first: a sockaddr shorter than the family's is `EINVAL`, IPv4 takes `AF_INET`, or `AF_UNSPEC` with `INADDR_ANY` rewritten to `AF_INET`, and otherwise `EAFNOSUPPORT`, raw IPv4 ignores the family, and IPv6 takes only `AF_INET6` (`EINVAL` for raw, `EAFNOSUPPORT` otherwise), so the host only ever sees `AF_INET` or `AF_INET6`.
+- **Why**: An `AF_UNSPEC` bind passed to the host oopsed the development VM's kernel and hung Appine, and other bogus families got the host's (AppArmor's) error instead of Linux 6.1's.
+- **Tradeoffs**: Rebinding a raw socket to another address, which `raw_bind` allows, is still refused by the host ping socket underneath (D22), and sendto's destination is still not checked by the layer.
+- **Watch out**: Programs relying on the host accepting an odd bind family now get Linux's error, and differential cases that bind with `AF_UNSPEC` need an unconfined native side, since a confined one can still hit the AppArmor oops.
+- **Source**: 0b2c3c8
+
+### D19: Netlink dumps fit in a page, and UDP receives end after a read shutdown
+- **What**: One `pack` helper fills link, address and route dump datagrams up to 3776 bytes (Linux's first dump datagram on 4 KiB pages), keeping one run per family and `NLMSG_DONE` alone; `SHUT_RD` or `SHUT_RDWR` sets `InetSocket::rd_shut`, also when the host answers `ENOTCONN` as Linux's `inet_shutdown` does, and a blocking recv on a datagram socket with nothing queued then returns 0 before timeouts and signals.
+- **Why**: Link dumps came in 8 KiB datagrams that page-sized readers (Go's `net.Interfaces`) cannot read once there are about nine interfaces, and a blocking UDP recv after a read shutdown looped between the host's `EAGAIN` and a readable poll at full CPU, hanging programs that wake receiver threads with shutdown.
+- **Tradeoffs**: Readers with large buffers get more datagrams than Linux sends them after the first, dumps are still not resumable for buffers under 3776 bytes, and raw ICMP sockets still wait after a read shutdown (recorded in the map).
+- **Watch out**: The read shutdown is a guest-side flag, so a host socket shut down some other way is not seen; a reader that assumes one datagram per family would break (none known).
+- **Source**: b3e134a
+
+### D20: accept4 installs only a complete socket, and socket timeouts are parsed strictly
+- **What**: accept4 finds a free fd slot before taking a connection and writes the address before installing the fd (a fault drops the socket), accepted sockets copy the listener's `SO_RCVTIMEO` and `SO_SNDTIMEO`, and the timeout parser returns `EINVAL` for short values, `EDOM` for out-of-range microseconds and a zero timeout for negative seconds.
+- **Why**: accept4 installed the fd before writing the address and took a connection before finding no free fd, accepted sockets lost the listener's timeouts, and the lenient parser let a negative timeout block forever.
+- **Tradeoffs**: None.
+- **Watch out**: Programs passing bad timeouts now see `EDOM` or `EINVAL`.
+- **Source**: 5d23297
+
+### D21: A refused blocking connect leaves the host socket ready for another connect
+- **What**: When a blocking connect fails, the failure branch connects the host socket once more and ignores the answer (`ECONNABORTED`, nothing sent).
+- **Why**: After a refused blocking connect the host socket stayed connecting, so the guest's next connect on it got `ECONNABORTED` where Linux sends a new SYN.
+- **Tradeoffs**: One extra host syscall on a failed blocking connect.
+- **Watch out**: None known; the extra connect goes through `__inet_stream_connect`'s `sock_error` path and sends nothing.
+- **Source**: f6a82cc
+
+### D22: Binding a raw ICMP socket again to its own address succeeds
+- **What**: A raw socket already bound on the host to the same address returns success without binding again.
+- **Why**: A second bind of a raw ICMP socket failed with `EINVAL` because its host ping socket refuses a second bind.
+- **Tradeoffs**: Binding to another address is still `EINVAL` (recorded in the map), since recreating the socket would lose its options and its aggregation-point registration.
+- **Watch out**: None known.
+- **Source**: dcacfb6
+
+### D23: Netlink options, getpeername and socketpair follow Linux's rules
+- **What**: `SockOpts` records generic options and reads them back by Linux's rules; netlink sockets gain a type, groups, flags, `SO_PASSCRED` and a send timeout, with bind, connect, autobind, `SOL_NETLINK` options, pktinfo and kernel credentials on receive; `SO_*TIMEO_NEW` map to the old options; getpeername reports the connected peer as Linux does; socketpair returns Linux's `EINVAL`, `ESOCKTNOSUPPORT` or `EPERM`; and rtnetlink change types up to `RTM_MAX` are `EPERM` without `CAP_NET_ADMIN`.
+- **Why**: Netlink options were misreported (`SO_TYPE` 0, no memberships, no autobind, `SO_PASSCRED` ignored), `SO_*TIMEO_NEW` had no effect, getpeername echoed the connect address, socketpair's errnos differed, and unprivileged rtnetlink changes answered `EOPNOTSUPP`.
+- **Tradeoffs**: Memberships and buffer sizes are only recorded, and autobind does not look for other sockets holding the tgid.
+- **Watch out**: Programs that relied on unknown netlink levels being accepted now get `ENOPROTOOPT`, and a wildcard connect from a socket bound to its own address reports the loopback.
+- **Source**: 5d7b936
 
 ## Superseded
 

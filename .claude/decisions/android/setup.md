@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -59,8 +59,8 @@
 - **What**: android/setup covers `Rootfs.kt`, `SettingsActivity.kt`, `login.sh` and `scripts/fetch-rootfs`, separate from android/service.
 - **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
 - **Tradeoffs**: The service drives switches and imports, so those flows span two maps, and D8's reason was never recorded.
-- **Watch out**: The map's open bugs include a password set in a running session keeping NOPASSWD until the next tab logs in and a switch interrupted by a kill silently becoming Alpine.
-- **Source**: 12c4afa
+- **Watch out**: The map's open bugs include a password set in a running session keeping NOPASSWD until the next tab logs in; a switch interrupted by a kill no longer becomes Alpine (D17).
+- **Source**: 12c4afa (bug list since updated by 237d663)
 
 ### D10: The execution tier row exists only in debug builds
 - **What**: Settings creates the tier row only when `BuildConfig.DEBUG`, with its strings left in `main`, which references them.
@@ -104,6 +104,28 @@
 - **Watch out**: The toggles' accessibility state (D12) was not checked with TalkBack on a device.
 - **Source**: 4c1a3ce
 
+### D16: Guest messages name the app Appine; prefixes and paths stay lowercase
+- **What**: The motd says "Welcome to Appine", and login.sh says "Appine tries again at the next login" and writes "# Written by Appine" into the NOPASSWD rules; the "appine:" prefixes, `/var/lib/appine`, `/var/cache/appine`, `30-appine.conf`, `sudoers.d/appine` and `profile.d/appine.sh` are unchanged.
+- **Why**: The motd and the login script's messages named the app in lowercase.
+- **Tradeoffs**: Messages read "appine: ... Appine tries again"; the rules file is rewritten at every login, so the new comment needs no migration.
+- **Watch out**: The motd is written only at import, so an installed rootfs keeps "Welcome to appine" until it is reset or switched.
+- **Source**: 3f04bf5 (with android/terminal D28)
+
+### D17: An import records its distro first and keeps the tarball until the store is in place
+- **What**: `prepare` commits `KEY_DISTRO` for the app's store before importing and deletes the tarball only after the rename and directory sync, and `Rootfs.importing` returns that record (Alpine when there is none) for a launch without a store (android/service D16).
+- **Why**: The distro was recorded only just before the store was renamed into place and the tarball was deleted right after importing, so a kill midway left nothing saying which distro was being imported and could lose the download.
+- **Tradeoffs**: A kill between deleting the old store and `prepare` starting still resumes the old distro; the cache holds the tarball a little longer during configure and sync.
+- **Watch out**: A distro whose download keeps failing is tried again at every launch without a store, each time falling back to Alpine with a notice.
+- **Source**: 237d663
+
+### D18: Rootless podman uses the host network, and container storage keeps the packages' defaults
+- **What**: Before every start (android/service D17) `Rootfs.ensureContainersConfig` writes `containers.rootless.conf.d/appine.conf` (`netns = "host"`) when missing and nothing else, so podman's overlay driver and docker's overlayfs snapshotter, the packages' defaults, run on the kernel's overlayfs rootful and rootless.
+- **Why**: Without TUN, pasta and slirp4netns cannot start for an ordinary user, and users had to find and edit the right files themselves; once the kernel had overlayfs, forcing vfs and the native snapshotter only cost every container a full copy of its image.
+- **Tradeoffs**: Rootless containers share the host's network; a store set up by an earlier build keeps its vfs `storage.conf` and native `daemon.json` (no migration, as the user asked for an unreleased app), and on Alpine the package's own `storage.conf` then sits in `storage.conf.apk-new`.
+- **Watch out**: A distribution whose podman or docker package defaults to another driver, or a future default needing overlay features Appine lacks (redirects, metacopy, idmapped layers), would fail without the old fallback.
+- **Source**: 0eb9e19, 869de68
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
+- ~~`ensureContainersConfig` also chooses vfs in `/etc/containers/storage.conf` (rewriting an active `driver = "overlay"` line) and the native snapshotter in `/etc/docker/daemon.json` (0eb9e19)~~ → replaced by **D18** in 869de68 (2026-11-08)

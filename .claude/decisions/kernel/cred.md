@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -30,11 +30,11 @@
 - **Source**: round 119 (`119-user-namespaces`)
 
 ### D4: execve transforms credentials like `cap_bprm_creds_from_file`, with file capabilities
-- **What**: Setuid/setgid bits (owner and group mapped, no nosuid, no no_new_privs), file capabilities from `security.capability` (v1–v3; v3 only with rootid 0), ambient capabilities, root emulation and `AT_SECURE` for privileged execution; no_new_privs or a tracer without `CAP_SYS_PTRACE` (recorded at attach) blocks gains.
+- **What**: Setuid/setgid bits (owner and group mapped, no nosuid, no no_new_privs), file capabilities from `security.capability` (v1–v3; v3 only where its root owns the namespace, D12), ambient capabilities, root emulation and `AT_SECURE` for privileged execution; no_new_privs or a tracer without `CAP_SYS_PTRACE` over the tracee's namespace (kernel/signal D20) blocks gains.
 - **Why**: Ordinary users (Debian `su`, sshd logins, a non-root login account) need file capabilities such as iputils-ping's `cap_net_raw`; before round 100 the xattr was stored and ignored at exec.
-- **Tradeoffs**: v3 file capabilities set inside a user namespace are not converted and do not apply; the tracer's privilege is a single flag checked in the initial namespace (Linux keeps the whole credential); sharing the fs context (`CLONE_FS`) does not suppress gains; no audit records.
+- **Tradeoffs**: Sharing the fs context (`CLONE_FS`) does not suppress gains; no audit records.
 - **Watch out**: File capabilities are only safe together with the xattr permission checks (`security.capability` needs `CAP_SETFCAP`, other `security.*` and `trusted.*` need `CAP_SYS_ADMIN`) and with privilege removal on write, truncate and chown; round 100 found all three missing and added them together.
-- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`)
+- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); f6a82cc, 2aca260
 
 ### D5: Guest seccomp is implemented in the kernel layer with Linux 6.1 semantics
 - **What**: Strict mode and cBPF filters with Linux's program checks, chain size limit, action precedence, inheritance and TSYNC; filters run in an interpreter at syscall entry (after a `PTRACE_SYSCALL` entry stop); `PTRACE_EVENT_SECCOMP` and the notification fd (including `ADDFD`) are supported; `KILL_PROCESS`'s `SIGSYS` cannot be caught, as with `SA_IMMUTABLE`.
@@ -54,8 +54,8 @@
 - **What**: kernel/cred covers `cred.rs` except user namespaces, `syscall/cred.rs` and `seccomp.rs`, while user namespaces stay in kernel/process.
 - **Why**: §11.1's credential and seccomp design had to leave the retired design doc, and the user asked for a module of its own.
 - **Tradeoffs**: User namespaces sit in kernel/process although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading.
-- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, global pids in seccomp notifications, privilege gains despite a shared fs context, untranslated `PRIO_USER`, new-file modes, the ptrace access checks and the vDSO bypassing seccomp for every clock, alarm clocks included.
-- **Source**: 12c4afa (bug list since updated by 4e64e74)
+- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, privilege gains despite a shared fs context and the vDSO bypassing seccomp for every clock, alarm clocks included.
+- **Source**: 12c4afa (bug list since updated by 4e64e74, and shortened by D9–D11 and kernel/process D33)
 
 ### D8: Credential and seccomp files read in the order their code runs
 - **What**: cred.rs runs credentials and file capabilities with the user namespace types (owned by kernel/process) last and `impl Cred`'s entry points before id translation and scope checks; syscall/cred.rs runs id syscalls, capabilities, then committing; seccomp.rs goes from installing filters through syscall entry, the sysctls, user notifications, ptrace and thread exit to the always-allow cache, cBPF and shared helpers; constants several sections use stay at the top.
@@ -63,3 +63,36 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; two seccomp sections (thread exit, shared helpers) hold one function each.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 159d4f4
+
+### D9: New files take their mode and owner through one helper following Linux
+- **What**: `new_owner(dir, mode, umask, is_dir)` follows `vfs_prepare_mode` and `inode_init_owner`, stripping setgid before the umask, masking directories to permission and sticky bits and adding setgid under setgid parents; `owns` needs `CAP_FOWNER` with only the owner mapped, as `inode_owner_or_capable` does.
+- **Why**: New files got the umask before the setgid strip, mkdir kept caller-supplied set-id bits, and `owns` also required the group to be mapped.
+- **Tradeoffs**: None.
+- **Watch out**: Callers creating nodes must pass the raw mode and the umask.
+- **Source**: 5d23297
+
+### D10: ptrace access checks pick credentials by mode, and procfs memory views use filesystem credentials
+- **What**: With `PTRACE_MODE_FSCREDS` `may_ptrace` compares the filesystem ids and the effective set, as `cap_ptrace_access_check` does, and otherwise the real ids and the permitted set; opening `mem`, `auxv`, `environ`, `maps`, `smaps` and `pagemap` uses fscreds; user namespaces record whether their creator had `CAP_SETFCAP` (for id-map writes, kernel/process D32).
+- **Why**: `may_ptrace` compared the target's permitted set with the caller's even for filesystem-credential checks, and the procfs memory views were checked with real credentials.
+- **Tradeoffs**: None known.
+- **Watch out**: Set-id helpers that changed their filesystem ids now get the access Linux gives them.
+- **Source**: f6a82cc
+
+### D11: seccomp reports pids in the caller's pid namespace
+- **What**: The pid in `SECCOMP_IOCTL_NOTIF_RECV` and the tid of a failed TSYNC are given in the caller's pid namespace (`ESRCH` when invisible), and `CAP_NET_BROADCAST` joins the capability constants.
+- **Why**: Notifications and TSYNC failures reported global pids.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d7b936
+
+### D12: File capabilities set in a user namespace are stored as v3 with its root
+- **What**: `FileCaps::xattr_to_store` follows `cap_convert_nscap` (a v2 value from an initial-namespace holder of `CAP_SETFCAP` stays v2, otherwise v3 with the mapped root as rootid, `EINVAL` when unmapped), `xattr_for_reader` follows `cap_inode_getsecurity` (v3 with the reader's view of the rootid, v2 where that root owns the reader's namespace, else `EOVERFLOW`), and execve applies capabilities only where `Cred::root_owns` the rootid (kernel/vfs D38).
+- **Why**: setcap inside a user namespace (a podman build step) failed, and v3 capabilities applied only with rootid 0.
+- **Tradeoffs**: Reading a value back depends on the reader's namespace, as on Linux, and existing v3 values with nonzero rootids, once ignored, now apply where their root owns the namespace.
+- **Watch out**: getxattr can now return `EOVERFLOW` to callers that only handled `ENODATA`.
+- **Source**: 2aca260
+
+## Superseded
+
+- ~~The tracer's privilege is a single flag recorded at attach and checked in the initial namespace (D4 in part)~~ → replaced by **kernel/signal D20** in f6a82cc (2026-11-08)
+- ~~v3 file capabilities apply only with rootid 0 and are not converted when set inside a user namespace (D4 in part)~~ → replaced by **D12** in 2aca260 (2026-11-08)

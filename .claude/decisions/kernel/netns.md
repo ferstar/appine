@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/netns"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/netns covers `netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs` and `netconf.rs`, keeping the nftables control plane and its evaluation in one map.
 - **Why**: The retired design doc's network-namespace section summarised address translation, devices, nftables and forwarding in five bullets, without their isolation limits.
 - **Tradeoffs**: The module is large (about 10k lines) and its map is dense.
-- **Watch out**: Bugs confirmed at the split stay open in the map, among them `limit` and `quota` ignoring "over", the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and a forwarder that can busy-spin.
-- **Source**: c3df5d3
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them no TUN/TAP device (so rootless podman's pasta and slirp4netns cannot start), per-key rate limits doing nothing, the initial namespace reaching containers' loopback sockets, same-port binds judged by host address, ephemeral ports aliasing explicit ones, connected UDP escaping namespace checks, nat drops becoming `EPERM`, dual-stack listeners not forwarded and route requests whose address sizes, gateway devices and next hops are checked unlike Linux 6.1's.
+- **Source**: c3df5d3 (bug list since updated by ce8a9ce, ac5da40, b43ff37 and 5d7b936)
 
 ### D10: `nft flush ruleset` flushes tables as Linux's `nf_tables_deltable` does
 - **What**: DELTABLE and DESTROYTABLE with family 0, or with neither a name nor a handle, remove every table of the family (all families for 0), only those with the given name if one is present, checked before the family validation; matching nothing succeeds.
@@ -84,3 +84,24 @@
 - **Tradeoffs**: git blame on the moved lines points at this commit unless read with -M or an ignore-revs file; netns.rs now has 10 sections, and `impl Default for NetConf` stays before the inherent impl as its constructor.
 - **Watch out**: Code appended at the end of a file drifts from this order.
 - **Source**: 5bc3be5
+
+### D12: The port forwarder backs off instead of spinning
+- **What**: A port whose first accept of a round fails with anything but `EAGAIN` is skipped for `ACCEPT_BACKOFF` (1 s), with the poll timeout shortened to its return; a poll error other than `EINTR` sleeps `POLL_BACKOFF` (100 ms); and a connection ends when a side reports `POLLERR` with a pending `SO_ERROR`, or `POLLHUP` after its end of file while the forwarder has not shut it for writing.
+- **Why**: The forwarder polled a readable listener whose accept kept failing (`EMFILE`, shut down), retried a failing poll at once, and kept polling a reset side it no longer read from, so each case spun the thread until something else changed.
+- **Tradeoffs**: A listener that recovers waits up to a second for its next accept, and a failing poll still retries ten times a second without a report.
+- **Watch out**: A host that reported `POLLHUP` for a cleanly half-closed side before the forwarder shut it would cut such connections; Linux reports it only with both directions shut or after a reset.
+- **Source**: ac5da40
+
+### D13: Onlink routes and nftables rate limits and quotas work as on Linux
+- **What**: Route requests read `rtm_flags`, and with `RTNH_F_ONLINK` the next hop needs a device that is up and, for IPv4, a scope below link and a unicast gateway, with dumps showing the flag; `Rule::rates` holds token buckets and quota counts by expression position (shared by batch copies), which `limit`, `quota` and xt `limit` use.
+- **Why**: Onlink routes failed with `ENETUNREACH`, "limit rate over" and "quota over" dropped every packet, "limit rate" accepted everything, and `iptables -m limit` never matched.
+- **Tradeoffs**: Byte limits and quotas count headers only, like `meta len`, and meters, hashlimit and recent still do nothing.
+- **Watch out**: A rule replaced in a batch starts with a full bucket, as a new expression does on Linux.
+- **Source**: b43ff37
+
+### D14: ping_group_range maps its group IDs with the writer's credentials
+- **What**: `parse_ping_group` maps both IDs through the writer's credentials: `EINVAL` when one is unmapped, `(1, 0)` when the range is reversed, kernel IDs otherwise.
+- **Why**: The sysctl stored the raw numbers, so a write from a user namespace recorded the wrong group IDs and accepted unmapped ones.
+- **Tradeoffs**: The value is still only recorded, since ping sockets are handed to the host and Android allows all groups.
+- **Watch out**: Writers of IDs unmapped in their namespace now get `EINVAL`, as on Linux.
+- **Source**: 2aca260

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -112,3 +112,10 @@
 - **Tradeoffs**: O_TMPFILE's `I_LINKABLE` exception has no counterpart, since O_TMPFILE is not implemented.
 - **Watch out**: None known.
 - **Source**: c108be0
+
+### D16: st_blocks comes from the host object
+- **What**: `Stat::blocks` is an `Option<u64>` filled from the host object's st_blocks by `fill_from_host` and `fill_from_object` and `None` elsewhere, where the size stands in, and st_blocks and tmpfs accounting follow it (kernel/vfs D37).
+- **Why**: Now that holes are real holes in the host object, st_blocks and tmpfs accounting must follow the storage a file takes, which only the host object knows.
+- **Tradeoffs**: st_blocks varies with the host filesystem (APFS on a macOS development host frees zeroed ranges; f2fs keeps inline data).
+- **Watch out**: Hosts that report delayed allocation late would undercount tmpfs writes until the instance is recounted.
+- **Source**: 5d7b936

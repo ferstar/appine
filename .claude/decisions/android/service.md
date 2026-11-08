@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -34,11 +34,11 @@
 - **Source**: round 37 (`37-trim-memory`)
 
 ### D5: After a kill, tabs come back without their processes
-- **What**: A `running` marker detects an abnormal end; each running tab's login setting, foreground cwd and plain-text scrollback (last 256 K, in transcripts named by their content) are saved every minute, when the UI hides, on memory pressure and after tabs open, close or end; on restart each tab gets a new shell in its directory below the old scrollback and a notice, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
-- **Why**: v1 restores only the layout, directories and scrollback, and says so; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash.
-- **Tradeoffs**: Programs are not restored; colours are lost; tabs never shown since the restore keep their old data; names saved by earlier versions are lost at the next restore.
-- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index.
-- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183
+- **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd and plain-text scrollback (last 256 K, in transcripts named by their content) are saved every minute, when the UI hides, on memory pressure and after tabs open, close or end; on restart each tab gets a new shell in its directory below the old scrollback and a notice, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
+- **Why**: v1 restores only the layout, directories and scrollback, and says so; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash; an "auto" tab resolved again at restore could become another user after accounts changed.
+- **Tradeoffs**: Programs are not restored; colours are lost; tabs never shown since the restore keep their old data; names saved by earlier versions are lost at the next restore; an account added between a tab's opening and its first save (up to a minute) can still be the one recorded.
+- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store.
+- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038
 
 ### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
 - **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records); OpenRC services that failed at boot are notified too.
@@ -50,15 +50,15 @@
 - **What**: android/service holds `TerminalService.kt` and `Tabs.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
 - **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
 - **Tradeoffs**: The code stays in one Gradle module, so cross-module statics remain (the login setting, the store lock).
-- **Watch out**: A restored "auto" tab may log in as another user, since the saved value is the setting (open in the map).
-- **Source**: 12c4afa (bug list since updated by 89ad551)
+- **Watch out**: None known; the restored "auto" tab logging in as another user, open at mapping, was fixed in 3beb038 (D5).
+- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038)
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
 - **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports find the tab by console; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
 - **Why**: The service held Termux `TerminalSession`s directly with a separate session → `ConsolePty` map, so the libghostty-vt terminal could not be one of its tabs (android/terminal D8).
 - **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly.
-- **Watch out**: Finished tabs keep the service alive, saved tabs can be lost or mismatched, and notification ids collide.
-- **Source**: 6ffb912
+- **Watch out**: None known; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
+- **Source**: 6ffb912; 89ad551
 
 ### D9: Exit all, restart and replace finish around an ongoing start instead of racing it
 - **What**: While `starting` or `transitioning` is set, Exit all only marks and detaches and the start, restart or replace finishes the exit; the wake lock is held throughout, a download finished during a restart waits in `pendingReplace` until the new kernel is up or has failed, a failed start says so in the notification and stops the service once no UI is left, and kill notifications take ids counting up from 100000.
@@ -94,6 +94,34 @@
 - **Tradeoffs**: The writes rely on androidx.core's Kotlin extensions, already a dependency.
 - **Watch out**: None known; each write is the same `apply()` as before.
 - **Source**: 4c1a3ce
+
+### D14: A restored run says why it ended, from Android's exit record
+- **What**: `markRunning` writes the pid into the marker and `takeKilled` returns it with the saved tabs; the service looks up `getHistoricalProcessExitReasons(package, pid, 1)` and opens the restored notice with one of seven reasons (low memory, background resources, force-stopped, updated, crash, ANR, general); a crash or ANR also posts notification 3 on the problems channel with "Copy report" (D6's header plus the pid, the kind, the UTC time and Android's ANR description), even when no tabs could be read.
+- **Why**: Every killed run was explained as "Android stopped the app", so an Appine crash looked like the system's doing and produced no report.
+- **Tradeoffs**: The pid ties the record to the run, since the newest package record could be a provider-only process started later; a marker without a pid or a record Android no longer keeps falls back to the general text; the report holds only what the exit record holds (no Java stack trace or native tombstone); updates are named only from Android 14.
+- **Watch out**: Low-memory kills are told apart only where `isLowMemoryKillReportSupported`; low memory, background resources and ANR were not triggered in testing, and the Chinese strings were not seen on a device; a Java crash's stack would need an uncaught-exception handler saving it for the next start.
+- **Source**: a1f47cc
+
+### D15: Bug reports name the app Appine; the in-tab tag stays `[appine]`
+- **What**: The copied report's first line is "Appine <version> (<code>, <build type>)", while the "[appine]" tag before restore notices and kill reports stays lowercase, as a source tag like "sudo:".
+- **Why**: The report opened with the product name in lowercase.
+- **Tradeoffs**: A notice can read "[appine] ... because Appine crashed", mixing both casings in one line.
+- **Watch out**: Capitalising the tag means changing TerminalService's two `showMessage` calls together with the setup module's "appine:" prefixes (android/setup D16).
+- **Source**: 3f04bf5 (with android/terminal D28)
+
+### D16: A launch without a ready store resumes the import of the recorded distro
+- **What**: Without a ready store `onCreate` calls `start(Rootfs.importing(this))`, the distro the interrupted import recorded (android/setup D17), and the existing fallback to Alpine with `switch_failed` covers a resumed import that cannot download or import.
+- **Why**: The service imported Alpine whenever no store was ready, so a switch interrupted by a kill silently became Alpine.
+- **Tradeoffs**: A resumed Debian import needs the network again when its tarball is gone from the cache.
+- **Watch out**: None known.
+- **Source**: 237d663
+
+### D17: The containers configuration is written before every start
+- **What**: The start thread calls `Rootfs.ensureContainersConfig` after `ensureNetworkConfig` (android/setup D18), so stores imported by earlier versions get it too.
+- **Why**: The configuration must exist before the guest starts, like the network config.
+- **Tradeoffs**: A store check, and a write when the file is missing, on every start.
+- **Watch out**: A store error while writing the file fails the start like the other ensure steps.
+- **Source**: 0eb9e19
 
 ## Superseded
 

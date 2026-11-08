@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-07 (HEAD = 2d78930). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -89,8 +89,8 @@
 - **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log and the Linux 6.1 ABI contract (uname, the ENOSYS policy, clock setting), leaving host-side signal handling to engine and auxv to kernel/process.
 - **Why**: The retired design doc's §7 was the only current-state description of signals, ptrace, core dumps and the ABI contract, and it said nothing about generation and delivery semantics.
 - **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split or found by Starnix's tests stay open in the map, among them silent group kills on unwritable or bad frames, an early `CLD_STOPPED`, coalesced siginfo, hardware slots left armed after detach, late single-step reports, unforced ptrace reads and `MADV_DONTNEED` wiping the vDSO.
-- **Source**: 9e5be2b (bug list since updated by 4e64e74)
+- **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, coalesced siginfo, hardware slots left armed after detach, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread and a repeated stop report after detaching at an attach-time group stop.
+- **Source**: 9e5be2b (bug list since updated by 4e64e74, ce8a9ce and 5d7b936, and shortened by D18–D21)
 
 ### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
 - **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
@@ -126,3 +126,38 @@
 - **Tradeoffs**: None known.
 - **Watch out**: Other trace-state fields a stopped thread reads after resuming would be lost the same way, since only stop, regs, resume and syscallno are kept.
 - **Source**: b877707
+
+### D18: A signal frame that cannot be used forces SIGSEGV through normal delivery
+- **What**: When `setup_frame` fails, delivery puts back a swapped sigsuspend/ppoll mask, leaves the mask alone and forces `SIGSEGV` with `SI_KERNEL` (`force_fatal` when the signal was `SIGSEGV`) before continuing the delivery loop, with restart decided once by the first signal taken; rt_sigreturn with a bad frame forces `SIGSEGV` at SP (`SEGV_ACCERR` when `Mm::mapped_above`, else `SEGV_MAPERR`; kernel/mm D28) and returns before the syscall-exit stop and delivery.
+- **Why**: Frame-setup failures and invalid sigreturn frames called group exit directly, skipping the handlers, core dumps and ptrace stops that Linux's forced `SIGSEGV` goes through.
+- **Tradeoffs**: The frame is validated before anything changes, so after a bad sigreturn the registers are the caller's, where Linux may have restored some before failing.
+- **Watch out**: A program looping on signals over a broken stack now runs one `SIGSEGV` handler per failure instead of dying at the first.
+- **Source**: 41bd6ec
+
+### D19: rt_sigqueueinfo reaches zombies, and core_pattern's `%d` prints the dumpable value
+- **What**: rt_sigqueueinfo accepts any existing thread group except pid 1, as kill does, and `%d` in `core_pattern` prints the dumpable value.
+- **Why**: rt_sigqueueinfo refused zombies that kill accepts, and `%d` printed the inverse of the dumpable flag.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 5d23297
+
+### D20: Tracers keep their credentials and are judged over the tracee's user namespace
+- **What**: `Trace::cred` holds the tracer's credentials from `PTRACE_ATTACH`, `PTRACE_SEIZE`, `PTRACE_TRACEME` and auto-attach, and `tracer_capable` checks `CAP_SYS_PTRACE` over a given user namespace, so `PEEK*`/`POKE*` on a non-dumpable tracee are `EIO` unless the tracer was capable over its namespace, and execve's suppression of privilege gains under a tracer (kernel/cred D4) uses the same check.
+- **Why**: A tracer attached without `CAP_SYS_PTRACE` kept reading and writing a process that later made itself non-dumpable (ssh-agent), and a tracer privileged only inside a user namespace was judged in the initial one.
+- **Tradeoffs**: Each traced thread holds a cloned `Cred`.
+- **Watch out**: Linux checks against `mm->user_ns` while Appine checks the namespace of the tracee's current credentials, which differ after setns into another user namespace.
+- **Source**: f6a82cc
+
+### D21: rt_sigaction masks unknown flags, and sender-supplied siginfo keeps its fields
+- **What**: rt_sigaction masks flags with `UAPI_SA_FLAGS`, and `InfoFields::User` keeps `si_errno`, `si_pid` and `si_uid` (converted like `Queue`'s) and bytes 24 to 48 of siginfo given by rt_sigqueueinfo and the like, which signalfd reports with its errno and value.
+- **Why**: Echoed unknown flags made `SA_UNSUPPORTED` probing read Appine as an old kernel, and sender-supplied siginfo lost `si_errno` and every field beyond `si_value`.
+- **Tradeoffs**: Bytes past `kernel_siginfo` are dropped as Linux drops them, and layouts without pid and uid (an `SI_TIMER` code sent by a process) still get the conversion.
+- **Watch out**: None known.
+- **Source**: dcacfb6
+
+### D22: signalfds open read-write and poll as `POLLIN` alone
+- **What**: signalfds are opened `O_RDWR`, as on Linux, with write still `EINVAL` through the write path, and report only `POLLIN` in kernel/poll's readiness table (kernel/poll D15).
+- **Why**: signalfds were opened `O_RDONLY` and reported `POLLRDNORM`, unlike Linux.
+- **Tradeoffs**: None known.
+- **Watch out**: None known.
+- **Source**: e6bfdf8

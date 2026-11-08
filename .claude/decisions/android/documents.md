@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-06 (HEAD = afd086a). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -29,10 +29,11 @@
 - **Source**: rounds 196 (`196-documents-read`), 197 (`197-documents-write`); d5dbe29
 
 ### D4: Changes reach the other side in both directions
-- **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds carry a close callback that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app.
+- **What**: Provider changes are replayed under each running kernel's lock as inotify events; write fds are wrapped by `ParcelFileDescriptor.wrap` with a close listener on the documents-close thread that reports `IN_MODIFY`/`IN_CLOSE_WRITE`; directories the guest changed are polled by the service and notified to the Files app in one `notifyChange` call.
 - **Why**: Hot-reload tools in the guest (`vite`, `cargo watch`) must see edits made with Android editors, as they do in Termux where files are real host files; the kernel's inotify is emulated and knew nothing of the provider's separate store connection. The Files app also did not refresh after guest changes.
-- **Tradeoffs**: `ParcelFileDescriptor.wrap` needs API 30 (minSdk is 29), so the fd is reopened by path to get a close callback, and a failed reopen falls back to the plain fd without the close events.
-- **Source**: round 201 (`201-documents-notify`)
+- **Tradeoffs**: If `wrap` throws, the same fd number is adopted again and handed out without close events, relying on `wrap` detaching the fd before it can fail (as AOSP has since API 30); the batched notification drops the sync-to-network flag, which no sync adapter here uses.
+- **Watch out**: A platform whose `wrap` fails before detaching would make the fallback adopt an fd `wrap` already closed.
+- **Source**: round 201 (`201-documents-notify`); 88b9138
 
 ### D5: Files without a known extension are recognised as text by content
 - **What**: Unknown types are sniffed in one batch: the first 4 KB without NUL and valid UTF-8 means `text/plain`; at most 1000 files per call.
@@ -59,3 +60,14 @@
 - **Tradeoffs**: The companion's path and MIME helpers keep their old order.
 - **Watch out**: git blame on the moved lines points at a546fea unless read with -M.
 - **Source**: a546fea
+
+### D9: `file:` links open as the provider's documents
+- **What**: `Documents.fileLink` maps a `file:` URI whose host is empty, `localhost` or the name in `/etc/hostname` to the document with the same guest path (percent-decoded, written back as an ID, empty and `.` components dropped, `..` refused), typed by the provider's own `getType` so its visibility rules apply; the terminal resolves it off the main thread and grants the viewer read access only (android/terminal D31), `findDocumentPath` lets the Files app open a directory it is sent to, and remote, hidden and missing files get their own toasts.
+- **Why**: `ls --hyperlink` and similar tools write `file:` links to guest paths, which have no host file, and a `file://` URI cannot be handed to another app (`FileUriExposedException`).
+- **Tradeoffs**: Files outside the home open only with "Show the whole system in Files" on; viewers can read but not save, so edits go through the Files app; `/proc`, `/dev` and other mounts are not in the store, so links into them count as missing.
+- **Watch out**: The Kotlin ID encoding must change together with the native `encode_path` (D2); the host is matched against `/etc/hostname`, not the running host name; `findDocumentPath` now also serves the Files app's own navigation.
+- **Source**: 1cc504b
+
+## Superseded
+
+- ~~Write fds reopened by their `/proc/self/fd` path to get a close callback, since `wrap` needed API 30 above minSdk 29 (D4 in part, round 201)~~ → replaced by **D4** in 88b9138 (2026-11-07)
