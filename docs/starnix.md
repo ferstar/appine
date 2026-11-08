@@ -157,4 +157,11 @@ Ordered by value for effort.
   families in round 83.
 - **Guest-initiated suspend, container freezing, `wakeup_count`:** Android decides when the phone
   sleeps.
-- **tun and io_uring:** already rejected (docs/design/15-rejected.md).
+- **tun:** Starnix's `modules/tun` (looked at on 2026-11-08, at 7e70df49) only handles
+  `TUNSETIFF`, which asks Fuchsia's netstack3 over FIDL for an interface; `read` and `write` return
+  `EOPNOTSUPP`, and its one test only checks that the interface name appears. The packets are
+  netstack3's work, in a separate component. Appine has no network stack to attach a device to
+  (kernel/netns map), so TUN would need one in the kernel layer (smoltcp is the candidate) plus a
+  second socket backend chosen by route, and policy routing for full-tunnel VPNs. Its main user,
+  rootless podman through pasta, can run as root instead, where bridge networks work.
+- **io_uring:** already rejected (docs/design/15-rejected.md).

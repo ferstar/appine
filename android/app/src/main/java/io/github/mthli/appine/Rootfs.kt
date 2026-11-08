@@ -461,8 +461,11 @@ internal object Rootfs {
 
     private const val ROOTLESS_CONTAINERS = """# Written by Appine when missing: Appine has no TUN device, so pasta and slirp4netns (the
 # networks podman makes for an ordinary user) cannot start, and rootless containers use the
-# host's network instead. Containers run as root are not affected. To change it, edit this file
-# or set netns in ~/.config/containers/containers.conf.
+# host's network instead: they are not isolated from the host or from each other, and port
+# mappings (-p) are dropped. Containers run as root keep their bridge networks, port mappings and
+# lookups by container name, so run podman as root for those (sudo podman; doas podman on Alpine).
+# Root gives up little here: every user, root included, runs inside the Android app's sandbox.
+# To change the default, edit this file or set netns in ~/.config/containers/containers.conf.
 [containers]
 netns = "host"
 """
