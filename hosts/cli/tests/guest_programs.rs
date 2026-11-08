@@ -327,6 +327,7 @@ fn host_calls_survive_kernel_bugs() {
             memory_limit: None,
             low_port_offset: None,
             always_map_low_ports: false,
+            exception_trace: false,
         })
         .unwrap();
         // An error in spawn: spawn fails

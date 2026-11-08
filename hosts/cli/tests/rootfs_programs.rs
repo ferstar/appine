@@ -475,6 +475,59 @@ fn core_files_have_the_linux_layout() {
 }
 
 #[test]
+fn unhandled_exceptions_are_reported_in_the_kernel_log() {
+    // With debug.exception-trace set, each kind of synchronous exception that ends a process
+    // unhandled is reported in the kernel log as arm64 Linux reports it, except under a handler
+    // or a tracer, at most 10 times in 5 seconds (tests/guest/crashlog.c); the reports name the
+    // program's file, so it is copied into the store to run
+    let (Some(store), Some(program)) = (store(), build_static("crashlog")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/crashlog && chmod +x /tmp/crashlog && /tmp/crashlog";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn machines_can_start_with_exception_reports_on() {
+    // The app starts its kernel with debug.exception-trace at 1 (MachineOptions::exception_trace)
+    // rather than arm64 Linux's 0, and the guest can still turn it off
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Interpreter,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: None,
+        low_port_offset: None,
+        always_map_low_ports: false,
+        exception_trace: true,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let id = machine.open_console(24, 80).unwrap();
+    let script =
+        "cd /proc/sys/debug; cat exception-trace; echo 0 > exception-trace; cat exception-trace";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    assert_eq!(read_console(&machine, id), "1\n0\n");
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+}
+
+#[test]
 fn each_step_of_finishing_a_process_survives_kernel_bugs() {
     // When a step of process finish hits a kernel-layer bug (simulated with the test hooks of debug
     // builds), only what that step does is lost, and the later steps are done all the same
@@ -1484,6 +1537,7 @@ fn oom_kills_are_reported_to_the_app() {
         memory_limit: Some(limit),
         low_port_offset: None,
         always_map_low_ports: false,
+        exception_trace: false,
     })
     .unwrap();
     let env = [PATH.as_bytes().to_vec()];
@@ -1728,6 +1782,7 @@ fn low_ports_bind_the_real_port_or_elsewhere() {
             memory_limit: None,
             low_port_offset: None,
             always_map_low_ports: always_map,
+            exception_trace: false,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
@@ -1782,6 +1837,7 @@ fn one_machine_runs_several_terminal_sessions() {
             memory_limit: None,
             low_port_offset: None,
             always_map_low_ports: false,
+            exception_trace: false,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
@@ -1936,6 +1992,7 @@ tty1::respawn:/sbin/getty 38400 tty1
             memory_limit: None,
             low_port_offset: None,
             always_map_low_ports: false,
+            exception_trace: false,
         })
         .unwrap();
         let env = [PATH.as_bytes().to_vec()];
@@ -2009,6 +2066,7 @@ fn files_app_changes_reach_inotify_watchers() {
         memory_limit: None,
         low_port_offset: None,
         always_map_low_ports: false,
+        exception_trace: false,
     })
     .unwrap();
     let env = [PATH.as_bytes().to_vec()];

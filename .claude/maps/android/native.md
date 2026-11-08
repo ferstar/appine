@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; API level 30 for the app and cargo-ndk; last, panics caught by every JNI function)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; API level 30 for the app and cargo-ndk; panics caught by every JNI function; last, exception reports on at start)
 
 ## Responsibilities
 
@@ -46,7 +46,9 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
   `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
   (through the store's change path).
-- Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0), `stop`, `boot`, `shutdown`, `takePower`,
+- Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0; the kernel starts with
+  `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports),
+  `stop`, `boot`, `shutdown`, `takePower`,
   `processes`, `trimMemory`, `setRoutes`, `takeKills`, `takeListens`, `takeChangedDirs`.
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
   `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`.
@@ -145,7 +147,8 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 
 - `MachineTest` runs on emulators with 4 KB and 16 KB pages: boot and shutdown by inittab, consoles,
   login and doas, restore, documents, mirrors, downloads (some opt-in with network), memory trim,
-  and kernel or engine bugs injected through the test hooks.
+  kernel or engine bugs injected through the test hooks, and a guest crash reaching the kernel
+  log.
 
 ## Dependencies (inbound / outbound)
 

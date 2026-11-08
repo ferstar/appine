@@ -416,15 +416,17 @@ const STATIC: [&[u8]; 129] = [
 /// The sysctls procfs only records, so that `sysctl -p` setups, benchmark scripts and checkers find
 /// them: (path relative to `/proc`, mode, default, lowest and highest value accepted), the range
 /// being that of Linux 6.1's handler (any int for `proc_dointvec`). A write keeps the value in
-/// `Kernel::sysctls` and changes nothing else; `kernel.randomize_va_space` starts at 0 because
-/// Appine places mappings at fixed addresses.
+/// `Kernel::sysctls` and changes nothing else, except `debug.exception-trace`, which
+/// crate::signal reads ([`recorded_value`]); `kernel.randomize_va_space` starts at 0 because
+/// Appine places mappings at fixed addresses, and `debug.exception-trace` at arm64's 0
+/// (`show_unhandled_signals`; x86 starts at 1).
 pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
     const INT_MIN: i64 = i32::MIN as i64;
     const INT_MAX: i64 = i32::MAX as i64;
     // LONG_MAX / HZ for the hung-task times (HZ 250, as on distribution arm64 kernels)
     const HUNG_MAX: i64 = i64::MAX / 250;
     [
-        (b"sys/debug/exception-trace", 0o644, 1, INT_MIN, INT_MAX),
+        (b"sys/debug/exception-trace", 0o644, 0, INT_MIN, INT_MAX),
         (b"sys/fs/overflowgid", 0o644, 65534, 0, 65535),
         (b"sys/fs/overflowuid", 0o644, 65534, 0, 65535),
         (b"sys/fs/suid_dumpable", 0o644, 0, 0, 2),
@@ -533,6 +535,12 @@ pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
 /// The [`RECORDED`] entry of a path.
 fn recorded(path: &[u8]) -> Option<&'static (&'static [u8], u32, i64, i64, i64)> {
     RECORDED.iter().find(|e| e.0 == path)
+}
+
+/// The current value of a [`RECORDED`] sysctl: the one written last, or its default.
+pub(crate) fn recorded_value(k: &Kernel, path: &[u8]) -> i64 {
+    let (path, _, default, ..) = *recorded(path).expect("a recorded sysctl");
+    k.sysctls.get(path).copied().unwrap_or(default)
 }
 
 /// The fixed directories and files under `/sys` (paths relative to `/sys`, directories ending in
@@ -2381,10 +2389,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
             }
             // The ID unmapped user and group IDs are shown as (Linux's default, 65534; bubblewrap
             // reads it at startup) and the other recorded sysctls
-            p if recorded(p).is_some() => {
-                let (path, _, default, ..) = *recorded(p).unwrap();
-                format!("{}\n", ps.k.sysctls.get(path).copied().unwrap_or(default))
-            }
+            p if recorded(p).is_some() => format!("{}\n", recorded_value(ps.k, p)),
             _ => return Err(Errno::EISDIR),
         },
         Entry(pid, tid, e) => {
@@ -3116,7 +3121,7 @@ fn map_line(store: &Store, r: &Region) -> String {
 /// removed while other hard links remain; here it does not. When apt upgrades, dpkg replaces old
 /// libraries with rename, and needrestart finds the processes to restart by the ` (deleted)` in
 /// maps.
-fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
+pub(crate) fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
     const DELETED: &[u8] = b" (deleted)";
     if !name.ends_with(DELETED) && store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
         name.extend_from_slice(DELETED);

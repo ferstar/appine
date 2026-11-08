@@ -707,7 +707,10 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
     // Exit::InvalidateCode at every ic ivau
     let ivau = std::mem::take(&mut cpu.state_mut().ivau_page);
     let pc = cpu.state().pc;
-    let (sig, info) = match exit {
+    // The signal, its siginfo, and the ESR and name of the exception in the kernel log's report of
+    // it (signal::show_unhandled): Linux reports undefined instructions and debug exceptions
+    // without an ESR
+    let (sig, info, esr, what) = match exit {
         Exit::InvalidateCode { addr } => {
             invalidate_code(cx, &[addr & !(PAGE_SIZE - 1), ivau]);
             return signal::deliver(cx, cpu, false);
@@ -722,10 +725,14 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             crate::debug::log(format_args!(
                 "undefined instruction {insn:#010x} at {pc:#x}"
             ));
-            (Signal::ILL, SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL))
+            let info = SigInfo::fault(code::ILL_ILLOPC, pc, ESR_IL);
+            (Signal::ILL, info, 0, signal::trap::UNDEFINED)
         }
         // Linux's SIGTRAP for a breakpoint has no esr_context in the signal frame
-        Exit::Breakpoint { .. } => (Signal::TRAP, SigInfo::fault(code::TRAP_BRKPT, pc, 0)),
+        Exit::Breakpoint { .. } => {
+            let info = SigInfo::fault(code::TRAP_BRKPT, pc, 0);
+            (Signal::TRAP, info, 0, signal::trap::DEBUG)
+        }
         // An engine bug (crate::bug)
         Exit::HostFault {
             signal,
@@ -781,6 +788,7 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             if past_eof == Some(true) {
                 let esr = ec << 26 | ESR_IL | wnr | FSC_TRANSLATION;
                 let info = SigInfo::fault(code::BUS_ADRERR, addr, esr);
+                signal::show_unhandled(cx, cpu, Signal::BUS, esr, signal::abort_name(esr));
                 signal::force(cx, Signal::BUS, info);
                 return signal::deliver(cx, cpu, false);
             }
@@ -796,27 +804,40 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 (code::SEGV_MAPERR, FSC_TRANSLATION)
             };
             let esr = ec << 26 | ESR_IL | wnr | fsc;
-            (Signal::SEGV, SigInfo::fault(code, addr, esr))
+            let info = SigInfo::fault(code, addr, esr);
+            (Signal::SEGV, info, esr, signal::abort_name(esr))
         }
         Exit::Fault {
             addr,
             access,
             kind: FaultKind::Alignment,
         } => {
-            let esr = match access {
-                Access::Exec => EC_PC_ALIGN << 26 | ESR_IL,
-                Access::Read => EC_DABT_LOW << 26 | ESR_IL | FSC_ALIGNMENT,
-                Access::Write => EC_DABT_LOW << 26 | ESR_IL | ESR_WNR | FSC_ALIGNMENT,
+            let (esr, what) = match access {
+                Access::Exec => (EC_PC_ALIGN << 26 | ESR_IL, signal::trap::SP_PC_ALIGNMENT),
+                Access::Read => {
+                    let esr = EC_DABT_LOW << 26 | ESR_IL | FSC_ALIGNMENT;
+                    (esr, signal::abort_name(esr))
+                }
+                Access::Write => {
+                    let esr = EC_DABT_LOW << 26 | ESR_IL | ESR_WNR | FSC_ALIGNMENT;
+                    (esr, signal::abort_name(esr))
+                }
             };
-            (Signal::BUS, SigInfo::fault(code::BUS_ADRALN, addr, esr))
+            (
+                Signal::BUS,
+                SigInfo::fault(code::BUS_ADRALN, addr, esr),
+                esr,
+                what,
+            )
         }
         Exit::Fault {
             addr,
             kind: FaultKind::StackAlignment,
             ..
         } => {
-            let info = SigInfo::fault(code::BUS_ADRALN, addr, EC_SP_ALIGN << 26 | ESR_IL);
-            (Signal::BUS, info)
+            let esr = EC_SP_ALIGN << 26 | ESR_IL;
+            let info = SigInfo::fault(code::BUS_ADRALN, addr, esr);
+            (Signal::BUS, info, esr, signal::trap::SP_PC_ALIGNMENT)
         }
         // Hardware watchpoint (the start of the access) or breakpoint (pc): the instruction has
         // not executed yet, and as in Linux's ptrace_hbptriggered there is no esr_context
@@ -824,8 +845,12 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             addr,
             kind: FaultKind::Watchpoint | FaultKind::HwBreakpoint,
             ..
-        } => (Signal::TRAP, SigInfo::fault(code::TRAP_HWBKPT, addr, 0)),
+        } => {
+            let info = SigInfo::fault(code::TRAP_HWBKPT, addr, 0);
+            (Signal::TRAP, info, 0, signal::trap::HW_BREAKPOINT)
+        }
     };
+    signal::show_unhandled(cx, cpu, sig, esr, what);
     signal::force(cx, sig, info);
     signal::deliver(cx, cpu, false)
 }

@@ -61,6 +61,11 @@ pub struct MachineOptions {
     /// bound as they are): for testing the mapping on hosts that can bind low ports (running as
     /// root, in a container).
     pub always_map_low_ports: bool,
+    /// Start with `debug.exception-trace` at 1 rather than arm64 Linux's 0, so that unhandled
+    /// exceptions are reported in the kernel log (the kernel/signal map) from the first process
+    /// on; the guest can still change it. The app does, so that guest crashes reach `dmesg` and
+    /// the bug reports carrying the kernel log.
+    pub exception_trace: bool,
 }
 
 /// stdin/stdout/stderr of a new process.
@@ -137,6 +142,9 @@ impl Machine {
                     .low_port_offset
                     .unwrap_or(crate::portmap::DEFAULT_OFFSET);
                 portmap.always_map = options.always_map_low_ports;
+            }
+            if options.exception_trace {
+                k.sysctls.insert(signal::EXCEPTION_TRACE, 1);
             }
             let init = ThreadGroup::new(INIT, 0, Rc::new(RefCell::new(SigHandlers::default())));
             k.groups.insert(INIT, Rc::new(RefCell::new(init)));
@@ -950,6 +958,7 @@ pub fn run(
         memory_limit: options.memory_limit,
         low_port_offset: options.low_port_offset,
         always_map_low_ports: options.always_map_low_ports,
+        exception_trace: false,
     })?;
     // With a terminal, the process is a session leader, and the console connected to the host
     // terminal is its controlling terminal

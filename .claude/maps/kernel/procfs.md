@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay module parameters last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay module parameters; `debug.exception-trace` last)
 
 ## Responsibilities
 
@@ -220,8 +220,10 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `randomize_va_space` (default 0: nothing is randomized), `kptr_restrict` (writes need
   `CAP_SYS_ADMIN`), `perf_*`, `hung_task_*`, `sched_rt_*`, `sched_schedstats`, `panic_on_oops`,
   `core_pipe_limit`, `modules_disabled` (only 1 can be written), `fs.suid_dumpable`,
-  `debug.exception-trace`), kept kernel-wide in `Kernel::sysctls`; `drop_caches` is write-only
-  (reads `EINVAL`). `kernel.modprobe` keeps a string, `kernel.tainted` only gains flags (of the 19
+  `debug.exception-trace`), kept kernel-wide in `Kernel::sysctls` and read through
+  `recorded_value`; all change nothing except `debug.exception-trace` (default 0, arm64's
+  `show_unhandled_signals`, or 1 when the host asks through `MachineOptions::exception_trace`, as
+  the app does), which turns on kernel/signal's unhandled-exception reports when non-zero; `drop_caches` is write-only (reads `EINVAL`). `kernel.modprobe` keeps a string, `kernel.tainted` only gains flags (of the 19
   defined; writes need `CAP_SYS_ADMIN`), and `vm.overcommit_memory` (0 to 2) is used: 1 turns off
   fork's commit check (`kernel/mm`). Constants: `file-max`, `cap_last_cap` 40, `ngroups_max`,
   `pid_max` 4194304; `random/uuid` is fresh per read, `boot_id` fixed per boot, the entropy values
@@ -354,7 +356,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for devpts and cgroup2, device
   checks); `kernel/process` (clone/clone3 cgroup placement and pids charge, unshare/setns, the
   freezer stop in the signal path); the OOM killer (`memory_limits`, `measure_memory`,
-  `oom_group`, events); `syscall/poll.rs` (epoll refusal); the machine (`Offline` before boot).
+  `oom_group`, events); `syscall/poll.rs` (epoll refusal); the machine (`Offline` before boot);
+  `kernel/signal` (`recorded_value` for `debug.exception-trace`, `mark_deleted` for the file
+  named in unhandled-exception reports).
 
 ### Outbound
 

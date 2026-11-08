@@ -1091,6 +1091,23 @@ class MachineTest {
         assertEquals(0, Native.takeKills(machine)?.size)
     }
 
+    /**
+     * The app starts its kernel with debug.exception-trace at 1 (arm64 Linux starts at 0), so a
+     * guest program that dies of an unhandled exception is reported in the kernel log, which bug
+     * reports carry: here an undefined instruction, named after the program's file and mapping.
+     */
+    @Test
+    fun guestCrashesReachTheKernelLog() {
+        val store = Rootfs.store(context).path
+        Native.writeFile(store, "/tmp/undefined", elf(intArrayOf(0 /* udf #0 */)), 0x1ed, true)
+        val machine = start(1)
+        assertEquals("1\n" to 0, sh(machine, "cat /proc/sys/debug/exception-trace"))
+        assertEquals(-SIGILL, run(machine, "/tmp/undefined", "undefined").second)
+        val (log, code) = sh(machine, "dmesg | grep 'unhandled exception'")
+        val report = Regex("""\] undefined\[\d+]: unhandled exception: undefined instruction in undefined\[400000\+1000]""")
+        assertTrue(log, code == 0 && report.containsMatchIn(log))
+    }
+
     /** Releasing caches (onTrimMemory) leaves running processes alone; new ones start as usual. */
     @Test
     fun trimMemoryKeepsTheMachineWorking() {
@@ -1166,6 +1183,7 @@ class MachineTest {
 
     private companion object {
         const val SIGHUP = 1
+        const val SIGILL = 4
         const val SIGSEGV = 11
 
         /** Syscall number of the test hook (core/kernel/src/bug.rs); x0 is the bug to simulate. */

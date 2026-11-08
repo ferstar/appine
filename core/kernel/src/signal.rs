@@ -831,6 +831,199 @@ pub(crate) fn force_fatal(cx: &mut Cx<'_>, sig: Signal, info: SigInfo) {
     cx.task.pending.borrow_mut().add(sig, info, false);
 }
 
+// ---- Reporting unhandled exceptions ----
+
+/// What a synchronous exception is called in its report ([`show_unhandled`]): the strings arm64
+/// Linux's handlers pass to `arm64_force_sig_fault`. Aborts are named by their fault status code
+/// ([`abort_name`]).
+pub(crate) mod trap {
+    /// `do_undefinstr`, through `force_signal_inject`.
+    pub const UNDEFINED: &str = "undefined instruction";
+    /// `brk_handler` and `single_step_handler`, through `send_user_sigtrap`.
+    pub const DEBUG: &str = "User debug trap";
+    /// `ptrace_hbptriggered`.
+    pub const HW_BREAKPOINT: &str = "Hardware breakpoint trap (ptrace)";
+    /// `do_sp_pc_abort`.
+    pub const SP_PC_ALIGNMENT: &str = "SP/PC alignment exception";
+    /// `arm64_notify_segfault` (a bad rt_sigreturn frame).
+    pub const ILLEGAL_ACCESS: &str = "illegal memory access";
+}
+
+/// The sysctl that turns the reports on ([`show_unhandled`]), as a path relative to `/proc`.
+pub(crate) const EXCEPTION_TRACE: &[u8] = b"sys/debug/exception-trace";
+
+/// arm64 Linux 6.1's `arm64_show_signal`, called just before a synchronous exception's signal is
+/// forced: while `debug.exception-trace` is non-zero and the signal will go unhandled (its handler
+/// is the default or ignored, which forcing resets, and no tracer decides), the kernel log gets
+/// `comm[tid]: unhandled exception: `, the exception class and `esr` when it is not 0, `what`, and
+/// the file mapped at the pc or above it, then the registers (`__show_regs`). At most 10 reports
+/// pass per 5 seconds across the kernel. Linux also reports every exception of the initial pid
+/// namespace's init, which in Appine is not guest code.
+pub(crate) fn show_unhandled(cx: &mut Cx<'_>, cpu: &Cpu, sig: Signal, esr: u64, what: &str) {
+    let handler = cx.t.group.borrow().sighand.borrow().get(sig).handler;
+    if crate::pseudo::recorded_value(cx.kr(), EXCEPTION_TRACE) == 0
+        || !matches!(handler, SigAction::DEFAULT | SigAction::IGNORE)
+        || crate::ptrace::traced(cx.task)
+    {
+        return;
+    }
+    let (allowed, suppressed) = cx
+        .k()
+        .unhandled_rs
+        .allow_reporting(std::time::Instant::now());
+    let log = cx.kr().klog.clone();
+    if suppressed > 0 {
+        crate::klog::printk(
+            &log,
+            crate::klog::level::WARNING,
+            format_args!("arm64_show_signal: {suppressed} callbacks suppressed"),
+        );
+    }
+    if !allowed {
+        return;
+    }
+    let comm = cx.task.comm.get();
+    let comm = &comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())];
+    let st = cpu.state();
+    let mut line = comm.to_vec();
+    line.extend_from_slice(format!("[{}]: unhandled exception: ", cx.tid()).as_bytes());
+    if esr != 0 {
+        line.extend_from_slice(format!("{}, ESR 0x{esr:016x}, ", class_name(esr)).as_bytes());
+    }
+    line.extend_from_slice(what.as_bytes());
+    // print_vma_addr: find_vma's mapping, the first ending above the pc (which need not contain
+    // it), when it maps a file
+    let region = cx.mm().regions().into_iter().find(|r| r.end > st.pc);
+    if let Some(r) = region
+        && let (Some((_, ino)), Some(name)) = (r.file, &r.name)
+    {
+        let path = match cx.vfs() {
+            Ok(vfs) => crate::pseudo::mark_deleted(vfs.store(), ino, name.to_vec()),
+            Err(_) => name.to_vec(),
+        };
+        let base = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
+        line.extend_from_slice(b" in ");
+        line.extend_from_slice(base);
+        line.extend_from_slice(format!("[{:x}+{:x}]", r.start, r.end - r.start).as_bytes());
+    }
+    line.push(b'\n');
+    crate::klog::emit(&log, 0, crate::klog::level::INFO, &line);
+    // __show_regs prints at KERN_DEFAULT, stored as default_message_loglevel; the CPU is the one
+    // getcpu reports
+    let level = cx.kr().printk[1] as u8 & 7;
+    let cpu_nr = cx.task.affinity.get().trailing_zeros().min(63);
+    let mut head = format!("CPU: {cpu_nr} PID: {} Comm: ", cx.tid()).into_bytes();
+    head.extend_from_slice(comm);
+    head.extend_from_slice(
+        format!(" {} 6.1.0-appine #1\n", tainted_text(cx.kr().tainted)).as_bytes(),
+    );
+    crate::klog::emit(&log, 0, level, &head);
+    for text in show_regs(crate::ptrace::pstate_of(st), &st.x, st.sp, st.pc) {
+        crate::klog::emit(&log, 0, level, text.as_bytes());
+    }
+}
+
+/// `__show_regs` for an AArch64 user thread, after the `CPU:` line: pstate, pc, lr, sp, then x29
+/// down to x0, three per line. Each line ends with a newline.
+fn show_regs(p: u64, x: &[u64; 31], sp: u64, pc: u64) -> Vec<String> {
+    let bit = |n: u32, on: char, off: char| if p >> n & 1 != 0 { on } else { off };
+    let flag = |n: u32| bit(n, '+', '-');
+    let btype = ["--", "jc", "-c", "j-"][(p >> 10 & 3) as usize];
+    let mut lines = vec![
+        format!(
+            "pstate: {p:08x} ({}{}{}{} {}{}{}{} {}PAN {}UAO {}TCO {}DIT {}SSBS BTYPE={btype})\n",
+            bit(31, 'N', 'n'),
+            bit(30, 'Z', 'z'),
+            bit(29, 'C', 'c'),
+            bit(28, 'V', 'v'),
+            bit(9, 'D', 'd'),
+            bit(8, 'A', 'a'),
+            bit(7, 'I', 'i'),
+            bit(6, 'F', 'f'),
+            flag(22),
+            flag(23),
+            flag(25),
+            flag(24),
+            flag(12),
+        ),
+        format!("pc : {pc:016x}\n"),
+        format!("lr : {:016x}\n", x[30]),
+        format!("sp : {sp:016x}\n"),
+    ];
+    for top in (0..10).rev().map(|n| n * 3 + 2) {
+        let regs: Vec<String> = (top - 2..=top)
+            .rev()
+            .map(|i| format!("x{i:<2}: {:016x}", x[i]))
+            .collect();
+        lines.push(format!("{}\n", regs.join(" ")));
+    }
+    lines
+}
+
+/// `esr_get_class_string`, for the exception classes Appine synthesizes (the others share Linux's
+/// "UNRECOGNIZED EC").
+fn class_name(esr: u64) -> &'static str {
+    match esr >> 26 & 0x3f {
+        0x00 => "Unknown/Uncategorized",
+        0x20 => "IABT (lower EL)",
+        0x22 => "PC Alignment",
+        0x24 => "DABT (lower EL)",
+        0x26 => "SP Alignment",
+        0x3c => "BRK (AArch64)",
+        _ => "UNRECOGNIZED EC",
+    }
+}
+
+/// The name arm64 Linux's `fault_info` gives an abort's fault status code, for the codes Appine
+/// synthesizes (crate::task) and the other translation and permission levels.
+pub(crate) fn abort_name(esr: u64) -> &'static str {
+    match esr & 0x3f {
+        0x04 => "level 0 translation fault",
+        0x05 => "level 1 translation fault",
+        0x06 => "level 2 translation fault",
+        0x07 => "level 3 translation fault",
+        0x0d => "level 1 permission fault",
+        0x0e => "level 2 permission fault",
+        0x0f => "level 3 permission fault",
+        0x21 => "alignment fault",
+        _ => "unknown fault",
+    }
+}
+
+/// `print_tainted`: "Not tainted", or "Tainted: " and one letter (or blank) for each of Linux
+/// 6.1's 19 flags.
+fn tainted_text(mask: u64) -> String {
+    const FLAGS: [(char, char); 19] = [
+        ('P', 'G'),
+        ('F', ' '),
+        ('S', ' '),
+        ('R', ' '),
+        ('M', ' '),
+        ('B', ' '),
+        ('U', ' '),
+        ('D', ' '),
+        ('A', ' '),
+        ('W', ' '),
+        ('C', ' '),
+        ('I', ' '),
+        ('O', ' '),
+        ('E', ' '),
+        ('L', ' '),
+        ('K', ' '),
+        ('X', ' '),
+        ('T', ' '),
+        ('N', ' '),
+    ];
+    if mask == 0 {
+        return "Not tainted".to_owned();
+    }
+    let flags = FLAGS.iter().enumerate();
+    let letters: String = flags
+        .map(|(i, &(on, off))| if mask >> i & 1 != 0 { on } else { off })
+        .collect();
+    format!("Tainted: {letters}")
+}
+
 // ---- Delivering signals ----
 
 /// Signals from synchronous exceptions are delivered first (Linux's `SYNCHRONOUS_MASK`).
@@ -1379,6 +1572,7 @@ pub(crate) fn sigreturn(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         } else {
             code::SEGV_MAPERR
         };
+        show_unhandled(cx, cpu, Signal::SEGV, 0, trap::ILLEGAL_ACCESS);
         force(cx, Signal::SEGV, SigInfo::fault(code, sp, 0));
         cpu.state_mut().x[0] = 0;
     }
@@ -1578,5 +1772,67 @@ mod tests {
         assert_eq!((p.set(), p.queued()), (Signal::USR1.bit(), 0));
         p.add(rt, value(8), false);
         assert_eq!(p.take(rt), SigInfo::default());
+    }
+
+    /// The register lines of an unhandled-exception report, as Linux 6.8 on arm64 printed them
+    /// for a static program writing to address 16 (the pstate without SSBS, which Appine does
+    /// not set).
+    #[test]
+    fn unhandled_reports_print_registers_as_linux() {
+        let mut x = [0u64; 31];
+        x[0] = 0x10;
+        x[1] = 1;
+        x[9] = 0;
+        x[10] = 5;
+        x[29] = 0xfffff1da8ed0;
+        x[28] = 0x4a0020;
+        x[27] = 0x18;
+        x[30] = 0x400730;
+        let lines = show_regs(0x6000_0000, &x, 0xfffff1da8ed0, 0x400824);
+        assert_eq!(lines.len(), 14);
+        assert_eq!(
+            lines[0],
+            "pstate: 60000000 (nZCv daif -PAN -UAO -TCO -DIT -SSBS BTYPE=--)\n"
+        );
+        assert_eq!(lines[1], "pc : 0000000000400824\n");
+        assert_eq!(lines[2], "lr : 0000000000400730\n");
+        assert_eq!(lines[3], "sp : 0000fffff1da8ed0\n");
+        assert_eq!(
+            lines[4],
+            "x29: 0000fffff1da8ed0 x28: 00000000004a0020 x27: 0000000000000018\n"
+        );
+        assert_eq!(
+            lines[10],
+            "x11: 0000000000000000 x10: 0000000000000005 x9 : 0000000000000000\n"
+        );
+        assert_eq!(
+            lines[13],
+            "x2 : 0000000000000000 x1 : 0000000000000001 x0 : 0000000000000010\n"
+        );
+        // NZCV, DIT, SSBS and a BTYPE
+        let lines = show_regs(0xf100_1c00, &x, 0, 0);
+        assert_eq!(
+            lines[0],
+            "pstate: f1001c00 (NZCV daif -PAN -UAO -TCO +DIT +SSBS BTYPE=j-)\n"
+        );
+    }
+
+    /// The exception classes and fault names Appine's synthesized ESRs get, and print_tainted.
+    #[test]
+    fn unhandled_reports_name_exceptions_as_linux() {
+        assert_eq!(class_name(0x9200_0047), "DABT (lower EL)");
+        assert_eq!(abort_name(0x9200_0047), "level 3 translation fault");
+        assert_eq!(class_name(0x8200_000f), "IABT (lower EL)");
+        assert_eq!(abort_name(0x8200_000f), "level 3 permission fault");
+        assert_eq!(abort_name(0x9200_0061), "alignment fault");
+        assert_eq!(class_name(0x8a00_0000), "PC Alignment");
+        assert_eq!(class_name(0x9a00_0000), "SP Alignment");
+        assert_eq!(class_name(0x5600_0000), "UNRECOGNIZED EC");
+        assert_eq!(tainted_text(0), "Not tainted");
+        assert_eq!(
+            tainted_text(1 << 9 | 1 << 12),
+            "Tainted: G        W  O      "
+        );
+        assert_eq!(tainted_text(1), "Tainted: P                  ");
     }
 }

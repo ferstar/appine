@@ -1,7 +1,8 @@
 //! The kernel log (the kernel/signal map): Linux 6.1's printk ring buffer.
 //!
 //! Records come from the kernel layer itself (the OOM killer ending a process, an internal error
-//! ending a process, see [`printk`]) and from guest writes to `/dev/kmsg`. There are three kinds
+//! ending a process, unhandled exceptions while `debug.exception-trace` is set, see [`printk`])
+//! and from guest writes to `/dev/kmsg`. There are three kinds
 //! of readers, as on Linux:
 //!
 //! - `/dev/kmsg`: each open file has its own position (a sequence number) and reads one record at
@@ -534,10 +535,12 @@ impl Drop for KmsgFile {
     }
 }
 
-/// `struct ratelimit_state` with the default interval of 5 seconds, at most 10 times, and
-/// `RATELIMIT_MSG_ON_RELEASE`: the number dropped is reported only at close.
+/// `struct ratelimit_state` with the default interval of 5 seconds and at most 10 times. With
+/// `RATELIMIT_MSG_ON_RELEASE` (`/dev/kmsg` writes) the number dropped is reported only at close
+/// ([`Ratelimit::allow`]); without it (unhandled exceptions, crate::signal) when the next interval
+/// begins ([`Ratelimit::allow_reporting`]).
 #[derive(Default)]
-struct Ratelimit {
+pub(crate) struct Ratelimit {
     begin: Option<std::time::Instant>,
     printed: u32,
     missed: u32,
@@ -547,19 +550,34 @@ impl Ratelimit {
     const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
     const BURST: u32 = 10;
 
-    /// `___ratelimit`: whether to let this one through.
+    /// `___ratelimit` with `RATELIMIT_MSG_ON_RELEASE`: whether to let this one through.
     fn allow(&mut self, now: std::time::Instant) -> bool {
+        self.check(now, true).0
+    }
+
+    /// `___ratelimit` without `RATELIMIT_MSG_ON_RELEASE`: whether to let this one through, and,
+    /// when it begins a new interval, how many the earlier ones dropped (Linux then logs
+    /// "`<function>`: N callbacks suppressed" before it).
+    pub fn allow_reporting(&mut self, now: std::time::Instant) -> (bool, u32) {
+        self.check(now, false)
+    }
+
+    fn check(&mut self, now: std::time::Instant, on_release: bool) -> (bool, u32) {
         let begin = *self.begin.get_or_insert(now);
+        let mut suppressed = 0;
         if now > begin + Self::INTERVAL {
+            if !on_release {
+                suppressed = std::mem::take(&mut self.missed);
+            }
             self.begin = Some(now);
             self.printed = 0;
         }
         if self.printed < Self::BURST {
             self.printed += 1;
-            true
+            (true, suppressed)
         } else {
             self.missed += 1;
-            false
+            (false, suppressed)
         }
     }
 }
@@ -746,5 +764,20 @@ mod tests {
         assert!(!rs.allow(t));
         assert!(rs.allow(t + Ratelimit::INTERVAL + std::time::Duration::from_millis(1)));
         assert_eq!(rs.missed, 1);
+    }
+
+    /// Without `RATELIMIT_MSG_ON_RELEASE`, the first call of a new interval gets the number
+    /// dropped, once.
+    #[test]
+    fn ratelimit_reports_drops_when_the_window_restarts() {
+        let mut rs = Ratelimit::default();
+        let t = std::time::Instant::now();
+        assert!((0..10).all(|_| rs.allow_reporting(t) == (true, 0)));
+        assert_eq!(rs.allow_reporting(t), (false, 0));
+        assert_eq!(rs.allow_reporting(t), (false, 0));
+        let later = t + Ratelimit::INTERVAL + std::time::Duration::from_millis(1);
+        assert_eq!(rs.allow_reporting(later), (true, 2));
+        assert_eq!(rs.allow_reporting(later), (true, 0));
+        assert_eq!(rs.missed, 0);
     }
 }

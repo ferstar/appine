@@ -321,6 +321,9 @@ pub(crate) struct Kernel {
     /// `/proc/sys/kernel/tainted`: the taint flags written by privileged processes (Appine itself
     /// taints nothing).
     pub tainted: u64,
+    /// The ratelimit of unhandled-exception reports, kernel-wide as in arm64 Linux's
+    /// `arm64_show_signal` (crate::signal).
+    pub unhandled_rs: crate::klog::Ratelimit,
     /// All inotify watches. Open files must report `IN_CLOSE_*` when destroyed, so it is shared
     /// through Rc.
     pub inotify: Rc<RefCell<crate::syscall::Registry>>,
@@ -421,6 +424,7 @@ impl Kernel {
             sysctls: BTreeMap::new(),
             modprobe: b"/sbin/modprobe".to_vec(),
             tainted: 0,
+            unhandled_rs: Default::default(),
             inotify: Rc::default(),
             file_maps: Default::default(),
         }

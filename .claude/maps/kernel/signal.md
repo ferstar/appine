@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd mode and bits last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd; unhandled-exception reports last)
 
 ## Responsibilities
 
@@ -65,7 +65,8 @@ procfs.
   dispatcher, delivery, clone/exec/exit, seccomp and wait.
 - **Core dumps**: `coredump::dump` from the default-action path.
 - **Kernel log**: `klog::printk`/`emit` (used by OOM, bug kills, cgroups, networking), `/dev/kmsg`,
-  `/proc/kmsg`, `syslog(2)`.
+  `/proc/kmsg`, `syslog(2)`; `show_unhandled` (with `abort_name` and the `trap` names) from the
+  run loop and rt_sigreturn.
 - **ABI**: `uname`, `/proc/version`, `/proc/sys/kernel/{osrelease,version,ostype}`, the
   dispatcher's default arm, `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
 
@@ -154,6 +155,21 @@ procfs.
 - Alignment → `SIGBUS`/`BUS_ADRALN` with ESR EC 0x24 (data, FSC 0x21, WnR on writes), 0x22 (PC,
   no FSC) or 0x26 (SP, `si_addr` = SP).
 - Undefined or non-whitelisted encodings → `SIGILL`/`ILL_ILLOPC`.
+- Just before forcing, `show_unhandled` (arm64's `arm64_show_signal`) reports the exception in the
+  kernel log while `debug.exception-trace` is non-zero (0 at start as on arm64, 1 when the host
+  starts the kernel with `MachineOptions::exception_trace`, as the app does) and the signal will
+  go unhandled: the handler is the default or ignored and the thread is not traced (Linux's
+  always-report for the initial init has no counterpart: Appine's pid 1 is not guest code). One
+  INFO line `comm[tid]: unhandled exception: `, the exception class and ESR unless the ESR is 0,
+  the exception's name (the abort's fault status name, or `undefined instruction`, `User debug
+  trap`, `Hardware breakpoint trap (ptrace)`, `SP/PC alignment exception`), and ` in
+  file[start+len]` for the first mapping ending above the pc when it maps a file (`find_vma`, so a
+  pc in a gap names the next mapping); then at the default message level the `CPU:` line, pstate,
+  pc, lr, sp and x29–x0. Undefined instructions and debug exceptions show no ESR, as on Linux. At
+  most 10 reports per 5 s kernel-wide (`Kernel::unhandled_rs`); the first one after a dropped
+  interval is preceded by `arm64_show_signal: N callbacks suppressed`. A bad rt_sigreturn frame is
+  reported as `illegal memory access` with the caller's registers; seccomp's `SIGSYS`, a frame that
+  cannot be written and single-step traps are not reported.
 - `force` unblocks or resets a blocked or ignored synchronous signal so it is delivered.
 - The faulting instruction has no visible effect (no register or base writeback), and the PC in the
   frame points at it (precision comes from the engine's checks).
@@ -261,9 +277,9 @@ procfs.
 
 - A printk-style ring buffer: 128 KB of text, at most 4096 records, oldest dropped first; records
   carry sequence, monotonic timestamp, facility, level and text (truncated to 991 bytes).
-- Writers: guest `/dev/kmsg` writes (prefix parsing, ratelimit 10 per 5 s by default), the OOM
-  killer, bug kills, cgroup fork rejections, low-port remapping, permission warnings. The host
-  kernel's log is not included.
+- Writers: guest `/dev/kmsg` writes (prefix parsing, ratelimit 10 per 5 s by default, drops
+  reported at close), the OOM killer, bug kills, unhandled-exception reports, cgroup fork
+  rejections, low-port remapping, permission warnings. The host kernel's log is not included.
 - Readers: `/dev/kmsg` (a sequence per open, one record per read, `EPIPE` after records were
   dropped, seeks to start, data or end), `syslog(2)` and `/proc/kmsg` (a shared read position;
   READ_ALL/READ_CLEAR return the newest records since the clear point).
@@ -300,10 +316,12 @@ procfs.
 ### Outbound
 
 - `kernel/process`: `request_wake*`, `signal_later`, group exit, namespace translation, wait.
-- `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`.
+- `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`,
+  `regions` (the mapping named in unhandled-exception reports).
 - `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`.
 - vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `may_ptrace`, `CAP_SYSLOG`),
-  `appine_hal` (clocks, `adjtimex` query).
+  `appine_hal` (clocks, `adjtimex` query), procfs (`debug.exception-trace` through
+  `recorded_value`, ` (deleted)` names through `mark_deleted`).
 
 ## Invariants and gotchas
 
@@ -347,6 +365,11 @@ procfs.
   ATTACH queued, so the parent gets a second `CLD_STOPPED`/`SIGCHLD` and waitpid stop report,
   where Linux 6.1 re-enters the stop silently; a shell whose stopped job was briefly attached by
   gdb or strace sees a duplicate stop.
+- **Synthesized abort ESRs differ from Linux's:** every translation fault is reported at level 3
+  and every fault inside a mapping as a permission fault, where Linux names the table level its
+  walk stopped at (often level 2 for an address with no page tables) and reports a never-touched
+  page whose mapping forbids the access as a translation fault; `esr_context` and
+  unhandled-exception reports show the difference, which only tools decoding the ESR notice.
 - **Minor divergences:** `settimeofday` skips argument validation and `clock_settime`
   returns `EINVAL` for CPU clocks where Linux returns `EPERM`; sigreturn silently drops DAIF bits
   Linux would reject; kernel-generated real-time signals lose their siginfo when the queue is full;

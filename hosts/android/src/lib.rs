@@ -677,6 +677,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
             memory_limit: None,
             low_port_offset: None,
             always_map_low_ports: false,
+            // Guest crashes are reported in the kernel log, which the app's bug reports carry
+            exception_trace: true,
         };
         match Machine::start(&options) {
             Ok(m) => {
