@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM choice, oom_score; futex keys, shm; `process_mrelease`; vDSO and `[vvar]` last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM, oom_score; futex keys, shm; `process_mrelease`; vDSO, `[vvar]`; shootdown waits last)
 
 ## Responsibilities
 
@@ -365,7 +365,8 @@ signals may still be delivered).
   sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry.
 - `shootdown` is the immediate form used when a PTE is re-pointed (CoW copy, return of a borrowed
   page, mprotect over CoW pages): it bumps the TLB generation, kicks only users in guest code, and
-  waits.
+  waits until none is in guest code, kicking again any it still finds there (one that entered
+  after the first kicks, which nothing else would stop).
 - The run loop sets `in_guest`, then reads the counters (a SeqCst store-then-load pairing with the
   mutator's bump-then-read). If `space` changed it re-attaches to a new `CodeSpace`; if `tlb`
   changed it flushes its TLB; if `code` changed it invalidates Tier 1 blocks for the ranges it
@@ -619,6 +620,10 @@ signals may still be delivered).
 - After an unmap, a permission downgrade or re-pointing an entry, every other thread of the address
   space must flush before the old host memory is released. Adding permissions never requires a
   flush: a stale TLB half only misses.
+- Waiting for users to leave guest code (`quiesce`, `shootdown`) holds the BKL, so it must kick
+  every user it waits for: an unkicked one may run guest code indefinitely, such as a spin waiting
+  for a thread that waits for that BKL, and the whole kernel stops (LTP shmctl05). Kicks are sticky,
+  so a kicked thread stops at its next guest entry too.
 - Every private anonymous page with content has a page-table entry. Kernel-side writes, mlock and
   `MAP_POPULATE` fill entries, mremap moves them, and `PROT_NONE` keeps them with prot 0. fork's
   lending and RSS measurement rely on this.
@@ -657,6 +662,11 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
+- **A shootdown does not stop users that enter guest code after it has passed them:** it waits for
+  each user in turn, so one that marks itself as running only after the wait has looked at it runs
+  guest code (with a flushed TLB) while the caller still holds the BKL; `set_protection`, which
+  gives copy-on-write pages new permissions before taking write permission from lent ones, assumes
+  no thread runs guest code in between, and such a thread could write a lent page there.
 - **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
   but do nothing.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets

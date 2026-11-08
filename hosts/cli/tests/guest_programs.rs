@@ -633,6 +633,38 @@ fn main_stack_grows_up_to_rlimit_stack() {
 }
 
 #[test]
+fn shootdowns_wait_only_for_threads_they_kicked() {
+    // tests/guest/cowspin.c: a parent taking back pages it lent its child shoots down the child's
+    // address space while the child's threads spin in guest code or wait for the BKL. Waiting for
+    // a spinner that was not kicked deadlocked the kernel, so a run is given 60 s
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let Some(program) = build_c_guest("cowspin") else {
+        return;
+    };
+    for tier in TIERS {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run appine-run");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let out = child.wait_with_output().unwrap();
+                panic!("tier {tier}: still running after 60 s\n{}", stderr(&out));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(stdout(&out), "done\n", "tier {tier}: {}", stderr(&out));
+    }
+}
+
+#[test]
 fn ipc_timers_credentials_and_scheduling() {
     // System V message queues, semaphores (SEM_UNDO) and shared memory across fork, POSIX timers
     // (overrun counts, SIGEV_THREAD, CPU clocks), clocks (no-BKL and locked ones agree), mremap,

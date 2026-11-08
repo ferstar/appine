@@ -4632,8 +4632,14 @@ impl Mm {
                 unsafe { u.kicker.kick() };
             }
         }
+        // Every user found in guest code is waited for, also one that entered after the kicks
+        // above (callers such as set_protection rely on no user running guest code afterwards).
+        // Such a user was not kicked and may run guest code for as long as it likes, such as a
+        // spin on a thread that waits for the BKL held here (LTP shmctl05): kick it too
         for u in &self.users {
             while u.in_guest.load(Ordering::SeqCst) {
+                // SAFETY: as above
+                unsafe { u.kicker.kick() };
                 std::thread::yield_now();
             }
         }
