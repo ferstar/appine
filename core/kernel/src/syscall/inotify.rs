@@ -292,6 +292,11 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
             (st.ino, internal(vfs.dev_of(&node)))
         }
         Node::Pseudo(_, p) => (crate::pseudo::ino_of(p), crate::pseudo::fs_of(p).dev()),
+        Node::Fuse(_, f) => {
+            vfs.fuse_permission(&cx.cred(), *f, MAY_READ)?;
+            let ino = crate::vfs::fuse::cached_attr(&vfs, *f)?.ino;
+            (ino, internal(vfs.dev_of(&node)))
+        }
     };
     let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
     let mut i = inotify.borrow_mut();
@@ -579,6 +584,7 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
     match node {
         Node::Store(_, ino) => Some(*ino),
         Node::Overlay(_, o) => Some(overlay::key(*o)),
+        Node::Fuse(_, f) => Some(crate::vfs::fuse::key(*f)),
         Node::Pseudo(..) => None,
     }
 }
@@ -662,6 +668,7 @@ fn file_key(f: &OpenFile) -> Option<(Ino, u32)> {
             Some((f.ovl.map_or(*ino, overlay::key), 0))
         }
         FileKind::Directory { node, .. } => Some((key_of(node)?, IN_ISDIR)),
+        FileKind::Fuse(h) => Some((crate::vfs::fuse::key(h.id), 0)),
         _ => None,
     }
 }

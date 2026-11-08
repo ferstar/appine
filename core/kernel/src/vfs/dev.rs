@@ -70,7 +70,7 @@ pub const DISK_GID: u32 = 6;
 
 /// The standard character nodes in `/dev`: name, device number, permissions, group. Terminal
 /// devices (tty, console, ptmx) are connected to PTYs by the syscall layer by device number.
-const NODES: [(&[u8], u64, u32, u32); 10] = [
+const NODES: [(&[u8], u64, u32, u32); 11] = [
     (b"null", rdev(1, 3), 0o666, 0),
     (b"zero", rdev(1, 5), 0o666, 0),
     (b"full", rdev(1, 7), 0o666, 0),
@@ -81,6 +81,7 @@ const NODES: [(&[u8], u64, u32, u32); 10] = [
     (b"console", rdev(5, 1), 0o600, 0),
     (b"ptmx", rdev(5, 2), 0o666, 0),
     (b"loop-control", LOOP_CONTROL, 0o660, DISK_GID),
+    (b"fuse", crate::vfs::fuse::DEV_RDEV, 0o666, 0),
 ];
 
 /// The standard symlinks in `/dev`, all pointing into procfs.

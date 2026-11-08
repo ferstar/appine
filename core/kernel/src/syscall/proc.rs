@@ -887,6 +887,7 @@ fn exec(
     let fds = cx.t.fds.clone();
     crate::locks::closed(cx.k(), &fds, &closed);
     super::mqueue_closed(cx.tgid(), &closed);
+    super::fuse::flush_all(cx, &closed);
     crate::unix::released(cx.k(), closed);
     {
         let group = cx.t.group.clone();

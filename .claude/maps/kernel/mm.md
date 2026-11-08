@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM, oom_score; futex keys, shm; `process_mrelease`; vDSO, `[vvar]`; shootdown waits last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; shootdown waits; FUSE copies last)
 
 ## Responsibilities
 
@@ -229,6 +229,8 @@ dumps and the host abstraction layer (`core/hal`).
   - read-only private file with a trusted content version → a `FileMaps` hit (VMA marked `cow`),
     or a new read-only host mapping inserted into the cache;
   - other file mappings → host `mmap` of `objects/<ino>` (read-write for private mappings);
+  - a FUSE file → host `mmap` of a memfd the syscall filled with the range read through the
+    daemon (`kernel/fuse`'s copy), never writable when shared (`EACCES`), kept as it was read;
   - shared anonymous and SysV shm → host shared memory.
 - A file has no trusted content version while its ctime is within the last 2 s, or once it has been
   mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, never cleared).

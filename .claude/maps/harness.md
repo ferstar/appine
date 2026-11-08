@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest cases and lock; suite tarballs; Starnix and gVisor cases; image export; CI split; stop signals; survey; overlay cases; watchdog knob last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest cases and lock; suite tarballs; Starnix and gVisor cases; image export; CI split; stop signals; survey; overlay cases; watchdog knob; FUSE cases and packages last)
 
 ## Responsibilities
 
@@ -127,8 +127,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   and removes it on exit; its lanes run under it.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined); elsewhere through `scripts/dev`.
-- A store (`target/difftest/store`) is imported once and gets about 18 packages; a tool check aborts
-  if any is missing; its `bin etc lib sbin usr tmp` are exported from inside Appine and imported as
+- A store (`target/difftest/store`) is imported once and gets about 23 packages (fuse3,
+  fuse-overlayfs, sshfs, openssh-sftp-server and rclone among them, for the `fuse` and
+  `fuse-tools` cases, whose native side needs `--device /dev/fuse`); a tool check aborts if any is
+  missing; its `bin etc lib sbin usr tmp` are exported from inside Appine and imported as
   the docker image `appine-difftest` (first run or `-r`).
 - Each case script runs with stderr merged into stdout on both sides: natively with
   `docker run` plus the case's `# docker-run-options:`, and as `/bin/sh -c` under `appine-run` plus

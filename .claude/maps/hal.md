@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`, `ClockWatch`; host statistics, `has_private_pages`; DNS waits; handlers' errno; Linux and Android only; `fallocate`, `MADV_REMOVE`, `map_file_over`; host vDSO, timezone last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `fill_random`, `ClockWatch`; host statistics, `has_private_pages`; DNS waits; handlers' errno; Linux and Android only; `fallocate`, `MADV_REMOVE`, `map_file_over`; host vDSO, timezone; `memfd` last)
 
 ## Responsibilities
 
@@ -63,7 +63,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`, `thread_activity`.
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
   `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `fallocate`, `lseek`, `copy_file`, `fsync`,
-  `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
+  `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `memfd`, `fill_random`, `drain`, `isatty`.
 - Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
   `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
@@ -113,6 +113,8 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `set_times_*`, `unlink_at`; `flock` and a shared mapping of the `lock` file coordinate store users.
 - `fallocate` passes the Linux `FALLOC_FL_*` mode through (a host filesystem without it answers
   `EOPNOTSUPP`).
+- `memfd` makes an empty close-on-exec host file in memory (`memfd_create`): the kernel layer's
+  copies of FUSE files for mappings and execve.
 - `read`/`write`/`pread`/`pwrite`/`fallocate`/`copy_file`/`flock` retry `EINTR`; others do not; partial
   transfers are returned as is. `copy_file` seeks the output fd and calls `sendfile` (callers fall
   back to chunked copies on `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`).

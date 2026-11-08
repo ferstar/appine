@@ -52,7 +52,11 @@ pub(super) fn setxattr(
     }
     let mut v = vec![0u8; size];
     cx.mm().read(UserSlice::new(value, size), &mut v)?;
-    let ino = writable_ino(cx, node_of(cx, target)?, &name)?;
+    let node = node_of(cx, target)?;
+    if let Node::Fuse(_, f) = node {
+        return fuse_change(cx, &node, f, &name, Some((&v, flags)));
+    }
+    let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     let store = vfs.store();
     // Program file capabilities: only v2 and v3 are accepted, CAP_SETFCAP is needed over the file
@@ -89,7 +93,17 @@ pub(super) fn getxattr(
     size: usize,
 ) -> SysResult {
     let name = read_name(cx, name)?;
-    let ino = readable_ino(cx, node_of(cx, target)?, &name)?;
+    let node = node_of(cx, target)?;
+    if let Node::Fuse(_, f) = node {
+        let vfs = cx.vfs()?;
+        super::fuse::xattr_permission(&vfs, &cx.cred(), f, &name, false)?;
+        let size = size.min(XATTR_SIZE_MAX);
+        return match crate::vfs::fuse::getxattr(cx, &vfs, f, Some(&name), size)? {
+            Err(len) => Ok(len as u64),
+            Ok(v) => reply(cx, value, size, &v),
+        };
+    }
+    let ino = readable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, false)?;
     let mut v = vfs.store().get_xattr(ino, &name)?;
@@ -100,9 +114,19 @@ pub(super) fn getxattr(
 }
 
 pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize) -> SysResult {
+    // A FUSE daemon's list is passed on as it is (6.1's fuse_listxattr)
+    if let Node::Fuse(_, f) = node_of(cx, target)? {
+        let vfs = cx.vfs()?;
+        vfs.fuse_permission(&cx.cred(), f, 0)?;
+        let size = size.min(XATTR_SIZE_MAX);
+        return match crate::vfs::fuse::getxattr(cx, &vfs, f, None, size)? {
+            Err(len) => Ok(len as u64),
+            Ok(v) => reply(cx, list, size, &v),
+        };
+    }
     let names = match node_of(cx, target)? {
         Node::Store(_, ino) => cx.vfs()?.store().list_xattr(ino)?,
-        Node::Pseudo(..) => Vec::new(),
+        Node::Pseudo(..) | Node::Fuse(..) => Vec::new(),
         // The overlay's own attributes are not listed (Linux's ovl_listxattr)
         Node::Overlay(_, o) => {
             let vfs = cx.vfs()?;
@@ -127,7 +151,11 @@ pub(super) fn listxattr(cx: &mut Cx<'_>, target: Target, list: u64, size: usize)
 
 pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResult {
     let name = read_name(cx, name)?;
-    let ino = writable_ino(cx, node_of(cx, target)?, &name)?;
+    let node = node_of(cx, target)?;
+    if let Node::Fuse(_, f) = node {
+        return fuse_change(cx, &node, f, &name, None);
+    }
+    let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
     // Removing program file capabilities needs CAP_SETFCAP over the file (cap_inode_removexattr)
@@ -140,6 +168,25 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     }
     vfs.store().remove_xattr(ino, &name)?;
     attrib(cx, target, ino);
+    Ok(0)
+}
+
+/// setxattr (`value` Some) or removexattr on FUSE node `id`: EROFS on a read-only mount, the
+/// permission rules, then the daemon. `security.capability` is passed as it is (Linux converts
+/// namespaced capabilities first).
+fn fuse_change(
+    cx: &mut Cx<'_>,
+    node: &Node,
+    id: crate::vfs::fuse::FuseId,
+    name: &[u8],
+    value: Option<(&[u8], u32)>,
+) -> SysResult {
+    let vfs = cx.vfs()?;
+    if vfs.readonly(node) {
+        return Err(Errno::EROFS);
+    }
+    super::fuse::xattr_permission(&vfs, &cx.cred(), id, name, true)?;
+    super::fuse::set_xattr(cx, &vfs, id, name, value)?;
     Ok(0)
 }
 

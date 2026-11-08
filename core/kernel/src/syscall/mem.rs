@@ -96,6 +96,9 @@ pub(super) fn mmap(
     let mut deny_exec = false;
     let low =
         flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
+    // A FUSE file has no page cache to map: what the mapping covers is read now into a host file,
+    // which stays open until it is mapped
+    let fuse_copy;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -116,6 +119,16 @@ pub(super) fn mmap(
         if kind == flags::MAP_SHARED && file.borrow().readable() && file.borrow().writable() {
             super::fs::prepare_write(cx, &file, None)?;
         }
+        // A shared writable mapping, or an executable one on a noexec mount, is refused below
+        let refused = {
+            let f = file.borrow();
+            let noexec = f
+                .node()
+                .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
+                .is_some_and(|m| m & ms::NOEXEC != 0);
+            kind == flags::MAP_SHARED && prot & prot::WRITE != 0 || noexec && prot & prot::EXEC != 0
+        };
+        fuse_copy = super::fuse::map_copy(cx, &file, (offset, len), refused)?;
         let f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
@@ -172,6 +185,31 @@ pub(super) fn mmap(
                 }
                 flags |= flags::MAP_ANONYMOUS;
                 None
+            }
+            // A copy of the data: a shared mapping can never be written (its writes would not
+            // reach the file), and noexec mounts refuse execution as for store files
+            // In do_mmap's order: not readable, then shared writable (EACCES), then executable on
+            // a noexec mount (EPERM); the copy was made only for a mapping passing them
+            FileKind::Fuse(h) => {
+                if !f.readable() || shared_write {
+                    return Err(Errno::EACCES);
+                }
+                let noexec = f
+                    .node()
+                    .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
+                    .is_some_and(|m| m & ms::NOEXEC != 0);
+                if noexec {
+                    if prot & prot::EXEC != 0 {
+                        return Err(Errno::EPERM);
+                    }
+                    deny_exec = true;
+                }
+                let Some(copy) = &fuse_copy else {
+                    return Err(Errno::EIO);
+                };
+                let ino = cx.vfs()?.fuse().get(h.id).map_or(0, |n| n.attr.ino);
+                label = Some((f.path.clone(), ino));
+                Some((copy.as_raw_fd(), offset, false))
             }
             FileKind::Path(_) => return Err(Errno::EBADF),
             _ => return Err(Errno::ENODEV),

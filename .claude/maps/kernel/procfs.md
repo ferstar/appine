@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay parameters; exception-trace; oom_score, swaps, locks, task oom files; missing names counted last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; `stat`; overlay; oom, swaps, locks; missing names; FUSE types last)
 
 ## Responsibilities
 
@@ -181,7 +181,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   per-kind lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times,
   signalfd mask, pidfd pids).
 - `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
-  thread has none: `EINVAL` at open, as `mounts_open_common`); `cgroup` is the path relative to the reader's
+  thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type as `Vfs::type_of`
+  gives it (`fuse.<subtype>` for a FUSE mount with a subtype); `cgroup` is the path relative to the reader's
   cgroup-namespace root; `net/` uses the target's network namespace.
 - Writable: `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,
@@ -208,7 +209,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `softirq` (the total and Linux's 10 types), `procs_blocked` are 0; `processes` counts every new task, threads included (Linux's `total_forks`). `uptime`
   includes the reader's
   boottime offset. `loadavg` comes from the guest's own load average. `filesystems` is a fixed
-  list; `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
+  list (`nodev fuse` included, no `fuseblk` or `fusectl`); `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
   `self`. `swaps` is the host's file when the app may read it (as meminfo's swap lines are the
   host's), otherwise Linux's header line alone; `locks` lists every lock and lease
   (`kernel/vfs`'s `proc_locks`) with pids in the instance's pid namespace.

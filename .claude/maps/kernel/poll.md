@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness; anonymous fd bits; AIO waits last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse` last)
 
 ## Responsibilities
 
@@ -64,7 +64,9 @@ signal delivery (`kernel/signal`).
   `PIPE_BUF` free, plus `POLLERR` without readers, as `pipe_poll`) and eventfd inline; timerfd
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
-  seccomp notify, kmsg; `O_PATH` files `POLLNVAL`; everything else (regular files, directories,
+  seccomp notify, kmsg, `/dev/fuse` (`kernel/fuse`: always writable, readable while a request or
+  interrupt waits, only `POLLERR` once aborted or before a mount attached it; it lists its
+  connection's reader object); `O_PATH` files `POLLNVAL`; everything else (regular files, directories,
   other devices, synthetic files, bpf) is always readable and writable. The bits are each Linux
   poll operation's: eventfd, timerfd and signalfd report `POLLIN`/`POLLOUT` without the
   `RDNORM`/`WRNORM` bits, an epoll `POLLIN|POLLRDNORM`.

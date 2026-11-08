@@ -821,7 +821,7 @@ fn unimplemented_paths_are_logged_once() {
                   cat /proc/sys/kernel/no_such_sysctl /proc/self/no_such_entry \
                   /sys/devices/system/cpu/no_such_file /dev/no_such_device /proc/999999/status \
                   /proc/self/fd/99 /sys/devices/system/cpu/cpu99999/online 2>/dev/null; done; \
-                  mknod /tmp/fuse c 10 229 && cat /tmp/fuse 2>/dev/null; rm -f /tmp/fuse; true";
+                  mknod /tmp/tun c 10 200 && cat /tmp/tun 2>/dev/null; rm -f /tmp/tun; true";
     for tier in TIERS {
         let out = command(store, tier, &["/bin/sh", "-c", script])
             .env("APPINE_LOG", "1")
@@ -838,7 +838,7 @@ fn unimplemented_paths_are_logged_once() {
             "missing /proc/<pid>/no_such_entry, first by cat",
             "missing /sys/devices/system/cpu/no_such_file, first by cat",
             "missing /dev/no_such_device, first by cat",
-            "char device 10:229, first by cat",
+            "char device 10:200, first by cat",
         ] {
             let n = lines.iter().filter(|l| **l == expected).count();
             assert_eq!(n, 1, "tier {tier}: {expected} in {lines:?}");

@@ -1607,7 +1607,7 @@ impl View<'_> {
                 return dev.then(|| format!("/dev/{name_text}"));
             }
             Node::Pseudo(_, p) => p,
-            Node::Overlay(..) => return None,
+            Node::Overlay(..) | Node::Fuse(..) => return None,
         };
         Some(match node {
             ProcRoot if numbered(b"") => return None,
@@ -2292,7 +2292,7 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                 "Linux version 6.1.0-appine (appine@localhost) #1 SMP PREEMPT appine\n".to_owned()
             }
             self::Global::Filesystems => {
-                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\n"
+                "nodev\tsysfs\nnodev\ttmpfs\n\text4\nnodev\tproc\nnodev\tdevpts\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\nnodev\tfuse\n"
                     .to_owned()
             }
             self::Global::Cmdline => "appine\n".to_owned(),
@@ -3336,7 +3336,7 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
             fs_root: ps.vfs.root_path(ps, &m),
             point,
             flags: m.flags,
-            fstype: m.fs.type_name(),
+            fstype: ps.vfs.type_of(&m),
             source: if m.source.is_empty() {
                 b"none"
             } else {
@@ -3359,7 +3359,7 @@ struct MountLine<'a> {
     fs_root: Vec<u8>,
     point: Vec<u8>,
     flags: u64,
-    fstype: &'static str,
+    fstype: String,
     source: &'a [u8],
     /// Superblock options ([`crate::vfs::Vfs::sb_options`]).
     options: String,
@@ -3371,7 +3371,7 @@ struct MountLine<'a> {
 impl MountLine<'_> {
     fn write(&self, out: &mut Vec<u8>, info: bool) {
         use crate::vfs::ms;
-        let (fstype, options) = (self.fstype, &self.options);
+        let (fstype, options) = (&self.fstype, &self.options);
         let sb = if self.sb_readonly { "ro" } else { "rw" };
         if info {
             let (id, parent) = (self.id, self.parent);

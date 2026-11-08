@@ -689,6 +689,17 @@ pub fn dup(fd: i32) -> Result<i32, i32> {
     if new < 0 { Err(last_errno()) } else { Ok(new) }
 }
 
+/// A new empty host file in memory (memfd_create, close-on-exec) named `name`.
+pub fn memfd(name: &std::ffi::CStr) -> Result<std::fs::File, i32> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: fd was just created and is owned by nobody else
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// The capacity of a host filesystem (statvfs).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStats {

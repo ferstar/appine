@@ -95,6 +95,9 @@ pub enum FileKind {
         entries: Option<Vec<DirEntry>>,
         /// `/proc/<pid>`: the process at open time (used as a pidfd).
         process: Option<std::rc::Weak<RefCell<crate::process::ThreadGroup>>>,
+        /// A FUSE directory: the daemon's handle from `FUSE_OPENDIR`, listed with
+        /// `FUSE_READDIR`.
+        fuse: Option<Box<crate::vfs::fuse::Handle>>,
     },
     /// A file opened with `O_PATH`: usable only as the starting point of `*at` calls or as the
     /// object of fstat.
@@ -134,6 +137,11 @@ pub enum FileKind {
     SeccompNotify(crate::seccomp::Listener),
     /// An eBPF program ([`crate::bpf`]).
     Bpf(std::rc::Rc<crate::bpf::Prog>),
+    /// A file in a FUSE filesystem other than a directory, read and written through its daemon
+    /// (in mount [`OpenFile::mnt`]).
+    Fuse(Box<crate::vfs::fuse::Handle>),
+    /// `/dev/fuse`: a FUSE daemon reads requests from it and writes replies.
+    FuseDev(crate::vfs::fuse::DevFile),
     /// A procfs, sysfs or cgroup2 file: content generated at open, regenerated when read again
     /// from offset 0.
     Proc {
@@ -309,6 +317,8 @@ impl OpenFile {
             | FileKind::SeccompNotify(_)
             | FileKind::Bpf(_)
             | FileKind::MessageQueue(_) => None,
+            FileKind::FuseDev(d) => d.ino.map(|ino| Node::Store(self.mnt, ino)),
+            FileKind::Fuse(h) => Some(Node::Fuse(self.mnt, h.id)),
             FileKind::Regular { ino, .. } | FileKind::Device { ino, .. } => {
                 Some(Node::Store(self.mnt, *ino))
             }
@@ -333,11 +343,13 @@ impl OpenFile {
 
     /// What locks are keyed by ([`crate::locks`]): the store inode, or for a file opened through
     /// an overlay its overlay node's key (Linux locks the overlay's inode, which copying up does
-    /// not change; [`crate::vfs::overlay::key`]).
+    /// not change; [`crate::vfs::overlay::key`]), or a FUSE node's key (the daemon is not asked:
+    /// `FUSE_POSIX_LOCKS` is not offered, so Linux keeps them in the kernel too).
     pub fn lock_ino(&self) -> Option<Ino> {
-        match self.ovl {
-            Some(o) => Some(crate::vfs::overlay::key(o)),
-            None => self.ino(),
+        match (self.ovl, self.node()) {
+            (Some(o), _) => Some(crate::vfs::overlay::key(o)),
+            (None, Some(Node::Fuse(_, f))) => Some(crate::vfs::fuse::key(f)),
+            (None, _) => self.ino(),
         }
     }
 

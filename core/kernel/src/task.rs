@@ -675,6 +675,9 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             if let Flow::Exec = flow {
                 generations = cx.mm().generations();
             }
+            if let Flow::Exit = flow {
+                crate::syscall::flush_at_exit(&mut cx);
+            }
             fast.refresh(shared, cx.task, cx.t);
             flow
         });

@@ -15,6 +15,7 @@
 
 pub mod browse;
 pub mod dev;
+pub mod fuse;
 pub mod import;
 pub mod overlay;
 pub mod store;
@@ -46,6 +47,9 @@ pub(crate) enum Node {
     /// A node in an overlay ([`overlay`]): the store inodes behind it are looked up through
     /// [`Vfs::overlay`].
     Overlay(MountId, overlay::OvlId),
+    /// A node in a FUSE filesystem ([`fuse`]): its daemon's node id and cached attributes are
+    /// looked up through [`Vfs::fuse`].
+    Fuse(MountId, fuse::FuseId),
 }
 
 impl Node {
@@ -55,16 +59,18 @@ impl Node {
     /// The mount reached through.
     pub(crate) fn mnt(&self) -> MountId {
         match self {
-            Node::Store(id, _) | Node::Pseudo(id, _) | Node::Overlay(id, _) => *id,
+            Node::Store(id, _) | Node::Pseudo(id, _) | Node::Overlay(id, _) | Node::Fuse(id, _) => {
+                *id
+            }
         }
     }
 
-    /// The store inode; None for nodes in synthetic filesystems and overlays (an overlay node's
-    /// store inodes are in lower layers that must not change, see [`Vfs::overlay`]).
+    /// The store inode; None for nodes in synthetic filesystems, overlays (an overlay node's
+    /// store inodes are in lower layers that must not change, see [`Vfs::overlay`]) and FUSE.
     pub(crate) fn ino(&self) -> Option<Ino> {
         match self {
             Node::Store(_, ino) => Some(*ino),
-            Node::Pseudo(..) | Node::Overlay(..) => None,
+            Node::Pseudo(..) | Node::Overlay(..) | Node::Fuse(..) => None,
         }
     }
 
@@ -74,6 +80,7 @@ impl Node {
             Node::Store(_, ino) => Node::Store(id, ino),
             Node::Pseudo(_, p) => Node::Pseudo(id, p),
             Node::Overlay(_, o) => Node::Overlay(id, o),
+            Node::Fuse(_, f) => Node::Fuse(id, f),
         }
     }
 }
@@ -157,6 +164,9 @@ pub(crate) enum Fs {
     /// overlayfs ([`overlay`]): store directories merged into one tree, a new instance on every
     /// mount.
     Overlay,
+    /// FUSE ([`fuse`]): a filesystem a guest process serves through `/dev/fuse`, a new instance
+    /// (connection) on every mount.
+    Fuse,
 }
 
 impl Fs {
@@ -170,6 +180,9 @@ impl Fs {
             b"tmpfs" => Some(Fs::Tmpfs),
             b"mqueue" => Some(Fs::Mqueue),
             b"overlay" => Some(Fs::Overlay),
+            // `fuse.<subtype>` is fuse with that subtype (Linux's `FS_HAS_SUBTYPE`)
+            b"fuse" => Some(Fs::Fuse),
+            n if n.starts_with(b"fuse.") => Some(Fs::Fuse),
             _ => None,
         }
     }
@@ -186,6 +199,7 @@ impl Fs {
             Fs::Nsfs => "nsfs",
             Fs::Mqueue => "mqueue",
             Fs::Overlay => "overlay",
+            Fs::Fuse => "fuse",
         }
     }
 
@@ -195,7 +209,7 @@ impl Fs {
         match self {
             Fs::Store => ROOT_DEV,
             // No boot instance; allocated separately on each mount
-            Fs::Tmpfs | Fs::Overlay => 0,
+            Fs::Tmpfs | Fs::Overlay | Fs::Fuse => 0,
             Fs::Proc => 0x17,
             Fs::Pts => 0x18,
             Fs::Sys => 0x16,
@@ -212,21 +226,27 @@ impl Fs {
     /// be mounted at the same place. sysfs and cgroup2 have only one instance per namespace, and
     /// mounting again on the root of the same mount is EBUSY.
     pub(crate) const fn new_instance(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Pts | Fs::Tmpfs | Fs::Overlay)
+        matches!(
+            self,
+            Fs::Proc | Fs::Pts | Fs::Tmpfs | Fs::Overlay | Fs::Fuse
+        )
     }
 
     /// Newly mounted instances have their own device numbers: procfs, tmpfs, and devpts (each
     /// instance has its own set of terminals, and the device number is the instance number,
     /// [`crate::tty::PtsOptions`]).
     pub(crate) const fn own_dev(self) -> bool {
-        matches!(self, Fs::Proc | Fs::Tmpfs | Fs::Pts | Fs::Overlay)
+        matches!(
+            self,
+            Fs::Proc | Fs::Tmpfs | Fs::Pts | Fs::Overlay | Fs::Fuse
+        )
     }
 
     /// Superblock options (the part after `rw` in the last column of mountinfo).
     pub(crate) const fn options(self) -> &'static str {
         match self {
             Fs::Cgroup => ",nsdelegate,memory_recursiveprot",
-            // Per instance for tmpfs, devpts and overlays ([`Vfs::sb_options`])
+            // Per instance for tmpfs, devpts, overlays and FUSE ([`Vfs::sb_options`])
             Fs::Store
             | Fs::Tmpfs
             | Fs::Pts
@@ -234,18 +254,20 @@ impl Fs {
             | Fs::Sys
             | Fs::Nsfs
             | Fs::Mqueue
-            | Fs::Overlay => "",
+            | Fs::Overlay
+            | Fs::Fuse => "",
         }
     }
 
     /// The filesystem's root directory (mount id 0, replaced by the new mount's when mounted).
-    /// The roots of tmpfs and overlay instances are created at mount time ([`Vfs::new_tmpfs`],
-    /// [`Vfs::new_overlay`]) and nsfs cannot be mounted; none of them uses this.
+    /// The roots of tmpfs, overlay and FUSE instances are created at mount time
+    /// ([`Vfs::new_tmpfs`], [`Vfs::new_overlay`], [`Vfs::new_fuse`]) and nsfs cannot be mounted;
+    /// none of them uses this.
     pub(crate) fn root(self) -> Node {
         Node::Pseudo(
             0,
             match self {
-                Fs::Store | Fs::Tmpfs | Fs::Overlay => return Node::Store(0, ROOT),
+                Fs::Store | Fs::Tmpfs | Fs::Overlay | Fs::Fuse => return Node::Store(0, ROOT),
                 Fs::Proc | Fs::Nsfs => PseudoNode::ProcRoot,
                 // Replaced by the new instance's when mounted
                 Fs::Pts => PseudoNode::PtsRoot(crate::tty::BOOT_PTS),
@@ -431,6 +453,8 @@ pub struct Vfs {
     namespaces: RefCell<Vec<std::rc::Weak<MntNs>>>,
     /// Overlay instances and their nodes.
     overlays: RefCell<overlay::Overlays>,
+    /// FUSE connections and their nodes.
+    fuse: RefCell<fuse::Fuses>,
 }
 
 struct Mounts {
@@ -922,6 +946,7 @@ impl Vfs {
             }),
             namespaces: Default::default(),
             overlays: Default::default(),
+            fuse: Default::default(),
         })
     }
 
@@ -1104,7 +1129,7 @@ impl Vfs {
                 let magic = matches!(&node, Node::Pseudo(_, p) if ps.magic(p));
                 let jump = match &node {
                     Node::Pseudo(id, p) => ps.follow(*id, p).transpose()?,
-                    Node::Store(..) | Node::Overlay(..) => None,
+                    Node::Store(..) | Node::Overlay(..) | Node::Fuse(..) => None,
                 };
                 if magic {
                     if flags & resolve::NO_MAGICLINKS != 0 {
@@ -1160,8 +1185,43 @@ impl Vfs {
                 let real = self.overlays.borrow().node(*o).real();
                 cred.permission(&self.store.attrs(real)?, MAY_EXEC)
             }
+            Node::Fuse(_, f) => self.fuse_permission(cred, *f, MAY_EXEC),
             _ => Ok(()),
         }
+    }
+
+    /// Whether a process with credentials `cred` may access FUSE node `id` with `mask` (6.1's
+    /// `fuse_permission` without `MAY_ACCESS` or `MAY_CHDIR`): never unless the mount allows that
+    /// process; then with `default_permissions` as the node's attributes say (fetched again when
+    /// they are out of date, [`fuse::need`]), and without it as the daemon decides, except that
+    /// executing a regular file needs some execute bit.
+    pub(crate) fn fuse_permission(
+        &self,
+        cred: &Cred,
+        id: fuse::FuseId,
+        mask: u32,
+    ) -> Result<(), Errno> {
+        let (allowed, default_permissions) = {
+            let f = self.fuse.borrow();
+            let conn = f.conn_of(id)?;
+            let c = conn.borrow();
+            (c.allows(cred), c.opts.default_permissions)
+        };
+        if !allowed {
+            return Err(Errno::EACCES);
+        }
+        let exec_regular =
+            mask & MAY_EXEC != 0 && self.fuse.borrow().node(id).kind() == mode::S_IFREG;
+        if default_permissions {
+            if cred.searches_all() && !exec_regular && mask & !MAY_EXEC == 0 {
+                return Ok(());
+            }
+            return cred.permission(&fuse::cached_attr(self, id)?.stat(), mask);
+        }
+        if exec_regular && fuse::cached_attr(self, id)?.mode & 0o111 == 0 {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
     }
 
     /// `..` in a path (Linux's `follow_dotdot`): stays put at the root directory; at a mount's
@@ -1428,6 +1488,20 @@ impl Vfs {
                     names.push(ovl.node(o).name.clone());
                     cur = Node::Overlay(id, up);
                 }
+                Node::Fuse(id, f) => {
+                    let fuse = self.fuse.borrow();
+                    let Some(n) = fuse.get(f) else {
+                        reached = false;
+                        break;
+                    };
+                    // The root of an instance whose mount is not this one
+                    if n.parent == f {
+                        reached = false;
+                        break;
+                    }
+                    names.push(n.name.clone());
+                    cur = Node::Fuse(id, n.parent);
+                }
             }
         }
         let mut out = Vec::new();
@@ -1452,6 +1526,7 @@ impl Vfs {
             Node::Store(_, ino) => self.store.kind(*ino),
             Node::Pseudo(_, p) => ps.kind(p),
             Node::Overlay(_, o) => self.store.kind(self.overlays.borrow().node(*o).real()),
+            Node::Fuse(_, f) => Ok(self.fuse.borrow().get(*f).ok_or(Errno::ENOTCONN)?.kind()),
         }
     }
 
@@ -1472,8 +1547,21 @@ impl Vfs {
                 *id,
                 self.overlays.borrow_mut().lookup(&self.store, *o, name)?,
             ),
+            Node::Fuse(id, f) => Node::Fuse(*id, self.fuse_child(*f, name)?),
         };
         Ok(self.mounted(child))
+    }
+
+    /// `name` in FUSE directory `dir` from the cache, or a retry to look it up ([`fuse::need`]).
+    pub(crate) fn fuse_child(&self, dir: fuse::FuseId, name: &[u8]) -> Result<fuse::FuseId, Errno> {
+        if name.len() > fuse::NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        match self.fuse.borrow().cached_child(dir, name) {
+            Some(Some(id)) => Ok(id),
+            Some(None) => Err(Errno::ENOENT),
+            None => Err(fuse::need(fuse::Query::Lookup(dir, name.to_vec()))),
+        }
     }
 
     /// When something is mounted on the node, replaces it with the root of the mount on it; with
@@ -1501,6 +1589,10 @@ impl Vfs {
             Node::Store(_, ino) => self.store.readlink(*ino),
             Node::Pseudo(id, p) => ps.readlink(*id, p),
             Node::Overlay(_, o) => self.store.readlink(self.overlays.borrow().node(*o).real()),
+            Node::Fuse(_, f) => match self.fuse.borrow().link(*f) {
+                Some(target) => Ok(target.to_vec()),
+                None => Err(fuse::need(fuse::Query::Readlink(*f))),
+            },
         }
     }
 
@@ -1552,6 +1644,10 @@ impl Vfs {
             Node::Store(id, ino) => Node::Store(*id, self.store.parent(*ino)?),
             Node::Pseudo(id, p) => ps.parent(p).map_or(dir.clone(), |up| Node::Pseudo(*id, up)),
             Node::Overlay(id, o) => Node::Overlay(*id, self.overlays.borrow().parent(*o)),
+            Node::Fuse(id, f) => Node::Fuse(
+                *id,
+                self.fuse.borrow().get(*f).ok_or(Errno::ENOTCONN)?.parent,
+            ),
         })
     }
 
@@ -1871,6 +1967,7 @@ impl Vfs {
                 Node::Store(..) => ROOT_DEV,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p).dev(),
                 Node::Overlay(_, o) => self.overlays.borrow().node(*o).dev,
+                Node::Fuse(_, f) => self.fuse.borrow().get(*f).map_or(0, |n| n.dev),
             })
     }
 
@@ -1887,6 +1984,7 @@ impl Vfs {
                 Node::Store(..) => Fs::Store,
                 Node::Pseudo(_, p) => crate::pseudo::fs_of(p),
                 Node::Overlay(..) => Fs::Overlay,
+                Node::Fuse(..) => Fs::Fuse,
             })
     }
 
@@ -2005,7 +2103,33 @@ impl Vfs {
                 .tmpfs
                 .get(&m.dev)
                 .map_or_else(String::new, |t| t.params.options()),
+            Fs::Fuse => self
+                .fuse
+                .borrow()
+                .conn(m.dev)
+                .map_or_else(String::new, |c| {
+                    let c = c.borrow();
+                    c.opts.show(c.user_ns())
+                }),
             fs => fs.options().to_owned(),
+        }
+    }
+
+    /// The mount's filesystem type as mountinfo shows it: a FUSE mount with a subtype shows
+    /// `fuse.<subtype>` (Linux's `show_type`).
+    pub(crate) fn type_of(&self, m: &Mount) -> String {
+        let name = m.fs.type_name().to_owned();
+        if m.fs != Fs::Fuse {
+            return name;
+        }
+        let subtype = self
+            .fuse
+            .borrow()
+            .conn(m.dev)
+            .and_then(|c| c.borrow().opts.subtype.clone());
+        match subtype {
+            Some(s) => format!("{name}.{}", String::from_utf8_lossy(&s)),
+            None => name,
         }
     }
 
@@ -2097,6 +2221,16 @@ impl Vfs {
                     cur = ovl.parent(cur);
                 }
             }
+            Node::Fuse(_, f) => {
+                let fuse = self.fuse.borrow();
+                let mut cur = *f;
+                while let Some(n) = fuse.get(cur)
+                    && n.parent != cur
+                {
+                    names.push(n.name.clone());
+                    cur = n.parent;
+                }
+            }
         }
         if names.is_empty() {
             return b"/".to_vec();
@@ -2162,6 +2296,50 @@ impl Vfs {
     /// layers and options).
     pub(crate) fn overlay(&self) -> crate::cell::Ref<'_, overlay::Overlays> {
         self.overlays.borrow()
+    }
+
+    /// Mounts a new FUSE instance served through connection `conn` (whose device number is
+    /// filled in here), returning the new mount's id and the connection; INIT is queued by the
+    /// caller.
+    pub(crate) fn new_fuse(
+        &self,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        conn: impl FnOnce(u64) -> fuse::Conn,
+    ) -> (MountId, std::rc::Rc<RefCell<fuse::Conn>>) {
+        let id = self.add_mount(Fs::Fuse, Node::ROOT, point, flags, source, None);
+        let dev = self.with_mount(id, |m| m.dev).unwrap_or(0);
+        let conn = std::rc::Rc::new(RefCell::new(conn(dev)));
+        let root = self.fuse.borrow_mut().add(conn.clone());
+        self.update_mount(id, |m| m.root = Node::Fuse(id, root));
+        self.mounts_changed();
+        (id, conn)
+    }
+
+    /// Mounts FUSE instance `dev` once more (mount(2) given a device file already attached to its
+    /// connection), at its root.
+    pub(crate) fn add_fuse_mount(
+        &self,
+        point: (Node, Option<Dentry>),
+        flags: u64,
+        source: Vec<u8>,
+        dev: u64,
+    ) -> Result<MountId, Errno> {
+        let root = self.fuse.borrow().root_of(dev).ok_or(Errno::ENOTCONN)?;
+        let id = self.add_mount(Fs::Fuse, Node::ROOT, point, flags, source, Some(dev));
+        self.update_mount(id, |m| m.root = Node::Fuse(id, root));
+        self.mounts_changed();
+        Ok(id)
+    }
+
+    /// The FUSE connections and their nodes.
+    pub(crate) fn fuse(&self) -> crate::cell::Ref<'_, fuse::Fuses> {
+        self.fuse.borrow()
+    }
+
+    pub(crate) fn fuse_mut(&self) -> crate::cell::RefMut<'_, fuse::Fuses> {
+        self.fuse.borrow_mut()
     }
 
     /// Metadata of overlay node `o` ([`overlay::Overlays::stat`]).
@@ -2439,6 +2617,22 @@ impl Vfs {
                     ovl.remove_instance(dev);
                 }
             }
+            // A FUSE instance without a mount aborts its connection, so its daemon's reads fail
+            // and it exits (6.1's `fuse_sb_destroy`)
+            let fuses: std::collections::HashSet<u64> = mounts
+                .list
+                .iter()
+                .chain(&mounts.detached)
+                .filter(|m| m.fs == Fs::Fuse)
+                .map(|m| m.dev)
+                .collect();
+            let mut fuse = self.fuse.borrow_mut();
+            for dev in fuse.devs() {
+                if !fuses.contains(&dev) {
+                    fuse.remove(dev);
+                }
+            }
+            drop(fuse);
             let live: std::collections::HashSet<u64> = mounts
                 .list
                 .iter()
@@ -3074,7 +3268,9 @@ mod tests {
                         )
                         .and_then(|n| match n {
                             Node::Store(_, ino) => vfs.store().stat(ino),
-                            Node::Pseudo(..) | Node::Overlay(..) => unreachable!(),
+                            Node::Pseudo(..) | Node::Overlay(..) | Node::Fuse(..) => {
+                                unreachable!()
+                            }
                         });
                     // Normal resolution filled everything needed into the cache; afterwards the
                     // cache alone gives the same result
@@ -3209,7 +3405,7 @@ mod tests {
         let cached = vfs.cached();
         let ino = |n: &Node| match n {
             Node::Store(_, i) => *i,
-            Node::Pseudo(..) | Node::Overlay(..) => unreachable!(),
+            Node::Pseudo(..) | Node::Overlay(..) | Node::Fuse(..) => unreachable!(),
         };
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin", true), None);
         assert_eq!(cached.stat(ROOT, ROOT, b"/bin/../usr", true), None);

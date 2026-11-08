@@ -99,6 +99,8 @@ impl Errno {
     pub const EOVERFLOW: Errno = Errno(75);
     /// The fd is in a bad state (the fd does not exist when bpf(2) fetches info).
     pub const EBADFD: Errno = Errno(77);
+    /// Protocol error (a FUSE daemon answering INIT with another major version).
+    pub const EPROTO: Errno = Errno(71);
     /// Too many users (a multithreaded process setns-ing into a time namespace).
     pub const EUSERS: Errno = Errno(87);
     /// Not a socket.
@@ -124,6 +126,8 @@ impl Errno {
     pub const ENETDOWN: Errno = Errno(100);
     /// Network unreachable.
     pub const ENETUNREACH: Errno = Errno(101);
+    /// Connection aborted (a FUSE request in flight when its connection was aborted).
+    pub const ECONNABORTED: Errno = Errno(103);
     /// Already connected.
     pub const EISCONN: Errno = Errno(106);
     /// Not connected.
@@ -155,6 +159,11 @@ impl Errno {
     /// into running `restart_syscall`, which goes on with the rest (the thread's
     /// [`crate::task::TaskState::restart`]).
     pub const ERESTART_RESTARTBLOCK: Errno = Errno(516);
+
+    /// Not an errno: a walk needs a reply from a FUSE daemon that it cannot wait for, so the
+    /// syscall dispatcher asks for it and runs the syscall again ([`crate::vfs::fuse::serve`]).
+    /// Never returned to the guest.
+    pub const FUSE_RETRY: Errno = Errno(600);
 
     /// The value a syscall returns to the guest: `-errno`.
     pub fn to_syscall_return(self) -> u64 {

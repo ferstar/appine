@@ -20,12 +20,13 @@ use super::fs::{AT_FDCWD, lookup_at, start_dir};
 use super::{SysResult, get, read_path};
 use crate::cred::cap;
 use crate::errno::Errno;
+use crate::fd::FileKind;
 use crate::kernel::Cx;
 use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
 use crate::vfs::store::{Ino, mode};
 use crate::vfs::{
-    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, lock, ms, overlay,
+    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, fuse, lock, ms, overlay,
 };
 
 const MS_REMOUNT: u64 = 0x20;
@@ -222,6 +223,9 @@ fn new_mount(
         cx.shared.fast_changed();
         return Ok(0);
     }
+    if fs == Fs::Fuse {
+        return fuse_mount(cx, &vfs, &fstype, source, (target, at), flags, data);
+    }
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
@@ -274,6 +278,73 @@ fn new_mount(
     if fs == Fs::Proc && pid_ns.level > 0 {
         vfs.set_proc_pid_ns(id, pid_ns);
     }
+    cx.shared.fast_changed();
+    Ok(0)
+}
+
+/// Mounts a new FUSE instance (6.1's `fuse_get_tree` and `fuse_fill_super`): type `fuse` or
+/// `fuse.<subtype>` (an empty subtype is EINVAL), the options of [`fuse::Options::parse`], of
+/// which `fd`, `rootmode`, `user_id` and `group_id` must all be given, and `fd` must be open on
+/// `/dev/fuse` by a process in the mounter's user namespace (EINVAL). The device file is attached
+/// to the new connection and `FUSE_INIT` queued; the mount does not wait for the daemon to answer
+/// it. A device file already attached mounts its instance again.
+fn fuse_mount(
+    cx: &mut Cx<'_>,
+    vfs: &Vfs,
+    fstype: &[u8],
+    source: Option<Vec<u8>>,
+    (target, at): (Node, Option<Dentry>),
+    flags: u64,
+    data: &[u8],
+) -> SysResult {
+    let cred = cx.cred();
+    let mut opts = fuse::Options::parse(data, &cred)?;
+    // The type's subtype is given before the options, so one there too is EINVAL (6.1's
+    // do_new_mount, then "Multiple subtypes specified")
+    if let Some(sub) = fstype.strip_prefix(b"fuse.") {
+        if sub.is_empty() || opts.subtype.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        opts.subtype = Some(sub.to_vec());
+    }
+    // A descriptor that is not open is EINVAL (6.1's fuse_get_tree finds no file)
+    let file = opts
+        .fd
+        .and_then(|fd| cx.fds().get(fd).ok())
+        .ok_or(Errno::EINVAL)?;
+    // One already attached to a connection mounts that connection's instance again, while it
+    // still exists (ENOTCONN once it is gone), whatever the other options say (sget_fc keyed by
+    // the connection)
+    let attached = match &file.borrow().kind {
+        FileKind::FuseDev(d) => d.conn.clone(),
+        _ => None,
+    };
+    if let Some(conn) = attached {
+        let dev = conn.borrow().dev;
+        if vfs.fuse().conn(dev).is_none() {
+            return Err(Errno::ENOTCONN);
+        }
+        room_for(cx, vfs, target.mnt(), 1)?;
+        vfs.add_fuse_mount((target, at), flags, source.unwrap_or_default(), dev)?;
+        cx.shared.fast_changed();
+        return Ok(0);
+    }
+    let (Some(_), Some(_), Some(_)) = (opts.rootmode, opts.user_id, opts.group_id) else {
+        return Err(Errno::EINVAL);
+    };
+    match &file.borrow().kind {
+        FileKind::FuseDev(d) if Rc::ptr_eq(&d.opener_ns, &cred.user_ns) => {}
+        _ => return Err(Errno::EINVAL),
+    }
+    room_for(cx, vfs, target.mnt(), 1)?;
+    let pid_ns = cx.pid_ns();
+    let (_, conn) = vfs.new_fuse((target, at), flags, source.unwrap_or_default(), |dev| {
+        fuse::Conn::new(dev, opts, &cred, pid_ns)
+    });
+    if let FileKind::FuseDev(d) = &mut file.borrow_mut().kind {
+        d.attach(&conn);
+    }
+    fuse::send_init(&conn);
     cx.shared.fast_changed();
     Ok(0)
 }

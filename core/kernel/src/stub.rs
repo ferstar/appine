@@ -114,7 +114,8 @@ fn linux_refuses(request: u32, on: &str) -> bool {
 pub(crate) fn file_kind(kind: &FileKind) -> &'static str {
     match kind {
         FileKind::Host(_) => "host file",
-        FileKind::Regular { .. } => REGULAR,
+        FileKind::Regular { .. } | FileKind::Fuse(_) => REGULAR,
+        FileKind::FuseDev(_) => "/dev/fuse",
         FileKind::Directory { .. } => DIRECTORY,
         FileKind::Path(_) => "O_PATH file",
         FileKind::Pipe(_) => "pipe",
@@ -271,7 +272,7 @@ mod tests {
         let missing = || Stub::Missing("/proc/<pid>/autogroup".into());
         assert!(hit(&mut s, missing(), "top").is_some());
         assert!(hit(&mut s, missing(), "top").is_none());
-        assert!(hit(&mut s, Stub::Device(false, 10, 229), "sshfs").is_some());
+        assert!(hit(&mut s, Stub::Device(false, 10, 200), "openvpn").is_some());
         assert_eq!(
             s.top(10),
             [
@@ -280,7 +281,7 @@ mod tests {
                 "prctl option 0x59616d61: 1 call, first by gdb",
                 "ioctl 0x80086601 (regular file): 1 call, first by lsattr",
                 "ioctl 0x80086601 (directory): 1 call, first by lsattr",
-                "char device 10:229: 1 call, first by sshfs",
+                "char device 10:200: 1 call, first by openvpn",
             ]
         );
     }

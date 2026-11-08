@@ -766,6 +766,7 @@ pub(crate) fn open_node(
     let ino = match *node {
         Node::Store(_, ino) => ino,
         Node::Overlay(_, o) => vfs.overlay().node(o).real(),
+        Node::Fuse(_, f) => return open_fuse(vfs, cred, node, f),
         Node::Pseudo(..) => return Err(Errno::EACCES),
     };
     let st = vfs.store().stat(ino)?;
@@ -781,6 +782,33 @@ pub(crate) fn open_node(
     }
     let nosuid = flags & crate::vfs::ms::NOSUID != 0;
     Ok((vfs.executable(ino)?, st, nosuid))
+}
+
+/// A program in a FUSE filesystem: the checks [`open_node`] makes, with execute permission as
+/// [`Vfs::fuse_permission`] decides, then a copy of the file read in this syscall (a retry reads
+/// it, [`crate::vfs::fuse::Query::Program`]). Its inode number is the node's key, which no store
+/// file has (the checks for programs open for writing and being executed compare them), and set-id
+/// bits and file capabilities never take effect, as on the nosuid mounts fusermount makes.
+fn open_fuse(
+    vfs: &Vfs,
+    cred: &Cred,
+    node: &Node,
+    id: crate::vfs::fuse::FuseId,
+) -> Result<(Executable, Stat, bool), Errno> {
+    use crate::vfs::fuse;
+    match vfs.fuse().get(id).ok_or(Errno::ENOTCONN)?.kind() {
+        mode::S_IFREG => {}
+        mode::S_IFLNK => return Err(Errno::ELOOP),
+        _ => return Err(Errno::EACCES),
+    }
+    vfs.fuse_permission(cred, id, MAY_EXEC)?;
+    if vfs.mount_flags(node).unwrap_or(0) & crate::vfs::ms::NOEXEC != 0 {
+        return Err(Errno::EACCES);
+    }
+    let mut st = fuse::cached_attr(vfs, id)?.stat();
+    st.ino = fuse::key(id);
+    let file = fuse::program(id).ok_or_else(|| fuse::need(fuse::Query::Program(id)))?;
+    Ok((Executable::open(file)?, st, true))
 }
 
 /// The last component of a program path, truncated to 15 bytes (`comm`).

@@ -1399,6 +1399,7 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
         FileKind::MessageQueue(q) => (q.borrow().readiness(), None),
         FileKind::SeccompNotify(l) => (l.readiness(), None),
         FileKind::Path(_) => (POLLNVAL, None),
+        FileKind::FuseDev(d) => (d.readiness(), None),
         // /dev/kmsg (`devkmsg_poll`): readable while there are unread records, with POLLERR and
         // POLLPRI as well when the record to be read has been pushed out; never reports writable
         FileKind::Device {
@@ -1462,6 +1463,7 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::Socket(s) => super::net::wake_objects(s, out),
         FileKind::MessageQueue(q) => out.push(wake::of(q)),
         FileKind::SeccompNotify(l) => out.push(l.object()),
+        FileKind::FuseDev(d) => out.extend(d.object()),
         FileKind::Device {
             kmsg: Some(user), ..
         } => out.push(wake::of(&*user.log)),

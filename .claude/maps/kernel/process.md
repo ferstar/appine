@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; the vDSO in time namespaces; scripts' ETXTBSY last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries last)
 
 ## Responsibilities
 
@@ -154,7 +154,13 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   undefined instructions raise `SIGILL`, breakpoints and watchpoints `SIGTRAP`, alignment faults
   `SIGBUS`, host faults kill the process; page faults go to `kernel/mm`.
 - The result (`Continue`, `Exec`, `Exit`) decides the next step; `Exec` re-attaches the translator
-  for the new address space. After each BKL-path handling the fast-path cache is refreshed.
+  for the new address space. After each BKL-path handling the fast-path cache is refreshed. On
+  `Exit`, still under the BKL, the last thread using its fd table flushes the FUSE files in it
+  (`kernel/fuse`) before `task::exit` drops the table.
+- Each syscall gets a fresh FUSE token, and a handler failing with the internal `FUSE_RETRY` (a
+  walk needed a FUSE daemon's reply) makes the dispatcher ask for it with the BKL released and run
+  the handler again from the start, at most 16384 times (then `EIO`); ptrace's entry and exit
+  stops and seccomp see one syscall.
 
 ### Exit and reaping
 
@@ -205,7 +211,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   argv becomes `[""]`.
 - Target: by path, by fd (`AT_EMPTY_PATH`), through `/proc/<pid>/fd/<n>` (the open file) or
   `/proc/<pid>/exe`. It must be a regular executable file (`EACCES`), not on a noexec mount;
-  nosuid is noted.
+  nosuid is noted. A program (or interpreter) on a FUSE mount is read whole into a host copy by a
+  retry before anything changes (`kernel/fuse`), runs as if from a nosuid mount, and carries its
+  FUSE key as inode number.
 - `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
   relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`).
 - `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
@@ -503,8 +511,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### Inbound
 
-- Syscall dispatch (`syscall/mod.rs`: the BKL around handlers, pid translation, `Mm::sync` after
-  each call), `Machine` and the hosts (CLI, Android JNI: boot, shutdown, power, spawn, stall), signals and
+- Syscall dispatch (`syscall/mod.rs`: the BKL around handlers, pid translation, FUSE retries,
+  `Mm::sync` after each call), `Machine` and the hosts (CLI, Android JNI: boot, shutdown, power, spawn, stall), signals and
   ptrace (group exit, delivery, exit hooks), procfs, every blocking syscall (via the wait API),
   `kernel/mm` (kicks through `TaskSync`, `quiesce`), mount (nsfs binds, procfs/mqueue mounts).
 
@@ -513,7 +521,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `engine`: `Cpu::new`/`run`/`step`/`reset`, `Dbt::attach`/`run`, `Kicker`, `guest_hwcap`.
 - `kernel/mm`: `fork`, `quiesce`, users, `futex_key`, `translate`, layout and mapping calls used by
   the loader, `defer_unmaps`/`release_unmapped`/`spare::refill`.
-- vfs (resolution, mount flags, store, `copy_ns`), credentials, cgroups, SysV IPC
+- vfs (resolution, mount flags, store, `copy_ns`), `kernel/fuse` (serving retries, the exit
+  flush, FUSE programs), credentials, cgroups, SysV IPC
   (`kernel/ipc`), AIO (`kernel/vfs`), the OOM killer (`kernel/mm`), loadavg, the store's deferred
   commits.
 - `appine_hal`: `poll`, `Event`, thread CPU clocks, host thread nice/affinity/ioprio, host thread
@@ -542,6 +551,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - A finite soft `RLIMIT_CPU` alone keeps the timer thread ticking every 10 ms even while idle.
 - A deadline is `Instant::now()` plus a guest duration, which panics on overflow: new readers of
   guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.
+- A syscall handler may run several times for one syscall (FUSE retries): whatever it does before
+  a walk that can fail with `FUSE_RETRY` is done again, so handlers change nothing before their
+  last walk.
 
 ## Confirmed bugs / technical debt
 

@@ -66,7 +66,7 @@ jobs=1
 # not prepare the store or the image
 group=
 image=appine-difftest
-packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg iptables nftables"
+packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg iptables nftables fuse3 fuse-overlayfs sshfs openssh-sftp-server rclone"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 while getopts t:rs:j:G: opt; do
@@ -149,7 +149,7 @@ fi
 # Checking only that the directory exists is not enough: a store whose install failed midway, or
 # whose cache was only partly restored, makes every test case fail
 if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
-    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap iptables nft &&
+    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap iptables nft fusermount3 fuse-overlayfs sshfs rclone &&
         nsenter --version | grep -q util-linux && dmesg --version | grep -q util-linux" >/dev/null 2>&1; then
     echo "difftest: $store lacks some of: $packages" >&2
     echo "difftest: install them with apk add, or delete $store to create it again" >&2
