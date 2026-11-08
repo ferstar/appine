@@ -33,14 +33,14 @@ in the module maps, not here.
 - **PTY scenarios:** the 83 recorded scenarios are the `line-discipline` differential case. All of
   them pass since the line discipline follows n_tty.
 - **`tests/syscalls/cpp`:** `scripts/build-starnix-tests` builds 81 of its 93 gtest programs
-  statically against musl, and CI builds them too. 64 programs run in seven differential cases by
+  statically against musl, and CI builds them too. 65 programs run in seven differential cases by
   subsystem (`starnix-mm`, `-process`, `-signal`, `-fs`, `-proc`, `-io`, `-overlay`) through a
   shared runner, each skipping by reason the tests that differ for a deviation recorded in a map
   or cannot be compared; `starnix-overlay` puts its layers on a tmpfs, since Linux refuses
-  docker's overlay root as an upper layer. The other 17 are listed with their reasons in
+  docker's overlay root as an upper layer. The other 16 are listed with their reasons in
   `tests/diff/gtest/run.sh`: they would reboot, suspend or set the clock of the VM, test what
-  Appine does not implement (bpf maps, perf, process_mrelease, userfaultfd, tun), need devices, or
-  have nothing to compare.
+  Appine does not implement (bpf maps, perf, userfaultfd, tun), need devices, or have nothing to
+  compare.
 - **Full run of the other programs (2026-11-07, at 8dc166b):**
   - About 70 more programs ran one test per process, as root, on native Linux 6.8 and on Appine.
     Of 2484 tests, 1186 passed on both sides, 532 passed only natively (203 of them in
@@ -120,13 +120,14 @@ in the module maps, not here.
 | 6d05aa9 | Mounts inherited by a less privileged namespace are locked; proc and sysfs mounts check owner and visibility; `max_*_namespaces` enforced |
 | 2a244d2, 4b4af75 | overlayfs with several lower layers and an upper one, after Linux 6.1 rather than Starnix's single-lower module; its `overlayfs_test`, fs_test's overlay tests and gVisor's overlay mount tests run |
 | 7b7f73b | Unhandled exceptions reported in the kernel log as arm64's `arm64_show_signal` does; `debug.exception-trace` starts at arm64's 0 (the recorded 1 was x86's), the app's kernels at 1 |
+| 39ea702 | `process_mrelease`, releasing around fork's copy-on-write (Starnix's `process_mrelease_test` runs in `starnix-mm`); `/proc/<pid>/oom_score`, also in thread directories, with vfork children at 0 and no longer picked by the OOM killer; `/proc/swaps`; `/proc/locks` and fdinfo's `lock:` lines, which lslocks needs for OFD locks; `NETLINK_SOCK_DIAG` refusing every query, so ss reads `/proc/net` quietly |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
 b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead), except
-7b7f73b, which takes an idea from the list below.
+7b7f73b and 39ea702, which take ideas from the list below.
 
 ## Not yet taken
 
@@ -138,10 +139,8 @@ Ordered by value for effort.
 | BKL watchdog | A lockup detector that names threads stuck in one syscall | A thread that takes no BKL, records holder, syscall and pc after 10 s, and reports through the kernel log and the bug report | Small to medium |
 | Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
 | Store reflinks | — | `FICLONE` and whole-file `copy_file_range` share a store object until written: coreutils' `cp` and Python's `Path.copy` try `FICLONE` first, and an overlay copy-up of a large file would no longer copy its data | 600–1000 lines |
-| Small procfs and netlink files | Has `vmstat`, `swaps`, `locks`, `io`, `oom_score` (some as stubs) | `oom_score` from the OOM killer's score, `swaps` header, `locks` from the lock table; `NETLINK_SOCK_DIAG` that answers `ENOENT` so `ss` falls back to `/proc` quietly | Small each |
 | vDSO clock reads | Reads the counter plus a vvar page under a seqlock, falling back to the syscall when the seqlock is busy | The step kernel/signal D4 leaves open; the engine already handles `CNTVCT_EL0` | Medium |
 | FUSE | INIT negotiation, about 25 opcodes, interrupts, no page cache | A new node kind, waiting on the daemon with the BKL released, private mappings of FUSE files; sshfs and rclone mount are the users | 3–5k lines |
-| `process_mrelease` | For lmkd: zeroes an exiting process's private anonymous memory, after copying what `vmsplice` put in pipes | Its one Linux user found, earlyoom (1.8 and later), only warns when it fails, and on Appine cannot pick a victim anyway (no `/proc/<pid>/oom_score`, and it watches the whole phone's `meminfo`); a killed process's memory already goes back to the host as soon as its threads stop. Would bring Starnix's `process_mrelease_test` (10 tests, all passing natively). Needs its own release path around fork's copy-on-write (kernel/mm map); worth doing with `oom_score` if earlyoom is wanted | 150–250 lines |
 
 ## Not worth taking
 
