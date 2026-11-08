@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; flag values; tarballs by version; Starnix and gVisor cases; image export; CI split; AppArmor; stop signals; no macOS host; unfinished survey stores last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files; tarballs by version; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; difftest lock and suite skips last)
 
 ## Responsibilities
 
@@ -46,8 +46,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - File formats: difftest's per-case directives `# docker-run-options:`, `# appine-options:` and
   `# difftest-files:`;
   outputs `target/difftest/<case>.{native,appine,appine.err}`, failure copies under `failed/`,
-  timings `durations-t<tier>.txt`; LTP's `results.txt` lines `<name> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP>
-  <code> <secs>`, `logs/<name>.log` (and `.prev.log`), `durations.txt`; survey's
+  timings `durations-t<tier>.txt`, the run lock `.lock/pid`; LTP's `results.txt` lines
+  `<name> <PASS|CONF|FAIL|TIMEOUT|BUG|SKIP> <code> <secs>`, `logs/<name>.log` (and `.prev.log`),
+  `durations.txt`; survey's
   `target/survey/<name>.{out,err}` (and `.native.*`).
 
 ## Public entry points
@@ -120,6 +121,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ### Differential tests
 
+- One run at a time: a run takes `target/difftest/.lock` (a directory holding its pid) before
+  touching the store, waits while another live run holds it, takes over one left by a killed run,
+  and removes it on exit; its lanes run under it.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined); elsewhere through `scripts/dev`.
 - A store (`target/difftest/store`) is imported once and gets about 18 packages; a tool check aborts
@@ -141,6 +145,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - A case name without `tests/diff/<name>.sh` is a failure, and so is every requested case that no
   lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
   from another directory works.
+- A case running a prebuilt suite (`run.sh <suite> "$SKIP" <program>…`) is reported `SKIP` when
+  that suite's tarball has not been built, and fails when the tarball lacks a program it names
+  (unless `SKIPPED.txt` lists it as not building); the summary counts the skipped cases, which do
+  not fail the run.
 
 ### Starnix's and gVisor's syscall tests
 
@@ -187,7 +195,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   set the clock of the VM, features Appine does not have (bpf maps and other program types, perf,
   process_mrelease, userfaultfd, overlayfs, tun), devices neither side has, and two with nothing
   to compare.
-- Without the tarball the cases print that it is missing and pass.
+- Without the tarball difftest reports the cases as `SKIP` (the runner itself would print the same
+  "not installed" line on both sides).
 
 ### LTP
 
@@ -299,9 +308,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Confirmed bugs / technical debt
 
-- **Concurrent difftest runs collide.** Per-case outputs and the report files are not
-  tier-qualified, each run wipes the other's lane claims, `-r` deletes clones another run is using,
-  and there is no lock.
 - **The two difftest sides start from different files.** The native image lacks `/root`, `/var`,
   `/opt`, `/home` and `/run`, while the Appine store keeps `/tmp` and `/root` between runs, so
   caches such as `/root/.cache` (Go, uv) exist only on the Appine side; cases clean `/tmp` by hand
@@ -310,9 +316,6 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
   stops `appine-run` itself), line-buffers input and
   echoes it while the guest echoes into the pipe; the size stays 24×80.
-- **The `starnix-*` and `gvisor-*` cases pass vacuously without the built tests:** locally they
-  only print that the tests are missing until `build-starnix-tests` / `build-gvisor-tests` has run
-  (they need the network and about four and ten minutes); CI's `full.yml` builds them.
 ## Open questions
 
 - Should difftest pass `APPINE_ON_BUG` and `APPINE_LOG` through, as it does `APPINE_DBT_REGS`?

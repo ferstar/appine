@@ -28,7 +28,10 @@
 #
 # The starnix-* and gvisor-* cases run Fuchsia Starnix's and gVisor's syscall tests (gtest
 # programs), one process per test, once scripts/build-starnix-tests or scripts/build-gvisor-tests
-# has built them; without them they only print that they are missing.
+# has built them; without them they are reported as SKIP, and a case naming a program the built
+# suite lacks fails.
+#
+# Only one run goes at a time (a lock under target/difftest): a second run waits for the first.
 #
 # Both sides' outputs are written to target/difftest/<name>.native and .appine and overwritten on
 # the next run; on a mismatch a copy is also saved as
@@ -77,6 +80,32 @@ while getopts t:rs:j:G: opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+out=target/difftest
+mkdir -p "$out"
+# One run at a time: runs share the per-case outputs, the lane claims and the lane clones (which -r
+# deletes), so a second run waits for the first. The lock is a directory holding the owner's pid;
+# one left by a run that was killed is taken over. The lanes (-G) run under their parent's lock
+if [ -z "$group" ]; then
+    lock=$out/.lock
+    waited=0
+    while ! mkdir "$lock" 2>/dev/null; do
+        holder=$(cat "$lock/pid" 2>/dev/null || true)
+        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+            rm -rf "$lock"
+            continue
+        fi
+        if [ "$waited" = 0 ]; then
+            echo "difftest: waiting for the run holding $lock (pid ${holder:-unknown})" >&2
+            waited=1
+        fi
+        sleep 2
+    done
+    echo $$ >"$lock/pid"
+    trap 'rm -rf "$lock"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+fi
 
 # linux <shell command>: runs in the Linux arm64 environment, where variables like $http_proxy are
 # expanded
@@ -168,8 +197,6 @@ if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 fi
 
-out=target/difftest
-mkdir -p "$out"
 if [ $# -eq 0 ]; then
     set -- $(cd tests/diff && ls *.sh | sed 's/\.sh$//')
 fi
@@ -181,6 +208,28 @@ run_group() {
     if [ ! -f "tests/diff/$name.sh" ]; then
         echo "FAIL $name: there is no tests/diff/$name.sh"
         return 1
+    fi
+    # A case running a prebuilt suite (`run.sh <suite> "$SKIP" <program>…`) would print the same
+    # "not installed" line on both sides without it, and a program missing from it lists no tests
+    # on either side: both would pass without running anything
+    suite=$(sed -n 's|.*gtest/run\.sh \([a-z]*\) .*|\1|p' "tests/diff/$name.sh")
+    if [ -n "$suite" ]; then
+        tests=$(ls target/$suite-tests/$suite-tests-*.tar 2>/dev/null | tail -n 1)
+        if [ -z "$tests" ]; then
+            echo "SKIP $name: the $suite tests are not built (scripts/build-$suite-tests)"
+            return 0
+        fi
+        # Programs that fail to build are listed in SKIPPED.txt and expected to be absent
+        absent=$(awk '/\\$/ { line = line substr($0, 1, length($0) - 1); next }
+            { line = line $0; if (sub(/.*run\.sh [a-z]+ "\$SKIP"/, "", line)) print line; line = "" }' \
+            "tests/diff/$name.sh" | tr ' ' '\n' | awk 'NF' | while read -r p; do
+                tar tf "$tests" "./bin/$p" >/dev/null 2>&1 ||
+                    tar xOf "$tests" ./SKIPPED.txt | grep -q "^$p:" || printf ' %s' "$p"
+            done)
+        if [ -n "$absent" ]; then
+            echo "FAIL $name: not in $tests:$absent (run scripts/build-$suite-tests)"
+            return 1
+        fi
     fi
     files=$(sed -n 's/^# difftest-files: //p' "tests/diff/$name.sh")
     unpack=""
@@ -262,9 +311,13 @@ if [ -n "$group" ]; then
 fi
 
 failed=0
+skipped=0
 if [ "$jobs" -le 1 ]; then
     for name in "$@"; do
-        run_group "$name" || failed=$((failed + 1))
+        report=$(run_group "$name") && code=0 || code=1
+        printf '%s\n' "$report"
+        [ "$code" = 0 ] || failed=$((failed + 1))
+        case $report in SKIP*) skipped=$((skipped + 1)) ;; esac
     done
 else
     rm -rf "$out"/.slot-*
@@ -294,9 +347,10 @@ else
         "$durations" "$out/.groups" | sort -s -k1,1 -nr | cut -d' ' -f2 |
         xargs -P "$jobs" -I '{}' "$self" -t "$tier" -s "$store" -j "$jobs" -G '{}' | tee "$reports" || true
     failed=$(grep -c '^FAIL ' "$reports" || true)
-    # Every group must have reported ok or FAIL: one whose lane died (or never started) printed
-    # nothing, and the pipeline above hides xargs' exit status
-    missing=$(awk 'FILENAME == ARGV[1] { if ($1 == "ok" || $1 == "FAIL") { sub(/:$/, "", $2); seen[$2] = 1 }; next }
+    skipped=$(grep -c '^SKIP ' "$reports" || true)
+    # Every group must have reported ok, FAIL or SKIP: one whose lane died (or never started)
+    # printed nothing, and the pipeline above hides xargs' exit status
+    missing=$(awk 'FILENAME == ARGV[1] { if ($1 == "ok" || $1 == "FAIL" || $1 == "SKIP") { sub(/:$/, "", $2); seen[$2] = 1 }; next }
         !($1 in seen) { print }' "$reports" "$out/.groups")
     for name in $missing; do
         echo "FAIL $name: no result (its lane did not finish)"
@@ -309,6 +363,7 @@ else
         "$out/.times" "$durations" | sort >"$durations.new"
     mv "$durations.new" "$durations"
 fi
+[ "$skipped" = 0 ] || echo "$skipped skipped (their test suites are not built)"
 [ "$failed" = 0 ] || {
     echo "$failed failed"
     exit 1
