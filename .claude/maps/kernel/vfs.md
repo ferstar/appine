@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; AIO; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; AIO; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode last)
 
 ## Responsibilities
 
@@ -644,7 +644,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - eventfd: counter or semaphore mode; writing `u64::MAX` is `EINVAL`; overflow blocks; every
   read/write wakes the object (the syscalls live in `kernel/poll`).
-- timerfd: realtime, monotonic, boottime and the alarm clocks (creating or setting an alarm timer
+- timerfd: opened read-write as Linux does (a write is `EINVAL`, there being no write operation);
+  realtime, monotonic, boottime and the alarm clocks (creating or setting an alarm timer
   needs `CAP_WAKE_ALARM` in the initial namespace, `EPERM`); expirations are kept on the clock's
   base (`itimer::Expiry`: relative realtime and monotonic on the host's monotonic clock, absolute
   realtime on its realtime clock, boottime on its boottime clock); settime resets the expiration

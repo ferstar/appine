@@ -511,9 +511,10 @@ pub(super) fn signalfd4(cx: &mut Cx<'_>, fd: i32, mask: u64, size: usize, flags:
         mask: set,
         group: std::rc::Rc::downgrade(&cx.t.group),
     };
+    // Read-write, as Linux's anon_inode_getfd gives it (write is EINVAL, F_GETFL shows O_RDWR)
     let file = OpenFile::new(
         FileKind::SignalFd(std::rc::Rc::new(crate::cell::RefCell::new(s))),
-        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
+        oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
     );
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)

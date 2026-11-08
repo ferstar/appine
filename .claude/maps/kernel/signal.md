@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd mode and bits last)
 
 ## Responsibilities
 
@@ -173,8 +173,9 @@ procfs.
   `rt_tgsigqueueinfo` or `pidfd_send_signal` is delivered as given as far as `kernel_siginfo`
   reaches (`si_errno` and the first 32 bytes of the union), si_pid and si_uid converted as for
   sigqueue.
-- signalfd: reads dequeue matching signals of the calling thread and its group, in the Linux
-  `signalfd_siginfo` layout; readiness also follows the calling thread.
+- signalfd: opened read-write as Linux does (a write is `EINVAL`); reads dequeue matching signals
+  of the calling thread and its group, in the Linux `signalfd_siginfo` layout; readiness
+  (`POLLIN` alone, as signalfd_poll) also follows the calling thread.
 
 ### exec and clone
 

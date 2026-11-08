@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; pselect6 clamps; loop devices; eventfd readv; test-suite findings; pipe edges, fasync kinds; `F_SETOWN` owners; epoll_ctl order, epoll_wait buffers, ppoll write-back, pipe readiness; anonymous fd bits last)
 
 ## Responsibilities
 
@@ -64,7 +64,9 @@ signal delivery (`kernel/signal`).
   (expirations), inotify, signalfd, pidfd (exited), epoll (nested, up to 4 levels), PTYs
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
   seccomp notify, kmsg; `O_PATH` files `POLLNVAL`; everything else (regular files, directories,
-  other devices, synthetic files, bpf) is always readable and writable.
+  other devices, synthetic files, bpf) is always readable and writable. The bits are each Linux
+  poll operation's: eventfd, timerfd and signalfd report `POLLIN`/`POLLOUT` without the
+  `RDNORM`/`WRNORM` bits, an epoll `POLLIN|POLLRDNORM`.
 - `poll_now` adds a zero-timeout host poll for the host fd (and its `HostEdges`), keeping
   `POLLERR`/`POLLHUP`/`POLLNVAL` regardless of the requested mask.
 - `arrivals(file)` gives monotonic `[in, out]` generation counters (plus host edges);
@@ -128,7 +130,7 @@ signal delivery (`kernel/signal`).
   never count; tee's write-side entry reads the length argument instead of `fd_out`).
 - Nested epolls: an inner epoll's generation is its `base` plus the shares of its armed
   interests, read side only, growing monotonically; edge-watching an inner epoll propagates host
-  edge watching inward. An epoll fd reports `POLLIN` only.
+  edge watching inward. An epoll fd reports `POLLIN|POLLRDNORM` (6.1's ep_eventpoll_poll).
 - `EPOLLEXCLUSIVE`: an edge is the file's drain and arrival counts; each edge is claimed by one
   epoll (level-triggered exclusive interests keep reporting to the claiming epoll). Exclusive
   waiters do not wait on the file: they queue on its `ExGate`, and the timer thread (subscribed to
@@ -140,8 +142,8 @@ signal delivery (`kernel/signal`).
 - `eventfd2` flags `EFD_SEMAPHORE|O_CLOEXEC|O_NONBLOCK` (else `EINVAL`). Read: buffer under 8
   `EINVAL`; takes the count (or 1 in semaphore mode) or blocks/`EAGAIN`/`ERESTARTSYS`. Write: under
   8 bytes or `u64::MAX` `EINVAL`; blocks or `EAGAIN` until the sum fits below `u64::MAX`; writing 0
-  still counts as an arrival. Readiness: `POLLIN|RDNORM` when nonzero, `POLLOUT|WRNORM` below
-  `u64::MAX - 1`; never `POLLERR`. Generations `[writes, reads]`.
+  still counts as an arrival. Readiness: `POLLIN` when nonzero, `POLLOUT` below `u64::MAX - 1`
+  (no `RDNORM`/`WRNORM`, as eventfd_poll); never `POLLERR`. Generations `[writes, reads]`.
 
 ### Signal-driven I/O
 
@@ -193,7 +195,6 @@ signal delivery (`kernel/signal`).
 - **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
   claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
   partial count.
-- **An epoll fd reports only `POLLIN`.**
 - **Pipe `POLLOUT` counts bytes, not buffers:** a pipe write end is reported writable once
   `PIPE_BUF` bytes are free, while Linux needs a free page buffer, so after partial reads leave
   buffers partly used, poll and epoll report a pipe writable earlier than Linux.
@@ -209,4 +210,5 @@ signal delivery (`kernel/signal`).
 ## To verify
 
 - Linux 6.1 comparisons above come from knowledge of `fs/select.c`, `fs/eventpoll.c`,
-  `fs/eventfd.c`, `fs/fcntl.c` and `fs/pipe.c`, not a source checkout.
+  `fs/eventfd.c`, `fs/fcntl.c` and `fs/pipe.c`, not a source checkout; the bits anonymous fds
+  report were also observed on a native 6.8 kernel.

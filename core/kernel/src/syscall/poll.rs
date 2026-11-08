@@ -1317,14 +1317,15 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             tty::readiness(&end.tty.borrow(), end.master, end.born),
             None,
         ),
+        // eventfd_poll reports POLLIN and POLLOUT without the RDNORM/WRNORM bits
         FileKind::EventFd(e) => {
             let e = e.borrow();
             let mut ev = 0;
             if e.count > 0 {
-                ev |= POLLIN | POLLRDNORM;
+                ev |= POLLIN;
             }
             if e.count < u64::MAX - 1 {
-                ev |= POLLOUT | POLLWRNORM;
+                ev |= POLLOUT;
             }
             (ev, None)
         }
@@ -1332,11 +1333,8 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             let mut t = t.borrow_mut();
             t.update();
             (
-                if t.expirations > 0 {
-                    POLLIN | POLLRDNORM
-                } else {
-                    0
-                },
+                // timerfd_poll reports POLLIN alone
+                if t.expirations > 0 { POLLIN } else { 0 },
                 None,
             )
         }
@@ -1348,17 +1346,17 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             },
             None,
         ),
-        FileKind::SignalFd(s) => (
-            if s.borrow().ready() {
-                POLLIN | POLLRDNORM
-            } else {
-                0
-            },
-            None,
-        ),
+        // signalfd_poll reports POLLIN alone
+        FileKind::SignalFd(s) => (if s.borrow().ready() { POLLIN } else { 0 }, None),
+        // ep_eventpoll_poll: POLLIN and POLLRDNORM while an interest is ready
         FileKind::Epoll(ep) if depth < MAX_NESTS => {
             let ready = ep.borrow().ready(depth + 1, 1);
-            (if ready.is_empty() { 0 } else { POLLIN }, None)
+            let ev = if ready.is_empty() {
+                0
+            } else {
+                POLLIN | POLLRDNORM
+            };
+            (ev, None)
         }
         FileKind::Epoll(_) => (0, None),
         // Since 6.9 there is also POLLHUP after the process is reaped; here it is the same as 6.1

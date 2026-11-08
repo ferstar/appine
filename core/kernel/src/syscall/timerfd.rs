@@ -57,9 +57,11 @@ pub(super) fn timerfd_create(cx: &mut Cx<'_>, clock: i32, flags: u32) -> SysResu
         fired: 0,
         settime_flags: 0,
     };
+    // Read-write, as Linux's anon_inode_getfd gives it: write is then EINVAL (no write operation),
+    // not EBADF, and F_GETFL shows O_RDWR
     let file = OpenFile::new(
         FileKind::TimerFd(Rc::new(RefCell::new(t))),
-        oflags::O_RDONLY | (flags & oflags::O_NONBLOCK),
+        oflags::O_RDWR | (flags & oflags::O_NONBLOCK),
     );
     cx.fds_mut()
         .install(file, flags & oflags::O_CLOEXEC != 0, 0)

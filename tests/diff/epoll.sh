@@ -468,6 +468,79 @@ int main(void)
 C
 gcc -O1 -o flags flags.c -lpthread && ./flags
 
+# Anonymous fds: their open modes (timerfd and signalfd are read-write like eventfd, epoll and
+# pidfd, so a write is EINVAL; inotify is read-only) and the bits their poll operations report
+# when ready, asked for every read and write bit
+cat > anonfd.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <sys/signalfd.h>
+#include <sys/syscall.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+
+static void show(const char *name, int fd)
+{
+    struct pollfd p = {.fd = fd, .events = POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM};
+    poll(&p, 1, 0);
+    uint64_t v = 1;
+    errno = 0;
+    long w = write(fd, &v, 8);
+    printf("%s: mode %d, revents %#x, write %ld %s\n", name, fcntl(fd, F_GETFL) & O_ACCMODE,
+           p.revents, w, w < 0 ? strerror(errno) : "");
+}
+
+int main(void)
+{
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    struct itimerspec soon = {.it_value = {0, 1000}};
+    timerfd_settime(tfd, 0, &soon, NULL);
+    usleep(10000);
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &usr1, NULL);
+    raise(SIGUSR1);
+    int sfd = signalfd(-1, &usr1, SFD_NONBLOCK);
+    unlink("/tmp/anonfd-created");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(ifd, "/tmp", IN_CREATE);
+    close(open("/tmp/anonfd-created", O_CREAT | O_WRONLY, 0644));
+    int efd = eventfd(1, EFD_NONBLOCK);
+    int ep = epoll_create1(0);
+    struct epoll_event e = {.events = EPOLLIN};
+    epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e);
+    struct mq_attr qa = {.mq_maxmsg = 4, .mq_msgsize = 8};
+    mqd_t mq = mq_open("/anonfd-queue", O_RDWR | O_CREAT | O_NONBLOCK, 0600, &qa);
+    mq_send(mq, "x", 1, 0);
+    mq_unlink("/anonfd-queue");
+    show("timerfd", tfd);
+    show("signalfd", sfd);
+    show("inotify", ifd);
+    show("eventfd", efd);
+    show("epoll", ep);
+    show("message queue", mq);
+    pid_t child = fork();
+    if (child == 0)
+        _exit(0);
+    int pfd = syscall(SYS_pidfd_open, child, 0);
+    usleep(100000);
+    show("pidfd of an exited child", pfd);
+    return 0;
+}
+C
+gcc -O1 -o anonfd anonfd.c && ./anonfd
+
 # A real tokio program: uv installs a package offline (not in the cache, so it fails). mio's
 # second wakeup used to be lost, and uv hung forever
 rm -rf /tmp/uvenv
