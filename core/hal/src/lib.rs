@@ -1205,6 +1205,34 @@ pub fn thread_ctxt_switches(tid: i32) -> Option<(u64, u64)> {
     ))
 }
 
+/// The name of host thread `tid` of this process and what it is doing, for reports of a thread
+/// stuck somewhere: `running`, `in host syscall <n>` (`/proc/self/task/<tid>/syscall`, readable
+/// only by the process itself), or else its scheduler state from `stat`. None when the thread has
+/// exited.
+pub fn thread_activity(tid: i32) -> Option<(String, String)> {
+    let task = format!("/proc/self/task/{tid}");
+    let name = std::fs::read_to_string(format!("{task}/comm")).ok()?;
+    // "running", "<nr> <args...> <sp> <pc>" in a syscall, "-1 <sp> <pc>" blocked outside one
+    let syscall = std::fs::read_to_string(format!("{task}/syscall")).unwrap_or_default();
+    let doing = match syscall.split_ascii_whitespace().next() {
+        Some("running") => "running".to_owned(),
+        Some(nr) if nr.parse::<u32>().is_ok() => format!("in host syscall {nr}"),
+        _ => {
+            let stat = std::fs::read_to_string(format!("{task}/stat")).ok()?;
+            match stat[stat.rfind(')')? + 1..]
+                .split_ascii_whitespace()
+                .next()?
+            {
+                "R" => "running".to_owned(),
+                "S" => "sleeping".to_owned(),
+                "D" => "in uninterruptible sleep".to_owned(),
+                state => format!("in state {state}"),
+            }
+        }
+    };
+    Some((name.trim_end().to_owned(), doing))
+}
+
 /// Restricts host thread `tid` of this process to the CPUs of [`host_cpus`] selected by `mask`
 /// (bit `i` is the `i`-th). Left unchanged on failure.
 pub fn set_thread_affinity(tid: i32, mask: u64) {

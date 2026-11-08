@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by tid; retargeting; syscall-stop detach; suite findings; frames, sigaction flags, siginfo; zombies, core_pattern; adjtimex; ptracer credentials; vDSO refill; signalfd; exception reports; ENOSYS list; unimplemented paths counted last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by tid, retargeting; ptrace; suite findings; frames, siginfo; zombies, core_pattern; adjtimex; vDSO; signalfd; exception reports; ENOSYS list; unimplemented paths; watchdog records last)
 
 ## Responsibilities
 
@@ -286,8 +286,9 @@ procfs.
 - A printk-style ring buffer: 128 KB of text, at most 4096 records, oldest dropped first; records
   carry sequence, monotonic timestamp, facility, level and text (truncated to 991 bytes).
 - Writers: guest `/dev/kmsg` writes (prefix parsing, ratelimit 10 per 5 s by default, drops
-  reported at close), the OOM killer, bug kills, unhandled-exception reports, cgroup fork
-  rejections, low-port remapping, permission warnings. The host kernel's log is not included.
+  reported at close), the OOM killer, bug kills, unhandled-exception reports, the BKL watchdog
+  (a too-long hold once it ended, `kernel/process`), cgroup fork rejections, low-port remapping,
+  permission warnings. The host kernel's log is not included.
 - Readers: `/dev/kmsg` (a sequence per open, one record per read, `EPIPE` after records were
   dropped, seeks to start, data or end), `syslog(2)` and `/proc/kmsg` (a shared read position;
   READ_ALL/READ_CLEAR return the newest records since the clear point).
@@ -343,7 +344,7 @@ procfs.
   syscall-entry/exit ptrace stops; `orig_x0`; restart handling.
 - Timers, the TTY layer (job-control signals to process groups), process exit (child status),
   seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
-  killer and bug handling (kernel log; bug kill reports read `stub::top`).
+  killer, bug handling and the BKL watchdog (kernel log; bug kill reports read `stub::top`).
 - Default arms reporting unimplemented paths: prctl and futex (`kernel/process`), fcntl, file
   ioctls and device opens (`kernel/vfs`), terminal ioctls (`kernel/tty`), socket ioctls
   (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).

@@ -448,6 +448,129 @@ fn host_calls_survive_kernel_bugs() {
 }
 
 #[test]
+fn bkl_watchdog_reports_long_holds() {
+    // A hold of the BKL longer than the watchdog's threshold (a test hook holds it for 2.5 s, the
+    // threshold is 1 s) is reported on stderr while it lasts, naming the process, the syscall
+    // (0xa991, the test hook's) and the host thread, and in the kernel log once it has ended. The
+    // watchdog does not depend on the tier
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("stall") else {
+        return;
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .env("APPINE_TEST_HOOKS", "1")
+        .env("APPINE_BKL_WATCHDOG", "1")
+        .arg(&program)
+        .output()
+        .expect("failed to run appine-run");
+    let (out, err) = (stdout(&out), stderr(&out));
+    assert!(out.ends_with("all ok\n"), "{out}{err}");
+    let report = err
+        .lines()
+        .find(|l| l.contains(" has held the BKL for "))
+        .unwrap_or_else(|| panic!("no report on stderr: {err}"));
+    assert!(
+        report.starts_with("appine: pid ")
+            && report.contains(" (guest-stall), thread ")
+            && report.contains(" in syscall 43409 at guest pc 0x")
+            && report.contains("(host thread guest-"),
+        "{report}"
+    );
+    // As dmesg would show it: "<3>[    1.234567] appine: pid 2 (guest-stall), thread 2 held the
+    // BKL for 2 s in syscall 43409 at guest pc 0x..."
+    let record = out.lines().next().unwrap();
+    assert!(
+        record.starts_with("<3>[")
+            && record.contains("] appine: pid ")
+            && record.contains(" (guest-stall), thread ")
+            && record.contains(" s in syscall 43409 at guest pc 0x"),
+        "{record}"
+    );
+    // The same record on stderr
+    let logged = record.split_once("] ").unwrap().1;
+    assert!(err.lines().any(|l| l == logged), "{logged}\n{err}");
+}
+
+#[test]
+fn bkl_stall_reaches_the_host() {
+    // Machine::stall answers without the BKL while a hold goes on, then carries its kernel log
+    // record once it ended
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio};
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("stall") else {
+        return;
+    };
+    // The kernel reads APPINE_BKL_WATCHDOG when it starts: rerun this test case in a child process
+    // that has it and APPINE_TEST_HOOKS set
+    if std::env::var_os("APPINE_TEST_HOOKS").is_none() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "bkl_stall_reaches_the_host", "--nocapture"])
+            .env("APPINE_TEST_HOOKS", "1")
+            .env("APPINE_BKL_WATCHDOG", "1")
+            .output()
+            .expect("failed to rerun the test");
+        assert!(
+            out.status.success() && stdout(&out).contains("1 passed"),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        return;
+    }
+    let machine = Machine::start(&MachineOptions::default()).unwrap();
+    assert_eq!(machine.stall(), None);
+    let pid = machine
+        .spawn(
+            program.as_os_str().as_bytes(),
+            &[b"stall".to_vec(), b"hold".to_vec()],
+            &[],
+            Stdio::Host,
+        )
+        .unwrap();
+    let wait_for = |what: &str, done: &dyn Fn(&appine_kernel::Stall) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(s) = machine.stall().filter(|s| done(s)) {
+                return s;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {what}: {:?}",
+                machine.stall()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let stall = wait_for("report", &|_| true);
+    assert_eq!((stall.id, stall.ended.as_ref()), (1, None), "{stall:?}");
+    assert!(
+        stall.secs >= 1
+            && stall
+                .report
+                .contains(&format!("pid {pid} (guest-stall), thread {pid} "))
+            && stall.report.contains(" in syscall 43409 at guest pc 0x"),
+        "{stall:?}"
+    );
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    let stall = wait_for("end", &|s| s.ended.is_some());
+    assert!(
+        stall.id == 1
+            && stall.secs >= 1
+            && stall.ended.as_ref().unwrap().contains(&format!(
+                "pid {pid} (guest-stall), thread {pid} held the BKL for {} s in syscall 43409",
+                stall.secs
+            )),
+        "{stall:?}"
+    );
+}
+
+#[test]
 fn memory_limit_and_thread_limits() {
     // RLIMIT_NPROC's default value and checks (root is not limited by it), and over the app's
     // memory limit the guest process using the most is killed

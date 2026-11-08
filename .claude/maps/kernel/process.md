@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; dying pid namespaces; exited main thread; rlimits; exit signals; test-suite findings; namespace limits; exit panics; waits, pids; sched_setattr, kcmp; futex commands, shm reaping; CAP_SYS_NICE over namespaces; AIO in the timer thread; the vfork mark last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, exits, waits; pid namespaces and limits; rlimits; suite findings; sched_setattr, kcmp; futexes, shm; CAP_SYS_NICE; AIO in the timer thread; vfork mark; BKL watchdog last)
 
 ## Responsibilities
 
@@ -14,8 +14,8 @@
 - guest tasks (threads) and thread groups (processes): creation (`clone`/`clone3`), the run loop,
   exit, reaping and `wait`;
 - `execve`: target resolution, credential effects, and the ELF loader that builds the new image;
-- the big kernel lock (BKL) that serialises the kernel layer, its borrow checks, and the no-BKL
-  fast path;
+- the big kernel lock (BKL) that serialises the kernel layer, its borrow checks, the no-BKL
+  fast path, and the watchdog that reports holds of it lasting too long;
 - the unified wait and wake-up mechanism, and futexes;
 - the timer thread (interval and POSIX timers, CPU-time limits, periodic checks);
 - the built-in virtual init (PID 1) and inittab boot/shutdown;
@@ -24,7 +24,7 @@
 
 Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`, the
 `wake` module), `cell.rs`, `syscall/proc.rs`, `syscall/fast.rs`, `futex.rs`, `loader.rs`,
-`machine.rs` (timer thread, boot/shutdown, host-facing calls), `itimer.rs`,
+`machine.rs` (timer thread, boot/shutdown, host-facing calls), `watchdog.rs`, `itimer.rs`,
 `syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `pidns.rs`, `nsproxy.rs`,
 `syscall/ns.rs`, and `UserNs` in `cred.rs`.
 
@@ -52,8 +52,13 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `task::pool` — pooled host threads (at most 8 idle, kept 5 s).
 - `Kernel` — the global state behind the BKL: tasks, groups, waiters, pid allocator, namespaces,
   init state, power requests.
-- `Shared` — the BKL mutex, its `held` hint and spinner counter, the fast-path epoch, the futex
-  queue, the timer thread's event.
+- `Shared` — the BKL mutex, its holder record (`Hold`) and spinner counter, the latest stall, the
+  fast-path epoch, the futex queue, the timer thread's event.
+- `Hold` — one cache line written by each holder on taking the BKL: the `held` hint, an
+  acquisition count, the holder's host tid, and its guest thread's `Entry` (tid, tgid, comm, what
+  it entered the kernel for as `Doing`, pc); `HoldSample` — one lock-free read of it.
+- `watchdog::Stall` — a hold reported as too long: id, seconds, the report, the kernel log record
+  once it ended.
 - `Bkl` — the held-lock guard; its `Drop` performs release-time work.
 - `Cx` — the context of one syscall or signal delivery; holds the `Bkl` (absent while released).
 
@@ -91,8 +96,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `kill` to pid 1 (power requests).
 - **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
-  `signal_later`/`flush_signals`, `Shared::fast_changed`, `loader::prepare`/`load_prepared`.
-- **Host-facing** (`Machine`): `start_kernel` (creates PID 1 and the timer thread), `spawn`, `boot`,
+  `signal_later`/`flush_signals`, `Shared::fast_changed`, `loader::prepare`/`load_prepared`,
+  `kernel::doing`/`done`.
+- **Host-facing** (`Machine`): `start_kernel` (creates PID 1, the timer thread and the BKL
+  watchdog), `stall` (the latest too-long hold; takes no BKL), `spawn`, `boot`,
   `shutdown`, `take_power`, `wait_*`, `signal` (a host signal to a guest process, `SI_KERNEL`);
   `run` (`appine-run`), which with `RunOptions::stop` passes the first stop signal the host got on
   to the program and ends every process at one arriving at least a second later, then finishes as
@@ -250,7 +257,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `sync_file_range`, msync, copy_file_range/sendfile copies, store metadata syncs, DNS stub queries,
   and the execve image build. A guard re-takes the BKL on return and on unwinding.
 - Acquisition: try once; otherwise up to half the host CPUs (1 to 4) spin for at most about 30 µs,
-  reading only the `held` flag; the rest sleep on the mutex.
+  reading only the `held` flag; the rest sleep on the mutex. The new holder sets `held` and records
+  itself in `Hold` (relaxed stores on the same cache line, no clock read).
 - Release (`Drop for Bkl`), in order: hang up closed terminals, match pending wake requests against
   waiters, clear `held`, unlock, clear the thread's held marker, notify pooled host threads, signal
   the matched events, release deferred host memory and refill fork spares (`kernel/mm`).
@@ -371,6 +379,29 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   either wakes the timer thread or is seen running. Changing `RLIMIT_CPU` does not wake
   the timer thread; the new limit takes effect at its next pass.
 
+### BKL watchdog
+
+- A guest thread records what it is in the kernel for in a thread-local `Entry` (`kernel::doing`):
+  starting, a syscall number (low 56 bits of x8), a memory fault, a kick, another exception, or
+  ending; with its tid, tgid, comm and pc at that entry. It is set before each BKL-path entry (and
+  before the fast path's panic kill), kept across the BKL re-takes inside that entry, and cleared
+  when the host thread finishes the guest thread. Threads running no guest thread (the timer
+  thread, host calls, the watchdog) record none.
+- `Machine::start` starts a host thread "bkl-watchdog" that never takes the BKL to look: every
+  fifth of the threshold (10 s; `APPINE_BKL_WATCHDOG` in seconds, 0 turns it off) it samples
+  `Hold`; the same sample (count, host tid, entry) seen for the threshold is one hold that lasted
+  too long. A sample torn by a new holder differs and only looks like another hold.
+- On reaching the threshold, without the BKL: one line on stderr naming the guest process (pid and
+  comm), thread, what it entered for and its pc, or else the host thread, plus the holder's host
+  thread name and activity (running, in host syscall n, or its scheduler state); the same line
+  becomes the latest `Stall` (ids count from 1 per kernel; seconds updated at each look).
+- When a later look sees the lock free or another hold: a KERN_ERR kernel log record naming the
+  holder and the total seconds (taking the BKL just to write it; a panic there is only reported),
+  the same line on stderr, and the `Stall` updated with it. Durations count from the first look,
+  so they are right to within one look. Nothing is ended.
+- `Machine::stall` returns the latest `Stall` without the BKL; the watchdog is stopped and joined
+  last in `Machine`'s drop.
+
 ### PID 1
 
 - The virtual init is a thread group with no threads and no guest program. Host-started processes
@@ -467,7 +498,7 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 ### Inbound
 
 - Syscall dispatch (`syscall/mod.rs`: the BKL around handlers, pid translation, `Mm::sync` after
-  each call), `Machine` and the hosts (CLI, Android JNI: boot, shutdown, power, spawn), signals and
+  each call), `Machine` and the hosts (CLI, Android JNI: boot, shutdown, power, spawn, stall), signals and
   ptrace (group exit, delivery, exit hooks), procfs, every blocking syscall (via the wait API),
   `kernel/mm` (kicks through `TaskSync`, `quiesce`), mount (nsfs binds, procfs/mqueue mounts).
 
@@ -479,8 +510,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - vfs (resolution, mount flags, store, `copy_ns`), credentials, cgroups, SysV IPC
   (`kernel/ipc`), AIO (`kernel/vfs`), the OOM killer (`kernel/mm`), loadavg, the store's deferred
   commits.
-- `appine_hal`: `poll`, `Event`, thread CPU clocks, host thread nice/affinity/ioprio, host CPUs,
-  random bytes; `std::thread`, `std::sync::Mutex`.
+- `appine_hal`: `poll`, `Event`, thread CPU clocks, host thread nice/affinity/ioprio, host thread
+  activity (watchdog reports), host CPUs, random bytes; `std::thread`, `std::sync::Mutex`.
 
 ## Invariants and gotchas
 
@@ -499,6 +530,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - The borrow-count assertion runs only at mid-syscall releases (`block_for`, `unlocked`), not at
   every BKL release.
+- `Hold` is written on every BKL acquisition: anything added to it must stay on its cache line and
+  cost a plain store, or every syscall pays. A thread that takes the BKL outside an entry after
+  running guest code (the run loop's translator re-attach) is attributed to its previous entry.
 - A finite soft `RLIMIT_CPU` alone keeps the timer thread ticking every 10 ms even while idle.
 - A deadline is `Instant::now()` plus a guest duration, which panics on overflow: new readers of
   guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.

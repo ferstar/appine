@@ -40,6 +40,7 @@ use crate::task::{self, FsContext, Task, TaskState};
 use crate::terminal;
 use crate::tty::Winsize;
 use crate::vfs::{Node, Vfs};
+use crate::watchdog::Watchdog;
 
 /// Options of a kernel instance.
 #[derive(Debug, Clone, Default)]
@@ -89,6 +90,7 @@ static RUNNING: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<Shared>)>> =
 pub struct Machine {
     shared: Arc<Shared>,
     timers: Option<JoinHandle<()>>,
+    watchdog: Option<Watchdog>,
 }
 
 /// How long the shutdown commands in inittab may take in total when [`run`] shuts down (OpenRC
@@ -162,9 +164,11 @@ impl Machine {
             .name("timers".into())
             .spawn(move || timers(timer_shared))
             .map_err(RunError::Io)?;
+        let watchdog = Watchdog::start(&shared);
         Ok(Machine {
             shared,
             timers: Some(timers),
+            watchdog,
         })
     }
 
@@ -731,6 +735,17 @@ impl Machine {
         .unwrap_or_default()
     }
 
+    /// The latest hold of the BKL that lasted longer than the watchdog's threshold
+    /// ([`crate::watchdog`]), ended or not. Does not take the BKL, so it answers while that hold
+    /// goes on: the app calls it outside the thread its other calls run on, which waits too.
+    pub fn stall(&self) -> Option<crate::Stall> {
+        self.shared
+            .stall
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// The summed statistics of exited threads when using Tier 1.
     pub fn dbt_stats(&self) -> Option<DbtStats> {
         self.shared.lock().dbt_stats
@@ -803,6 +818,9 @@ impl Drop for Machine {
         }
         if let Some(t) = self.timers.take() {
             let _ = t.join();
+        }
+        if let Some(w) = self.watchdog.take() {
+            w.stop();
         }
     }
 }

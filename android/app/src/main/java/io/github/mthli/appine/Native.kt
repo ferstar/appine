@@ -215,6 +215,15 @@ internal object Native {
     @JvmStatic
     external fun takeKills(machine: Long): Array<String>?
 
+    /**
+     * The latest hold of the kernel lock that lasted longer than the kernel's watchdog allows,
+     * ended or not: `<id>\t<seconds>\t<report>\t<kernel log record once ended, else empty>`, or
+     * null for none. Does not take the BKL: called on the main thread, since the worker waits for
+     * a hold that has not ended.
+     */
+    @JvmStatic
+    external fun bklStall(machine: Long): String?
+
     /** Takes the guest's power request (busybox's reboot, halt, poweroff): [POWER_NONE] etc. */
     @JvmStatic
     external fun takePower(machine: Long): Int

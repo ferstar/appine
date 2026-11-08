@@ -54,6 +54,7 @@ mod uaccess;
 mod unix;
 mod vdso;
 pub mod vfs;
+mod watchdog;
 
 pub use appine_engine::DbtStats;
 pub use appine_hal::net::Route as HostRoute;
@@ -64,6 +65,7 @@ pub use machine::{Machine, MachineOptions, SHUTDOWN_TIMEOUT, Stdio, run};
 pub use portmap::ListenEvent;
 pub use process::{ExitStatus, RunError, RunOptions, RunReport, Signal, Tier};
 pub use terminal::Terminal;
+pub use watchdog::Stall;
 
 use std::path::Path;
 

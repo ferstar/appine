@@ -19,7 +19,7 @@ use crate::bug::Trap;
 use crate::cell::RefCell;
 use crate::errno::Errno;
 use crate::fd::FdTable;
-use crate::kernel::{Cx, Kernel, Shared, Tid, request_wake_on, wake};
+use crate::kernel::{Cx, Doing, Entry, Kernel, Shared, Tid, request_wake_on, wake};
 use crate::mm::{CodeSpace, Generations, Mm};
 use crate::process::{CpuTime, ExitStatus, Signal, ThreadGroup, Tier};
 use crate::signal::{self, AltStack, Pending, SigInfo, code};
@@ -491,6 +491,7 @@ pub(crate) fn current() -> Option<(Rc<Task>, Rc<RefCell<ThreadGroup>>)> {
 
 fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| run(&shared, tid, &mut cpu, reused)));
+    crate::kernel::done();
     // CURRENT has already been cleared by exit while holding the BKL
     if r.is_err() {
         // A kernel-layer bug, and not in a place that contains it (crate::bug): the thread cannot
@@ -503,6 +504,15 @@ fn thread_main(shared: Arc<Shared>, tid: Tid, mut cpu: Cpu, reused: bool) {
 
 /// `reused`: the host thread has run other guest threads ([`pool`]).
 fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
+    // What this thread holds the BKL for, for the watchdog (crate::watchdog)
+    let entry = |task: Option<&Task>, doing, pc| Entry {
+        tid,
+        tgid: task.map_or(0, |t| t.tgid),
+        comm: task.map_or([0; 16], |t| t.comm.get()),
+        doing,
+        pc,
+    };
+    crate::kernel::doing(entry(None, Doing::Start, cpu.state().pc));
     let k = shared.lock();
     let task = k.tasks[&tid].clone();
     let group = Rc::downgrade(&task.state.borrow().group);
@@ -524,6 +534,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         let what = format_args!("kernel panic while starting the thread");
         crate::bug::kill(&k, &task, cpu.state().pc, what);
         drop(k);
+        crate::kernel::doing(entry(Some(&task), Doing::Exit, cpu.state().pc));
         return exit(shared, task, cpu.state(), None);
     };
     let (sync, tier) = (task.sync.clone(), k.tier);
@@ -637,6 +648,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             None => {
                 task.sleeping.store(false, Ordering::SeqCst);
                 let nr = cpu.state().x[8];
+                crate::kernel::doing(entry(Some(&task), Doing::Syscall(nr), cpu.state().pc));
                 let what = format_args!("kernel panic in syscall {nr} without the BKL");
                 crate::bug::kill(&shared.lock(), &task, cpu.state().pc, what);
                 break;
@@ -645,6 +657,13 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
 
         // A kernel-layer bug ends only this process (crate::bug)
         let pc = cpu.state().pc;
+        let doing = match exit {
+            Exit::Svc { .. } => Doing::Syscall(cpu.state().x[8]),
+            Exit::Fault { .. } => Doing::Fault,
+            Exit::Kick => Doing::Kick,
+            _ => Doing::Exception,
+        };
+        crate::kernel::doing(entry(Some(&task), doing, pc));
         let entered = crate::bug::catch(|| {
             let k = shared.lock();
             let mut state = task.state.borrow_mut();
@@ -685,6 +704,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
             Flow::Exit => break,
         }
     }
+    crate::kernel::doing(entry(Some(&task), Doing::Exit, cpu.state().pc));
     exit(shared, task, cpu.state(), dbt.map(|(d, _)| d.stats()));
 }
 

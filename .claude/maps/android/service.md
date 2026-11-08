@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; robust start, exit and tab saving; tab names removed; kill reports; the app named Appine; resumed imports; auto tabs saved as their account; containers file; unimplemented paths in bug reports last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; unimplemented paths in reports; BKL stalls last)
 
 ## Responsibilities
 
@@ -18,7 +18,8 @@ outlives an Activity:
   was killed (`Tabs`);
 - the ongoing notification and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
-  directories) and turns them into tab messages, notifications and lifecycle actions;
+  directories, too-long holds of the BKL) and turns them into tab messages, notifications and
+  lifecycle actions;
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
   mirror).
@@ -90,6 +91,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ### Poll (every 2 s, on the worker)
 
+- First, on the main thread, `bklStall` (it takes no BKL, and the worker would wait behind a hold
+  that does not end) reports a too-long hold of the BKL (Reports below).
 - Fetches `takeListens`, `takeKills`, `takePower`, `processes`, `takeChangedDirs`; results are
   applied on the main thread only if the kernel is still the same.
 - Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs whose shell ended
@@ -171,11 +174,15 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   crashed" or "Appine stopped responding" with "copy report": the bug report's app, device, distro
   and tier lines and one line with the pid, the kind (with the signal for a native crash), the time
   in UTC and, for an ANR, Android's description.
+- Too-long holds of the BKL (`kernel/process`'s watchdog): a new stall of the current kernel posts
+  "Appine's kernel is stuck" with the seconds so far and "copy report" (the watchdog's report line);
+  once it has ended, a notification still showing becomes "was stuck" with the total seconds and
+  the kernel log record in its report, without alerting again (a dismissed one stays dismissed).
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.
 - Listens: the first listen on a non-loopback address per (guest port, host port) pair and kernel
   (the kernel queues at most 32), with remap text when the ports differ.
 - Channels: `sessions` (low), `network`, `problems`; ids 1 (ongoing), 2 (boot), 3 (a crash of the
-  last run), 1000 + guest port (listen), and from 100000 one id per kill report, counting up from
+  last run), 4 (a BKL stall), 1000 + guest port (listen), and from 100000 one id per kill report, counting up from
   a clock-seeded start (wrapping after 100000).
 - The ongoing notification counts running tabs; "Running in the background" when none runs, and
   "Cannot start: …" after a failed start.
@@ -198,7 +205,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - Every native call that takes the BKL goes through the single worker, so polls and saves are
   ordered before stop and shutdown; a stale kernel handle is harmless (the JNI table no longer
-  finds it).
+  finds it). A call that must answer while the BKL is stuck (`bklStall`) must not take it and runs
+  on the main thread.
 - Results of a poll are dropped if the kernel changed meanwhile (reports fetched just before a
   restart are lost).
 - Android names low-memory kills only where `isLowMemoryKillReportSupported`; elsewhere they are

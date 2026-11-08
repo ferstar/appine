@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE`; `host_swaps` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate` and `MADV_REMOVE`; `host_swaps`; `thread_activity` last)
 
 ## Responsibilities
 
@@ -60,7 +60,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Statistics: `memory_usage`, `memory_info`, `ram_and_swap`, `host_meminfo`, `host_vmstat`,
   `host_swaps`, `statvfs`,
   `fd_limit`, `raise_fd_limit`, `host_cpus`, `cpu_sysfs`, `thread_cpu_clock`,
-  `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`.
+  `thread_system_ns(_self)`, `thread_ctxt_switches(_self)`, `thread_activity`.
 - Files: `open_dir`, `open_at`, `stat_at`, `fstat`, `chmod_at`, `unlink_at`, `set_times_at`,
   `set_times_fd`, `read`, `write`, `pread`, `pwrite`, `fallocate`, `lseek`, `copy_file`, `fsync`,
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
@@ -131,7 +131,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `cpu_sysfs` reads host CPU sysfs files (unreadable → `None`).
 - Per-thread: `gettid`, `set_thread_name` (15 bytes), `thread_cpu_clock` (`pthread_getcpuclockid`),
   `getrusage(RUSAGE_THREAD)` for the calling thread, `/proc/self/task/<tid>/{stat,status}` for
-  others; `set_thread_affinity`/`set_thread_nice`/`set_thread_ioprio` act on host tids and ignore
+  others; `thread_activity` gives another thread's name and whether it is running, in a host
+  syscall (from `syscall`, which only the process itself can read) or else its `stat` state, for
+  the BKL watchdog's reports; `set_thread_affinity`/`set_thread_nice`/`set_thread_ioprio` act on host tids and ignore
   failures (the kernel applies its own policy first: nice floor −4, RT ioprio downgraded).
 - `clock_gettime`/`clock_getres` pass clock ids through; `adjtimex_query` makes the real read-only
   call on Linux and synthesizes an unsynchronized state on Android.

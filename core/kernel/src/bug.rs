@@ -388,7 +388,9 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 /// 10. panic the next time this process waits on a futex, after registering as a waiter;
 /// 11. act as if the host's wall clock had jumped ([`crate::itimer::clock_jumped`]: every waiting
 ///     thread is woken, `TFD_TIMER_CANCEL_ON_SET` timerfds are cancelled), which a test cannot
-///     cause by setting the host's clock.
+///     cause by setting the host's clock;
+/// 12. hold the BKL for `addr` milliseconds, as a kernel operation that takes too long, for the
+///     BKL watchdog ([`crate::watchdog`]).
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -437,6 +439,7 @@ pub(crate) fn test_hook(
         9 => arm(Trap::Fast, cx.tid()),
         10 => arm(Trap::FutexWait, cx.tgid()),
         11 => crate::itimer::clock_jumped(cx.kr()),
+        12 => std::thread::sleep(std::time::Duration::from_millis(addr)),
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)

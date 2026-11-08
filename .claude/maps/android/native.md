@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: Kotlin compiler and lint warnings fail the build, lint checks on outside data informational; route parsing; tarballs by version; Fuchsia's notice; API level 30 for the app and cargo-ndk; panics caught by every JNI function; last, exception reports on at start)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: warnings fail the build; route parsing; tarballs by version; Fuchsia's notice; API level 30; panics caught in every JNI function; exception reports at start; `bklStall` last)
 
 ## Responsibilities
 
@@ -49,7 +49,9 @@ terminal's emulator shim, JNI functions, sessions and views (`android/terminal`)
 - Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0; the kernel starts with
   `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports),
   `stop`, `boot`, `shutdown`, `takePower`,
-  `processes`, `trimMemory`, `setRoutes`, `takeKills`, `takeListens`, `takeChangedDirs`.
+  `processes`, `trimMemory`, `setRoutes`, `takeKills`, `takeListens`, `takeChangedDirs`, and
+  `bklStall` (the latest too-long hold of the BKL as `<id>\t<seconds>\t<report>\t<end record or
+  empty>`, or null; it does not take the BKL).
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
   `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`.
 

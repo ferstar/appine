@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files and lock; suite tarballs, skips and leftovers; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; overlay cases; process_mrelease_test; survey's unimplemented paths last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest cases and lock; suite tarballs; Starnix and gVisor cases; image export; CI split; stop signals; survey; overlay cases; watchdog knob last)
 
 ## Responsibilities
 
@@ -97,7 +97,8 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - Environment knobs read by the kernel and engine: `APPINE_LOG`, `APPINE_STRACE` (also routes fast
   syscalls through the BKL), `APPINE_PERF_MAP`, `APPINE_ON_BUG` (`kill`/`abort`; release builds
   kill only the guest process by default), `APPINE_TEST_HOOKS` (only in debug or `test-hooks`
-  builds), `APPINE_DBT_REGS`.
+  builds), `APPINE_DBT_REGS`, `APPINE_BKL_WATCHDOG` (the watchdog's threshold in seconds, 0 off;
+  the tests set 1 with a test hook that holds the BKL).
 
 ### Integration tests and benchmarks
 

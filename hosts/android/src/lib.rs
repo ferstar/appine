@@ -1067,6 +1067,29 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     })
 }
 
+/// The latest hold of the BKL that lasted longer than the watchdog's threshold, ended or not:
+/// `<id>\t<seconds>\t<report>\t<kernel log record once ended, else empty>`, or null for none.
+/// Does not take the BKL, so the app can call it on the main thread while the worker waits for
+/// that hold to end. Tabs and newlines inside the fields are replaced by spaces.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_bklStall<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    guarded!("Native.bklStall", std::ptr::null_mut(), {
+        let Some(s) = machine(handle).and_then(|m| m.stall()) else {
+            return std::ptr::null_mut();
+        };
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        let ended = s.ended.as_deref().map(clean).unwrap_or_default();
+        let line = format!("{}\t{}\t{}\t{ended}", s.id, s.secs, clean(&s.report));
+        env.new_string(line)
+            .map(JString::into_raw)
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Takes the guest's power request (busybox's reboot, halt, poweroff): 0 none, 1 reboot, 2 halt,
 /// 3 power off.
 #[unsafe(no_mangle)]

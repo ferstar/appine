@@ -126,11 +126,15 @@ class TerminalService : Service() {
      *   map);
      * - whether guest processes remain when there are no sessions and no UI: if none, exit (the
      *   android/service map).
+     *
+     * Before that, on the main thread, whether one kernel operation has held the kernel lock too
+     * long ([reportStall]): the worker would wait for it to end like everything else.
      */
     private val poll = object : Runnable {
         override fun run() {
             val m = machine
             if (m == 0L) return
+            Native.bklStall(m)?.let { reportStall(m, it) }
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
@@ -158,6 +162,48 @@ class TerminalService : Service() {
 
     /** Shutting down to exit ([exitAll]). */
     private var exiting = false
+
+    /**
+     * An entry of [Native.bklStall]: one kernel operation has held the kernel lock longer than the
+     * kernel's watchdog allows, and every guest program, and this service's other calls into the
+     * kernel, wait for it. A new one posts a notification with "Copy report" ([bugReport]); once
+     * it has ended, a notification still showing says how long it lasted, without alerting again.
+     */
+    private fun reportStall(m: Long, line: String) {
+        val f = line.split('\t')
+        if (f.size != 4) return
+        val id = f[0].toLongOrNull() ?: return
+        val ended = f[3].isNotEmpty()
+        val seen = Triple(m, id, ended)
+        if (seen == stallNotified) return
+        val manager = getSystemService(NotificationManager::class.java)
+        val updating = stallNotified.first == m && stallNotified.second == id
+        stallNotified = seen
+        if (updating && manager.activeNotifications.none { it.id == STALL_NOTIFICATION_ID }) return
+        val secs = f[1].toIntOrNull() ?: 0
+        val text = getString(if (ended) R.string.stall_ended_text else R.string.stall_text, secs)
+        // The record of its end is a kernel log line
+        val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
+            .putExtra(EXTRA_REPORT, bugReport(f[2], f[3]))
+            .putExtra(EXTRA_NOTIFICATION, STALL_NOTIFICATION_ID)
+        val pending = PendingIntent.getService(
+            this, STALL_NOTIFICATION_ID, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val open = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(if (ended) R.string.stall_ended_title else R.string.stall_title))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
+            .build()
+        manager.notify(STALL_NOTIFICATION_ID, notification)
+    }
 
     /** A [start] is running: the rootfs is being prepared or the kernel is starting. */
     private var starting = false
@@ -209,6 +255,12 @@ class TerminalService : Service() {
      * a new service does not reuse the ids of reports still shown from the last one.
      */
     private var killNotifications = (System.currentTimeMillis() % KILL_NOTIFICATION_COUNT).toInt()
+
+    /**
+     * The hold of the kernel lock last notified ([reportStall]): the kernel it was in, its id, and
+     * whether it had ended.
+     */
+    private var stallNotified = Triple(0L, 0L, false)
 
     /**
      * The thread that probes mirror speeds after an import or after "automatic" is chosen in
@@ -1258,6 +1310,8 @@ class TerminalService : Service() {
         private const val BOOT_NOTIFICATION_ID = 2
         /** The notification that the last run ended in a crash or ANR of Appine. */
         private const val CRASH_NOTIFICATION_ID = 3
+        /** The notification that a kernel operation held the kernel lock too long ([reportStall]). */
+        private const val STALL_NOTIFICATION_ID = 4
         /**
          * Notifications of ended processes: one id per report, above every listen id, so neither a
          * listen nor a later report replaces one (and with it a bug's "Copy report").

@@ -95,6 +95,10 @@
     <string name="killed_oom_app">%1$s（pid %2$d）被结束了：App 的内存用到了上限（已用 %3$s，上限 %4$s），OOM killer 挑中了它。</string>
     <string name="killed_oom_cgroup">%1$s（pid %2$d）被结束了：cgroup %3$s 用到了 memory.max（已用 %4$s，上限 %5$s）。</string>
     <string name="killed_bug">%1$s（pid %2$d）因为 Appine 的内部错误被结束了。这是 Appine 的 bug，报告可以在通知里复制，用 dmesg 也看得到。</string>
+    <string name="stall_title">Appine 内核卡住了</string>
+    <string name="stall_text">Appine 内核里的一个操作已经运行了 %1$d 秒，所有程序都在等它结束。这是 Appine 的 bug，反馈时请附上复制的报告。</string>
+    <string name="stall_ended_title">Appine 内核刚才卡住了</string>
+    <string name="stall_ended_text">Appine 内核里的一个操作运行了 %1$d 秒，所有程序都等它结束。这是 Appine 的 bug，反馈时请附上复制的报告。</string>
     <string name="copy_report">复制报告</string>
     <string name="report_copied">已复制报告</string>
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>

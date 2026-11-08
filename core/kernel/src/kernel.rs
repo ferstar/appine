@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -124,6 +124,13 @@ thread_local! {
     /// The BKL this thread holds ([`Shared::id`]), 0 meaning none.
     #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
     static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What the guest thread on this host thread entered the kernel for ([`doing`]), copied into
+    /// [`Hold`] each time this thread takes a BKL.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static DOING: std::cell::Cell<Entry> = const { std::cell::Cell::new(Entry::NONE) };
+    /// This host thread's tid, read at its first BKL ([`Hold::host_tid`]).
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static HOST_TID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Wake-ups requested while this thread holds the BKL: channels ([`wake`]) and objects,
     /// processed by the same thread when it releases the BKL ([`Kernel::flush_wakeups`]).
     /// Recorded per thread rather than globally: one host process can contain several kernels
@@ -714,10 +721,10 @@ pub(crate) type DnsAnswers = Mutex<Vec<(u64, Vec<u8>)>>;
 /// Kernel objects shared by all guest threads.
 pub(crate) struct Shared {
     kernel: Mutex<Kernel>,
-    /// Some thread holds the BKL (only a hint): waiters read only this while spinning and try to
-    /// take the lock only when it looks free, so that the lock's cache line does not bounce
-    /// between cores.
-    held: AtomicBool,
+    /// Whether some thread holds the BKL, and which ([`Hold`]).
+    hold: Hold,
+    /// The latest hold of the BKL that the watchdog found too long ([`crate::watchdog`]).
+    pub stall: Mutex<Option<crate::watchdog::Stall>>,
     /// The number of threads spinning for the BKL: at most [`max_spinners`]; the others go
     /// straight to sleep rather than wasting cores.
     spinning: AtomicU32,
@@ -744,7 +751,8 @@ impl Shared {
     pub fn new(kernel: Kernel) -> Shared {
         Shared {
             kernel: Mutex::new(kernel),
-            held: AtomicBool::new(false),
+            hold: Hold::default(),
+            stall: Mutex::new(None),
             spinning: AtomicU32::new(0),
             timers: Arc::new(Event::new().expect("cannot create an eventfd for the timers")),
             dns_answers: Arc::new(Mutex::new(Vec::new())),
@@ -762,11 +770,11 @@ impl Shared {
     /// at most [`BKL_SPIN`]: going to sleep and being woken takes tens of microseconds, the
     /// releasing side needs one more futex wake, and the lock stays free meanwhile. Parallel
     /// lstat in `git status` used to be slower than single-threaded. Spinning reads only
-    /// [`Shared::held`] and tries to take the lock only when it looks free; when [`max_spinners`]
+    /// [`Hold::held`] and tries to take the lock only when it looks free; when [`max_spinners`]
     /// threads are already spinning, go straight to sleep.
     pub fn lock(&self) -> Bkl<'_> {
         if let Ok(k) = self.kernel.try_lock() {
-            return Bkl::new(k, &self.held);
+            return Bkl::new(k, &self.hold);
         }
         if self.spinning.fetch_add(1, Ordering::Acquire) < max_spinners() {
             if let Some(k) = self.spin() {
@@ -777,7 +785,7 @@ impl Shared {
         }
         Bkl::new(
             self.kernel.lock().unwrap_or_else(PoisonError::into_inner),
-            &self.held,
+            &self.hold,
         )
     }
 
@@ -786,7 +794,7 @@ impl Shared {
     fn spin(&self) -> Option<Bkl<'_>> {
         let mut deadline = None;
         for i in 0u32.. {
-            if !self.held.load(Ordering::Relaxed) {
+            if !self.hold.held.load(Ordering::Relaxed) {
                 let k = match self.kernel.try_lock() {
                     Ok(k) => Some(k),
                     Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
@@ -794,7 +802,7 @@ impl Shared {
                 };
                 if let Some(k) = k {
                     self.spinning.fetch_sub(1, Ordering::Release);
-                    return Some(Bkl::new(k, &self.held));
+                    return Some(Bkl::new(k, &self.hold));
                 }
             }
             std::hint::spin_loop();
@@ -812,10 +820,15 @@ impl Shared {
     }
 
     /// Distinguishes the kernels in one host process (in tests, when the app switches kernels):
-    /// [`bkl_holder`] uses it to tell which BKL is held. It is the address of [`Shared::held`],
+    /// [`bkl_holder`] uses it to tell which BKL is held. It is the address of [`Hold::held`],
     /// which does not change while Shared lives and is never 0.
     pub fn id(&self) -> usize {
-        &self.held as *const AtomicBool as usize
+        &self.hold.held as *const AtomicBool as usize
+    }
+
+    /// Who holds the BKL, read without it ([`crate::watchdog`]).
+    pub fn hold(&self) -> &Hold {
+        &self.hold
     }
 
     /// The state threads recorded for no-BKL syscalls (`syscall::fast`) may be stale: some
@@ -864,14 +877,15 @@ impl Shared {
 
 /// Proof of holding the BKL; on release it wakes the waiting threads, then returns to the host
 /// the host memory released while it was held ([`crate::mm::release_unmapped`]).
-pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>, &'a AtomicBool);
+pub(crate) struct Bkl<'a>(ManuallyDrop<MutexGuard<'a, Kernel>>, &'a Hold);
 
 impl<'a> Bkl<'a> {
-    fn new(guard: MutexGuard<'a, Kernel>, held: &'a AtomicBool) -> Bkl<'a> {
-        held.store(true, Ordering::Relaxed);
-        HELD.set(held as *const AtomicBool as usize);
+    fn new(guard: MutexGuard<'a, Kernel>, hold: &'a Hold) -> Bkl<'a> {
+        hold.held.store(true, Ordering::Relaxed);
+        hold.record();
+        HELD.set(&hold.held as *const AtomicBool as usize);
         crate::mm::defer_unmaps();
-        Bkl(ManuallyDrop::new(guard), held)
+        Bkl(ManuallyDrop::new(guard), hold)
     }
 }
 
@@ -897,7 +911,7 @@ impl Drop for Bkl<'_> {
             crate::bug::report(format_args!("kernel panic while hanging up terminals"));
         }
         self.0.flush_wakeups();
-        self.1.store(false, Ordering::Relaxed);
+        self.1.held.store(false, Ordering::Relaxed);
         // SAFETY: self.0 is not used after this
         unsafe { ManuallyDrop::drop(&mut self.0) };
         HELD.set(0);
@@ -918,6 +932,189 @@ impl Drop for Bkl<'_> {
 fn max_spinners() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| (appine_hal::host_cpus().len() / 2).clamp(1, 4) as u32)
+}
+
+/// Whether some thread holds the BKL, and which, for the watchdog ([`crate::watchdog`]) that reads
+/// it without the lock. Each holder writes it when it takes the lock ([`Hold::record`]). It sits
+/// on one cache line with `held`, which the holder writes then anyway, so the other stores add
+/// almost nothing to taking the lock; it reads no clock.
+#[derive(Default)]
+#[repr(C, align(64))]
+pub(crate) struct Hold {
+    /// Some thread holds the BKL (only a hint): waiters read only this while spinning and try to
+    /// take the lock only when it looks free, so that the lock's cache line does not bounce
+    /// between cores.
+    held: AtomicBool,
+    /// How many times the lock was taken (wrapping): a different count is a different hold.
+    count: AtomicU32,
+    /// The holder's host tid.
+    host_tid: AtomicI32,
+    /// The guest thread on the holder's host thread and its process ([`Entry`]); 0 when the
+    /// holder runs none (the timer thread, the host calling [`crate::Machine`]).
+    tid: AtomicI32,
+    tgid: AtomicI32,
+    /// That thread's name, 16 bytes in two words.
+    comm: [AtomicU64; 2],
+    /// What that guest thread entered the kernel for ([`Doing::bits`]).
+    doing: AtomicU64,
+    /// The guest pc at that entry.
+    pc: AtomicU64,
+}
+
+/// One look at [`Hold`] while the BKL was held: the same values seen again mean the same hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldSample {
+    pub count: u32,
+    pub host_tid: i32,
+    pub entry: Entry,
+}
+
+impl Hold {
+    /// Records the calling thread as the holder; called just after taking the lock. Only the
+    /// holder writes, so the count needs no read-modify-write.
+    fn record(&self) {
+        let host_tid = match HOST_TID.get() {
+            0 => {
+                let tid = appine_hal::gettid();
+                HOST_TID.set(tid);
+                tid
+            }
+            tid => tid,
+        };
+        let e = DOING.get();
+        self.host_tid.store(host_tid, Ordering::Relaxed);
+        self.tid.store(e.tid, Ordering::Relaxed);
+        self.tgid.store(e.tgid, Ordering::Relaxed);
+        for (word, bytes) in self.comm.iter().zip(e.comm.chunks_exact(8)) {
+            word.store(
+                u64::from_ne_bytes(bytes.try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+        }
+        self.doing.store(e.doing.bits(), Ordering::Relaxed);
+        self.pc.store(e.pc, Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed).wrapping_add(1);
+        self.count.store(count, Ordering::Relaxed);
+    }
+
+    /// The current holder, None when the lock looks free. The fields are read one by one without
+    /// the lock: a sample taken while a new holder writes them can mix two holders, and differs
+    /// from the samples before and after it, so it only looks like another hold.
+    pub fn sample(&self) -> Option<HoldSample> {
+        if !self.held.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut comm = [0; 16];
+        for (bytes, word) in comm.chunks_exact_mut(8).zip(&self.comm) {
+            bytes.copy_from_slice(&word.load(Ordering::Relaxed).to_ne_bytes());
+        }
+        Some(HoldSample {
+            count: self.count.load(Ordering::Relaxed),
+            host_tid: self.host_tid.load(Ordering::Relaxed),
+            entry: Entry {
+                tid: self.tid.load(Ordering::Relaxed),
+                tgid: self.tgid.load(Ordering::Relaxed),
+                comm,
+                doing: Doing::from_bits(self.doing.load(Ordering::Relaxed)),
+                pc: self.pc.load(Ordering::Relaxed),
+            },
+        })
+    }
+}
+
+/// Why a guest thread is in the kernel ([`doing`]): what a long hold of the BKL is reported with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub tid: Tid,
+    /// 0 before the thread has found its process (while it starts).
+    pub tgid: Tid,
+    /// The thread's name at the entry (`Task::comm`), copied so that a report needs neither the
+    /// BKL nor the thread still being there; zeros while it starts.
+    pub comm: [u8; 16],
+    pub doing: Doing,
+    /// The guest pc at the entry.
+    pub pc: u64,
+}
+
+impl Entry {
+    const NONE: Entry = Entry {
+        tid: 0,
+        tgid: 0,
+        comm: [0; 16],
+        doing: Doing::Nothing,
+        pc: 0,
+    };
+}
+
+/// What a guest thread entered the kernel for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Doing {
+    /// Not on a guest thread.
+    Nothing,
+    /// Starting the thread.
+    Start,
+    /// A syscall: its number, the low 56 bits of x8.
+    Syscall(u64),
+    /// A memory fault.
+    Fault,
+    /// A kick: signals, stops, a TLB shootdown.
+    Kick,
+    /// Any other exception (undefined instruction, breakpoint, code invalidation, a host fault).
+    Exception,
+    /// Ending the thread.
+    Exit,
+}
+
+impl Doing {
+    /// The kind in the top byte, a syscall number below it.
+    const fn bits(self) -> u64 {
+        match self {
+            Doing::Nothing => 0,
+            Doing::Start => 1 << 56,
+            Doing::Syscall(nr) => 2 << 56 | nr & ((1 << 56) - 1),
+            Doing::Fault => 3 << 56,
+            Doing::Kick => 4 << 56,
+            Doing::Exception => 5 << 56,
+            Doing::Exit => 6 << 56,
+        }
+    }
+
+    const fn from_bits(bits: u64) -> Doing {
+        match bits >> 56 {
+            1 => Doing::Start,
+            2 => Doing::Syscall(bits & ((1 << 56) - 1)),
+            3 => Doing::Fault,
+            4 => Doing::Kick,
+            5 => Doing::Exception,
+            6 => Doing::Exit,
+            _ => Doing::Nothing,
+        }
+    }
+}
+
+impl std::fmt::Display for Doing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Doing::Nothing => f.write_str("outside the guest"),
+            Doing::Start => f.write_str("starting the thread"),
+            Doing::Syscall(nr) => write!(f, "in syscall {nr}"),
+            Doing::Fault => f.write_str("handling a memory fault"),
+            Doing::Kick => f.write_str("handling a kick"),
+            Doing::Exception => f.write_str("handling an exception"),
+            Doing::Exit => f.write_str("ending the thread"),
+        }
+    }
+}
+
+/// The guest thread on this host thread enters the kernel for `entry`: every BKL it takes until
+/// the next call (waits inside a syscall take it again) records this in [`Hold`].
+pub(crate) fn doing(entry: Entry) {
+    DOING.set(entry);
+}
+
+/// This host thread no longer runs a guest thread.
+pub(crate) fn done() {
+    DOING.set(Entry::NONE);
 }
 
 /// Signals the events collected by [`signal_later`].
