@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: the vDSO seccomp bypass also covers the alarm clocks; new files' modes and owns; ptrace access credentials and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: new files' modes and owners; ptrace access and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities; the vDSO's seccomp bypass last)
 
 ## Responsibilities
 
@@ -159,8 +159,9 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - Filters belong to threads, are copied by clone/fork and kept across execve; an exiting leader's
   chain is held until the group is reaped.
 - At syscall entry (after a `PTRACE_SYSCALL` entry stop): disabled, `PTRACE_O_SUSPEND_SECCOMP` and
-  the vDSO clock stubs (clock_gettime, clock_getres and gettimeofday issued from the vDSO, for any
-  clock id) skip; strict mode allows read, write, exit and rt_sigreturn and kills otherwise;
+  the vDSO clock stubs (an svc from a stub at a vDSO clock entry, for gettimeofday and the clocks
+  Linux's vDSO reads in user space; the host's vDSO code makes only real syscalls,
+  `kernel/signal`) skip; strict mode allows read, write, exit and rt_sigreturn and kills otherwise;
   in filter mode a number in the top filter's bitmap runs at once, otherwise every filter runs
   (newest first) on `seccomp_data` (nr, `AUDIT_ARCH_AARCH64`, pc, original x0 and x1..x5) and the
   most severe action wins (ties: the newer filter). Actions: ERRNO (capped at 4095), TRAP (`SIGSYS`
@@ -215,10 +216,6 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - **A shared fs context does not block privilege gains.** Nothing models Linux's
   `LSM_UNSAFE_SHARE`: a process sharing `CLONE_FS` with a setuid program can still change its cwd,
   root or umask.
-- **The vDSO bypass covers every clock.** Linux's vDSO falls back to a real (filtered) syscall for
-  CPU-time clocks, the alarm clocks (`CLOCK_REALTIME_ALARM`, `CLOCK_BOOTTIME_ALARM`) and invalid
-  ids; here filters restricting clock ids (Chromium's) never fire, and
-  a guest can jump to the vDSO's `svc` to skip its own filter for these three syscalls.
 - **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.
@@ -240,5 +237,5 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 ## To verify
 
 - The Linux 6.1 comparisons above (`access_override_creds`, `cap_ptrace_access_check`,
-  `inode_owner_or_capable`, `vfs_prepare_mode`, `ptracer_capable`, the vDSO fallbacks) come from the
+  `inode_owner_or_capable`, `vfs_prepare_mode`, `ptracer_capable`) come from the
   verifiers' knowledge of the kernel source, not from a side-by-side reading or a differential test.

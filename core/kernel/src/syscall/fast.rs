@@ -8,11 +8,13 @@
 //! changed and the call goes to [`dispatch`](super::dispatch) with the BKL held, which also fills
 //! the cache with what is needed.
 //!
-//! Clock reads (`clock_gettime`, `gettimeofday`) are here too: the vDSO time functions are only
-//! svc stubs (the kernel/signal map), so Go's nanotime and the JVM's `System.nanoTime` enter the
-//! kernel every time. One go build makes 2.18 million of them, and the few threads queuing for the
-//! BKL waited 2.5 s in total. The host clocks and the thread's own CPU clock need no kernel state;
-//! process CPU clocks and other threads' go to the BKL path.
+//! Clock reads (`clock_gettime`, `gettimeofday`) are here too. The host's vDSO reads most clocks
+//! without entering the kernel layer (the kernel/signal map), but they come here from its svc
+//! stubs (the built vDSO, a time namespace with offsets), from what the vDSO leaves to the kernel
+//! (CPU-time clocks), and from programs making the syscall themselves; with stubs only, one go
+//! build made 2.18 million of them, and the few threads queuing for the BKL waited 2.5 s in total.
+//! The host clocks and the thread's own CPU clock need no kernel state; process CPU clocks and
+//! other threads' go to the BKL path.
 //!
 //! Futex wait and wake and nanosleep are here too: the futex wait queue has its own lock
 //! ([`Shared::futexes`]), and a waiting thread sleeps on its own event, woken by futex wakes,
@@ -24,9 +26,9 @@
 //! path to be redone, which handles the signal and the restart.
 //!
 //! For a thread with seccomp only two kinds of syscalls come here: numbers for which the filter
-//! always returns ALLOW (cached by number, [`crate::seccomp::always_allowed`]), and the vDSO's
-//! clock reads (which do not enter the kernel on Linux and are not checked). Others go to the BKL
-//! path to be checked.
+//! always returns ALLOW (cached by number, [`crate::seccomp::always_allowed`]), and the vDSO stubs'
+//! reads of clocks Linux's vDSO reads in user space (which are not checked, as they do not enter
+//! the kernel on Linux). Others go to the BKL path to be checked.
 //!
 //! While holding the BKL a thread records its root directory, current directory and credentials
 //! ([`Fast`]). Other threads may change them (a chdir shared through `CLONE_FS`, credentials shared
@@ -76,9 +78,10 @@ pub(crate) struct Fast {
     /// The ranges of the writable shared mappings in the address space
     /// ([`crate::mm::Mm::shared_maps`]): futex keys there are not the address space's.
     shared_maps: Arc<RwLock<Vec<(u64, u64)>>>,
-    /// The address of the vDSO mapping (an execve that replaces the address space changes
-    /// [`Shared::fast_epoch`]).
-    vdso: u64,
+    /// The address of the vDSO mapping and whether its clock functions are svc stubs
+    /// ([`crate::mm::Mm::vdso_svc`]; an execve that replaces the address space changes
+    /// [`Shared::fast_epoch`], and so does entering a time namespace).
+    vdso: (u64, bool),
     /// Offsets (nanoseconds) of the time namespace the thread is in: the monotonic clock's and
     /// boottime's. setns switching namespaces calls [`Shared::fast_changed`], and the offsets no
     /// longer change once a process has entered.
@@ -122,7 +125,7 @@ impl Fast {
             cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
             mm: t.mm.borrow().id,
             shared_maps: t.mm.borrow().shared_maps(),
-            vdso: t.mm.borrow().vdso,
+            vdso: (t.mm.borrow().vdso, t.mm.borrow().vdso_svc),
             time: task.ns.borrow().time.offsets_ns(),
         }
     }
@@ -161,15 +164,15 @@ impl Fast {
         true
     }
 
-    /// What may run without checking under seccomp: the vDSO's clock-reading stubs (on Linux they
-    /// do not enter the kernel), and numbers for which the filter always returns ALLOW
-    /// ([`crate::seccomp::always_allowed`]).
+    /// What may run without checking under seccomp: the vDSO stubs' clock reads
+    /// ([`crate::vdso::clock_stub_at`]; on Linux they do not enter the kernel), and numbers for
+    /// which the filter always returns ALLOW ([`crate::seccomp::always_allowed`]).
     fn seccomp_allows(&self, task: &Task, cpu: &Cpu) -> bool {
         if !task.seccomp_on.load(Ordering::Relaxed) {
             return true;
         }
         let s = cpu.state();
-        crate::vdso::clock_stub_at(self.vdso, s.pc, s.x[8])
+        crate::vdso::clock_stub_at(self.vdso, s.pc, s.x[8], s.x[0])
             || crate::seccomp::always_allowed(task, s.x[8])
     }
 
@@ -274,7 +277,7 @@ fn gettimeofday(cpu: &Cpu, tv: u64, tz: u64) -> Option<SysResult> {
         write(cpu, tv, &pair(sec, nsec / 1000))?;
     }
     if tz != 0 {
-        write(cpu, tz, &[0; 8])?;
+        write(cpu, tz, &super::misc::timezone())?;
     }
     Some(Ok(0))
 }

@@ -31,6 +31,7 @@
 #define SYSREG_CTR_EL0 SYSREG(3, 3, 0, 0, 1)
 #define SYSREG_CNTFRQ_EL0 SYSREG(3, 3, 14, 0, 0)
 #define SYSREG_CNTVCT_EL0 SYSREG(3, 3, 14, 0, 2)
+#define SYSREG_CNTVCTSS_EL0 SYSREG(3, 3, 14, 0, 6)
 #define SYSREG_DIT SYSREG(3, 3, 4, 2, 5)
 
 /*
@@ -677,6 +678,12 @@ static enum appine_exit sysreg_move(cpu_t *c, uint32_t insn)
         if (!read)
             return undef(c, insn);
         __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v)::"memory");
+        wx(c, rt, v);
+        return next(c);
+    case SYSREG_CNTVCTSS_EL0: /* ECV: the same counter, self-synchronized (no isb needed) */
+        if (!read || !appine_has2(APPINE_HWCAP2_ECV))
+            return undef(c, insn);
+        __asm__ volatile("mrs %0, s3_3_c14_c0_6" : "=r"(v)::"memory");
         wx(c, rt, v);
         return next(c);
 #endif

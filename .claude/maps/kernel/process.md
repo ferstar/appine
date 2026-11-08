@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts, exits, waits; pid namespaces and limits; rlimits; suite findings; sched_setattr, kcmp; futexes, shm; CAP_SYS_NICE; AIO in the timer thread; vfork mark; BKL watchdog last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; the vDSO in time namespaces last)
 
 ## Responsibilities
 
@@ -230,7 +230,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   (ld-musl, or glibc's ld.so) is loaded the same way and must itself be `ET_DYN` without an
   interpreter.
 - A position-independent main program loads at `0x5555_5555_0000`; the interpreter and then the
-  vDSO are placed top-down below the mmap area (so the vDSO is below the interpreter). There is no
+  vDSO are placed top-down below the mmap area (so the vDSO is below the interpreter), with the
+  host's `[vvar]` right below the vDSO when the vDSO is the host's (`kernel/signal`). There is no
   ASLR.
 - Segments are private file mappings of the host object when every segment's offset and address
   agree modulo the page size and no two share a page; otherwise every page is anonymous memory with
@@ -278,8 +279,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `newfstatat`/`statx` (when the root and cwd are in the store's metadata cache, no synthetic
   filesystem or other mount is crossed, and the credentials can skip search-permission checks).
 - It is off while strace-tracing, under `PTRACE_SYSCALL`, single-stepping, or with a pending
-  `ivau_page`; with seccomp only for numbers the filter always allows (vDSO clock stubs always).
-- Per-thread state (root, cwd, credentials, time offsets, the vDSO address) is cached under the BKL
+  `ivau_page`; with seccomp only for numbers the filter always allows, and for the vDSO stubs'
+  reads of clocks Linux's vDSO reads in user space (`kernel/signal`).
+- Per-thread state (root, cwd, credentials, time offsets, the vDSO address and whether its clock
+  functions are stubs) is cached under the BKL
   and invalidated by a global epoch bumped by `fast_changed` (chdir, chroot, credential changes,
   mounts, setns, time-namespace entry). A call that cannot complete falls back to the BKL path.
 - Fast futex: under the futex lock the value is compared and the waiter enqueued; it sleeps on its
@@ -459,7 +462,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   (`kernel/vfs`), a new cgroup namespace is rooted at the creator's cgroup. Pid namespaces nest to
   level 32 and user namespaces to 33 (`ENOSPC` beyond). Time namespaces follow the Linux 6.2
   rule: a new one becomes time-for-children; non-`CLONE_VM` children enter it at fork; threads and
-  vfork children enter at execve.
+  vfork children enter at execve. Entering one with offsets, at fork, execve or setns, puts svc
+  stubs over the host vDSO's clock entries in the address space (`Mm::vdso_syscalls`), so clock
+  reads come to the kernel layer, which adds the offsets.
 - Namespace limits (Linux's ucounts): a namespace created by effective user u in user namespace n
   (for a new user namespace, n is its parent; open_tree's anonymous mount namespaces count too)
   counts for (n, u), then for (n's parent, n's owner) up to the initial user namespace, and every

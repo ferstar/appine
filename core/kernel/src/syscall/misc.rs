@@ -879,9 +879,19 @@ pub(super) fn gettimeofday(cx: &mut Cx<'_>, tv: u64, tz: u64) -> SysResult {
         write_pair(cx, tv, sec, nsec / 1000)?;
     }
     if tz != 0 {
-        put(cx, tz, [0u8; 8])?;
+        put(cx, tz, timezone())?;
     }
     Ok(0)
+}
+
+/// The `struct timezone` gettimeofday reports: the host kernel's, as the host's vDSO reports it
+/// (the kernel/signal map; the guest cannot set it, settimeofday being refused).
+pub(super) fn timezone() -> [u8; 8] {
+    let (west, dst) = appine_hal::timezone();
+    let mut tz = [0u8; 8];
+    tz[..4].copy_from_slice(&west.to_le_bytes());
+    tz[4..].copy_from_slice(&dst.to_le_bytes());
+    tz
 }
 
 pub(super) fn times(cx: &mut Cx<'_>, buf: u64) -> SysResult {

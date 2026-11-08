@@ -584,7 +584,7 @@ pub(crate) fn check(cx: &mut Cx<'_>, cpu: &mut Cpu, nr: u64) -> Verdict {
         let t = cx.task.trace.borrow();
         t.tracer.is_some() && t.options & crate::ptrace::opt::SUSPEND_SECCOMP != 0
     };
-    if mode == mode::DISABLED || suspended || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
+    if mode == mode::DISABLED || suspended || crate::vdso::clock_stub(cx, cpu, nr) {
         return Verdict::Run(nr);
     }
     match (mode, top) {

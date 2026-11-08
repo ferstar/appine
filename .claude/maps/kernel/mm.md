@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; smaps, RSS; fork; truncation; idle checks; OOM choice; futex keys, `MADV_REMOVE`, vDSO, shm; `process_mrelease`, oom_score; clones' file mappings last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM choice, oom_score; futex keys, shm; `process_mrelease`; vDSO and `[vvar]` last)
 
 ## Responsibilities
 
@@ -51,8 +51,8 @@ dumps and the host abstraction layer (`core/hal`).
   (`vmas: BTreeMap<start, Vma>`), the `graveyard` of host regions awaiting shootdown, brk and
   layout fields (`brk_start`, `brk`, `mmap_top`, `start_stack`, `stack_low`), the consistency
   counters, CoW state, the code-group membership, and fields consumed elsewhere (`exe`, `dbt_regs`,
-  `vdso`, `args`, `env`, `auxv`, `membarrier`, `lock_future`, `lock_onfault`). Used only under the
-  BKL, as `Rc<RefCell<Mm>>`.
+  `vdso`, `vdso_svc`, `args`, `env`, `auxv`, `membarrier`, `lock_future`, `lock_onfault`). Used
+  only under the BKL, as `Rc<RefCell<Mm>>`.
 - `Vma` — one mapping: length, guest prot, `Backing`, `may_write`/`may_exec` (Linux
   `VM_MAYWRITE`/`VM_MAYEXEC`), `Arc<HostRegion>` plus host pointer, `name`/`ino` for maps,
   `file_len` (bytes before EOF), `file_id`/`content` (file identity and version), a dup'd fd for
@@ -63,7 +63,8 @@ dumps and the host abstraction layer (`core/hal`).
   private, or the same file at contiguous offsets; shared anonymous never), backing, prot, lock,
   may_write, growsdown, dump and fork flags, `anon` and name.
 - `Backing` — `Anonymous` (private anonymous), `PrivateFile` (private file mapping), `Shared`
-  (shared file, shared anonymous, `/dev/zero` or SysV shm).
+  (shared file, shared anonymous, `/dev/zero` or SysV shm; also `[vvar]`, whose host memory is
+  shared with forked children).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
 - `Refill` — the private-file piece re-mapped at the old address after `MREMAP_DONTUNMAP`.
 
@@ -71,7 +72,8 @@ dumps and the host abstraction layer (`core/hal`).
 
 - `HostRegion` — owns one host range (`base`, `len`). `anonymous: Some(reserve)` marks a range that
   is recycled on drop. `reserved` marks a placeholder with no host memory, whose base is the fake
-  address `RESERVED_HOST` and is never dereferenced.
+  address `RESERVED_HOST` and is never dereferenced. `foreign` marks host memory the kernel layer
+  does not own and only reads (the host's vvar pages behind `[vvar]`): never unmapped or recycled.
 - `recycled` — process-wide reuse pool of anonymous host ranges keyed by `(len, reserve)`: at most
   256 MB in total and 32 ranges per key.
 - `spare` — pre-mapped `MAP_NORESERVE` host pieces that `fork` takes while holding the BKL: two
@@ -143,9 +145,10 @@ dumps and the host abstraction layer (`core/hal`).
   mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`, `mlockall`/`munlockall`, `mincore`,
   `release` (process_mrelease, on another process's address space). `brk` calls `Mm::brk`
   directly.
-- **execve / loader**: `Mm::new`, `share_files`, `set_layout`, `map_anonymous`, `find_free`
-  (interpreter and vDSO placement), `set_brk`, `map_stack`, `set_start_stack`, `label`,
-  `write_kernel` (segments, `.bss`), plus the public layout fields.
+- **execve / loader**: `Mm::new`, `share_files`, `set_layout`, `map_anonymous`, `map_vvar`,
+  `find_free` (interpreter and vDSO placement), `set_brk`, `map_stack`, `set_start_stack`,
+  `label`, `write_kernel` (segments, `.bss`), plus the public layout fields.
+- **Time namespaces** (clone, execve, setns, `kernel/process`): `vdso_syscalls`.
 - **Fault path** (task run loop): `cow_break`, `fault_in`, `fault_past_eof`, `Cx::grow_stack`
   (→ `grow_down`), `is_mapped`.
 - **Stack growth from the kernel**: `Cx::grow_stack_to` at syscall entry; `Cx::grow_stack` before
@@ -189,6 +192,25 @@ dumps and the host abstraction layer (`core/hal`).
 - `map_stack` maps the arguments and auxv plus 128 KB at the top of one host region of
   `max(min(page-aligned RLIMIT_STACK, 8 MB), mapped length)`, leaving the rest below as reserved
   growth room.
+
+### vDSO and `[vvar]`
+
+- The loader maps the vDSO image (`kernel/signal`) as private anonymous memory written by the
+  kernel. When the image is the host's vDSO, `map_vvar` first maps `[vvar]` right below it, as
+  long as the host's vvar mappings and at the same distance, since the host's code addresses its
+  data relative to itself: a `Shared` VMA, readable only (`may_write` and `may_exec` false, so
+  mprotect asking for more is `EACCES`), on a `foreign` `HostRegion` at the host's vvar address.
+  Only its first `data` bytes (the clock data the host's code reads) count as contents and get
+  entries; the rest behaves like a file mapping past EOF (`SIGBUS`), as the time-namespace page
+  does on Linux outside a time namespace.
+- `[vvar]` is shared with forked children like any shared mapping, cannot be written by ptrace
+  (`write_force` refuses shared mappings without write permission), cannot grow (`EFAULT`, checked
+  before looking for room, Linux's `VM_DONTEXPAND`) or be duplicated by mremap (`EINVAL`), counts
+  in no resident-memory measure, writes nothing to core files, and shows as private `r--p` in maps.
+- `vdso_svc` says whether the vDSO's clock functions are svc stubs: set at execve for the built
+  image, and by `vdso_syscalls` once a process using the address space enters a time namespace
+  with offsets, which writes the stubs over the host image's clock entries (`write_kernel`) and
+  queues the vDSO for code invalidation. It is copied at fork and never cleared.
 
 ### mmap and host backing
 
@@ -300,8 +322,8 @@ signals may still be delivered).
   became writable) as `Reread`s that the syscall reads from the store object (zeros past EOF, or
   for an object that cannot be opened) and stores with `fill_private`. Executable ranges are queued
   for code invalidation; shared mappings and unwritten or `cow` ones are left alone. The vDSO is
-  refilled from the kernel's image after its pages are discarded (Linux's special mapping faults
-  its pages back), so its code survives.
+  refilled from the kernel's image (with the svc stubs when `vdso_svc`) after its pages are
+  discarded (Linux's special mapping faults its pages back), so its code survives.
 - `MADV_REMOVE` (`remove`): the range must be fully mapped; locked pages or private anonymous
   memory `EINVAL`, other private or never-writable mappings `EACCES`; the shared mappings' parts
   before EOF are freed through the host's `MADV_REMOVE` (a hole in the host file or shared
@@ -473,13 +495,14 @@ signals may still be delivered).
 ### Introspection
 
 - `regions` labels each VMA (file name, else `[stack]` for the VMA containing `start_stack` and the
-  contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[heap]` inside
-  `[brk_start, brk)`) and joins adjacent pieces of one Linux VMA (`same_vma`, plus the same label;
+  contiguous same-prot growsdown VMAs below it, else `[vdso]`, else `[vvar]` for the foreign VMA,
+  else `[heap]` inside `[brk_start, brk)`) and joins adjacent pieces of one Linux VMA (`same_vma`, plus the same label;
   may_exec is not compared). procfs escapes a newline in a file name as `\012`.
 - Residency comes from host pointers, never from guest addresses: host `mincore`, except that
   `resident_in` (smaps) counts file mappings by host pagemap presence (falling back to `mincore`;
   readahead fills the page cache around touched pages) and a borrowed page only when the owner's
-  host page is resident. `resident_pages` counts every borrowed page. Reserved VMAs never count.
+  host page is resident. `resident_pages` counts every borrowed page. Reserved VMAs and `[vvar]`
+  never count.
 - `stack_bytes` (VmStk) sums the grows-down VMAs.
 - `resident_split` (status's `RssAnon`/`RssFile`/`RssShmem`) measures each VMA as
   `resident_pages` does and sorts it: private anonymous memory, borrowed pages and written private
@@ -495,8 +518,8 @@ signals may still be delivered).
   getrusage.
 - `pagemap` marks resident private anonymous pages present and exclusive, borrowed pages present
   only, file pages present and file-backed, and reports no frame numbers.
-- `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP`; the core-dump writer leaves holes
-  where `residency` reports pages absent.
+- `dump_regions` applies `coredump_filter` and `MADV_DONTDUMP` and writes nothing of `[vvar]`; the
+  core-dump writer leaves holes where `residency` reports pages absent.
 
 ### OOM killer
 
@@ -557,7 +580,8 @@ signals may still be delivered).
 
 - Syscall dispatch: `syscall/mem.rs`, and `syscall/mod.rs` (`sync` after every BKL syscall, stack
   growth at entry).
-- Processes: `syscall/proc.rs` (clone/fork, execve), `task.rs` (run loop, fault dispatch, users),
+- Processes: `syscall/proc.rs` (clone/fork, execve), `syscall/ns.rs` (setns, `vdso_syscalls`),
+  `task.rs` (run loop, fault dispatch, users),
   `kernel.rs` (`Cx` stack growth, BKL hooks), `signal.rs` (signal frames).
 - Loader (`loader.rs`), ptrace (`write_force`), futexes (`futex_key`, `translate`, `id` and
   `shared_maps` on the fast path), membarrier (`quiesce`), SysV IPC, `syscall/fs.rs` (truncation, `ETXTBSY` via
@@ -575,6 +599,8 @@ signals may still be delivered).
 - `appine_hal`: host `mmap`/`munmap`/`madvise` wrappers, file mapping with host-page alignment,
   `fstat`, `msync`, `mincore`-based residency, pagemap reads (`touched_pages`), `ram_and_swap`,
   `page_size`.
+- `kernel/signal`'s vDSO: the image to refill (`image`, `svc_image`), the clock entries and their
+  stubs (`clocks`, `svc_bytes`), and its identity as a trusted translation source.
 - vfs (file kinds, mount flags, seals), credentials (`CAP_IPC_LOCK`), rlimits; SysV IPC
   (`reap_shm` after munmap, mremap and `MAP_FIXED` mmap, so a removed segment goes with its last
   attachment).

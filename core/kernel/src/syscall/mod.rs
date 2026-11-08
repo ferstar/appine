@@ -134,8 +134,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     // continuing with PTRACE_SYSCALL, it stops at exit too, even if it never stopped at entry (this
     // is how strace --seccomp-bpf gets return values). The vDSO's clock-reading stubs do not enter
     // the kernel on Linux, so with seccomp there is no exit stop for them either
-    let exit_stop =
-        watched.is_some() || (filtered && !crate::vdso::clock_stub(cx, cpu.state().pc, nr));
+    let exit_stop = watched.is_some() || (filtered && !crate::vdso::clock_stub(cx, cpu, nr));
     if (traced || filtered) && nr == NO_SYSCALL {
         if !crate::ptrace::syscall_exit(cx, cpu) {
             return Flow::Exit;

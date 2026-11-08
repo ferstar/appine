@@ -240,6 +240,11 @@ impl Vma {
         self.region.reserved
     }
 
+    /// `[vvar]`: the host's memory, only read ([`HostRegion::foreign`]).
+    fn foreign(&self) -> bool {
+        self.region.foreign
+    }
+
     /// A shared mapping of store file `ino` through host file `from`, which follows the file when
     /// its data moves to another host file ([`Mm::file_moving`]).
     fn moves_with(&self, ino: u64, from: (u64, u64)) -> bool {
@@ -323,6 +328,10 @@ pub struct Mm {
     /// Load address of the vDSO (signal handlers return to the sigreturn trampoline in it by
     /// default).
     pub vdso: u64,
+    /// The vDSO's clock functions are svc stubs answered by the kernel layer: always for the built
+    /// image, and for the host's once a process using this address space is in a time namespace
+    /// with offsets ([`Mm::vdso_syscalls`]).
+    pub vdso_svc: bool,
     /// Range of the argv strings on the initial stack (`/proc/<pid>/cmdline`).
     pub args: (u64, u64),
     /// Range of the envp strings on the initial stack (`/proc/<pid>/environ`).
@@ -383,6 +392,7 @@ impl Mm {
             exe: None,
             dbt_regs: appine_engine::DbtRegs::Default,
             vdso: 0,
+            vdso_svc: false,
             args: (0, 0),
             env: (0, 0),
             auxv: Rc::from([]),
@@ -433,6 +443,67 @@ impl Mm {
             region,
             host,
         )
+    }
+
+    /// Maps the host's vvar pages as `[vvar]` at a fixed address (used by the loader, below the
+    /// vDSO; the range must be free): `len` bytes, of which the first `data` are readable host
+    /// memory at `host`, the host's clock data that the host's vDSO code reads. The rest (the
+    /// time-namespace page, newer kernels' random-number state) has no entries: accesses get
+    /// SIGBUS ([`Mm::fault_past_eof`]), as on Linux outside a time namespace. Like Linux's special
+    /// mapping it is private, cannot be made writable or executable, is shared by forked children,
+    /// counts towards no resident memory and is not written to core files.
+    pub fn map_vvar(&mut self, start: u64, len: u64, host: usize, data: u64) -> Result<(), Errno> {
+        if !self.is_free(start, len) {
+            return Err(Errno::EEXIST);
+        }
+        let host = NonNull::new(host as *mut u8).ok_or(Errno::EINVAL)?;
+        let region = Arc::new(HostRegion {
+            base: host,
+            len: data as usize,
+            anonymous: None,
+            reserved: false,
+            foreign: true,
+        });
+        self.insert(
+            start,
+            len,
+            data,
+            prot::READ,
+            Backing::Shared,
+            false,
+            region,
+            host,
+        )?;
+        self.vmas.get_mut(&start).unwrap().may_exec = false;
+        Ok(())
+    }
+
+    /// Replaces the entries of the vDSO's clock functions with svc stubs, so they enter the kernel
+    /// layer, which applies the time namespace's offsets (a process using this address space
+    /// entered a time namespace with offsets; Linux's vDSO reads them from a namespace page
+    /// instead). The built image's functions already are stubs. Not undone: the stubs are right in
+    /// any time namespace, only slower.
+    pub fn vdso_syscalls(&mut self) -> Result<(), Errno> {
+        if self.vdso_svc || self.vdso == 0 {
+            return Ok(());
+        }
+        for (offset, nr) in crate::vdso::clocks() {
+            self.write_kernel(self.vdso + offset, &crate::vdso::svc_bytes(nr))?;
+        }
+        let len = (crate::vdso::image().len() as u64).next_multiple_of(PAGE_SIZE);
+        self.invalidate_code(self.vdso, len);
+        self.vdso_svc = true;
+        Ok(())
+    }
+
+    /// The image the vDSO's pages come back as after being discarded: the one mapped at execve,
+    /// with svc stubs once [`Mm::vdso_syscalls`] put them in.
+    fn vdso_image(&self) -> &'static [u8] {
+        if self.vdso_svc {
+            crate::vdso::svc_image()
+        } else {
+            crate::vdso::image()
+        }
     }
 
     /// Sets the initial program break (used by the loader).
@@ -1331,6 +1402,7 @@ impl Mm {
                         len: m.len,
                         anonymous: None,
                         reserved: false,
+                        foreign: false,
                     });
                     if let Some(key) = key {
                         self.files.insert(key, region.clone(), m.ptr);
@@ -1533,6 +1605,15 @@ impl Mm {
         if !self.in_one_vma(old, old_end) {
             return Err(Errno::EFAULT);
         }
+        // [vvar] cannot grow, in place or moved (Linux's VM_DONTEXPAND, before looking for room)
+        if self
+            .vmas
+            .range(..old_end)
+            .next_back()
+            .is_some_and(|(_, v)| v.foreign())
+        {
+            return Err(Errno::EFAULT);
+        }
         let vma_end = self
             .vmas
             .range(..old_end)
@@ -1581,7 +1662,7 @@ impl Mm {
             }
             self.munmap(dst, new_len)?;
         }
-        if v.backing != Backing::Shared {
+        if v.backing != Backing::Shared || v.foreign() {
             return Err(Errno::EINVAL);
         }
         let dst = match fixed {
@@ -1614,6 +1695,7 @@ impl Mm {
 
     /// The `len` bytes mremap grows by: following offset `offset` in `template`, with the same kind
     /// and permissions. Private file mappings need `file` (the host fd of the mapped file).
+    /// `[vvar]` cannot grow (`EFAULT`, Linux's `VM_DONTEXPAND`).
     fn extension(
         &self,
         template: &Vma,
@@ -1621,6 +1703,9 @@ impl Mm {
         len: u64,
         file: Option<i32>,
     ) -> Result<Vma, Errno> {
+        if template.foreign() {
+            return Err(Errno::EFAULT);
+        }
         // (host memory, host address, fd kept for a shared mapping, bytes with file contents)
         let (region, host, file, file_len) = match (&template.backing, &template.file) {
             (Backing::Shared, Some((fd, start))) => {
@@ -1634,6 +1719,7 @@ impl Mm {
                     len: m.len,
                     anonymous: None,
                     reserved: false,
+                    foreign: false,
                 });
                 let file_len = file_extent(raw, file_offset, len);
                 (region, m.ptr, Some((fd.clone(), file_offset)), file_len)
@@ -1651,6 +1737,7 @@ impl Mm {
                     len: m.len,
                     anonymous: None,
                     reserved: false,
+                    foreign: false,
                 });
                 (region, m.ptr, None, file_extent(fd, file_offset, len))
             }
@@ -2172,7 +2259,7 @@ impl Mm {
                 // The vDSO comes back as the kernel's image, not zeros (on Linux a special
                 // mapping whose pages fault back in; breakpoints written into it are gone)
                 if s == self.vdso {
-                    let image = crate::vdso::image();
+                    let image = self.vdso_image();
                     let (from, to) = (
                         (cursor - s) as usize,
                         ((stop - s) as usize).min(image.len()),
@@ -2538,6 +2625,7 @@ impl Mm {
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.vdso = self.vdso;
+        child.vdso_svc = self.vdso_svc;
         child.args = self.args;
         child.env = self.env;
         // membarrier registrations last until execve (a new Mm), as Linux copies the mm's
@@ -2982,6 +3070,8 @@ impl Mm {
                 Some(b"[stack]")
             } else if s == self.vdso {
                 Some(b"[vdso]")
+            } else if v.foreign() {
+                Some(b"[vvar]")
             } else if s >= self.brk_start && s < self.brk && self.brk_start != 0 {
                 Some(b"[heap]")
             } else {
@@ -2996,7 +3086,7 @@ impl Mm {
                     start: s,
                     end: s + v.len,
                     prot: v.prot,
-                    shared: v.backing == Backing::Shared,
+                    shared: v.backing == Backing::Shared && !v.foreign(),
                     name,
                     file: v.file_id.map(|(_, _, offset)| (offset, v.ino)),
                     locked: v.locked,
@@ -3086,7 +3176,7 @@ impl Mm {
         let mut total = 0;
         for (&s, v) in self.vmas.range(first..end) {
             let (from, to) = (addr.max(s), end.min(s + v.len));
-            if from >= to || v.reserved() {
+            if from >= to || v.reserved() || v.foreign() {
                 continue;
             }
             let ranges = if v.backing == Backing::Anonymous && v.len > EAGER_MAX {
@@ -3251,6 +3341,7 @@ impl Mm {
         };
         for (&s, v) in &self.vmas {
             let pages = match (v.backing, v.file_id) {
+                _ if v.foreign() => continue,
                 (Backing::Anonymous, _) if !v.written.get() => continue,
                 (Backing::Anonymous, _) if v.len > EAGER_MAX => self
                     .touched_windows(s)
@@ -3285,6 +3376,9 @@ impl Mm {
         let mut spans = Vec::with_capacity(self.vmas.len());
         let now = std::time::Instant::now();
         for (&s, v) in &self.vmas {
+            if v.foreign() {
+                continue;
+            }
             let page_cache = match v.backing {
                 Backing::Anonymous if !v.written.get() => continue,
                 Backing::Anonymous => false,
@@ -3333,7 +3427,7 @@ impl Mm {
                 let offset = v.file_id.map(|(_, _, off)| off);
                 let size = if s == self.vdso {
                     v.len
-                } else if v.dontdump {
+                } else if v.dontdump || v.foreign() {
                     0
                 } else {
                     match v.backing {
@@ -3552,6 +3646,7 @@ impl Mm {
                 len: host_len,
                 anonymous: Some(reserve),
                 reserved: false,
+                foreign: false,
             }),
             base,
         ))
@@ -4726,6 +4821,9 @@ struct HostRegion {
     anonymous: Option<bool>,
     /// No host memory ([`HostRegion::reserved`]).
     reserved: bool,
+    /// Host memory the kernel layer does not own and only reads: the host's vvar page
+    /// ([`Mm::map_vvar`]). Never unmapped or reused, and not counted as anyone's memory.
+    foreign: bool,
 }
 
 impl HostRegion {
@@ -4742,6 +4840,7 @@ impl HostRegion {
             len: 0,
             anonymous: None,
             reserved: true,
+            foreign: false,
         })
     }
 }
@@ -4752,7 +4851,7 @@ unsafe impl Sync for HostRegion {}
 
 impl Drop for HostRegion {
     fn drop(&mut self) {
-        if self.reserved {
+        if self.reserved || self.foreign {
             return;
         }
         let (base, len, anonymous) = (self.base, self.len, self.anonymous);
@@ -4988,6 +5087,7 @@ pub(crate) mod spare {
                 len: host_len,
                 anonymous: Some(false),
                 reserved: false,
+                foreign: false,
             }),
             base,
         ))

@@ -3515,7 +3515,7 @@ const HWCAP_NAMES: [&str; 30] = [
 ];
 
 /// Likewise, the names of the HWCAP2 bits, which come after HWCAP's.
-const HWCAP2_NAMES: [&str; 15] = [
+const HWCAP2_NAMES: [&str; 20] = [
     "dcpodp",
     "sve2",
     "sveaes",
@@ -3531,6 +3531,11 @@ const HWCAP2_NAMES: [&str; 15] = [
     "svebf16",
     "i8mm",
     "bf16",
+    "dgh",
+    "rng",
+    "bti",
+    "mte",
+    "ecv",
 ];
 
 fn cpuinfo() -> String {

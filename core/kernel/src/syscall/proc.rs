@@ -483,6 +483,11 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     if flags & CLONE_VM == 0 && ns.time.id != ns.time_for_children.id {
         ns.time = ns.time_for_children.clone();
         ns.time.frozen.set(true);
+        // With offsets, the child's vDSO clock functions must enter the kernel layer, which adds
+        // them (the kernel/signal map)
+        if ns.time.offsets_ns() != [0, 0] {
+            mm.borrow_mut().vdso_syscalls()?;
+        }
     }
     let task = Task::new(
         tid,
@@ -845,6 +850,11 @@ fn exec(
     let interp = interp_label(Some(&*vfs), &view, &cred, &root, &cwd, &image);
     label_image(&mut mm, &image, (&exe, st.ino), interp);
     mm.exe = Some(st.ino);
+    // The process runs in the time namespace for children from here on (entered below); with
+    // offsets, the vDSO's clock functions must enter the kernel layer, which adds them
+    if cx.task.ns.borrow().time_for_children.offsets_ns() != [0, 0] {
+        mm.vdso_syscalls()?;
+    }
 
     // From here on nothing may fail: end the other threads in the thread group, then replace the
     // address space

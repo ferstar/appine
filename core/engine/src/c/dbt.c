@@ -155,6 +155,7 @@ _Static_assert((MAX_BLOCK_WORDS & BRANCH_MASK) == 0 && MAX_BLOCK_WORDS << REASON
 #define SYSREG_DCZID_EL0 0xd807
 #define SYSREG_CNTFRQ_EL0 0xdf00
 #define SYSREG_CNTVCT_EL0 0xdf02
+#define SYSREG_CNTVCTSS_EL0 0xdf06
 
 /* Block size of DC ZVA, matching the DCZID_EL0 that Tier 0 reports */
 #define DCZ_BLOCK 64
@@ -2062,7 +2063,8 @@ static bool translate_branch_sys(struct xlate *x, uint32_t insn, uint64_t pc)
         /* Timers are read-only, and writes have already been rejected by tier0_defined; read
          * as is on the host */
         case SYSREG_CNTFRQ_EL0:
-        case SYSREG_CNTVCT_EL0: {
+        case SYSREG_CNTVCT_EL0:
+        case SYSREG_CNTVCTSS_EL0: {
             struct operands o = {.n = 1, .pos = {0}, .sp = {false}, .writes_rd = read};
             return emit_operands(x, insn, &o) || fallback(x, pc);
         }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`; `ClockWatch`; `has_private_pages`; `host_vmstat`; DNS waits; signal-handler errno; Linux and Android only; `fallocate`, `MADV_REMOVE`; `host_swaps`; `thread_activity`; `map_file_over` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `fill_random`, `ClockWatch`; host statistics, `has_private_pages`; DNS waits; handlers' errno; Linux and Android only; `fallocate`, `MADV_REMOVE`, `map_file_over`; host vDSO, timezone last)
 
 ## Responsibilities
 
@@ -21,8 +21,8 @@ and Linux (glibc), the only hosts it builds for, returning raw host errnos:
   context switches;
 - waiting: `poll`/`ppoll`, `Event` (eventfd), `Edges` (edge-triggered host epoll on one fd), `Watch`
   (level-triggered host epoll over many fds);
-- threads and time: tid, thread names, CPU clocks, affinity, nice, ioprio, clocks, a read-only
-  `adjtimex`;
+- threads and time: tid, thread names, CPU clocks, affinity, nice, ioprio, clocks, the kernel's
+  timezone, a read-only `adjtimex`, and where the host mapped its vDSO and vvar pages;
 - networking: nonblocking host sockets, interfaces, routes, source selection, DNS resolution;
 - terminal helpers for the CLI: raw mode, a `SIGWINCH` pipe and a stop-signal pipe.
 
@@ -66,7 +66,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `sync_file_range`, `syncfs`, `flock`, `ioctl`, `dup`, `fill_random`, `drain`, `isatty`.
 - Waiting and threads: `poll`, `Event`, `Edges`, `Watch`, `ClockWatch`, `gettid`, `set_thread_name`,
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
-  `clock_getres`, `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
+  `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
   `setsockopt`, `getsockopt`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
   `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`.
@@ -137,8 +137,12 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   syscall (from `syscall`, which only the process itself can read) or else its `stat` state, for
   the BKL watchdog's reports; `set_thread_affinity`/`set_thread_nice`/`set_thread_ioprio` act on host tids and ignore
   failures (the kernel applies its own policy first: nice floor −4, RT ioprio downgraded).
-- `clock_gettime`/`clock_getres` pass clock ids through; `adjtimex_query` makes the real read-only
-  call on Linux and synthesizes an unsynchronized state on Android.
+- `clock_gettime`/`clock_getres` pass clock ids through; `timezone` makes the raw gettimeofday
+  syscall (glibc's wrapper zeroes the timezone) and returns the kernel's `sys_tz`; `adjtimex_query`
+  makes the real read-only call on Linux and synthesizes an unsynchronized state on Android.
+- `host_vdso` takes the vDSO's start from `AT_SYSINFO_EHDR` and its length from the `[vdso]` line of
+  `/proc/self/maps`, and the vvar start from the contiguous `[vvar*]` mappings right below it; None
+  when either is missing.
 - CLI: `RawMode::enter` on stdin; `sigwinch_notifier` installs a handler writing one byte to a
   nonblocking pipe, and `stop_notifier` handlers for SIGINT, SIGTERM and SIGHUP writing each
   signal's number to another (each callable once per process; the CLI calls each once). Both

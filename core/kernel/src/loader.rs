@@ -686,15 +686,25 @@ pub fn load_prepared(
         entry = loaded.entry;
     }
 
+    // The vDSO, and below it the host's vvar pages when the vDSO is the host's (the kernel/signal
+    // map): its code finds its data at the distance it has in the host
     let vdso = crate::vdso::image();
     let vdso_len = (vdso.len() as u64).next_multiple_of(PAGE_SIZE);
+    let vvar = crate::vdso::vvar();
+    let vvar_len = vvar.map_or(0, |v| v.len);
     let vdso_base = mm
-        .find_free(vdso_len)
-        .ok_or(LoadError::Memory(Errno::ENOMEM))?;
+        .find_free(vvar_len + vdso_len)
+        .ok_or(LoadError::Memory(Errno::ENOMEM))?
+        + vvar_len;
+    if let Some(v) = vvar {
+        mm.map_vvar(vdso_base - v.len, v.len, v.host, v.data)
+            .map_err(LoadError::Memory)?;
+    }
     mm.map_anonymous(vdso_base, vdso_len, prot::READ | prot::EXEC)
         .and_then(|()| mm.write_kernel(vdso_base, vdso))
         .map_err(LoadError::Memory)?;
     mm.vdso = vdso_base;
+    mm.vdso_svc = !crate::vdso::host();
     mm.dbt_regs = dbt_regs(exe.go);
 
     mm.set_brk(main.end);
@@ -1108,6 +1118,23 @@ mod tests {
         let mut magic = [0u8; 4];
         mm.read(UserSlice::new(vdso, 4), &mut magic).unwrap();
         assert_eq!(&magic, b"\x7fELF");
+        // With the host's vDSO, the host's vvar data page is readable right where its code
+        // expects it, and nothing else of [vvar] is
+        if let Some(v) = crate::vdso::vvar() {
+            let regions = mm.regions();
+            let at = regions.iter().position(|r| r.start == vdso).unwrap();
+            let below = &regions[at - 1];
+            assert_eq!((below.start, below.end), (vdso - v.len, vdso));
+            assert_eq!(below.name.as_deref(), Some(&b"[vvar]"[..]));
+            assert!(!below.shared && below.prot == prot::READ);
+            let start = vdso - v.len;
+            assert!(mm.mmu().translate(start, prot::READ).is_some());
+            assert!(mm.mmu().translate(start, prot::WRITE).is_none());
+            // (A host in a time namespace, such as a container, has no unreadable part)
+            if v.data < v.len {
+                assert!(mm.mmu().translate(start + v.data, prot::READ).is_none());
+            }
+        }
     }
 
     #[test]

@@ -208,6 +208,7 @@ struct appine_cpu {
 #define APPINE_HWCAP2_FRINT (UINT64_C(1) << 8)
 #define APPINE_HWCAP2_I8MM (UINT64_C(1) << 13)
 #define APPINE_HWCAP2_BF16 (UINT64_C(1) << 14)
+#define APPINE_HWCAP2_ECV (UINT64_C(1) << 19)
 
 /* The AT_HWCAP advertised to the guest: host support ∩ implemented by Tier 0 ∩ the whitelist */
 uint64_t appine_guest_hwcap(void);

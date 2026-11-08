@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 14 confirmed and 9 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; failed internal checks under the guard; the stale kicker after an exit panic, fixed in the kernel; guard lock registration and pc 0 lookups last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: stale source comments fixed; failed internal checks under the guard; the stale kicker after an exit panic; guard lock registration and pc 0 lookups; ECV's counter last)
 
 ## Responsibilities
 
@@ -115,8 +115,8 @@ Tier 1, only CPUID advertised).
 - System registers: NZCV, FPCR (writes masked to AHP, DN, FZ, RMode and, with FP16, FZ16), FPSR
   (cumulative flags only) and TPIDR_EL0 are read-write; TPIDRRO_EL0 reads 0; DCZID_EL0 reads 4
   (64-byte blocks); CTR_EL0 reads `0x8444c004` (DIC = IDC = 0, so guests must issue `ic ivau`);
-  CNTVCT and CNTFRQ read the host; DIT is feature-gated; the ID space comes from the feature set;
-  anything else is undefined.
+  CNTVCT and CNTFRQ read the host, and so does CNTVCTSS (no `isb`) when ECV is offered; DIT is
+  feature-gated; the ID space comes from the feature set; anything else is undefined.
 - HINT space (NOP, YIELD, `PACIASP`/`AUTIASP`, BTI) is a no-op; non-hint PAC (PACGA, one-source
   PAC, BRAA/BLRAA/RETAA) and HLT are undefined. DMB and DSB are full fences; ISB is a no-op.
 - `dc zva` zeroes 64 bytes and needs write permission; other DC operations and `ic ivau` only check
@@ -186,8 +186,8 @@ Tier 1, only CPUID advertised).
   - loads and stores get the inline TLB path (section 8); PRFM emits nothing;
   - `svc #0` exits to the kernel inline; other `svc` immediates, BRK, and PSTATE writes other than
     FlagM go to Tier 0;
-  - `mrs`/`msr tpidr_el0` use the CPU state, `mrs dczid_el0` becomes the constant 4; NZCV, CNTVCT
-    and CNTFRQ accesses run natively; every other system register (including FPCR and FPSR) goes
+  - `mrs`/`msr tpidr_el0` use the CPU state, `mrs dczid_el0` becomes the constant 4; NZCV, CNTVCT,
+    CNTVCTSS and CNTFRQ accesses run natively (Tier 0 has already accepted them); every other system register (including FPCR and FPSR) goes
     to Tier 0;
   - HINT space, including PAC and BTI hints, emits nothing; authenticated branches go to Tier 0;
   - DC CVAC/CVAU/CIVAC/CVAP/CVADP and `ic ivau` only check read access; `ic ivau` records its page
@@ -363,8 +363,9 @@ Tier 1, only CPUID advertised).
   CPUID is always advertised. The implemented set (FP, ASIMD, AES, PMULL, SHA1/2/3/512, CRC32,
   ATOMICS, ASIMDDP, LRCPC, ILRCPC, FPHP/ASIMDHP, JSCVT, ASIMDRDM, FCMA, ASIMDFHM, and in HWCAP2 I8MM,
   BF16, FRINT) is intersected with the host's and offered only if the host has FP and ASIMD and
-  native stubs work. FlagM, FlagM2, SB, DCPOP, DCPODP and DIT are offered from host support
-  regardless of that gate.
+  native stubs work. FlagM, FlagM2, SB, DCPOP, DCPODP, DIT and ECV (HWCAP2, the self-synchronized
+  counter `CNTVCTSS_EL0`, which the host's vDSO reads instead of `CNTVCT_EL0` on hosts that have
+  it; guests run that code, `kernel/signal`) are offered from host support regardless of that gate.
 - Dependencies: SHA3 and SHA512 only together and with SHA2; FPHP and ASIMDHP together; FHM needs
   FPHP; LRCPC2 needs LRCPC; FlagM2 needs FlagM; DCPODP needs DCPOP. Not implemented: LSE2, SM3/SM4,
   SVE/SME, PAC (PACA/PACG), BTI, MTE.
@@ -414,7 +415,7 @@ Tier 1, only CPUID advertised).
 
 - `kernel/mm` structures: the page table (`appine_mmu_translate`, the PTE layout walked by the
   refill routine), the TLB entry layout and `tlb_used`.
-- Host: `getauxval`, `mrs midr_el1`/`fpcr`/`cntvct_el0`/`cntfrq_el0`, `msr dit`, `mmap`/`mremap`/
+- Host: `getauxval`, `mrs midr_el1`/`fpcr`/`cntvct_el0`/`cntvctss_el0`/`cntfrq_el0`, `msr dit`, `mmap`/`mremap`/
   `madvise`, pthreads (locks, once, TLS), `sigaction`/`sigsetjmp`/`siglongjmp`, instruction-cache
   maintenance.
 

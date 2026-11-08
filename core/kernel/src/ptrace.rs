@@ -433,7 +433,7 @@ pub(crate) const EVENTMSG_SYSCALL_EXIT: u64 = 2;
 /// returns whether PTRACE_SYSCALL stops at the entry. Whether to stop at the exit is decided
 /// again by [`syscall_exit`] from the state at that time.
 pub(crate) fn syscall_start(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> Option<bool> {
-    if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu.state().pc, nr) {
+    if !traced(cx.task) || crate::vdso::clock_stub(cx, cpu, nr) {
         return None;
     }
     let mut t = cx.task.trace.borrow_mut();
@@ -474,7 +474,7 @@ pub(crate) fn syscall_traced(cx: &Cx<'_>, cpu: &Cpu, nr: u64) -> bool {
             return false;
         }
     }
-    !crate::vdso::clock_stub(cx, cpu.state().pc, nr)
+    !crate::vdso::clock_stub(cx, cpu, nr)
 }
 
 /// A syscall stop: as on arm64 Linux, x7 is 0 (entry) or 1 (exit) during the stop, and the tracer

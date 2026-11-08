@@ -1400,6 +1400,64 @@ fn timespec_pair(ts: &libc::timespec) -> (i64, i64) {
     (ts.tv_sec as i64, ts.tv_nsec as i64)
 }
 
+/// The host kernel's timezone (`sys_tz`, which gettimeofday reports): (minutes west of
+/// Greenwich, DST type). Android sets it to the device's time zone; Linux distributions leave it
+/// at 0 unless the RTC keeps local time.
+pub fn timezone() -> (i32, i32) {
+    // struct timezone (the libc crate leaves it opaque on glibc); the syscall itself, since
+    // glibc's gettimeofday zeroes it before asking the kernel
+    let mut tz = [0i32; 2];
+    let tv: *mut libc::timeval = std::ptr::null_mut();
+    unsafe { libc::syscall(libc::SYS_gettimeofday, tv, tz.as_mut_ptr()) };
+    (tz[0], tz[1])
+}
+
+/// Where the host kernel mapped its vDSO into this process, and the vvar pages right below it.
+pub struct HostVdso {
+    /// The vDSO's mapping (`[vdso]`, starting at `AT_SYSINFO_EHDR`).
+    pub vdso: NonNull<u8>,
+    pub vdso_len: usize,
+    /// The start of the vvar mappings right below it (`[vvar]`, and on x86 since 6.13 also
+    /// `[vvar_vclock]`): the vDSO's code finds its data at fixed distances below itself.
+    pub vvar: NonNull<u8>,
+}
+
+/// The host's vDSO and vvar mappings in this process, from `AT_SYSINFO_EHDR` and
+/// `/proc/self/maps`; None when either is missing.
+pub fn host_vdso() -> Option<HostVdso> {
+    let base = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) } as usize;
+    if base == 0 {
+        return None;
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    // (start, end, name) of each mapping, in address order
+    let mappings: Vec<(usize, usize, &str)> = maps
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (start, end) = fields.next()?.split_once('-')?;
+            let name = fields.nth(4).unwrap_or("");
+            let start = usize::from_str_radix(start, 16).ok()?;
+            Some((start, usize::from_str_radix(end, 16).ok()?, name))
+        })
+        .collect();
+    let at = mappings
+        .iter()
+        .position(|&(start, _, name)| start == base && name == "[vdso]")?;
+    let mut vvar = base;
+    for &(start, end, name) in mappings[..at].iter().rev() {
+        if end != vvar || !name.starts_with("[vvar") {
+            break;
+        }
+        vvar = start;
+    }
+    (vvar < base).then(|| HostVdso {
+        vdso: NonNull::new(base as *mut u8).unwrap(),
+        vdso_len: mappings[at].1 - base,
+        vvar: NonNull::new(vvar as *mut u8).unwrap(),
+    })
+}
+
 /// The size of `struct __kernel_timex` (the same on arm64 and x86_64 Linux).
 pub const TIMEX_SIZE: usize = 208;
 
@@ -1714,5 +1772,17 @@ mod tests {
         assert_eq!(cachestat(fd, 4096, 4096).unwrap()[0], 1);
         assert_eq!(cachestat(fd, 1 << 20, 0).unwrap(), [0; 5]);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn finds_the_host_vdso_and_its_vvar() {
+        let v = host_vdso().unwrap();
+        let page = page_size();
+        assert!(v.vdso_len >= page && v.vdso_len.is_multiple_of(page));
+        let vvar_len = v.vdso.as_ptr() as usize - v.vvar.as_ptr() as usize;
+        assert!(vvar_len >= page && vvar_len.is_multiple_of(page));
+        // SAFETY: the vDSO mapping is readable
+        let magic = unsafe { std::slice::from_raw_parts(v.vdso.as_ptr(), 4) };
+        assert_eq!(magic, b"\x7fELF");
     }
 }

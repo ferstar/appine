@@ -436,6 +436,11 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     }
     if let Some(ns) = set.time {
         ns.frozen.set(true);
+        // With offsets, the vDSO's clock functions must enter the kernel layer, which adds them
+        // (writing into the vDSO mapped at execve cannot fail)
+        if ns.offsets_ns() != [0, 0] {
+            let _ = cx.mm_mut().vdso_syscalls();
+        }
         let mut p = cx.task.ns.borrow_mut();
         p.time = ns.clone();
         p.time_for_children = ns;

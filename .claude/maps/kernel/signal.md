@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by tid, retargeting; ptrace; suite findings; frames, siginfo; zombies, core_pattern; adjtimex; vDSO; signalfd; exception reports; ENOSYS list; unimplemented paths; watchdog records last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO last)
 
 ## Responsibilities
 
@@ -45,7 +45,10 @@ procfs.
 - Thread state: `pending`, `sigmask`, `saved_sigmask`, `killed`; group state: `pending`,
   `sighand`, `stopped`, `stop_signal`, stop/continue reports, `exiting`.
 - `SignalFd` — mask and the creating group.
-- `vdso::Image` — the vDSO bytes and the sigreturn offset, built once.
+- `vdso::Image` — the image every process maps, chosen once per kernel: its bytes, the same with svc
+  stubs at the clock functions' entries, the sigreturn offset, the clock functions' offsets with
+  their syscalls, and for the host's vDSO a `Vvar` (the length of `[vvar]`, the host address of
+  its start, and how many bytes of it the guest may read).
 - `ptrace::Trace` — per-thread tracing state: tracer tgid, seized, options, run mode
   (`Cont`/`Syscall`/`Step`), current `Stop` (`Signal`, `Group`, `Syscall(entry)`, `Event`), the saved
   `Regs` copy, siginfo, event message, syscall number, `HwDebug` slots.
@@ -211,15 +214,42 @@ procfs.
 
 ### vDSO
 
-- One page, built at runtime as a minimal real ELF shared object (`ET_DYN`, a loadable segment and a
-  dynamic segment, `DT_HASH`, symbol versions with `LINUX_2.6.39`, soname `linux-vdso.so.1`) and
-  passed through `AT_SYSINFO_EHDR`. Each process maps a private anonymous copy (debuggers can set
-  breakpoints in it); `MADV_DONTNEED` over it brings back the image (`kernel/mm`), as Linux's
-  special mapping faults its pages back.
-- `__kernel_rt_sigreturn` is exactly `mov x8, #139; svc #0` (libgcc's unwinder matches the bytes),
-  preceded by a `nop`.
-- `__kernel_gettimeofday`, `clock_gettime` and `clock_getres` are `mov x8, #nr; svc #0; ret` stubs;
-  an `svc` at those addresses takes the no-BKL fast path and skips ptrace and seccomp stops.
+- The image is chosen at its first use and kept for the kernel's life. Preferred is the host
+  kernel's own vDSO: a copy of the host's `[vdso]` mapping (found through `AT_SYSINFO_EHDR` and
+  `/proc/self/maps`), whose clock functions read the counter (`CNTVCT_EL0`, or `CNTVCTSS_EL0` on
+  hosts with ECV, both read natively by the engine) and the host's vvar data, so `clock_gettime`,
+  `gettimeofday` and `clock_getres` run in guest code without entering the kernel layer and return
+  exactly what the host's syscalls return; what they leave to the kernel (CPU-time clocks, invalid
+  clocks, a host whose counter is unusable) is a real syscall, as on Linux. The loader maps the
+  host's vvar pages read-only as `[vvar]` right below the copy, at the distance the host's code
+  expects (`kernel/mm`): the guest can read the first host page, or the first two when the host
+  itself runs in a time namespace (its first page's clock mode is `VDSO_CLOCKMODE_TIMENS`; the
+  real data is then on the second).
+- The copy is used only if musl's lookup finds the four symbols with version `LINUX_2.6.39`,
+  `__kernel_rt_sigreturn` is exactly `mov x8, #139; svc #0`, and each clock function is at least
+  12 bytes long. It is changed only where Appine's contract needs it: every other defined symbol is
+  made undefined (newer kernels' `__kernel_getrandom` reads vvar pages the guest does not get), and
+  the `Linux` version note says 6.1.0. Its clock functions then run once in the interpreter, in a
+  private address space with the vvar data mapped as in a guest, and every result must lie between
+  host readings taken just before and after (realtime, monotonic, raw, both coarse clocks,
+  boottime, TAI), with the same resolutions and timezone; syscalls they make are answered by the
+  host, and anything else, or more than 100000 instructions, fails it.
+- Otherwise (no host vDSO, a check failing, a non-arm64 build) the image is built at runtime as a
+  one-page minimal real ELF shared object (`ET_DYN`, a loadable segment and a dynamic segment,
+  `DT_HASH`, symbol versions with `LINUX_2.6.39`, soname `linux-vdso.so.1`), with
+  `__kernel_rt_sigreturn` preceded by a `nop` and the clock functions as `mov x8, #nr; svc #0; ret`
+  stubs. With `APPINE_LOG=1` the reason the host's was not used is logged.
+- Either is passed through `AT_SYSINFO_EHDR`. Each process maps a private anonymous copy (debuggers
+  can set breakpoints in it); `MADV_DONTNEED` over it brings back the image (`kernel/mm`), as
+  Linux's special mapping faults its pages back.
+- In a time namespace with offsets the host's code would return the host's clocks, so the clock
+  functions' entries of the host's image are overwritten with the same svc stubs (`Mm::vdso_syscalls`)
+  when such a namespace is entered (`kernel/process`), and the kernel layer adds the offsets; this
+  is never undone. An svc from a stub (the svc right after a clock entry, with that entry's
+  syscall) takes the no-BKL fast path and skips ptrace and seccomp stops, but only for
+  `gettimeofday` and the clocks Linux's vDSO reads in user space (realtime, monotonic, raw, the two
+  coarse clocks, boottime, TAI); other clocks, and every syscall the host's code makes, are
+  ordinary syscalls that tracers and seccomp see, as on Linux.
 
 ### ptrace
 
@@ -307,6 +337,8 @@ procfs.
   never crash; each is counted as an unimplemented path (below). The list of
   `ENOSYS` numbers is kept in round 139 (`docs/rounds/139-unimplemented-syscalls.md`), less
   process_mrelease (448), implemented since (`kernel/mm`).
+- `gettimeofday` reports the host kernel's timezone (`sys_tz`; Android sets it to the device's time
+  zone), from the host's vDSO and from the syscall alike.
 - The guest cannot change host time: `settimeofday` is `EPERM` without reading its arguments;
   `clock_settime` validates the timespec, then is `EPERM` for `CLOCK_REALTIME` and `EINVAL` for every
   other clock; any modifying `adjtimex`/`clock_adjtime` is `EPERM` (as without `CAP_SYS_TIME`);
@@ -354,9 +386,10 @@ procfs.
 - `kernel/process`: `request_wake*`, `signal_later`, group exit, namespace translation, wait.
 - `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`,
   `regions` (the mapping named in unhandled-exception reports).
-- `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`.
+- `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`; a private
+  `Mmu` and `Cpu` for the host vDSO's check.
 - vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `may_ptrace`, `CAP_SYSLOG`),
-  `appine_hal` (clocks, `adjtimex` query), procfs (`debug.exception-trace` through
+  `appine_hal` (clocks, `adjtimex` query, `host_vdso`, `timezone`), procfs (`debug.exception-trace` through
   `recorded_value`, ` (deleted)` names through `mark_deleted`, `comm_str` for a path's first
   caller).
 
@@ -367,6 +400,10 @@ procfs.
 - `SIGKILL` and `SIGSTOP` can never be blocked, caught or ignored; `SA_IMMUTABLE` actions skip
   ptrace signal-delivery stops.
 - The sigreturn trampoline's bytes are part of the ABI and must not change.
+- The host's vDSO code is run unchanged except for its symbols and notes: the engine must execute
+  whatever the host kernel put there (alternatives such as ECV's counter included), which the
+  check at first use guards; the time-namespace detection relies on the clock mode being the
+  second word of the host's vvar data (Linux 5.6 on).
 - The tracer works on the saved register copy; changes made directly to the CPU state during a
   stop would be overwritten on resume.
 - Only threads calling `exit`/`exit_group` or taking the fatal signal report

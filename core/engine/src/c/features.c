@@ -27,9 +27,11 @@
 /* The ones not using native instruction stubs: for FlagM and FlagM2 the interpreter computes the
  * flags, SB and DC CVAP, DC CVADP need no work in the interpreter, and DIT is kept in the cpu;
  * Tier 1 copies CFINV, AXFLAG, XAFLAG, RMIF, SETF and SB verbatim, and the host thread's DIT
- * follows the guest's (appine_sync_dit), so the host must have them too */
+ * follows the guest's (appine_sync_dit), so the host must have them too. ECV's self-synchronized
+ * counter (CNTVCTSS_EL0) is read on the host by both tiers: the host's vDSO, which guests run
+ * (the kernel/signal map), reads it instead of CNTVCT_EL0 on hosts that have it */
 #define INTEGER (APPINE_HWCAP_FLAGM | APPINE_HWCAP_SB | APPINE_HWCAP_DCPOP | APPINE_HWCAP_DIT)
-#define INTEGER2 (APPINE_HWCAP2_FLAGM2 | APPINE_HWCAP2_DCPODP)
+#define INTEGER2 (APPINE_HWCAP2_FLAGM2 | APPINE_HWCAP2_DCPODP | APPINE_HWCAP2_ECV)
 
 /* SHA3 and SHA512 are advertised only together, and also need SHA2: LLVM's sha3 feature covers
  * both groups, so the whitelist check cannot tell them apart, and real CPUs always implement them
