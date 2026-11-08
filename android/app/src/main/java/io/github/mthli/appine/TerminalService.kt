@@ -796,7 +796,7 @@ class TerminalService : Service() {
             .setAutoCancel(true)
         if (bug) {
             val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-                .putExtra(EXTRA_REPORT, bugReport(f[4], f[5]))
+                .putExtra(EXTRA_REPORT, bugReport(f[4], f[5], f[6]))
                 .putExtra(EXTRA_NOTIFICATION, id)
             val pending = PendingIntent.getService(
                 this, id, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -809,11 +809,12 @@ class TerminalService : Service() {
     /**
      * The report copied for the user to paste into feedback: the app's version, the device, the
      * distro and the execution tier, plus the kernel layer's report (process, thread, last guest
-     * pc, the panic message and location, the same as the line in `dmesg`), and the kernel log
+     * pc, the panic message and location, the same as the line in `dmesg`), the kernel log
      * entries before it and itself ([log] separated by U+001E, with timestamps as `dmesg` writes
-     * them).
+     * them), and the unimplemented paths the guest reached most since boot ([stubs] separated by
+     * U+001E: what the workload asked for that Appine lacks).
      */
-    private fun bugReport(report: String, log: String): String = buildString {
+    private fun bugReport(report: String, log: String, stubs: String = ""): String = buildString {
         appendLine("Appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
         appendLine(
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
@@ -824,6 +825,10 @@ class TerminalService : Service() {
         if (log.isNotEmpty()) {
             append("\n\nKernel log:\n")
             append(log.split('\u001e').joinToString("\n"))
+        }
+        if (stubs.isNotEmpty()) {
+            append("\n\nUnimplemented paths reached:\n")
+            append(stubs.split('\u001e').joinToString("\n"))
         }
     }
 

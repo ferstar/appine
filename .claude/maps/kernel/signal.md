@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by thread id; signal retargeting; syscall-stop detach; test-suite findings; unwritable frames; zombies, core %d; adjtimex; ptracer credentials; sigaction flags, queued siginfo; vDSO refill; core_pattern access; signalfd; unhandled-exception reports, the ENOSYS list last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: kill by tid; retargeting; syscall-stop detach; suite findings; frames, sigaction flags, siginfo; zombies, core_pattern; adjtimex; ptracer credentials; vDSO refill; signalfd; exception reports; ENOSYS list; unimplemented paths counted last)
 
 ## Responsibilities
 
@@ -19,14 +19,15 @@ user-visible ABI contract:
 - ptrace (tracer and tracee sides) and `process_vm_readv/writev`;
 - core dumps;
 - the kernel log (`/dev/kmsg`, `syslog(2)`, `/proc/kmsg`);
-- the kernel-version contract, the `ENOSYS` policy for unimplemented syscalls, and refusing guest
-  clock changes.
+- the kernel-version contract, the `ENOSYS` policy for unimplemented syscalls, counting the paths
+  the kernel layer does not implement, and refusing guest clock changes.
 
 Root: `core/kernel/src/signal.rs`, `syscall/sig.rs`, `vdso.rs`, `ptrace.rs`, `syscall/ptrace.rs`,
 `coredump.rs`, `klog.rs`, signalfd (in `fd.rs`/`syscall/sig.rs`), and in `syscall/misc.rs`:
 `uname`, `syslog`, `adjtimex`, clock setting, `restart_syscall`; the dispatcher's restart and
-unimplemented-syscall handling in `syscall/mod.rs`; the fault-to-signal branch of the run loop in
-`task.rs`.
+unimplemented-syscall handling in `syscall/mod.rs`; `stub.rs`, which counts unimplemented paths
+(the default arms calling it stay with their modules); the fault-to-signal branch of the run loop
+in `task.rs`.
 
 Outside the module: waking and namespace translation (`kernel/process`), CPU state, kicks and the
 host fault guard (`engine`), page-fault classification (`kernel/mm`), seccomp (with credentials),
@@ -51,6 +52,11 @@ procfs.
 - `TraceExit`, `leader_tracer`, `exit_tracer` — tracee exits held back for the tracer.
 - `coredump::ThreadCore`, `CoreWriter` — per-thread state collected for a core file, and its writer.
 - `klog::Klog`, `Record`, `KmsgFile` — the ring buffer, its records, one `/dev/kmsg` open.
+- `stub::Stub` — an unimplemented path with the value that reached it (syscall number, prctl
+  option, fcntl command, ioctl request with the kind of file, madvise advice, futex command, a
+  missing name's path, a device without a driver); `stub::Stubs` — the kernel's table of them
+  (`Kernel::stubs`, in a cell so procfs views can record): count and first caller's comm per path,
+  in first-hit order.
 
 ## Public entry points
 
@@ -69,6 +75,8 @@ procfs.
   run loop and rt_sigreturn.
 - **ABI**: `uname`, `/proc/version`, `/proc/sys/kernel/{osrelease,version,ostype}`, the
   dispatcher's default arm, `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
+- **Unimplemented paths**: `stub::hit` and `stub::ioctl` from default arms, `stub::record` from
+  procfs views; `stub::top` for kernel-bug kill reports.
 
 ## Data flow / lifecycle
 
@@ -295,7 +303,7 @@ procfs.
   relaxations (6.2); code comments also follow newer kernels for `RWF_NOAPPEND` (6.9) and the
   generic-netlink `nlctrl` replies (6.8).
 - Unimplemented syscalls (including io_uring) return `ENOSYS` from the dispatcher's default arm and
-  never crash; with `APPINE_LOG=1` a local debug line is written to the host's stderr. The list of
+  never crash; each is counted as an unimplemented path (below). The list of
   `ENOSYS` numbers is kept in round 139 (`docs/rounds/139-unimplemented-syscalls.md`), less
   process_mrelease (448), implemented since (`kernel/mm`).
 - The guest cannot change host time: `settimeofday` is `EPERM` without reading its arguments;
@@ -303,6 +311,29 @@ procfs.
   other clock; any modifying `adjtimex`/`clock_adjtime` is `EPERM` (as without `CAP_SYS_TIME`);
   queries read the host's NTP state on Linux hosts and report unsynchronized (`STA_UNSYNC`,
   `TIME_ERROR`) on Android.
+
+### Unimplemented paths
+
+- `stub::hit` counts, per kernel, each path the kernel layer does not implement, as Starnix's
+  `track_stub!` and `not_found` do: the dispatcher's default arm (`ENOSYS`; not number -1), prctl
+  options (`EINVAL`; not the options it handles given refused arguments), fcntl commands
+  (`EINVAL`), madvise advice it refuses (`EINVAL`, after the range checks), futex commands
+  (`ENOSYS`), ioctl requests that reach a default arm (`ENOTTY`) with the kind of file (unhandled
+  kinds and host fds not in the passthrough list, terminals, and sockets: requests the interface
+  passthrough does not take, on any family, and those of a new network namespace), names path
+  resolution does not find where Linux would have them (`/proc`, `/sys`, the boot `/dev`; the
+  rules are `kernel/procfs`'s) and device nodes without a driver (`ENXIO`). `stub::ioctl` leaves
+  out requests of type `'T'` on files that are not terminals, which Linux refuses there too,
+  except TIOCOUTQ (SIOCOUTQ) on sockets and FIOQSIZE on regular files and directories. Values no
+  Linux defines are counted like the others.
+- Each path keeps its call count and the comm of its first caller; the table holds 128 paths, and
+  hits of new paths after that are only counted as dropped.
+- With `APPINE_LOG=1` the first hit of each path writes `appine: unimplemented <path>, first by
+  <comm> (pid <pid>)` to the host's stderr (`syscall <nr>` for syscalls).
+- A kernel-bug kill report (`KillReason::Bug::stubs`) carries the 10 most-called paths, ties in
+  first-hit order (`prctl option 0x59616d61: 2 calls, first by gdb`; option tags of 0x10000 and
+  above in hex), and a line counting the rest. Nothing reaches the guest: the kernel log has no
+  such lines.
 
 ## Dependencies (inbound / outbound)
 
@@ -312,7 +343,10 @@ procfs.
   syscall-entry/exit ptrace stops; `orig_x0`; restart handling.
 - Timers, the TTY layer (job-control signals to process groups), process exit (child status),
   seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
-  killer and bug handling (kernel log).
+  killer and bug handling (kernel log; bug kill reports read `stub::top`).
+- Default arms reporting unimplemented paths: prctl and futex (`kernel/process`), fcntl, file
+  ioctls and device opens (`kernel/vfs`), terminal ioctls (`kernel/tty`), socket ioctls
+  (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).
 
 ### Outbound
 
@@ -322,7 +356,8 @@ procfs.
 - `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`.
 - vfs (core files, `/dev/kmsg`), credentials (`may_signal`, `may_ptrace`, `CAP_SYSLOG`),
   `appine_hal` (clocks, `adjtimex` query), procfs (`debug.exception-trace` through
-  `recorded_value`, ` (deleted)` names through `mark_deleted`).
+  `recorded_value`, ` (deleted)` names through `mark_deleted`, `comm_str` for a path's first
+  caller).
 
 ## Invariants and gotchas
 

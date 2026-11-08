@@ -8,8 +8,10 @@
 # run by the guest's /bin/sh (stdin is /dev/null), with APPINE_LOG=1. stdout is written to
 # target/survey/<name>.out and stderr (including the kernel layer's logs) to <name>.err; at the end
 # there is one line per workload: the exit code, the time, the number of internal errors reported by
-# the kernel layer (kernel bugs, kernel objects borrowed while the BKL is released) and the
-# unimplemented syscalls.
+# the kernel layer (kernel bugs, kernel objects borrowed while the BKL is released), the
+# unimplemented syscalls and the other unimplemented paths reached (prctl options, fcntl commands,
+# ioctl requests, madvise advice, futex commands, names missing under /proc, /sys and /dev, devices
+# without a driver; core/kernel/src/stub.rs).
 # The output is for people to read: the script only prints results and does not compare with native.
 # Without names, everything under tests/survey/ runs. Each workload runs for at most SURVEY_TIMEOUT
 # seconds (1500 by default).
@@ -124,9 +126,12 @@ for name in "$@"; do
         <"tests/survey/$name.sh" >"$out/$name.out" 2>"$out/$name.err"
     code=$?
     set -e
-    enosys=$(sed -n 's/^appine: unimplemented syscall //p' "$out/$name.err" | sort -nu | tr '\n' ' ')
+    # The kernel layer writes one line the first time each path is reached
+    paths=$(sed -n 's/^appine: unimplemented \(.*\), first by .*/\1/p' "$out/$name.err")
+    enosys=$(printf '%s\n' "$paths" | sed -n 's/^syscall //p' | sort -nu | tr '\n' ' ')
+    stubs=$(printf '%s\n' "$paths" | grep -v '^syscall ' | grep . | sort -u | paste -sd ';' - || true)
     bugs=$(grep -c '^appine: internal error' "$out/$name.err" || true)
     [ "$bugs" != 0 ] || bugs=""
-    printf '%-10s exit %-3s %4ss  %s%s\n' "$name" "$code" "$(($(date +%s) - start))" \
-        "${bugs:+INTERNAL ERRORS: $bugs  }" "${enosys:+ENOSYS: $enosys}"
+    printf '%-10s exit %-3s %4ss  %s%s%s\n' "$name" "$code" "$(($(date +%s) - start))" \
+        "${bugs:+INTERNAL ERRORS: $bugs  }" "${enosys:+ENOSYS: $enosys }" "${stubs:+UNIMPLEMENTED: $stubs}"
 done

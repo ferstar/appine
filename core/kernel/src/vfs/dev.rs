@@ -52,6 +52,12 @@ pub const fn rdev(major: u32, minor: u32) -> u64 {
     ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u64
 }
 
+/// Splits a device number in Linux's encoding into major and minor (`new_decode_dev`).
+pub const fn split_rdev(rdev_value: u64) -> (u32, u32) {
+    let r = rdev_value as u32;
+    ((r & 0xfff00) >> 8, (r & 0xff) | ((r >> 12) & 0xfff00))
+}
+
 /// The block major of loop devices.
 pub const LOOP_MAJOR: u32 = 7;
 /// `/dev/loop-control`'s device number (misc 10:237).

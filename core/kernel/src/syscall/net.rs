@@ -3267,7 +3267,10 @@ fn netns_ioctl(
         {
             Err(Errno::EPERM)
         }
-        None => Err(Errno::ENOTTY),
+        None => {
+            crate::stub::ioctl(cx, request, "socket");
+            Err(Errno::ENOTTY)
+        }
     }
 }
 
@@ -3340,7 +3343,10 @@ fn interface_ioctl(cx: &mut Cx<'_>, host_fd: i32, request: u32, arg: u64) -> Sys
                 .write(UserSlice::new(guest_buf + got as u64, n), &extra[..n])?;
             put(cx, arg, ((got + n) as i32).to_le_bytes()).map(|()| 0)
         }
-        _ => Err(Errno::ENOTTY),
+        _ => {
+            crate::stub::ioctl(cx, request, "socket");
+            Err(Errno::ENOTTY)
+        }
     }
 }
 

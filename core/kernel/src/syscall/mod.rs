@@ -522,7 +522,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
         449 => misc::futex_waitv(cx, a[0], a[1] as u32, a[2] as u32, a[3], a[4] as i32),
         451 => fs::cachestat(cx, a[0] as i32, a[1], a[2], a[3] as u32),
         _ => {
-            debug::unimplemented_syscall(nr);
+            // -1 from the program itself is ENOSYS on Linux too
+            if nr != NO_SYSCALL {
+                crate::stub::hit(cx, crate::stub::Stub::Syscall(nr));
+            }
             Err(Errno::ENOSYS)
         }
     };

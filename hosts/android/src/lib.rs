@@ -1015,9 +1015,10 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeListens<'l>(
 
 /// Takes the guest processes the kernel layer ended (kernel bug, engine fault, OOM killer): each
 /// entry is `<console or -1>\t<pid>\t<process name>\t<bug|oom>\t<a>\t<b>\t<c>`; for bug, a is the
-/// report and b the last few lines of the kernel log (separated by U+001E); for oom, a is the
-/// cgroup (empty for the app's limit), b and c the usage and the limit (bytes). Newlines, tabs and
-/// U+001E inside the fields are replaced by spaces.
+/// report, b the last few lines of the kernel log and c the unimplemented paths the guest reached
+/// most (both separated by U+001E); for oom, a is the cgroup (empty for the app's limit), b and c
+/// the usage and the limit (bytes). Newlines, tabs and U+001E inside the fields are replaced by
+/// spaces.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
     mut env: JNIEnv<'l>,
@@ -1035,9 +1036,15 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_takeKills<'l>(
         for (i, k) in kills.iter().enumerate() {
             let console = k.console.map_or(-1, i64::from);
             let tail = match &k.reason {
-                appine_kernel::KillReason::Bug { report, log } => {
-                    let log: Vec<String> = log.iter().map(|l| clean(l)).collect();
-                    format!("bug\t{}\t{}\t", clean(report), log.join("\u{1e}"))
+                appine_kernel::KillReason::Bug { report, log, stubs } => {
+                    let join = |lines: &[String]| {
+                        lines
+                            .iter()
+                            .map(|l| clean(l))
+                            .collect::<Vec<_>>()
+                            .join("\u{1e}")
+                    };
+                    format!("bug\t{}\t{}\t{}", clean(report), join(log), join(stubs))
                 }
                 appine_kernel::KillReason::OutOfMemory {
                     cgroup,

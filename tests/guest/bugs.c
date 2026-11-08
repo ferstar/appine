@@ -9,6 +9,7 @@
  * tests): host-call-then-exit exits after planting it, host-call-then-read reads stdin after
  * planting it.
  */
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -108,6 +109,15 @@ int main(int argc, char **argv)
             read(0, &c, 1);
         }
         return 0;
+    }
+
+    /*
+     * The kernel layer counts the paths it does not implement, and the reports of the bugs below
+     * carry them (crate::stub): a prctl option no Linux defines, asked twice
+     */
+    for (int i = 0; i < 2; i++) {
+        if (syscall(SYS_prctl, 0x7fff0000, 0, 0, 0, 0) != -1 || errno != EINVAL)
+            fail("an unknown prctl option is EINVAL");
     }
 
     pid_t pid = fork();

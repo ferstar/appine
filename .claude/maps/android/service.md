@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; robust start, exit and tab saving; tab names removed; kill reports; the app named Appine; resumed imports; auto tabs saved as their account; rootless containers file last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; robust start, exit and tab saving; tab names removed; kill reports; the app named Appine; resumed imports; auto tabs saved as their account; containers file; unimplemented paths in bug reports last)
 
 ## Responsibilities
 
@@ -164,7 +164,9 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   while it is visible (another tab or Settings in front does not count), and always for an Appine
   bug. Bugs always notify with "copy report": app version
   and build, device (Android release and API, maker and model, ABI, page size), distro and tier
-  (always 1 in a release build), the kernel's report line, and up to 10 earlier kernel log records.
+  (always 1 in a release build), the kernel's report line, up to 10 earlier kernel log records, and
+  under "Unimplemented paths reached" the 10 the guest reached most since boot, with a line for the
+  rest (the kill line's last field, `kernel/signal`).
 - Crashes of the last run: a crash (Java or native) or ANR record of the killed run posts "Appine
   crashed" or "Appine stopped responding" with "copy report": the bug report's app, device, distro
   and tier lines and one line with the pid, the kind (with the signal for a native crash), the time

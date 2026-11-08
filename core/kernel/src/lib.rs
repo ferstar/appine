@@ -44,6 +44,7 @@ mod rawicmp;
 mod route;
 mod seccomp;
 mod signal;
+mod stub;
 mod syscall;
 mod task;
 mod terminal;

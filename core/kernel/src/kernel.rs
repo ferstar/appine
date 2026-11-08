@@ -256,6 +256,9 @@ pub(crate) struct Kernel {
     /// Guest processes the kernel layer ended (kernel bugs, host faults in the engine, the OOM
     /// killer), waiting for the app to take them ([`crate::Machine::take_kills`]).
     pub kills: RefCell<Vec<crate::bug::KillReport>>,
+    /// The paths the kernel layer does not implement that the guest has reached ([`crate::stub`]);
+    /// in a cell, since procfs lookups record them through a shared view.
+    pub stubs: RefCell<crate::stub::Stubs>,
     /// Groups in which address spaces of the same program share Tier 1 translations
     /// ([`crate::mm::CodeGroup`]).
     pub code_groups: crate::mm::CodeGroups,
@@ -392,6 +395,7 @@ impl Kernel {
             stopping: false,
             klog: Default::default(),
             kills: Default::default(),
+            stubs: Default::default(),
             pipe_max_size: crate::pipe::PIPE_MAX_SIZE,
             nr_open: crate::fd::MAX_FDS,
             mount_max: 100_000,

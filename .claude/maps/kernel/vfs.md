@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode; AIO; `/proc/locks` last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: open, I/O and sync flags; locks; owners and file caps; loop devices; timerfd clocks; test-suite findings; mounts and propagation; splice; holes, seeks, renames; overlayfs; timerfd mode; AIO; `/proc/locks`; FIONREAD on regular files, misses and driverless devices counted last)
 
 ## Responsibilities
 
@@ -44,7 +44,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   nodes. `Node::ino` is None for overlay nodes. `Dentry = (Node, name)` is where a result was last
   found.
 - `Pseudo` trait — what a synthetic filesystem offers the walker: lookup, parent, name, readlink,
-  `follow`/`follow_dentry` (magic-link jumps), `magic`, `protected_symlinks`.
+  `follow`/`follow_dentry` (magic-link jumps), `magic`, `protected_symlinks`, and `missing` (told
+  of each name resolution did not find).
 - `resolve` — openat2's `RESOLVE_*` bits; `SCOPED = BENEATH | IN_ROOT`.
 - `Vfs` — the store handle, the mount table, the no-BKL resolver state and the overlay table.
 - `Mount` — id, namespace, filesystem, root node, mount point (`None` for a tree root or an
@@ -139,7 +140,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE`); `.` is skipped; `..` follows Linux's
   `follow_dotdot` (stays at the process root, climbs stacked mount points at a mount root, takes
   the parent, enters anything mounted there; a namespace-tree root or detached root stays put);
-  other names are looked up and then lifted to the topmost mount stacked on the result.
+  other names are looked up and then lifted to the topmost mount stacked on the result; a name not
+  found (`ENOENT`) is passed to `Pseudo::missing` first, so the procfs view counts the names
+  Linux would have under `/proc`, `/sys` and the boot `/dev` (`kernel/signal`'s unimplemented
+  paths).
 - Symlinks (intermediate, or last with `follow`): over 40 is `ELOOP`; `protected_symlinks`
   (default on) applies to the last component of store links only (`EACCES`); `NO_SYMLINKS` or a
   nosymfollow mount is `ELOOP`. Magic links (`/proc/<pid>/fd/*`, `cwd`, `root`, `exe`, `ns/*`)
@@ -402,6 +406,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `F_SETSIG`, pipe size and seals are also handled in fcntl.
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
+- ioctl: `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`, the clone and dedupe requests, socket
+  owners and then `FIONREAD` on regular inodes (store and tmpfs files, procfs, sysfs and nsfs
+  files, message queues: the size stat reports less the position, as an int, negative past the
+  end, as Linux's `do_vfs_ioctl`) come before dispatch by kind (nsfs, seccomp listeners,
+  terminals, sockets, loop devices, pipe and inotify `FIONREAD`, the random device); host fds pass
+  only the termios and window-size requests and `FIONREAD` to the host. Every other request is
+  `ENOTTY`, counted as an unimplemented path unless Linux refuses it on that kind of file too.
 
 ### Opening
 
@@ -610,7 +621,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Opening dispatches by device number for any node anywhere (unless nodev): 5:0 and 5:1 the
   caller's controlling terminal, 5:2 the ptmx of the devpts next to the node, major 136 a boot
   devpts slave, 1:3/5/7/8/9/11 `Device`, 10:237 loop-control; block 7:N the loop device N (created
-  if missing, like Linux's legacy autoload); anything else `ENXIO`.
+  if missing, like Linux's legacy autoload); anything else `ENXIO`, counted as an unimplemented
+  path (char or block, major:minor).
 - `/dev/zero`, `/dev/full` and the random devices fill the whole buffer per read; randomness
   comes from the host `/dev/urandom` and never blocks (entropy count fixed at 256; the random
   ioctls follow 6.1's `random_ioctl`).
@@ -765,7 +777,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   poll, lseek, fsync, `copy_file`, `statvfs`, `memory_info`, `fill_random`); the kernel's wake
   objects and `Cx::unlocked`; signals (`SIGPIPE`, `SIGIO`, `F_SETSIG`); `bpf::check_device`;
   `kernel/ipc` (mqueue objects); `cgroup`; `pidns`/`nsproxy`; for AIO, `kernel/poll` (`poll_once`,
-  `wait_aio_polls`, `watch_aio_poll`, the temporary sigmask) and `kernel/mm` (the context page).
+  `wait_aio_polls`, `watch_aio_poll`, the temporary sigmask) and `kernel/mm` (the context page);
+  `kernel/signal`'s `stub` for unimplemented fcntl commands, ioctl requests and devices.
 
 ## Invariants and gotchas
 

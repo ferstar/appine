@@ -157,7 +157,10 @@ pub(super) fn futex(
             let n = futexes.requeue(key, val, key2, timeout as u32);
             Ok(n as u64)
         }
-        _ => Err(Errno::ENOSYS),
+        _ => {
+            crate::stub::hit(cx, crate::stub::Stub::Futex(cmd));
+            Err(Errno::ENOSYS)
+        }
     }
 }
 
@@ -1198,7 +1201,13 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
                 _ => Err(Errno::ENODEV),
             }
         }
-        _ => Err(Errno::EINVAL),
+        // Options handled above whose arguments were refused
+        PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_KEEPCAPS | PR_CAPBSET_READ
+        | PR_CAPBSET_DROP | PR_SET_TIMING => Err(Errno::EINVAL),
+        _ => {
+            crate::stub::hit(cx, crate::stub::Stub::Prctl(option));
+            Err(Errno::EINVAL)
+        }
     }
 }
 

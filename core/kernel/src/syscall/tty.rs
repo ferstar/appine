@@ -817,7 +817,10 @@ pub(crate) fn ioctl(
             }
             Ok(0)
         }
-        _ => Err(Errno::ENOTTY),
+        _ => {
+            crate::stub::ioctl(cx, request, crate::stub::TERMINAL);
+            Err(Errno::ENOTTY)
+        }
     }
 }
 

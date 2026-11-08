@@ -4,7 +4,7 @@
 # PR_SET_PDEATHSIG and __WNOTHREAD, short symlinks, /proc/<pid>/exe pointing at the program file
 # itself, DIT across signals, fork, execve and ptrace, a fixed btime in /proc/stat, POSIX locks
 # across execve and close_range, O_SYNC and O_DSYNC kept at open, chown(-1, -1) of set-id files,
-# /proc/<tid> of a thread that is not the main one
+# /proc/<tid> of a thread that is not the main one, FIONREAD on regular files
 set -e
 cd /tmp
 # raw ICMP sockets (Appine emulates them with ping sockets on the host): data received on IPv4
@@ -1725,3 +1725,46 @@ print("after the thread exits:", os.path.exists(d))
 PY
 python3 tids.py
 rm -f tids.py
+
+# FIONREAD on regular files (Linux's do_vfs_ioctl, for every S_IFREG inode): the size less the
+# position, negative past the end; procfs files have size 0 and sysfs attributes one page; a
+# directory and a character device answer ENOTTY
+python3 - <<'PY'
+import array, errno, fcntl, os, termios
+
+def fionread(fd):
+    n = array.array("i", [0])
+    try:
+        fcntl.ioctl(fd, termios.FIONREAD, n)
+        return n[0]
+    except OSError as e:
+        return errno.errorcode[e.errno]
+
+with open("/tmp/fionread", "wb") as f:
+    f.write(b"x" * 1000)
+fd = os.open("/tmp/fionread", os.O_RDONLY)
+print("regular file:", fionread(fd))
+os.read(fd, 100)
+print("after reading 100:", fionread(fd))
+os.lseek(fd, 3000, os.SEEK_SET)
+print("past the end:", fionread(fd))
+os.close(fd)
+os.unlink("/tmp/fionread")
+fd = os.memfd_create("fionread")
+os.write(fd, b"0123456789")
+print("memfd at its end:", fionread(fd))
+os.lseek(fd, 4, os.SEEK_SET)
+print("memfd at 4:", fionread(fd))
+os.close(fd)
+fd = os.open("/proc/self/status", os.O_RDONLY)
+os.read(fd, 10)
+print("procfs file after reading 10:", fionread(fd))
+os.close(fd)
+fd = os.open("/sys/devices/system/cpu/online", os.O_RDONLY)
+print("sysfs file:", fionread(fd))
+os.close(fd)
+for path in ["/tmp", "/dev/null"]:
+    fd = os.open(path, os.O_RDONLY)
+    print(path, fionread(fd))
+    os.close(fd)
+PY

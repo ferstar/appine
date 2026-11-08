@@ -47,14 +47,8 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-/// Records an unimplemented syscall, as input for deciding which syscalls to add next.
-pub(crate) fn unimplemented_syscall(nr: u64) {
-    if enabled() {
-        eprintln!("appine: unimplemented syscall {nr}");
-    }
-}
-
-/// Records one debug log line.
+/// Records one debug log line (unimplemented paths reached for the first time among them,
+/// [`crate::stub`]).
 pub(crate) fn log(args: fmt::Arguments<'_>) {
     if enabled() {
         eprintln!("appine: {args}");

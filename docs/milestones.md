@@ -251,6 +251,8 @@ In `gvisor-process`, Appine's side of `ExecTest.ExecuteOnlySpecialFiles` fails i
 
 In `gvisor-fs`, the native side of `PtyTest.TCFLSHWakesReplicaPolloutAfterMasterInputFlush` failed once on 2026-11-08 while four groups ran in parallel (`-j 4`), and passed when the group was rerun alone; it waits for a replica's `POLLOUT` after the master flushes its input, and was presumably slowed by the load. The cause was not investigated.
 
+In `starnix-io`, the native side of `Pty.EchoModes` failed once on 2026-11-08 in a full run with four lanes (`-j 4`), while Appine's side passed, and the group passed when rerun alone. The cause was not investigated.
+
 
 ## R1 measurements
 

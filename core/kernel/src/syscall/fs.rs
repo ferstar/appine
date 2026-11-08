@@ -113,9 +113,9 @@ const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 /// Device number of the PTY master device (`/dev/ptmx`).
 const PTMX_RDEV: u64 = rdev(5, 2);
 
-/// ioctls that can be passed through to the host terminal: number, argument size, whether the
-/// argument is an output.
-const TTY_IOCTLS: [(u32, usize, bool); 14] = [
+/// ioctls that can be passed through to a host fd (the terminal, or the pipe or file `appine-run`
+/// was given): number, argument size, whether the argument is an output.
+const HOST_IOCTLS: [(u32, usize, bool); 15] = [
     (0x5401, 36, true),       // TCGETS
     (0x5402, 36, false),      // TCSETS
     (0x5403, 36, false),      // TCSETSW
@@ -130,6 +130,7 @@ const TTY_IOCTLS: [(u32, usize, bool); 14] = [
     (0x402c_542b, 44, false), // TCSETS2
     (0x402c_542c, 44, false), // TCSETSW2
     (0x402c_542d, 44, false), // TCSETSF2
+    (FIONREAD, 4, true),
 ];
 const FIONREAD: u32 = 0x541b;
 const RNDGETENTCNT: u32 = 0x8004_5200;
@@ -1240,7 +1241,13 @@ fn open_store(
                     tty::open_slave(cx, at, flags)?
                 }
                 None => {
-                    let dev = dev::open(store, ino)?;
+                    // A character device without a driver (Linux's `chrdev_open`)
+                    let dev = dev::open(store, ino).inspect_err(|&e| {
+                        if e == Errno::ENXIO {
+                            let (major, minor) = dev::split_rdev(r);
+                            crate::stub::hit(cx, crate::stub::Stub::Device(false, major, minor));
+                        }
+                    })?;
                     let kmsg = match dev {
                         Device::Kmsg => Some(open_kmsg(cx, accmode)?),
                         _ => None,
@@ -1694,7 +1701,10 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             *cx.k().seals.get_mut(&ino).unwrap() |= add;
             Ok(0)
         }
-        _ => Err(Errno::EINVAL),
+        _ => {
+            crate::stub::hit(cx, crate::stub::Stub::Fcntl(cmd));
+            Err(Errno::EINVAL)
+        }
     }
 }
 
@@ -2033,6 +2043,18 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             let pid = if pid < 0 { -local } else { local };
             return put(cx, arg, pid.to_le_bytes()).map(|()| 0);
         }
+        // Before the file's own ioctls, as in Linux's do_vfs_ioctl: every regular inode answers,
+        // in the store and tmpfs, procfs, sysfs and nsfs, and message queues
+        FIONREAD
+            if matches!(
+                file.borrow().kind,
+                FileKind::Regular { .. } | FileKind::Proc { .. } | FileKind::MessageQueue(_)
+            ) =>
+        {
+            if let Some(n) = unread(cx, &file)? {
+                return put(cx, arg, n.to_le_bytes()).map(|()| 0);
+            }
+        }
         _ => {}
     }
     let ns = match &file.borrow().kind {
@@ -2097,9 +2119,13 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
             dev: Device::Random,
             ..
         } => return random_ioctl(cx, request, arg),
-        _ => return Err(Errno::ENOTTY),
+        kind => {
+            crate::stub::ioctl(cx, request, crate::stub::file_kind(kind));
+            return Err(Errno::ENOTTY);
+        }
     };
-    let Some(&(_, size, out)) = TTY_IOCTLS.iter().find(|(r, ..)| *r == request) else {
+    let Some(&(_, size, out)) = HOST_IOCTLS.iter().find(|(r, ..)| *r == request) else {
+        crate::stub::ioctl(cx, request, "host file");
         return Err(Errno::ENOTTY);
     };
     let mut buf = vec![0u8; size];
@@ -2111,6 +2137,20 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, fd: i32, request: u32, arg: u64) -> SysResu
         cx.mm().write(UserSlice::new(arg, size), &buf)?;
     }
     Ok(rc as u64)
+}
+
+/// FIONREAD on a regular file (Linux's `do_vfs_ioctl`): the size as stat reports it less the file
+/// position, as an int (negative past the end, cut to 32 bits as Linux's `put_user` into an int
+/// cuts it); None when the file is not regular.
+fn unread(cx: &Cx<'_>, file: &FileRef) -> Result<Option<i32>, Errno> {
+    // asm-generic's struct stat: st_mode at 16, st_size at 48 (encode_stat)
+    let st = file_stat(cx, file)?;
+    let mode = u32::from_le_bytes(st[16..20].try_into().unwrap());
+    if mode & mode::S_IFMT != mode::S_IFREG {
+        return Ok(None);
+    }
+    let size = i64::from_le_bytes(st[48..56].try_into().unwrap());
+    Ok(Some(size.wrapping_sub(file.borrow().pos as i64) as i32))
 }
 
 /// The open file of an ioctl fd or FICLONE's source fd: as with Linux's `fdget`, files opened

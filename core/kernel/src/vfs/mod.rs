@@ -386,6 +386,9 @@ pub(crate) trait Pseudo {
     fn protected_symlinks(&self) -> bool {
         false
     }
+    /// Path resolution found no `name` in directory `dir` (ENOENT): the view counts the names
+    /// Linux would have as unimplemented paths ([`crate::stub`]).
+    fn missing(&self, _dir: &Node, _name: &[u8]) {}
 }
 
 /// The `resolve` of openat2's `struct open_how` (Linux's `RESOLVE_*`, matching path
@@ -1058,7 +1061,13 @@ impl Vfs {
                 found = None;
                 continue;
             }
-            let node = self.lookup(ps, &dir, &comp)?;
+            let node = match self.lookup(ps, &dir, &comp) {
+                Err(e) if e == Errno::ENOENT => {
+                    ps.missing(&dir, &comp);
+                    return Err(e);
+                }
+                r => r?,
+            };
             // Something is mounted on the name: enter that mount (traverse_mounts)
             if flags & resolve::NO_XDEV != 0 && node.mnt() != dir.mnt() {
                 return Err(Errno::EXDEV);

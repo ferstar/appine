@@ -1348,6 +1348,13 @@ impl Pseudo for View<'_> {
         found.ok_or(Errno::ENOENT)
     }
 
+    fn missing(&self, dir: &Node, name: &[u8]) {
+        if let Some(path) = self.missing_path(dir, name) {
+            let task = self.k.tasks.get(&self.tid).map(|t| &**t);
+            crate::stub::record(self.k, task, self.tgid, crate::stub::Stub::Missing(path));
+        }
+    }
+
     fn kind(&self, node: &PseudoNode) -> Result<u32, Errno> {
         use PseudoNode::*;
         Ok(match node {
@@ -1573,6 +1580,70 @@ impl Pseudo for View<'_> {
 }
 
 impl View<'_> {
+    /// The path counted as unimplemented when path resolution finds no `name` in `dir`
+    /// ([`Pseudo::missing`], Starnix's `not_found`): names Linux would have in the fixed parts of
+    /// procfs and sysfs and in the `/dev` mounted at boot, with the numbers of processes, threads,
+    /// CPUs, interfaces and loop devices replaced by placeholders. None where the absence is a
+    /// fact rather than a gap: a process, thread, fd, terminal, message queue, cgroup, interface,
+    /// CPU or loop device that does not exist, the files of a process that has gone, anything
+    /// under a cgroup (the root and the other cgroups have different files) or outside these
+    /// filesystems.
+    fn missing_path(&self, dir: &Node, name: &[u8]) -> Option<String> {
+        use PseudoNode::*;
+        let numbered = |prefix: &[u8]| {
+            name.strip_prefix(prefix)
+                .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))
+        };
+        let pid_dir = |tid: Option<Tid>| match tid {
+            Some(_) => "/proc/<pid>/task/<tid>",
+            None => "/proc/<pid>",
+        };
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let name_text = text(name);
+        let node = match dir {
+            Node::Store(mnt, _) => {
+                let dev = *mnt == crate::vfs::DEV_MOUNT
+                    && self.vfs.mount_root(dir) == Some(crate::vfs::DEV_MOUNT);
+                return dev.then(|| format!("/dev/{name_text}"));
+            }
+            Node::Pseudo(_, p) => p,
+            Node::Overlay(..) => return None,
+        };
+        Some(match node {
+            ProcRoot if numbered(b"") => return None,
+            ProcRoot => format!("/proc/{name_text}"),
+            // Interfaces
+            Static(path) if *path == NET_CONF4 || *path == NET_CONF6 => return None,
+            Static(path) => format!("/proc/{}{name_text}", text(path)),
+            NetConf(v6, _, b"") => {
+                let v = if *v6 { 6 } else { 4 };
+                format!("/proc/sys/net/ipv{v}/conf/<interface>/{name_text}")
+            }
+            Pid(pid, tid) if self.pid_exists(*pid, *tid) => {
+                format!("{}/{name_text}", pid_dir(*tid))
+            }
+            Entry(pid, tid, self::Entry::Net) if self.pid_exists(*pid, *tid) => {
+                format!("{}/net/{name_text}", pid_dir(*tid))
+            }
+            Entry(pid, tid, self::Entry::Ns) if self.pid_exists(*pid, *tid) => {
+                format!("{}/ns/{name_text}", pid_dir(*tid))
+            }
+            SysRoot => format!("/sys/{name_text}"),
+            // Interfaces, loop devices, CPUs
+            Sys(path) if *path == SYS_NET_DIR || *path == SYS_BLOCK_DIR => return None,
+            Sys(path) if *path == SYS_CPU_DIR && numbered(b"cpu") => return None,
+            Sys(path) => format!("/sys/{}{name_text}", text(path)),
+            SysCpu(_, path) => {
+                format!("/sys/devices/system/cpu/cpu<n>/{}{name_text}", text(path))
+            }
+            // Bridge ports
+            SysNet(_, b"brif/") => return None,
+            SysNet(_, path) => format!("/sys/class/net/<interface>/{}{name_text}", text(path)),
+            SysBlock(_, path) => format!("/sys/block/loop<n>/{}{name_text}", text(path)),
+            _ => return None,
+        })
+    }
+
     /// Whether the reader may look at the root directory, current directory, program file and
     /// namespaces of process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
     fn may_read(&self, pid: Tid) -> bool {

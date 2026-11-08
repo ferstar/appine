@@ -21,7 +21,7 @@ use crate::cred::cap;
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, oflags};
 use crate::kernel::Cx;
-use crate::vfs::dev::{DISK_GID, Device, LOOP_MAJOR, LOOP_MIN_COUNT, rdev};
+use crate::vfs::dev::{DISK_GID, Device, LOOP_MAJOR, LOOP_MIN_COUNT, rdev, split_rdev as split};
 use crate::vfs::store::{Ino, mode};
 use crate::vfs::{DEV_MOUNT, Node};
 
@@ -104,7 +104,12 @@ pub(super) fn open(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let (major, minor) = split(rdev_value);
-    if major != LOOP_MAJOR || minor >= MAX_DEVICES {
+    // Block devices other than loop devices have no driver (Linux's `blkdev_get_no_open`)
+    if major != LOOP_MAJOR {
+        crate::stub::hit(cx, crate::stub::Stub::Device(true, major, minor));
+        return Err(Errno::ENXIO);
+    }
+    if minor >= MAX_DEVICES {
         return Err(Errno::ENXIO);
     }
     let dev = match cx.kr().loops.devices.get(&minor) {
@@ -973,12 +978,6 @@ fn valid_block_size(size: u32) -> Result<(), Errno> {
     } else {
         Err(Errno::EINVAL)
     }
-}
-
-/// Splits a device number in Linux's encoding into major and minor.
-fn split(rdev_value: u64) -> (u32, u32) {
-    let r = rdev_value as u32;
-    ((r & 0xfff00) >> 8, (r & 0xff) | ((r >> 12) & 0xfff00))
 }
 
 /// `struct loop_info` (old) and `struct loop_info64` on arm64.

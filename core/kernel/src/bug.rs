@@ -156,8 +156,14 @@ pub enum KillReason {
     /// A kernel-layer or engine bug: `report` is the report line (also written to the kernel log),
     /// and `log` is the few records before it in the kernel log plus itself (as `dmesg` writes
     /// them, one per line): whether there were other bugs, OOMs or guest-written logs before the
-    /// error can then be seen in the report copied for developers.
-    Bug { report: String, log: Vec<String> },
+    /// error can then be seen in the report copied for developers. `stubs` is the paths the kernel
+    /// layer does not implement that the guest reached most often since boot, one per line
+    /// (`prctl option 0x59616d61: 2 calls, first by gdb`, [`crate::stub`]).
+    Bug {
+        report: String,
+        log: Vec<String>,
+        stubs: Vec<String>,
+    },
     /// OOM killer: the app's memory limit (`cgroup` is None) or some cgroup's `memory.max` was not
     /// enough; usage and limit are in bytes.
     OutOfMemory {
@@ -186,7 +192,8 @@ pub(crate) fn kill(k: &Kernel, task: &Task, pc: u64, what: fmt::Arguments<'_>) {
     );
     eprintln!("{report}");
     let log = log(k, &report);
-    record_kill(k, task.tgid, comm, KillReason::Bug { report, log });
+    let stubs = crate::stub::top(k);
+    record_kill(k, task.tgid, comm, KillReason::Bug { report, log, stubs });
     task.killed.set(true);
     segv(k, task.tgid);
 }
@@ -204,7 +211,8 @@ pub(crate) fn kill_process(k: &Kernel, tgid: Tid, what: fmt::Arguments<'_>) {
     );
     eprintln!("{report}");
     let log = log(k, &report);
-    record_kill(k, tgid, comm, KillReason::Bug { report, log });
+    let stubs = crate::stub::top(k);
+    record_kill(k, tgid, comm, KillReason::Bug { report, log, stubs });
     segv(k, tgid);
 }
 

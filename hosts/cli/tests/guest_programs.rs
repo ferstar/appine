@@ -408,11 +408,20 @@ fn host_calls_survive_kernel_bugs() {
             "{tier:?}: {kills:?}"
         );
         // The report carries the kernel log, as `dmesg` writes it: the report itself last, older
-        // records before it (here the report of the previous bug)
+        // records before it (here the report of the previous bug); and the unimplemented paths
+        // the guest reached (crate::stub), here the unknown prctl option it asked for twice
         let reports: Vec<(&str, &[String])> = kills
             .iter()
             .map(|k| match &k.reason {
-                KillReason::Bug { report, log } => (report.as_str(), log.as_slice()),
+                KillReason::Bug { report, log, stubs } => {
+                    assert!(
+                        stubs.contains(
+                            &"prctl option 0x7fff0000: 2 calls, first by guest-bugs".into()
+                        ),
+                        "{tier:?}: {stubs:?}"
+                    );
+                    (report.as_str(), log.as_slice())
+                }
                 other => panic!("{tier:?}: {other:?}"),
             })
             .collect();

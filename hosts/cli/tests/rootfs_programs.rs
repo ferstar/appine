@@ -786,6 +786,49 @@ fn device_nodes_work() {
 }
 
 #[test]
+fn unimplemented_paths_are_logged_once() {
+    // With APPINE_LOG=1 the first hit of each path the kernel layer does not implement is written
+    // to stderr (crate::stub): names Linux would have under /proc, /sys and /dev, with the pid
+    // replaced, and a device without a driver; a process, fd or CPU that does not exist is no gap
+    let Some(store) = store() else {
+        return;
+    };
+    let script = "for i in 1 2; do \
+                  cat /proc/sys/kernel/no_such_sysctl /proc/self/no_such_entry \
+                  /sys/devices/system/cpu/no_such_file /dev/no_such_device /proc/999999/status \
+                  /proc/self/fd/99 /sys/devices/system/cpu/cpu99999/online 2>/dev/null; done; \
+                  mknod /tmp/fuse c 10 229 && cat /tmp/fuse 2>/dev/null; rm -f /tmp/fuse; true";
+    for tier in TIERS {
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .env("APPINE_LOG", "1")
+            .output()
+            .unwrap();
+        assert_ok(tier, &out);
+        let lines: Vec<&str> = stderr(&out)
+            .lines()
+            .filter_map(|l| l.strip_prefix("appine: unimplemented "))
+            .map(|l| l.split(" (pid ").next().unwrap())
+            .collect();
+        for expected in [
+            "missing /proc/sys/kernel/no_such_sysctl, first by cat",
+            "missing /proc/<pid>/no_such_entry, first by cat",
+            "missing /sys/devices/system/cpu/no_such_file, first by cat",
+            "missing /dev/no_such_device, first by cat",
+            "char device 10:229, first by cat",
+        ] {
+            let n = lines.iter().filter(|l| **l == expected).count();
+            assert_eq!(n, 1, "tier {tier}: {expected} in {lines:?}");
+        }
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("status") || l.contains("fd/") || l.contains("cpu9")),
+            "tier {tier}: {lines:?}"
+        );
+    }
+}
+
+#[test]
 fn procfs_describes_processes() {
     for (tier, out) in run(&[
         "/bin/sh",

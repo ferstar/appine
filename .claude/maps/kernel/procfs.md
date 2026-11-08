@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay parameters; exception-trace; oom_score, swaps, locks, task oom files last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: `/proc/net` owners; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access, link modes; cgroups; write opens; block sizes, affinity, bpf rights; `/proc/sys` permissions and IDs; `softirq` line; overlay parameters; exception-trace; oom_score, swaps, locks, task oom files; missing names counted last)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 ## Public entry points
 
 - `Pseudo for View`: `lookup`, `parent`, `name`, `kind`, `readlink`, `follow`, `follow_dentry`,
-  `magic`, `protected_symlinks`.
+  `magic`, `protected_symlinks`, `missing`.
 - `pseudo::stat`, `node_ino`, `ino_of`, `fs_of`, `readdir`, `content`, `writable`, `unreadable`,
   `write`, `written`, `read_pagemap`, `read_mem`, `write_mem`, `describe`, `sockets`,
   `socket_ino`, `pty`.
@@ -95,6 +95,15 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the process's
   euid/egid, or the root of its credentials' user namespace when not dumpable; the entries inside
   `fdinfo/`, `ns/` and `net/`, reopened open files and everything else belong to root.
+- Names path resolution does not find (`View::missing`, Starnix's `not_found`) are counted as
+  unimplemented paths (`kernel/signal`) when Linux would have them: under the procfs root (not
+  numeric names), the fixed `/proc/sys` and `/proc/sysvipc` trees (not interface names in
+  `conf/`), an existing process's or thread's directory and its `net/` and `ns/`, the fixed sysfs
+  tree (not interfaces, loop devices or `cpu<n>` names), and inside a CPU's, interface's (not
+  `brif/`) or loop device's sysfs directory; and at the root of the boot `/dev` tmpfs. Process,
+  thread, CPU, interface and loop numbers become placeholders (`/proc/<pid>/task/<tid>/x`,
+  `/sys/devices/system/cpu/cpu<n>/x`); fds, terminals, message queues, cgroups and the files of
+  a process that has gone are never counted.
   Times are "now" except devpts terminals; directories have nlink 2 (`task/` 2 plus threads);
   sizes are 0 except sysfs and cgroup files (4096).
 
@@ -375,7 +384,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
   `loadavg`, the VFS (`mounts_from`, `reach`, `path_of`, devpts options, the loop devices'
-  `Loops`, `proc_locks` and `fd_locks`), the OOM killer (`proc_score`).
+  `Loops`, `proc_locks` and `fd_locks`), the OOM killer (`proc_score`), unimplemented-path counting
+  (`stub::record`).
 - Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
   `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine
   (`guest_hwcap*`, `guest_midr`).

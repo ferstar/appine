@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files and lock; suite tarballs, skips and leftovers; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; overlay cases; process_mrelease_test last)
+> Maintained: 2026-11-08 (targeted verification only since the full mapping: rust-analyzer; LTP devices, store stamp, skips; difftest case files and lock; suite tarballs, skips and leftovers; Starnix and gVisor cases; image export; CI split; stop signals; survey stores; overlay cases; process_mrelease_test; survey's unimplemented paths last)
 
 ## Responsibilities
 
@@ -226,7 +226,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - `survey` keeps a store with about 40 packages (network needed to build it; one whose creation did
   not finish, marked by `<store>.partial`, is made again); each workload script
   runs under `APPINE_LOG=1` and a timeout, and one line reports exit code, time, the count of
-  internal errors and the unimplemented syscalls seen; `-n image` runs the same scripts in docker
+  internal errors, the unimplemented syscalls seen (`ENOSYS:`) and the other unimplemented paths
+  (`UNIMPLEMENTED:`: prctl, fcntl, ioctl, madvise and futex values, missing names under `/proc`,
+  `/sys` and `/dev`, devices without a driver), read from the kernel's
+  first-hit lines (`appine: unimplemented …`); `-n image` runs the same scripts in docker
   for comparison; with no names only the top-level scripts run (`glibc/`, `suites/`, `ai/` by name;
   `ai/` uses a mock model API). Nothing is judged automatically.
 - `tests/crash` (root in the VM, dm-flakey, loop devices, docker images) runs a write workload in

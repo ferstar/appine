@@ -373,6 +373,7 @@ pub(super) fn madvise(cx: &mut Cx<'_>, addr: u64, len: u64, advice: i32) -> SysR
     // No KSM, transparent huge pages or memory fault injection (MERGEABLE, HUGEPAGE, COLLAPSE,
     // HWPOISON and so on)
     if !matches!(advice, 0..=4 | 8..=11 | 16..=24) {
+        crate::stub::hit(cx, crate::stub::Stub::Madvise(advice));
         return Err(Errno::EINVAL);
     }
     if len == 0 {
