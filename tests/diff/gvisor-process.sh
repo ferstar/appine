@@ -17,15 +17,11 @@ SKIP="$SKIP:$P.ExecvePtraceLockStress"
 # at an attach-time group stop reports the stop again
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
-# kernel/process: PI futex operations are ENOSYS (the untimed waiters of some of them hang)
-F=SharedPrivate/PrivateAndSharedFutexTest
-SKIP="$SKIP:$F.PIBasic/*:$F.PIConcurrency/*:$F.PITryLock/*:$F.PIWaiters/*"
 # kernel/cred: per-thread id changes leak to every thread (a helper thread's setresuid takes root
-# from the main thread, whose cleanup then fails); a shared fs context does not block privilege
-# gains; kernel/cred D2: no ACLs
+# from the main thread, whose cleanup then fails); kernel/cred D2: no ACLs
 SKIP="$SKIP:ExecTest.FileCapsAlreadyHeldKeptWithNoNewPrivs:ExecTest.FileCapsClearAmbient"
 SKIP="$SKIP:ExecTest.FileCapsClearAmbientWithNoNewPrivs:ExecTest.FileCapsNotGainedWithNoNewPrivs"
-SKIP="$SKIP:ExecTest.SUIDExecDoesntGainUIDWithSharedFSContext:ExecTest.ACLExecuteOnlyBinary"
+SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
 # kernel/signal: rt_sigqueueinfo to a zombie is ESRCH
 SKIP="$SKIP:RtSignalTest.InvalidCodes"
 # Hang on both sides until the 60 s timeout (only the timeout would be compared)

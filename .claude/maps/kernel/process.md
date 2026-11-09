@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes last)
 
 ## Responsibilities
 
@@ -69,7 +69,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Waiter — (event, interest channels, optional sorted object list), stored in `Kernel::waiters`.
 - `futex::Key` — `Private{mm, addr, shared}`, `Host(address)` or `File{dev, ino, offset}`;
   `Futexes` — one queue of
-  (id, key, bitset, event) with its own mutex; `Enqueued` — removes its entry on drop.
+  (id, key, bitset, event, and for a `FUTEX_LOCK_PI` waiter a `PiWaiter`: its global tid and
+  the lock's address in its address space) with its own mutex; `Enqueued` — removes its entry on
+  drop.
 
 ### Exec, timers, init, namespaces
 
@@ -178,15 +180,15 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   group status (Linux 6.1 `synchronize_group_exit`).
 - `task::exit` runs in stages, each contained by `bug::catch`: collect statistics and CPU time,
   sample RSS if last, release the address space (robust list, `clear_child_tid` wake when the
-  address space is shared, vfork completion, leave its users), ptrace and seccomp cleanup; when
-  that stage panics, vfork completion and leaving the users run again on their own (both are
-  idempotent) before the process is killed, so no stale user is kicked and no vfork parent waits;
-  remove
-  the task and its pid, and reap SysV shm segments marked for removal whose last attachment that
-  was (`kernel/ipc`); hand this thread's children to another live thread (non-last) or finish
-  the group (last); drop references under the BKL; collect unix sockets in flight, IPC
-  namespaces and the mounts of dead mount namespaces or detached mounts the thread was the last
-  user of; request an `EXITED` wake. The engine CPU state is freed after the BKL is released.
+  address space is shared, vfork completion, leave its users), ptrace and seccomp cleanup; when that
+  stage panics, vfork completion and leaving the users run again on their own (both are idempotent)
+  before the process is killed, so no stale user is kicked and no vfork parent waits; remove the
+  task and its pid, hand PI locks it owned with waiters to their first waiters
+  (`futex::pi_owners_exited`), and reap SysV shm segments marked for removal whose last attachment
+  that was (`kernel/ipc`); hand this thread's children to another live thread (non-last) or finish
+  the group (last); drop references under the BKL; collect unix sockets in flight, IPC namespaces
+  and the mounts of dead mount namespaces or detached mounts the thread was the last user of;
+  request an `EXITED` wake. The engine CPU state is freed after the BKL is released.
 - `finish_group`: release AIO; reparent children to the nearest `PR_SET_CHILD_SUBREAPER` ancestor
   in the same pid-namespace level that still has live threads (one in the middle of exiting can be
   chosen, as on Linux), else the pid-namespace init while it has not exited, else the virtual init
@@ -355,8 +357,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   meet. Kernel wakes (robust list, `clear_child_tid`) are shared operations. The no-BKL path
   handles only writable private pages outside the address space's writable shared mappings. The
   single waiter list is scanned linearly.
-- Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET, WAKE_BITSET, `futex_waitv`;
-  the PI operations return `ENOSYS`. As in 6.1's `sys_futex`/`do_futex`: the command is everything
+- Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET, WAKE_BITSET, `futex_waitv`,
+  LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI; WAIT_REQUEUE_PI and CMP_REQUEUE_PI return `ENOSYS`.
+  As in 6.1's `sys_futex`/`do_futex`: the command is everything
   but `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME` (unknown bits `ENOSYS`); the timeout of a
   command taking one is read and checked first (`EFAULT`, `EINVAL`), then `FUTEX_CLOCK_REALTIME`
   with anything but the absolute waits is `ENOSYS`. Wake counts are ints that stop after the
@@ -374,6 +377,19 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   list and `clear_child_tid` at thread exit also wake waiters; a robust lock word on a
   copy-on-write page (not written since fork) or a page without an entry is made writable first
   (`cow_break`, `fault_in`), as Linux faults it in.
+- PI locks (6.1's `futex_lock_pi`, `futex_unlock_pi`, without priority inheritance: the host
+  schedules the threads; BKL path only): the word holds the owner's tid as its own pid namespace
+  sees it. LOCK_PI takes a word with no owner (keeping `FUTEX_OWNER_DIED`, adding
+  `FUTEX_WAITERS` while PI waiters are queued); the caller's own word is `EDEADLK`; otherwise it
+  sets `FUTEX_WAITERS`, then needs the owner to exist (`ESRCH`), and TRYLOCK_PI gives up
+  (`EAGAIN`) while a lock queues as a PI waiter until the word is handed to it. A signal restarts
+  it (`ERESTARTNOINTR`); the deadline (absolute, `CLOCK_REALTIME` for LOCK_PI, `CLOCK_MONOTONIC`
+  for LOCK_PI2 unless `FUTEX_CLOCK_REALTIME`) ends it with `ETIMEDOUT`. UNLOCK_PI needs the caller
+  to own the word (`EPERM`) and hands it to the first PI waiter (its tid with `FUTEX_WAITERS`,
+  `wake_futex_pi`) or clears it. Plain wakes and requeues leave PI waiters alone.
+- When a thread exits (after it leaves the task table), every PI lock with waiters whose owner no
+  longer exists goes to its first waiter with `FUTEX_WAITERS` and `FUTEX_OWNER_DIED`
+  (`exit_pi_state_list`, `fixup_pi_state_owner`), so a robust mutex reports `EOWNERDEAD`.
 - Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
   share one queue without lost wakeups.
 
@@ -583,9 +599,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **No PI futexes:** `FUTEX_LOCK_PI`, `LOCK_PI2`, `UNLOCK_PI`, `TRYLOCK_PI` and the requeue-PI
-  pair are `ENOSYS`, so glibc's and musl's `PTHREAD_PRIO_INHERIT` mutexes fail to initialize
-  (`ENOTSUP`).
+- **PI futexes are partial:** no priority is inherited (waiters are served first come, first
+  served, and owners are not boosted); `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_CMP_REQUEUE_PI` are
+  `ENOSYS` (glibc since 2.25 and musl do not use them); an execve does not hand over the PI locks
+  the calling thread holds (Linux's `futex_exec_release` does), only an exit does.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.

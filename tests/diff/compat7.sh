@@ -3,7 +3,7 @@
 # not exceed 128 KB): process_mrelease, /proc/<pid>/oom_score, /proc/swaps, /proc/locks, and ss
 # reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries, ETXTBSY for running a
 # `#!` script that is open for writing, setuid programs run with a shared fs context, and the layout
-# fields of /proc/<pid>/stat, and the length limit of AF_UNIX datagram queues
+# fields of /proc/<pid>/stat, the length limit of AF_UNIX datagram queues, and PI futexes
 set -e
 cd /tmp
 # Linux's swap_show header, then the host's swap areas, which a container sees too
@@ -314,8 +314,8 @@ def within(a, pred):
             return pred(m)
     return False
 exe = os.readlink("/proc/self/exe")
-print("code in the program's executable mapping", within(code[0], lambda m: "x" in m[1] and m[-1] == exe),
-      code[0] < code[1])
+print("code in the program's executable mapping",
+      within(code[0], lambda m: "x" in m[1] and m[-1] == exe), code[0] < code[1])
 print("stack in [stack]", within(stack, lambda m: m[-1] == "[stack]"))
 print("data from the code on", code[0] <= data[0] <= data[1], "heap after the data", brk >= data[1])
 print("arguments, then the environment, on the stack", args[0] < args[1] <= env[0] < env[1],
@@ -379,3 +379,115 @@ open(q, "w").write(old)
 os.unlink("/tmp/dq.sock")
 os.unlink("/tmp/dq2.sock")
 PY
+
+# PI futexes (FUTEX_LOCK_PI, TRYLOCK_PI, UNLOCK_PI), without priority inheritance itself: musl's
+# PTHREAD_PRIO_INHERIT mutexes under contention; the errors (a word the caller owns EDEADLK,
+# unlocking another's EPERM, an owner that does not exist ESRCH after FUTEX_WAITERS is set, a
+# trylock EAGAIN, a deadline ETIMEDOUT); an owner whose robust list holds the lock dying makes the
+# waiter's lock EOWNERDEAD, and one exiting without it hands the word over with FUTEX_OWNER_DIED too
+cat >pi.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FUTEX_LOCK_PI 6
+#define FUTEX_UNLOCK_PI 7
+#define FUTEX_TRYLOCK_PI 8
+#define FUTEX_TID_MASK 0x3fffffff
+
+static pthread_mutex_t m;
+static long count;
+static volatile unsigned word;
+static volatile int ready;
+
+static long futex(volatile unsigned *w, int op, struct timespec *t)
+{
+    return syscall(SYS_futex, w, op, 0, t, 0, 0) < 0 ? -errno : 0;
+}
+
+static void *add(void *a)
+{
+    for (int i = 0; i < 20000; i++) {
+        pthread_mutex_lock(&m);
+        count++;
+        pthread_mutex_unlock(&m);
+    }
+    return a;
+}
+
+static void *hold(void *a)
+{
+    futex(&word, FUTEX_LOCK_PI, 0);
+    ready = 1;
+    usleep(300000);
+    return a;
+}
+
+static void *die_robust(void *a)
+{
+    pthread_mutex_lock(&m);
+    ready = 1;
+    usleep(300000);
+    return a;
+}
+
+int main(void)
+{
+    pthread_mutexattr_t at;
+    pthread_mutexattr_init(&at);
+    printf("PRIO_INHERIT: %d\n", pthread_mutexattr_setprotocol(&at, PTHREAD_PRIO_INHERIT));
+    pthread_mutex_init(&m, &at);
+    pthread_t t[4];
+    for (int i = 0; i < 4; i++)
+        pthread_create(&t[i], 0, add, 0);
+    for (int i = 0; i < 4; i++)
+        pthread_join(t[i], 0);
+    printf("count %ld\n", count);
+    unsigned tid = gettid();
+    word = 0;
+    printf("lock free: %ld, owner is me %d\n", futex(&word, FUTEX_LOCK_PI, 0), word == tid);
+    printf("again: %ld\n", futex(&word, FUTEX_LOCK_PI, 0));
+    printf("unlock: %ld, word %u\n", futex(&word, FUTEX_UNLOCK_PI, 0), word);
+    word = 0x3ffffff0;
+    printf("unlock another's: %ld\n", futex(&word, FUTEX_UNLOCK_PI, 0));
+    printf("owner missing: %ld, waiters set %d\n", futex(&word, FUTEX_LOCK_PI, 0), word >> 31);
+    word = 0;
+    ready = 0;
+    pthread_t h;
+    pthread_create(&h, 0, hold, 0);
+    while (!ready)
+        usleep(1000);
+    printf("trylock: %ld\n", futex(&word, FUTEX_TRYLOCK_PI, 0));
+    struct timespec dl;
+    clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_nsec += 50000000;
+    if (dl.tv_nsec >= 1000000000) {
+        dl.tv_sec++;
+        dl.tv_nsec -= 1000000000;
+    }
+    printf("deadline: %ld\n", futex(&word, FUTEX_LOCK_PI, &dl));
+    long r = futex(&word, FUTEX_LOCK_PI, 0);
+    printf("after the owner exited: %ld, owner is me %d, waiters %d, owner died %d\n", r,
+           (word & FUTEX_TID_MASK) == tid, word >> 31, (word >> 30) & 1);
+    pthread_join(h, 0);
+    pthread_mutexattr_setrobust(&at, PTHREAD_MUTEX_ROBUST);
+    pthread_mutex_init(&m, &at);
+    ready = 0;
+    pthread_create(&h, 0, die_robust, 0);
+    while (!ready)
+        usleep(1000);
+    r = pthread_mutex_lock(&m);
+    printf("robust owner died: %s\n", r == EOWNERDEAD ? "EOWNERDEAD" : r ? "error" : "0");
+    pthread_mutex_consistent(&m);
+    pthread_mutex_unlock(&m);
+    pthread_join(h, 0);
+    return 0;
+}
+C
+gcc -O1 -pthread -o pi pi.c
+./pi
+rm -f pi pi.c

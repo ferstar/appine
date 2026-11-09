@@ -8,7 +8,7 @@ use crate::cred::{cap, secbit};
 use crate::errno::Errno;
 use crate::futex::{Enqueued, Key};
 use crate::itimer::{CpuTimer, Expiry, ITimer};
-use crate::kernel::{Cx, wake};
+use crate::kernel::{Cx, Tid, wake};
 use crate::klog;
 use crate::process::{RLIM_NLIMITS, RLIMIT_NOFILE, Rusage, Signal};
 use crate::uaccess::UserSlice;
@@ -19,6 +19,8 @@ const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
 const FUTEX_WAKE_OP: u32 = 5;
 const FUTEX_LOCK_PI: u32 = 6;
+const FUTEX_UNLOCK_PI: u32 = 7;
+const FUTEX_TRYLOCK_PI: u32 = 8;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
@@ -157,6 +159,25 @@ pub(super) fn futex(
             let n = futexes.requeue(key, val, key2, timeout as u32);
             Ok(n as u64)
         }
+        // LOCK_PI's timeout is absolute on CLOCK_REALTIME, LOCK_PI2's on CLOCK_MONOTONIC unless
+        // FUTEX_CLOCK_REALTIME; TRYLOCK_PI takes none
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
+            let deadline = match timeout {
+                0 => None,
+                _ if cmd == FUTEX_TRYLOCK_PI => None,
+                addr => {
+                    let realtime = cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0;
+                    let clock = if realtime {
+                        CLOCK_REALTIME
+                    } else {
+                        CLOCK_MONOTONIC
+                    };
+                    Some(expiry_in_ns(cx, clock, read_timespec(cx, addr)?)?)
+                }
+            };
+            futex_lock_pi(cx, (uaddr, private), cmd == FUTEX_TRYLOCK_PI, deadline)
+        }
+        FUTEX_UNLOCK_PI => futex_unlock_pi(cx, uaddr, private),
         _ => {
             crate::stub::hit(cx, crate::stub::Stub::Futex(cmd));
             Err(Errno::ENOSYS)
@@ -287,6 +308,125 @@ fn futex_wait(
             };
         }
     }
+}
+
+/// `FUTEX_LOCK_PI`, `LOCK_PI2` and `TRYLOCK_PI` (Linux 6.1's `futex_lock_pi`, without priority
+/// inheritance: the host schedules the threads): a free word (no owner) is taken at once, keeping
+/// `FUTEX_OWNER_DIED`; one the caller owns is EDEADLK; otherwise `FUTEX_WAITERS` is set, the owner
+/// must exist (ESRCH), a trylock gives up (EAGAIN), and a lock waits until its owner hands the word
+/// over ([`futex_unlock_pi`], or [`crate::futex::pi_owners_exited`] when the owner exits). A
+/// signal restarts the call (ERESTARTNOINTR); the deadline ends it with ETIMEDOUT. Tids in the word
+/// are as each thread's own pid namespace sees them.
+fn futex_lock_pi(
+    cx: &mut Cx<'_>,
+    (uaddr, private): (u64, bool),
+    trylock: bool,
+    deadline: Option<Expiry>,
+) -> SysResult {
+    use crate::futex::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, PiWaiter};
+    let key = futex_key(cx, uaddr, private)?;
+    let me = cx.pid_ns().vnr(cx.tid()).unwrap_or(0) as u32;
+    let shared = cx.shared;
+    let id = {
+        let mut futexes = shared.futexes();
+        let mm = cx.mm();
+        let word = crate::futex::writable_word(&mm, uaddr).ok_or(Errno::EFAULT)?;
+        let mut cur = word.load(Ordering::SeqCst);
+        loop {
+            let owner = cur & FUTEX_TID_MASK;
+            if owner == me {
+                return Err(Errno::EDEADLK);
+            }
+            if owner == 0 {
+                let mut new = (cur & FUTEX_OWNER_DIED) | me;
+                if futexes.has_pi(key, None) {
+                    new |= FUTEX_WAITERS;
+                }
+                match word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return Ok(0),
+                    Err(v) => cur = v,
+                }
+                continue;
+            }
+            // The first waiter sets the bit before looking at the owner, so its unlock comes to
+            // the kernel (futex_lock_pi_atomic)
+            if cur & FUTEX_WAITERS == 0 {
+                let new = cur | FUTEX_WAITERS;
+                if let Err(v) = word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    cur = v;
+                    continue;
+                }
+            }
+            break;
+        }
+        let owner = cx.pid_ns().find((cur & FUTEX_TID_MASK) as Tid);
+        if !owner.is_some_and(|g| cx.kr().tasks.contains_key(&g)) {
+            return Err(Errno::ESRCH);
+        }
+        if trylock {
+            return Err(Errno::EAGAIN);
+        }
+        let waiter = PiWaiter {
+            tid: cx.tid(),
+            addr: uaddr,
+        };
+        futexes.enqueue_pi(key, cx.task.event.clone(), waiter)
+    };
+    let waiting = Enqueued::new(shared, [id]);
+    crate::bug::trap(crate::bug::Trap::FutexWait, cx.tgid());
+    loop {
+        // Dequeued: the lock was handed over
+        if !shared.futexes().is_queued(id) {
+            waiting.leave();
+            return Ok(0);
+        }
+        let err = if deadline.is_some_and(Expiry::passed) {
+            Some(Errno::ETIMEDOUT)
+        } else if cx.interrupted() {
+            Some(Errno::ERESTARTNOINTR)
+        } else {
+            cx.wait_alone(deadline.map(Expiry::instant)).err()
+        };
+        if let Some(e) = err {
+            return match waiting.leave() {
+                Some(_) => Ok(0),
+                None => Err(e),
+            };
+        }
+    }
+}
+
+/// `FUTEX_UNLOCK_PI` (Linux 6.1's `futex_unlock_pi`): the caller must own the word (EPERM); the
+/// first waiter gets it (its tid with `FUTEX_WAITERS`, `wake_futex_pi`) and is woken, and without
+/// waiters it becomes 0.
+fn futex_unlock_pi(cx: &mut Cx<'_>, uaddr: u64, private: bool) -> SysResult {
+    use crate::futex::{FUTEX_TID_MASK, FUTEX_WAITERS};
+    let key = futex_key(cx, uaddr, private)?;
+    let me = cx.pid_ns().vnr(cx.tid()).unwrap_or(0) as u32;
+    let mut futexes = cx.shared.futexes();
+    let mm = cx.mm();
+    let word = crate::futex::writable_word(&mm, uaddr).ok_or(Errno::EFAULT)?;
+    let next = futexes.first_pi(key).and_then(|(id, w)| {
+        let tgid = cx.kr().tasks.get(&w.tid)?.tgid;
+        let tid = cx.kr().pid_ns_of(tgid).vnr(w.tid)?;
+        Some((id, FUTEX_WAITERS | tid as u32))
+    });
+    let mut cur = word.load(Ordering::SeqCst);
+    loop {
+        if cur & FUTEX_TID_MASK != me {
+            return Err(Errno::EPERM);
+        }
+        let new = next.map_or(0, |(_, v)| v);
+        match word.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(v) => cur = v,
+        }
+    }
+    if let Some((id, _)) = next {
+        futexes.hand_over(id);
+    }
+    Ok(0)
 }
 
 /// Flags of `struct futex_waitv`: a 32-bit futex, and valid only within this process (we do not

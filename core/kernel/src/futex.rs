@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use appine_engine::prot;
 use appine_hal::Event;
 
-use crate::kernel::Shared;
+use crate::kernel::{Shared, Tid};
 use crate::mm::Mm;
 use crate::uaccess::UserSlice;
 
@@ -42,6 +42,18 @@ struct Entry {
     bitset: u32,
     /// The waiting thread's event ([`crate::task::Task::event`]).
     event: Arc<Event>,
+    /// A `FUTEX_LOCK_PI` waiter: its thread, which the lock is handed to ([`Futexes::first_pi`]).
+    /// Plain wakes and requeues leave such waiters alone.
+    pi: Option<PiWaiter>,
+}
+
+/// A thread blocked in `FUTEX_LOCK_PI`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PiWaiter {
+    /// Its global tid.
+    pub tid: Tid,
+    /// The address of the lock word in its own address space.
+    pub addr: u64,
 }
 
 /// All futex waiters, in registration order (first come, first served on wake).
@@ -55,14 +67,65 @@ impl Futexes {
     /// Registers a waiter and returns its id. `event` is the event to signal when it is woken; the
     /// waiter must wait with [`crate::kernel::Cx::wait_alone`].
     pub fn enqueue(&mut self, key: Key, bitset: u32, event: Arc<Event>) -> u64 {
+        self.push(key, bitset, event, None)
+    }
+
+    /// Registers a `FUTEX_LOCK_PI` waiter ([`Futexes::enqueue`]), which gets the lock when it is
+    /// woken ([`Futexes::first_pi`], [`Futexes::hand_over`]).
+    pub fn enqueue_pi(&mut self, key: Key, event: Arc<Event>, waiter: PiWaiter) -> u64 {
+        self.push(key, u32::MAX, event, Some(waiter))
+    }
+
+    fn push(&mut self, key: Key, bitset: u32, event: Arc<Event>, pi: Option<PiWaiter>) -> u64 {
         self.next_id += 1;
         self.waiting.push(Entry {
             id: self.next_id,
             key,
             bitset,
             event,
+            pi,
         });
         self.next_id
+    }
+
+    /// The first `FUTEX_LOCK_PI` waiter on `key` (Linux's top waiter; without priorities, the one
+    /// that came first): its id and thread.
+    pub fn first_pi(&self, key: Key) -> Option<(u64, PiWaiter)> {
+        self.waiting
+            .iter()
+            .find(|e| e.key == key && e.pi.is_some())
+            .and_then(|e| e.pi.map(|w| (e.id, w)))
+    }
+
+    /// Whether `FUTEX_LOCK_PI` waiters other than `except` are queued on `key`.
+    pub fn has_pi(&self, key: Key, except: Option<u64>) -> bool {
+        self.waiting
+            .iter()
+            .any(|e| e.key == key && e.pi.is_some() && Some(e.id) != except)
+    }
+
+    /// The first `FUTEX_LOCK_PI` waiter of each key that has some (for owners that exit): its id
+    /// and thread.
+    pub fn pi_heads(&self) -> Vec<(u64, PiWaiter)> {
+        let mut keys: Vec<Key> = Vec::new();
+        let mut heads = Vec::new();
+        for e in &self.waiting {
+            if let Some(w) = e.pi
+                && !keys.contains(&e.key)
+            {
+                keys.push(e.key);
+                heads.push((e.id, w));
+            }
+        }
+        heads
+    }
+
+    /// Wakes waiter `id`, the new owner of the lock it waited for.
+    pub fn hand_over(&mut self, id: u64) {
+        if let Some(i) = self.waiting.iter().position(|e| e.id == id) {
+            let e = self.waiting.remove(i);
+            crate::kernel::signal_later(&e.event);
+        }
     }
 
     /// FUTEX_REQUEUE: wakes at most `n_wake` waiters on `key`, then moves at most `n_requeue` more
@@ -70,7 +133,11 @@ impl Futexes {
     pub fn requeue(&mut self, key: Key, n_wake: u32, key2: Key, n_requeue: u32) -> u32 {
         let woken = self.wake(key, n_wake, u32::MAX);
         let mut moved = 0;
-        for e in self.waiting.iter_mut().filter(|e| e.key == key) {
+        for e in self
+            .waiting
+            .iter_mut()
+            .filter(|e| e.key == key && e.pi.is_none())
+        {
             if moved == n_requeue {
                 break;
             }
@@ -85,7 +152,7 @@ impl Futexes {
     pub fn wake(&mut self, key: Key, n: u32, bitset: u32) -> u32 {
         let mut woken = 0;
         self.waiting.retain(|e| {
-            if woken < n && e.key == key && e.bitset & bitset != 0 {
+            if woken < n && e.key == key && e.bitset & bitset != 0 && e.pi.is_none() {
                 woken += 1;
                 crate::kernel::signal_later(&e.event);
                 false
@@ -161,9 +228,9 @@ impl<I: AsRef<[u64]>> Drop for Enqueued<'_, I> {
     }
 }
 
-const FUTEX_WAITERS: u32 = 0x8000_0000;
-const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
-const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+pub(crate) const FUTEX_WAITERS: u32 = 0x8000_0000;
+pub(crate) const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+pub(crate) const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 /// The most list entries processed (`ROBUST_LIST_LIMIT`), against a cycle built by the guest.
 const ROBUST_LIST_LIMIT: usize = 2048;
 
@@ -249,6 +316,44 @@ fn owner_died(futexes: &mut Futexes, mm: &Mm, addr: u64, tid: u32, pi: bool, pen
     }
     if !pi && cur & FUTEX_WAITERS != 0 {
         wake(futexes);
+    }
+}
+
+/// A thread has exited: each PI lock with waiters whose owner no longer exists goes to its first
+/// waiter (Linux's `exit_pi_state_list` handing the rt_mutex over, and the new owner's
+/// `fixup_pi_state_owner`). The word becomes the waiter's tid with `FUTEX_WAITERS` and
+/// `FUTEX_OWNER_DIED`, whether or not the lock was on the owner's robust list.
+pub(crate) fn pi_owners_exited(k: &crate::kernel::Kernel, futexes: &mut Futexes) {
+    for (id, w) in futexes.pi_heads() {
+        let Some(task) = k.tasks.get(&w.tid) else {
+            continue;
+        };
+        let ns = k.pid_ns_of(task.tgid);
+        let Ok(res) = task.res.try_borrow() else {
+            continue;
+        };
+        let Ok(mm) = res.mm.try_borrow() else {
+            continue;
+        };
+        let (Some(word), Some(me)) = (writable_word(&mm, w.addr), ns.vnr(w.tid)) else {
+            continue;
+        };
+        let cur = word.load(Ordering::SeqCst);
+        let owner = cur & FUTEX_TID_MASK;
+        if owner != 0
+            && ns
+                .find(owner as Tid)
+                .is_some_and(|g| k.tasks.contains_key(&g))
+        {
+            continue;
+        }
+        let new = FUTEX_OWNER_DIED | me as u32 | FUTEX_WAITERS;
+        if word
+            .compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            futexes.hand_over(id);
+        }
     }
 }
 

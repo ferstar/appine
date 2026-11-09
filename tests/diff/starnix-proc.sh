@@ -21,9 +21,6 @@ SKIP="$SKIP:ProcfsAccessTest/ProcfsAccessTest.AccessDeniedToNonOwnerWithoutCapPt
 # kernel/procfs fidelity gaps: st_blksize is 4096; procfs mount options are ignored; fd links are
 # 0777 whatever the open mode
 SKIP="$SKIP:ProcfsBlksizeTest.*:ProcHidePidTest.HidePidAndGidMountOptions:ProcTaskDirTest.FdOpathMode"
-# kernel/procfs: stat address fields ignore the ptrace check
-SKIP="$SKIP:ProcTaskDirTest.ParentFieldsValidWithCapSysPtrace"
-SKIP="$SKIP:ProcTaskDirTest.ParentFieldsZeroedWithoutCapSysPtrace"
 # kernel/procfs: a reaped process's held directory behaves like a live or missing one
 SKIP="$SKIP:ProcTaskDirTest.PidDirFdListingAndReadsFailAfterExit"
 SKIP="$SKIP:ProcTaskDirTest.PidDirFdLookupsFailAfterExit"

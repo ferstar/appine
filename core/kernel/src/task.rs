@@ -999,6 +999,12 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     }
     k.tasks.remove(&tid);
     k.release_pid(tid);
+    // PI locks this thread held with waiters go to their first waiter (exit_pi_state_list)
+    if crate::bug::catch(|| crate::futex::pi_owners_exited(&k, &mut shared.futexes())).is_none() {
+        crate::bug::report(format_args!(
+            "kernel panic while thread {tid} handed over its PI futexes"
+        ));
+    }
     // Its address space's attachments no longer count: a segment marked for removal goes with
     // its last one (Linux's exit_mmap closes them)
     crate::ipc::reap_shm(&mut k);
