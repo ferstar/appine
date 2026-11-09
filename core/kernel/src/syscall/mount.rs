@@ -111,9 +111,11 @@ pub(super) fn mount(
     }
     // remount does not climb up: a covered node reached through a magic link is not a mount root
     // (EINVAL)
+    // Superblock flags: a new instance's, or a remount's without MS_BIND
+    let sb = flags & ms::PER_SB;
     if flags & MS_REMOUNT != 0 {
         let keep_atime = flags & (ATIME | MS_STRICTATIME) == 0;
-        let data = (flags & MS_BIND == 0).then_some(&data[..]);
+        let data = (flags & MS_BIND == 0).then_some((&data[..], sb));
         return remount(cx, &resolved, mnt, keep_atime, data);
     }
     if flags & MS_BIND != 0 {
@@ -125,7 +127,14 @@ pub(super) fn mount(
     if flags & MS_MOVE != 0 {
         return move_mount(cx, source.as_deref(), (node, at));
     }
-    new_mount(cx, fstype, source, (node, at), mnt, &data)
+    new_mount(cx, fstype, source, (node, at), (mnt, sb), &data)
+}
+
+/// The superblock flags `sb` of the instance mount `id` created (Linux's `fc->sb_flags`).
+fn new_superblock(vfs: &Vfs, id: MountId, sb: u64) {
+    if let Some(m) = vfs.mount(id) {
+        vfs.set_sb_flags(m.dev, sb);
+    }
 }
 
 /// A string argument of mount(2); None for a null pointer.
@@ -136,13 +145,14 @@ fn optional_str(cx: &Cx<'_>, addr: u64) -> Result<Option<Vec<u8>>, Errno> {
     read_path(cx, addr).map(Some)
 }
 
-/// Mounts a new filesystem (Linux's `do_new_mount`).
+/// Mounts a new filesystem (Linux's `do_new_mount`) with mount flags `flags`; a new instance
+/// gets superblock flags `sb` ([`ms::PER_SB`]).
 fn new_mount(
     cx: &mut Cx<'_>,
     fstype: Option<Vec<u8>>,
     source: Option<Vec<u8>>,
     (target, at): (Node, Option<Dentry>),
-    flags: u64,
+    (flags, sb): (u64, u64),
     data: &[u8],
 ) -> SysResult {
     let fstype = fstype.ok_or(Errno::EINVAL)?;
@@ -221,17 +231,19 @@ fn new_mount(
             (layers, (cred.fsuid, cred.fsgid), pins),
             options,
         );
+        new_superblock(&vfs, id, sb);
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
     if fs == Fs::Fuse {
-        return fuse_mount(cx, &vfs, &fstype, source, (target, at), flags, data);
+        return fuse_mount(cx, &vfs, &fstype, source, (target, at), (flags, sb), data);
     }
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
         let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
         let id = vfs.new_tmpfs((target, at), flags, source, params)?;
+        new_superblock(&vfs, id, sb);
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
@@ -259,6 +271,9 @@ fn new_mount(
     );
     if inherited != 0 {
         vfs.update_mount(id, |m| m.locks = inherited);
+    }
+    if fs.new_instance() {
+        new_superblock(&vfs, id, sb);
     }
     // Every devpts mount is a new instance (since 4.7) with its own set of terminals, numbered by
     // the newly allocated device number
@@ -295,7 +310,7 @@ fn fuse_mount(
     fstype: &[u8],
     source: Option<Vec<u8>>,
     (target, at): (Node, Option<Dentry>),
-    flags: u64,
+    (flags, sb): (u64, u64),
     data: &[u8],
 ) -> SysResult {
     let cred = cx.cred();
@@ -342,6 +357,7 @@ fn fuse_mount(
     let (id, conn) = vfs.new_fuse((target, at), flags, source.unwrap_or_default(), |dev| {
         fuse::Conn::new(dev, opts, &cred, pid_ns)
     });
+    new_superblock(vfs, id, sb);
     propagate(cx, vfs, id, &targets);
     if let FileKind::FuseDev(d) = &mut file.borrow_mut().kind {
         d.attach(&conn);
@@ -634,12 +650,14 @@ fn bind_ns(
 /// ([`remount_tmpfs`]). Going read-only while files are open for writing is EBUSY: through this
 /// mount for `MS_BIND` (`mnt_make_readonly`), through any mount of the same filesystem otherwise
 /// (`sb_prepare_remount_readonly`).
+/// remount: with `data` (no `MS_BIND`, Linux's `do_remount`) the filesystem's options and its
+/// superblock flags `sb` change too, otherwise (`do_reconfigure_mnt`) only the mount's flags.
 fn remount(
     cx: &mut Cx<'_>,
     target: &Node,
     flags: u64,
     keep_atime: bool,
-    data: Option<&[u8]>,
+    data: Option<(&[u8], u64)>,
 ) -> SysResult {
     let vfs = cx.vfs()?;
     let id = vfs.mount_root(target).ok_or(Errno::EINVAL)?;
@@ -655,18 +673,23 @@ fn remount(
     if !m.keeps_locked(flags) {
         return Err(Errno::EPERM);
     }
-    if flags & ms::RDONLY != 0 && m.flags & ms::RDONLY == 0 {
-        let writers = writers(cx.kr());
-        let busy = if data.is_some() {
+    // Going read-only: the superblock while no mount of it has writers (sb_prepare_remount_readonly),
+    // or just this mount while it has none (mnt_make_readonly)
+    let sb_ro = vfs.sb_readonly(&m);
+    let busy = match data {
+        Some((_, sb)) if sb & ms::RDONLY != 0 && !sb_ro => {
+            let writers = writers(cx.kr());
             vfs.mounts()
                 .iter()
                 .any(|o| o.dev == m.dev && writers.contains(&o.id))
-        } else {
-            writers.contains(&id)
-        };
-        if busy {
-            return Err(Errno::EBUSY);
         }
+        None if flags & ms::RDONLY != 0 && m.flags & ms::RDONLY == 0 => {
+            writers(cx.kr()).contains(&id)
+        }
+        _ => false,
+    };
+    if busy {
+        return Err(Errno::EBUSY);
     }
     // An overlay without an upper layer stays read-only (6.1's ovl_remount)
     if data.is_some()
@@ -681,10 +704,14 @@ fn remount(
     }
     // Without MS_BIND the superblock changes too: a tmpfs's size and inode count; on error the
     // mount's flags do not change either
-    if let Some(data) = data
+    if let Some((data, _)) = data
         && m.fs == Fs::Tmpfs
     {
         remount_tmpfs(&vfs, m.dev, data)?;
+    }
+    if let Some((_, sb)) = data {
+        let old = vfs.sb_flags(&m);
+        vfs.set_sb_flags(m.dev, (old & !ms::REMOUNT_SB) | (sb & ms::REMOUNT_SB));
     }
     vfs.update_mount(id, |m| m.flags = flags);
     // Once the root filesystem becomes nosymfollow, resolution without the BKL is no longer

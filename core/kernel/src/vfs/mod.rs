@@ -294,9 +294,19 @@ pub(crate) mod ms {
     pub const NOATIME: u64 = 0x400;
     pub const NODIRATIME: u64 = 0x800;
     pub const RELATIME: u64 = 1 << 21;
+    pub const SYNCHRONOUS: u64 = 0x10;
+    pub const MANDLOCK: u64 = 0x40;
+    pub const DIRSYNC: u64 = 0x80;
+    pub const LAZYTIME: u64 = 1 << 25;
     /// Those kept on the mount (the ones matching Linux's `MNT_*`).
     pub const PER_MOUNT: u64 =
         RDONLY | NOSUID | NODEV | NOEXEC | NOSYMFOLLOW | NOATIME | NODIRATIME | RELATIME;
+    /// Those kept on the filesystem instance (Linux's `SB_*` of a new superblock); read-only is
+    /// both a mount flag and a superblock flag.
+    pub const PER_SB: u64 = RDONLY | SYNCHRONOUS | MANDLOCK | DIRSYNC | LAZYTIME;
+    /// The superblock flags a remount without `MS_BIND` sets (Linux's `MS_RMT_MASK`): not
+    /// dirsync.
+    pub const REMOUNT_SB: u64 = RDONLY | SYNCHRONOUS | MANDLOCK | LAZYTIME;
 }
 
 /// Locks on a mount (Linux's `MNT_LOCKED` and `MNT_LOCK_*`, kept in [`Mount::locks`]): a mount
@@ -558,6 +568,10 @@ struct Mounts {
     /// Options of devpts instances mounted by mount(2), by device number (the boot one is not
     /// here).
     devpts: std::collections::HashMap<u64, crate::tty::PtsOptions>,
+    /// Superblock flags ([`ms::PER_SB`]) of filesystem instances, by device number: given when an
+    /// instance was mounted, changed by a remount without `MS_BIND`; absent is none (the boot
+    /// instances).
+    sb_flags: std::collections::HashMap<u64, u64>,
 }
 
 impl Mounts {
@@ -916,6 +930,7 @@ impl Vfs {
             proc_ns: Default::default(),
             mq_dev: Default::default(),
             devpts: Default::default(),
+            sb_flags: Default::default(),
         };
         // The directory named `name` under directory `dir` in mount `mnt`
         let subdir = |dir: Option<&Node>, name: &[u8]| -> Option<Node> {
@@ -2308,14 +2323,38 @@ impl Vfs {
     }
 
     /// Mount `m`'s filesystem itself is read-only (Linux's `sb_rdonly`), whatever the mount's
-    /// flags: an overlay without an upper layer.
+    /// flags.
     pub(crate) fn sb_readonly(&self, m: &Mount) -> bool {
-        m.fs == Fs::Overlay
+        self.sb_flags(m) & ms::RDONLY != 0
+    }
+
+    /// The superblock flags of mount `m`'s filesystem ([`ms::PER_SB`]): those it was mounted or
+    /// last remounted with (shared by every bind of it), read-only too for an overlay without an
+    /// upper layer.
+    pub(crate) fn sb_flags(&self, m: &Mount) -> u64 {
+        let flags = self
+            .mounts
+            .borrow()
+            .sb_flags
+            .get(&m.dev)
+            .copied()
+            .unwrap_or(0);
+        let lower_only = m.fs == Fs::Overlay
             && self
                 .overlays
                 .borrow()
                 .instance(m.dev)
-                .is_some_and(|i| i.upper.is_none())
+                .is_some_and(|i| i.upper.is_none());
+        flags | if lower_only { ms::RDONLY } else { 0 }
+    }
+
+    /// Sets the superblock flags of the filesystem instance with device number `dev` (a new
+    /// instance, or a remount without `MS_BIND`).
+    pub(crate) fn set_sb_flags(&self, dev: u64, flags: u64) {
+        self.mounts
+            .borrow_mut()
+            .sb_flags
+            .insert(dev, flags & ms::PER_SB);
     }
 
     /// The path in the filesystem of the part the mount sees (the fourth column of mountinfo:

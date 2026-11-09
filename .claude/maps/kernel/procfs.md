@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay, mountinfo; change notifications; per-thread credentials; vfork freezing last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay; change notifications; per-thread credentials; vfork freezing; mount options last)
 
 ## Responsibilities
 
@@ -205,7 +205,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
   thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type as `Vfs::type_of`
   gives it (`fuse.<subtype>` for a FUSE mount with a subtype); mountinfo's optional fields are
-  `shared:N`, `master:N` and `unbindable` (no `propagate_from`); `cgroup` is the path relative to the reader's
+  `shared:N`, `master:N` and `unbindable` (no `propagate_from`), and its superblock options start
+  with the instance's `ro`/`rw` and `sync`, `dirsync`, `mand`, `lazytime` (`Vfs::sb_flags`), which
+  `mounts` puts after its `ro` (the mount's or the instance's) as `show_vfsmnt` does; `cgroup` is the path relative to the reader's
   cgroup-namespace root; `net/` uses the target's network namespace.
 - Writable: `oom_score_adj` (-1000..1000; going below the minimum needs `CAP_SYS_RESOURCE`, and a
   privileged write sets the new minimum), `coredump_filter` (masked to 0x1ff), `mem`, the id maps,

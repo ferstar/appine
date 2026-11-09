@@ -257,6 +257,8 @@ In `mount-locks`, Appine's side failed once on 2026-11-08 in a full Tier 0 run w
 
 In `pty`, Appine's side of the packet-mode `^C` lines differed once on 2026-11-09 in a full run with four lanes: the master's first read after `^C` returned `\x03` (both flush bits) and the read after the `NOFLSH` `^C` found nothing (`EAGAIN`), where the native side reports the write flush first and the read flush on the next read. The group passed 5 of 5 runs alone. Which bits the first read sees depends on when it comes; the cause was not investigated.
 
+In `fuse`, Appine's side failed once on 2026-11-10 in a full run with four lanes: after the open file of `f2` was closed and the second `drop_caches`, the daemon's count still showed `f2` as remembered (`f2 1`), which the native side has forgotten by then. The group passed 3 of 3 reruns alone. The check sleeps one second after `drop_caches`, and under load the forget may come later; the cause was not investigated.
+
 
 ## R1 measurements
 

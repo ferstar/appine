@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: I/O flags, locks, owners; loop; timerfd; splice, holes; overlayfs; AIO; clones; FUSE; collection; ACLs; Files app writers; mount propagation; memfd seals, pivot_root, deleted bind roots last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: I/O flags, locks, owners; loop; timerfd; splice, holes; overlayfs; AIO; clones; FUSE; ACLs; Files app; mounts, propagation, deleted roots; memfd seals; superblock flags last)
 
 ## Responsibilities
 
@@ -60,7 +60,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   directory and name of a bound file (`root_at`) and whether that name was removed
   (`root_gone`).
 - `Mounts` — the global list (also the mountinfo order), detached mounts, id and device counters,
-  per-instance side tables (tmpfs, procfs pid namespaces, mqueue devices, devpts instances).
+  per-instance side tables (tmpfs, procfs pid namespaces, mqueue devices, devpts instances,
+  superblock flags).
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue, Overlay, Fuse; which kinds get a new
   instance and their own device number per mount (tmpfs, procfs, devpts, overlay, FUSE).
 - `MntNs` — namespace id, owning user namespace, `anon` flag (open_tree clones). A task's
@@ -232,7 +233,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount, strip `MS_MGC_VAL`, `MS_NOUSER` is `EINVAL`, `may_mount` (`CAP_SYS_ADMIN` in the user
   namespace owning the caller's mount namespace), then remount, bind, propagation, move, new mount.
 - New mounts: proc, devpts, sysfs, cgroup2, tmpfs, mqueue, overlay (see overlayfs), `fuse` and
-  `fuse.<subtype>` (`kernel/fuse`); anything else `ENODEV`. sysfs, cgroup2
+  `fuse.<subtype>` (`kernel/fuse`); anything else `ENODEV`. A new instance (tmpfs, procfs,
+  devpts, overlay, a new FUSE connection) takes the read-only, sync, dirsync, mand and lazytime
+  flags it is mounted with as its superblock flags (`Vfs::sb_flags`, by device number, shared by
+  its binds); sysfs, cgroup2 and mqueue mounts reuse an instance and leave its flags. sysfs, cgroup2
   and same-namespace mqueue mounted on the root of a mount of the same filesystem are `EBUSY`.
   mqueue needs `CAP_SYS_ADMIN` over the IPC namespace, proc over the owner of the caller's pid
   namespace, sysfs over the owner of its network namespace and cgroup2 over the owner of its
@@ -249,12 +253,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   locked in place on or under it is `EINVAL` (`has_locked_children`); binding a namespace file
   creates an nsfs mount that pins the namespace (a mount-namespace file must be newer than the
   caller's namespace).
-- Remount needs the exact mount root; flags change on this mount only (atime bits are kept if
-  none are given); clearing a locked ro, nodev, nosuid or noexec or changing locked atime flags
+- Remount needs the exact mount root; flags change on this mount (atime bits are kept if none are
+  given), and without `MS_BIND` the instance's superblock flags too (read-only, sync, mand and
+  lazytime as given, dirsync kept: Linux's `MS_RMT_MASK`); clearing a locked ro, nodev, nosuid or noexec or changing locked atime flags
   is `EPERM` before anything changes (`can_change_locked_flags`); going read-only while regular
   or synthetic files are open for writing (in fd tables, or backing a loop device) is `EBUSY`:
   through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`), through any mount of
-  the same device without it (`sb_prepare_remount_readonly`). A tmpfs remount without
+  the same device when the instance turns read-only without it (`sb_prepare_remount_readonly`). A tmpfs remount without
   `MS_BIND` reconfigures the shared instance (`size=`/`nr_inodes=`/`inode32|64` per
   `shmem_reconfigure`). Remounting an overlay without an upper layer read-write without
   `MS_BIND` is `EROFS` (6.1's `ovl_remount`).
@@ -315,12 +320,13 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   below it lose their mount point, while a mount locked in place stays on its detached parent
   (6.1's `disconnect_mount`), so an fd kept in the detached tree still finds what hides a path.
 - Mount flags are enforced where Linux checks them: ro, of the mount or of the filesystem
-  (`readonly` includes `sb_readonly`, an overlay without an upper layer; `EROFS` in creation after
+  (`readonly` includes `sb_readonly`: the instance's flag, or an overlay without an upper layer; `EROFS` in creation after
   `EEXIST`,
   before directory write permission; in unlink/rmdir/rename before lookup; attribute changes;
   write opens of regular files, with `O_TRUNC` checked before permission), noexec (exec `EACCES`,
   `PROT_EXEC` mmap `EPERM`), nosuid (exec ignores set-id bits and file caps), nodev (device opens
-  `EACCES`), nosymfollow (`ELOOP`); atime flags are only recorded and reported.
+  `EACCES`), nosymfollow (`ELOOP`); atime flags and the sync, dirsync, mand and lazytime
+  superblock flags are only recorded and reported.
 - Removing or renaming a mount point in the caller's namespace is `EBUSY`; mounts on it in other
   namespaces are detached. Removing the name a mount's root is (a bound directory, or the name a
   bound file was found at, even with other links left) marks that mount in any namespace
@@ -619,7 +625,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `STATX_BASIC_STATS` (no btime, mount id or attributes). statfs: the store reports ext4's magic
   with the host's `statvfs` of the objects directory, tmpfs its own magic and limits (recounted),
   an overlay overlayfs's magic with the store's capacity, synthetic filesystems their magic with
-  zero sizes; `f_flags` from the mount, plus read-only for a read-only filesystem.
+  zero sizes; `f_flags` from the mount, plus the filesystem's read-only, sync and mand
+  (`flags_by_sb`).
 - access/faccessat: real IDs unless `AT_EACCESS` (capabilities only when the real uid is root in
   the caller's namespace); `EROFS` for `W_OK` after the permission check.
 - chmod drops `S_ISGID` when the caller is not in the file's group and lacks `CAP_FSETID` over
@@ -1081,10 +1088,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   precedes the fault, where Linux commits only whole copied pages (a sub-page writev fails with
   `EFAULT` and writes nothing); and a write or vmsplice whose buffer faults after its first page
   fails with `EFAULT` instead of returning the pages copied.
-- **No superblock flags:** read-only, sync, dirsync, lazytime and mandlock given to a new mount are
-  flags of that mount only, so a tmpfs mounted read-only becomes writable through a bind remount
-  (Linux keeps the superblock read-only and every mount of it with it), binds do not inherit a
-  read-only superblock, and mountinfo's superblock options always say `rw`.
 - **`IN_EXCL_UNLINK` filters the wrong events:** the flag is honoured only by directory watches
   and keyed on the child's link count, so a file's own watch keeps reporting writes and closes
   after the file is unlinked, a directory watch keeps reporting I/O through an unlinked name while

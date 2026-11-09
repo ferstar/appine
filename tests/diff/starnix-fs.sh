@@ -15,15 +15,6 @@ SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
 # kernel/vfs: umount ignores mappings
 SKIP="$SKIP:MountTest.BusyWithMmap"
-# kernel/vfs: a filesystem has no superblock flags of its own (a tmpfs mounted read-only becomes
-# writable through a bind remount, and mountinfo's super options are always rw)
-SKIP="$SKIP:MountTest.RemountReadOnlyToReadWriteIgnored:MountTest.RemountBindReadOnlyFlagInheritance"
-SKIP="$SKIP:ProcMountsTest.RemountBindReadOnlyFlagInheritance"
-SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_DIRSYNC"
-SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_LAZYTIME"
-SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_MANDLOCK"
-SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_RDONLY"
-SKIP="$SKIP:MountTest/ProcMountinfoSuperblockFlagsTest.FlagReporting/MS_SYNCHRONOUS"
 # kernel/procfs: procfs mount options (hidepid, gid) are ignored
 SKIP="$SKIP:ProcMountsTest.FilesystemMountOptions"
 # kernel/vfs: O_NOTIFICATION_PIPE is EINVAL; pipe I/O with faulting buffers ignores Linux's

@@ -3421,7 +3421,7 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
                 &m.source
             },
             options: ps.vfs.sb_options(&m),
-            sb_readonly: ps.vfs.sb_readonly(&m),
+            sb_flags: ps.vfs.sb_flags(&m),
             prop: m.prop,
         }
         .write(&mut out, info);
@@ -3442,9 +3442,9 @@ struct MountLine<'a> {
     source: &'a [u8],
     /// Superblock options ([`crate::vfs::Vfs::sb_options`]).
     options: String,
-    /// The filesystem itself is read-only ([`crate::vfs::Vfs::sb_readonly`]): mountinfo shows
-    /// it in the superblock options, mounts with the mount's.
-    sb_readonly: bool,
+    /// The filesystem's own flags ([`crate::vfs::Vfs::sb_flags`]): mountinfo shows them in the
+    /// superblock options, mounts with the mount's.
+    sb_flags: u64,
     /// Shown in mountinfo's optional fields.
     prop: crate::vfs::Propagation,
 }
@@ -3453,7 +3453,9 @@ impl MountLine<'_> {
     fn write(&self, out: &mut Vec<u8>, info: bool) {
         use crate::vfs::ms;
         let (fstype, options) = (&self.fstype, &self.options);
-        let sb = if self.sb_readonly { "ro" } else { "rw" };
+        let sb_ro = self.sb_flags & ms::RDONLY != 0;
+        let sb = if sb_ro { "ro" } else { "rw" };
+        let sb_opts = sb_options(self.sb_flags);
         if info {
             let (id, parent) = (self.id, self.parent);
             let (major, minor) = (self.dev >> 8, self.dev & 0xff);
@@ -3476,14 +3478,19 @@ impl MountLine<'_> {
             }
             out.extend_from_slice(format!(" - {fstype} ").as_bytes());
             out.extend(mangle(self.source));
-            out.extend_from_slice(format!(" {sb}{options}\n").as_bytes());
+            out.extend_from_slice(format!(" {sb}{sb_opts}{options}\n").as_bytes());
         } else {
-            let ro = if self.sb_readonly { ms::RDONLY } else { 0 };
+            // show_vfsmnt: read-only if the mount or the filesystem is, the superblock's flags,
+            // then the mount's
+            let ro = if sb_ro { ms::RDONLY } else { 0 };
             let opts = mount_options(self.flags | ro);
+            let (rw, mnt) = opts.split_at(2);
             out.extend(mangle(self.source));
             out.push(b' ');
             out.extend(mangle(&self.point));
-            out.extend_from_slice(format!(" {fstype} {opts}{options} 0 0\n").as_bytes());
+            out.extend_from_slice(
+                format!(" {fstype} {rw}{sb_opts}{mnt}{options} 0 0\n").as_bytes(),
+            );
         }
     }
 }
@@ -3502,6 +3509,23 @@ fn mount_options(flags: u64) -> String {
         (ms::NOSYMFOLLOW, ",nosymfollow"),
     ] {
         if flags & bit != 0 {
+            s += name;
+        }
+    }
+    s
+}
+
+/// The superblock's own options (Linux's `show_sb_opts`).
+fn sb_options(sb: u64) -> String {
+    use crate::vfs::ms;
+    let mut s = String::new();
+    for (bit, name) in [
+        (ms::SYNCHRONOUS, ",sync"),
+        (ms::DIRSYNC, ",dirsync"),
+        (ms::MANDLOCK, ",mand"),
+        (ms::LAZYTIME, ",lazytime"),
+    ] {
+        if sb & bit != 0 {
             s += name;
         }
     }

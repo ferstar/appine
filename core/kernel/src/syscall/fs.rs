@@ -5385,10 +5385,12 @@ fn statfs_of(cx: &mut Cx<'_>, node: &Node) -> Result<[u8; 120], Errno> {
         ..Default::default()
     };
     let vfs = cx.vfs()?;
-    // The mount's flags plus the filesystem's read-only one (Linux's flags_by_mnt and
-    // flags_by_sb)
-    let flags =
-        vfs.mount_flags(node).unwrap_or(0) | if vfs.readonly(node) { ms::RDONLY } else { 0 };
+    // The mount's flags plus the filesystem's read-only, sync and mand ones (Linux's flags_by_mnt
+    // and flags_by_sb)
+    let sb = vfs.mount(node.mnt()).map_or(0, |m| vfs.sb_flags(&m));
+    let flags = vfs.mount_flags(node).unwrap_or(0)
+        | if vfs.readonly(node) { ms::RDONLY } else { 0 }
+        | sb & (ms::SYNCHRONOUS | ms::MANDLOCK);
     // tmpfs reports by pages and inodes (Linux's shmem_statfs): an unlimited item is all 0s;
     // usage is counted afresh
     if let Some(dev) = vfs.tmpfs_dev(node) {
@@ -5464,8 +5466,16 @@ fn statfs_flags(flags: u64) -> u64 {
     const ST_VALID: u64 = 0x20;
     const ST_RELATIME: u64 = 0x1000;
     const ST_NOSYMFOLLOW: u64 = 0x2000;
-    // RDONLY, NOSUID, NODEV, NOEXEC, NOATIME, NODIRATIME have the same values as MS_*
-    let same = ms::RDONLY | ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::NOATIME | ms::NODIRATIME;
+    // RDONLY, NOSUID, NODEV, NOEXEC, SYNCHRONOUS, MANDLOCK, NOATIME, NODIRATIME have the same
+    // values as MS_*
+    let same = ms::RDONLY
+        | ms::NOSUID
+        | ms::NODEV
+        | ms::NOEXEC
+        | ms::SYNCHRONOUS
+        | ms::MANDLOCK
+        | ms::NOATIME
+        | ms::NODIRATIME;
     let mut f = ST_VALID | (flags & same);
     if flags & ms::RELATIME != 0 {
         f |= ST_RELATIME;
