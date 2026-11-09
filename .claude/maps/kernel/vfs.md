@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes last)
 
 ## Responsibilities
 
@@ -68,14 +68,17 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mounter's filesystem IDs, the tmpfs instances its layers are in, parsed `Options`) and every
   `OvlNode` by `OvlId`: instance, parent and name (Linux's overlay dentry), the upper store inode
   and the lower ones (all merged lower directories for a directory, the topmost for anything else),
-  the lower inode it was copied up from (`origin`), and the children already looked up.
+  the lower inode it was copied up from (`origin`), and the children already looked up; and the
+  nodes whose names were removed (orphans), each with the system call count when it was.
+- `overlay::Hold` — an open file's claim on an overlay node, counted in one process-wide table.
 - `Cached` / `Pending` — the lock-free resolver used by fast-path stat (64-component stack).
 - `FdTable` — slots (`FileRef` plus per-fd `cloexec`), the soft `RLIMIT_NOFILE`, `holds_locks`.
 - `OpenFile` (`FileRef = Rc<RefCell<OpenFile>>`) — kind, access mode and status flags, position,
   display path, dentry, mount, owner/signal for `F_SETOWN*`, epoll/fasync bookkeeping, inotify
   `Opened` record, `pos_busy`, lock ownership, open_tree namespace, memfd data; `ovl`, the
   overlay node of a regular file, device or FIFO opened through an overlay (the kind holds the
-  store inode behind it); `retired`, the host handles it had before its file moved to another
+  store inode behind it); `ovl_holds`, its `Hold`s on the overlay nodes it names (its kind's
+  directory or `O_PATH` node, `ovl`, the directory of its dentry); `retired`, the host handles it had before its file moved to another
   object, kept until it closes.
 - `FileKind` — Host, Regular, Directory, Path, Pipe, Device, Pty, Socket, Epoll, EventFd,
   TimerFd, SignalFd, Inotify, Pidfd, MessageQueue, SeccompNotify, Bpf, Proc, Fuse (a FUSE file
@@ -112,7 +115,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `clone_mount`, `attach_tree`, `subtree`, `collect`, `readonly`, `sb_readonly`, `mount_flags`,
   `dev_of`, `fs_of`, `type_of`, `tmpfs_*`, `new_overlay`, `overlay`, `overlay_stat`,
   `overlay_readdir`, `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`,
-  `overlay_prefix`, `is_point_in`, `new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
+  `overlay_prefix`, `sweep_overlays`, `is_point_in`, `new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
   `fuse_child`, `fuse_permission`, `mount_nodes` (every attached and detached mount's root and
   point, which FUSE's node sweep keeps);
   syscalls `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `mount_setattr` (`fsopen`/`fsconfig`/`fsmount`/`fspick` have no handler: ENOSYS).
@@ -184,7 +187,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `NO_XDEV`'s "root taken" rule is approximated).
 - Back to paths: `reach` climbs through mount points (or the recorded dentry for mounts on files)
   and stops as unreachable at a namespace-tree root, a detached root, or a tmpfs root; a deleted
-  directory is `ENOENT`. mountinfo's `mounts_from` does the same for every mount, looking mounts up
+  directory (an overlay one once its name is removed) is `ENOENT`. mountinfo's `mounts_from` does the same for every mount, looking mounts up
   through an index by id built once. `getcwd` prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed
   live against the reader's root; an fd's display path is computed once at open, with
   ` (deleted)` appended later when nlink is 0.
@@ -366,6 +369,15 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `user.overlay.opaque` with `userxattr`, in any layer) ends it after itself. The same directory
   and name give the same node, its inodes refreshed from the layers on each lookup. Mounts on
   directories inside a layer are not seen through the overlay.
+- Node lifetime: a node lasts while its name does. Removing the name (unlink, rmdir, a rename
+  replacing it) makes it an orphan that no lookup finds again; once 1024 orphans have gathered
+  (then twice as many as the last sweep left), the end of a syscall sweeps them
+  (`sweep_overlays`): an orphan goes, with every node below it, unless it or a node below it is
+  held by an open file (`Hold`), is a process's root or cwd, the directory a running program was
+  found in, a mount's root or point, or watched by inotify, or it was removed after another
+  thread's system call began, unless that system call waits only on files it holds (reads and
+  writes, polls, waits for children and signals, sleeps, futexes, locks, receives, IPC, AIO
+  events; `waits_on_files_only`), as `kernel/process` numbers system calls.
 - readdir merges the layers' entries sorted by name, the highest layer's entry for each name,
   whiteouts hiding the names below them, each entry's inode number the one stat shows. Stat is the
   topmost inode's with the overlay's device number and the inode number of the lower inode a
@@ -905,8 +917,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   rename); `store_dir` refuses overlay directories (`EXDEV`) so no store path can reach a layer.
   A `Node::Store` of an overlay mount and its upper inode is built only inside one call (truncate,
   `may_create`), for mount flags.
-- Overlay nodes live until their instance's last mount is collected, one per directory and name
-  ever looked up through it.
+- Overlay nodes live while their names do, and a removed one while anything may still use it:
+  every open file naming an overlay node must hold it (`OpenFile::hold`, or the kind's node at
+  creation), and every other long-lived holder must be in the sweep's scan, or the node goes from
+  under it; a system call that waits while keeping a node it looked up (an open waiting for a FIFO
+  peer or a lease break) is kept safe only by staying out of `waits_on_files_only`.
 - An fd's display path is frozen at open; later renames do not change `/proc/<pid>/fd/N`.
 - Locks and leases are keyed by inode only and live in one kernel; they are not visible to other
   kernels or the host.
@@ -1053,7 +1068,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   then removed leaves the file's watch reporting its deletion with its last name, where Linux's
   overlay keeps the link counted on the file's inode and never does; `/proc/<pid>/exe` of a
   program from an overlay is followed by its
-  path; overlay nodes are never freed while mounted, so walking a large tree grows memory; the
+  path and never shows ` (deleted)` once the program's name is removed; nodes of names that still
+  exist are never freed while mounted, so walking a large tree keeps one per name looked up (Linux
+  shrinks its dentry cache under pressure), and removed ones stay while a path-based system call
+  that began before their removal still runs in another thread; the
   no-BKL stat never serves paths in an overlay; a copied-up file shares the lower object, so a
   change made to the lower layer by another path before the upper file is written shows through
   it (Linux leaves that undefined); origins are not recorded (no `trusted.overlay.origin`,

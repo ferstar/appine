@@ -193,6 +193,10 @@ pub struct OpenFile {
     /// Changes to the file's metadata go through the node ([`OpenFile::node`]), never to that
     /// inode directly.
     pub ovl: Option<crate::vfs::overlay::OvlId>,
+    /// The overlay nodes it names (its directory or `O_PATH` node, [`OpenFile::ovl`], the
+    /// directory of [`OpenFile::dentry`]), kept from being forgotten while it is open
+    /// ([`OpenFile::hold`]).
+    ovl_holds: Vec<crate::vfs::overlay::Hold>,
     /// The lower inode's object such a file was opened with, once its reads have moved to the
     /// copied-up one (`syscall::fs::follow_copy_up`): kept until the file is closed, since a read
     /// without the BKL may still be using it.
@@ -253,6 +257,14 @@ impl OpenFile {
 
     /// Creates an open file and records the absolute path at open time.
     pub fn with_path(kind: FileKind, flags: u32, path: Option<Rc<[u8]>>) -> FileRef {
+        let ovl_holds = match &kind {
+            FileKind::Directory {
+                node: Node::Overlay(_, o),
+                ..
+            }
+            | FileKind::Path(Node::Overlay(_, o)) => vec![crate::vfs::overlay::Hold::new(*o)],
+            _ => Vec::new(),
+        };
         Rc::new(RefCell::new(OpenFile {
             kind,
             flags: flags & !oflags::O_CLOEXEC,
@@ -261,6 +273,7 @@ impl OpenFile {
             dentry: None,
             mnt: crate::vfs::ROOT_MOUNT,
             ovl: None,
+            ovl_holds,
             ovl_lower: None,
             retired: Vec::new(),
             owner: (0, 0),
@@ -296,6 +309,15 @@ impl OpenFile {
                 self.flags & oflags::O_ACCMODE,
                 oflags::O_WRONLY | oflags::O_RDWR
             )
+    }
+
+    /// Keeps `node`, when it is an overlay node, from being forgotten while the file is open:
+    /// for the overlay node set as [`OpenFile::ovl`] and the directory of [`OpenFile::dentry`]
+    /// (the kind's node is held when the file is created).
+    pub fn hold(&mut self, node: &Node) {
+        if let Node::Overlay(_, o) = node {
+            self.ovl_holds.push(crate::vfs::overlay::Hold::new(*o));
+        }
     }
 
     /// The corresponding filesystem node (host fds, anonymous pipes and PTYs have none).

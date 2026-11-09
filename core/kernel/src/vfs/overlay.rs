@@ -7,7 +7,9 @@
 //! Every layer is a directory in the inode store, so an overlay node refers to the store inodes
 //! behind it ([`OvlNode`]) and reads go to the topmost of them. Nodes are created as names are
 //! looked up and kept per directory and name (Linux's overlay dentries), so the same path always
-//! gives the same node; they are dropped with their instance ([`Overlays::remove_instance`]).
+//! gives the same node; they are dropped with their instance ([`Overlays::remove_instance`]),
+//! and a node whose name was removed (unlinked, or replaced by a rename) is dropped once nothing
+//! can use it any more ([`Overlays::sweep`]).
 //!
 //! Changes go to the upper layer. What they change is first copied up ([`Overlays::upper_of`]):
 //! its parent directories, then itself with its data, attributes and times, each in one store
@@ -16,7 +18,9 @@
 //! one was removed is opaque, and a directory with lower layers cannot be renamed (EXDEV, Linux
 //! without `redirect_dir`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, PoisonError};
 
 use super::store::{DirEntry, Ino, Stat, Store, mode};
 use crate::errno::Errno;
@@ -47,6 +51,11 @@ pub(crate) type Layers = (Option<Ino>, Vec<Ino>);
 /// Most layers one overlay may stack (Linux's `OVL_MAX_STACK`).
 const MAX_STACK: usize = 500;
 
+/// Removed nodes kept before a sweep is tried ([`Overlays::wants_sweep`]); after a sweep the next
+/// one waits for twice as many as were left, so nodes still in use are not scanned again and
+/// again.
+const ORPHANS_MIN: usize = 1024;
+
 /// Every overlay instance and the nodes looked up in them.
 #[derive(Default)]
 pub(crate) struct Overlays {
@@ -54,6 +63,51 @@ pub(crate) struct Overlays {
     instances: HashMap<u64, Instance>,
     nodes: HashMap<OvlId, OvlNode>,
     next: OvlId,
+    /// Nodes whose name was removed, with the [`crate::task::SYSCALLS`] count when it was: no
+    /// lookup finds them again, and they go once nothing uses them ([`Overlays::sweep`]).
+    orphans: Vec<(OvlId, u64)>,
+    /// The number of orphans at which the next sweep is tried (0 meaning [`ORPHANS_MIN`]).
+    sweep_at: usize,
+}
+
+/// Open files holding each overlay node ([`Hold`]): their nodes are never swept. One table for
+/// every kernel in the process, since an open file does not know its kernel; a number held in
+/// another kernel only keeps a node of the same number a little longer.
+static HELD: Mutex<BTreeMap<OvlId, usize>> = Mutex::new(BTreeMap::new());
+
+/// An open file's claim on an overlay node (the node it was opened through, the directory it was
+/// opened in): while one exists, [`Overlays::sweep`] keeps the node, wherever the open file is
+/// (fd tables, `SCM_RIGHTS` messages in flight, epoll sets, AIO, loop devices).
+pub(crate) struct Hold(OvlId);
+
+impl Hold {
+    pub(crate) fn new(id: OvlId) -> Hold {
+        *HELD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id)
+            .or_default() += 1;
+        Hold(id)
+    }
+
+    /// Whether some open file holds node `id`.
+    fn held(id: OvlId) -> bool {
+        HELD.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&id)
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = held.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// One overlay instance (Linux's overlay superblock).
@@ -386,7 +440,73 @@ impl Overlays {
     pub(crate) fn remove_instance(&mut self, dev: u64) {
         if self.instances.remove(&dev).is_some() {
             self.nodes.retain(|_, n| n.dev != dev);
+            let nodes = &self.nodes;
+            self.orphans.retain(|(id, _)| nodes.contains_key(id));
         }
+    }
+
+    /// Node `id` lost its name: lookups no longer find it, and it can go once nothing uses it.
+    fn orphan(&mut self, id: OvlId) {
+        let now = crate::task::SYSCALLS.load(Ordering::Relaxed);
+        self.orphans.push((id, now));
+    }
+
+    /// Whether enough removed nodes have gathered to try a [`Overlays::sweep`].
+    pub(crate) fn wants_sweep(&self) -> bool {
+        self.orphans.len() >= self.sweep_at.max(ORPHANS_MIN)
+    }
+
+    /// Drops the removed nodes nothing can use any more, with what lies below them; returns how
+    /// many nodes went. A node stays while it, or a node below it (whose parent links lead to
+    /// it), is in `keep` (processes' roots, cwds and programs' directories, mounts, inotify
+    /// watches) or held by an open file ([`Hold`]), and while it was removed at or after
+    /// `oldest`, the [`crate::task::SYSCALLS`] number of the earliest system call still running in
+    /// another thread that may hold nodes it looked up before the removal.
+    pub(crate) fn sweep(&mut self, keep: &HashSet<OvlId>, oldest: u64) -> usize {
+        let orphans = std::mem::take(&mut self.orphans);
+        let removed: HashMap<OvlId, u64> = orphans.iter().copied().collect();
+        // Removed nodes are no longer their directories' children: index them by parent
+        let mut under: HashMap<OvlId, Vec<OvlId>> = HashMap::new();
+        for &(id, _) in &orphans {
+            if let Some(n) = self.nodes.get(&id) {
+                under.entry(n.parent).or_default().push(id);
+            }
+        }
+        let mut gone = 0;
+        for &(top, _) in &orphans {
+            if !self.nodes.contains_key(&top) {
+                continue;
+            }
+            let (mut stack, mut tree) = (vec![top], Vec::new());
+            let free = loop {
+                let Some(id) = stack.pop() else {
+                    break true;
+                };
+                if keep.contains(&id)
+                    || removed.get(&id).is_some_and(|&at| at >= oldest)
+                    || Hold::held(id)
+                {
+                    break false;
+                }
+                tree.push(id);
+                if let Some(n) = self.nodes.get(&id) {
+                    stack.extend(n.children.values());
+                }
+                stack.extend(under.get(&id).into_iter().flatten());
+            };
+            if free {
+                for id in tree {
+                    gone += usize::from(self.nodes.remove(&id).is_some());
+                }
+            }
+        }
+        let nodes = &self.nodes;
+        self.orphans = orphans
+            .into_iter()
+            .filter(|(id, _)| nodes.contains_key(id))
+            .collect();
+        self.sweep_at = 2 * self.orphans.len();
+        gone
     }
 
     /// Device numbers of the instances.
@@ -673,6 +793,7 @@ impl Overlays {
             Ok(())
         })?;
         self.node_mut(dir).children.remove(name);
+        self.orphan(child);
         Ok(())
     }
 
@@ -771,11 +892,15 @@ impl Overlays {
         n.parent = new;
         n.name = new_name.to_vec();
         self.node_mut(new).children.insert(new_name.to_vec(), src);
-        if exchange && let Some(d) = replaced {
-            let n = self.node_mut(d);
-            n.parent = old;
-            n.name = old_name.to_vec();
-            self.node_mut(old).children.insert(old_name.to_vec(), d);
+        match replaced {
+            Some(d) if exchange => {
+                let n = self.node_mut(d);
+                n.parent = old;
+                n.name = old_name.to_vec();
+                self.node_mut(old).children.insert(old_name.to_vec(), d);
+            }
+            Some(d) => self.orphan(d),
+            None => {}
         }
         Ok(())
     }
@@ -933,6 +1058,68 @@ mod tests {
         assert_eq!(of_key(f), None);
         o.remove_instance(0x31);
         assert!(!o.linked(top));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nodes of removed names go once nothing uses them: not while kept, held by an open file,
+    /// below a kept or held node, or removed after another thread's system call began.
+    #[test]
+    fn removed_nodes_go_once_unused() {
+        let dir = std::env::temp_dir().join(format!("appine-ovl-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::create(&dir).unwrap();
+        let root = super::super::store::ROOT;
+        let l = s.mkdir(root, b"l", 0o755, 0, 0).unwrap();
+        let u = s.mkdir(root, b"u", 0o755, 0, 0).unwrap();
+        let mut o = Overlays::default();
+        let top = o.add_instance(
+            0x32,
+            (Some(u), vec![l]),
+            ((0, 0), Vec::new()),
+            Options::default(),
+        );
+        let create = |o: &mut Overlays, d: OvlId, name: &[u8]| {
+            let up = o.upper_of(&s, d, CopyUp::All).unwrap();
+            s.create_file(up, name, 0o644, 0, 0).unwrap();
+            o.lookup(&s, d, name).unwrap()
+        };
+        // Files made and removed one after another: every node goes
+        for i in 0..100 {
+            let name = format!("tmp{i}");
+            create(&mut o, top, name.as_bytes());
+            o.remove(&s, top, name.as_bytes(), false).unwrap();
+        }
+        assert_eq!(o.orphans.len(), 100);
+        let before = o.nodes.len();
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 100);
+        assert_eq!(o.nodes.len(), before - 100);
+        assert!(o.orphans.is_empty());
+        // A removed directory with a removed file below it held open, another kept as a cwd,
+        // a file replaced by a rename while another thread's system call was running
+        let up = o.upper_of(&s, top, CopyUp::All).unwrap();
+        s.mkdir(up, b"d", 0o755, 0, 0).unwrap();
+        let d = o.lookup(&s, top, b"d").unwrap();
+        let f = create(&mut o, d, b"f");
+        let hold = Hold::new(f);
+        o.remove(&s, d, b"f", false).unwrap();
+        o.remove(&s, top, b"d", true).unwrap();
+        s.mkdir(up, b"cwd", 0o755, 0, 0).unwrap();
+        let cwd = o.lookup(&s, top, b"cwd").unwrap();
+        o.remove(&s, top, b"cwd", true).unwrap();
+        let started = crate::task::SYSCALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let g = create(&mut o, top, b"g");
+        create(&mut o, top, b"h");
+        o.rename(&s, (top, b"h"), (top, b"g"), (false, false))
+            .unwrap();
+        let keep = HashSet::from([cwd]);
+        assert_eq!(o.sweep(&keep, started), 0);
+        assert!([d, f, cwd, g].iter().all(|n| o.nodes.contains_key(n)));
+        // Once let go and the system call is over, all of it goes
+        drop(hold);
+        assert_eq!(o.sweep(&HashSet::new(), u64::MAX), 4);
+        assert!([d, f, cwd, g].iter().all(|n| !o.nodes.contains_key(n)));
+        assert!(o.linked(top) && o.orphans.is_empty());
+        o.remove_instance(0x32);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

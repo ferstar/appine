@@ -1534,6 +1534,10 @@ impl Vfs {
                         reached = false;
                         break;
                     }
+                    // A removed directory, as in the store
+                    if !ovl.linked(o) {
+                        return Err(Errno::ENOENT);
+                    }
                     names.push(ovl.node(o).name.clone());
                     cur = Node::Overlay(id, up);
                 }
@@ -2365,6 +2369,15 @@ impl Vfs {
     /// layers and options).
     pub(crate) fn overlay(&self) -> crate::cell::Ref<'_, overlay::Overlays> {
         self.overlays.borrow()
+    }
+
+    /// Drops the removed overlay nodes nothing uses any more ([`overlay::Overlays::sweep`]).
+    pub(crate) fn sweep_overlays(
+        &self,
+        keep: &std::collections::HashSet<overlay::OvlId>,
+        oldest: u64,
+    ) -> usize {
+        self.overlays.borrow_mut().sweep(keep, oldest)
     }
 
     /// Mounts a new FUSE instance served through connection `conn` (whose device number is

@@ -1337,6 +1337,73 @@ pub(super) fn collect_released(k: &crate::kernel::Kernel, vfs: &Vfs) {
     }
 }
 
+/// At the end of a syscall, once enough overlay names have been removed: drops the nodes
+/// behind them that nothing can use any more ([`overlay::Overlays::sweep`]). Kept are the nodes
+/// processes' roots and cwds are, the directories programs were run from (`/proc/<pid>/exe`
+/// follows them), mounts' roots and points, and inotify watches; open files hold their own
+/// ([`overlay::Hold`]). A system call another thread is in may hold nodes it looked up while it
+/// waits, so it keeps those removed since it began, unless it waits only on files it holds
+/// ([`waits_on_files_only`]): a long wait4, epoll_wait or read keeps nothing.
+pub(super) fn sweep_overlays(cx: &Cx<'_>) {
+    let Ok(vfs) = cx.vfs() else {
+        return;
+    };
+    if !vfs.overlay().wants_sweep() {
+        return;
+    }
+    let ovl = |n: &Node| match n {
+        Node::Overlay(_, o) => Some(*o),
+        _ => None,
+    };
+    let k = cx.kr();
+    let mut keep = HashSet::new();
+    let mut oldest = u64::MAX;
+    for task in k.tasks.values() {
+        let (began, nr) = task.syscall.get();
+        if began != 0 && !Rc::ptr_eq(task, cx.task) && !waits_on_files_only(nr) {
+            oldest = oldest.min(began);
+        }
+        // Something is borrowed (not expected between syscalls): another time
+        let Ok(res) = task.res.try_borrow() else {
+            return;
+        };
+        let Ok(fs) = res.fs.try_borrow() else {
+            return;
+        };
+        keep.extend(ovl(&fs.root));
+        keep.extend(ovl(&fs.cwd));
+    }
+    for g in k.groups.values() {
+        let Ok(g) = g.try_borrow() else {
+            return;
+        };
+        if let Some((dir, _)) = g.exe.as_ref().and_then(|e| e.dentry.as_ref()) {
+            keep.extend(ovl(dir));
+        }
+    }
+    keep.extend(vfs.mount_nodes().iter().filter_map(ovl));
+    let Ok(inotify) = k.inotify.try_borrow() else {
+        return;
+    };
+    keep.extend(inotify.watched().filter_map(overlay::of_key));
+    drop(inotify);
+    vfs.sweep_overlays(&keep, oldest);
+}
+
+/// Whether system call `nr` waits (with the BKL released) only on files it holds or on nothing,
+/// never holding a node it looked up by path: reads and writes, polls and epoll, waits for
+/// children and signals, sleeps and futexes, locks, socket receives and accepts, message queues
+/// and semaphores, AIO events.
+fn waits_on_files_only(nr: u64) -> bool {
+    // read to tee (63–77) are reads and writes, sendfile, pselect6, ppoll, signalfd4 and splice
+    (63..=77).contains(&nr)
+        || [
+            4, 22, 25, 29, 32, 82, 83, 95, 98, 101, 115, 133, 137, 182, 183, 188, 189, 192, 193,
+            202, 207, 212, 242, 243, 260, 285, 292, 441, 449,
+        ]
+        .contains(&nr)
+}
+
 fn collect_now(k: &crate::kernel::Kernel, vfs: &Vfs) {
     match try_in_use(k) {
         Some(used) => vfs.collect(&used),

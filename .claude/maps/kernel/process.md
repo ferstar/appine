@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering last)
 
 ## Responsibilities
 
@@ -38,7 +38,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - `Task` — one guest thread: tid, `killed`, `pdeathsig`, exit status, CPU-clock bookkeeping, nice,
   affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`, `vfork` (its
-  vfork completion is still pending, for the OOM killer); thread-private `TaskState` (address
+  vfork completion is still pending, for the OOM killer), `syscall` (the BKL syscall it is in: its
+  number in the global `SYSCALLS` count and the syscall number); thread-private `TaskState` (address
   space, fd table and `FsContext`, each shared or not per clone flags; thread group; alternate
   stack; `clear_child_tid`; vfork completion).
 - `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mm` shootdowns).
@@ -167,8 +168,12 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   buffers of read, write, pread64, pwrite64 and the vector forms are read into FUSE mappings
   (`kernel/fuse`'s `prefault`), since those consume input before copying. ptrace's entry and exit
   stops and seccomp see one syscall. After the handler, between syscalls, the FUSE node cache may
-  be swept (`kernel/fuse`'s `sweep`), and detached mounts whose last use the syscall let go of
-  are collected (`kernel/vfs`).
+  be swept (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of
+  are collected and removed overlay nodes swept (`kernel/vfs`).
+- From after the entry stop and seccomp until those sweeps, before the exit stop and signal
+  delivery, the thread records the syscall in `Task::syscall` (`InSyscall`, cleared on every way
+  out), numbered by the global `SYSCALLS` count, so the overlay sweep can tell which syscalls
+  began before a removal.
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
 
@@ -586,6 +591,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
   nodes; a node another thread holds must be found by `kernel/fuse`'s `in_use` scan, an open
   handle or a request in flight.
+- Removed overlay nodes are kept for every syscall in progress that began before the removal,
+  unless its number is in `kernel/vfs`'s `waits_on_files_only`: a syscall that waits with the BKL
+  released while keeping a node it looked up must never be added there.
 
 ## Confirmed bugs / technical debt
 

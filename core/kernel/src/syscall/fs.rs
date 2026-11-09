@@ -618,6 +618,10 @@ fn open_path_with(
         let mut f = file.borrow_mut();
         f.mnt = mnt;
         f.ovl = Some(o);
+        f.hold(&Node::Overlay(mnt, o));
+    }
+    if let Some((dir, _)) = &parent {
+        file.borrow_mut().hold(dir);
     }
     file.borrow_mut().dentry = parent.clone();
     if let Some(ino) = opened_ino {

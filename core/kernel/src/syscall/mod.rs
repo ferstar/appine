@@ -50,6 +50,7 @@ pub(crate) use ptrace::encode_regset;
 pub(crate) use sched::host_started;
 pub(crate) use tty::{hang_up, hang_up_closed};
 
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use appine_engine::Cpu;
@@ -174,6 +175,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     crate::vfs::fuse::new_syscall();
     fuse::prefault(cx, nr, &a);
     crate::mm::take_wanted();
+    // Until the end of the syscall, other threads see that this one may hold overlay nodes it
+    // looked up (mount::sweep_overlays)
+    let in_syscall = InSyscall::enter(cx.task, nr);
     let mut retries = 0;
     let result = loop {
         let result = match nr {
@@ -579,6 +583,9 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     if let Ok(vfs) = cx.vfs() {
         mount::collect_released(cx.kr(), &vfs);
     }
+    // Removed overlay nodes nothing uses any more
+    mount::sweep_overlays(cx);
+    drop(in_syscall);
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
     // before reaping)
@@ -630,6 +637,24 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     crate::ptrace::syscall_stepped(cx);
     // Handle pending signals and syscall restarts before returning to user space, as on Linux
     signal::deliver(cx, cpu, true)
+}
+
+/// The thread is inside BKL system call `nr` while this lives ([`crate::task::Task::syscall`]),
+/// left on every way out of [`dispatch`].
+struct InSyscall(Rc<crate::task::Task>);
+
+impl InSyscall {
+    fn enter(task: &Rc<crate::task::Task>, nr: u64) -> InSyscall {
+        let n = crate::task::SYSCALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        task.syscall.set((n, nr));
+        InSyscall(task.clone())
+    }
+}
+
+impl Drop for InSyscall {
+    fn drop(&mut self) {
+        self.0.syscall.set((0, 0));
+    }
 }
 
 /// Calling `nr` in pid namespace `ns`: pids, tids and process group IDs in the arguments are

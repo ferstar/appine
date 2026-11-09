@@ -164,6 +164,11 @@ pub(crate) struct Task {
     /// The tracer resumed it with PTRACE_SYSCALL: all syscalls go to the BKL-holding path so that
     /// they can stop at entry and exit (`syscall::fast` reads it without the BKL).
     pub syscall_traced: AtomicBool,
+    /// The system call the thread is in on the BKL path, as (its number in [`SYSCALLS`], its
+    /// system call number); (0, 0) outside one. Read under the BKL by other threads: an overlay
+    /// node removed after a thread's system call began may still be used by it
+    /// (the overlay sweep in `syscall::mount`).
+    pub syscall: Cell<(u64, u64)>,
     /// How the thread ended itself: the exit code of exit(2), or seccomp having it end with a
     /// signal (reported to the tracer when a traced thread exits).
     pub exit_status: Cell<ExitStatus>,
@@ -191,6 +196,10 @@ pub(crate) struct Task {
     /// State accessed only by the thread itself.
     pub state: std::cell::RefCell<TaskState>,
 }
+
+/// System calls entered on the BKL path so far, across all kernels: each one takes the next
+/// number ([`Task::syscall`]), so numbers order system calls against what happens under the BKL.
+pub(crate) static SYSCALLS: AtomicU64 = AtomicU64::new(0);
 
 /// A thread's private state, and the resources it shares with other threads.
 pub(crate) struct TaskState {
@@ -273,6 +282,7 @@ impl Task {
             host_tid: Cell::new(0),
             trace: RefCell::default(),
             syscall_traced: AtomicBool::new(false),
+            syscall: Cell::new((0, 0)),
             exit_status: Cell::new(ExitStatus::Exited(0)),
             exit_started: Cell::new(false),
             vfork: Cell::new(vfork),
