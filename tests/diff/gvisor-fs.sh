@@ -23,9 +23,7 @@ SKIP="$SKIP:OpenTest.OpenWithStrangeFlags"
 # kernel/vfs: scoped openat2 never returns EAGAIN (the rename variants loop for minutes)
 SKIP="$SKIP:Openat2Test.BeneathRaceWithMount:Openat2Test.InRootRaceWithMount"
 SKIP="$SKIP:Openat2Test.BeneathRaceWithRename:Openat2Test.InRootRaceWithRename"
-# kernel/cred: per-thread id changes leak to every thread (a helper thread's setresuid takes the
-# main thread's CAP_CHOWN); kernel/vfs: anonymous pipes and sockets cannot change owner
-SKIP="$SKIP:ChownKinds/ChownParamTest.ChownFileSucceedsAsRoot/*"
+# kernel/vfs: anonymous pipes and sockets cannot change owner
 SKIP="$SKIP:ChownTest.FchownPipeFileSucceeds:ChownTest.FchownPipeFileFails"
 M=MountTest
 # mount_test. kernel/vfs: mount and unmount events do not propagate between peers and slaves (only

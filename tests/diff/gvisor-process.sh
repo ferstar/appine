@@ -17,10 +17,7 @@ SKIP="$SKIP:$P.ExecvePtraceLockStress"
 # at an attach-time group stop reports the stop again
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
-# kernel/cred: per-thread id changes leak to every thread (a helper thread's setresuid takes root
-# from the main thread, whose cleanup then fails); kernel/cred D2: no ACLs
-SKIP="$SKIP:ExecTest.FileCapsAlreadyHeldKeptWithNoNewPrivs:ExecTest.FileCapsClearAmbient"
-SKIP="$SKIP:ExecTest.FileCapsClearAmbientWithNoNewPrivs:ExecTest.FileCapsNotGainedWithNoNewPrivs"
+# kernel/cred D2: no ACLs
 SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
 # kernel/signal: rt_sigqueueinfo to a zombie is ESRCH
 SKIP="$SKIP:RtSignalTest.InvalidCodes"
