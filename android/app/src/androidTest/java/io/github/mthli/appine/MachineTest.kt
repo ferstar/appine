@@ -995,6 +995,38 @@ class MachineTest {
     }
 
     /**
+     * The persisted grants a deleted, renamed or moved directory takes along (the android/documents
+     * map): those on the directory and below it, as document or tree URIs (a document reached
+     * through a tree counts as its tree), once each; not a sibling sharing the name's prefix,
+     * another provider's documents or IDs that are not canonical.
+     */
+    @Test
+    fun documentsGrantsBelowADirectory() {
+        val authority = Documents.authority(context)
+        fun doc(id: String) = DocumentsContract.buildDocumentUri(authority, id)
+        fun tree(id: String) = DocumentsContract.buildTreeDocumentUri(authority, id)
+        val uris = listOf(
+            doc("/home/a/dir"),
+            tree("/home/a/dir/sub"),
+            doc("/home/a/dir/sub/f.txt"),
+            DocumentsContract.buildDocumentUriUsingTree(tree("/home/a/dir"), "/home/a/dir/g"),
+            doc("/home/a/dirx"),
+            tree("/home/a"),
+            doc("/home/a/dir/../x"),
+            DocumentsContract.buildDocumentUri("other.documents", "/home/a/dir/f"),
+        )
+        assertEquals(
+            listOf("/home/a/dir", "/home/a/dir/sub", "/home/a/dir/sub/f.txt"),
+            Documents.grantedUnder(uris, authority, "/home/a/dir"),
+        )
+        assertEquals(
+            listOf("/home/a/dir", "/home/a/dir/sub", "/home/a/dir/sub/f.txt", "/home/a/dirx", "/home/a"),
+            Documents.grantedUnder(uris, authority, "/"),
+        )
+        assertEquals(emptyList<String>(), Documents.grantedUnder(uris, authority, "/home/b"))
+    }
+
+    /**
      * Changes made in the Files app go to the running kernel, and a program watching in the guest
      * receives inotify events: a written file is reported only when the Files app side closes it
      * ([Documents.openDocument] hands the fd out with a close callback). The other way round,

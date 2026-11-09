@@ -162,7 +162,7 @@ class Documents : DocumentsProvider() {
         val home = writableHome(context)
         val path = writable(home, documentId)
         browse { Native.browseRemove(it, home.path, path) }
-        revokeDocumentPermission(documentId)
+        revokeTree(context, documentId, path)
         childrenChanged(context, parent(path))
     }
 
@@ -172,7 +172,7 @@ class Documents : DocumentsProvider() {
         val path = writable(home, documentId)
         val name = browse { Native.browseRename(it, home.path, path, fileName(displayName, "", true)) }
         val renamed = child(parent(path), name)
-        if (renamed != path) revokeDocumentPermission(documentId)
+        if (renamed != path) revokeTree(context, documentId, path)
         childrenChanged(context, parent(path))
         return renamed
     }
@@ -187,7 +187,7 @@ class Documents : DocumentsProvider() {
         val path = writable(home, sourceDocumentId)
         val target = writable(home, targetParentDocumentId, top = true)
         browse { Native.browseMove(it, home.path, path, target) }
-        revokeDocumentPermission(sourceDocumentId)
+        revokeTree(context, sourceDocumentId, path)
         childrenChanged(context, parent(path))
         childrenChanged(context, target)
         return child(target, path.substringAfterLast('/'))
@@ -361,6 +361,20 @@ class Documents : DocumentsProvider() {
         context.contentResolver.notifyChange(DocumentsContract.buildChildDocumentsUri(authority(context), dir), null)
     }
 
+    /**
+     * Document [documentId] (canonical [path]) was deleted, renamed or moved: the grants on it go,
+     * and so do the persisted grants other apps hold on documents below it. The framework revokes
+     * a URI together with the URIs under it by path segment, and an ID is one segment, so a grant
+     * on a descendant would outlive the directory and, as IDs are paths, cover a file created at
+     * the same path later. Transient grants below it cannot be listed; they end with the activity
+     * that holds them.
+     */
+    private fun revokeTree(context: Context, documentId: String, path: String) {
+        revokeDocumentPermission(documentId)
+        val held = runCatching { context.contentResolver.outgoingPersistedUriPermissions }.getOrDefault(emptyList())
+        grantedUnder(held.map { it.uri }, authority(context), path).forEach(::revokeDocumentPermission)
+    }
+
     /** What a `file:` link names ([fileLink]). */
     sealed interface FileLink {
         /** A document shown now, and its MIME type. */
@@ -524,6 +538,20 @@ class Documents : DocumentsProvider() {
         }
 
         fun child(dir: String, name: String) = if (dir == "/") "/$name" else "$dir/$name"
+
+        /**
+         * Of the granted URIs [uris], the document IDs of those on this provider ([authority]) that
+         * name [path] or a document below it: a tree URI by its tree's document, other URIs by
+         * their document ([revokeTree]).
+         */
+        fun grantedUnder(uris: List<Uri>, authority: String, path: String): List<String> = uris.mapNotNull { uri ->
+            if (uri.authority != authority) return@mapNotNull null
+            val id = runCatching {
+                if (DocumentsContract.isTreeUri(uri)) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
+            }.getOrNull() ?: return@mapNotNull null
+            val doc = canonical(id) ?: return@mapNotNull null
+            id.takeIf { doc == path || doc.startsWith(if (path == "/") "/" else "$path/") }
+        }.distinct()
 
         fun parent(path: String) = path.substringBeforeLast('/').ifEmpty { "/" }
 

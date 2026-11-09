@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-07 (targeted verification only since the full mapping: the system root independent of a home root, a home of `/` refused as writable; write fds with a close callback, guest changes notified in one call; last, `file:` links and document paths)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: a system root apart from the home root, a home of `/` read-only; write fds with a close callback; changes notified in one call; `file:` links; grants below directories last)
 
 ## Responsibilities
 
@@ -77,7 +77,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 - Create: names sanitised (`/` and NUL to `_`; empty, `.`, `..` to `_`), an extension added from
   the MIME type for files; owned by the home account, 0644/0755, numbered on collision. Delete,
   rename (no overwrite, no extension added) and move are limited to the home by real path; each
-  revokes grants on the source ID and notifies the affected directories.
+  revokes grants on the source ID and, among the persisted grants other apps hold on this
+  provider (`getOutgoingPersistedUriPermissions`), those on documents below it (`grantedUnder`: a
+  tree URI by its tree's document), and notifies the affected directories. The framework revokes
+  a URI with those below it by path segment, and an ID is a single segment, hence the listing.
 - Search: by name under the root, breadth first (200 results, 50,000 entries).
 
 ### Links from the terminal
@@ -132,9 +135,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ## Confirmed bugs / technical debt
 
-- **Grants outlive moved or deleted directories.** Only the exact source ID is revoked; grants on
-  its descendants survive, and since IDs are paths a file later created at the same path is covered
-  by the old grant.
+- **Transient grants outlive moved or deleted directories.** Grants given for an activity (opening
+  a file in another app) cannot be listed, so those on a moved or deleted directory's descendants
+  last until that activity ends, and since IDs are paths they cover a file created at the same
+  path meanwhile; persisted grants are revoked.
 
 ## Open questions
 
