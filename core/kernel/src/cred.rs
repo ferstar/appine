@@ -630,7 +630,15 @@ impl Cred {
     /// target is dumpable, or there is `CAP_SYS_PTRACE` in the target's user namespace; then both
     /// are in the same user namespace and the target's permitted set does not exceed our own
     /// permitted set (our effective set with `fscreds`), or there is that `CAP_SYS_PTRACE`.
-    pub fn may_ptrace(&self, target: &Cred, dumpable: bool, fscreds: bool) -> bool {
+    ///
+    /// A target that is not dumpable is reachable only with `CAP_SYS_PTRACE` in `mm_ns`, the
+    /// user namespace of its address space (Linux's `mm->user_ns`; the target's own when None).
+    pub fn may_ptrace(
+        &self,
+        target: &Cred,
+        (dumpable, mm_ns): (bool, Option<&UserNs>),
+        fscreds: bool,
+    ) -> bool {
         let (uid, gid, caps) = if fscreds {
             (self.fsuid, self.fsgid, self.cap_effective)
         } else {
@@ -644,7 +652,11 @@ impl Cred {
                 .all(|&g| g == gid);
         let privileged = self.ns_capable(&target.user_ns, cap::SYS_PTRACE);
         let subset = self.user_ns.id == target.user_ns.id && target.cap_permitted & !caps == 0;
-        privileged || same && dumpable && subset
+        // __ptrace_may_access: the IDs or the capability, then dumpable or the capability over the
+        // address space's namespace, then cap_ptrace_access_check
+        let reachable =
+            dumpable || self.ns_capable(mm_ns.unwrap_or(&target.user_ns), cap::SYS_PTRACE);
+        (same || privileged) && reachable && (subset || privileged)
     }
 
     /// Whether a process with credentials `target` may be signalled (`kill_ok_by_cred`): the
@@ -1005,6 +1017,20 @@ pub(crate) struct UserNs {
 }
 
 impl UserNs {
+    /// This namespace or its nearest ancestor where `uid` and `gid` (kernel IDs) are both mapped
+    /// (Linux's `privileged_wrt_inode_uidgid` walk in `would_dump`); the initial namespace at the
+    /// latest.
+    pub fn holding(self: &Rc<UserNs>, uid: u32, gid: u32) -> Rc<UserNs> {
+        let mut ns = self.clone();
+        while let Some(parent) = ns.parent.clone() {
+            if ns.uid_map.borrow().up(uid).is_some() && ns.gid_map.borrow().up(gid).is_some() {
+                break;
+            }
+            ns = parent;
+        }
+        ns
+    }
+
     /// The boot-time user namespace (a new copy each time, compared by id).
     pub fn init() -> Rc<UserNs> {
         Rc::new(UserNs {

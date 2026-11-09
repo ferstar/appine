@@ -103,6 +103,8 @@ impl Errno {
     pub const EPROTO: Errno = Errno(71);
     /// Too many users (a multithreaded process setns-ing into a time namespace).
     pub const EUSERS: Errno = Errno(87);
+    /// Accessing a corrupted shared library (execve: an interpreter that is not an aarch64 ELF).
+    pub const ELIBBAD: Errno = Errno(80);
     /// Not a socket.
     pub const ENOTSOCK: Errno = Errno(88);
     /// Message too long.

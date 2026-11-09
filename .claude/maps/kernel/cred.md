@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' owners; ptrace access and credentials; seccomp pids; v3 file caps; vDSO seccomp bypass; shared fs at execve; per-thread credentials; personality clearing last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: new files' owners; ptrace access and credentials; seccomp pids; v3 file caps; vDSO seccomp bypass; shared fs at execve; per-thread credentials; personality clearing; mm user namespace last)
 
 ## Responsibilities
 
@@ -135,8 +135,11 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   ambient; `KEEP_CAPS` is cleared; secureexec = setid or (non-root real uid and (file effective or
   permitted ⊄ ambient)).
 - After the transition: secureexec sets `AT_SECURE` and caps the stack rlimit at 8 MB; dumpable is
-  cleared when ids differ or permitted grew, else set from whether the caller can read the file;
-  pdeathsig is cleared in those cases. A setuid or setgid program, or one whose file capabilities
+  cleared when ids differ or permitted grew, else set from whether the caller can read the program
+  file and its interpreter; pdeathsig is cleared in those cases. The address space's user namespace
+  (`ThreadGroup::mm_user_ns`, Linux's `mm->user_ns`, kept by fork) is the caller's, raised for a
+  file it cannot read to the nearest ancestor where that file's owner and group are mapped
+  (`UserNs::holding`, `would_dump`). A setuid or setgid program, or one whose file capabilities
   would grant more than the caller had (judged before no_new_privs or an unsafe execution takes
   the gain away), clears the personality flags in `PER_CLEAR_ON_SETID` (Linux's
   `bprm->per_clear`).
@@ -162,10 +165,12 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - `may_signal` (Linux `kill_ok_by_cred`): sender's real or effective uid equals the target's real
   or saved uid, or `CAP_KILL` over the target's namespace; callers add same group and SIGCONT
   within the session.
-- `may_ptrace(target, dumpable, fscreds)`: privileged (`CAP_SYS_PTRACE` over the target's
-  namespace) or (all three target uids and gids equal the caller's filesystem or real ids, the target
-  is dumpable, same namespace and the target's permitted ⊆ the caller's effective set with
-  filesystem credentials, its permitted set with real ones); procfs links and the opens of
+- `may_ptrace(target, (dumpable, mm namespace), fscreds)` (Linux's `__ptrace_may_access` and
+  `cap_ptrace_access_check`): all three target uids and gids equal the caller's filesystem or real
+  ids, or `CAP_SYS_PTRACE` over the target's namespace; and the target is dumpable or the caller
+  has `CAP_SYS_PTRACE` over its address space's namespace; and the same namespace with the target's
+  permitted ⊆ the caller's effective set with filesystem credentials (its permitted set with real
+  ones), or `CAP_SYS_PTRACE` over the target's namespace; procfs links and the opens of
   `/proc/<pid>/mem`, `auxv`, `environ`, `maps`, `smaps` and `pagemap` use filesystem credentials,
   ptrace attach, process_vm, pidfd_getfd, kcmp and setns through a pidfd real ones.
 

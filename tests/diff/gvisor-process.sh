@@ -31,4 +31,5 @@ SKIP="$SKIP:VforkTest.ExecedChildExitDoesntUnstopParent:VforkTest.SigchldReceive
 SKIP="$SKIP:VforkTest.ParentStopsUntilChildExits:ExitTest.CloseFds"
 sh /tmp/difftest-files/gtest/run.sh gvisor "$SKIP" fork_test vfork_test exec_test exit_test \
     wait_test pidfd_test kill_test tgkill_test sigaction_test sigprocmask_test sigaltstack_test \
-    sigtimedwait_test sigstop_test signalfd_test rtsignal_test alarm_test ptrace_test futex_test
+    sigtimedwait_test sigstop_test signalfd_test rtsignal_test alarm_test ptrace_test futex_test \
+    exec_binary_test

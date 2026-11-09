@@ -384,6 +384,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.sid = parent.sid;
         g.rlimits = parent.rlimits;
         g.dumpable = parent.dumpable;
+        g.mm_user_ns = parent.mm_user_ns.clone();
         g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
@@ -865,7 +866,16 @@ fn exec(
         secure,
         stack_limit,
     };
-    let mut read_interp = |p: &[u8]| process::read_executable(&vfs, &view, &cred, &root, &cwd, p);
+    // An interpreter the caller cannot read makes the process non-dumpable too (would_dump): its
+    // owner and group
+    let interp_unreadable = std::cell::Cell::new(None);
+    let mut read_interp = |p: &[u8]| {
+        let (exe, st, _) = process::open_executable(&vfs, &view, &cred, &root, &cwd, p)?;
+        if cred.permission(&st, crate::cred::MAY_READ).is_err() {
+            interp_unreadable.set(Some((st.uid, st.gid)));
+        }
+        Ok(exe)
+    };
     let prepared = loader::prepare(&file, &mut read_interp).map_err(load_error)?;
     // The new address space is built with the BKL released: mapping the program's segments and
     // building the initial stack took most of execve's time under the lock, and processes at both
@@ -956,8 +966,8 @@ fn exec(
         // As with Linux's commit_creds, changing the effective IDs or gaining new capabilities
         // makes the process non-dumpable, and the parent's exit no longer signals it; a
         // privileged exec likewise no longer signals it. Other execs make it dumpable again
-        // (begin_new_exec), except when the program file is not readable by the caller
-        // (would_dump)
+        // (begin_new_exec), except when the program file or its interpreter is not readable by
+        // the caller (would_dump)
         let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
         let gained = new_cred.cap_permitted & !cred.cap_permitted != 0;
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
@@ -967,8 +977,20 @@ fn exec(
             g.dumpable = false;
             cx.task.pdeathsig.set(0);
         } else {
-            g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok();
+            g.dumpable = cred.permission(&st, crate::cred::MAY_READ).is_ok()
+                && interp_unreadable.get().is_none();
         }
+        // The new address space belongs to the caller's user namespace, or to the nearest
+        // ancestor where a program file it could not read is owned by mapped IDs (would_dump's
+        // mm->user_ns), so tracers privileged only in a namespace below cannot reach it
+        let mut mm_ns = cred.user_ns.clone();
+        if cred.permission(&st, crate::cred::MAY_READ).is_err() {
+            mm_ns = mm_ns.holding(st.uid, st.gid);
+        }
+        if let Some((uid, gid)) = interp_unreadable.get() {
+            mm_ns = mm_ns.holding(uid, gid);
+        }
+        g.mm_user_ns = Some(mm_ns);
         if secure {
             cx.task.pdeathsig.set(0);
         }
@@ -1013,6 +1035,10 @@ fn exec(
     let st = cpu.state_mut();
     st.pc = image.entry;
     st.sp = image.sp;
+    // What Linux fails to map after the point of no return kills the process (force_fatal_sig)
+    if image.doomed {
+        signal::force_fatal(cx, Signal::SEGV, SigInfo::kernel());
+    }
     // Handle already pending signals before the new program starts
     if cx.interrupted() {
         // SAFETY: cpu belongs to the current thread, which is running
@@ -1088,6 +1114,7 @@ fn file_caps(vfs: &Vfs, ino: Ino, cred: &Cred) -> Result<Option<FileCaps>, Errno
 fn load_error(e: LoadError) -> Errno {
     match e {
         LoadError::NotElf | LoadError::Unsupported(_) | LoadError::Malformed(_) => Errno::ENOEXEC,
+        LoadError::BadInterpreter(_) => Errno::ELIBBAD,
         LoadError::ArgumentsTooLong => Errno::E2BIG,
         LoadError::Memory(e) | LoadError::Read(e) | LoadError::Interpreter(_, e) => e,
     }
@@ -1125,6 +1152,9 @@ pub(crate) fn label_image(
     exe: (&Rc<[u8]>, u64),
     interp: Option<(Rc<[u8]>, u64)>,
 ) {
+    if image.main.1 <= image.main.0 {
+        return;
+    }
     mm.label(
         image.main.0,
         image.main.1 - image.main.0,
@@ -1737,7 +1767,7 @@ fn ptrace_access(cx: &Cx<'_>, tid: Tid, fscreds: bool) -> bool {
     let g = group.borrow();
     g.tgid == cx.tgid()
         || k.cred_of(tid)
-            .is_some_and(|c| cx.cred().may_ptrace(&c, g.dumpable, fscreds))
+            .is_some_and(|c| cx.cred().may_ptrace(&c, g.dump_scope(), fscreds))
 }
 
 // ---- unshare ----

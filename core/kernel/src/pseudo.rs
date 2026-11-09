@@ -1673,7 +1673,7 @@ impl View<'_> {
                 || self
                     .k
                     .cred_of(pid)
-                    .is_some_and(|c| self.reader().may_ptrace(&c, g.dumpable, true))
+                    .is_some_and(|c| self.reader().may_ptrace(&c, g.dump_scope(), true))
         })
     }
 

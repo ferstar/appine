@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; futexes, PI; execve, loader; BKL watchdog; vDSO; timers; FUSE, mount, overlay hooks; per-thread credentials; sched_yield; vfork freezing; exec personality last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; futexes, PI; BKL watchdog; vDSO; timers; FUSE, mount, overlay hooks; per-thread credentials; sched_yield; vfork freezing; exec personality; ELF loader last)
 
 ## Responsibilities
 
@@ -245,15 +245,17 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   file capabilities come from the xattr; a fs context shared with another process makes the
   execution unsafe, so it gains nothing (`kernel/cred`). A secure exec clamps the stack limit to
   8 MB (written back to `RLIMIT_STACK`).
-- Under the BKL the main ELF is parsed and the interpreter file opened and read; then the BKL is
-  released while the interpreter's headers are parsed and a new address space (sharing the kernel's
-  read-only file mappings, the vDSO image, host random bytes) and initial stack are built. Back
-  under the BKL, a killed thread gives up with `EINTR`.
+- Under the BKL the main ELF is parsed and the interpreter file opened, read and its headers
+  checked; then the BKL is released while a new address space (sharing the kernel's read-only file
+  mappings, the vDSO image, host random bytes) and initial stack are built. Back under the BKL, a
+  killed thread gives up with `EINTR`. What Linux fails to map only after its point of no return
+  makes the image doomed: execve commits as usual and then kills the process with a forced
+  `SIGSEGV` (`force_fatal_sig`).
 - Point of no return: the other threads are killed and waited for (the BKL is released while
   waiting; only the caller being killed can still fail it, with `EINTR`); a non-leader takes over
   the tgid. Then: enter the time namespace for children, unshare and close-on-exec the fd table,
   release locks, sample RSS, record the new `exe_file`, apply dumpable/pdeathsig rules and
-  credentials, clear `READ_IMPLIES_EXEC` from the personality (arm64's `SET_PERSONALITY`) and on a
+  credentials, set the address space's user namespace (`ThreadGroup::mm_user_ns`, `kernel/cred`), clear `READ_IMPLIES_EXEC` from the personality (arm64's `SET_PERSONALITY`) and on a
   privileged exec the other `PER_CLEAR_ON_SETID` flags (`kernel/cred`), clear POSIX timers and
   AIO, unshare and reset signal handlers, release the old address space (reaping shm segments
   marked for removal it held last), reset the CPU state for the new page table (re-kicking if
@@ -261,17 +263,32 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### ELF loader
 
-- Accepts 64-bit little-endian aarch64 `ET_EXEC` and `ET_DYN` (else `ENOEXEC`); a `PT_INTERP`
-  (ld-musl, or glibc's ld.so) is loaded the same way and must itself be `ET_DYN` without an
-  interpreter.
-- A position-independent main program loads at `0x5555_5555_0000`; the interpreter and then the
+- Before the point of no return, as 6.1's `load_elf_binary`: the program must be a 64-bit
+  little-endian aarch64 `ET_EXEC` or `ET_DYN` with 1 to 65536 bytes of 56-byte program headers
+  (`ENOEXEC`); only the first `PT_INTERP` counts, of 2 to 4096 bytes ending in NUL (`ENOEXEC`), its
+  path cut at the first NUL (an empty one is `EACCES`, as opening the working directory is); the
+  interpreter (ld-musl, or glibc's ld.so) must be an aarch64 ELF with readable program headers
+  (`ELIBBAD`), and its own `PT_INTERP` is ignored.
+- After it (the image doomed): a `PT_LOAD` with file contents whose offset disagrees with its
+  address within the page, whose file size exceeds its memory size, or that reaches beyond 2^48;
+  an interpreter of another type than `ET_EXEC` or `ET_DYN` or with nothing to load; any failure
+  to map; an entry beyond 2^48. A program without `PT_LOAD` loads (and faults at its entry);
+  contents past the end of the file are mapped (reading them is `SIGBUS`).
+- `AT_PHDR` is the address of `e_phoff` in the last `PT_LOAD` whose file contents hold it, else 0,
+  plus the bias (`PT_PHDR` is not used). `AT_BASE` is the interpreter's bias, 0 for an `ET_EXEC`
+  interpreter, which loads where it says.
+- A position-independent main program loads at `0x5555_5555_0000` (at its own addresses when
+  they start above that); the interpreter and then the
   vDSO are placed top-down below the mmap area (so the vDSO is below the interpreter), with the
   host's `[vvar]` right below the vDSO when the vDSO is the host's (`kernel/signal`). There is no
   ASLR.
-- Segments are private file mappings of the host object when every segment's offset and address
-  agree modulo the page size and no two share a page; otherwise every page is anonymous memory with
-  the union of the covering segments' permissions, filled by copying. The `.bss` tail of the last
-  file page is zeroed.
+- Segments are mapped in order, each over what earlier ones mapped, as since 6.7's `elf_load`
+  (which the differential tests' native side runs; 6.1 maps a page of the file even for a
+  segment without file contents when its address is not page-aligned): the pages holding its file
+  contents as a private mapping of the host object (copied into anonymous memory for a program
+  without a host file), the rest of its last file page zeroed when it has more memory than file,
+  and its remaining pages anonymous memory that is readable and writable, and executable when the
+  segment is (`vm_brk_flags`).
 - The initial stack holds argv, envp, the execfn, the platform string and 16 random bytes, and the
   auxv in this order: `AT_SYSINFO_EHDR`, `AT_MINSIGSTKSZ`, `AT_HWCAP`, `AT_PAGESZ` (4096),
   `AT_CLKTCK` (100), `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, `AT_UID`,
@@ -627,18 +644,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
   drops, so a panic there would leave the BKL locked; wake requests made without the BKL go to a
   global fallback that any kernel instance may consume.
-- **The ELF loader disagrees with Linux on unusual program headers:** an executable with no
-  `PT_LOAD` segment, or whose program header table lies outside every loaded segment and has no
-  `PT_PHDR`, fails execve with `ENOEXEC`, where Linux 6.1 execs it (with `AT_PHDR` 0) and the new
-  image then runs or faults; conversely, segments whose file offset and address disagree within the
-  page are loaded by copying, where Linux kills the process with `SIGSEGV` after the point of no
-  return. `Elf::parse` also fails with `ENOEXEC`, before the point of no return, for a `PT_INTERP`
-  with a NUL before its last byte (Linux uses the string up to the first NUL: `"\0\0"` opens the
-  cwd and fails with `EACCES`), a `PT_LOAD` whose file range runs past EOF (Linux maps it, zeros
-  after EOF) and a `PT_LOAD` ending above 2^48 (Linux commits and kills with `SIGSEGV`); an
-  interpreter that is not an aarch64 ELF is `ENOEXEC` where Linux returns `ELIBBAD`. Only
-  hand-made ELFs and unusual linker-script output are affected (gVisor's `exec_binary_test` builds
-  its ELFs with the headers outside the only `PT_LOAD`, so most of it fails here).
 
 ## Open questions
 

@@ -388,6 +388,12 @@ pub(crate) struct ThreadGroup {
     pub child_subreaper: bool,
     /// `PR_SET_DUMPABLE`, inherited by fork.
     pub dumpable: bool,
+    /// The user namespace of the address space (Linux's `mm->user_ns`): the credentials' at
+    /// execve, or the nearest ancestor where the owner and group of a program file (or
+    /// interpreter) the caller could not read are mapped (`would_dump`); kept by fork. A process
+    /// that is not dumpable can be traced only with `CAP_SYS_PTRACE` over it. None until the first
+    /// execve: the credentials' namespace.
+    pub mm_user_ns: Option<Rc<crate::cred::UserNs>>,
     /// `PR_SET_NO_NEW_PRIVS`, kept by both fork and execve.
     pub no_new_privs: bool,
     /// `/proc/<pid>/oom_score_adj` (-1000–1000), inherited by fork. Used when the OOM killer picks
@@ -476,6 +482,7 @@ impl ThreadGroup {
             cpu_itimers: [None; 2],
             child_subreaper: false,
             dumpable: true,
+            mm_user_ns: None,
             no_new_privs: false,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
@@ -504,6 +511,12 @@ impl ThreadGroup {
     pub fn cpu(&self, k: &Kernel) -> CpuTime {
         let threads = self.threads.iter().filter_map(|t| k.tasks.get(t));
         threads.fold(self.cpu, |sum, t| sum + t.cpu())
+    }
+
+    /// What decides access to a process that is not dumpable ([`crate::cred::Cred::may_ptrace`]):
+    /// whether it is dumpable, and its address space's user namespace.
+    pub fn dump_scope(&self) -> (bool, Option<&crate::cred::UserNs>) {
+        (self.dumpable, self.mm_user_ns.as_deref())
     }
 
     /// The sample before execve replaces the address space: a process that was forked, has not

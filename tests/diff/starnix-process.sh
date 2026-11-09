@@ -5,10 +5,8 @@
 # scheduling, rlimits, prctl, sysinfo, POSIX timers, restarted reads, breakpoints, and the tests'
 # own fork helpers. Run by tests/diff/gtest/run.sh, one process per test. Tests that differ for a
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
-# kernel/process: the ELF loader disagrees with Linux on unusual program headers
-SKIP="ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
 # kernel/process: PI futexes inherit no priority (the second fails natively in this container too)
-SKIP="$SKIP:FutexTest.LockPiBoostsOwnerPriorityInProcStat"
+SKIP="FutexTest.LockPiBoostsOwnerPriorityInProcStat"
 SKIP="$SKIP:FutexTest.LockPiRealtimeWaiterBoostsOwnerPriorityInProcStat"
 # kernel/vfs: splice into a file stops quietly at RLIMIT_FSIZE
 SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileTruncatedByFSize"
