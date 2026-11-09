@@ -3358,6 +3358,7 @@ fn mounts(ps: &View<'_>, root: &Node, ns: u64, info: bool) -> Vec<u8> {
             },
             options: ps.vfs.sb_options(&m),
             sb_readonly: ps.vfs.sb_readonly(&m),
+            prop: m.prop,
         }
         .write(&mut out, info);
     }
@@ -3380,6 +3381,8 @@ struct MountLine<'a> {
     /// The filesystem itself is read-only ([`crate::vfs::Vfs::sb_readonly`]): mountinfo shows
     /// it in the superblock options, mounts with the mount's.
     sb_readonly: bool,
+    /// Shown in mountinfo's optional fields.
+    prop: crate::vfs::Propagation,
 }
 
 impl MountLine<'_> {
@@ -3395,7 +3398,19 @@ impl MountLine<'_> {
             out.push(b' ');
             out.extend(mangle(&self.point));
             let opts = mount_options(self.flags);
-            out.extend_from_slice(format!(" {opts} - {fstype} ").as_bytes());
+            out.extend_from_slice(format!(" {opts}").as_bytes());
+            // The optional fields (show_mountinfo): peer group, master, unbindable
+            let p = self.prop;
+            if p.group != 0 {
+                out.extend_from_slice(format!(" shared:{}", p.group).as_bytes());
+            }
+            if p.master != 0 {
+                out.extend_from_slice(format!(" master:{}", p.master).as_bytes());
+            }
+            if p.unbindable {
+                out.extend_from_slice(b" unbindable");
+            }
+            out.extend_from_slice(format!(" - {fstype} ").as_bytes());
             out.extend(mangle(self.source));
             out.extend_from_slice(format!(" {sb}{options}\n").as_bytes());
         } else {

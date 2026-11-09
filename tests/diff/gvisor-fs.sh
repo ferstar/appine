@@ -6,10 +6,8 @@
 # recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/tty: TIOCSPGRP error codes; kernel/procfs fidelity gaps: the devpts root is 0555
 SKIP="JobControlTest.SetForegroundProcessGroupEmptyProcessGroup:SetModeTest.SetMode/*"
-# kernel/vfs D6: mount propagation is not emulated; kernel/vfs: mounts copied into a less
-# privileged namespace are not locked
-SKIP="$SKIP:PivotRootTest.OnSharedNewRoot:PivotRootTest.OnSharedNewRootParent"
-SKIP="$SKIP:PivotRootTest.OnSharedPutOldMountpoint:PivotRootTest.LockedNewRootFails"
+# kernel/vfs: mounts copied into a less privileged namespace are not locked
+SKIP="$SKIP:PivotRootTest.LockedNewRootFails"
 # kernel/vfs: utimensat always reports IN_ATTRIB; watches on synthetic nodes never report;
 # IN_EXCL_UNLINK filters the wrong events; executing a file reports no inotify events
 SKIP="$SKIP:Inotify.Utimensat:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
@@ -28,18 +26,14 @@ SKIP="$SKIP:Openat2Test.BeneathRaceWithRename:Openat2Test.InRootRaceWithRename"
 # main thread's CAP_CHOWN); kernel/vfs: anonymous pipes and sockets cannot change owner
 SKIP="$SKIP:ChownKinds/ChownParamTest.ChownFileSucceedsAsRoot/*"
 SKIP="$SKIP:ChownTest.FchownPipeFileSucceeds:ChownTest.FchownPipeFileFails"
-# mount_test. kernel/vfs D6: mount propagation is not emulated (no peer groups, no shared:N in
-# mountinfo, no events)
 M=MountTest
-SKIP="$SKIP:$M.ArgumentsAreIgnored:$M.BindParentToChild:$M.BindPeerGroupsWithChildren"
-SKIP="$SKIP:$M.BindSharedOnShared:$M.BindSlaveToShared:$M.InerheritPropagation"
-SKIP="$SKIP:$M.LargeTreePropagationEvent:$M.MakeMultipleShared:$M.MakePeer:$M.MakeShared"
-SKIP="$SKIP:$M.MakeSharedSlave:$M.MakeSlave:$M.MountMoveSharedParent:$M.MountNamespacePropagation"
-SKIP="$SKIP:$M.MountNamespaceSlavesNewUserNamespace:$M.PrivateMasterUnslaves:$M.PropagateMountEvent"
-SKIP="$SKIP:$M.RecursiveBindPropagation:$M.SetMountPropagationOfStackedMounts"
-SKIP="$SKIP:$M.SetPropagationRecursive:$M.SlaveMaster:$M.UmountIgnoresPeersWithChildren"
-SKIP="$SKIP:$M.UmountPropagatedSubtreeFromPrivilegedNS:$M.UmountReparentsCoveredMounts"
-SKIP="$SKIP:$M.MaxMounts:$M.MaxMountsWithSlave:$M.FailedBindDoesNotBreakPropagation"
+# mount_test. kernel/vfs: mount and unmount events do not propagate between peers and slaves (only
+# the types are recorded and shown)
+SKIP="$SKIP:$M.BindSharedOnShared:$M.BindSlaveToShared:$M.LargeTreePropagationEvent"
+SKIP="$SKIP:$M.MountNamespacePropagation:$M.MountNamespaceSlavesNewUserNamespace"
+SKIP="$SKIP:$M.PropagateMountEvent:$M.RecursiveBindPropagation:$M.UmountIgnoresPeersWithChildren"
+SKIP="$SKIP:$M.UmountPropagatedSubtreeFromPrivilegedNS:$M.MaxMounts:$M.MaxMountsWithSlave"
+SKIP="$SKIP:$M.FailedBindDoesNotBreakPropagation"
 # kernel/procfs: sysfs has no /sys/kernel
 SKIP="$SKIP:$M.LockedMountStopsOverlayOfSysfs"
 SKIP="$SKIP:$M.UserNamespaceSysfsMountRevealingLockedMount"

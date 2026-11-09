@@ -26,7 +26,8 @@ use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
 use crate::vfs::store::{Ino, mode};
 use crate::vfs::{
-    Dentry, Fs, Mount, MountId, Node, Pseudo, PseudoNode, TmpfsParams, Vfs, fuse, lock, ms, overlay,
+    Dentry, Fs, Mount, MountId, Node, PropagationType, Pseudo, PseudoNode, TmpfsParams, Vfs, fuse,
+    lock, ms, overlay,
 };
 
 const MS_REMOUNT: u64 = 0x20;
@@ -542,7 +543,11 @@ fn bind(
     if dir != vfs.is_dir(&view, &target)? {
         return Err(Errno::ENOTDIR);
     }
-    // Unmounted mounts and mounts in other namespaces cannot be bound (Linux's check_mnt)
+    // An unbindable mount, unmounted mounts and mounts in other namespaces cannot be bound
+    // (Linux's __do_loopback, check_mnt)
+    if vfs.propagation(src.mnt()).unbindable {
+        return Err(Errno::EINVAL);
+    }
     check_mnt(cx, &vfs, src.mnt())?;
     check_mnt(cx, &vfs, target.mnt())?;
     if !recursive && has_locked_children(&vfs, &view, &src) {
@@ -552,7 +557,7 @@ fn bind(
     // Plan the copies of the mounts inside the source before mounting: if the target is inside the
     // source, the new mount is not copied into itself
     let inside = if recursive { vfs.mounts() } else { Vec::new() };
-    let plan = plan_copies(&vfs, &view, &inside, &src);
+    let plan = plan_copies(&vfs, &view, &inside, &src)?;
     room_for(cx, &vfs, target.mnt(), 1 + plan.len())?;
     let id = vfs.add_mount(
         m.fs,
@@ -566,9 +571,14 @@ fn bind(
         vfs.set_root_at(id, found);
     }
     // As in __do_loopback, the new mount keeps the source's locked flags but is not locked itself;
-    // the mounts copied below it keep their locks
-    vfs.update_mount(id, |n| n.locks = m.locks & !lock::MOUNT);
+    // the mounts copied below it keep their locks. A bind of a shared mount is its peer, of a
+    // slave a slave of the same master (clone_mnt), and then the parent's type applies
+    vfs.update_mount(id, |n| {
+        n.locks = m.locks & !lock::MOUNT;
+        n.prop = m.prop.of_bind();
+    });
     vfs.add_copies(id, &plan);
+    vfs.attached(id);
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -704,14 +714,27 @@ fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
     })
 }
 
-/// Changes the propagation type (Linux's `do_change_type`): only checks the arguments.
+/// Changes the propagation type (Linux's `do_change_type`) of the mount whose root `target` is,
+/// attached in any namespace or detached, and with `MS_REC` of the mounts below it. Only the
+/// types change: mount events do not propagate ([`crate::vfs::Propagation`]).
 fn change_type(cx: &mut Cx<'_>, target: &Node, flags: u64) -> SysResult {
-    cx.vfs()?.mount_root(target).ok_or(Errno::EINVAL)?;
-    let kind = flags & !(MS_REC | MS_SILENT);
-    if kind & !MS_PROPAGATION != 0 || !kind.is_power_of_two() {
-        return Err(Errno::EINVAL);
-    }
+    let vfs = cx.vfs()?;
+    let id = vfs.any_mount_root(target).ok_or(Errno::EINVAL)?;
+    let kind = propagation_type(flags & !(MS_REC | MS_SILENT)).ok_or(Errno::EINVAL)?;
+    vfs.set_propagation(id, kind, flags & MS_REC != 0);
     Ok(0)
+}
+
+/// The propagation type of exactly one of `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and
+/// `MS_UNBINDABLE` (`flags_to_propagation_type`).
+fn propagation_type(flags: u64) -> Option<PropagationType> {
+    match flags {
+        MS_SHARED => Some(PropagationType::Shared),
+        MS_SLAVE => Some(PropagationType::Slave),
+        MS_PRIVATE => Some(PropagationType::Private),
+        MS_UNBINDABLE => Some(PropagationType::Unbindable),
+        _ => None,
+    }
 }
 
 /// `MS_MOVE` (Linux's `do_move_mount`): moves mount `source`, with the mounts inside it, onto
@@ -910,6 +933,9 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
     let file = if clone {
+        if vfs.propagation(node.mnt()).unbindable {
+            return Err(Errno::EINVAL);
+        }
         check_mnt(cx, &vfs, node.mnt())?;
         if flags & AT_RECURSIVE == 0 && has_locked_children(&vfs, &view, &node) {
             return Err(Errno::EINVAL);
@@ -928,7 +954,7 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
         } else {
             Vec::new()
         };
-        let plan = plan_copies(&vfs, &view, &inside, &node);
+        let plan = plan_copies(&vfs, &view, &inside, &node)?;
         let id = vfs.clone_mount(&node, found.filter(|_| !dir), ns.id)?;
         vfs.add_copies(id, &plan);
         let file = crate::fd::OpenFile::new(crate::fd::FileKind::Path(node.in_mount(id)), o_path);
@@ -1110,8 +1136,12 @@ pub(super) fn mount_setattr(
             return Err(Errno::EBUSY);
         }
     }
-    for t in targets {
+    for &t in &targets {
         vfs.update_mount(t, |m| m.flags = changed(m));
+    }
+    // The propagation type, after the flags (mount_setattr_commit)
+    if let Some(kind) = propagation_type(propagation) {
+        vfs.set_propagation(id, kind, flags & AT_RECURSIVE != 0);
     }
     cx.shared.fast_changed();
     Ok(0)
@@ -1183,6 +1213,11 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     let (Some(new_mnt), Some(root_mnt)) = (vfs.mount(new.mnt()), vfs.mount(root.mnt())) else {
         return Err(Errno::EINVAL);
     };
+    // Nothing shared may be involved: put_old's mount, or the parents of new_root and of the root
+    let shared = |id: Option<MountId>| id.is_some_and(|id| vfs.propagation(id).group != 0);
+    if shared(Some(old.mnt())) || shared(new_mnt.parent()) || shared(root_mnt.parent()) {
+        return Err(Errno::EINVAL);
+    }
     if new_mnt.locks & lock::MOUNT != 0 {
         return Err(Errno::EINVAL);
     }
@@ -1389,7 +1424,7 @@ fn plan_copies<'a>(
     ps: &dyn Pseudo,
     snapshot: &'a [Mount],
     root: &Node,
-) -> Vec<(Option<usize>, &'a Mount)> {
+) -> Result<Vec<(Option<usize>, &'a Mount)>, Errno> {
     let mut children: HashMap<MountId, Vec<&Mount>> = HashMap::new();
     for m in snapshot {
         if let Some(parent) = m.parent() {
@@ -1397,7 +1432,10 @@ fn plan_copies<'a>(
         }
     }
     // The children of mount `of` to copy: those with a point, mounted under `root` (a mount on a
-    // file searches upwards from the directory it was mounted through)
+    // file searches upwards from the directory it was mounted through), except unbindable ones and
+    // what is below them (copy_tree); an unbindable one locked in place cannot be left out without
+    // uncovering what it hides (EPERM)
+    let locked_unbindable = std::cell::Cell::new(false);
     let below = |of: MountId, root: &Node| -> Vec<&'a Mount> {
         children
             .get(&of)
@@ -1409,6 +1447,12 @@ fn plan_copies<'a>(
                     let from = c.at.as_ref().map_or(point, |(dir, _)| dir);
                     point == root || vfs.is_under(ps, from, root)
                 })
+            })
+            .filter(|c| {
+                if c.prop.unbindable && c.locks & lock::MOUNT != 0 {
+                    locked_unbindable.set(true);
+                }
+                !c.prop.unbindable
             })
             .collect()
     };
@@ -1428,7 +1472,10 @@ fn plan_copies<'a>(
                 .map(|g| (Some(index), g)),
         );
     }
-    plan
+    if locked_unbindable.get() {
+        return Err(Errno::EPERM);
+    }
+    Ok(plan)
 }
 
 /// Linux's `count_mounts`: adding `n` mounts to the namespace of mount `parent` must leave it
@@ -1468,6 +1515,20 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
         return Err(Errno::EINVAL);
     }
     may_mount_on(&target)?;
+    // A mount in a shared parent does not move, nor a tree holding an unbindable mount onto a
+    // shared mount (do_move_mount)
+    let parent = vfs.mount(id).and_then(|m| m.parent());
+    if !anon && parent.is_some_and(|p| vfs.propagation(p).group != 0) {
+        return Err(Errno::EINVAL);
+    }
+    if vfs.propagation(target.mnt()).group != 0
+        && vfs
+            .subtree(id)
+            .iter()
+            .any(|&m| vfs.propagation(m).unbindable)
+    {
+        return Err(Errno::EINVAL);
+    }
     if anon {
         let size = vfs.mount_ns(id).map_or(0, |ns| vfs.count_in(ns));
         room_for(cx, &vfs, target.mnt(), size)?;
@@ -1478,6 +1539,7 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
         }
         vfs.move_mount(id, Some((target, at)));
     }
+    vfs.attached(id);
     cx.shared.fast_changed();
     Ok(0)
 }

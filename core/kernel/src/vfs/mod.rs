@@ -351,6 +351,53 @@ pub(crate) struct Mount {
     pub pin: Option<crate::nsproxy::NsRef>,
     /// Bits from [`lock`].
     pub locks: u64,
+    /// Its propagation type: shared (in a peer group), a slave, unbindable ([`Propagation`]).
+    pub prop: Propagation,
+}
+
+/// A mount's propagation (Linux's `mnt_group_id`, `mnt_master` and `MNT_UNBINDABLE`, by
+/// `fs/pnode.c`'s rules): recorded, changed and shown in mountinfo, while mount and unmount
+/// events do not propagate between mounts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Propagation {
+    /// The peer group of a shared mount (`shared:N`), 0 when not shared.
+    pub group: u32,
+    /// The peer group it is a slave of (`master:N`), 0 when not a slave.
+    pub master: u32,
+    pub unbindable: bool,
+}
+
+/// What `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` make a mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PropagationType {
+    Shared,
+    Slave,
+    Private,
+    Unbindable,
+}
+
+impl Propagation {
+    /// A bind's (Linux's `clone_mnt` without flags): a peer of a shared source, a slave of the
+    /// same master as a slave one.
+    pub(crate) fn of_bind(self) -> Propagation {
+        Propagation {
+            unbindable: false,
+            ..self
+        }
+    }
+
+    /// A copy into a less privileged mount namespace (`CL_SHARED_TO_SLAVE`): a shared mount's
+    /// copy is a slave of its peer group.
+    fn of_slave_copy(self) -> Propagation {
+        match self.group {
+            0 => self,
+            g => Propagation {
+                group: 0,
+                master: g,
+                ..self
+            },
+        }
+    }
 }
 
 impl Mount {
@@ -515,6 +562,7 @@ impl Mounts {
             expiring: false,
             pin: None,
             locks: 0,
+            prop: Propagation::default(),
         });
     }
 
@@ -830,6 +878,7 @@ impl Vfs {
                 expiring: false,
                 pin: None,
                 locks: 0,
+                prop: Propagation::default(),
             }],
             detached: Vec::new(),
             next: RUN_MOUNT + 1,
@@ -1816,6 +1865,13 @@ impl Vfs {
                 root_at: m.root_at.as_ref().map(|(d, n)| (tag(d), n.clone())),
                 expiring: false,
                 locks,
+                // Copies of shared mounts are their peers, or in a less privileged namespace
+                // their slaves (copy_mnt_ns's CL_SHARED_TO_SLAVE)
+                prop: if lock_all {
+                    m.prop.of_slave_copy()
+                } else {
+                    m.prop
+                },
                 ..m
             };
             mounts.list.push(copy);
@@ -1868,6 +1924,7 @@ impl Vfs {
             // As in __do_loopback, the copy's own root is not locked (the mounts copied below it
             // keep their locks)
             locks: m.locks & !lock::MOUNT,
+            prop: m.prop.of_bind(),
             ..m
         });
         drop(mounts);
@@ -2467,9 +2524,12 @@ impl Vfs {
             expiring: false,
             pin: None,
             locks: 0,
+            prop: Propagation::default(),
         });
         drop(mounts);
         self.mounts_changed();
+        // Private, unless mounted under a shared mount
+        self.attached(id);
         id
     }
 
@@ -2530,6 +2590,7 @@ impl Vfs {
                 expiring: false,
                 pin: c.pin.clone(),
                 locks: c.locks,
+                prop: c.prop.of_bind(),
             });
             ids.push(id);
         }
@@ -2745,6 +2806,55 @@ impl Vfs {
     }
 
     /// Changes the flags and the MNT_EXPIRE mark of mount `id`.
+    /// Changes the propagation type of mount `id` (attached or detached), and with `recursive` of
+    /// the mounts below it (Linux's `do_change_type`; for `Shared` every mount first gets a peer
+    /// group of its own, `invent_group_ids`).
+    pub(crate) fn set_propagation(&self, id: MountId, kind: PropagationType, recursive: bool) {
+        let mut mounts = self.mounts.borrow_mut();
+        let ids = if recursive {
+            mounts.subtree(id)
+        } else {
+            vec![id]
+        };
+        for id in ids {
+            mounts.change_propagation(id, kind);
+        }
+        drop(mounts);
+        self.mounts_changed();
+    }
+
+    /// Mount `id` was just attached (a new mount, a bind, a move): under a shared parent it and
+    /// the mounts below it become shared, each without a peer group getting one of its own (6.1's
+    /// `attach_recursive_mnt`; the copies Linux then propagates to the parent's peers and slaves
+    /// are not made).
+    pub(crate) fn attached(&self, id: MountId) {
+        let mut mounts = self.mounts.borrow_mut();
+        let Some(parent) = mounts.all().find(|m| m.id == id).and_then(Mount::parent) else {
+            return;
+        };
+        if !mounts.all().any(|m| m.id == parent && m.prop.group != 0) {
+            return;
+        }
+        for id in mounts.subtree(id) {
+            mounts.change_propagation(id, PropagationType::Shared);
+        }
+    }
+
+    /// The propagation of mount `id` (attached or detached).
+    pub(crate) fn propagation(&self, id: MountId) -> Propagation {
+        let mounts = self.mounts.borrow();
+        mounts
+            .all()
+            .find(|m| m.id == id)
+            .map_or_else(Propagation::default, |m| m.prop)
+    }
+
+    /// The mount whose root `node` is, attached or detached.
+    pub(crate) fn any_mount_root(&self, node: &Node) -> Option<MountId> {
+        let mounts = self.mounts.borrow();
+        mounts.all().find(|m| m.root == *node).map(|m| m.id)
+    }
+
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
         if let Some(m) = self
             .mounts
@@ -2950,6 +3060,86 @@ fn detach(mounts: &mut Mounts, gone: impl Fn(&Mount) -> bool) {
             m.at = None;
         }
         mounts.detached.push(m);
+    }
+    // Unmounted mounts leave their peer groups (umount_tree's change_mnt_propagation(MS_PRIVATE))
+    for id in ids {
+        mounts.change_propagation(id, PropagationType::Private);
+    }
+}
+
+// ---- Propagation types (fs/pnode.c) ----
+
+impl Mounts {
+    fn all(&self) -> impl Iterator<Item = &Mount> {
+        self.list.iter().chain(&self.detached)
+    }
+
+    fn get_mut(&mut self, id: MountId) -> Option<&mut Mount> {
+        self.list
+            .iter_mut()
+            .chain(self.detached.iter_mut())
+            .find(|m| m.id == id)
+    }
+
+    /// Mount `id` and the mounts below it, attached or detached.
+    fn subtree(&self, id: MountId) -> Vec<MountId> {
+        let all: Vec<Mount> = self.all().cloned().collect();
+        tree_of(&all, id)
+    }
+
+    /// A peer group number no mount uses (`mnt_alloc_group_id`: the smallest free one).
+    fn new_group(&self) -> u32 {
+        let used: std::collections::HashSet<u32> = self
+            .all()
+            .flat_map(|m| [m.prop.group, m.prop.master])
+            .collect();
+        (1..).find(|g| !used.contains(g)).unwrap_or(u32::MAX)
+    }
+
+    /// Linux's `change_mnt_propagation`.
+    fn change_propagation(&mut self, id: MountId, kind: PropagationType) {
+        if kind == PropagationType::Shared {
+            let group = self.new_group();
+            if let Some(m) = self.get_mut(id) {
+                if m.prop.group == 0 {
+                    m.prop.group = group;
+                }
+                m.prop.unbindable = false;
+            }
+            return;
+        }
+        self.make_slave(id);
+        if kind != PropagationType::Slave
+            && let Some(m) = self.get_mut(id)
+        {
+            m.prop.master = 0;
+            m.prop.unbindable = kind == PropagationType::Unbindable;
+        }
+    }
+
+    /// Linux's `do_make_slave`: a shared mount with peers becomes a slave of its peer group; the
+    /// last member of a group leaves it for its own master (none: private), taking the group's
+    /// slaves along; a mount that is not shared keeps what it is.
+    fn make_slave(&mut self, id: MountId) {
+        let Some(m) = self.all().find(|m| m.id == id) else {
+            return;
+        };
+        let Propagation { group, master, .. } = m.prop;
+        if group == 0 {
+            return;
+        }
+        let peers = self.all().any(|o| o.id != id && o.prop.group == group);
+        if !peers {
+            for o in self.list.iter_mut().chain(self.detached.iter_mut()) {
+                if o.prop.master == group {
+                    o.prop.master = master;
+                }
+            }
+        }
+        if let Some(m) = self.get_mut(id) {
+            m.prop.group = 0;
+            m.prop.master = if peers { group } else { master };
+        }
     }
 }
 

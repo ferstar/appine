@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types last)
 
 ## Responsibilities
 
@@ -55,7 +55,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   FUSE table (`kernel/fuse`'s connections and nodes).
 - `Mount` — id, namespace, filesystem, root node, mount point (`None` for a tree root or an
   unmounted mount), the node and dentry it sits on, per-mount `MS_*` flags, device number, source,
-  `MNT_EXPIRE` mark, pinned namespace, locks (`lock`: Linux's `MNT_LOCKED` and `MNT_LOCK_*`).
+  `MNT_EXPIRE` mark, pinned namespace, locks (`lock`: Linux's `MNT_LOCKED` and `MNT_LOCK_*`),
+  propagation (`Propagation`: peer group, master group, unbindable).
 - `Mounts` — the global list (also the mountinfo order), detached mounts, id and device counters,
   per-instance side tables (tmpfs, procfs pid namespaces, mqueue devices, devpts instances).
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue, Overlay, Fuse; which kinds get a new
@@ -246,8 +247,21 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `MS_BIND` reconfigures the shared instance (`size=`/`nr_inodes=`/`inode32|64` per
   `shmem_reconfigure`). Remounting an overlay without an upper layer read-write without
   `MS_BIND` is `EROFS` (6.1's `ovl_remount`).
-- Propagation flags are validated (one type, plus `MS_REC`/`MS_SILENT`) and have no effect;
-  everything behaves as private.
+- Propagation types (`fs/pnode.c`): one of `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE`,
+  `MS_UNBINDABLE` (plus `MS_REC`/`MS_SILENT`; mount_setattr's `propagation` too) on the root of a
+  mount in any namespace or detached. Shared puts the mount in a peer group of its own (numbered as
+  `mnt_alloc_group_id`, the smallest free) unless it has one; slave makes a shared mount with peers
+  a slave of its group, and the last member of a group a slave of its own master (none: private),
+  its group's slaves going along (`do_make_slave`); private and unbindable also drop the master.
+  A bind or an open_tree clone of a shared mount is its peer, of a slave a slave of the same
+  master; an unbindable mount cannot be bound or cloned (`EINVAL`), recursive copies leave
+  unbindable mounts out (`EPERM` for one locked in place); a namespace copy's mounts are their
+  originals' peers, or their slaves in a less privileged namespace (`CL_SHARED_TO_SLAVE`); a
+  mount attached under a shared mount (new, bind, move) becomes shared with the mounts below it
+  (`attach_recursive_mnt`); unmounted mounts become private. `MS_MOVE` of a mount in a shared
+  parent, or of a tree holding an unbindable mount onto a shared one, and `pivot_root` with
+  put_old's mount or the parent of new_root or of the root shared, are `EINVAL`. Only the types
+  change: mount and unmount events do not propagate to peers and slaves.
 - `MS_MOVE` (a mount locked in place `EINVAL`), `pivot_root` (6.1's checks after resolving both
   paths, a locked `new_root` `EINVAL`; the old root's lock moves to the new root, so the old one
   can then be detached; `chroot_fs_refs` for tasks whose root or cwd was the old root in the same
@@ -967,16 +981,15 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   ioctls are `EINVAL` where Linux answers `ENOTTY` or `EOPNOTSUPP`; `BLKGETDISKSEQ` advances
   only when a device is created or bound, not when it is unbound.
 - **Fidelity gaps:** statx never reports btime, `stx_mnt_id`, attributes or `STATX_DIOALIGN`; no
-  `protected_regular`/`protected_fifos`; no `O_TMPFILE`; a fault on a mapping of a full tmpfs
-  never raises Linux's `SIGBUS`, and writes through shared mappings are counted only when the
-  instance is recounted; `RLIMIT_NOFILE`
-  set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks are never cleared by an
-  access to the mount, and LTP umount2_02's mark-then-expire sequences fail; propagation is not
-  emulated; `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not
-  sync it (Linux's write path does); `O_NOTIFICATION_PIPE` is `EINVAL` from pipe2 (Linux 6.1
-  creates a notification pipe or, without watch queues, fails with `ENOPKG`); vmsplice copies the
-  data at the call where Linux queues references to the user pages, so changes the writer makes
-  to the buffer before the reader reads are not seen.
+  `protected_regular`/`protected_fifos`; no `O_TMPFILE`; a fault on a mapping of a full tmpfs never
+  raises Linux's `SIGBUS`, and writes through shared mappings are counted only when the instance is
+  recounted; `RLIMIT_NOFILE` set by prlimit applies to the whole shared fd table; `MNT_EXPIRE` marks
+  are never cleared by an access to the mount, and LTP umount2_02's mark-then-expire sequences fail;
+  `sendfile`, `copy_file_range` and `splice` into an `O_SYNC`/`O_DSYNC` file do not sync it (Linux's
+  write path does); `O_NOTIFICATION_PIPE` is `EINVAL` from pipe2 (Linux 6.1 creates a notification
+  pipe or, without watch queues, fails with `ENOPKG`); vmsplice copies the data at the call where
+  Linux queues references to the user pages, so changes the writer makes to the buffer before the
+  reader reads are not seen.
 - **splice's argument checks differ:** the fds' access modes (`EBADF`) are checked before a pipe
   given an offset (`ESPIPE`), where 6.1's `__do_splice` returns `ESPIPE` first, and an offset on a
   socket or other unseekable non-pipe is `ESPIPE` instead of `EINVAL`.
@@ -1004,10 +1017,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   flags of that mount only, so a tmpfs mounted read-only becomes writable through a bind remount
   (Linux keeps the superblock read-only and every mount of it with it), binds do not inherit a
   read-only superblock, and mountinfo's superblock options always say `rw`.
-- **Propagation changes outside the namespace are `EINVAL`:** the propagation type is set only on a
-  mount root found in the mount list, so a lazily unmounted (detached) mount, reached through a
-  kept fd, is refused where Linux 6.1's `do_change_type` only checks that the path is a mount
-  root.
 - **`IN_EXCL_UNLINK` filters the wrong events:** the flag is honoured only by directory watches
   and keyed on the child's link count, so a file's own watch keeps reporting writes and closes
   after the file is unlinked, a directory watch keeps reporting I/O through an unlinked name while
@@ -1023,12 +1032,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Anonymous pipes and sockets cannot change owner:** fchown on them always succeeds and changes
   nothing, even for an unprivileged caller that Linux refuses with `EPERM`, and fstat shows the
   caller as owner rather than the creator.
-- **mountinfo shows no propagation:** propagation types are not even recorded, so there are no
-  `shared:N`/`master:N` fields. dockerd bind-mounts its data root onto itself and makes it shared
-  when it is not on a shared mount, and unmounts it at shutdown only if mountinfo shows that mount
-  shared; under Appine the bind stays until the next boot, so removing the data root is `EBUSY`
-  (a restarted dockerd reuses it). podman warns that `/` is not a shared mount, as it does
-  natively without systemd.
+- **Mount events do not propagate:** peer groups and slaves are recorded and shown, but a mount or
+  unmount under a shared mount is not repeated under its peers and slaves (Linux's `propagate_mnt`,
+  `propagate_umount`), so a bind with `rshared` propagation, a container sharing mounts back to
+  the host, or `MS_SHARED` between mount namespaces never sees the other side's mounts; mount
+  counts include no propagated copies.
 
 - **Private mappings do not follow a file to its own object:** a private mapping made while its
   file shared an object keeps the shared data in the pages it has not copied after the file is

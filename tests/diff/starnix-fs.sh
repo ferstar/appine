@@ -13,11 +13,10 @@ SKIP="$SKIP:FcntlTest.NoatimePermission"
 SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
 # kernel/procfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
-# kernel/vfs: propagation is not emulated, and propagation changes on mounts outside the caller's
-# namespace (a lazily unmounted one) are EINVAL
+# kernel/vfs: mount and unmount events do not propagate between peers and slaves
 SKIP="$SKIP:MountTest.BasicSharing:MountTest.InheritShared:MountTest.PropagateOntoMountRoot"
 SKIP="$SKIP:MountTest.PropagateOvermount:MountTest.PropagateUnmount:MountTest.QuizAMountMove"
-SKIP="$SKIP:MountTest.QuizCPropagation:DetachedMountTest.ChangePropagationSucceeds"
+SKIP="$SKIP:MountTest.QuizCPropagation"
 # kernel/vfs: umount ignores mappings; pivot_root resolves both paths before checking them;
 # mountinfo loses the root of a bind whose source was removed
 SKIP="$SKIP:MountTest.BusyWithMmap:MountTest.PivotRootErrors:MountTest.ProcMountInfoRoot"
