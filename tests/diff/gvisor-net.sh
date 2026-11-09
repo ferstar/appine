@@ -8,9 +8,11 @@
 # Cannot be compared: Appine hands the malformed destination to the host socket, and in this VM
 # the host's AppArmor answers EAFNOSUPPORT before Linux's own EINVAL check
 SKIP="IPUnboundSockets/IPUnboundSocketTest.InsufficientBufferTOS/*"
-# kernel/net D3: host interfaces, addresses and routes in the initial namespace cannot be changed,
-# and no netlink multicast notifications are sent; unsupported change requests (rules) answer
-# EOPNOTSUPP; netlink destination addresses are ignored (LinkMulticastGroupCapNetAdmin)
+# kernel/net D3: host interfaces, addresses and routes in the initial namespace cannot be changed
+# (the multicast-group tests change lo there; in a new namespace they would still need lo renamed,
+# routes on lo, notifications carrying the request's seq and port, and sends to groups);
+# unsupported change requests (rules) answer EOPNOTSUPP; netlink destination addresses are
+# ignored (LinkMulticastGroupCapNetAdmin)
 R=NetlinkRouteIpv4AndIpv6Tests/NetlinkRouteIpInvariantTest
 SKIP="$SKIP:NetlinkRouteTest.AddAndRemoveAddr:NetlinkRouteTest.LinkedToNetns"
 SKIP="$SKIP:NetlinkRouteTest.LinkMulticastGroup*:$R.AddAndRemoveRoute/*:$R.AddAndRemoveRule/*"

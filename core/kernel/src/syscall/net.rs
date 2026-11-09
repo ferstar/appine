@@ -169,6 +169,11 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
         _ => return Err(Errno::EAFNOSUPPORT),
     };
     let sock = Rc::new(RefCell::new(sock));
+    if matches!(&*sock.borrow(), Socket::Netlink(s) if s.protocol == NETLINK_ROUTE) {
+        let all = &mut cx.k().rtnl_sockets;
+        all.retain(|w| w.strong_count() > 0);
+        all.push(Rc::downgrade(&sock));
+    }
     if let Socket::Inet(InetSocket {
         icmp: Some(r),
         fd,
@@ -1497,7 +1502,12 @@ fn netlink_getsockopt(
             SO_TYPE => int(s.ty),
             SO_PROTOCOL => int(s.protocol),
             SO_DOMAIN => int(AF_NETLINK),
-            SO_ERROR | SO_ACCEPTCONN => int(0),
+            SO_ERROR => int(if s.overrun.take() {
+                Errno::ENOBUFS.0
+            } else {
+                0
+            }),
+            SO_ACCEPTCONN => int(0),
             SO_PASSCRED => int(s.passcred as i32),
             SO_RCVTIMEO => Ok((encode_timeval(s.rcvtimeo), None)),
             SO_SNDTIMEO => Ok((encode_timeval(s.sndtimeo), None)),
@@ -2210,6 +2220,9 @@ pub(crate) fn send(
     if is_unix(sock) {
         return unix::send(cx, sock, nonblock, data, addr, control, flags);
     }
+    if matches!(&*sock.borrow(), Socket::Netlink(_)) {
+        return netlink_send(cx, sock, data);
+    }
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let (host_fd, ty, timeout, to_stub) = match &mut *sock.borrow_mut() {
         Socket::Inet(s) => {
@@ -2221,30 +2234,7 @@ pub(crate) fn send(
                 && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
-        Socket::Netlink(s) => {
-            netlink_autobind(cx, s);
-            let host = KernelHost {
-                k: cx.kr(),
-                cred: cx.cred(),
-                net: s.net.clone(),
-                pid_ns: cx.pid_ns(),
-                fds: cx.t.fds.clone(),
-                proc_pid: cx.pid_ns().vnr(cx.task.tgid).unwrap_or(0) as u32,
-                comm: cx.task.comm.get(),
-            };
-            // The nftables ruleset of the boot namespace changed: look again at which ports to
-            // forward
-            let init = &cx.kr().init_ns.net;
-            let before = (s.net.is_none() && s.protocol == NETLINK_NETFILTER)
-                .then(|| init.nft.borrow().generation);
-            s.handle(data, &host);
-            if before.is_some_and(|g| g != init.nft.borrow().generation) {
-                forward_all(cx.kr());
-            }
-            request_wake_object(wake::of(sock));
-            return Ok(data.len());
-        }
-        Socket::Unix(_) => unreachable!("handled above"),
+        Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
     };
     if to_stub {
         // DNS stub: a host thread resolves it while the send returns at once, as a UDP send does
@@ -2571,46 +2561,54 @@ pub(crate) fn recv(
     if let Some(tap) = raw {
         return raw_recv(cx, sock, &tap, nonblock, max, control_len, flags);
     }
-    // Datagrams produced in process: DNS stub answers, netlink answers
-    let local = |q: &mut std::collections::VecDeque<Vec<u8>>, addr: Vec<u8>| {
-        let d = if flags & MSG_PEEK != 0 {
+    // Datagrams produced in process: DNS stub answers, netlink answers and notifications
+    fn take<T: Clone>(q: &mut std::collections::VecDeque<T>, peek: bool) -> Option<T> {
+        if peek {
             q.front().cloned()
         } else {
             q.pop_front()
-        }?;
+        }
+    }
+    let peek = flags & MSG_PEEK != 0;
+    let local = |d: Vec<u8>, addr: Vec<u8>| {
         let n = d.len().min(max);
-        Some(Message {
+        Message {
             data: d[..n].to_vec(),
             len: d.len(),
             addr,
             control: Vec::new(),
             flags: if d.len() > n { MSG_TRUNC } else { 0 },
-        })
+        }
     };
     // The deadline for netlink answers (SO_RCVTIMEO), set the first time no answer can be read
     let mut netlink_deadline = None;
     let (host_fd, ty, timeout) = loop {
         let host = match &mut *sock.borrow_mut() {
             Socket::Inet(s) => {
-                let addr = stub_addr(s.family);
-                if let Some(m) = local(&mut s.answers, addr) {
-                    return Ok(m);
+                if let Some(d) = take(&mut s.answers, peek) {
+                    return Ok(local(d, stub_addr(s.family)));
                 }
                 Some((s.fd, s.ty, s.rcvtimeo))
             }
             Socket::Netlink(s) => {
-                let addr = {
-                    let mut b = vec![0u8; 12];
-                    b[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
-                    b
-                };
-                if let Some(mut m) = local(&mut s.queue, addr) {
-                    // netlink_recvmsg: the pktinfo (group 0, answers being unicast), then the
+                // A dropped notification is reported before what is queued (sock_error)
+                if s.overrun.take() {
+                    return Err(Errno::ENOBUFS);
+                }
+                if let Some((d, group)) = take(&mut s.queue, peek) {
+                    // From the kernel (pid 0), with the group a notification went to as a mask
+                    let mut addr = vec![0u8; 12];
+                    addr[..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+                    if (1..=32).contains(&group) {
+                        addr[8..].copy_from_slice(&(1u32 << (group - 1)).to_le_bytes());
+                    }
+                    let mut m = local(d, addr);
+                    // netlink_recvmsg: the pktinfo (the group, 0 for an answer), then the
                     // credentials of the kernel, which sends as root (pid 0; uid and gid 0 as
                     // the receiver sees them, the overflow IDs when 0 is not mapped)
                     let mut room = control_len;
                     if s.flags & (1 << NETLINK_PKTINFO) != 0 {
-                        let group = 0u32.to_le_bytes();
+                        let group = group.to_le_bytes();
                         put_cmsg(
                             &mut m.control,
                             &mut room,
@@ -2783,9 +2781,9 @@ pub(crate) fn recv(
                 // Also wake up when DNS stub answers come in: they do not go through the host
                 // socket
                 if let Socket::Inet(s) = &mut *sock.borrow_mut()
-                    && let Some(m) = local(&mut s.answers, stub_addr(s.family))
+                    && let Some(d) = take(&mut s.answers, peek)
                 {
-                    return Ok(m);
+                    return Ok(local(d, stub_addr(s.family)));
                 }
                 // A datagram socket shut down for reading: a blocking receive with nothing queued
                 // returns 0 (Linux's __skb_wait_for_more_packets checks RCV_SHUTDOWN before
@@ -3014,6 +3012,97 @@ fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8
 
 // ---- netlink ----
 
+/// Sends a netlink request: the kernel answers it at once into the socket's queue. A change
+/// request on `NETLINK_ROUTE` also notifies the sockets that joined the link, address or route
+/// groups of a namespace it changed ([`rtnl_watched`], [`rtnl_notify`]).
+fn netlink_send(cx: &mut Cx<'_>, sock: &SocketRef, data: &[u8]) -> Result<usize, Errno> {
+    let notes = {
+        let mut guard = sock.borrow_mut();
+        let Socket::Netlink(s) = &mut *guard else {
+            unreachable!("checked by the caller")
+        };
+        netlink_autobind(cx, s);
+        let mut host = KernelHost::of(cx, s.net.clone());
+        if s.protocol == NETLINK_ROUTE {
+            host.watched = rtnl_watched(cx.kr(), Some((sock, s)));
+        }
+        // The nftables ruleset of the boot namespace changed: look again at which ports to
+        // forward
+        let init = &cx.kr().init_ns.net;
+        let before = (s.net.is_none() && s.protocol == NETLINK_NETFILTER)
+            .then(|| init.nft.borrow().generation);
+        s.handle(data, &host);
+        if before.is_some_and(|g| g != init.nft.borrow().generation) {
+            forward_all(cx.kr());
+        }
+        host.notes.into_inner()
+    };
+    request_wake_object(wake::of(sock));
+    rtnl_notify(cx.k(), notes);
+    Ok(data.len())
+}
+
+/// The network namespaces with a socket in a notified rtnetlink group, a sending one `s` included
+/// (it is borrowed: Linux notifies the sender too unless it asked for `NLM_F_ECHO`).
+fn rtnl_watched(
+    k: &crate::kernel::Kernel,
+    sender: Option<(&SocketRef, &NetlinkSocket)>,
+) -> Vec<Rc<crate::nsproxy::NetNs>> {
+    let ns_of = |net: &Option<Rc<crate::nsproxy::NetNs>>| {
+        net.clone().unwrap_or_else(|| k.init_ns.net.clone())
+    };
+    let mut out: Vec<Rc<crate::nsproxy::NetNs>> = Vec::new();
+    for other in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let ns = if let Some((_, s)) = sender.filter(|(sock, _)| Rc::ptr_eq(&other, sock)) {
+            s.subscribed().then(|| ns_of(&s.net))
+        } else {
+            match other.try_borrow().as_deref() {
+                Ok(Socket::Netlink(o)) if o.subscribed() => Some(ns_of(&o.net)),
+                _ => None,
+            }
+        };
+        if let Some(ns) = ns.filter(|ns| !out.iter().any(|o| Rc::ptr_eq(o, ns))) {
+            out.push(ns);
+        }
+    }
+    out
+}
+
+/// Interface ioctls that change something (`SIOCSIF*` for flags, addresses, metric, MTU, name,
+/// hardware address, transmit queue; `SIOCDIFADDR`; `SIOCADDRT`, `SIOCDELRT`): rtnetlink
+/// listeners are told what they changed, as for change requests.
+const CHANGING_IOCTLS: [u32; 15] = [
+    0x890b, 0x890c, 0x8914, 0x8916, 0x8918, 0x891a, 0x891c, 0x891e, 0x8922, 0x8923, 0x8924, 0x8934,
+    0x8936, 0x8937, 0x8943,
+];
+
+/// Queues the notifications of a change request on the sockets of each namespace that joined
+/// their groups, and wakes them.
+fn rtnl_notify(k: &mut crate::kernel::Kernel, notes: Vec<RtnlNotes>) {
+    if notes.is_empty() {
+        return;
+    }
+    k.rtnl_sockets.retain(|w| w.strong_count() > 0);
+    for sock in k.rtnl_sockets.iter().filter_map(|w| w.upgrade()) {
+        let Socket::Netlink(s) = &mut *sock.borrow_mut() else {
+            continue;
+        };
+        let ns = s.net.clone().unwrap_or_else(|| k.init_ns.net.clone());
+        let mut any = false;
+        for (_, changes) in notes.iter().filter(|(n, _)| Rc::ptr_eq(n, &ns)) {
+            for (group, msg) in changes {
+                any |= s.notify(*group, msg);
+            }
+        }
+        if any {
+            request_wake_object(wake::of(&sock));
+        }
+    }
+}
+
+/// A namespace and the notifications (group, message) for what a request changed in it.
+type RtnlNotes = (Rc<crate::nsproxy::NetNs>, Vec<(u32, Vec<u8>)>);
+
 /// Host information for netlink answers: interfaces come from the host, traffic counters and the
 /// routes the host handed over come from the kernel. In a new network namespace there is only its
 /// lo ([`crate::netns`]), and traffic is not counted.
@@ -3029,9 +3118,68 @@ struct KernelHost<'a> {
     /// PROC_PID, PROC_NAME).
     proc_pid: u32,
     comm: [u8; 16],
+    /// The namespaces with sockets listening for link, address and route changes
+    /// ([`rtnl_watched`]), and the notifications for what this request changed in them.
+    watched: Vec<Rc<crate::nsproxy::NetNs>>,
+    notes: std::cell::RefCell<Vec<RtnlNotes>>,
 }
 
-impl KernelHost<'_> {
+impl<'a> KernelHost<'a> {
+    /// The calling process looking at network namespace `net` (None: the boot one), watching
+    /// none for notifications.
+    fn of(cx: &'a Cx<'_>, net: Option<Rc<crate::nsproxy::NetNs>>) -> KernelHost<'a> {
+        KernelHost {
+            k: cx.kr(),
+            cred: cx.cred(),
+            net,
+            pid_ns: cx.pid_ns(),
+            fds: cx.t.fds.clone(),
+            proc_pid: cx.pid_ns().vnr(cx.task.tgid).unwrap_or(0) as u32,
+            comm: cx.task.comm.get(),
+            watched: Vec::new(),
+            notes: Default::default(),
+        }
+    }
+
+    /// The watched namespaces as they are now ([`KernelHost::changed_since`]).
+    fn snapshots(&self, watched: &[Rc<crate::nsproxy::NetNs>]) -> Vec<crate::net::Snapshot> {
+        watched
+            .iter()
+            .map(|ns| crate::net::Snapshot::take(&self.at(ns)))
+            .collect()
+    }
+
+    /// The notifications for what changed in the watched namespaces since `before` was taken.
+    fn changed_since(
+        &self,
+        watched: &[Rc<crate::nsproxy::NetNs>],
+        before: Vec<crate::net::Snapshot>,
+    ) -> Vec<RtnlNotes> {
+        let after = self.snapshots(watched);
+        watched
+            .iter()
+            .zip(before)
+            .zip(after)
+            .map(|((ns, before), after)| (ns.clone(), after.changes(&before)))
+            .filter(|(_, changes)| !changes.is_empty())
+            .collect()
+    }
+
+    /// The same requester looking at namespace `ns`.
+    fn at(&self, ns: &Rc<crate::nsproxy::NetNs>) -> KernelHost<'_> {
+        KernelHost {
+            k: self.k,
+            cred: self.cred.clone(),
+            net: (!Rc::ptr_eq(ns, &self.k.init_ns.net)).then(|| ns.clone()),
+            pid_ns: self.pid_ns.clone(),
+            fds: self.fds.clone(),
+            proc_pid: self.proc_pid,
+            comm: self.comm,
+            watched: Vec::new(),
+            notes: Default::default(),
+        }
+    }
+
     /// The network namespace this socket is in (the boot one is recorded as None).
     fn ns(&self) -> Rc<crate::nsproxy::NetNs> {
         self.net
@@ -3134,7 +3282,21 @@ impl crate::net::Host for KernelHost<'_> {
     fn configure(&self, req: &[u8]) -> Option<Result<(), crate::netdev::Fail>> {
         // IFLA_NET_NS_PID (19) is a process, IFLA_NET_NS_FD (28) a namespace file
         let resolve = |attr: u16, value: u32| self.net_of(attr == 19, value);
-        crate::netdev::request(&self.ns(), &self.cred, req, &resolve)
+        // What the namespaces being watched look like before and after a change request
+        // (RTM_NEW, DEL and SETLINK, NEW and DELADDR, NEW and DELROUTE): it can change another
+        // namespace too (moving a link, a veth's peer)
+        let ty = req
+            .get(4..6)
+            .map_or(0, |t| u16::from_le_bytes([t[0], t[1]]));
+        let watched = match ty {
+            16 | 17 | 19 | 20 | 21 | 24 | 25 => &self.watched[..],
+            _ => &[],
+        };
+        let before = self.snapshots(watched);
+        let done = crate::netdev::request(&self.ns(), &self.cred, req, &resolve);
+        let notes = self.changed_since(watched, before);
+        self.notes.borrow_mut().extend(notes);
+        done
     }
 
     fn peer_net(&self, attr: u16, value: u32) -> Result<Option<i32>, i32> {
@@ -3159,6 +3321,24 @@ impl crate::net::Host for KernelHost<'_> {
 
 /// Socket ioctls: FIONREAD, and interface information (`SIOCGIF*`).
 pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
+    // One that changes an interface, address or route: notify rtnetlink listeners of what it did
+    let watched = if CHANGING_IOCTLS.contains(&request) {
+        rtnl_watched(cx.kr(), None)
+    } else {
+        Vec::new()
+    };
+    if watched.is_empty() {
+        return socket_ioctl(cx, sock, request, arg);
+    }
+    let before = KernelHost::of(cx, None).snapshots(&watched);
+    let r = socket_ioctl(cx, sock, request, arg);
+    let notes = KernelHost::of(cx, None).changed_since(&watched, before);
+    rtnl_notify(cx.k(), notes);
+    r
+}
+
+/// Socket ioctls, as [`ioctl`] without the notifications.
+fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
     const FIONREAD: u32 = 0x541b;
     const SIOCATMARK: u32 = 0x8905;
     // A socket in a new network namespace: interface ioctls see only its lo (crate::netns)
@@ -3385,7 +3565,13 @@ pub(crate) fn readiness(sock: &Socket) -> (i16, Option<i32>) {
         }
         Socket::Inet(s) if !s.answers.is_empty() => (POLLIN | POLLOUT, None),
         Socket::Inet(s) => (0, Some(s.fd)),
-        Socket::Netlink(s) => (POLLOUT | if s.queue.is_empty() { 0 } else { POLLIN }, None),
+        Socket::Netlink(s) => {
+            let err = if s.overrun.get() { POLLERR } else { 0 };
+            (
+                POLLOUT | err | if s.queue.is_empty() { 0 } else { POLLIN },
+                None,
+            )
+        }
         Socket::Unix(u) => (u.readiness(), None),
     }
 }

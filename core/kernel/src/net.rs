@@ -12,7 +12,7 @@
 //!   table is always empty.
 //! - AF_UNIX: emulated entirely in process ([`crate::unix`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::time::Duration;
@@ -305,10 +305,13 @@ const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_GETROUTE: u16 = 26;
 const RTM_GETNEIGH: u16 = 30;
 const RTM_NEWRULE: u16 = 32;
@@ -394,8 +397,10 @@ pub(crate) struct NetlinkSocket {
     /// `nl_pid`: assigned on bind, or by the first connect or send (Linux's autobind); 0 until
     /// then.
     pub pid: u32,
-    /// Answers waiting for the guest to read them, one datagram per item.
-    pub queue: VecDeque<Vec<u8>>,
+    /// Answers and notifications waiting for the guest to read them, one datagram per item,
+    /// with the multicast group a notification went to (0 for a unicast answer: the source
+    /// address's `nl_groups` and `NETLINK_PKTINFO` report it).
+    pub queue: VecDeque<(Vec<u8>, u32)>,
     /// The number of datagrams put into `queue` (`EPOLLET` triggers on each).
     pub arrivals: u64,
     /// `SO_RCVTIMEO`: how long to wait at most when there is no answer to read.
@@ -409,9 +414,12 @@ pub(crate) struct NetlinkSocket {
     pub cap_ack: bool,
     /// The multicast groups joined by bind or `NETLINK_ADD_MEMBERSHIP` (bit `n - 1` for group
     /// `n`), None until the first one (Linux allocates the set then, and
-    /// `NETLINK_LIST_MEMBERSHIPS` reports nothing before). Only recorded: no notifications are
-    /// ever sent.
+    /// `NETLINK_LIST_MEMBERSHIPS` reports nothing before). On `NETLINK_ROUTE` the link, address
+    /// and route groups receive notifications ([`Snapshot::changes`]).
     pub groups: Option<u64>,
+    /// A notification was dropped for a full queue: the next receive or `SO_ERROR` takes
+    /// `ENOBUFS` (`netlink_overrun`).
+    pub overrun: std::cell::Cell<bool>,
     /// The `SOL_NETLINK` flags that are only recorded and read back (`NETLINK_PKTINFO`,
     /// `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`, `NETLINK_LISTEN_ALL_NSID`,
     /// `NETLINK_GET_STRICT_CHK`): bit `n` for option `n`. With `NETLINK_PKTINFO` every message
@@ -442,7 +450,33 @@ impl NetlinkSocket {
             passcred: false,
             sndtimeo: None,
             opts: SockOpts::default(),
+            overrun: Default::default(),
         }
+    }
+
+    /// It is an rtnetlink socket that joined a group notifications go to.
+    pub fn subscribed(&self) -> bool {
+        self.protocol == NETLINK_ROUTE && self.groups.is_some_and(|g| g & RTNL_NOTIFIED != 0)
+    }
+
+    /// Queues notification `msg` of multicast group `group` when the socket joined it; when the
+    /// queue is full it is dropped, and unless `NETLINK_NO_ENOBUFS` the next receive reports the
+    /// overrun. Returns whether it concerned the socket.
+    pub fn notify(&mut self, group: u32, msg: &[u8]) -> bool {
+        const NETLINK_NO_ENOBUFS: u32 = 5;
+        if self.protocol != NETLINK_ROUTE || self.groups.is_none_or(|g| g & (1 << (group - 1)) == 0)
+        {
+            return false;
+        }
+        if self.queue.len() >= NOTE_QUEUE {
+            if self.flags & (1 << NETLINK_NO_ENOBUFS) == 0 {
+                self.overrun.set(true);
+            }
+            return true;
+        }
+        self.queue.push_back((msg.to_vec(), group));
+        self.arrivals += 1;
+        true
     }
 
     /// How many multicast groups the protocol has (Linux's `nl_table[].groups`: at least 32,
@@ -468,7 +502,7 @@ impl NetlinkSocket {
                 comm: b"",
             };
             for d in host.netfilter(data, &peer) {
-                self.queue.push_back(d);
+                self.queue.push_back((d, 0));
                 self.arrivals += 1;
             }
             return;
@@ -492,7 +526,7 @@ impl NetlinkSocket {
                 _ => self.route_request(&h[..len], host),
             };
             for d in answers {
-                self.queue.push_back(d);
+                self.queue.push_back((d, 0));
                 self.arrivals += 1;
             }
             off += len.next_multiple_of(4);
@@ -1048,6 +1082,175 @@ fn broadcast_of(i: &Interface, addr: &[u8], prefix: u8) -> Option<[u8; 4]> {
     }
     let ip = u32::from_be_bytes(addr.try_into().ok()?);
     Some((ip | u32::MAX >> prefix).to_be_bytes())
+}
+
+// ---- rtnetlink notifications ----
+
+/// The rtnetlink groups notifications go to (`RTNLGRP_*`).
+const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
+const RTNLGRP_IPV4_ROUTE: u32 = 7;
+const RTNLGRP_IPV6_IFADDR: u32 = 9;
+const RTNLGRP_IPV6_ROUTE: u32 = 11;
+/// Those groups as bits of [`NetlinkSocket::groups`].
+const RTNL_NOTIFIED: u64 = 1 << (RTNLGRP_LINK - 1)
+    | 1 << (RTNLGRP_IPV4_IFADDR - 1)
+    | 1 << (RTNLGRP_IPV4_ROUTE - 1)
+    | 1 << (RTNLGRP_IPV6_IFADDR - 1)
+    | 1 << (RTNLGRP_IPV6_ROUTE - 1);
+/// The most datagrams a socket holds before notifications are dropped (about its 212992-byte
+/// receive buffer at a typical notification's size).
+const NOTE_QUEUE: usize = 1024;
+
+/// A namespace's links, addresses and routes as rtnetlink dumps encode them (message bodies, in
+/// dump order). Taken before and after a change request, the difference is what Linux notifies
+/// as it makes each change ([`Snapshot::changes`]).
+pub(crate) struct Snapshot {
+    links: Vec<Vec<u8>>,
+    addrs: Vec<Vec<u8>>,
+    routes: Vec<Vec<u8>>,
+}
+
+impl Snapshot {
+    /// The namespace `host` serves.
+    pub(crate) fn take(host: &dyn Host) -> Snapshot {
+        let links = host.links();
+        let mut addrs = Vec::new();
+        for f in [AF_INET, AF_INET6] {
+            for l in &links {
+                addrs.extend(match l {
+                    Link::Host(i) => addr_messages(i, f as u8),
+                    Link::Virt(v, _) => crate::netdev::addr_messages(v, f),
+                });
+            }
+        }
+        let routes = host
+            .tables()
+            .iter()
+            .filter(|e| e.family == AF_INET || e.family == AF_INET6)
+            .map(crate::route::route_message)
+            .collect();
+        let links = links
+            .iter()
+            .map(|l| match l {
+                Link::Host(i) => link_message(i, host.stats(&i.name), host.tx_queue_len(&i.name)),
+                Link::Virt(v, nsid) => crate::netdev::link_message(v, *nsid),
+            })
+            .collect();
+        Snapshot {
+            links,
+            addrs,
+            routes,
+        }
+    }
+
+    /// The notifications (group, message) for the change from `before` to this one, in the order
+    /// Linux makes them: links that appeared or changed (`RTM_NEWLINK`, statistics aside),
+    /// addresses that went and came, routes that went and came, links that went
+    /// (`RTM_DELLINK`). An address or route that changed in place ([`addr_identity`], [`route_identity`]) is only notified
+    /// as new. They carry no sequence number, port or flags.
+    pub(crate) fn changes(&self, before: &Snapshot) -> Vec<(u32, Vec<u8>)> {
+        let index = |m: &[u8]| {
+            m.get(4..8)
+                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let find = |set: &[Vec<u8>], i| set.iter().find(|m| index(m) == i).cloned();
+        let note = |group, ty, body: &[u8]| (group, message(ty, 0, 0, 0, body));
+        let mut out = Vec::new();
+        for m in &self.links {
+            if find(&before.links, index(m))
+                .is_none_or(|old| without_stats(&old) != without_stats(m))
+            {
+                out.push(note(RTNLGRP_LINK, RTM_NEWLINK, m));
+            }
+        }
+        let groups = [
+            (
+                &before.addrs,
+                &self.addrs,
+                addr_identity as Identity,
+                RTM_DELADDR,
+                RTM_NEWADDR,
+                RTNLGRP_IPV4_IFADDR,
+                RTNLGRP_IPV6_IFADDR,
+            ),
+            (
+                &before.routes,
+                &self.routes,
+                route_identity,
+                RTM_DELROUTE,
+                RTM_NEWROUTE,
+                RTNLGRP_IPV4_ROUTE,
+                RTNLGRP_IPV6_ROUTE,
+            ),
+        ];
+        for (old, new, identity, del, add, v4, v6) in groups {
+            let group = |m: &[u8]| match m.first().map(|&f| f as i32) {
+                Some(AF_INET) => v4,
+                _ => v6,
+            };
+            // Hashed: a namespace can hold thousands of addresses and routes
+            let kept: HashSet<_> = new.iter().map(|m| identity(m)).collect();
+            let was: HashSet<&Vec<u8>> = old.iter().collect();
+            let gone = |m: &&Vec<u8>| !kept.contains(&identity(m));
+            out.extend(old.iter().filter(gone).map(|m| note(group(m), del, m)));
+            out.extend(
+                new.iter()
+                    .filter(|m| !was.contains(m))
+                    .map(|m| note(group(m), add, m)),
+            );
+        }
+        for m in &before.links {
+            if find(&self.links, index(m)).is_none() {
+                out.push(note(RTNLGRP_LINK, RTM_DELLINK, m));
+            }
+        }
+        out
+    }
+}
+
+/// The identity of an address or route message (header bytes, attributes).
+type Identity = for<'a> fn(&'a [u8]) -> (Vec<u8>, Vec<(u16, &'a [u8])>);
+
+/// What identifies an address: family, prefix length, interface (`struct ifaddrmsg` without
+/// flags and scope), address and local address.
+fn addr_identity(m: &[u8]) -> (Vec<u8>, Vec<(u16, &[u8])>) {
+    let head = [&m[..2.min(m.len())], m.get(4..8).unwrap_or_default()].concat();
+    (head, picked(m.get(8..), &[IFA_ADDRESS, IFA_LOCAL]))
+}
+
+/// What identifies a route: family, destination length, TOS and table (of `struct rtmsg`), then
+/// destination, priority and table attributes.
+fn route_identity(m: &[u8]) -> (Vec<u8>, Vec<(u16, &[u8])>) {
+    const RTA_DST: u16 = 1;
+    const RTA_PRIORITY: u16 = 6;
+    const RTA_TABLE: u16 = 15;
+    let head = [0, 1, 3, 4]
+        .iter()
+        .filter_map(|&i| m.get(i).copied())
+        .collect();
+    (
+        head,
+        picked(m.get(12..), &[RTA_DST, RTA_PRIORITY, RTA_TABLE]),
+    )
+}
+
+/// The attributes of types `types` in `attrs`.
+fn picked<'a>(attrs: Option<&'a [u8]>, types: &[u16]) -> Vec<(u16, &'a [u8])> {
+    crate::route::attrs(attrs.unwrap_or_default())
+        .into_iter()
+        .filter(|(t, _)| types.contains(t))
+        .collect()
+}
+
+/// A link message's header and attributes without its statistics, which change with traffic.
+fn without_stats(m: &[u8]) -> (&[u8], Vec<(u16, &[u8])>) {
+    let (head, attrs) = m.split_at(m.len().min(16));
+    let attrs = crate::route::attrs(attrs)
+        .into_iter()
+        .filter(|&(t, _)| t != IFLA_STATS && t != IFLA_STATS64)
+        .collect();
+    (head, attrs)
 }
 
 // ---- NETLINK_GENERIC ----
@@ -1764,6 +1967,69 @@ pub(crate) const PROC_ARP: &str =
 mod tests {
     use super::*;
 
+    /// What a change request notifies: links whose statistics alone changed are left out, an
+    /// address changed in place is only new, and a full queue drops and flags the overrun.
+    #[test]
+    fn snapshot_changes_are_notified_as_on_linux() {
+        let link = |index: i32, mtu: u32, rx: u64| {
+            let mut p = vec![0u8; 16];
+            p[4..8].copy_from_slice(&index.to_le_bytes());
+            attr(&mut p, IFLA_MTU, &mtu.to_le_bytes());
+            attr(&mut p, IFLA_STATS64, &rx.to_le_bytes());
+            p
+        };
+        let addr = |a: u8, flags: u8| {
+            let mut p = vec![AF_INET as u8, 24, flags, 0, 2, 0, 0, 0];
+            attr(&mut p, IFA_ADDRESS, &[10, 0, 0, a]);
+            p
+        };
+        let route = |dst: u8, proto: u8| {
+            let mut p = vec![AF_INET6 as u8, 64, 0, 0, 254, proto, 0, 1, 0, 0, 0, 0];
+            let mut to = [0u8; 16];
+            to[..2].copy_from_slice(&[0xfd, dst]);
+            attr(&mut p, 1, &to); // RTA_DST
+            p
+        };
+        let before = Snapshot {
+            links: vec![link(1, 1500, 10), link(2, 1500, 0)],
+            addrs: vec![addr(1, 0), addr(2, 0)],
+            routes: vec![route(1, 2), route(2, 2)],
+        };
+        let after = Snapshot {
+            links: vec![link(1, 1500, 99), link(3, 1400, 0)],
+            addrs: vec![addr(1, 0x80), addr(3, 0)],
+            routes: vec![route(1, 4)],
+        };
+        let got: Vec<_> = after
+            .changes(&before)
+            .into_iter()
+            .map(|(g, m)| (g, u16::from_le_bytes([m[4], m[5]]), m[16..].to_vec()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (RTNLGRP_LINK, RTM_NEWLINK, link(3, 1400, 0)),
+                (RTNLGRP_IPV4_IFADDR, RTM_DELADDR, addr(2, 0)),
+                (RTNLGRP_IPV4_IFADDR, RTM_NEWADDR, addr(1, 0x80)),
+                (RTNLGRP_IPV4_IFADDR, RTM_NEWADDR, addr(3, 0)),
+                (RTNLGRP_IPV6_ROUTE, RTM_DELROUTE, route(2, 2)),
+                (RTNLGRP_IPV6_ROUTE, RTM_NEWROUTE, route(1, 4)),
+                (RTNLGRP_LINK, RTM_DELLINK, link(2, 1500, 0)),
+            ]
+        );
+
+        let mut s = NetlinkSocket::new(NETLINK_ROUTE, SOCK_RAW);
+        assert!(!s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
+        s.groups = Some(1 << (RTNLGRP_IPV4_IFADDR - 1));
+        assert!(s.subscribed() && !s.notify(RTNLGRP_LINK, b"x"));
+        for _ in 0..=NOTE_QUEUE {
+            assert!(s.notify(RTNLGRP_IPV4_IFADDR, b"y"));
+        }
+        assert_eq!(s.queue.len(), NOTE_QUEUE);
+        assert_eq!(s.queue[0], (b"y".to_vec(), RTNLGRP_IPV4_IFADDR));
+        assert!(s.overrun.get());
+    }
+
     fn lo() -> Interface {
         Interface {
             name: "lo".into(),
@@ -1869,7 +2135,7 @@ mod tests {
             },
         );
         // Interfaces, NLMSG_DONE, IPv4 addresses, NLMSG_DONE are one datagram each
-        let datagrams: Vec<_> = s.queue.drain(..).map(|d| parse(&d)).collect();
+        let datagrams: Vec<_> = s.queue.drain(..).map(|(d, _)| parse(&d)).collect();
         let types: Vec<Vec<u16>> = datagrams
             .iter()
             .map(|d| d.iter().map(|m| m.0).collect())
@@ -1925,7 +2191,7 @@ mod tests {
         };
         let mut ask = |req: Vec<u8>| -> (u16, Vec<u8>) {
             s.handle(&req, &NOTHING);
-            let d = parse(&s.queue.pop_front().unwrap());
+            let d = parse(&s.queue.pop_front().unwrap().0);
             assert!(s.queue.is_empty());
             d[0].clone()
         };
@@ -1984,7 +2250,7 @@ mod tests {
             );
             s.queue
                 .drain(..)
-                .map(|d| {
+                .map(|(d, _)| {
                     assert!(d.len() <= 4096, "a {}-byte datagram", d.len());
                     parse(&d)
                 })
@@ -2025,7 +2291,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|d| parse(&d)).collect()
+            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
         };
         let dump = |ty, family: i32| {
             message(
@@ -2078,7 +2344,7 @@ mod tests {
                 attr(&mut p, *t, d);
             }
             s.handle(&message(RTM_GETNSID, NLM_F_REQUEST, 5, 0, &p), &NOTHING);
-            s.queue.drain(..).flat_map(|d| parse(&d)).collect()
+            s.queue.drain(..).flat_map(|(d, _)| parse(&d)).collect()
         };
         // The other namespace is found: the answer is -1 (no number assigned), the same as what
         // `ip netns list` sees on Linux
@@ -2115,7 +2381,7 @@ mod tests {
         // The answer's datagrams, each parsed into messages
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|d| parse(&d)).collect()
+            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
         };
         // Query nlctrl by name, asking for an ack: the answer and the ack are two datagrams, and
         // the ack attaches only the request's message header
@@ -2201,7 +2467,7 @@ mod tests {
         s.pid = 42;
         let mut ask = |req: &[u8]| -> Vec<Vec<(u16, Vec<u8>)>> {
             s.handle(req, &NOTHING);
-            s.queue.drain(..).map(|d| parse(&d)).collect()
+            s.queue.drain(..).map(|(d, _)| parse(&d)).collect()
         };
         let dump = NLM_F_REQUEST | NLM_F_DUMP;
         // ss's inet_diag_req_v2 for TCP over IPv4, a unix_diag_req, the old TCPDIAG_GETSOCK, a

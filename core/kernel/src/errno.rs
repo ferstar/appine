@@ -132,6 +132,8 @@ impl Errno {
     pub const ECONNABORTED: Errno = Errno(103);
     /// Connection reset by peer (an AF_UNIX connection closed with data it had not read).
     pub const ECONNRESET: Errno = Errno(104);
+    /// No buffer space (a netlink socket that lost notifications to a full queue).
+    pub const ENOBUFS: Errno = Errno(105);
     /// Already connected.
     pub const EISCONN: Errno = Errno(106);
     /// Not connected.

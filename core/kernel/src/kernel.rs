@@ -293,6 +293,9 @@ pub(crate) struct Kernel {
     pub aio_polls: Vec<Weak<RefCell<crate::syscall::AioContext>>>,
     /// The ICMP taps of the network namespaces ([`crate::rawicmp`]), watched by the timer thread.
     pub icmp_taps: Vec<std::rc::Weak<crate::cell::RefCell<crate::rawicmp::Tap>>>,
+    /// The `NETLINK_ROUTE` sockets, which link, address and route notifications go to
+    /// (`syscall::net`, [`crate::net::Snapshot`]).
+    pub rtnl_sockets: Vec<std::rc::Weak<crate::cell::RefCell<crate::net::Socket>>>,
     /// DNS stub queries being resolved by host threads: the socket each answer goes to
     /// ([`Shared::dns_answers`], `syscall::net`).
     pub dns_queries: HashMap<u64, std::rc::Weak<crate::cell::RefCell<crate::net::Socket>>>,
@@ -423,6 +426,7 @@ impl Kernel {
             fasync: Vec::new(),
             aio_polls: Vec::new(),
             icmp_taps: Vec::new(),
+            rtnl_sockets: Vec::new(),
             dns_queries: HashMap::new(),
             dns_last: 0,
             leases: BTreeMap::new(),

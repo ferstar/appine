@@ -7,7 +7,7 @@
 # kernel/tty: /dev/tty cannot be told apart from the slave it opens
 SKIP="Pty.OpenDevTTY"
 # kernel/net: host interfaces cannot be changed (interface setters are EPERM, before the name is
-# looked up), and multicast groups never hear anything
+# looked up), so the multicast-group test cannot change lo's address
 SKIP="$SKIP:IoctlTest.SIOCSIFFLAGS_Success:IoctlInvalidTest/IoctlInvalidTest.InvalidRequest/9"
 SKIP="$SKIP:RouteNetlinkSocket.AddDropMulticastGroup"
 # kernel/net: netlink requests are not validated as Linux validates them; single RTM_GETNEIGH

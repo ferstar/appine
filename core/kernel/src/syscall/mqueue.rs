@@ -710,7 +710,7 @@ fn send_cookie(sock: &Weak<RefCell<Socket>>, mut cookie: [u8; 32], code: u8) {
         && let Socket::Netlink(n) = &mut *sock.borrow_mut()
     {
         cookie[31] = code;
-        n.queue.push_back(cookie.to_vec());
+        n.queue.push_back((cookie.to_vec(), 0));
         n.arrivals += 1;
         request_wake_object(wake::of(&sock));
     }

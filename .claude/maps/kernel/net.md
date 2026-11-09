@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: timeouts; port map entries; DNS stub threads; socket I/O; listen events; test-suite findings; bind checks; dump size; UDP read shutdown; accept, connect; raw rebinds; netlink options, peers, socketpair; sock_diag last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: ports, listen events; DNS stub; socket I/O, timeouts, binds, UDP shutdown; raw rebinds; suite findings; netlink options, peers, dumps, sock_diag; rtnetlink notifications last)
 
 ## Responsibilities
 
@@ -15,9 +15,9 @@
   options handled in the kernel layer;
 - raw ICMP and ICMPv6 sockets emulated on unprivileged host ping sockets, including traceroute's
   ICMP errors;
-- in-process netlink (`NETLINK_ROUTE`, `NETLINK_GENERIC`'s `nlctrl`, the `NETLINK_NETFILTER`
-  entry point, `NETLINK_SOCK_DIAG` refusing every query, `NETLINK_KOBJECT_UEVENT`) and the routing
-  table;
+- in-process netlink (`NETLINK_ROUTE` with link, address and route notifications,
+  `NETLINK_GENERIC`'s `nlctrl`, the `NETLINK_NETFILTER` entry point, `NETLINK_SOCK_DIAG` refusing
+  every query, `NETLINK_KOBJECT_UEVENT`) and the routing table;
 - the DNS stub at `127.0.0.53:53`;
 - low-port mapping on the host and hiding it from the guest;
 - traffic counters for interfaces and protocols;
@@ -43,10 +43,13 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   guest shut it down for reading). Guest `O_NONBLOCK` lives on the open file.
 - `Message` (one recv result), `Routed` (connect/sendto routing result: namespace map, nat,
   filter verdict, original destinations).
-- `NetlinkSocket` — protocol, type, `nl_pid`, datagram queue, arrival counter,
-  `rcvtimeo`/`sndtimeo`, namespace, `ext_ack`/`cap_ack`, joined groups, the other recorded
-  `SOL_NETLINK` flags, `passcred`, `SockOpts`; `Host` trait / `KernelHost` (interfaces, links, tables, routes, stats,
-  configure, netfilter, all scoped to the socket's namespace); `Link` (host or virtual).
+- `NetlinkSocket` — protocol, type, `nl_pid`, datagram queue (each with the multicast group it
+  went to, 0 for answers), arrival counter, `overrun`, `rcvtimeo`/`sndtimeo`, namespace,
+  `ext_ack`/`cap_ack`, joined groups, the other recorded `SOL_NETLINK` flags, `passcred`,
+  `SockOpts`; `Host` trait / `KernelHost` (interfaces, links, tables, routes, stats, configure,
+  netfilter, all scoped to the socket's namespace, plus the namespaces watched for notifications
+  and the notifications a request caused); `Link` (host or virtual); `Snapshot` (a namespace's
+  link, address and route messages); `Kernel::rtnl_sockets` (weak, every `NETLINK_ROUTE` socket).
 - `route::Entry` — one route (`host` marks entries whose source the host chooses).
 - `RawIcmp` (per raw socket: last guest echo id, `ICMP_FILTER`, guest option flags, its `Tap`),
   `Tap` (per-namespace aggregation point on a host epoll: sources and receivers), `Source`,
@@ -70,7 +73,10 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `getpeername`, `sendto`/`sendmsg`/`sendmmsg`, `recvfrom`/`recvmsg`/`recvmmsg`, `setsockopt`,
   `getsockopt`, `shutdown`; read/write on sockets (`net::recv`/`send` with flags 0); `net::ioctl`;
   `readiness`, `wake_objects`, `arrivals` for poll/epoll.
-- Netlink: `NetlinkSocket::handle` (`route_request`, `generic_request`, `Host::netfilter`).
+- Netlink: `NetlinkSocket::handle` (`route_request`, `generic_request`, `Host::netfilter`);
+  `netlink_send` and the socket `ioctl` wrapper with `rtnl_watched`/`rtnl_notify`,
+  `KernelHost::{snapshots, changed_since}`, `Snapshot::{take, changes}`,
+  `NetlinkSocket::{subscribed, notify}`.
 - Routes: `route::{tables, merge, get, rule_messages, proc_route, proc_ipv6_route, host_routes}`;
   `Machine::set_routes`.
 - Raw ICMP: `tap_for`, `register`, `RawIcmp::{sent, setsockopt}`, `udp_setsockopt`, `before_io`,
@@ -285,13 +291,15 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   reports them. connect (`netlink_connect`): `AF_UNSPEC` does nothing, otherwise a whole
   `sockaddr_nl` (`EINVAL`), a port or group needing `CAP_NET_ADMIN` (`EPERM`); connect and send
   autobind an unbound socket to the tgid. shutdown does nothing; listen and accept `EOPNOTSUPP`.
-- send handles each message synchronously and queues reply datagrams; recv pops one datagram
-  (`MSG_PEEK` clones; oversized datagrams are truncated with `MSG_TRUNC` and the rest lost);
-  source `{AF_NETLINK, 0, 0}`; with `NETLINK_PKTINFO` a pktinfo control message (group 0), then
-  with `SO_PASSCRED` the kernel's credentials (pid 0, uid and gid 0 as the receiver sees them),
-  cut as `put_cmsg` cuts them; waits honour `SO_RCVTIMEO`.
+- send handles each message synchronously and queues reply datagrams; recv first takes a pending
+  overrun (`ENOBUFS` once), then pops one datagram (`MSG_PEEK` clones; oversized datagrams are
+  truncated with `MSG_TRUNC` and the rest lost); source `{AF_NETLINK, 0, group mask}`; with
+  `NETLINK_PKTINFO` a pktinfo control message (the group, 0 for answers), then with `SO_PASSCRED`
+  the kernel's credentials (pid 0, uid and gid 0 as the receiver sees them), cut as `put_cmsg`
+  cuts them; waits honour `SO_RCVTIMEO`.
 - Options: `SOL_SOCKET` reports the type, protocol, `AF_NETLINK`, `SO_PASSCRED`, the timeouts
-  (`SO_SNDTIMEO` only recorded), `SO_ERROR`/`SO_ACCEPTCONN` 0, `SO_PEERCRED` pid 0 and uid/gid -1,
+  (`SO_SNDTIMEO` only recorded), `SO_ERROR` (takes a pending overrun's `ENOBUFS`, else 0),
+  `SO_ACCEPTCONN` 0, `SO_PEERCRED` pid 0 and uid/gid -1,
   and the `SockOpts` ones; other names are accepted and ignored by setsockopt and `ENOPROTOOPT` to
   getsockopt. `SOL_NETLINK` (value read only when a whole int): `NETLINK_ADD_MEMBERSHIP`/`DROP`
   (permission as for bind; the set is allocated first, then group 0 or beyond the count
@@ -300,8 +308,23 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   `LISTEN_ALL_NSID` (`CAP_NET_BROADCAST` over the namespace owner), `CAP_ACK`, `EXT_ACK`,
   `GET_STRICT_CHK` (reading one needs room for an int, `EINVAL`); only `NETLINK_CAP_ACK` and
   `NETLINK_EXT_ACK` have effects (on device-layer change errors and nftables, not on query or
-  generic-netlink errors); other names and levels `ENOPROTOOPT`. No multicast notifications are
-  ever sent (mq_notify cookies are the only asynchronous messages).
+  generic-netlink errors), and `NETLINK_NO_ENOBUFS` on overruns; other names and levels
+  `ENOPROTOOPT`.
+- rtnetlink notifications: every `NETLINK_ROUTE` socket is registered (weakly) in
+  `Kernel::rtnl_sockets`. A send on `NETLINK_ROUTE` first collects the namespaces that have a
+  socket in the link, IPv4/IPv6 address or IPv4/IPv6 route groups (1, 5, 7, 9, 11), the sender
+  included; for a change request (`RTM_NEW`/`DEL`/`SETLINK`, `NEW`/`DELADDR`, `NEW`/`DELROUTE`)
+  `KernelHost::configure` snapshots each of them before and after the device layer runs it (a
+  request can change another namespace: moving a link, a veth's peer); a socket ioctl that changes
+  an interface, address or route (`SIOCSIF*`, `SIOCDIFADDR`, `SIOCADDRT`/`SIOCDELRT`) is wrapped
+  the same way. The difference becomes
+  messages in Linux's order: new or changed links (`RTM_NEWLINK`, statistics ignored), addresses
+  gone and new, routes gone and new (one changed in place — same family, prefix, interface or
+  table, destination, priority — is only new, as `ip route replace` is), links gone. After the
+  sender's borrow ends they are queued on every registered socket of that namespace that joined
+  the group, with seq, port and flags 0, and each such socket is woken. A socket holding 1024
+  datagrams drops the notification and, unless `NETLINK_NO_ENOBUFS`, sets `overrun` (`POLLERR`
+  while pending). mq_notify cookies are the other asynchronous messages.
 - `NETLINK_ROUTE`: change requests (`NEW`/`DEL`/`SET` for links, addresses, routes) need
   `CAP_NET_ADMIN` over the namespace owner and go to `kernel/netns`'s device layer; other change
   types Linux 6.1 knows (up to `RTM_MAX`) are `EPERM` without it and `EOPNOTSUPP` with it (host
@@ -360,7 +383,9 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
   the BKL.
 - Addresses are rewritten at the boundary in both directions (namespaces, ports, nat, DNS stub);
   anything returning an address to the guest must go through the same unmapping.
-- Netlink replies are snapshots taken at send time.
+- Netlink replies are snapshots taken at send time; notifications are differences between
+  snapshots, so what a request changes counts, not how (several steps of one request collapse,
+  and a namespace nobody listens to is never snapshotted).
 - A bind must not reach the host with `AF_UNSPEC`: Ubuntu's 6.8 kernels (colima's 6.8.0-117) oops
   in AppArmor's `aa_inet_bind_perm` on one from a confined process, and the host thread dies
   holding the BKL, hanging every guest process. bind rewrites the family to `AF_INET` first.
@@ -378,8 +403,13 @@ epoll and readiness plumbing (`kernel/poll`); `/proc/net` and sysfs file structu
 - **Netlink dumps are not resumable:** a reader whose buffer is smaller than a dump datagram (at
   most 3776 bytes, a whole rule dump in one) gets `MSG_TRUNC` and loses the rest, where Linux
   sizes later datagrams to the reader's buffer and continues the dump on the next recv.
-- **Netlink memberships and ids are only recorded:** joined groups never receive anything, so
-  monitors subscribe and wait forever; `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
+- **Only rtnetlink change requests are notified:** groups other than rtnetlink's link, address
+  and route ones (neighbours, rules, netconf, nsid, other protocols) never receive anything;
+  changes made through sysctls (`disable_ipv6`) or to the host's own interfaces (boot namespace)
+  are not notified; notifications carry seq, port and flags 0 (Linux copies the request's seq and
+  port into address and route ones, and new routes carry `NLM_F_CREATE`/`EXCL`), `NLM_F_ECHO` is
+  not honoured, and the queue cap counts datagrams (1024), not `SO_RCVBUF` bytes.
+- **Netlink ids are only recorded:** `NETLINK_CAP_ACK`/`EXT_ACK` are ignored for query and
   generic-netlink errors; ids are not checked for uniqueness, so a second socket of a process
   autobinds to the same tgid (Linux picks a negative number) and an explicit id another socket
   holds is not `EADDRINUSE`.
