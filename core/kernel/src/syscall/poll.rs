@@ -260,6 +260,11 @@ fn wait_ready(
             if only_wanted { e & wanted != 0 } else { e != 0 }
         };
         if ready.iter().zip(items).any(counts) || deadline.is_some_and(|d| Instant::now() >= d) {
+            for ((f, _), &e) in items.iter().zip(&ready) {
+                if let Some(f) = f {
+                    took_change(&f.borrow(), e);
+                }
+            }
             return Ok(ready);
         }
         if cx.interrupted() {
@@ -472,6 +477,9 @@ impl Epoll {
         if int.events & EPOLLONESHOT != 0 {
             int.armed = false;
         }
+        if let Some(file) = int.file.upgrade() {
+            took_change(&file.borrow(), ev as i16);
+        }
         // Exclusive interest: this edge belongs to this epoll; other epolls wait for the next
         // edge
         if int.events & EPOLLEXCLUSIVE != 0
@@ -544,13 +552,16 @@ pub(super) fn epoll_ctl(cx: &mut Cx<'_>, epfd: i32, op: u32, fd: i32, event: u64
     if file.borrow().flags & oflags::O_PATH != 0 {
         return Err(Errno::EBADF);
     }
-    // Regular files, directories and devices like /dev/null do not support poll, and Linux does
-    // not allow adding them to an epoll
+    // Regular files, directories, devices like /dev/null and the synthetic files without a poll
+    // operation (per-process procfs files, nsfs) do not support poll, and Linux does not allow
+    // adding them to an epoll
     if matches!(
+        &file.borrow().kind,
+        FileKind::Proc { klog: None, node, .. } if !crate::pseudo::pollable(node)
+    ) || matches!(
         file.borrow().kind,
         FileKind::Regular { .. }
             | FileKind::Directory { .. }
-            | FileKind::Proc { klog: None, .. }
             | FileKind::Device {
                 dev: Device::Null
                     | Device::Zero
@@ -1436,7 +1447,36 @@ fn readiness(f: &OpenFile, depth: u32) -> (i16, Option<i32>) {
             },
             None,
         ),
+        // sysfs and cgroup2 files (`kernfs_generic_poll`), mounts and mountinfo (`mounts_poll`):
+        // POLLERR and POLLPRI while changed since last read from the start
+        FileKind::Proc { event: Some(e), .. } => {
+            let base = if e.mounts {
+                POLLIN | POLLRDNORM
+            } else {
+                POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM
+            };
+            (
+                if e.changed() {
+                    base | POLLERR | POLLPRI
+                } else {
+                    base
+                },
+                None,
+            )
+        }
         _ => (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM, None),
+    }
+}
+
+/// Events `ev` of open file `f` were reported to the guest: a change of the mount table reported
+/// by mounts or mountinfo is taken in (`mounts_poll` records the namespace's event as it reports
+/// it), so it is not reported again until the next change.
+fn took_change(f: &OpenFile, ev: i16) {
+    if ev & (POLLPRI | POLLERR) != 0
+        && let FileKind::Proc { event: Some(e), .. } = &f.kind
+        && e.mounts
+    {
+        e.seen.set(e.counter.get());
     }
 }
 
@@ -1480,6 +1520,7 @@ fn wake_objects(f: &OpenFile, out: &mut Vec<wake::Object>) {
         FileKind::Proc {
             klog: Some(log), ..
         } => out.push(wake::of(&**log)),
+        FileKind::Proc { event: Some(e), .. } => out.push(wake::of_value(&*e.counter)),
         _ => {}
     }
 }
@@ -1539,6 +1580,7 @@ fn arrivals_with(f: &OpenFile, host: fn(&HostEdges) -> [u64; 2], depth: u32) -> 
         FileKind::Proc {
             klog: Some(log), ..
         } => [log.borrow().next_seq(), 0],
+        FileKind::Proc { event: Some(e), .. } => [e.counter.get(), 0],
         _ => [0, 0],
     };
     let host = f.host_edges.as_ref().map_or([0, 0], host);

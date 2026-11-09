@@ -30,10 +30,12 @@
 //! ([`crate::oom`]), and the others (`memory.high`, `cpu.max`, `cpuset.cpus`...) have no effect;
 //! `cgroup.freeze` freezes the processes in the subtree (threads stop before returning to the
 //! guest, and waiting syscalls return as if interrupted by a signal and restart after thaw);
-//! `cgroup.kill` kills the processes in the whole subtree.
+//! `cgroup.kill` kills the processes in the whole subtree. The files Linux notifies of changes
+//! (`cgroup.events`, `memory.events`, `memory.events.local`, `pids.events`) report them to poll
+//! (`POLLPRI`) and inotify (`IN_MODIFY`) while something watches them ([`notify_changes`]).
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use crate::cred::Cred;
@@ -186,6 +188,16 @@ impl Cgroup {
 pub(crate) struct Cgroups {
     pub map: BTreeMap<u64, Cgroup>,
     next: u64,
+    /// The notifying files something watches (an open file or an inotify watch), by cgroup and
+    /// name ([`observe`], [`notify_changes`]).
+    observed: HashMap<(u64, &'static [u8]), Observed>,
+}
+
+/// A notifying cgroup file being watched: what it showed when last looked at, and the counter its
+/// changes bump ([`crate::fd::ProcEvent`]).
+struct Observed {
+    content: Option<String>,
+    counter: Rc<Cell<u64>>,
 }
 
 impl Default for Cgroups {
@@ -194,7 +206,99 @@ impl Default for Cgroups {
         Cgroups {
             map: BTreeMap::from([(ROOT, root)]),
             next: ROOT + 1,
+            observed: HashMap::new(),
         }
+    }
+}
+
+/// The files whose changes Linux notifies (`cgroup_file_notify`: populated and frozen, memory
+/// events, pids events).
+const NOTIFYING: [&[u8]; 4] = [
+    b"cgroup.events",
+    b"memory.events",
+    b"memory.events.local",
+    b"pids.events",
+];
+
+/// The number inotify keys cgroup file `name` of cgroup `id` by (its directory with an empty
+/// name): the top two bits 01, which store inode numbers, overlay keys (10) and FUSE keys (11)
+/// never have, then the cgroup id and the file's place in [`FILES`] (0 for the directory).
+pub(crate) fn key(id: u64, name: &[u8]) -> u64 {
+    let file = FILES.iter().position(|f| f.0 == name).map_or(0, |i| i + 1);
+    1 << 62 | id << 8 | file as u64
+}
+
+/// Whether `key` is a cgroup file's ([`key`]).
+pub(crate) const fn is_key(key: u64) -> bool {
+    key >> 62 == 1
+}
+
+/// The change counter of file `name` of cgroup `id` for an open file or an inotify watch to
+/// follow; None for a file Linux never notifies. A new one starts from the file's current
+/// contents, so only later changes count.
+pub(crate) fn observe(k: &mut Kernel, id: u64, name: &'static [u8]) -> Option<Rc<Cell<u64>>> {
+    if !NOTIFYING.contains(&name) {
+        return None;
+    }
+    if let Some(o) = k.cgroups.observed.get(&(id, name)) {
+        return Some(o.counter.clone());
+    }
+    let content = file(k, id, name, &|t| t);
+    let counter = Rc::new(Cell::new(1));
+    k.cgroups.observed.insert(
+        (id, name),
+        Observed {
+            content,
+            counter: counter.clone(),
+        },
+    );
+    Some(counter)
+}
+
+/// Every notifying file of cgroup `id`, for a watch on its directory ([`observe`]).
+pub(crate) fn observe_all(k: &mut Kernel, id: u64) {
+    let names: Vec<&'static [u8]> = k
+        .cgroups
+        .files(id)
+        .filter(|f| NOTIFYING.contains(f))
+        .collect();
+    for name in names {
+        observe(k, id, name);
+    }
+}
+
+/// Looks for changes in the watched notifying files, as Linux's `cgroup_file_notify` reports
+/// them where they happen: each whose contents differ from what it showed last bumps its counter
+/// (pollers see `POLLPRI` and are woken) and reports `IN_MODIFY` to inotify watches on it and on
+/// its directory (`kernfs_notify`). Called after syscalls, thread exits, freezer stops and the
+/// timer thread's checks (the OOM killer); does nothing while nothing is watched. A file nothing
+/// watches any more, or whose cgroup is gone, is forgotten.
+pub(crate) fn notify_changes(k: &mut Kernel) {
+    if k.cgroups.observed.is_empty() {
+        return;
+    }
+    let watched: std::collections::HashSet<u64> = k.inotify.borrow().watched().collect();
+    let keys: Vec<(u64, &'static [u8])> = k.cgroups.observed.keys().copied().collect();
+    let mut changed = Vec::new();
+    for (id, name) in keys {
+        let held = Rc::strong_count(&k.cgroups.observed[&(id, name)].counter) > 1;
+        let now = file(k, id, name, &|t| t);
+        if now.is_none()
+            || !held && !watched.contains(&key(id, name)) && !watched.contains(&key(id, b""))
+        {
+            k.cgroups.observed.remove(&(id, name));
+            continue;
+        }
+        let o = k.cgroups.observed.get_mut(&(id, name)).unwrap();
+        if now != o.content {
+            o.content = now;
+            o.counter.set(o.counter.get() + 1);
+            crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*o.counter));
+            changed.push((id, name));
+        }
+    }
+    for (id, name) in changed {
+        crate::syscall::kernfs_modified(k, key(id, name), key(id, b""), name);
     }
 }
 

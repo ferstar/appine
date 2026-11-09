@@ -2275,6 +2275,28 @@ pub(crate) fn open_unwritable(node: &PseudoNode, for_write: bool) -> Result<(), 
     }
 }
 
+/// Files with a poll operation, which epoll accepts: procfs's global files, `/proc/sys`,
+/// `/proc/sysvipc` and `/proc/<pid>/net` (`proc_reg_poll`, `proc_sys_poll`), mounts and mountinfo
+/// (`mounts_poll`), and every sysfs and cgroup2 file (`kernfs_fop_poll`). The other per-process
+/// files and nsfs have none (epoll_ctl's EPERM).
+pub(crate) fn pollable(node: &PseudoNode) -> bool {
+    use PseudoNode::*;
+    matches!(
+        node,
+        Global(_)
+            | Static(_)
+            | Net(..)
+            | NetConf(..)
+            | NetSysctl(_)
+            | Entry(_, _, self::Entry::Mounts | self::Entry::MountInfo)
+            | Sys(_)
+            | SysCpu(..)
+            | SysNet(..)
+            | SysBlock(..)
+            | Cgroup(..)
+    )
+}
+
 /// Files that cannot be read: write-only cgroup files (`cgroup.kill`); as on Linux this is not
 /// checked at open, and reading is EINVAL (`cgroup_seqfile_show` has no read callback).
 pub(crate) fn unreadable(node: &PseudoNode) -> bool {

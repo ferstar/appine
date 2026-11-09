@@ -1284,6 +1284,10 @@ fn wait_while_stopped(cx: &mut Cx<'_>) -> Flow {
             break Flow::Continue;
         }
         cx.task.frozen.set(frozen);
+        // The last thread stopping completes the freeze (cgroup.events' frozen)
+        if frozen {
+            crate::cgroup::notify_changes(cx.k());
+        }
         // Only SIGCONT, SIGKILL and thawing can make it leave here, so other signals are not
         // checked
         let _ = cx.wait(None, &mut []);

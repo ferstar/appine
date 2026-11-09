@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes; mount events, cgroup2 watches last)
 
 ## Responsibilities
 
@@ -198,7 +198,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   nosymfollow, and the path is absolute or relative to a cwd in that mount. It returns `None` on
   any cache miss, more than 64 pending components, any store inode that is a mount point, and
   trailing links that `protected_symlinks` might refuse; it never enters synthetic filesystems.
-  Mount table changes call `mounts_changed`, and syscalls refresh threads with `fast_changed`.
+  Mount table changes call `mounts_changed`, which also bumps the mount event counter polled
+  through mounts and mountinfo (`kernel/procfs`), and syscalls refresh threads with
+  `fast_changed`.
 
 ### Mount table and boot mounts
 
@@ -781,8 +783,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   watch (`ENOSPC`) limits and the queue limit come from `/proc/sys/fs/inotify/*` (defaults 128
   instances, 2^20 watches, 16384 queued events).
 - Watches are keyed by store inode number, for an overlay node by its key (its id with the top
-  bit set, `overlay::key`, also the lock tables' key), or for a FUSE node by `fuse::key`; watches on synthetic nodes are accepted,
-  counted and never report. Adding one needs read permission on what the store or the overlay
+  bit set, `overlay::key`, also the lock tables' key), for a FUSE node by `fuse::key`, or for a
+  cgroup2 file or directory by `cgroup::key`, whose changes `kernel/procfs` reports as
+  `IN_MODIFY`; watches on other synthetic nodes are accepted, counted and never report. Adding one needs read permission on what the store or the overlay
   shows; fdinfo gives the inode number and device stat shows. `IN_MASK_ADD`/`IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW`,
   `IN_EXCL_UNLINK`, `IN_ONESHOT`; store targets need read permission.
 - Reporting: with no watches every hook costs one emptiness check. An event goes first to
@@ -943,7 +946,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - inotify keys an overlay node by `overlay::key` (as the lock tables do): a hook given the store
   inode behind something reached through an overlay reports to the layer, where no watch on the
   overlay sees it, so overlay paths must pass the node's key (`key_of`, `file_key`). Store inode
-  numbers, overlay keys (top bit) and FUSE keys (top two bits) must never collide.
+  numbers (below 2^62) and the keys of overlay nodes (top bits 10), FUSE nodes (11) and cgroup2
+  files (01) must never collide, and each kind's `of_key`/`id_of`/`is_key` must check both bits.
 - A walk may fail with the internal `FUSE_RETRY` (`kernel/fuse`): code that swallows walk errors
   (`.ok()`, `has_child`) must not turn it into "not found" where that changes what is done, and
   nothing that changes state may come before a walk that can need it.

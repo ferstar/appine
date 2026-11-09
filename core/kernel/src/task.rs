@@ -1108,6 +1108,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     {
         failed(&k, "collecting mount namespaces");
     }
+    // A cgroup may have lost its last process (cgroup.events' populated)
+    if crate::bug::catch(|| crate::cgroup::notify_changes(&mut k)).is_none() {
+        failed(&k, "notifying cgroup changes");
+    }
     // Child state changes are requested separately by finish_group (wake::CHILD), the vfork
     // parent is woken by release_mm, and closed files make their own requests; here only those
     // waiting for threads to end are woken (execve, shutdown)

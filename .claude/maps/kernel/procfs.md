@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes; change notifications last)
 
 ## Responsibilities
 
@@ -141,8 +141,20 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   apply immediately, do not advance the position (except `mem`), and mark the snapshot stale.
   Per-process numbers use `proc_number`/`kstrto` (first 12 bytes, base 0, `EINVAL`/`ERANGE`);
   most sysctls parse decimal after trimming.
-- Synthetic files (other than kmsg) cannot be added to epoll (`EPERM`) and poll as always ready, so
-  mount table changes are never signalled through mountinfo.
+- Change notifications (`fd::ProcEvent`): epoll accepts the files with a Linux poll operation
+  (`pseudo::pollable`: global procfs files, `/proc/sys`, `/proc/sysvipc`, `/proc/<pid>/net`,
+  mounts, mountinfo, every sysfs and cgroup2 file; other per-process files and nsfs are `EPERM`).
+  mounts and mountinfo poll as `POLLIN|POLLRDNORM`, plus `POLLERR|POLLPRI` once the mount table
+  has changed since the open or since the last change a poll or epoll reported (reading does not
+  take it in); one counter (`Vfs::mount_events`) serves every mount namespace. sysfs and cgroup2
+  files poll as always readable and writable, plus `POLLERR|POLLPRI` before their first read from
+  the start and, for `cgroup.events`, `memory.events`, `memory.events.local` and `pids.events`,
+  after each change of their contents until read again (kernfs). Those four files are compared
+  with what they showed while an open file or an inotify watch observes them (`cgroup::observe`,
+  `notify_changes`, after BKL syscalls, thread exits, freezer stops and the timer thread's
+  checks); a change wakes pollers and reports `IN_MODIFY` to watches on the file and its
+  directory, and a write to any cgroup2 file reports `IN_MODIFY` too. inotify keys cgroup2 files
+  with the top bits 01 (`cgroup::key`); other synthetic files never report.
 
 ### Per-process files
 
@@ -418,9 +430,13 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 - **Per-thread fd views are wrong:** `task/<tid>/fd` and `fdinfo` show the group leader's table even
   when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
-- **No change notifications:** synthetic files cannot be added to epoll (`EPERM`) and always poll
-  ready, so mount table changes (`mountinfo`'s `POLLPRI`) and `cgroup.events` changes are never
-  signalled; libmount monitors, systemd and containerd's OOM watching rely on them.
+- **Change notifications are partial:** a mount change in any namespace marks every mounts and
+  mountinfo reader (Linux counts per namespace), as do propagation-type changes (Linux does not
+  touch the namespace for them); a cgroup2 change is noticed when the next syscall, thread exit,
+  freezer stop or timer-thread pass looks (not at once), and changes that come and go between two
+  looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
+  watched; sysctl poll (`hostname`, `domainname`) never reports `POLLPRI`; other synthetic files
+  report no inotify events (opens, reads, writes).
 - **`frozen 1` never appears while a vfork parent waits:** the waiting parent never counts as frozen,
   so runtimes that wait for `cgroup.events` to report frozen (runc pause) can wait until thaw.
 - **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in

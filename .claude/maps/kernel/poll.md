@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse`; exclusive timerfds last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse`; exclusive timerfds; synthetic files last)
 
 ## Responsibilities
 
@@ -66,8 +66,13 @@ signal delivery (`kernel/signal`).
   (`tty::readiness`), sockets (`net::readiness` → unix, netlink, inet, raw ICMP), message queues,
   seccomp notify, kmsg, `/dev/fuse` (`kernel/fuse`: always writable, readable while a request or
   interrupt waits, only `POLLERR` once aborted or before a mount attached it; it lists its
-  connection's reader object); `O_PATH` files `POLLNVAL`; everything else (regular files, directories,
-  other devices, synthetic files, bpf) is always readable and writable. The bits are each Linux
+  connection's reader object); synthetic files with change notifications (`fd::ProcEvent`:
+  mounts and mountinfo `POLLIN|POLLRDNORM`, sysfs and cgroup2 files readable and writable, both
+  plus `POLLERR|POLLPRI` while changed, their counter as wake object and read arrival,
+  `kernel/procfs`); `O_PATH` files `POLLNVAL`; everything else (regular files, directories, other
+  devices, other synthetic files, bpf) is always readable and writable. A report of `POLLPRI` or
+  `POLLERR` from mounts or mountinfo, by ppoll, pselect6 or epoll, takes the change in
+  (`took_change`, as `mounts_poll` does). The bits are each Linux
   poll operation's: eventfd, timerfd and signalfd report `POLLIN`/`POLLOUT` without the
   `RDNORM`/`WRNORM` bits, an epoll `POLLIN|POLLRDNORM`.
 - `poll_now` adds a zero-timeout host poll for the host fd (and its `HostEdges`), keeping
@@ -109,8 +114,8 @@ signal delivery (`kernel/signal`).
 - `epoll_create1`: only `O_CLOEXEC` (else `EINVAL`).
 - `epoll_ctl` checks in Linux 6.1's order: the event is copied first except for DEL (`EFAULT`);
   epfd, then the target (`EBADF`; `O_PATH` `EBADF`); a target that cannot be polled — regular
-  files, directories, synthetic files, `/dev/null|zero|full`, loop devices and
-  `/dev/loop-control` — `EPERM`; epfd not an epoll, or the target itself, `EINVAL`;
+  files, directories, synthetic files without a Linux poll operation (`pseudo::pollable`),
+  `/dev/null|zero|full`, loop devices and `/dev/loop-control` — `EPERM`; epfd not an epoll, or the target itself, `EINVAL`;
   `EPOLLEXCLUSIVE` only on ADD, not on epolls, and not with ONESHOT/RDHUP/PRI (`EINVAL`); on ADD
   loops or depth over 4 `ELOOP`. Interests are keyed by (fd, open file);
   ADD `EEXIST`, MOD replaces (re-arms; MOD of an exclusive interest `EINVAL`), DEL, missing

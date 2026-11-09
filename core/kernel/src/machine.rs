@@ -858,6 +858,10 @@ fn timers(shared: Arc<Shared>) {
                 k.oom.limit = u64::MAX;
             }
         }
+        // The OOM killer's memory events (memory.events) for watchers of cgroup files
+        if crate::bug::catch(|| crate::cgroup::notify_changes(&mut k)).is_none() {
+            crate::bug::report(format_args!("kernel panic while notifying cgroup changes"));
+        }
         match crate::bug::catch(|| crate::oom::unmap_code_views(&mut k, &shared)) {
             Some(Some(due)) => next = Some(next.map_or(due, |n| n.min(due))),
             Some(None) => {}

@@ -35,7 +35,7 @@ mod xattr;
 pub(crate) use aio::{AioContext, check_polls as check_aio_polls, released as aio_released};
 pub(crate) use fs::ENTROPY;
 pub(crate) use fs::{create_exclusive, unlink_path, write_at};
-pub(crate) use inotify::{Inotify, Opened, Registry, host_change};
+pub(crate) use inotify::{Inotify, Opened, Registry, host_change, kernfs_modified};
 pub(crate) use lease::Lease;
 pub(crate) use loopdev::{LoopOpen, Loops};
 pub(crate) use misc::Restart;
@@ -585,6 +585,8 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     }
     // Removed overlay nodes nothing uses any more
     mount::sweep_overlays(cx);
+    // Changes to watched cgroup files (crate::cgroup::notify_changes)
+    crate::cgroup::notify_changes(cx.k());
     drop(in_syscall);
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated

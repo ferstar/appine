@@ -30,14 +30,15 @@ use crate::errno::Errno;
 pub(crate) type OvlId = u64;
 
 /// The number that stands for node `id` in tables keyed by store inode number (locks, inotify
-/// watches): its id with the top bit set, which store inode numbers never have.
+/// watches): its id with the top two bits 10, which store inode numbers never have (FUSE keys
+/// have 11, cgroup2 files' 01).
 pub(crate) const fn key(id: OvlId) -> Ino {
     1 << 63 | id
 }
 
-/// The node a [`key`] stands for; None for a store inode number.
+/// The node a [`key`] stands for; None for a store inode number or another kind of key.
 pub(crate) const fn of_key(key: Ino) -> Option<OvlId> {
-    if key >> 63 == 1 {
+    if key >> 62 == 2 {
         Some(key & !(1 << 63))
     } else {
         None

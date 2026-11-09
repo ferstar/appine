@@ -299,6 +299,16 @@ pub(super) fn inotify_add_watch(cx: &mut Cx<'_>, fd: i32, path: u64, mask: u32) 
         }
     };
     let keep = IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT;
+    // A cgroup2 file, or a cgroup's directory, starts being looked at for changes
+    match &node {
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, b"")) => {
+            crate::cgroup::observe_all(cx.k(), *id);
+        }
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name)) => {
+            crate::cgroup::observe(cx.k(), *id, name);
+        }
+        _ => {}
+    }
     let mut i = inotify.borrow_mut();
     // The same object already has a watch: change its mask (merged with IN_MASK_ADD)
     if let Some((&wd, w)) = i.watches.iter_mut().find(|(_, w)| w.node == node) {
@@ -487,13 +497,15 @@ impl Registry {
             return false;
         };
         let mut unlinked = None;
-        // An overlay node is unlinked once its directory no longer has it
+        // An overlay node is unlinked once its directory no longer has it; cgroup2 files never
+        // are
         let mut is_unlinked = |child: Ino| {
             *unlinked.get_or_insert_with(|| {
-                vfs.upgrade().is_some_and(|v| match overlay::of_key(child) {
-                    Some(o) => !v.overlay().linked(o),
-                    None => v.store().stat(child).map_or(true, |st| st.nlink == 0),
-                })
+                !crate::cgroup::is_key(child)
+                    && vfs.upgrade().is_some_and(|v| match overlay::of_key(child) {
+                        Some(o) => !v.overlay().linked(o),
+                        None => v.store().stat(child).map_or(true, |st| st.nlink == 0),
+                    })
             })
         };
         let mut queued = false;
@@ -590,7 +602,19 @@ pub(crate) fn key_of(node: &Node) -> Option<Ino> {
         Node::Store(_, ino) => Some(*ino),
         Node::Overlay(_, o) => Some(overlay::key(*o)),
         Node::Fuse(_, f) => Some(crate::vfs::fuse::key(*f)),
+        // cgroup2 files report the changes Linux notifies (crate::cgroup::notify_changes)
+        Node::Pseudo(_, crate::pseudo::PseudoNode::Cgroup(id, name)) => {
+            Some(crate::cgroup::key(*id, name))
+        }
         Node::Pseudo(..) => None,
+    }
+}
+
+/// A notifying cgroup2 file (inotify key `key`, its directory's `dir`) changed: `IN_MODIFY` to
+/// the watches on the directory (with the name) and on the file, as `kernfs_notify` reports it.
+pub(crate) fn kernfs_modified(k: &Kernel, key: Ino, dir: Ino, name: &[u8]) {
+    if let Ok(mut r) = k.inotify.try_borrow_mut() {
+        r.notify(key, Some((dir, name)), IN_MODIFY);
     }
 }
 

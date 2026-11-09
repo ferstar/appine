@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds; cgroup2 notifications last)
 
 ## Responsibilities
 
@@ -170,7 +170,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   (`kernel/fuse`'s `prefault`), since those consume input before copying. ptrace's entry and exit
   stops and seccomp see one syscall. After the handler, between syscalls, the FUSE node cache may
   be swept (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of
-  are collected and removed overlay nodes swept (`kernel/vfs`).
+  are collected and removed overlay nodes swept (`kernel/vfs`), and watched cgroup2 files
+  compared for changes (`kernel/procfs`'s `notify_changes`, also run at thread exit, freezer
+  stops and by the timer thread after the OOM check).
 - From after the entry stop and seccomp until those sweeps, before the exit stop and signal
   delivery, the thread records the syscall in `Task::syscall` (`InSyscall`, cleared on every way
   out), numbered by the global `SYSCALLS` count, so the overlay sweep can tell which syscalls

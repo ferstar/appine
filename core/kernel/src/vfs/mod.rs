@@ -507,6 +507,9 @@ pub struct Vfs {
     overlays: RefCell<overlay::Overlays>,
     /// FUSE connections and their nodes.
     fuse: RefCell<fuse::Fuses>,
+    /// Bumped at each change of the mount table (Linux's `touch_mnt_namespace`), for the poll of
+    /// mounts and mountinfo ([`crate::fd::ProcEvent`]).
+    mount_events: std::rc::Rc<std::cell::Cell<u64>>,
 }
 
 struct Mounts {
@@ -1001,6 +1004,7 @@ impl Vfs {
             namespaces: Default::default(),
             overlays: Default::default(),
             fuse: Default::default(),
+            mount_events: std::rc::Rc::new(std::cell::Cell::new(1)),
         })
     }
 
@@ -2914,6 +2918,14 @@ impl Vfs {
         let mut cached = self.cached.borrow_mut();
         cached.mounts = points;
         cached.usable = usable;
+        // Readers polling mounts and mountinfo see POLLPRI; one counter serves every namespace
+        self.mount_events.set(self.mount_events.get() + 1);
+        crate::kernel::request_wake_object(crate::kernel::wake::of_value(&*self.mount_events));
+    }
+
+    /// The counter of mount table changes ([`Vfs::mounts_changed`]).
+    pub(crate) fn mount_events(&self) -> std::rc::Rc<std::cell::Cell<u64>> {
+        self.mount_events.clone()
     }
 }
 

@@ -8,7 +8,8 @@
 SKIP="JobControlTest.SetForegroundProcessGroupEmptyProcessGroup:SetModeTest.SetMode/*"
 # kernel/vfs: mounts copied into a less privileged namespace are not locked
 SKIP="$SKIP:PivotRootTest.LockedNewRootFails"
-# kernel/vfs: utimensat always reports IN_ATTRIB; watches on synthetic nodes never report;
+# kernel/vfs: utimensat always reports IN_ATTRIB; watches on synthetic nodes other than cgroup2's
+# never report (procfs opens and reads);
 # IN_EXCL_UNLINK filters the wrong events; executing a file reports no inotify events
 SKIP="$SKIP:Inotify.Utimensat:Inotify.KernfsBasic:Inotify.KernfsDynamicFileAcrossSave"
 SKIP="$SKIP:Inotify.ExcludeUnlink*:Inotify.Exec"
@@ -42,11 +43,11 @@ SKIP="$SKIP:$M.UserNamespaceSysfsMountRevealingLockedMount"
 SKIP="$SKIP:$M.ChangeMountFlagsOfLockedMount:$M.LockedMountFlagsAreInheritedByBind"
 SKIP="$SKIP:$M.LockedMountStopsNonRecBind:$M.UserNamespaceProcMountRevealingLockedMount"
 SKIP="$SKIP:$M.UserNamespaceProcMountLockedReadOnly:$M.UserNamespaceProcBindMountIsNotVisible"
-# kernel/vfs D7: fsopen and fsmount are ENOSYS (these skip themselves on Appine); kernel/procfs: no
-# change notifications (mountinfo cannot be polled); kernel/vfs: atime ignores the guest's settings;
+# kernel/vfs D7: fsopen and fsmount are ENOSYS (these skip themselves on Appine); kernel/vfs: atime
+# ignores the guest's settings;
 # kernel/vfs D3: tmpfs counts file sizes (no holes, no SIGBUS when full); kernel/cred D1: one
 # credential per thread group (a helper thread drops CAP_SYS_ADMIN for the cleanup too)
-SKIP="$SKIP:$M.UserNamespaceProcFsmount*:$M.PollMountInfo:$M.MountInfoAfterUnshare"
+SKIP="$SKIP:$M.UserNamespaceProcFsmount*"
 SKIP="$SKIP:$M.MountNoAtime:$M.TmpfsSizePartialWriteMultiplePages:$M.TmpfsSizeMmap"
 SKIP="$SKIP:$M.UmountPermDenied"
 # Slow by design (it sleeps 30 s to show that shared locks do not block), left out for the time it

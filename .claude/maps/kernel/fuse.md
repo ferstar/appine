@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed; key bits last)
 
 ## Responsibilities
 
@@ -368,7 +368,8 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 - `enter` and `moved` keep parents free of loops; everything that climbs parents (`reach`,
   `fs_path`, `is_within`, `is_under`) depends on it.
 - Uniques are even, so the low bit marks interrupt replies.
-- Store inode numbers, overlay keys (top bit) and FUSE keys (top two bits) must never collide.
+- Store inode numbers (below 2^62), overlay keys (top bits 10), FUSE keys (11) and cgroup2 files'
+  inotify keys (01) must never collide.
 - The type of a node never changes; a reply giving another type is EIO (getattr, setattr) or a new
   node (lookup).
 - Nodes are forgotten only between syscalls (`sweep`), so a `FuseId` in a syscall's locals stays

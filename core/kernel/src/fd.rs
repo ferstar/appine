@@ -167,7 +167,61 @@ pub enum FileKind {
         /// and the id maps, `setgroups` and `timens_offsets` check writes with them, so a
         /// descriptor handed to another process keeps its opener's view and rights.
         opener: Rc<crate::cred::Cred>,
+        /// Change notifications of a file Linux polls for them: sysfs and cgroup2 files, mounts
+        /// and mountinfo.
+        event: Option<ProcEvent>,
     },
+}
+
+/// Change notifications of an open synthetic file: kernfs's `kernfs_generic_poll` for sysfs and
+/// cgroup2 files, procfs's `mounts_poll` for mounts and mountinfo. Poll reports `POLLERR` and
+/// `POLLPRI` while the file has changed since a kernfs file was last read from the start, or since
+/// mounts or mountinfo last had a change reported (`syscall::poll`'s `took_change`).
+pub struct ProcEvent {
+    /// Bumped at each change of what the file shows (cgroup2's notifying files,
+    /// [`crate::cgroup::notify_changes`]; the mount table, [`crate::vfs::Vfs::mount_events`]);
+    /// constant for the other kernfs files.
+    pub counter: Rc<std::cell::Cell<u64>>,
+    /// The counter when a kernfs file was last read from the start (0 before its first read, so
+    /// it is reported as changed until then, as kernfs's are), or when mounts or mountinfo last
+    /// had a change reported.
+    pub seen: std::cell::Cell<u64>,
+    /// The counter when the contents were generated.
+    pub generated: std::cell::Cell<u64>,
+    /// mounts and mountinfo: readable only (`EPOLLIN|EPOLLRDNORM`), where kernfs files are also
+    /// writable (`DEFAULT_POLLMASK`).
+    pub mounts: bool,
+}
+
+impl ProcEvent {
+    /// A kernfs file following `counter` (Linux's open node starts its event at 1, the open file
+    /// at 0).
+    pub fn kernfs(counter: Rc<std::cell::Cell<u64>>) -> ProcEvent {
+        let now = counter.get();
+        ProcEvent {
+            counter,
+            seen: std::cell::Cell::new(0),
+            generated: std::cell::Cell::new(now),
+            mounts: false,
+        }
+    }
+
+    /// mounts or mountinfo following the mount table's `counter`, seen as of the open
+    /// (`mounts_open_common` records the namespace's event).
+    pub fn mounts(counter: Rc<std::cell::Cell<u64>>) -> ProcEvent {
+        let now = counter.get();
+        ProcEvent {
+            counter,
+            seen: std::cell::Cell::new(now),
+            generated: std::cell::Cell::new(now),
+            mounts: true,
+        }
+    }
+
+    /// Whether the file has changed since it was last read from the start (`POLLPRI`).
+    pub fn changed(&self) -> bool {
+        self.seen.get() != self.counter.get()
+    }
 }
 
 /// An open file.

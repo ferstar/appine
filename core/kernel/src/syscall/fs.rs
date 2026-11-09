@@ -884,6 +884,25 @@ fn open_pseudo(
         }
         _ => None,
     };
+    // Change notifications: the mount table for mounts and mountinfo, a cgroup file's changes
+    // for the files cgroup2 notifies, none (but kernfs's first-read rule) for other sysfs and
+    // cgroup2 files
+    let event = match node {
+        PseudoNode::Entry(_, _, pseudo::Entry::Mounts | pseudo::Entry::MountInfo) => {
+            Some(crate::fd::ProcEvent::mounts(vfs.mount_events()))
+        }
+        PseudoNode::Cgroup(id, name) if !name.is_empty() => Some(crate::fd::ProcEvent::kernfs(
+            crate::cgroup::observe(cx.k(), id, name)
+                .unwrap_or_else(|| Rc::new(std::cell::Cell::new(1))),
+        )),
+        PseudoNode::Sys(_)
+        | PseudoNode::SysCpu(..)
+        | PseudoNode::SysNet(..)
+        | PseudoNode::SysBlock(..) => Some(crate::fd::ProcEvent::kernfs(Rc::new(
+            std::cell::Cell::new(1),
+        ))),
+        _ => None,
+    };
     Ok(FileKind::Proc {
         mnt,
         node,
@@ -892,6 +911,7 @@ fn open_pseudo(
         mm,
         ns,
         klog,
+        event,
         opener: Rc::new(cred.clone()),
     })
 }
@@ -3945,9 +3965,20 @@ fn refresh_pseudo(cx: &mut Cx<'_>, file: &FileRef, offset: Option<u64>) -> Resul
                 ns: None,
                 klog: None,
                 opener,
+                event,
                 ..
             } if pos == 0 && !pseudo::unreadable(node) => {
-                if std::mem::take(fresh) {
+                // Reading a kernfs file from the start takes in its changes so far
+                // (kernfs_seq_show; mounts and mountinfo take them in as poll reports them);
+                // contents generated before a change are made again
+                let current = event.as_ref().is_none_or(|e| {
+                    let now = e.counter.get();
+                    if !e.mounts {
+                        e.seen.set(now);
+                    }
+                    e.generated.replace(now) == now
+                });
+                if std::mem::take(fresh) && current {
                     return Ok(());
                 }
                 (*mnt, node.clone(), opener.clone())
@@ -4108,6 +4139,12 @@ pub(super) fn write_bytes(
                 if let PseudoNode::Cgroup(_, b"memory.max") = node {
                     cx.k().oom.recheck();
                     crate::kernel::signal_later(&cx.shared.timers);
+                }
+                // A write is IN_MODIFY (fsnotify_modify); of the synthetic files only cgroup2's
+                // can be watched
+                if let PseudoNode::Cgroup(id, name) = node {
+                    let key = crate::cgroup::key(id, name);
+                    super::kernfs_modified(cx.kr(), key, crate::cgroup::key(id, b""), name);
                 }
             }
             let ino = match file.borrow().kind {

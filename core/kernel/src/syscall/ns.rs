@@ -513,6 +513,7 @@ pub(super) fn ioctl(
             ns: Some(related),
             klog: None,
             opener: Rc::new(cx.cred()),
+            event: None,
         },
         crate::fd::oflags::O_RDONLY,
         Some(Rc::from(name.into_bytes())),

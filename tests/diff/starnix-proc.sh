@@ -7,9 +7,8 @@
 # kernel/procfs: no change notifications (polling cgroup.events never wakes, so the test hangs);
 # writes through a removed cgroup's open files give the wrong result; fidelity gaps: chown
 # delegation of cgroups is impossible and cgroup directories are always 0755
-SKIP="CgroupTest.PollEvents:CgroupTest.WriteToInterfaceFileAfterCgroupIsDeleted"
+SKIP="CgroupTest.WriteToInterfaceFileAfterCgroupIsDeleted"
 SKIP="$SKIP:CgroupTest.ChownDirectoryDoesNotPropagate:CgroupTest.NewDirectoryOwnedByCreator"
-SKIP="$SKIP:CgroupTest.MkdirWithPermissions"
 # kernel/procfs: /proc/zoneinfo, /proc/pressure/* and /proc/kallsyms are absent; per-process
 # timerslack_ns is absent; Yama is absent; no tracefs
 SKIP="$SKIP:ProcfsTest.ZoneInfo:PressureTest/*:ProcKallsymsTest.*:ProcTaskDirTest.TimerslackNs*"
