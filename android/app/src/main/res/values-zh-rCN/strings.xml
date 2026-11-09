@@ -31,6 +31,10 @@
     <string name="shortcuts_tabs">标签页</string>
     <string name="tab_ended">%1$s（已结束）</string>
     <string name="tab_description">标签页 %1$d：%2$s</string>
+    <string name="tab_number">标签页 %1$d</string>
+    <string name="channel_terminal">程序的响铃和通知</string>
+    <string name="bell_rang">终端响铃了</string>
+    <string name="program_copied">程序把文本复制到了剪贴板</string>
     <string name="modifier_locked">%1$s 已锁定</string>
     <string name="menu_settings">设置</string>
     <string name="settings">设置</string>

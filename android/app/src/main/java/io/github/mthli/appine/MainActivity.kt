@@ -58,6 +58,12 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** [current]'s position when the tabs were last shown, where its successor is taken from. */
     private var currentIndex = 0
 
+    /**
+     * The tab a notification asked to show ([EXTRA_TAB], a [VtSession.id]), -1 for none; shown
+     * once the service is bound and the kernel ready ([showRequestedTab]).
+     */
+    private var requestedTab = -1
+
     private var fontSize = 0
 
     /** The last toast ([showToast]), cancelled by the next. */
@@ -141,6 +147,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
         fontSize = getPreferences(MODE_PRIVATE).getInt(PREF_FONT_SIZE, dp(12))
         screen = VtView(this, Host()).apply {
             setFontSize(fontSize.toFloat())
@@ -193,6 +200,14 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
+    /** A notification of a tab was tapped while this activity exists (it is `singleTask`). */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
+        showRequestedTab()
+    }
+
     override fun onStart() {
         super.onStart()
         // Settings may have changed it while this activity was stopped
@@ -233,6 +248,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         status.visibility = View.GONE
         screen.visibility = View.VISIBLE
+        if (showRequestedTab()) return
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
@@ -258,6 +274,9 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         renderTabs()
     }
+
+    /** The program in the tab shown rang the bell (the service sends only those). */
+    override fun onBell() = screen.bell()
 
     /** Settings changed while this activity is visible too (split screen). */
     override fun onSettingsChanged() {
@@ -293,6 +312,19 @@ class MainActivity : Activity(), TerminalService.Listener {
         val s = service ?: return
         if (s.machine == 0L) return
         show(s.createSession())
+    }
+
+    /**
+     * Shows the tab a notification named ([requestedTab]) once the kernel is ready; false when
+     * there is none, or it has closed.
+     */
+    private fun showRequestedTab(): Boolean {
+        val s = service ?: return false
+        if (requestedTab < 0 || s.machine == 0L) return false
+        val session = s.sessions.firstOrNull { it.id == requestedTab }
+        requestedTab = -1
+        session?.let(::show)
+        return session != null
     }
 
     private fun show(session: VtSession) {
@@ -549,6 +581,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     private fun themeColor(attr: Int) = MaterialColors.getColor(this, attr, Color.WHITE)
 
     companion object {
+        /** A [VtSession.id]: the tab to show (a tab's notification, from the service). */
+        const val EXTRA_TAB = "tab"
         private const val PREF_FONT_SIZE = "font_size"
     }
 }

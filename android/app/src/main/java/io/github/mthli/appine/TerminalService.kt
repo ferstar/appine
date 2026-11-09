@@ -66,6 +66,9 @@ class TerminalService : Service() {
         /** The session list, a title or a state changed. */
         fun onSessionsChanged() {}
 
+        /** A program rang the bell in the tab in front ([inFront]). */
+        fun onBell() {}
+
         /**
          * State shown in Settings changed: the download progress of a distro switch ([switching]),
          * the mirror.
@@ -257,6 +260,15 @@ class TerminalService : Service() {
     private var killNotifications = (System.currentTimeMillis() % KILL_NOTIFICATION_COUNT).toInt()
 
     /**
+     * The next tab's [VtSession.id], counting up from the clock, so a notification still shown
+     * from an earlier service does not open a new tab with its number.
+     */
+    private var nextSessionId = (System.currentTimeMillis() % TAB_NOTIFICATION_COUNT).toInt()
+
+    /** When each tab's bell last posted a notification ([notifyTab]). */
+    private val bellNotified = HashMap<VtSession, Long>()
+
+    /**
      * The hold of the kernel lock last notified ([reportStall]): the kernel it was in, its id, and
      * whether it had ended.
      */
@@ -300,8 +312,15 @@ class TerminalService : Service() {
     internal var focus: VtSession? = null
         private set
 
-    /** The tab the Activity is showing (saving tabs records which one it is). */
+    /**
+     * The tab the Activity is showing (saving tabs records which one it is); showing a tab takes
+     * away its notification ([notifyTab]).
+     */
     internal var current: VtSession? = null
+        set(value) {
+            field = value
+            value?.let(::cancelTabNotification)
+        }
 
     /**
      * What the sessions report (title changes, ends) goes to the current Activity (if any); their
@@ -310,6 +329,37 @@ class TerminalService : Service() {
     private val sessionEvents = object : VtSession.Events {
         override fun onTitleChanged(session: VtSession) {
             each { it.onSessionsChanged() }
+        }
+
+        override fun onBell(session: VtSession) {
+            if (inFront(session)) {
+                each { it.onBell() }
+                return
+            }
+            val now = System.currentTimeMillis()
+            if (now - (bellNotified[session] ?: 0) < BELL_NOTIFY_MS) return
+            bellNotified[session] = now
+            notifyTab(session, "", getString(R.string.bell_rang), quiet = true)
+        }
+
+        /**
+         * Programs write the clipboard as Ghostty lets them (clipboard-write = allow), from any
+         * tab; Android 13 and later show the copy themselves.
+         */
+        override fun onClipboard(session: VtSession, text: String?) {
+            val clipboard = getSystemService(ClipboardManager::class.java)
+            if (text == null) {
+                clipboard.clearPrimaryClip()
+                return
+            }
+            clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), text))
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                Toast.makeText(this@TerminalService, R.string.program_copied, Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        override fun onNotification(session: VtSession, title: String, body: String) {
+            if (!inFront(session)) notifyTab(session, title, body, quiet = false)
         }
 
         override fun onFinished(session: VtSession) {
@@ -390,8 +440,11 @@ class TerminalService : Service() {
         val problems = NotificationChannel(
             PROBLEMS_CHANNEL_ID, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
         )
+        val terminal = NotificationChannel(
+            TERMINAL_CHANNEL_ID, getString(R.string.channel_terminal), NotificationManager.IMPORTANCE_DEFAULT,
+        )
         getSystemService(NotificationManager::class.java)
-            .createNotificationChannels(listOf(channel, services, problems))
+            .createNotificationChannels(listOf(channel, services, problems, terminal))
     }
 
     /**
@@ -697,7 +750,7 @@ class TerminalService : Service() {
      */
     internal fun createSession(account: String = login, cwd: String? = null): VtSession {
         val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
-        val session = VtSession(pty, machine, sessionEvents)
+        val session = VtSession(nextSessionId++, pty, machine, sessionEvents)
         sessions.add(session)
         sessionsChanged()
         return session
@@ -708,7 +761,47 @@ class TerminalService : Service() {
         session.release()
         sessions.remove(session)
         unshown.remove(session)
+        cancelTabNotification(session)
         sessionsChanged()
+    }
+
+    /**
+     * Whether [session] is the tab in front of the user: the terminal Activity shows it while
+     * visible (not another tab, and not Settings in front of the terminal).
+     */
+    private fun inFront(session: VtSession) = session === current && listeners.any { it is MainActivity }
+
+    /**
+     * A program in [session], not the tab in front, asked for attention (a bell, OSC 9, OSC 777):
+     * one notification per tab, replaced by the tab's next one and taken away when the tab is
+     * shown, opening that tab. It is titled [title], or else the tab's title; a [quiet] one (the
+     * bell) alerts only when the tab's notification is not showing already.
+     */
+    private fun notifyTab(session: VtSession, title: String, text: String, quiet: Boolean) {
+        val number = sessions.indexOf(session) + 1
+        if (number == 0) return
+        val id = TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT
+        val open = Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, session.id)
+        val pending = PendingIntent.getActivity(
+            this, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = Notification.Builder(this, TERMINAL_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title.ifEmpty { session.title?.takeIf { it.isNotBlank() } ?: "sh" })
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setSubText(getString(R.string.tab_number, number))
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(quiet)
+            .build()
+        getSystemService(NotificationManager::class.java).notify(id, notification)
+    }
+
+    private fun cancelTabNotification(session: VtSession) {
+        bellNotified.remove(session)
+        getSystemService(NotificationManager::class.java)
+            .cancel(TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT)
     }
 
     private fun sessionsChanged() {
@@ -832,9 +925,8 @@ class TerminalService : Service() {
         }
         val session = sessions.firstOrNull { it.console == console && console >= 0 }
         val shown = session?.showMessage("[appine] $text") == true
-        // Enough only when that tab is the one in front of the user: not another tab, and not
-        // Settings in front of the terminal
-        if (shown && session === current && listeners.any { it is MainActivity } && !bug) return
+        // Enough only when that tab is the one in front of the user
+        if (shown && inFront(session) && !bug) return
         val id = KILL_NOTIFICATION_BASE + killNotifications++ % KILL_NOTIFICATION_COUNT
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
@@ -1255,7 +1347,10 @@ class TerminalService : Service() {
         updateWakeLock()
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
-        for (s in sessions) s.release()
+        for (s in sessions) {
+            s.release()
+            cancelTabNotification(s)
+        }
         sessions.clear()
         unshown.clear()
         sessionsChanged()
@@ -1272,7 +1367,10 @@ class TerminalService : Service() {
         // here
         if (restore == null) Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        for (s in sessions) s.release()
+        for (s in sessions) {
+            s.release()
+            cancelTabNotification(s)
+        }
         sessions.clear()
         val m = machine
         machine = 0
@@ -1306,6 +1404,7 @@ class TerminalService : Service() {
         private const val CHANNEL_ID = "sessions"
         private const val NETWORK_CHANNEL_ID = "network"
         private const val PROBLEMS_CHANNEL_ID = "problems"
+        private const val TERMINAL_CHANNEL_ID = "terminal"
         /** The boot failure notification. */
         private const val BOOT_NOTIFICATION_ID = 2
         /** The notification that the last run ended in a crash or ANR of Appine. */
@@ -1318,6 +1417,11 @@ class TerminalService : Service() {
          */
         private const val KILL_NOTIFICATION_BASE = 100_000
         private const val KILL_NOTIFICATION_COUNT = 100_000
+        /** Notifications for tabs ([notifyTab]), one per tab, above the kill reports' ids. */
+        private const val TAB_NOTIFICATION_BASE = 200_000
+        private const val TAB_NOTIFICATION_COUNT = 100_000
+        /** A tab's bell posts at most one notification per this long. */
+        private const val BELL_NOTIFY_MS = 1_000L
         private const val NOTIFICATION_ID = 1
         /** Listen notifications are numbered by port: 1000 + port, below [KILL_NOTIFICATION_BASE]. */
         private const val LISTEN_NOTIFICATION_BASE = 1000

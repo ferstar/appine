@@ -158,9 +158,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var cursorColor = 0
     private var cursorShown = false
     private var cursorStyle = 1
+    private var cursorBlinking = false
     private var cursorX = 0
     private var cursorY = 0
     private var atBottom = true
+
+    /** A blinking cursor ([updateBlink]): whether the timer runs, and the phase it is in. */
+    private var blinkRunning = false
+    private var blinkOn = true
+    private val blinkTick = object : Runnable {
+        override fun run() {
+            blinkOn = !blinkOn
+            invalidate()
+            postDelayed(this, BLINK_MS)
+        }
+    }
+
+    /** When the bell last vibrated ([bell]). */
+    private var lastBell = 0L
 
     // The scrollable area (scrollback and screen) in rows, the viewport's first row in it and the
     // rows it shows, for the scroll bar
@@ -343,6 +358,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
+    /**
+     * A program in the tab shown rang the bell: a short vibration (the system's reject pattern,
+     * subject to its touch feedback setting), at most one per [BELL_MS], so a shell's completion
+     * beeps or a flood of BELs do not buzz on.
+     */
+    fun bell() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastBell < BELL_MS) return
+        lastBell = now
+        performHapticFeedback(HapticFeedbackConstants.REJECT)
+    }
+
     // ---- Metrics and the grid ----
 
     /**
@@ -461,6 +488,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val oldCursorY = cursorY
         cursorShown = b.get(5).toInt() != 0
         cursorStyle = b.get(6).toInt()
+        cursorBlinking = b.get(7).toInt() != 0
         cursorX = b.getShort(8).toInt() and 0xffff
         cursorY = b.getShort(10).toInt() and 0xffff
         val newFg = b.getInt(12)
@@ -483,6 +511,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollOffset = b.getInt(40)
         scrollLen = b.getInt(44)
         if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
+        updateBlink()
+        if (cursorX != oldCursorX || cursorY != oldCursorY) restartBlink()
         if (newFg != defaultFg || newBg != defaultBg) {
             // Rows that did not change still have the old default colours
             defaultFg = newFg
@@ -737,6 +767,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     private fun drawCursor(c: Canvas) {
         if (tab == 0L || !cursorShown || cursorX >= cols || cursorY >= rows) return
+        if (blinkRunning && !blinkOn) return
         val i = cursorY * cols + cursorX
         val span = if ((attrs[i] shr 12) and 3 == WIDE) 2 else 1
         val l = cursorX * cellWidth
@@ -759,6 +790,36 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
             }
         }
+    }
+
+    /**
+     * Blinks the cursor every [BLINK_MS] (as Android's text fields do) while the program asks for
+     * a blinking one (DECSCUSR, mode 12) and the view has the keyboard focus in a focused window;
+     * otherwise no timer runs and the cursor stays shown (hollow without the focus).
+     */
+    private fun updateBlink() {
+        val blinking = cursorBlinking && cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
+        if (blinking == blinkRunning) return
+        blinkRunning = blinking
+        removeCallbacks(blinkTick)
+        if (blinking) {
+            blinkOn = true
+            postDelayed(blinkTick, BLINK_MS)
+        } else if (!blinkOn) {
+            blinkOn = true
+            invalidate()
+        }
+    }
+
+    /** Input or a moved cursor shows a blinking cursor again for a whole period. */
+    private fun restartBlink() {
+        if (!blinkRunning) return
+        removeCallbacks(blinkTick)
+        if (!blinkOn) {
+            blinkOn = true
+            invalidate()
+        }
+        postDelayed(blinkTick, BLINK_MS)
     }
 
     private fun drawPreedit(c: Canvas) {
@@ -897,6 +958,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun send(data: ByteArray?, scrolling: Boolean = false) {
         if (data == null || data.isEmpty()) return
         if (!scrolling) scroller.forceFinished(true)
+        restartBlink()
         if (!atBottom && tab != 0L) {
             VtNative.scroll(tab, 0)
             awakenScrollBars()
@@ -911,7 +973,21 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (!hasWindowFocus) scroller.forceFinished(true)
         // Focus events (mode 1004): editors reload changed files when they regain focus
         if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
+        updateBlink()
         invalidate()
+    }
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        updateBlink()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // Still counted as attached during this call
+        blinkRunning = false
+        blinkOn = true
+        removeCallbacks(blinkTick)
     }
 
     override fun onCheckIsTextEditor() = true
@@ -1593,6 +1669,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** Rows per mouse wheel notch. */
         const val WHEEL_ROWS = 3
+
+        /** A blinking cursor's half period, as Android's text fields. */
+        const val BLINK_MS = 500L
+
+        /** The shortest time between two vibrations of the bell. */
+        const val BELL_MS = 100L
 
         // How scrolling goes (scrollWay)
         const val WAY_VIEWPORT = 0

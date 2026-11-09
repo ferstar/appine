@@ -33,6 +33,10 @@
     <string name="shortcuts_tabs">Tabs</string>
     <string name="tab_ended">%1$s (ended)</string>
     <string name="tab_description">Tab %1$d: %2$s</string>
+    <string name="tab_number">Tab %1$d</string>
+    <string name="channel_terminal">Bells and notifications from programs</string>
+    <string name="bell_rang">The terminal bell rang</string>
+    <string name="program_copied">A program copied text to the clipboard</string>
     <string name="modifier_locked">%1$s locked</string>
     <string name="menu_settings">Settings</string>
     <string name="settings">Settings</string>

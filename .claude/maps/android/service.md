@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; unimplemented paths in reports; BKL stalls last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; unimplemented paths in reports; BKL stalls; programs' bells, clipboard writes and notifications last)
 
 ## Responsibilities
 
@@ -34,15 +34,17 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 - `TerminalService` — a same-process service; `LocalBinder` hands activities a direct reference.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onMachineReady(error)`,
-  `onProgress`, `onSessionsChanged`, `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`
-  (sessions redraw their view themselves).
+  `onProgress`, `onSessionsChanged`, `onBell` (the tab in front), `onExitAll`, `onRestarting`,
+  `onSettingsChanged`, `onNotice` (sessions redraw their view themselves).
   Activities register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least
   one listener (Settings included).
 - `worker` — a single-thread executor (`appine-worker`) that serialises native calls taking the
   BKL: poll, shutdown, stop, trim, routes, `consoleCwd`.
 - Session state (internal): `sessions`, `unshown` (restored tabs not yet displayed), `restore`
-  (saved tabs from a killed run), `ended` (why that run ended), `focus`, `current`;
-  `sessionEvents` (title changed, finished).
+  (saved tabs from a killed run), `ended` (why that run ended), `focus`, `current` (setting it
+  takes the tab's notification away), `nextSessionId` (counting up from the clock),
+  `bellNotified` (when each tab's bell last notified); `sessionEvents` (title changed, bell,
+  clipboard write, notification, finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a restart).
@@ -134,9 +136,16 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 
 ### Sessions, saving and restore
 
-- `createSession(login, cwd)` builds a `ConsolePty` and a `VtSession`; the shell starts when a
-  view first knows its size. Sessions report title changes and ends, which become
-  `onSessionsChanged`. `removeSession` releases the session.
+- `createSession(login, cwd)` builds a `ConsolePty` and a `VtSession` with the next id; the shell
+  starts when a view first knows its size. Sessions report title changes and ends, which become
+  `onSessionsChanged`. `removeSession` releases the session and takes its notification away, as
+  `detach` and `onDestroy` do for every tab.
+- What programs ask of the app (`android/terminal`): a bell in the tab in front (`inFront`: it is
+  `current` and the terminal Activity is a listener, so not another tab and not Settings in
+  front) goes to the listeners' `onBell`; elsewhere it becomes the tab's notification, at most
+  once a second per tab. An OSC 9 or OSC 777 notification becomes the tab's notification unless
+  the tab is in front. A clipboard write sets the clipboard from any tab (labelled Appine), or
+  clears it; before Android 13, which shows copies itself, a toast says a program copied text.
 - Saving (`saveTabs`): for running sessions only, the login setting and the transcript
   (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread and the foreground
   group's cwd (`consoleCwd` of the session's console) on the worker, where an `auto` login is saved
@@ -174,6 +183,11 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   crashed" or "Appine stopped responding" with "copy report": the bug report's app, device, distro
   and tier lines and one line with the pid, the kind (with the signal for a native crash), the time
   in UTC and, for an ANR, Android's description.
+- Tab notifications (`notifyTab`): one per tab on the `terminal` channel, replaced by the tab's
+  next one: titled with OSC 777's title, else the program's title (`sh` when none), with the
+  body (or "The terminal bell rang") and "Tab N" as subtext; a bell's alerts only when the tab's
+  notification is not showing already (`setOnlyAlertOnce`). Tapping one opens the activity on
+  that tab (`EXTRA_TAB` with the session id); showing the tab or closing it takes it away.
 - Too-long holds of the BKL (`kernel/process`'s watchdog): a new stall of the current kernel posts
   "Appine's kernel is stuck" with the seconds so far and "copy report" (the watchdog's report line);
   once it has ended, a notification still showing becomes "was stuck" with the total seconds and
@@ -181,9 +195,10 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot.
 - Listens: the first listen on a non-loopback address per (guest port, host port) pair and kernel
   (the kernel queues at most 32), with remap text when the ports differ.
-- Channels: `sessions` (low), `network`, `problems`; ids 1 (ongoing), 2 (boot), 3 (a crash of the
-  last run), 4 (a BKL stall), 1000 + guest port (listen), and from 100000 one id per kill report, counting up from
-  a clock-seeded start (wrapping after 100000).
+- Channels: `sessions` (low), `network`, `problems`, `terminal`; ids 1 (ongoing), 2 (boot), 3 (a
+  crash of the last run), 4 (a BKL stall), 1000 + guest port (listen), from 100000 one id per kill
+  report, counting up from a clock-seeded start (wrapping after 100000), and from 200000 one per
+  tab (its id, wrapping after 100000).
 - The ongoing notification counts running tabs; "Running in the background" when none runs, and
   "Cannot start: …" after a failed start.
 

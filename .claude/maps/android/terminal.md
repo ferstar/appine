@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles; panics caught in VtNative; kill reports last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles; panics caught in VtNative; kill reports; bell, OSC 52, notifications, cursor blink last)
 
 ## Responsibilities
 
@@ -61,14 +61,17 @@ libghostty-vt with Zig (`android/native`).
 
 ### The terminal
 
-- `VtSession` — a tab owned by the service: its `ConsolePty`, the terminal handle (0 until the
-  shell starts), the view showing it (`view`, read on the pump thread), pending restored text and
-  messages, a `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer`
-  executor; `Events` (title changed, finished) go to the service.
+- `VtSession` — a tab owned by the service: its `id` (from the service, naming the tab in a
+  notification's intent), its `ConsolePty`, the terminal handle (0 until the shell starts), the
+  view showing it (`view`, read on the pump thread), pending restored text and messages, a
+  `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer` executor; `Events`
+  (title changed, bell, clipboard write, notification, finished) go to the service on the main
+  thread.
 - `VtView` — the view: the attached `VtSession`, cell metrics, a mirror of the screen (codepoint,
   colours, attributes, grapheme clusters per cell, each row's selected columns), a backing bitmap
   of the grid, the modes, scroll position and selection bounds of the last frame, the IME
-  connection, gestures and the fling's `OverScroller`, selection handles and the floating menu.
+  connection, gestures and the fling's `OverScroller`, selection handles and the floating menu,
+  the cursor's blink timer and the bell's last vibration.
   `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift`
   and `modifiersUsed`, and `onLink` (opens a link in another app).
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
@@ -78,18 +81,21 @@ libghostty-vt with Zig (`android/native`).
 - In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
   flag) in a table `TABS` keyed by handles from 1, never reused. In `vt.c`: `AppineVt` (the
   terminal, its render state, key and mouse encoders, reply, frame and copy buffers, the
-  synchronized-output hold, and the tracked anchor of a selection drag).
+  synchronized-output hold, the tracked anchor of a selection drag, and the effects since they
+  were last taken: bells, the last clipboard write, the last notification; `AppineVtEffects` is
+  how they are handed out, laid out as vt.rs's `RawEffects`).
 
 ## Public entry points
 
 - Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
-  most configuration changes itself, the dark mode included); listener callbacks `onMachineReady`, `onProgress`, `onSessionsChanged`,
-  `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`.
+  most configuration changes itself, the dark mode included), started with `EXTRA_TAB` (a
+  `VtSession.id`) by a tab's notification; listener callbacks `onMachineReady`, `onProgress`,
+  `onSessionsChanged`, `onBell`, `onExitAll`, `onRestarting`, `onSettingsChanged`, `onNotice`.
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `destroy`, `pump`, `frame`, `resize`, `scroll`, `key`,
   `paste`, `mouse`, `focus`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`,
-  `copy`, `link`, `title`, `message`, `transcript`, `print`; `pump` calls `VtSession.onOutput` and
-  `onTitle` back.
+  `copy`, `link`, `title`, `message`, `transcript`, `print`; `pump` calls `VtSession.onOutput`,
+  `onTitle`, `onBell`, `onClipboard` and `onNotification` back.
 
 ## Data flow / lifecycle
 
@@ -154,6 +160,10 @@ libghostty-vt with Zig (`android/native`).
   last one.
 - Showing a tab attaches it to the view (`VtView.attach`); `onRestarting` and `onDestroy` detach
   it, so sessions never keep a destroyed Activity's view.
+- A tab's notification (a bell, OSC 9 or OSC 777 while the tab was not in front,
+  android/service) opens the activity with `EXTRA_TAB`, from `onCreate` or `onNewIntent`: the tab
+  with that id is shown once the service is bound and the kernel ready, in place of the usual
+  choice; a tab closed meanwhile leaves the usual one.
 
 ### Input and display
 
@@ -218,6 +228,16 @@ libghostty-vt with Zig (`android/native`).
   again, calls `VtSession.onOutput` only when it sets `dirty` (so a burst asks for one frame, and
   nothing is asked while no view takes frames) and `onTitle` after OSC 0/2. It runs whether or not
   a view shows the tab.
+- What programs ask of the app is taken after each read (`appine_vt_take_effects`) and handed to
+  the session, which posts it to the service: the bell (any number of BELs in a read counts once);
+  a clipboard write (OSC 52, OSC 1337, OSC 5522, to any location, as Ghostty's
+  `clipboard-write = allow`): its `text/plain` representation up to 256 KiB (larger is denied,
+  other types unsupported), or a request to clear; a notification (OSC 9's body, OSC 777's title
+  and body, up to 4 KiB each; only the last of a read). Clipboard reads (OSC 52 `?`) have no
+  callback and go unanswered, as with `clipboard-read = deny`. What the app prints itself
+  (`VtNative.print`) asks nothing: its effects are dropped. Where they go is the service's choice
+  (android/service): the bell of the tab in front vibrates through `VtView.bell`, other bells and
+  notifications become the tab's notification, and clipboard writes always reach the clipboard.
 - The waiter waits for the shell, gives the pump up to 0.5 s to take the last output, then on the
   main thread closes the console (once) and prints "[Process completed (code N | signal N) - press
   Enter]". Enter from a key or the IME then closes the tab (`Host.onInput`).
@@ -264,6 +284,12 @@ libghostty-vt with Zig (`android/native`).
 - The cursor (bar, block with the glyph redrawn in the background colour, underline, hollow; hollow
   when unfocused), the IME's composing text (shifted left at the right edge) and the theme's text
   selection handles are drawn over the bitmap each draw.
+- The cursor blinks (shown and hidden every 500 ms, as Android's text fields) while the frame
+  header says the program asked for blinking (DECSCUSR, mode 12; libghostty-vt's default is off)
+  and the view has the focus in a focused window; otherwise no timer runs. Input and a cursor
+  move show it again for a whole period.
+- The bell of the tab shown vibrates once through `performHapticFeedback(REJECT)` (a double
+  click, subject to the system's touch feedback setting), at most once per 100 ms.
 
 #### Input
 
@@ -470,6 +496,11 @@ libghostty-vt with Zig (`android/native`).
   consoles) before shutting the kernel down, so the pump's read returns first.
 - A `VtSession` closes its console exactly once (`hangUp`), so a later close cannot hang up a tab
   that reused the number.
+- The pump stays in native code for the tab's whole life, so JNI local references it makes for
+  each event (the clipboard text, a notification's strings) must be deleted after the call, or
+  they pile up in its frame.
+- `AppineVtEffects` (vt.c) and `RawEffects` (vt.rs) are one layout and change together, as the
+  frame format does.
 - libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock; the frame buffer is
   written only by `frame`, which only the main thread calls, so the main thread reads it after the
   lock is released.
@@ -520,15 +551,14 @@ libghostty-vt with Zig (`android/native`).
 
 ## Confirmed bugs / technical debt
 
-- **The terminal lacks** the bell and triple-tap (line) or rectangular selection. libghostty-vt has the two selections (`ghostty_terminal_select_line`, a
-  selection's `rectangle` flag).
-- **libghostty-vt features not wired**: no callbacks for OSC 52 clipboard writes, OSC 9/777
-  notifications, OSC 9;4 progress, OSC 7501 program status, OSC 7 working directories or OSC 133
-  prompts (the last two also need shell integration, which Ghostty ships for bash, zsh, fish,
-  elvish and nushell but not ash, and Appine installs none); no search; no scrollback compression
-  (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
-  libghostty-vt snapshots; no terminfo name is set, so XTGETTCAP `TN` goes unanswered; and
-  `VtView` ignores the frame header's `cursor_blinking`, so the cursor never blinks.
+- **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
+  (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
+- **libghostty-vt features not wired**: no callbacks for OSC 9;4 progress, OSC 7501 program
+  status, OSC 7 working directories or OSC 133 prompts (the last two also need shell integration,
+  which Ghostty ships for bash, zsh, fish, elvish and nushell but not ash, and Appine installs
+  none); no search; no scrollback compression (`TerminalService.trimMemory` trims only the
+  kernel); tabs are restored from plain text, not libghostty-vt snapshots; no terminfo name is
+  set, so XTGETTCAP `TN` goes unanswered.
 - **More of libghostty-vt left unused**:
   - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`,
     `select_output` (needs OSC 133), and the selection gesture state machine (click counts to
@@ -572,6 +602,10 @@ libghostty-vt with Zig (`android/native`).
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English. Flings and the scroll bar were tried there with adb swipes only (viewport and
   alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger.
+- The bell's vibration on real devices and with haptics turned off; the copy toast Android 12
+  and earlier get for a program's clipboard write (only tried on API 34, where the system shows
+  its own); how tab notifications look and alert outside an API 34 emulator (there Android
+  bundled them with the ongoing notification, so the first tap expands the bundle).
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
   `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
   also after a full reset and on the alternate screen, was checked on a macOS build of

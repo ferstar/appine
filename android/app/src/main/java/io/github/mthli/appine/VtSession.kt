@@ -19,6 +19,8 @@ import kotlin.concurrent.thread
  * service's worker.
  */
 internal class VtSession(
+    /** Names the tab in a notification's intent (from the service, never reused in a run). */
+    val id: Int,
     private val pty: ConsolePty,
     private val machine: Long,
     private val events: Events,
@@ -27,6 +29,15 @@ internal class VtSession(
     /** What the service hears about (main thread). */
     interface Events {
         fun onTitleChanged(session: VtSession)
+
+        /** A program rang the bell (BEL); several in one read of the console count once. */
+        fun onBell(session: VtSession)
+
+        /** A program wrote the clipboard (OSC 52): [text], or null to clear it. */
+        fun onClipboard(session: VtSession, text: String?)
+
+        /** A program asked for a notification (OSC 9 body, OSC 777 title and body). */
+        fun onNotification(session: VtSession, title: String, body: String)
 
         fun onFinished(session: VtSession)
     }
@@ -179,6 +190,24 @@ internal class VtSession(
     @Suppress("unused")
     fun onTitle() {
         main.post { if (!released) events.onTitleChanged(this) }
+    }
+
+    /** From vt.rs, on the pump thread: a program rang the bell. */
+    @Suppress("unused")
+    fun onBell() {
+        main.post { if (!released) events.onBell(this) }
+    }
+
+    /** From vt.rs, on the pump thread: a program wrote the clipboard (null clears it). */
+    @Suppress("unused")
+    fun onClipboard(text: String?) {
+        main.post { if (!released) events.onClipboard(this, text) }
+    }
+
+    /** From vt.rs, on the pump thread: a program asked for a notification. */
+    @Suppress("unused")
+    fun onNotification(title: String, body: String) {
+        main.post { if (!released) events.onNotification(this, title, body) }
     }
 
     /** The grid changed: the terminal reflows and the console's foreground group gets SIGWINCH. */

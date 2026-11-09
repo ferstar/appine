@@ -78,6 +78,13 @@
 // ends its hold cannot freeze the tab
 #define HOLD_LIMIT_NS (1000LL * 1000 * 1000)
 
+// The largest clipboard write (OSC 52) taken: Android's clipboard goes through a binder
+// transaction, which fails beyond about 1 MB (the text is sent as UTF-16)
+#define CLIPBOARD_MAX ((size_t)256 * 1024)
+
+// What a notification (OSC 9, OSC 777) keeps of its title and body
+#define NOTIFICATION_MAX ((size_t)4096)
+
 typedef struct {
   uint8_t *ptr;
   size_t len;
@@ -121,6 +128,23 @@ static int64_t now_ns(void) {
   return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+// What appine_vt_take_effects reports (vt.rs's `Effects` has the same layout)
+#define APPINE_CLIPBOARD_NONE 0
+#define APPINE_CLIPBOARD_TEXT 1
+#define APPINE_CLIPBOARD_CLEAR 2
+
+typedef struct {
+  uint32_t bells;
+  int32_t clipboard;
+  const uint8_t *clip;
+  size_t clip_len;
+  bool notified;
+  const uint8_t *title;
+  size_t title_len;
+  const uint8_t *body;
+  size_t body_len;
+} AppineVtEffects;
+
 typedef struct AppineVt {
   GhosttyTerminal term;
   GhosttyRenderState state;
@@ -147,6 +171,14 @@ typedef struct AppineVt {
   Buf text;
   // A program set the title (OSC 0/2) since appine_vt_take_title_changed
   bool title_changed;
+  // Effects for the app since appine_vt_take_effects: bells rung (BEL), the last clipboard write
+  // (OSC 52: text, or a request to clear), the last notification (OSC 9, OSC 777)
+  uint32_t bells;
+  int clipboard;
+  Buf clip;
+  bool notified;
+  Buf note_title;
+  Buf note_body;
   // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -218,6 +250,65 @@ static void on_title_changed(GhosttyTerminal t, void *userdata) {
   vt->title_changed = true;
 }
 
+static void on_bell(GhosttyTerminal t, void *userdata) {
+  (void)t;
+  AppineVt *vt = userdata;
+  vt->bells++;
+}
+
+static bool keep(Buf *b, GhosttyString s, size_t max) {
+  size_t len = s.len < max ? s.len : max;
+  b->len = 0;
+  if (!buf_reserve(b, len)) return false;
+  memcpy(b->ptr, s.ptr, len);
+  b->len = len;
+  return true;
+}
+
+static bool is_text(GhosttyString mime) {
+  static const char plain[] = "text/plain";
+  return mime.len >= sizeof(plain) - 1 && memcmp(mime.ptr, plain, sizeof(plain) - 1) == 0;
+}
+
+// A program writes the clipboard (OSC 52, OSC 1337, OSC 5522; Ghostty's default
+// clipboard-write = allow). Android has one clipboard, so every location goes there; only text is
+// taken, up to CLIPBOARD_MAX. Reads (OSC 52 "?") have no callback and so go unanswered, as with
+// Ghostty's clipboard-read = deny
+static void on_clipboard_write(GhosttyTerminal t, void *userdata, const GhosttyClipboardWrite *w) {
+  (void)t;
+  AppineVt *vt = userdata;
+  GhosttyClipboardWriteReply reply = {.size = sizeof(reply)};
+  const GhosttyClipboardContent *text = NULL;
+  for (size_t i = 0; i < w->contents_len && text == NULL; i++) {
+    if (is_text(w->contents[i].mime)) text = &w->contents[i];
+  }
+  if (w->contents_len == 0) {
+    vt->clipboard = APPINE_CLIPBOARD_CLEAR;
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+  } else if (text == NULL) {
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+  } else if (text->data.len > CLIPBOARD_MAX) {
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED;
+  } else if (!keep(&vt->clip, text->data, CLIPBOARD_MAX)) {
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR;
+  } else {
+    vt->clipboard = APPINE_CLIPBOARD_TEXT;
+    reply.result = GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+  }
+  w->reply(w, &reply);
+}
+
+// OSC 9 (body only) or OSC 777 notify (title and body)
+static void on_notification(GhosttyTerminal t, void *userdata,
+                            const GhosttyTerminalDesktopNotification *n) {
+  (void)t;
+  AppineVt *vt = userdata;
+  if (keep(&vt->note_title, n->title, NOTIFICATION_MAX) &&
+      keep(&vt->note_body, n->body, NOTIFICATION_MAX)) {
+    vt->notified = true;
+  }
+}
+
 // A hold began: capture the screen now, which is the frame the program wants to keep showing
 static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   AppineVt *vt = userdata;
@@ -268,6 +359,11 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_RENDER_HOLD, (const void *)on_render_hold);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
                        (const void *)on_title_changed);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_BELL, (const void *)on_bell);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+                       (const void *)on_clipboard_write);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
+                       (const void *)on_notification);
   size_t lines = SCROLLBACK_LINES;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
   // Grapheme clustering (mode 2027) by default, as in Ghostty (grapheme-width-method = unicode):
@@ -306,6 +402,9 @@ void appine_vt_free(AppineVt *vt) {
   free(vt->frame.ptr);
   free(vt->extras.ptr);
   free(vt->text.ptr);
+  free(vt->clip.ptr);
+  free(vt->note_title.ptr);
+  free(vt->note_body.ptr);
   free(vt->grapheme);
   free(vt);
 }
@@ -969,13 +1068,30 @@ const uint8_t *appine_vt_link(AppineVt *vt, uint16_t x, uint16_t y, size_t *len)
   return found ? vt->text.ptr : NULL;
 }
 
-// ---- Title, messages, transcript ----
+// ---- Title, effects, messages, transcript ----
 
 // Whether a program set the title since the last call
 bool appine_vt_take_title_changed(AppineVt *vt) {
   bool changed = vt->title_changed;
   vt->title_changed = false;
   return changed;
+}
+
+// The bells, clipboard write and notification since the last call (vt.rs's `Effects`); the
+// text stays valid until the next feed
+void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
+  out->bells = vt->bells;
+  out->clipboard = vt->clipboard;
+  out->clip = vt->clip.ptr;
+  out->clip_len = vt->clipboard == APPINE_CLIPBOARD_TEXT ? vt->clip.len : 0;
+  out->notified = vt->notified;
+  out->title = vt->note_title.ptr;
+  out->title_len = vt->notified ? vt->note_title.len : 0;
+  out->body = vt->note_body.ptr;
+  out->body_len = vt->notified ? vt->note_body.len : 0;
+  vt->bells = 0;
+  vt->clipboard = APPINE_CLIPBOARD_NONE;
+  vt->notified = false;
 }
 
 // The title set by the program (OSC 0/2), empty when none; valid until the next text call

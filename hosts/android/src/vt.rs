@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use appine_kernel::Machine;
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jfloat, jint, jlong, jobject, jstring};
 
 use super::{machine, string, throw};
@@ -37,6 +37,24 @@ use super::{machine, string, throw};
 struct AppineVt {
     _opaque: [u8; 0],
 }
+
+/// What `appine_vt_take_effects` reports (vt.c's `AppineVtEffects`).
+#[repr(C)]
+struct RawEffects {
+    bells: u32,
+    clipboard: i32,
+    clip: *const u8,
+    clip_len: usize,
+    notified: bool,
+    title: *const u8,
+    title_len: usize,
+    body: *const u8,
+    body_len: usize,
+}
+
+/// vt.c's `APPINE_CLIPBOARD_TEXT` and `APPINE_CLIPBOARD_CLEAR`.
+const CLIPBOARD_TEXT: i32 = 1;
+const CLIPBOARD_CLEAR: i32 = 2;
 
 // vt.c
 unsafe extern "C" {
@@ -82,6 +100,7 @@ unsafe extern "C" {
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
+    fn appine_vt_take_effects(vt: *mut AppineVt, out: *mut RawEffects);
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_message(vt: *mut AppineVt, text: *const u8, len: usize) -> bool;
     fn appine_vt_transcript(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -111,6 +130,40 @@ impl Term {
         unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 
+    /// The bells, clipboard write and notification programs sent since the last call.
+    fn take_effects(&mut self) -> Effects {
+        let mut raw = RawEffects {
+            bells: 0,
+            clipboard: 0,
+            clip: std::ptr::null(),
+            clip_len: 0,
+            notified: false,
+            title: std::ptr::null(),
+            title_len: 0,
+            body: std::ptr::null(),
+            body_len: 0,
+        };
+        unsafe { appine_vt_take_effects(self.0, &mut raw) };
+        let text = |p: *const u8, len: usize| {
+            if p.is_null() || len == 0 {
+                return String::new();
+            }
+            // SAFETY: vt.c keeps len bytes at p until the next feed, which needs the lock
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
+        };
+        Effects {
+            bell: raw.bells > 0,
+            clipboard: match raw.clipboard {
+                CLIPBOARD_TEXT => Some(Some(text(raw.clip, raw.clip_len))),
+                CLIPBOARD_CLEAR => Some(None),
+                _ => None,
+            },
+            notification: raw
+                .notified
+                .then(|| (text(raw.title, raw.title_len), text(raw.body, raw.body_len))),
+        }
+    }
+
     /// Text vt.c returned (`len` bytes at `p`, kept until its next text call) as a Java string;
     /// null for a null `p`. Called with the lock held.
     fn text(&self, env: &mut JNIEnv<'_>, p: *const u8, len: usize) -> jstring {
@@ -127,6 +180,52 @@ impl Term {
 impl Drop for Term {
     fn drop(&mut self) {
         unsafe { appine_vt_free(self.0) };
+    }
+}
+
+/// What programs asked of the app in one read of the console: the bell (any number of BELs
+/// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body).
+struct Effects {
+    bell: bool,
+    clipboard: Option<Option<String>>,
+    notification: Option<(String, String)>,
+}
+
+impl Effects {
+    /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`); false
+    /// when a call threw. The strings are local references, deleted after each call: the pump
+    /// stays in native code for the tab's whole life, so they would otherwise pile up.
+    fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
+        if self.bell && env.call_method(session, "onBell", "()V", &[]).is_err() {
+            return false;
+        }
+        if let Some(clip) = self.clipboard {
+            let text = match clip.map(|t| env.new_string(t)) {
+                Some(Ok(s)) => JObject::from(s),
+                Some(Err(_)) => return false,
+                None => JObject::null(),
+            };
+            let sig = "(Ljava/lang/String;)V";
+            let called = env.call_method(session, "onClipboard", sig, &[JValue::Object(&text)]);
+            let _ = env.delete_local_ref(text);
+            if called.is_err() {
+                return false;
+            }
+        }
+        if let Some((title, body)) = self.notification {
+            let (Ok(title), Ok(body)) = (env.new_string(title), env.new_string(body)) else {
+                return false;
+            };
+            let sig = "(Ljava/lang/String;Ljava/lang/String;)V";
+            let args = [JValue::Object(&title), JValue::Object(&body)];
+            let called = env.call_method(session, "onNotification", sig, &args);
+            let _ = env.delete_local_ref(title);
+            let _ = env.delete_local_ref(body);
+            if called.is_err() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -217,13 +316,17 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
         let Ok(data) = env.convert_byte_array(&data) else {
             return;
         };
-        tab.term().feed(&data);
+        let mut term = tab.term();
+        term.feed(&data);
+        // The app's own text asks nothing of it
+        term.take_effects();
     })
 }
 
 /// Moves the console's output into the terminal until the session ends or the console is closed;
-/// calls `session.onOutput()` whenever the screen changed after the last frame was taken, and
-/// `session.onTitle()` when a program set the title.
+/// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
+/// `session.onTitle()` when a program set the title, and `onBell`, `onClipboard` and
+/// `onNotification` for what programs asked of the app ([`Effects`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     mut env: JNIEnv<'l>,
@@ -241,10 +344,11 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let (replies, titled) = {
+            let (replies, titled, effects) = {
                 let mut term = tab.term();
                 let replies = term.feed(&buf[..n]);
-                (replies, unsafe { appine_vt_take_title_changed(term.0) })
+                let titled = unsafe { appine_vt_take_title_changed(term.0) };
+                (replies, titled, term.take_effects())
             };
             // A program waiting for an answer (DA, DSR) does not read further until it comes
             if !replies.is_empty() && !tab.write(&m, &replies) {
@@ -255,6 +359,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
             let output = !tab.dirty.swap(true, Ordering::AcqRel);
             if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
                 || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
+                || !effects.deliver(&mut env, &session)
             {
                 let _ = env.exception_clear();
                 break;
