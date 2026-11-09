@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries, page reads and node sweeps last)
 
 ## Responsibilities
 
@@ -158,9 +158,16 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `Exit`, still under the BKL, the last thread using its fd table flushes the FUSE files in it
   (`kernel/fuse`) before `task::exit` drops the table.
 - Each syscall gets a fresh FUSE token, and a handler failing with the internal `FUSE_RETRY` (a
-  walk needed a FUSE daemon's reply) makes the dispatcher ask for it with the BKL released and run
-  the handler again from the start, at most 16384 times (then `EIO`); ptrace's entry and exit
-  stops and seccomp see one syscall.
+  walk needed a FUSE daemon's reply, or a copy met a page of a FUSE mapping not yet read,
+  `kernel/mm`'s `Fill`) makes the dispatcher ask for it with the BKL released and run the handler
+  again from the start, at most 16384 times (then `EIO`); a page that cannot be read ends the
+  syscall with `EFAULT` (`ERESTARTSYS` when a signal took the read back). Before the handler, the
+  buffers of read, write, pread64, pwrite64 and the vector forms are read into FUSE mappings
+  (`kernel/fuse`'s `prefault`), since those consume input before copying. ptrace's entry and exit
+  stops and seccomp see one syscall. After the handler, between syscalls, the FUSE node cache may
+  be swept (`kernel/fuse`'s `sweep`).
+- A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
+  re-executing (`kernel/mm`'s fault order).
 
 ### Exit and reaping
 
@@ -553,7 +560,11 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.
 - A syscall handler may run several times for one syscall (FUSE retries): whatever it does before
   a walk that can fail with `FUSE_RETRY` is done again, so handlers change nothing before their
-  last walk.
+  last walk. Copies to and from guest memory can fail with it too (FUSE mappings), which only the
+  read/write buffers read in first make safe.
+- Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
+  nodes; a node another thread holds must be found by `kernel/fuse`'s `in_use` scan, an open
+  handle or a request in flight.
 
 ## Confirmed bugs / technical debt
 

@@ -10,7 +10,7 @@ mod cred;
 pub(crate) mod fast;
 mod fs;
 mod fuse;
-pub(crate) use fuse::flush_at_exit;
+pub(crate) use fuse::{fill, flush_at_exit};
 mod inotify;
 mod ipc;
 mod lease;
@@ -168,8 +168,12 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     use xattr::Target::{Fd, Path};
 
     // A walk that needs a FUSE daemon's reply asks for it and runs the syscall again from the
-    // start (crate::vfs::fuse); every retry finds one more thing in the cache
+    // start (crate::vfs::fuse); every retry finds one more thing in the cache. So does a copy
+    // finding a page of a FUSE file's mapping not yet read (crate::mm::Fill), though the buffers
+    // of reads and writes are read in first
     crate::vfs::fuse::new_syscall();
+    fuse::prefault(cx, nr, &a);
+    crate::mm::take_wanted();
     let mut retries = 0;
     let result = loop {
         let result = match nr {
@@ -551,13 +555,24 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             if retries > FUSE_RETRIES {
                 break Err(Errno::EIO);
             }
-            match crate::vfs::fuse::serve(cx) {
+            let served = match crate::mm::take_wanted() {
+                // A copy that cannot be completed is EFAULT, as on Linux; a signal before the
+                // daemon took the read restarts the syscall
+                Some(w) => fuse::fill(cx, w).map_err(|e| match e {
+                    Errno::EINTR => Errno::ERESTARTSYS,
+                    _ => Errno::EFAULT,
+                }),
+                None => crate::vfs::fuse::serve(cx),
+            };
+            match served {
                 Ok(()) => continue,
                 Err(e) => break Err(e),
             }
         }
         break result;
     };
+    // Between syscalls nothing holds a FUSE node but what in_use finds
+    fuse::sweep(cx);
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
     // before reaping)

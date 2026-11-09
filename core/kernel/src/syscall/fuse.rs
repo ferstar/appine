@@ -16,6 +16,7 @@ use crate::cred::{Cred, MAY_EXEC, MAY_READ, MAY_WRITE};
 use crate::errno::Errno;
 use crate::fd::{FileKind, FileRef, oflags};
 use crate::kernel::Cx;
+use crate::mm::Fill;
 use crate::vfs::fuse::{self, Args, Conn, Entry, FuseId, Handle, op};
 use crate::vfs::store::{DirEntry, mode};
 use crate::vfs::{MountId, Node, Vfs, ms};
@@ -191,7 +192,8 @@ pub(super) fn create(
                     flags: kept,
                     dir: false,
                     no_release: false,
-                };
+                }
+                .counted();
                 return Ok((id, FileKind::Fuse(Box::new(h))));
             }
             Err(Errno::ENOSYS) => {}
@@ -1352,25 +1354,163 @@ pub(super) fn file_io(file: &FileRef) -> Option<Io> {
 
 // ---- Mappings ----
 
-/// For mmap of an open FUSE file: `len` bytes from `offset` copied into a host file to map
-/// ([`fuse::snapshot`]), None for any other file, one not open for reading or a mapping mmap will
-/// refuse anyway (`refused`), so nothing is read for it. Linux maps the
-/// file's page cache, which later writes through the mount change; a mapping here keeps what was
-/// read when it was made.
-pub(super) fn map_copy(
+/// For mmap of an open FUSE file: what the mapping reads its pages through ([`Fill`]), an empty
+/// host file as long as the file is (its size from the attribute cache, fetched first when stale),
+/// into which pages are read as they are touched ([`fill`]). None for any other file, one not open
+/// for reading or a mapping mmap will refuse anyway (`refused`). As in 6.1's `fuse_file_mmap`, a
+/// file the daemon opened with `FOPEN_DIRECT_IO` cannot be mapped shared (`ENODEV`). Linux maps
+/// the file's page cache, which later writes through the mount change; here a page keeps what was
+/// read when it was first touched.
+pub(super) fn map_fill(
     cx: &mut Cx<'_>,
     file: &FileRef,
-    (offset, len): (u64, u64),
+    shared: bool,
     refused: bool,
-) -> Result<Option<std::fs::File>, Errno> {
-    let io = {
+) -> Result<Option<Rc<Fill>>, Errno> {
+    let (id, direct) = {
         let f = file.borrow();
         match &f.kind {
-            FileKind::Fuse(h) if f.readable() && !refused => Io::of(h),
+            FileKind::Fuse(h) if f.readable() && !refused => {
+                (h.id, h.open_flags & fuse::fopen::DIRECT_IO != 0)
+            }
             _ => return Ok(None),
         }
     };
-    fuse::snapshot(cx, io.handle(), offset, len).map(Some)
+    if direct && shared {
+        return Err(Errno::ENODEV);
+    }
+    let size = fuse::cached_attr(&*cx.vfs()?, id)?.size;
+    let host = appine_hal::memfd(c"appine-fuse").map_err(Errno)?;
+    host.set_len(size)
+        .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+    Ok(Some(Fill::new(host, size, file.clone())))
+}
+
+/// Reads into an on-demand mapping of a FUSE file ([`Fill`]) the pages missing around file page
+/// `page` (Linux's `filemap_fault` read-around), the BKL released while the daemon answers.
+pub(crate) fn fill(cx: &mut Cx<'_>, (fill, page): (Rc<Fill>, u64)) -> Result<(), Errno> {
+    let Some(window) = fill.window(page) else {
+        return Ok(());
+    };
+    let io = match &fill.source.borrow().kind {
+        FileKind::Fuse(h) => Io::of(h),
+        _ => return Err(Errno::EIO),
+    };
+    let data = fuse::read(cx, io.handle(), window.0, window.1 as usize)?;
+    fill.store(window, &data)
+}
+
+/// Before a read or write syscall (`nr`, arguments `a`): the pages of its buffers in on-demand
+/// mappings ([`Fill`]) are read in first, as Linux's `fault_in_iov_iter_readable` does, since a
+/// syscall that already consumed input cannot simply run again when its copy finds one missing
+/// ([`Errno::FUSE_RETRY`]). Errors are left for the syscall to meet.
+pub(super) fn prefault(cx: &mut Cx<'_>, nr: u64, a: &[u64; 6]) {
+    use appine_engine::prot;
+    if !cx.mm().has_fills() {
+        return;
+    }
+    // (buffers, whether the syscall writes into them)
+    let (ranges, into) = match nr {
+        63 | 67 => (vec![(a[1], a[2])], true),
+        64 | 68 => (vec![(a[1], a[2])], false),
+        65 | 69 | 286 | 66 | 70 | 287 => {
+            let n = (a[2] as usize).min(1024);
+            let mut raw = vec![0u8; n * 16];
+            if cx
+                .read_user(crate::uaccess::UserSlice::new(a[1], raw.len()), &mut raw)
+                .is_err()
+            {
+                return;
+            }
+            let iov = raw
+                .chunks_exact(16)
+                .map(|c| {
+                    let base = u64::from_le_bytes(c[..8].try_into().unwrap());
+                    (base, u64::from_le_bytes(c[8..].try_into().unwrap()))
+                })
+                .collect();
+            (iov, matches!(nr, 65 | 69 | 286))
+        }
+        _ => return,
+    };
+    let need = if into { prot::WRITE } else { prot::READ };
+    for (addr, len) in ranges {
+        loop {
+            let Some(w) = cx.mm().first_unread(addr, len, need) else {
+                break;
+            };
+            if fill(cx, w).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+// ---- Forgetting nodes ----
+
+/// Forgets the FUSE nodes nothing uses when the cache asked for it ([`fuse::SWEEP`]: it grew too
+/// large, or `drop_caches`), at the end of a syscall, when no syscall of this thread holds a node.
+/// Other threads hold nodes only through what [`in_use`] finds, open handles and requests in
+/// flight ([`fuse::Fuses::evict`]).
+pub(super) fn sweep(cx: &Cx<'_>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !fuse::SWEEP.load(Relaxed) || !fuse::SWEEP.swap(false, Relaxed) {
+        return;
+    }
+    let Ok(vfs) = cx.vfs() else {
+        return;
+    };
+    let all = fuse::DROP.swap(false, Relaxed);
+    match in_use(cx.kr(), &vfs) {
+        Some(keep) => {
+            vfs.fuse_mut().evict(&keep, all);
+        }
+        // Something is borrowed: another time
+        None => {
+            fuse::SWEEP.store(true, Relaxed);
+            if all {
+                fuse::DROP.store(true, Relaxed);
+            }
+        }
+    }
+}
+
+/// The FUSE nodes that processes' root directories, cwds, open files (O_PATH ones too) and
+/// running programs are, that mounts are on or of, and that inotify watches; None when some of
+/// it is borrowed.
+fn in_use(k: &crate::kernel::Kernel, vfs: &Vfs) -> Option<std::collections::HashSet<FuseId>> {
+    let mut used = std::collections::HashSet::new();
+    let mut add = |n: Node| {
+        if let Node::Fuse(_, id) = n {
+            used.insert(id);
+        }
+    };
+    for task in k.tasks.values() {
+        let res = task.res.try_borrow().ok()?;
+        {
+            let fs = res.fs.try_borrow().ok()?;
+            add(fs.root.clone());
+            add(fs.cwd.clone());
+        }
+        if let Some(id) = res.mm.try_borrow().ok()?.exe.and_then(fuse::id_of) {
+            add(Node::Fuse(0, id));
+        }
+        let fds = res.fds.try_borrow().ok()?;
+        for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
+            if let Some(n) = file.try_borrow().ok()?.node() {
+                add(n);
+            }
+        }
+    }
+    for n in vfs.mount_nodes() {
+        add(n);
+    }
+    for key in k.inotify.try_borrow().ok()?.watched() {
+        if let Some(id) = fuse::id_of(key) {
+            add(Node::Fuse(0, id));
+        }
+    }
+    Some(used)
 }
 
 /// Descriptors closed other than by close(2) (replaced by dup2, close_range, close-on-exec):

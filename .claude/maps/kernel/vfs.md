@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks and node holders last)
 
 ## Responsibilities
 
@@ -112,7 +112,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `dev_of`, `fs_of`, `type_of`, `tmpfs_*`, `new_overlay`, `overlay`, `overlay_stat`,
   `overlay_readdir`, `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`,
   `overlay_prefix`, `is_point_in`, `new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
-  `fuse_child`, `fuse_permission`;
+  `fuse_child`, `fuse_permission`, `mount_nodes` (every attached and detached mount's root and
+  point, which FUSE's node sweep keeps);
   syscalls `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `mount_setattr` (`fsopen`/`fsconfig`/`fsmount`/`fspick` have no handler: ENOSYS).
 - **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `pipe2`,
   `lseek`, `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
@@ -858,6 +859,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- `Node` values are held without counting (cwds, roots, open files, mounts, inotify watches):
+  `kernel/fuse` may forget a FUSE node between syscalls only when its scan finds none of them, so a
+  new long-lived holder of FUSE nodes must be added to that scan.
 - A detached mount has a mount point only while it is locked in place on a detached parent;
   lifting to mounts (`mounted`) and climbing out of a mount root (`root_point`) search the detached
   list too, while everything acting on attached mounts (`mount`, `mount_root`, `children`,

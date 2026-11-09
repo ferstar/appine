@@ -96,9 +96,9 @@ pub(super) fn mmap(
     let mut deny_exec = false;
     let low =
         flags & (flags::MAP_FIXED | flags::MAP_FIXED_NOREPLACE) != 0 && below_min_addr(cx, addr);
-    // A FUSE file has no page cache to map: what the mapping covers is read now into a host file,
-    // which stays open until it is mapped
-    let fuse_copy;
+    // A FUSE file has no page cache to map: the mapping reads its pages into a host file as they
+    // are touched (crate::mm::Fill)
+    let mut fuse_fill = None;
     let file = if flags & flags::MAP_ANONYMOUS != 0 {
         if low && len != 0 {
             return Err(Errno::EPERM);
@@ -128,7 +128,7 @@ pub(super) fn mmap(
                 .is_some_and(|m| m & ms::NOEXEC != 0);
             kind == flags::MAP_SHARED && prot & prot::WRITE != 0 || noexec && prot & prot::EXEC != 0
         };
-        fuse_copy = super::fuse::map_copy(cx, &file, (offset, len), refused)?;
+        fuse_fill = super::fuse::map_fill(cx, &file, kind == flags::MAP_SHARED, refused)?;
         let f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
         match &f.kind {
@@ -186,10 +186,10 @@ pub(super) fn mmap(
                 flags |= flags::MAP_ANONYMOUS;
                 None
             }
-            // A copy of the data: a shared mapping can never be written (its writes would not
-            // reach the file), and noexec mounts refuse execution as for store files
+            // Read on demand into a host file: a shared mapping can never be written (its writes
+            // would not reach the file), and noexec mounts refuse execution as for store files
             // In do_mmap's order: not readable, then shared writable (EACCES), then executable on
-            // a noexec mount (EPERM); the copy was made only for a mapping passing them
+            // a noexec mount (EPERM); the fill was made only for a mapping passing them
             FileKind::Fuse(h) => {
                 if !f.readable() || shared_write {
                     return Err(Errno::EACCES);
@@ -204,12 +204,12 @@ pub(super) fn mmap(
                     }
                     deny_exec = true;
                 }
-                let Some(copy) = &fuse_copy else {
+                let Some(fill) = &fuse_fill else {
                     return Err(Errno::EIO);
                 };
                 let ino = cx.vfs()?.fuse().get(h.id).map_or(0, |n| n.attr.ino);
                 label = Some((f.path.clone(), ino));
-                Some((copy.as_raw_fd(), offset, false))
+                Some((fill.fd(), offset, false))
             }
             FileKind::Path(_) => return Err(Errno::EBADF),
             _ => return Err(Errno::ENODEV),
@@ -219,7 +219,13 @@ pub(super) fn mmap(
     if flags & MAP_LOCKED != 0 {
         check_memlock(cx, len.next_multiple_of(PAGE_SIZE)).map_err(|_| Errno::EAGAIN)?;
     }
-    let start = cx.mm_mut().mmap(addr, len, prot, flags, file)?;
+    let fill = fuse_fill;
+    let start = match &fill {
+        Some(fill) => cx
+            .mm_mut()
+            .mmap_fill(addr, len, prot, flags, (fill.clone(), offset))?,
+        None => cx.mm_mut().mmap(addr, len, prot, flags, file)?,
+    };
     // MAP_FIXED may have replaced a segment's last attachment
     if flags & flags::MAP_FIXED != 0 {
         crate::ipc::reap_shm(cx.k());
@@ -250,6 +256,18 @@ pub(super) fn mmap(
         || cx.mm().lock_future && !cx.mm().lock_onfault;
     if populate {
         cx.mm().populate(start, len);
+        // A FUSE file's pages are read now, the BKL released (errors are not reported, as on
+        // Linux)
+        if fill.is_some() && prot != 0 {
+            loop {
+                let Some(w) = cx.mm().first_unread(start, len, 0) else {
+                    break;
+                };
+                if super::fuse::fill(cx, w).is_err() {
+                    break;
+                }
+            }
+        }
     }
     Ok(start)
 }

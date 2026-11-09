@@ -31,8 +31,9 @@
 //! cache: reads and writes go to the daemon as they come (as with `FOPEN_DIRECT_IO`), and
 //! mappings copy the file ([`snapshot`]).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::store::{Ino, Stat, mode};
@@ -49,6 +50,15 @@ pub(crate) type FuseId = u64;
 /// only the top one ([`super::overlay::key`]).
 pub(crate) const fn key(id: FuseId) -> Ino {
     3 << 62 | id
+}
+
+/// The node a [`key`] stands for.
+pub(crate) const fn id_of(key: Ino) -> Option<FuseId> {
+    if key >> 62 == 3 {
+        Some(key & !(3 << 62))
+    } else {
+        None
+    }
 }
 
 /// `FUSE_SUPER_MAGIC` (statfs's `f_type`).
@@ -79,6 +89,7 @@ pub(crate) const NAME_MAX: usize = 1024;
 /// Operation codes (`enum fuse_opcode`).
 pub(crate) mod op {
     pub const LOOKUP: u32 = 1;
+    pub const FORGET: u32 = 2;
     pub const GETATTR: u32 = 3;
     pub const SETATTR: u32 = 4;
     pub const READLINK: u32 = 5;
@@ -108,6 +119,7 @@ pub(crate) mod op {
     pub const ACCESS: u32 = 34;
     pub const CREATE: u32 = 35;
     pub const INTERRUPT: u32 = 36;
+    pub const BATCH_FORGET: u32 = 42;
     pub const FALLOCATE: u32 = 43;
     pub const RENAME2: u32 = 45;
     pub const LSEEK: u32 = 46;
@@ -144,6 +156,7 @@ mod init {
 
 /// `FOPEN_*` flags of an open reply.
 pub(crate) mod fopen {
+    pub const DIRECT_IO: u32 = 1 << 0;
     pub const NONSEEKABLE: u32 = 1 << 2;
     pub const STREAM: u32 = 1 << 4;
     pub const NOFLUSH: u32 = 1 << 5;
@@ -463,6 +476,12 @@ pub(crate) struct Conn {
     /// Interrupts to send, before any other request (the unique of the request each interrupts).
     interrupts: VecDeque<u64>,
     requests: HashMap<u64, Req>,
+    /// Lookups to return (`FUSE_FORGET`): node id and count ([`Fuses::evict`]).
+    forgets: VecDeque<(u64, u64)>,
+    /// How many forgets may still go before a pending request (6.1's `forget_batch`).
+    forget_batch: i32,
+    /// Open handles of each node id ([`Handle`]): such nodes are never forgotten.
+    opens: HashMap<u64, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +566,9 @@ impl Conn {
             pending: VecDeque::new(),
             interrupts: VecDeque::new(),
             requests: HashMap::new(),
+            forgets: VecDeque::new(),
+            forget_batch: 16,
+            opens: HashMap::new(),
         }
     }
 
@@ -642,6 +664,7 @@ impl Conn {
         self.aborted = true;
         self.pending.clear();
         self.interrupts.clear();
+        self.forgets.clear();
         self.requests.retain(|_, r| {
             if r.background {
                 return false;
@@ -651,6 +674,58 @@ impl Conn {
             }
             true
         });
+    }
+
+    /// The next forget message for a read of `len` bytes (6.1's `fuse_read_forget`): one
+    /// `FUSE_FORGET`, or a `FUSE_BATCH_FORGET` of as many as fit when several are queued and the
+    /// daemon speaks 7.16 or later. Neither is answered.
+    fn read_forget(&mut self, len: usize) -> Vec<u8> {
+        let unique = self.next_unique;
+        self.next_unique += 2;
+        if self.minor < 16 || self.forgets.len() == 1 {
+            let (nodeid, nlookup) = self.forgets.pop_front().unwrap();
+            return Args::default()
+                .u32((IN_HEADER + 8) as u32)
+                .u32(op::FORGET)
+                .u64(unique)
+                .u64(nodeid)
+                .u64(0)
+                .u64(0)
+                .u64(nlookup)
+                .0;
+        }
+        let n = self.forgets.len().min((len - IN_HEADER - 8) / 16);
+        let mut message = Args::default()
+            .u32((IN_HEADER + 8 + n * 16) as u32)
+            .u32(op::BATCH_FORGET)
+            .u64(unique)
+            .u64(0)
+            .u64(0)
+            .u64(0)
+            .u32(n as u32)
+            .u32(0);
+        for (nodeid, nlookup) in self.forgets.drain(..n) {
+            message = message.u64(nodeid).u64(nlookup);
+        }
+        message.0
+    }
+
+    /// The node ids requests still unanswered are about: the node of each, and the other
+    /// directory of a rename or the file of a link (their callers hold those nodes until the
+    /// reply comes).
+    fn busy_nodeids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for r in self.requests.values() {
+            let m = &r.message;
+            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
+            ids.push(u64::from_le_bytes(m[16..24].try_into().unwrap()));
+            if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8 {
+                ids.push(u64::from_le_bytes(
+                    m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
+                ));
+            }
+        }
+        ids
     }
 
     /// The error a new request gets before it is queued: ENOTCONN once aborted, ECONNREFUSED
@@ -1009,6 +1084,19 @@ pub(crate) fn dev_read(
                     return Ok(message);
                 }
             }
+            // Forgets go first while nothing is pending, else up to 16 between requests and then
+            // 8 requests in a row (6.1's fuse_dev_do_read)
+            if !c.forgets.is_empty() {
+                if c.pending.is_empty() || {
+                    c.forget_batch -= 1;
+                    c.forget_batch >= 0
+                } {
+                    return Ok(c.read_forget(len));
+                }
+                if c.forget_batch <= -8 {
+                    c.forget_batch = 16;
+                }
+            }
             let mut ended = false;
             while let Some(unique) = c.pending.pop_front() {
                 let r = c.requests.get_mut(&unique).expect("pending request");
@@ -1202,6 +1290,27 @@ pub(crate) struct Fuses {
     /// The node of each (device number, node id).
     by_nodeid: HashMap<(u64, u64), FuseId>,
     next: FuseId,
+    /// Counts entries made ([`Node::seen`]).
+    clock: u64,
+}
+
+/// Nodes the cache keeps before it forgets the ones least recently looked up ([`Fuses::evict`]).
+const NODES_MAX: usize = 1 << 14;
+
+/// The cache should be swept at the end of the syscall ([`Fuses::evict`]): it outgrew
+/// [`NODES_MAX`], or `drop_caches` asked ([`DROP`]).
+pub(crate) static SWEEP: AtomicBool = AtomicBool::new(false);
+
+/// `drop_caches` asked to drop dentries and inodes: every node nothing uses goes.
+pub(crate) static DROP: AtomicBool = AtomicBool::new(false);
+
+/// A write of `value` to `/proc/sys/vm/drop_caches`: 2 and 3 drop dentries and inodes, which
+/// for FUSE means forgetting the nodes nothing uses.
+pub(crate) fn drop_caches(value: i64) {
+    if value & 2 != 0 {
+        DROP.store(true, Ordering::Relaxed);
+        SWEEP.store(true, Ordering::Relaxed);
+    }
 }
 
 /// One FUSE node (Linux's fuse inode, with the dentries naming it under its directory).
@@ -1226,6 +1335,11 @@ pub(crate) struct Node {
     /// An `O_APPEND` write is between asking for the size and writing there: others wait (6.1
     /// holds the inode lock across both).
     pub appending: bool,
+    /// Entries the daemon returned for it, given back with `FUSE_FORGET` when it is forgotten
+    /// (Linux's `nlookup`).
+    nlookup: u64,
+    /// When it was last entered ([`Fuses::clock`]): the oldest go first.
+    seen: u64,
 }
 
 impl Node {
@@ -1274,6 +1388,8 @@ impl Fuses {
                 children: HashMap::new(),
                 link: None,
                 appending: false,
+                nlookup: 0,
+                seen: 0,
             },
         );
         self.by_nodeid.insert((dev, ROOT_ID), id);
@@ -1355,8 +1471,12 @@ impl Fuses {
             .get(&(dev, e.nodeid))
             .copied()
             .filter(|id| (self.nodes[id].attr.mode ^ e.attr.mode) & mode::S_IFMT == 0);
+        self.clock += 1;
         let id = match known {
             Some(id) => {
+                // The lookup counts even when the entry is refused (the inode stays cached on
+                // Linux, to be forgotten later)
+                self.nodes.get_mut(&id).unwrap().nlookup += 1;
                 if self.nodes[&id].kind() == mode::S_IFDIR && self.is_within(dir, id) {
                     return Err(Errno::ELOOP);
                 }
@@ -1379,12 +1499,18 @@ impl Fuses {
                         children: HashMap::new(),
                         link: None,
                         appending: false,
+                        nlookup: 1,
+                        seen: 0,
                     },
                 );
+                if self.nodes.len() > NODES_MAX {
+                    SWEEP.store(true, Ordering::Relaxed);
+                }
                 id
             }
         };
         let n = self.nodes.get_mut(&id).unwrap();
+        n.seen = self.clock;
         // The root keeps itself as its parent
         if n.nodeid != ROOT_ID {
             n.parent = dir;
@@ -1400,6 +1526,95 @@ impl Fuses {
             .children
             .insert(name.to_vec(), (Some(id), e.entry_until, t));
         Ok(id)
+    }
+
+    /// Forgets the nodes nothing uses (Linux evicting unused inodes), giving their lookups back to
+    /// their daemons (`FUSE_FORGET`, [`Conn::read_forget`]); returns how many went. Kept are
+    /// those in `keep` (what processes' roots, cwds and open files, mounts, inotify watches and
+    /// running programs are), roots, nodes with an open handle or a request in flight, and the
+    /// directories any of these or any remaining node lies in. With `all` (`drop_caches`) every
+    /// other node goes; otherwise only when the cache holds more than [`NODES_MAX`], the least
+    /// recently entered first, down to 3/4 of it. Entries naming forgotten nodes go too, and so do
+    /// negative entries no longer valid.
+    pub fn evict(&mut self, keep: &HashSet<FuseId>, all: bool) -> usize {
+        let target = if all { 0 } else { NODES_MAX / 4 * 3 };
+        if self.nodes.len() <= target {
+            return 0;
+        }
+        let mut kept = keep.clone();
+        for c in self.conns.values() {
+            let Ok(c) = c.try_borrow() else {
+                return 0;
+            };
+            let busy = c.busy_nodeids();
+            for (&id, n) in &self.nodes {
+                if n.dev == c.dev
+                    && (n.nodeid == ROOT_ID
+                        || c.opens.get(&n.nodeid).is_some_and(|&k| k > 0)
+                        || busy.contains(&n.nodeid))
+                {
+                    kept.insert(id);
+                }
+            }
+        }
+        // The directories they are in
+        for id in kept.clone() {
+            let mut x = id;
+            while let Some(n) = self.nodes.get(&x) {
+                if n.parent == x || !kept.insert(n.parent) {
+                    break;
+                }
+                x = n.parent;
+            }
+        }
+        let mut gone: HashSet<FuseId> = HashSet::new();
+        // Leaves first, oldest first; a directory whose last node went is a leaf the next round
+        while self.nodes.len() > target {
+            let parents: HashSet<FuseId> = self
+                .nodes
+                .iter()
+                .filter(|(id, n)| n.parent != **id)
+                .map(|(_, n)| n.parent)
+                .collect();
+            let mut leaves: Vec<(u64, FuseId)> = self
+                .nodes
+                .iter()
+                .filter(|(id, _)| !kept.contains(id) && !parents.contains(id))
+                .map(|(&id, n)| (n.seen, id))
+                .collect();
+            if leaves.is_empty() {
+                break;
+            }
+            leaves.sort_unstable();
+            leaves.truncate(self.nodes.len() - target);
+            for (_, id) in leaves {
+                let n = self.nodes.remove(&id).unwrap();
+                if self.by_nodeid.get(&(n.dev, n.nodeid)) == Some(&id) {
+                    self.by_nodeid.remove(&(n.dev, n.nodeid));
+                }
+                if n.nlookup > 0
+                    && let Some(c) = self.conns.get(&n.dev)
+                {
+                    let mut c = c.borrow_mut();
+                    if !c.aborted {
+                        c.forgets.push_back((n.nodeid, n.nlookup));
+                    }
+                }
+                gone.insert(id);
+            }
+        }
+        for n in self.nodes.values_mut() {
+            n.children.retain(|_, (child, until, t)| match child {
+                Some(c) => !gone.contains(c),
+                None => fresh(*until, *t),
+            });
+        }
+        for c in self.conns.values() {
+            if !c.borrow().forgets.is_empty() {
+                request_wake_object(readers(c));
+            }
+        }
+        gone.len()
     }
 
     /// Whether node `id` is `top` or below it, by following parents up to a root (whose parent
@@ -1721,8 +1936,25 @@ pub(crate) struct Handle {
     pub no_release: bool,
 }
 
+impl Handle {
+    /// Counts it among the node's open handles ([`Conn::opens`]), which keep the node from being
+    /// forgotten until it goes.
+    pub(crate) fn counted(self) -> Handle {
+        *self.conn.borrow_mut().opens.entry(self.nodeid).or_insert(0) += 1;
+        self
+    }
+}
+
 impl Drop for Handle {
     fn drop(&mut self) {
+        if let Ok(mut c) = self.conn.try_borrow_mut()
+            && let Some(k) = c.opens.get_mut(&self.nodeid)
+        {
+            *k -= 1;
+            if *k == 0 {
+                c.opens.remove(&self.nodeid);
+            }
+        }
         if self.no_release {
             return;
         }
@@ -1757,15 +1989,18 @@ pub(crate) fn open(
     if !keep_trunc {
         sent &= !oflags::O_TRUNC;
     }
-    let handle = |fh, open_flags, no_release| Handle {
-        conn: conn.clone(),
-        id,
-        nodeid,
-        fh,
-        open_flags,
-        flags: sent,
-        dir,
-        no_release,
+    let handle = |fh, open_flags, no_release| {
+        Handle {
+            conn: conn.clone(),
+            id,
+            nodeid,
+            fh,
+            open_flags,
+            flags: sent,
+            dir,
+            no_release,
+        }
+        .counted()
     };
     if skip {
         return Ok(handle(0, 0, true));
@@ -2200,5 +2435,73 @@ mod tests {
         assert!(f.node(a).fresh_attr().is_none());
         f.remove(0x30);
         assert!(f.get(a).is_none() && f.root_of(0x30).is_none());
+    }
+
+    #[test]
+    fn nodes_nothing_uses_are_forgotten_with_their_lookups() {
+        new_syscall();
+        let mut f = Fuses::default();
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        c.borrow_mut().minor = 37;
+        let root = f.add(c.clone());
+        let entry = |nodeid, m| Entry {
+            nodeid,
+            attr: Attr {
+                ino: nodeid,
+                mode: m,
+                nlink: 1,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+        let d = f.enter(root, b"d", &entry(2, mode::S_IFDIR)).unwrap();
+        let x = f.enter(d, b"x", &entry(3, mode::S_IFREG)).unwrap();
+        // Looked up twice, under two names (a hard link)
+        assert_eq!(f.enter(root, b"y", &entry(3, mode::S_IFREG)), Ok(x));
+        let o = f.enter(root, b"o", &entry(4, mode::S_IFREG)).unwrap();
+        let p = f.enter(d, b"p", &entry(5, mode::S_IFREG)).unwrap();
+        // Below the limit nothing goes, unless dropping caches
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        // An open handle and a request in flight keep their nodes, a kept node its directory
+        let h = Handle {
+            conn: c.clone(),
+            id: o,
+            nodeid: 4,
+            fh: 1,
+            open_flags: 0,
+            flags: 0,
+            dir: false,
+            no_release: true,
+        }
+        .counted();
+        c.borrow_mut()
+            .queue(op::GETATTR, 5, None, &[], (false, false));
+        assert_eq!(f.evict(&HashSet::from([x]), true), 0);
+        assert!([d, x, o, p].iter().all(|&id| f.get(id).is_some()));
+        // Leaves first, then the directory left empty
+        c.borrow_mut().requests.clear();
+        drop(h);
+        assert_eq!(f.evict(&HashSet::new(), true), 4);
+        assert!(f.get(root).is_some() && f.nodes.len() == 1);
+        assert_eq!(f.cached_child(root, b"y"), None);
+        let mut forgets: Vec<_> = c.borrow().forgets.iter().copied().collect();
+        forgets.sort_unstable();
+        assert_eq!(forgets, [(2, 1), (3, 2), (4, 1), (5, 1)]);
+        // Several go in one FUSE_BATCH_FORGET, one alone in a FUSE_FORGET
+        let m = c.borrow_mut().read_forget(8192);
+        assert_eq!(
+            &m[..8],
+            &[48 + 64, 0, 0, 0, op::BATCH_FORGET as u8, 0, 0, 0]
+        );
+        assert_eq!(u32::from_le_bytes(m[40..44].try_into().unwrap()), 4);
+        // The node id is a new node once looked up again
+        let x2 = f.enter(root, b"y", &entry(3, mode::S_IFREG)).unwrap();
+        assert_ne!(x2, x);
+        f.evict(&HashSet::new(), true);
+        let m = c.borrow_mut().read_forget(8192);
+        assert_eq!(&m[..8], &[48, 0, 0, 0, op::FORGET as u8, 0, 0, 0]);
+        assert_eq!(&m[16..24], &3u64.to_le_bytes());
+        assert_eq!(&m[40..48], &1u64.to_le_bytes());
     }
 }

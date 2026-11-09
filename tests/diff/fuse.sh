@@ -4,7 +4,10 @@
 # readdir, symlinks, reads and writes (one larger than a request), O_APPEND (two processes appending
 # at once) and O_TRUNC, creating,
 # renaming and removing files and directories, links, chmod, truncate and times, xattrs, statfs,
-# running a script and a program from the mount, a private mapping, the errors the daemon and the
+# running a script and a program from the mount, mappings (read page by page as they are touched:
+# far-apart pages, read(2) and write(2) on mapped buffers, fork, MADV_DONTNEED, mremap,
+# MAP_POPULATE, SIGBUS past the end, a library loaded from the mount), nodes forgotten after
+# drop_caches unless open or a current directory (a daemon of its own), the errors the daemon and the
 # kernel return, the daemon leaving when the mount goes, ENOTCONN once the daemon is killed, and
 # the errors of mount options and of /dev/fuse before a mount. The layers are on one tmpfs on
 # both sides. Not compared: inode numbers (fuse-overlayfs takes them from the layers' files) and
@@ -197,6 +200,69 @@ with open("/tmp/fuse/m/sub2/b", "rb") as f:
         print("noexec mmap:", e.strerror)
 '
 mount -o remount,exec m
+echo "-- mappings read on demand"
+python3 -c '
+import ctypes, hashlib, os, signal
+libc = ctypes.CDLL(None, use_errno=True)
+vp, sz = ctypes.c_void_p, ctypes.c_size_t
+libc.mmap.restype = libc.mremap.restype = vp
+libc.mmap.argtypes = [vp, sz, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+libc.mremap.argtypes = [vp, sz, sz, ctypes.c_int]
+libc.madvise.argtypes = [vp, sz, ctypes.c_int]
+libc.read.argtypes = libc.write.argtypes = [ctypes.c_int, vp, sz]
+libc.read.restype = libc.write.restype = ctypes.c_ssize_t
+R, W, SHARED, PRIVATE, POPULATE, P = 1, 2, 1, 2, 0x8000, 4096
+data = b"".join(hashlib.sha256(b"%d" % i).digest() * 128 for i in range(768)) + b"tail"
+with open("/tmp/fuse/m/big", "wb") as f:
+    f.write(data)
+fd = os.open("/tmp/fuse/m/big", os.O_RDWR)
+def page(a, p):
+    return ctypes.string_at(a + p * P, P)
+def same(a, pages):
+    return all(page(a, p) == data[p * P:(p + 1) * P] for p in pages)
+a = libc.mmap(None, len(data), R, SHARED, fd, 0)
+print("pages far apart:", same(a, [700, 3, 512, 255, 0, 767]))
+whole = hashlib.sha256(ctypes.string_at(a, len(data))).digest()
+print("whole:", whole == hashlib.sha256(data).digest(), page(a, 768)[:6])
+b = libc.mmap(None, len(data), R, PRIVATE, fd, 0)
+out = os.open("/tmp/fuse/out", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+n = libc.write(out, b + 5 * P + 7, 40 * P)
+print("write(2) from it:", n, os.pread(out, 40 * P, 0) == data[5 * P + 7:45 * P + 7])
+c = libc.mmap(None, len(data), R | W, PRIVATE, fd, 0)
+os.lseek(out, 0, 0)
+n = libc.read(out, c + 300 * P + 10, 6)
+want = data[300 * P:300 * P + 10] + data[5 * P + 7:5 * P + 13] + data[300 * P + 16:301 * P]
+print("read(2) into it:", n, page(c, 300) == want)
+ctypes.memmove(c + 400 * P, b"parent", 6)
+pid = os.fork()
+if pid == 0:
+    ok = page(c, 400)[:6] == b"parent" and same(c, [401, 600])
+    ctypes.memmove(c + 401 * P, b"child", 5)
+    os._exit(0 if ok else 1)
+_, status = os.waitpid(pid, 0)
+print("fork:", os.waitstatus_to_exitcode(status), same(c, [401]))
+libc.madvise(c + 400 * P, P, 4)
+print("MADV_DONTNEED:", same(c, [400]))
+d = libc.mmap(None, 8 * P, R, PRIVATE, fd, 100 * P)
+d = libc.mremap(d, 8 * P, 64 * P, 1)
+print("mremap:", ctypes.string_at(d + 60 * P, P) == data[160 * P:161 * P])
+e = libc.mmap(None, len(data) + 3 * P, R, PRIVATE | POPULATE, fd, 0)
+print("MAP_POPULATE:", same(e, [2, 766]))
+pid = os.fork()
+if pid == 0:
+    ctypes.string_at(e + 770 * P, 1)
+    os._exit(0)
+_, status = os.waitpid(pid, 0)
+print("past the end:", signal.Signals(os.WTERMSIG(status)).name)
+'
+cp /usr/lib/libz.so.1 m/libz.so.1
+python3 -c '
+import ctypes, zlib
+z = ctypes.CDLL("/tmp/fuse/m/libz.so.1")
+z.zlibVersion.restype = ctypes.c_char_p
+print("a library from the mount:", z.zlibVersion().decode() == zlib.ZLIB_RUNTIME_VERSION)
+'
+rm m/big m/libz.so.1 out
 echo "-- upper layer"
 # Without RENAME_WHITEOUT (Appine) fuse-overlayfs leaves .wh. files instead of whiteout devices
 find u ! -type c ! -name '.wh.*' | sort | sed 's/^/  /'
@@ -213,6 +279,87 @@ sleep 1
 ls m 2>&1
 stat m 2>&1 | head -1
 umount m && echo unmounted
+echo "-- forgetting nodes"
+# A daemon speaking the protocol itself, recording for each name the lookups not yet forgotten
+cat > fz.py <<'EOF'
+import ctypes, os, struct, sys
+libc = ctypes.CDLL(None, use_errno=True)
+fd = os.open("/dev/fuse", os.O_RDWR)
+opts = b"fd=%d,rootmode=40000,user_id=0,group_id=0" % fd
+if libc.mount(b"fz", b"/tmp/fuse/z", b"fuse.fz", 0, opts) != 0:
+    sys.exit("mount: %d" % ctypes.get_errno())
+names = {1: {b"d": 2, b"f1": 3, b"f2": 4, b"f3": 5}, 2: {b"g": 6}}
+label = {2: "d", 3: "f1", 4: "f2", 5: "f3", 6: "g"}
+held = {n: 0 for n in label}
+def attr(n):
+    mode = 0o40755 if n in names else 0o100644
+    return struct.pack("<6Q4x4x4xIIIIIII", n, 0, 0, 0, 0, 0, mode, 1, 0, 0, 0, 4096, 0)
+def state():
+    with open("/tmp/fuse/zs.new", "w") as f:
+        f.write("".join("%s %d\n" % (label[n], held[n]) for n in sorted(label)))
+    os.rename("/tmp/fuse/zs.new", "/tmp/fuse/zs")
+def reply(unique, error=0, body=b""):
+    os.write(fd, struct.pack("<IiQ", 16 + len(body), -error, unique) + body)
+while True:
+    try:
+        m = os.read(fd, 1 << 17)
+    except OSError:
+        break
+    _, op, unique, node = struct.unpack_from("<IIQQ", m)
+    body = m[40:]
+    if op == 26:
+        reply(unique, body=struct.pack("<IIIIHHIIHHI28x", 7, 31, 0, 0, 0, 0, 4096, 1, 0, 0, 0))
+    elif op == 1:
+        child = names.get(node, {}).get(body.rstrip(b"\0"))
+        if child is None:
+            reply(unique, 2)
+            continue
+        held[child] += 1
+        state()
+        reply(unique, body=struct.pack("<QQQQII", child, 0, 3600, 3600, 0, 0) + attr(child))
+    elif op == 3:
+        reply(unique, body=struct.pack("<QII", 3600, 0, 0) + attr(node))
+    elif op in (14, 27):
+        reply(unique, body=struct.pack("<QII", 0, 0, 0))
+    elif op in (18, 29, 25):
+        reply(unique)
+    elif op == 2:
+        held[node] -= struct.unpack_from("<Q", body)[0]
+        state()
+    elif op == 42:
+        count = struct.unpack_from("<I", body)[0]
+        for i in range(count):
+            n, k = struct.unpack_from("<QQ", body, 8 + 16 * i)
+            held[n] -= k
+        state()
+    elif op != 36:
+        reply(unique, 38)
+EOF
+mkdir z
+python3 fz.py &
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q ' /tmp/fuse/z ' /proc/self/mountinfo && break
+    sleep 0.5
+done
+stat -c %n z/f1 z/f2 z/f3 z/d/g
+exec 3< z/f2
+(cd z/d && sleep 3) &
+sleeper=$!
+sleep 1
+# Docker mounts /proc/sys read-only
+mount -o remount,rw /proc/sys 2>/dev/null
+# What nothing uses goes; the open file and the current directory stay
+echo 2 > /proc/sys/vm/drop_caches
+sleep 1
+cat zs
+exec 3<&-
+wait $sleeper
+echo 2 > /proc/sys/vm/drop_caches
+sleep 1
+cat zs
+umount z && echo unmounted
+sleep 0.5
+rm -f fz.py zs
 echo "-- mount errors"
 python3 -c '
 import ctypes, errno, os

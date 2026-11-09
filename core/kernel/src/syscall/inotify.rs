@@ -453,6 +453,11 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// The inodes (and node keys) with watches on them.
+    pub(crate) fn watched(&self) -> impl Iterator<Item = Ino> + '_ {
+        self.by_ino.keys().copied()
+    }
+
     /// An event of `ino` itself: reported first to the watches of its directory `parent` (with
     /// the name), then to its own. Each instance that got an event requests a wakeup
     /// (`Inotify::push`).

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; shootdown waits; FUSE copies last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; shootdown waits; FUSE mappings read on demand last)
 
 ## Responsibilities
 
@@ -57,8 +57,12 @@ dumps and the host abstraction layer (`core/hal`).
   `VM_MAYWRITE`/`VM_MAYEXEC`), `Arc<HostRegion>` plus host pointer, `name`/`ino` for maps,
   `file_len` (bytes before EOF), `file_id`/`content` (file identity and version), a dup'd fd for
   shared file mappings, `shm`, and flags `cow`, `locked`, `written` (sticky), `growsdown`,
-  `dontdump`, `wipeonfork`, `dontfork`, `noreserve`, and `anon`, the identity of the anon_vma it
-  would have on Linux (0 until a fork).
+  `dontdump`, `wipeonfork`, `dontfork`, `noreserve`, `anon`, the identity of the anon_vma it
+  would have on Linux (0 until a fork), and `fill` for a mapping read on demand.
+- `Fill` (`Rc`) — a FUSE file mapping read on demand: a sparse host file (memfd) as long as the
+  file was when mapped, holding what was read at the file's own offsets; the open file to read
+  from (kept open while mapped); the runs of file pages read; and the read-ahead state. Every VMA
+  made from one mmap call (split, forked, moved, grown) holds the same one.
 - `same_vma` — whether two adjacent VMAs are one VMA on Linux: same contents source (anonymous
   private, or the same file at contiguous offsets; shared anonymous never), backing, prot, lock,
   may_write, growsdown, dump and fork flags, `anon` and name.
@@ -67,6 +71,8 @@ dumps and the host abstraction layer (`core/hal`).
   shared with forked children).
 - `flags` — guest ABI values of the `MAP_*` flags the mm interprets.
 - `Refill` — the private-file piece re-mapped at the old address after `MREMAP_DONTUNMAP`.
+- `WANTED` (thread-local) — the page of a `Fill` a kernel access found not read, for the syscall
+  dispatcher (`take_wanted`).
 
 ### Host backing
 
@@ -140,7 +146,7 @@ dumps and the host abstraction layer (`core/hal`).
 
 ## Public entry points
 
-- **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `munmap`, `protect` (mprotect), `mremap` (including
+- **Syscalls** (`syscall/mem.rs` → `Mm`): `mmap`, `mmap_fill` (a FUSE file), `munmap`, `protect` (mprotect), `mremap` (including
   `MREMAP_DONTUNMAP` via `mremap_dontunmap`), `remap_file_pages` (emulated as a shared fixed
   mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`, `mlockall`/`munlockall`, `mincore`,
   `release` (process_mrelease, on another process's address space). `brk` calls `Mm::brk`
@@ -149,8 +155,10 @@ dumps and the host abstraction layer (`core/hal`).
   `find_free` (interpreter and vDSO placement), `set_brk`, `map_stack`, `set_start_stack`,
   `label`, `write_kernel` (segments, `.bss`), plus the public layout fields.
 - **Time namespaces** (clone, execve, setns, `kernel/process`): `vdso_syscalls`.
-- **Fault path** (task run loop): `cow_break`, `fault_in`, `fault_past_eof`, `Cx::grow_stack`
-  (→ `grow_down`), `is_mapped`.
+- **Fault path** (task run loop): `cow_break`, `fault_in`, `fill_wanted`, `fault_past_eof`,
+  `Cx::grow_stack` (→ `grow_down`), `is_mapped`.
+- **Mappings read on demand** (`kernel/fuse`, the dispatcher): `Fill::new`, `window`, `store`,
+  `fd`, `take_wanted`, `has_fills`, `first_unread`.
 - **Stack growth from the kernel**: `Cx::grow_stack_to` at syscall entry; `Cx::grow_stack` before
   building a signal frame; `grow_for` through `Cx::read_user`, `Cx::write_user`,
   `Cx::write_user_partial` and `/proc/<pid>/mem`.
@@ -229,8 +237,8 @@ dumps and the host abstraction layer (`core/hal`).
   - read-only private file with a trusted content version → a `FileMaps` hit (VMA marked `cow`),
     or a new read-only host mapping inserted into the cache;
   - other file mappings → host `mmap` of `objects/<ino>` (read-write for private mappings);
-  - a FUSE file → host `mmap` of a memfd the syscall filled with the range read through the
-    daemon (`kernel/fuse`'s copy), never writable when shared (`EACCES`), kept as it was read;
+  - a FUSE file → host `mmap` of its `Fill`'s memfd, empty at first (`mmap_fill`): no content
+    version, no `FileMaps`, `file_len` 0; never writable when shared (`EACCES`);
   - shared anonymous and SysV shm → host shared memory.
 - A file has no trusted content version while its ctime is within the last 2 s, or once it has been
   mapped shared from a writably opened descriptor (`WRITABLY_SHARED`, never cleared).
@@ -254,10 +262,24 @@ dumps and the host abstraction layer (`core/hal`).
   is at or past EOF, the VMA prot (with write implying read) lacks the access, or the page already
   has an entry (including a prot-0 one). Otherwise it fills every empty slot of the 2 MB leaf range
   clipped to the VMA and EOF; existing entries are left alone and no flush is needed.
+- A `Fill` VMA keeps `file_len` 0, so `map_pages` and every other path sizing by `file_len`
+  (mprotect, mremap, fork, populate) build none of its entries; only `fault_in` does, for a page
+  already read, and then for the runs read within its 2 MB leaf range. Its EOF is the size the file
+  had when mapped (`contents_len`).
+- Reading a page (`kernel/fuse`'s `fill`): `Fill::window` picks the pages not read around it (32
+  centred on it; from it, twice the last read when it continues that read, or twice the run read
+  just before it, up to 512), the daemon is asked with the BKL released, and `store` writes the
+  pages still missing into the memfd with `pwrite` and records them. A page not read has no
+  private copy anywhere (no entry, no kernel write), so the host file reaches every mapping of it,
+  shared or private.
 - `mprotect` to `PROT_NONE` keeps entries with prot 0 (the host page keeps its content); changing
   back rewrites the kept entries and fills the rest under the eager rule above, otherwise on demand.
 - Execute-only mappings (`PROT_EXEC` without `PROT_READ`) do not gain read permission: data loads
   and kernel reads fault, instruction fetch works.
+- A kernel access (`read`, `write`, `read_cstr`, `write_kernel`) meeting a page of a `Fill` mapping
+  not yet read fails with the internal `FUSE_RETRY` and records the page in `WANTED`; the syscall
+  dispatcher reads it and runs the syscall again (`kernel/process`). `write_kernel` checks the whole
+  range first, before changing anything.
 - Tier 0 looks up the data TLB in C and calls `appine_tlb_fill` on a miss. The fill fails if the
   entry is absent or lacks the needed bit. A data fill sets both halves at once, leaving the read
   half invalid on pages with a load watchpoint and the write half invalid on pages with any
@@ -272,10 +294,14 @@ dumps and the host abstraction layer (`core/hal`).
 1. A write fault where `cow_break` succeeds → re-execute.
 2. The page now translates (another thread fixed it while this one waited for the BKL) → re-execute.
 3. `fault_in` succeeds → re-execute.
-4. `fault_past_eof`: past EOF in a shared file mapping whose file has grown → map the new part and
-   re-execute; otherwise past EOF → `SIGBUS` / `BUS_ADRERR`.
-5. Stack growth (`grow_down`) succeeds → re-execute.
-6. Otherwise `SIGSEGV`: `SEGV_ACCERR` if the address is mapped, else `SEGV_MAPERR`.
+4. A page of a `Fill` mapping not yet read and allowing the access (`fill_wanted`) → read it through
+   the daemon (above) and re-execute; a signal arriving before the daemon took the read is
+   delivered first and the access faults again; a read error → `SIGBUS` / `BUS_ADRERR`.
+5. `fault_past_eof`: past EOF in a shared file mapping whose file has grown → map the new part and
+   re-execute (not a `Fill` mapping, which keeps its size); otherwise past EOF → `SIGBUS` /
+   `BUS_ADRERR`.
+6. Stack growth (`grow_down`) succeeds → re-execute.
+7. Otherwise `SIGSEGV`: `SEGV_ACCERR` if the address is mapped, else `SEGV_MAPERR`.
 
 "Re-execute" forces no signal and leaves the PC on the faulting instruction (already-pending
 signals may still be delivered).
@@ -292,8 +318,9 @@ signals may still be delivered).
   it with the VMAs before it already changed. With `PROT_GROWSDOWN` the range starts at the start
   of the Linux VMA holding that first VMA, which must grow down (`EINVAL`; `ENOMEM` if it starts at
   or above the end), so it reaches the parts the mapping grew by; `PROT_GROWSUP`, alone or with it,
-  is `EINVAL`. A `cow` VMA is copied (`unshare`, which sets `dirty`) before it becomes
-  writable, and a `reserved` region gets real host memory (`back_reserved`) before it becomes
+  is `EINVAL`. A `cow` VMA is copied (`unshare`, which sets `dirty`; a `Fill` VMA maps its host
+  file privately again, copies the pages it changed after reading them and drops its entries)
+  before it becomes writable, and a `reserved` region gets real host memory (`back_reserved`) before it becomes
   accessible. Otherwise only a permission downgrade sets `dirty`; a range containing fork CoW pages
   gets an immediate `shootdown` either way.
 - `mremap` follows Linux's order: no mapping at the old address is `EFAULT`; a `MREMAP_FIXED`
@@ -302,7 +329,10 @@ signals may still be delivered).
   a target only unmaps the tail; `MREMAP_DONTUNMAP` applies the one-VMA rule first. Growing in
   place needs the old end to be a VMA end, free space above, and the new end at or below
   `mmap_top`; the grown part becomes a separate VMA with the same lock, dump, fork and `anon`
-  flags. A move re-points the same host memory and moves the page-table entries with it.
+  flags (a `Fill` VMA's maps more of its host file, sharing the fill; the syscall opens no store
+  file for it). A move re-points the same host memory and moves the page-table entries with it.
+  `MREMAP_DONTUNMAP` leaves at the old address of a `Fill` VMA its host file mapped privately
+  again (what was read, as the page cache would give) instead of a `Refill`.
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
   address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
   unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`. A shared file mapping
@@ -322,7 +352,9 @@ signals may still be delivered).
   file's contents: whole host pages of a host private file mapping through host `MADV_DONTNEED`,
   and the rest (partial host pages on 16 KB hosts, or a mapping copied into anonymous memory when it
   became writable) as `Reread`s that the syscall reads from the store object (zeros past EOF, or
-  for an object that cannot be opened) and stores with `fill_private`. Executable ranges are queued
+  for an object that cannot be opened) and stores with `fill_private`; a `Fill` mapping's partial
+  host pages are read back from its host file, so it returns to what was read and its entries
+  stay. Executable ranges are queued
   for code invalidation; shared mappings and unwritten or `cow` ones are left alone. The vDSO is
   refilled from the kernel's image (with the svc stubs when `vdso_svc`) after its pages are
   discarded (Linux's special mapping faults its pages back), so its code survives.
@@ -412,7 +444,10 @@ signals may still be delivered).
     length; everything else gets new anonymous memory;
   - private anonymous VMAs that were ever written are lent, except `MADV_WIPEONFORK` ones, where
     the child keeps its own all-zero memory; never-written ones need nothing;
-  - writable private file VMAs are copied page by page up to EOF, skipping all-zero pages.
+  - writable private file VMAs are copied page by page up to EOF, skipping all-zero pages; a
+    `Fill` one instead maps its host file privately again and copies the pages read that differ
+    from it, keeping the same fill (pages either side reads later reach both), and is never
+    carved.
 - Lending: VMAs of at most 16 pages lend every page. Larger ones read the host
   `/proc/self/pagemap` only over 2 MB leaf windows that have entries or CoW pages (merged up to
   1 GB); untouched pages are known zero and the child keeps its own. If pagemap is unreadable, every
@@ -582,7 +617,9 @@ signals may still be delivered).
 ### Inbound
 
 - Syscall dispatch: `syscall/mem.rs`, and `syscall/mod.rs` (`sync` after every BKL syscall, stack
-  growth at entry).
+  growth at entry, `take_wanted` on a retry).
+- `kernel/fuse`: `Fill` (`map_fill` makes it, `fill` reads into it, `prefault` reads syscall
+  buffers in through `first_unread`).
 - Processes: `syscall/proc.rs` (clone/fork, execve), `syscall/ns.rs` (setns, `vdso_syscalls`),
   `task.rs` (run loop, fault dispatch, users),
   `kernel.rs` (`Cx` stack growth, BKL hooks), `signal.rs` (signal frames).
@@ -604,6 +641,8 @@ signals may still be delivered).
   `page_size`.
 - `kernel/signal`'s vDSO: the image to refill (`image`, `svc_image`), the clock entries and their
   stubs (`clocks`, `svc_bytes`), and its identity as a trusted translation source.
+- `kernel/fuse` through `Fill::source` (the open file a `Fill` keeps open; reading is the
+  caller's).
 - vfs (file kinds, mount flags, seals), credentials (`CAP_IPC_LOCK`), rlimits; SysV IPC
   (`reap_shm` after munmap, mremap and `MAP_FIXED` mmap, so a removed segment goes with its last
   attachment).
@@ -626,6 +665,10 @@ signals may still be delivered).
   every user it waits for: an unkicked one may run guest code indefinitely, such as a spin waiting
   for a thread that waits for that BKL, and the whole kernel stops (LTP shmctl05). Kicks are sticky,
   so a kicked thread stops at its next guest entry too.
+- A `Fill` VMA has `file_len` 0 and entries only for pages read; a page not read is never written
+  anywhere (guest writes need an entry, kernel writes read it first), so storing it into the host
+  file shows it to every VMA of the fill, and copies of a `Fill` VMA (fork, `unshare`, mremap)
+  map that host file again rather than copying into anonymous memory.
 - Every private anonymous page with content has a page-table entry. Kernel-side writes, mlock and
   `MAP_POPULATE` fill entries, mremap moves them, and `PROT_NONE` keeps them with prot 0. fork's
   lending and RSS measurement rely on this.
@@ -669,6 +712,13 @@ signals may still be delivered).
   guest code (with a flushed TLB) while the caller still holds the BKL; `set_protection`, which
   gives copy-on-write pages new permissions before taking write permission from lent ones, assumes
   no thread runs guest code in between, and such a thread could write a lent page there.
+- **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
+  touched, so writes through the mount or by another process are not seen and separate mmap calls
+  read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,
+  `MADV_WILLNEED` and core dumps do not read pages (dumps write unread pages as zeros); a kernel
+  access to an unread page reruns the whole syscall, so a syscall other than read/write, pread,
+  pwrite and the vector forms (whose buffers the dispatcher reads in first) repeats what it did
+  before the copy, or returns a short count after a partial transfer.
 - **Some madvise advice is ignored:** `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*` are accepted
   but do nothing.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets

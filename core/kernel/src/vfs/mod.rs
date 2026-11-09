@@ -1680,6 +1680,18 @@ impl Vfs {
         self.mounts.borrow().list.clone()
     }
 
+    /// The roots and mount points of every mount, attached or detached.
+    pub(crate) fn mount_nodes(&self) -> Vec<Node> {
+        let mounts = self.mounts.borrow();
+        mounts
+            .list
+            .iter()
+            .chain(&mounts.detached)
+            .flat_map(|m| [Some(m.root.clone()), m.point.clone()])
+            .flatten()
+            .collect()
+    }
+
     /// Attached mounts in mount namespace `ns`, in mount order.
     #[cfg(test)]
     fn mounts_in(&self, ns: u64) -> Vec<Mount> {

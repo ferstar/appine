@@ -530,7 +530,7 @@ pub(crate) const RECORDED: [(&[u8], u32, i64, i64, i64); 40] = {
             INT_MIN,
             INT_MAX,
         ),
-        // Write-only; nothing to drop, as the host keeps the page cache
+        // Write-only; the host keeps the page cache, and FUSE nodes are forgotten (write)
         (b"sys/vm/drop_caches", 0o200, 0, 1, 4),
         (b"sys/vm/mmap_rnd_bits", 0o600, 18, 18, 33),
         (b"sys/vm/mmap_rnd_compat_bits", 0o600, 11, 11, 16),
@@ -4179,6 +4179,16 @@ pub(crate) fn write(
             .and_then(|s| s.trim().parse().ok())
             .ok_or(Errno::EINVAL)?;
         crate::mm::MMAP_MIN_ADDR.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Dropping dentries and inodes (2, 3) forgets the FUSE nodes nothing uses; the host keeps
+    // the page cache
+    if let PseudoNode::Static(b"sys/vm/drop_caches") = node
+        && let Some(v) = std::str::from_utf8(data)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+        && (1..=4).contains(&v)
+    {
+        crate::vfs::fuse::drop_caches(v);
     }
     if let PseudoNode::Static(b"sys/vm/max_map_count") = node {
         let n: usize = std::str::from_utf8(data)

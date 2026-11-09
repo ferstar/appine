@@ -168,6 +168,170 @@ pub struct Refill {
     pub name: Option<Rc<[u8]>>,
 }
 
+/// A file mapping whose pages are read from the file only when first touched (a FUSE file: there
+/// is no page cache to map, and the daemon cannot be waited for under the BKL). Every VMA made from
+/// one mmap call (split, forked, moved or grown by mremap) holds the same `Fill`, and its host
+/// memory maps `host` at the file's own offsets, shared or privately. Such VMAs keep `file_len` 0,
+/// so nothing builds their entries but [`Mm::fault_in`], and only for pages already read. A page
+/// not yet read has no private copy anywhere (no entry, no kernel write: those need it read
+/// first), so storing it into `host` ([`Fill::store`]) reaches every mapping of it, and
+/// `MADV_DONTNEED` brings a private page back to what was read.
+pub struct Fill {
+    /// What was read so far, at the file's own offsets; the rest are holes.
+    host: std::fs::File,
+    /// The file's size when it was mapped: `host`'s length, past which accesses get SIGBUS.
+    size: u64,
+    /// The file to read from, kept open while it is mapped (Linux's `vm_file`).
+    pub source: crate::fd::FileRef,
+    /// Pages read so far, as runs of file page numbers (start → end).
+    filled: RefCell<BTreeMap<u64, u64>>,
+    /// The file page where the last read ended and how many pages it took: a fault right there
+    /// reads twice as much, up to [`FILL_MAX`] (Linux ramps up its read-ahead the same way).
+    ahead: Cell<(u64, u64)>,
+}
+
+/// Pages one read of a [`Fill`] takes around a fault (Linux's default read-ahead, 128 KB).
+const FILL_PAGES: u64 = 32;
+
+/// The most pages one read of a [`Fill`] takes for sequential faults.
+const FILL_MAX: u64 = 512;
+
+thread_local! {
+    /// The page of an on-demand file mapping ([`Fill`]) that a kernel access found not yet read:
+    /// the access failed with [`Errno::FUSE_RETRY`], and the syscall dispatcher reads it
+    /// ([`take_wanted`]) and runs the syscall again.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static WANTED: std::cell::RefCell<Option<(Rc<Fill>, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The page a kernel access last wanted read ([`WANTED`]): the fill and its file page number.
+pub fn take_wanted() -> Option<(Rc<Fill>, u64)> {
+    WANTED.with_borrow_mut(Option::take)
+}
+
+impl Fill {
+    /// A fill reading from `source` into the empty host file `host`, which is `size` bytes long.
+    pub fn new(host: std::fs::File, size: u64, source: crate::fd::FileRef) -> Rc<Fill> {
+        Rc::new(Fill {
+            host,
+            size,
+            source,
+            filled: RefCell::new(BTreeMap::new()),
+            ahead: Cell::new((u64::MAX, 0)),
+        })
+    }
+
+    /// Its host file.
+    pub fn fd(&self) -> i32 {
+        std::os::fd::AsRawFd::as_raw_fd(&self.host)
+    }
+
+    /// Whether file page `page` has been read.
+    fn has(&self, page: u64) -> bool {
+        self.filled
+            .borrow()
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, &end)| page < end)
+    }
+
+    /// The first file page in `[lo, hi)` not yet read.
+    fn first_missing(&self, lo: u64, hi: u64) -> Option<u64> {
+        let mut at = lo;
+        for (s, e) in self.runs(lo, hi) {
+            if at < s {
+                break;
+            }
+            at = e;
+        }
+        (at < hi).then_some(at)
+    }
+
+    /// The runs of pages read within file pages `[lo, hi)`.
+    fn runs(&self, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+        let filled = self.filled.borrow();
+        let first = filled.range(..=lo).next_back().map_or(lo, |(&s, _)| s);
+        filled
+            .range(first..hi)
+            .map(|(&s, &e)| (s.max(lo), e.min(hi)))
+            .filter(|(s, e)| s < e)
+            .collect()
+    }
+
+    /// The bytes of the file to read for a fault on file page `page`, as (offset, length): the
+    /// pages not yet read around it ([`FILL_PAGES`]), within the file. A fault right after pages
+    /// already read reads ahead instead, twice as much as the last read when it continues it, or
+    /// as the pages read just before (Linux's context read-ahead), up to [`FILL_MAX`]. None when
+    /// the page has been read meanwhile or lies past the end.
+    pub fn window(&self, page: u64) -> Option<(u64, u64)> {
+        let last = self.size.div_ceil(PAGE_SIZE);
+        if page >= last || self.has(page) {
+            return None;
+        }
+        let (next, prev) = self.ahead.get();
+        let before = self
+            .filled
+            .borrow()
+            .range(..page)
+            .next_back()
+            .filter(|&(_, &e)| e == page)
+            .map_or(0, |(&s, _)| page - s);
+        let (lo, hi) = if page == next || before > 0 {
+            let size = if page == next { prev } else { before };
+            (page, page + (size * 2).clamp(FILL_PAGES, FILL_MAX))
+        } else {
+            let lo = page.saturating_sub(FILL_PAGES / 2);
+            (lo, lo + FILL_PAGES)
+        };
+        let filled = self.filled.borrow();
+        let lo = filled
+            .range(..page)
+            .next_back()
+            .map_or(lo, |(_, &e)| lo.max(e));
+        let hi = filled
+            .range(page..)
+            .next()
+            .map_or(hi, |(&s, _)| hi.min(s))
+            .min(last);
+        Some((lo * PAGE_SIZE, (hi - lo) * PAGE_SIZE))
+    }
+
+    /// Stores what was read for [`Fill::window`] `(offset, len)` (`data`, shorter at the end of
+    /// the file): only pages still not read, as another thread may have read some meanwhile.
+    pub fn store(&self, (offset, len): (u64, u64), data: &[u8]) -> Result<(), Errno> {
+        use std::os::unix::fs::FileExt;
+        let (lo, hi) = (offset / PAGE_SIZE, (offset + len) / PAGE_SIZE);
+        let mut at = lo;
+        for (s, e) in self.runs(lo, hi).into_iter().chain([(hi, hi)]) {
+            // [at, s) is still missing
+            let from = ((at - lo) * PAGE_SIZE) as usize;
+            let to = (((s - lo) * PAGE_SIZE) as usize).min(data.len());
+            if from < to {
+                self.host
+                    .write_all_at(&data[from..to], at * PAGE_SIZE)
+                    .map_err(|e| Errno(e.raw_os_error().unwrap_or(Errno::EIO.0)))?;
+            }
+            at = e;
+        }
+        let mut filled = self.filled.borrow_mut();
+        // Merge with the runs it touches
+        let (mut s, mut e) = (lo, hi);
+        let touching: Vec<u64> = filled
+            .range(..=hi)
+            .filter(|&(_, &end)| end >= lo)
+            .map(|(&start, _)| start)
+            .collect();
+        for start in touching {
+            let end = filled.remove(&start).unwrap();
+            (s, e) = (s.min(start), e.max(end));
+        }
+        filled.insert(s, e);
+        self.ahead.set((hi, hi - lo));
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct Vma {
     len: u64,
@@ -232,6 +396,8 @@ struct Vma {
     /// its own, shared by the pieces that were one VMA in the parent. On Linux such child VMAs no
     /// longer merge with their neighbours, while the parent's still do.
     anon: u64,
+    /// A file mapping read on demand ([`Fill`]); its `file_len` stays 0.
+    fill: Option<Rc<Fill>>,
 }
 
 impl Vma {
@@ -243,6 +409,28 @@ impl Vma {
     /// `[vvar]`: the host's memory, only read ([`HostRegion::foreign`]).
     fn foreign(&self) -> bool {
         self.region.foreign
+    }
+
+    /// The file offset of its start (0 for anonymous memory).
+    fn offset(&self) -> u64 {
+        self.file_id.map_or(0, |f| f.2)
+    }
+
+    /// Bytes from its start that the host memory may be read at: `file_len`, or for a mapping read
+    /// on demand ([`Fill`]) as far as the file reached when mapped.
+    fn contents_len(&self) -> u64 {
+        match &self.fill {
+            Some(f) => extent(f.size as i64, self.offset(), self.len),
+            None => self.file_len,
+        }
+    }
+
+    /// For a mapping read on demand: the file page of guest address `addr` (in this VMA starting
+    /// at `start`) and its fill, when that page lies within the file but has not been read.
+    fn unread(&self, start: u64, addr: u64) -> Option<(Rc<Fill>, u64)> {
+        let fill = self.fill.as_ref()?;
+        let page = (self.offset() + (addr - start)) / PAGE_SIZE;
+        (addr < start + self.contents_len() && !fill.has(page)).then(|| (fill.clone(), page))
     }
 
     /// A shared mapping of store file `ino` through host file `from`, which follows the file when
@@ -356,6 +544,8 @@ pub struct Mm {
     me: MmRef,
     /// Host mappings of read-only file mappings, shared by all address spaces ([`FileMaps`]).
     files: FileMaps,
+    /// A mapping read on demand ([`Fill`]) has been made here (or in the parent before fork).
+    fills: bool,
 }
 
 impl Mm {
@@ -403,6 +593,7 @@ impl Mm {
             loans: Rc::default(),
             me: Weak::new(),
             files: FileMaps::default(),
+            fills: false,
         }
     }
 
@@ -865,7 +1056,7 @@ impl Mm {
             return false;
         };
         let p = mmu_prot(v.prot);
-        let end = s + v.file_len.min(v.len);
+        let end = s + v.contents_len().min(v.len);
         if page >= end || p == 0 || p & need != need {
             return false;
         }
@@ -874,10 +1065,88 @@ impl Mm {
         }
         let lo = (page & !(LEAF_SPAN - 1)).max(s);
         let hi = ((page | (LEAF_SPAN - 1)) + 1).min(end);
-        // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
-        // memory
-        let host = unsafe { v.host.add((lo - s) as usize) };
-        unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok()
+        let Some(fill) = &v.fill else {
+            // SAFETY: [lo, hi) is inside the part of this VMA with contents, and it holds the host
+            // memory
+            let host = unsafe { v.host.add((lo - s) as usize) };
+            return unsafe { self.mmu.fill_shared(lo, host, hi - lo, p) }.is_ok();
+        };
+        // Read on demand: only the pages already read
+        if v.unread(s, page).is_some() {
+            return false;
+        }
+        let first = (v.offset() / PAGE_SIZE) as i128 - (s / PAGE_SIZE) as i128;
+        let guest = |p: u64| ((p as i128 - first) as u64) * PAGE_SIZE;
+        let file = |a: u64| ((a / PAGE_SIZE) as i128 + first) as u64;
+        for (a, b) in fill.runs(file(lo), file(hi)) {
+            let (from, to) = (guest(a), guest(b));
+            // SAFETY: [from, to) is inside the part of this VMA with contents, and it holds the
+            // host memory
+            let host = unsafe { v.host.add((from - s) as usize) };
+            if unsafe { self.mmu.fill_shared(from, host, to - from, p) }.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// For a guest access to `addr` that [`Mm::fault_in`] could not satisfy: the page of an
+    /// on-demand file mapping ([`Fill`]) still to be read, when the mapping allows the access
+    /// (`need`). The caller reads it and retries.
+    pub fn fill_wanted(&self, addr: u64, need: u32) -> Option<(Rc<Fill>, u64)> {
+        let (&s, v) = self.vmas.range(..=addr).next_back()?;
+        let p = mmu_prot(v.prot);
+        if addr >= s + v.len || p == 0 || p & need != need {
+            return None;
+        }
+        v.unread(s, addr)
+    }
+
+    /// Whether some mapping is read on demand ([`Fill`]): only then can a buffer need reading
+    /// before a syscall uses it ([`Mm::first_unread`]).
+    pub fn has_fills(&self) -> bool {
+        self.fills
+    }
+
+    /// The first page of `[addr, addr + len)` that lies in an on-demand file mapping ([`Fill`])
+    /// allowing `need` (any mapping, even `PROT_NONE`, when 0) and has not been read.
+    pub fn first_unread(&self, addr: u64, len: u64, need: u32) -> Option<(Rc<Fill>, u64)> {
+        let end = addr.saturating_add(len);
+        let first = self
+            .vmas
+            .range(..=addr)
+            .next_back()
+            .map_or(addr, |(&s, _)| s);
+        for (&s, v) in self.vmas.range(first..end) {
+            let p = mmu_prot(v.prot);
+            if v.fill.is_none() || need != 0 && (p == 0 || p & need != need) {
+                continue;
+            }
+            let (from, to) = (addr.max(s), end.min(s + v.contents_len()));
+            if from >= to {
+                continue;
+            }
+            let first = v.offset() / PAGE_SIZE;
+            let (lo, hi) = ((from - s) / PAGE_SIZE, (to - s).div_ceil(PAGE_SIZE));
+            let fill = v.fill.as_ref().unwrap();
+            if let Some(page) = fill.first_missing(first + lo, first + hi) {
+                return Some((fill.clone(), page));
+            }
+        }
+        None
+    }
+
+    /// The error of a kernel access to `addr` that found no page (`need`): when it is a page of an
+    /// on-demand file mapping still to be read, [`Errno::FUSE_RETRY`], recording it for the
+    /// dispatcher ([`take_wanted`]); EFAULT otherwise.
+    fn miss(&self, addr: u64, need: u32) -> Errno {
+        match self.fill_wanted(addr, need) {
+            Some(w) => {
+                WANTED.with_borrow_mut(|x| *x = Some(w));
+                Errno::FUSE_RETRY
+            }
+            None => Errno::EFAULT,
+        }
     }
 
     /// Called when a guest access to `addr` faults. Returns `Some(true)` if the address is in the
@@ -886,8 +1155,12 @@ impl Mm {
     /// instruction can simply be re-executed. Returns None otherwise.
     pub fn fault_past_eof(&mut self, addr: u64) -> Option<bool> {
         let (&s, v) = self.vmas.range(..=addr).next_back()?;
-        if addr >= s + v.len || addr < s + v.file_len {
+        if addr >= s + v.len || addr < s + v.contents_len() {
             return None;
+        }
+        // A mapping read on demand keeps the size the file had when mapped
+        if v.fill.is_some() {
+            return Some(true);
         }
         if let (Backing::Shared, Some((fd, offset))) = (v.backing, &v.file) {
             let extent = file_extent(std::os::fd::AsRawFd::as_raw_fd(&**fd), *offset, v.len);
@@ -1099,7 +1372,7 @@ impl Mm {
                         .translate(cur, required_prot)
                         .ok_or(Errno::EFAULT)?
                 }
-                None => return Err(Errno::EFAULT),
+                None => return Err(self.miss(cur, required_prot)),
             };
             f(host.as_ptr(), done, chunk);
             done += chunk;
@@ -1124,7 +1397,9 @@ impl Mm {
         let mut cur = addr;
         loop {
             let chunk = (PAGE_SIZE - cur % PAGE_SIZE) as usize;
-            let host = self.translate(cur, prot::READ).ok_or(Errno::EFAULT)?;
+            let host = self
+                .translate(cur, prot::READ)
+                .ok_or_else(|| self.miss(cur, prot::READ))?;
             // SAFETY: translate guarantees this page stays valid for the duration of this call
             let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr(), chunk) };
             if let Some(n) = bytes.iter().position(|&b| b == 0) {
@@ -1152,6 +1427,15 @@ impl Mm {
         // own, and file mappings sharing host memory with other address spaces first copy their
         // own
         let end = page_up(addr.saturating_add(data.len() as u64)).unwrap_or(u64::MAX);
+        // The pages of a mapping read on demand are read first: the write keeps the rest of them
+        if let Some(w) = self
+            .fills
+            .then(|| self.first_unread(addr, data.len() as u64, 0))
+            .flatten()
+        {
+            WANTED.with_borrow_mut(|x| *x = Some(w));
+            return Err(Errno::FUSE_RETRY);
+        }
         self.cow_settle(addr & !(PAGE_SIZE - 1), end);
         let first = self
             .vmas
@@ -1194,9 +1478,9 @@ impl Mm {
                 .vmas
                 .range(..=cur)
                 .next_back()
-                .filter(|&(&s, v)| cur < s + v.file_len)
+                .filter(|&(&s, v)| cur < s + v.contents_len())
                 .ok_or(Errno::EFAULT)?;
-            let chunk = ((s + v.file_len - cur) as usize).min(data.len() - done);
+            let chunk = ((s + v.contents_len() - cur) as usize).min(data.len() - done);
             v.written.set(true);
             self.exec_changed |= v.prot & prot::EXEC != 0;
             // SAFETY: [cur, cur + chunk) is in the part of this VMA with contents, and it holds
@@ -1301,6 +1585,32 @@ impl Mm {
         flags: u32,
         file: Option<(i32, u64, bool)>,
     ) -> Result<u64, Errno> {
+        self.map(addr, len, prot, flags, file, None)
+    }
+
+    /// mmap(2) of a file read on demand ([`Fill`]) from file offset `offset`: its pages get
+    /// entries only once read.
+    pub fn mmap_fill(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+        (fill, offset): (Rc<Fill>, u64),
+    ) -> Result<u64, Errno> {
+        let file = Some((fill.fd(), offset, false));
+        self.map(addr, len, prot, flags, file, Some(fill))
+    }
+
+    fn map(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        flags: u32,
+        file: Option<(i32, u64, bool)>,
+        fill: Option<Rc<Fill>>,
+    ) -> Result<u64, Errno> {
         let len = page_up(len).filter(|&l| l != 0).ok_or(Errno::EINVAL)?;
         let shared = flags & 3 == flags::MAP_SHARED;
         if !shared && flags & 3 != flags::MAP_PRIVATE {
@@ -1339,6 +1649,7 @@ impl Mm {
             .zip(file)
             .map(|(s, (_, offset, _))| (s.st_dev, s.st_ino, offset));
         let content = match (&st, file_id) {
+            _ if fill.is_some() => None,
             (Some(_), Some((dev, ino, _))) if shared && file.is_some_and(|f| f.2) => {
                 content::writably_shared(dev, ino);
                 None
@@ -1416,6 +1727,7 @@ impl Mm {
             return Err(Errno::EACCES);
         }
         let file_len = match file {
+            _ if fill.is_some() => 0,
             Some((_, offset, _)) => extent(st.as_ref().map_or(0, |s| s.st_size), offset, len),
             None => len,
         };
@@ -1432,12 +1744,14 @@ impl Mm {
             _ => None,
         };
         self.insert(start, len, file_len, prot, backing, may_write, region, host)?;
+        self.fills |= fill.is_some();
         let v = self.vmas.get_mut(&start).unwrap();
         v.file_id = file_id;
         v.content = content;
         v.cow = cached;
         v.file = dup;
         v.noreserve = flags & flags::MAP_NORESERVE != 0;
+        v.fill = fill;
         if backing == Backing::Shared && may_write {
             self.note_shared_maps(false);
         }
@@ -1505,6 +1819,14 @@ impl Mm {
                     v.locked = false;
                     alias.push((s, v));
                 }
+                // Read on demand: the host file holds what was read, as the page cache would
+                Backing::PrivateFile if v.fill.is_some() => {
+                    let (region, host) = Self::fill_host(v, v.offset(), v.len)?;
+                    let mut v = v.clone();
+                    (v.region, v.host, v.locked, v.cow) = (region, host, false, false);
+                    v.written.set(v.prot & prot::WRITE != 0);
+                    alias.push((s, v));
+                }
                 Backing::PrivateFile => refill.push(Refill {
                     start: s,
                     len: v.len,
@@ -1531,7 +1853,8 @@ impl Mm {
     /// it ([`Mm::mremap`]).
     pub fn private_file_ino(&self, addr: u64) -> Option<u64> {
         let (&s, v) = self.vmas.range(..=addr).next_back()?;
-        (addr < s + v.len && v.backing == Backing::PrivateFile && v.ino != 0).then_some(v.ino)
+        (addr < s + v.len && v.backing == Backing::PrivateFile && v.ino != 0 && v.fill.is_none())
+            .then_some(v.ino)
     }
 
     /// Implements mremap(2): `fixed` is the `MREMAP_FIXED` target address. When growing it first
@@ -1708,6 +2031,15 @@ impl Mm {
         }
         // (host memory, host address, fd kept for a shared mapping, bytes with file contents)
         let (region, host, file, file_len) = match (&template.backing, &template.file) {
+            // Read on demand: more of the same host file, its entries built as pages are read
+            _ if template.fill.is_some() => {
+                let (region, host) = Self::fill_host(template, template.offset() + offset, len)?;
+                let file = template
+                    .file
+                    .as_ref()
+                    .map(|(fd, o)| (fd.clone(), o + offset));
+                (region, host, file, 0)
+            }
             (Backing::Shared, Some((fd, start))) => {
                 let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
                 let file_offset = start + offset;
@@ -1776,7 +2108,52 @@ impl Mm {
             dontfork: template.dontfork,
             noreserve: template.noreserve,
             anon: template.anon,
+            fill: template.fill.clone(),
         })
+    }
+
+    /// Host memory for `len` bytes of on-demand VMA `v`'s file from `offset` ([`Fill`]): its host
+    /// file mapped again, shared or privately as `v` is.
+    fn fill_host(v: &Vma, offset: u64, len: u64) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        let fill = v.fill.as_ref().ok_or(Errno::EFAULT)?;
+        let host_len = usize::try_from(len).map_err(|_| Errno::ENOMEM)?;
+        let shared = v.backing == Backing::Shared;
+        let m = appine_hal::map_file(fill.fd(), offset, host_len, shared, false).map_err(Errno)?;
+        let region = Arc::new(HostRegion {
+            base: m.base,
+            len: m.len,
+            anonymous: None,
+            reserved: false,
+            foreign: false,
+        });
+        Ok((region, m.ptr))
+    }
+
+    /// A private copy of on-demand VMA `v` ([`Fill`]) for fork or for [`Mm::unshare`]: its host file
+    /// mapped privately again, with the pages `v` changed after reading them copied over (pages
+    /// not read are still holes on both sides).
+    fn fill_copy(v: &Vma) -> Result<(Arc<HostRegion>, NonNull<u8>), Errno> {
+        let (region, host) = Self::fill_host(v, v.offset(), v.len)?;
+        let fill = v.fill.as_ref().unwrap();
+        let first = v.offset() / PAGE_SIZE;
+        let pages = v.contents_len() / PAGE_SIZE;
+        for (a, b) in fill.runs(first, first + pages) {
+            for p in a..b {
+                let at = ((p - first) * PAGE_SIZE) as usize;
+                // SAFETY: both pieces of host memory have v.len bytes, this page lies within the
+                // file's contents, and they do not overlap
+                unsafe {
+                    let src =
+                        std::slice::from_raw_parts(v.host.as_ptr().add(at), PAGE_SIZE as usize);
+                    let dst =
+                        std::slice::from_raw_parts_mut(host.as_ptr().add(at), PAGE_SIZE as usize);
+                    if src != dst {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+        }
+        Ok((region, host))
     }
 
     /// Moves the mappings in `[old, old + len)` to `dst` as they are (the host memory stays put).
@@ -2278,10 +2655,37 @@ impl Mm {
             }
             // Only written pages differ from the file (a `cow` mapping never is), and whole pages
             // past the end of the file have no entries
-            let in_file = stop.min(s + page_up(v.file_len).unwrap_or(v.len));
+            let in_file = stop.min(s + page_up(v.contents_len()).unwrap_or(v.len));
             if v.backing == Backing::PrivateFile && v.written.get() && !v.cow && cursor < in_file {
                 if v.prot & prot::EXEC != 0 {
                     self.code_ranges.push((cursor, in_file - cursor));
+                }
+                // Read on demand: its host file holds what was read, which the rest of a host page
+                // is read back from
+                if let Some(fill) = &v.fill {
+                    use std::os::unix::fs::FileExt;
+                    // SAFETY: [cursor, in_file) is inside this VMA's host file mapping
+                    let left = unsafe {
+                        discard_file_host(
+                            v.host.add((cursor - s) as usize),
+                            (in_file - cursor) as usize,
+                        )
+                    };
+                    let base = v.offset() + (cursor - s);
+                    for (off, l) in left {
+                        // SAFETY: this piece lies inside this VMA's own writable host memory
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                v.host.as_ptr().add((cursor - s) as usize + off),
+                                l,
+                            )
+                        };
+                        if fill.host.read_exact_at(dst, base + off as u64).is_err() {
+                            dst.fill(0);
+                        }
+                    }
+                    cursor = stop;
+                    continue;
                 }
                 let base = v.file_id.map_or(0, |f| f.2) + (cursor - s);
                 let reread = |a: u64, l: u64| Reread {
@@ -2389,7 +2793,7 @@ impl Mm {
                 // Only written pages differ from the file (a `cow` mapping never is), and whole
                 // pages past its end have no entries
                 Backing::PrivateFile if !v.cow => {
-                    let len = page_up(v.file_len).unwrap_or(v.len).min(v.len) as usize;
+                    let len = page_up(v.contents_len()).unwrap_or(v.len).min(v.len) as usize;
                     // SAFETY: [host, host + len) is this VMA's own private host memory
                     unsafe {
                         if v.region.anonymous.is_none() {
@@ -2635,6 +3039,7 @@ impl Mm {
         child.exe = self.exe;
         child.dbt_regs = self.dbt_regs;
         child.mmap_top = self.mmap_top;
+        child.fills = self.fills;
         child.start_stack = self.start_stack;
         child.stack_low = self.stack_low;
         let spare: BTreeMap<u64, u64> = self
@@ -2662,7 +3067,7 @@ impl Mm {
                     && v.len <= FORK_PIECE_MAX
                     && match v.backing {
                         Backing::Shared => false,
-                        Backing::PrivateFile => v.prot & prot::WRITE != 0,
+                        Backing::PrivateFile => v.prot & prot::WRITE != 0 && v.fill.is_none(),
                         Backing::Anonymous => true,
                     }
             })
@@ -2719,6 +3124,8 @@ impl Mm {
                 };
             let (region, host) = if share {
                 (v.region.clone(), v.host)
+            } else if v.fill.is_some() {
+                Self::fill_copy(v)?
             } else {
                 // The heap still reserves host address space, so growing it in the child extends
                 // the same VMA too
@@ -2775,6 +3182,7 @@ impl Mm {
             c.dontdump = v.dontdump;
             c.wipeonfork = v.wipeonfork;
             c.anon = anon[&start];
+            c.fill = v.fill.clone();
         }
         let (mut borrowed, mut lent) = (Vec::new(), Vec::new());
         for start in cow {
@@ -3487,11 +3895,11 @@ impl Mm {
             .vmas
             .range(..=addr)
             .next_back()
-            .filter(|&(&s, v)| addr < s + v.file_len.min(v.len))
+            .filter(|&(&s, v)| addr < s + v.contents_len().min(v.len))
         else {
             return false;
         };
-        let n = buf.len().min((s + v.file_len - addr) as usize);
+        let n = buf.len().min((s + v.contents_len() - addr) as usize);
         let host = if self
             .cow
             .borrow()
@@ -3609,6 +4017,18 @@ impl Mm {
     /// its own.
     fn unshare(&mut self, start: u64) -> Result<(), Errno> {
         let v = &self.vmas[&start];
+        if v.fill.is_some() {
+            // Read on demand: the entries come back as pages are touched again
+            let (region, host) = Self::fill_copy(v)?;
+            self.mmu.unmap(start, v.len).map_err(map_err)?;
+            let v = self.vmas.get_mut(&start).unwrap();
+            let old = std::mem::replace(&mut v.region, region);
+            v.host = host;
+            v.cow = false;
+            self.graveyard.push(old);
+            self.dirty = true;
+            return Ok(());
+        }
         let reserve = v.prot & prot::WRITE != 0 && !v.noreserve;
         let (region, host) = Self::new_anonymous(v.len, reserve)?;
         // SAFETY: both pieces of host memory have at least v.len bytes and do not overlap
@@ -3698,6 +4118,7 @@ impl Mm {
                 dontfork: false,
                 noreserve: false,
                 anon: 0,
+                fill: None,
             },
         );
         Ok(())
@@ -5706,6 +6127,123 @@ mod tests {
         child.read(UserSlice::new(hidden, 4), &mut buf).unwrap();
         assert_eq!(&buf, b"kept");
         assert!(!child.vmas[&(reserved + PAGE_SIZE)].written.get());
+    }
+
+    #[test]
+    fn fill_reads_ahead_after_pages_read() {
+        let host = appine_hal::memfd(c"appine-mm-fill").unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let f = Fill::new(host, 2048 * PAGE_SIZE, source);
+        let window = |page: u64| {
+            let (off, len) = f.window(page).unwrap();
+            f.store((off, len), &[]).unwrap();
+            (off / PAGE_SIZE, len / PAGE_SIZE)
+        };
+        // Around the first fault, then twice as much where it ended
+        assert_eq!(window(0), (0, 32));
+        assert_eq!(window(32), (32, 64));
+        assert_eq!(window(500), (484, 32));
+        // Right after 96 pages read: twice that, though the last read was elsewhere
+        assert_eq!(window(96), (96, 192));
+        // Up to the pages read further on
+        assert_eq!(window(288), (288, 196));
+        assert_eq!(window(1000), (984, 32));
+        assert_eq!(f.window(100), None);
+        assert_eq!(f.window(2048), None);
+    }
+
+    #[test]
+    fn mappings_read_on_demand_map_only_pages_read() {
+        let size = 100 * PAGE_SIZE + 100;
+        let host = appine_hal::memfd(c"appine-mm-fill").unwrap();
+        host.set_len(size).unwrap();
+        let source = crate::fd::OpenFile::new(crate::fd::FileKind::Host(-1), 0);
+        let fill = Fill::new(host, size, source);
+        // The daemon's part: file page p holds p + 1
+        let read = |f: &Fill, page: u64| {
+            let (off, len) = f.window(page).unwrap();
+            let mut data: Vec<u8> = (off / PAGE_SIZE..(off + len) / PAGE_SIZE)
+                .flat_map(|p| [(p + 1) as u8; PAGE_SIZE as usize])
+                .collect();
+            data.truncate((size - off).min(len) as usize);
+            f.store((off, len), &data).unwrap();
+        };
+        let mut mm = Mm::new();
+        let len = 103 * PAGE_SIZE;
+        let a = mm
+            .mmap_fill(0, len, RW, flags::MAP_PRIVATE, (fill.clone(), 0))
+            .unwrap();
+        // Nothing has entries yet; a kernel access asks for the page it needs
+        assert!(!mm.fault_in(a + 50 * PAGE_SIZE, prot::READ));
+        let mut b = [0u8; 6];
+        let at = |p: u64| UserSlice::new(a + p * PAGE_SIZE, 6);
+        assert_eq!(mm.read(at(50), &mut b), Err(Errno::FUSE_RETRY));
+        let (f, page) = take_wanted().unwrap();
+        assert_eq!(page, 50);
+        // Read-around: 32 pages centred on the fault
+        assert_eq!(f.window(50), Some((34 * PAGE_SIZE, 32 * PAGE_SIZE)));
+        read(&f, 50);
+        mm.read(at(50), &mut b).unwrap();
+        assert_eq!(b, [51; 6]);
+        assert!(mm.fill_wanted(a + 65 * PAGE_SIZE, prot::READ).is_none());
+        assert_eq!(
+            mm.fill_wanted(a + 66 * PAGE_SIZE, prot::READ).unwrap().1,
+            66
+        );
+        // A fault where the last read ended reads twice as much, up to the end of the file
+        assert_eq!(fill.window(66), Some((66 * PAGE_SIZE, 35 * PAGE_SIZE)));
+        read(&fill, 66);
+        mm.read(UserSlice::new(a + 100 * PAGE_SIZE + 95, 6), &mut b)
+            .unwrap();
+        assert_eq!(b, [101, 101, 101, 101, 101, 0]);
+        // Past the end of the file there is nothing to read: SIGBUS
+        assert!(mm.fill_wanted(a + 101 * PAGE_SIZE, prot::READ).is_none());
+        assert_eq!(mm.fault_past_eof(a + 101 * PAGE_SIZE), Some(true));
+        assert_eq!(mm.fault_past_eof(a + 10 * PAGE_SIZE), None);
+        // Writes stay private and fork copies them; what either side reads reaches both
+        mm.write(at(40), b"parent").unwrap();
+        let child = mm.fork().unwrap();
+        child.borrow().read(at(40), &mut b).unwrap();
+        assert_eq!(&b, b"parent");
+        assert_eq!(child.borrow().read(at(10), &mut b), Err(Errno::FUSE_RETRY));
+        read(&take_wanted().unwrap().0, 10);
+        child.borrow().read(at(10), &mut b).unwrap();
+        assert_eq!(b, [11; 6]);
+        mm.read(at(10), &mut b).unwrap();
+        assert_eq!(b, [11; 6]);
+        child.borrow().write(at(41), b"child!").unwrap();
+        mm.read(at(41), &mut b).unwrap();
+        assert_eq!(b, [42; 6]);
+        // MADV_DONTNEED brings back what was read
+        assert!(
+            mm.discard(a + 40 * PAGE_SIZE, PAGE_SIZE)
+                .unwrap()
+                .is_empty()
+        );
+        mm.read(at(40), &mut b).unwrap();
+        assert_eq!(b, [41; 6]);
+        child.borrow().read(at(40), &mut b).unwrap();
+        assert_eq!(&b, b"parent");
+        // Grown by mremap, it goes on reading the same file
+        let moved = mm
+            .mremap(
+                a + 90 * PAGE_SIZE,
+                PAGE_SIZE,
+                8 * PAGE_SIZE,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        mm.read(UserSlice::new(moved + 5 * PAGE_SIZE, 6), &mut b)
+            .unwrap();
+        assert_eq!(b, [96; 6]);
+        // A kernel write into a page not read asks for it first
+        assert_eq!(
+            mm.write_kernel(a + 33 * PAGE_SIZE, b"x"),
+            Err(Errno::FUSE_RETRY)
+        );
+        assert_eq!(take_wanted().unwrap().1, 33);
     }
 
     #[test]

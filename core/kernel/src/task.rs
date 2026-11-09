@@ -809,7 +809,23 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
                 Access::Read => (EC_DABT_LOW, 0),
                 Access::Write => (EC_DABT_LOW, ESR_WNR),
             };
-            let past_eof = cx.mm_mut().fault_past_eof(addr);
+            // A FUSE file's mapping reads its pages as they are touched (crate::mm::Fill): read
+            // this one with the BKL released and re-execute. A signal arriving before the daemon
+            // took the read is delivered first, and the access faults again after it; a page that
+            // cannot be read is SIGBUS, as on Linux
+            let wanted = cx.mm().fill_wanted(addr, need);
+            let unreadable = match wanted {
+                Some(w) => match crate::syscall::fill(cx, w) {
+                    Ok(()) | Err(Errno::EINTR) => return signal::deliver(cx, cpu, false),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            let past_eof = if unreadable {
+                Some(true)
+            } else {
+                cx.mm_mut().fault_past_eof(addr)
+            };
             if past_eof == Some(false) {
                 // The file of a shared mapping grew and the new contents are mapped in: re-execute
                 return signal::deliver(cx, cpu, false);
