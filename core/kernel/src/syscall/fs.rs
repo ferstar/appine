@@ -3363,11 +3363,14 @@ fn try_share(cx: &mut Cx<'_>, input: &FileRef, output: &FileRef) -> Result<bool,
             host(so).map_err(host_errno)?,
         )
     };
-    // A deleted source's object may already be on its way to the reaper
+    // A deleted source's object may already be on its way to the reaper; an object the Files app
+    // is writing would carry its writes into both files
     let k = cx.kr();
     if k.unsharing.contains(&dst)
         || k.seals.contains_key(&dst)
         || vfs.store().attrs(src)?.nlink == 0
+        || vfs.store().host_writing(src)?
+        || vfs.store().host_writing(dst)?
     {
         return Ok(false);
     }
@@ -3388,7 +3391,7 @@ fn try_share(cx: &mut Cx<'_>, input: &FileRef, output: &FileRef) -> Result<bool,
     }
     remove_privs(cx, dst)?;
     vfs.store().share(src, dst)?;
-    rehome(cx, &vfs, dst);
+    rehome(cx.kr(), &vfs, dst);
     Ok(true)
 }
 
@@ -4469,7 +4472,7 @@ pub(super) fn make_private(cx: &mut Cx<'_>, ino: Ino, keep: Option<u64>) -> Resu
         moved_from = from.ok();
         break;
     }
-    rehome(cx, &vfs, ino);
+    rehome(cx.kr(), &vfs, ino);
     if let Some(from) = moved_from {
         move_mappings(cx, &vfs, ino, from);
     }
@@ -4529,10 +4532,10 @@ fn move_mappings(cx: &Cx<'_>, vfs: &Vfs, ino: Ino, from: (u64, u64)) {
 /// description borrowed at this moment keeps its handle; one opened for writing then fails to
 /// write (EBADF, its handle being read-only) rather than writing the shared object, or comes back
 /// here before writing when still marked.
-fn rehome(cx: &Cx<'_>, vfs: &Vfs, ino: Ino) {
+fn rehome(k: &crate::kernel::Kernel, vfs: &Vfs, ino: Ino) {
     let store = vfs.store();
     let held = store.held(ino).unwrap_or(true);
-    for file in opens_of(cx.kr(), ino) {
+    for file in opens_of(k, ino) {
         let Ok(mut f) = file.try_borrow_mut() else {
             crate::debug::log(format_args!("rehome: an open file of inode {ino} is busy"));
             continue;
@@ -4549,6 +4552,16 @@ fn rehome(cx: &Cx<'_>, vfs: &Vfs, ino: Ino) {
         }
     }
     vfs.forget_executable(ino);
+}
+
+/// The host (the Files app) gave held regular file `ino` an object of its own as it opened it for
+/// writing ([`crate::vfs::browse::open_write`]): this kernel's descriptions of it move there too, as
+/// after the kernel's own unsharing (shared mappings stay on the old object). Called with the BKL
+/// held.
+pub(crate) fn host_unshared(k: &crate::kernel::Kernel, ino: Ino) {
+    if let Some(vfs) = k.vfs.clone() {
+        rehome(k, &vfs, ino);
+    }
 }
 
 /// Every description of store regular file `ino` in this kernel: in fd tables, in AF_UNIX

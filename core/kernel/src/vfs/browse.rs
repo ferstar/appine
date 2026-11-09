@@ -206,11 +206,13 @@ pub enum Change {
         is_dir: bool,
     },
     /// Regular file `ino` (named `parent.1` in directory `parent.0`) was opened for writing,
-    /// truncated if `truncated`.
+    /// truncated if `truncated`; with `unshared` it shared its object until then and now has one
+    /// of its own, which the kernel's open files of it must move to.
     Opened {
         ino: Ino,
         parent: (Ino, Vec<u8>),
         truncated: bool,
+        unshared: bool,
     },
     /// A regular file opened for writing was closed: something was written (the other side
     /// writes the host object directly, and the kernel does not see each write).
@@ -405,7 +407,8 @@ fn moved(
 
 /// Opens a regular file inside `top` for reading and writing (following symlinks; the file pointed
 /// at must also be inside `top`), truncating it first with `truncate` and opening with `O_APPEND`
-/// with `append`. Returns the object on the host.
+/// with `append`. Returns the object on the host, recorded as written by the host until
+/// [`written`] reports the close by the same `path` ([`Store::host_opened`]).
 pub fn open_write(
     store: &Store,
     top: &[u8],
@@ -415,29 +418,33 @@ pub fn open_write(
     changes: &mut Vec<Change>,
 ) -> Result<File, Errno> {
     let (ino, parent) = writable_file(store, top, path)?;
+    let unshared = store.held(ino)?;
     // Truncated first: a file sharing its object then gets an empty one of its own rather than a
     // copy (Store::make_private)
     if truncate {
         store.truncate(ino, 0)?;
     }
     let file = store.open_object_append(ino, append)?;
+    store.host_opened(ino, path)?;
     changes.push(Change::Opened {
         ino,
         parent,
         truncated: truncate,
+        unshared,
     });
     Ok(file)
 }
 
 /// A file opened by [`open_write`] was closed (the other side writes to the host object, not
-/// through here): records [`Change::Written`]. Not recorded if the file was removed or moved away
-/// in the meantime.
+/// through here): its object may be shared again, and [`Change::Written`] is recorded, unless the
+/// file was removed or moved away in the meantime.
 pub fn written(
     store: &Store,
     top: &[u8],
     path: &[u8],
     changes: &mut Vec<Change>,
 ) -> Result<(), Errno> {
+    store.host_closed(path);
     let (ino, parent) = writable_file(store, top, path)?;
     changes.push(Change::Written { ino, parent });
     Ok(())
@@ -831,7 +838,8 @@ mod tests {
                 Change::Opened {
                     ino: a,
                     parent: parent.clone(),
-                    truncated: true
+                    truncated: true,
+                    unshared: false
                 },
                 Change::Written { ino: a, parent }
             ]

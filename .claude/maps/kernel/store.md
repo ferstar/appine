@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects; host writers last)
 
 ## Responsibilities
 
@@ -126,7 +126,13 @@ provider and rootfs installation UI (`android`).
   in place.
 - `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
   callers (the browse API, `write_file`) never write a shared object; they do not move the kernel's
-  open descriptions (`kernel/vfs` does that for its own unsharing).
+  open descriptions themselves: the browse API's `Opened` change says when it unshared the file
+  (`unshared`), and the kernel then moves its own (`kernel/vfs`).
+- Objects the provider handed out for writing are recorded process-wide (`HOST_WRITERS`: the
+  store's identity, the object, the path it was opened by) from `open_write` until `written`
+  reports the close by the same path, whatever became of the file; `host_writing` tells the kernel
+  not to share such an object with another file, as the provider's writes would reach both. A
+  close that is never reported keeps its object out of sharing (only copies are made).
 
 ### Namespace operations
 
@@ -310,11 +316,9 @@ provider and rootfs installation UI (`android`).
 
 ## Confirmed bugs / technical debt
 
-- **Shared objects across connections:** a Files app write to a held file makes it private without
-  moving the running kernel's open descriptions, which keep reading the shared object until the
-  kernel next moves them; and a file the Files app holds open for writing, cloned by the guest at
-  that moment, has its later writes land in the clone too (only the kernel's own writers are
-  checked).
+- **Shared mappings across connections:** when a Files app write gives a held file an object of its
+  own, the running kernel moves its open descriptions there but not its shared mappings, which
+  keep the old shared object.
 - **Shared objects of deleted files:** a held file deleted while open keeps its share until boot,
   so the next write to another file sharing the object copies it although nobody reads the deleted
   one any more.

@@ -113,6 +113,18 @@ const MAX_CHANGED_DIRS: usize = 256;
 /// fdatasynced; beyond that the whole filesystem is syncfsed once ([`Store::flush_replaced`]).
 const FLUSH_EACH: usize = 16;
 
+/// Objects the host side (the Files app) has handed out for writing ([`Store::host_opened`]): the
+/// store they are in (its `objects` directory's device and inode), the object, and the path the
+/// file was opened by. The other side writes such an object directly, so no other file may come
+/// to share it ([`Store::host_writing`]). An open goes when the close is reported by the same path
+/// ([`Store::host_closed`]), whatever happened to the file meanwhile; one whose close is never
+/// reported (the close could not be watched) keeps its object out of sharing, which costs only
+/// copies.
+static HOST_WRITERS: Mutex<Vec<HostWriter>> = Mutex::new(Vec::new());
+
+/// One entry of [`HOST_WRITERS`]: the store's identity, the object, the path.
+type HostWriter = ((u64, u64), Ino, Vec<u8>);
+
 /// The times [`Store::set_times`] sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileTime {
@@ -708,6 +720,52 @@ impl Store {
     /// written, so it must get an object of its own before it is changed ([`Store::unshare`]).
     pub fn held(&self, ino: Ino) -> Result<bool, Errno> {
         Ok(self.row(ino)?.1.held.is_some())
+    }
+
+    /// The host handed regular file `ino`'s object out for writing, opened by `path`
+    /// ([`HOST_WRITERS`]).
+    pub fn host_opened(&self, ino: Ino, path: &[u8]) -> Result<(), Errno> {
+        let entry = (self.id()?, self.data(ino)?.object, path.to_vec());
+        HOST_WRITERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+        Ok(())
+    }
+
+    /// The host closed a file it had opened for writing by `path`.
+    pub fn host_closed(&self, path: &[u8]) {
+        let Ok(id) = self.id() else {
+            return;
+        };
+        let mut writers = HOST_WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(i) = writers.iter().position(|(s, _, p)| *s == id && p == path) {
+            writers.remove(i);
+        }
+    }
+
+    /// Whether the host may be writing regular file `ino`'s object, which then must not be shared
+    /// with another file in either direction (the writes would reach both).
+    pub fn host_writing(&self, ino: Ino) -> Result<bool, Errno> {
+        if HOST_WRITERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let (id, object) = (self.id()?, self.data(ino)?.object);
+        Ok(HOST_WRITERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(s, o, _)| *s == id && *o == object))
+    }
+
+    /// The store's identity across connections: the device and inode of its `objects` directory.
+    fn id(&self) -> Result<(u64, u64), Errno> {
+        let st = appine_hal::fstat(self.meta.objects_dir.as_raw_fd()).map_err(Errno)?;
+        Ok((st.st_dev, st.st_ino))
     }
 
     /// Metadata in the database (without touching the host; a regular file's size and times are

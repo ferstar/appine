@@ -2194,6 +2194,97 @@ fn files_app_changes_reach_inotify_watchers() {
     assert!(machine.take_changed_dirs().is_empty());
 }
 
+#[test]
+fn files_app_writes_stay_out_of_clones() {
+    // The Files app writes a file's host object itself (appine_kernel::browse_changing hands out
+    // the fd): a clone the guest makes while the app has the file open copies it rather than
+    // sharing its object, so the app's later writes stay out of the clone; and when the app opens
+    // a file that shares its object for writing, the guest's descriptions of the file move to the
+    // file's new object with it and read what the app wrote (tests/guest/hostclone.c)
+    use appine_kernel::vfs::browse;
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio as Io, Tier};
+    use std::os::unix::fs::FileExt;
+    let (Some(store), Some(program)) = (store(), build_static("hostclone")) else {
+        return;
+    };
+    let script = "rm -rf /root/hc && mkdir /root/hc && cat > /root/hc/hostclone && \
+                  chmod +x /root/hc/hostclone && echo AAAA > /root/hc/src";
+    let out = command(store, "1", &["/bin/sh", "-c", script])
+        .stdin(std::fs::File::open(&program).unwrap())
+        .output()
+        .unwrap();
+    assert_ok("1", &out);
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Dbt,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: None,
+        low_port_offset: None,
+        always_map_low_ports: false,
+        exception_trace: false,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let run = |script: &str| {
+        let id = machine.open_console(24, 200).unwrap();
+        let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+        let pid = machine
+            .spawn(b"/bin/sh", &argv, &env, Io::Console(id))
+            .unwrap();
+        let out = read_console(&machine, id).replace('\r', "");
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{out}");
+        out
+    };
+    let top = b"/root".as_slice();
+    let errno = |_| appine_kernel::errno::Errno::EIO;
+    // The app opens src for writing and keeps it open while the guest clones it
+    let mut writer = None;
+    appine_kernel::browse_changing(store, |s, c| {
+        writer = Some(browse::open_write(
+            s,
+            top,
+            b"/root/hc/src",
+            false,
+            false,
+            c,
+        )?);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        run("/root/hc/hostclone clone /root/hc/src /root/hc/dst"),
+        "cloned\n"
+    );
+    writer.take().unwrap().write_all_at(b"BBBB\n", 0).unwrap();
+    appine_kernel::browse_changing(store, |s, c| browse::written(s, top, b"/root/hc/src", c))
+        .unwrap();
+    assert_eq!(run("cat /root/hc/src /root/hc/dst"), "BBBB\nAAAA\n");
+    // A clone made after the app closed the file shares it again; the app then writes the clone
+    // while a guest program holds it open
+    assert_eq!(
+        run("/root/hc/hostclone clone /root/hc/src /root/hc/dst2"),
+        "cloned\n"
+    );
+    let host = {
+        let store = store.to_path_buf();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            appine_kernel::browse_changing(&store, |s, c| {
+                let f = browse::open_write(s, top, b"/root/hc/dst2", false, false, c)?;
+                f.write_all_at(b"CCCC\n", 0).map_err(errno)
+            })
+            .unwrap();
+            appine_kernel::browse_changing(&store, |s, c| {
+                browse::written(s, top, b"/root/hc/dst2", c)
+            })
+            .unwrap();
+        })
+    };
+    let out = run("/root/hc/hostclone hold /root/hc/dst2 3");
+    host.join().unwrap();
+    assert_eq!(out, "holding\nread CCCC\n");
+    assert_eq!(run("cat /root/hc/src; rm -rf /root/hc"), "BBBB\n");
+}
+
 /// Runs once under each tier, returning (tier, output); returns an empty list without a rootfs.
 fn run(args: &[&str]) -> Vec<(&'static str, Output)> {
     let Some(store) = store() else {

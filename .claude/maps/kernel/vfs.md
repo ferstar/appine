@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes; mount events, cgroup2 watches last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes; mount events, cgroup2 watches; Files app writers last)
 
 ## Responsibilities
 
@@ -554,8 +554,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Clones: a copy_file_range of a whole non-empty input from offset 0 into an output no longer than
   it, and FICLONE or FICLONERANGE doing the same, share the input's object (`try_share`), unless
   either is a memfd, opened through an overlay or in tmpfs, the input is deleted, open for writing
-  in this kernel by a description not marked `cow`, or writably mapped shared, or the output is
-  mapped, sealed or being unshared; then they copy. The output's set-id bits go first and its
+  in this kernel by a description not marked `cow`, or writably mapped shared, either is open for
+  writing by the Files app (`kernel/store`'s `host_writing`), or the output is mapped, sealed or
+  being unshared; then they copy. The output's set-id bits go first and its
   descriptions move to the shared object (`rehome`); copy_file_range returns the whole length at
   once and advances the positions. FICLONE and FICLONERANGE check in 6.1's order: different mounts
   (memfds on their own) `EXDEV`, directories `EISDIR`, other non-regular files `EINVAL`, modes and
@@ -815,7 +816,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   Linux's overlay makes them through the VFS.
 - Files app changes (`host_change`, run under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; there are no
-  access, close-nowrite, read-open or attribute events from the provider.
+  access, close-nowrite, read-open or attribute events from the provider. An `Opened` that gave a
+  held file an object of its own also moves this kernel's descriptions of it there
+  (`host_unshared`, `rehome`), even with no watches.
 - read returns whole events (`EINVAL` if the first does not fit), blocks unless nonblocking;
   `FIONREAD`, poll readiness and fdinfo read the instance. No fanotify (`ENOSYS`), no dnotify.
 

@@ -797,6 +797,16 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
     if let Change::Moved { from, to, ino, .. } = c {
         renamed(k, (from.0, &from.1), (to.0, &to.1), || Some(*ino));
     }
+    // A held file the host made private as it opened it for writing: the kernel's open files of it
+    // move to its new object, even with no watches
+    if let Change::Opened {
+        ino,
+        unshared: true,
+        ..
+    } = c
+    {
+        super::fs::host_unshared(k, *ino);
+    }
     if idle(k) {
         return;
     }
@@ -840,6 +850,7 @@ pub(crate) fn host_change(k: &Kernel, c: &Change) {
             ino,
             parent,
             truncated,
+            ..
         } => {
             let parent = Some((parent.0, parent.1.as_slice()));
             if *truncated {
