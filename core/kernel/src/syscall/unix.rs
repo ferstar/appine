@@ -103,14 +103,22 @@ pub(super) fn bind(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(),
         return Err(Errno::EINVAL);
     }
     let mut bound = unnamed();
-    let net = with(sock, |u| u.net_id());
+    let (net, ty) = with(sock, |u| (u.net_id(), u.ty));
     match parse(addr)? {
         Addr::Unnamed => {
-            let path = cx.k().unix.autobind(net, sock).ok_or(Errno::EADDRINUSE)?;
+            let path = cx
+                .k()
+                .unix
+                .autobind(net, ty, sock)
+                .ok_or(Errno::EADDRINUSE)?;
             bound.extend_from_slice(&path);
         }
         Addr::Abstract(p) => {
-            if !cx.k().unix.insert(Name::Abstract(net, p.to_vec()), sock) {
+            if !cx
+                .k()
+                .unix
+                .insert(Name::Abstract(net, ty, p.to_vec()), sock)
+            {
                 return Err(Errno::EADDRINUSE);
             }
             bound.extend_from_slice(p);
@@ -204,6 +212,7 @@ pub(super) fn accept(
             _ => Err(Errno::EINVAL),
         })?;
         if let Some(new) = new {
+            with(&new, |u| u.embryo = false);
             // The listener's SO_PASSCRED carries over (unix_sock_inherit_flags)
             if with(sock, |u| u.passcred) {
                 with(&new, |u| u.passcred = true);
@@ -316,7 +325,7 @@ pub(super) fn send(
     // Without a declaration it is the sender itself (Linux's maybe_add_creds uses the real user ID
     // and group ID)
     let cred = declared.unwrap_or_else(|| cx.scm_cred());
-    let (ty, timeout) = with(sock, |u| (u.ty, u.sndtimeo));
+    let (ty, timeout, from) = with(sock, |u| (u.ty, u.sndtimeo, u.addr.clone()));
     let deadline = deadline(timeout);
     if ty == SOCK_DGRAM {
         return send_dgram(cx, sock, nonblock, deadline, data, addr, files, cred);
@@ -349,7 +358,7 @@ pub(super) fn send(
                 }
                 if c.space() >= data.len() {
                     let inflight = !files.is_empty();
-                    c.push(packet(data, files, cred, Vec::new()));
+                    c.push(packet(data, files, cred, from));
                     if inflight {
                         crate::unix::note_inflight(cx.k(), &tx);
                     }
@@ -365,11 +374,12 @@ pub(super) fn send(
                     if !files.is_empty() {
                         crate::unix::note_inflight(cx.k(), &tx);
                     }
+                    // The receiver's recvfrom gets the sender's address, as bound when sent
                     c.push(packet(
                         &data[done..done + n],
                         std::mem::take(&mut files),
                         cred,
-                        Vec::new(),
+                        from.clone(),
                     ));
                     done += n;
                     if done == data.len() {
@@ -570,8 +580,14 @@ pub(super) fn recv(
             Link::None if u.ty != SOCK_DGRAM => Err(Errno::ENOTCONN),
             _ => Ok(u.rx.clone()),
         })?;
-        let (got, eof) = {
+        let (got, eof, reset) = {
             let mut c = rx.borrow_mut();
+            // A connection reset by the peer (Linux's sk_err): a seqpacket socket reports it
+            // before what is queued (__skb_try_recv_datagram), a stream socket once it has read
+            // everything (unix_stream_read_generic)
+            if ty == SOCK_SEQPACKET && c.take_reset() {
+                return Err(Errno::ECONNRESET);
+            }
             let room = max - part.as_ref().map_or(0, |p| p.data.len());
             let got = if ty == SOCK_STREAM {
                 // A read of nothing returns 0 at once when something is queued, taking the first
@@ -582,7 +598,8 @@ pub(super) fn recv(
             } else {
                 c.read_packet(room, peek)
             };
-            (got, c.eof)
+            let reset = got.is_none() && c.take_reset();
+            (got, c.eof, reset)
         };
         if let Some(r) = got {
             let r = match part.take() {
@@ -599,6 +616,12 @@ pub(super) fn recv(
             }
             part = Some(r);
             continue;
+        }
+        if reset {
+            return match part.take() {
+                Some(r) => Ok(deliver(cx, r, passcred, control_len, flags)),
+                None => Err(Errno::ECONNRESET),
+            };
         }
         if eof {
             return Ok(match part.take() {
@@ -755,7 +778,12 @@ pub(super) fn getsockopt(
     let int = |v: i32| v.to_le_bytes().to_vec();
     Ok(match name {
         SO_TYPE => int(u.ty),
-        SO_ERROR | SO_PROTOCOL => int(0),
+        SO_PROTOCOL => int(0),
+        // A connection reset by the peer, reported once (sock_error)
+        SO_ERROR => match &u.link {
+            Link::Stream { rx, .. } if rx.borrow_mut().take_reset() => int(Errno::ECONNRESET.0),
+            _ => int(0),
+        },
         SO_DOMAIN => int(AF_UNIX),
         SO_PASSCRED => int(u.passcred as i32),
         SO_ACCEPTCONN => int(matches!(u.link, Link::Listening { .. }) as i32),
@@ -824,7 +852,10 @@ enum Addr<'a> {
 fn find(cx: &Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<SocketRef, Errno> {
     let name = match parse(addr)? {
         Addr::Unnamed => return Err(Errno::EINVAL),
-        Addr::Abstract(p) => Name::Abstract(with(sock, |u| u.net_id()), p.to_vec()),
+        Addr::Abstract(p) => {
+            let (net, ty) = with(sock, |u| (u.net_id(), u.ty));
+            Name::Abstract(net, ty, p.to_vec())
+        }
         Addr::Path(p) => {
             let node = lookup_at(cx, AT_FDCWD, p, true)?;
             let vfs = cx.vfs()?;

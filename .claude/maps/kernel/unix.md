@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: socket timeouts; reads of nothing; shutdowns; gVisor deviations; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, generic options, control buffers; datagram queue length last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts; reads of nothing; shutdowns; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, options; datagram queue length; resets, typed abstract names, sender addresses last)
 
 ## Responsibilities
 
@@ -29,17 +29,19 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 ## Key types
 
 - `UnixSocket` — type, bound address bytes, `link`, the datagram receive queue `rx`, `peer_cred`,
-  `passcred`, `rcvtimeo`/`sndtimeo`, `shut_wr`, the namespace it was created in, and the generic
-  options it only records (`SockOpts`, `kernel/net`).
+  `passcred`, `rcvtimeo`/`sndtimeo`, `shut_wr`, `embryo` (a server end not accepted yet), the
+  namespace it was created in, and the generic options it only records (`SockOpts`,
+  `kernel/net`).
 - `Link` — `None`, `Listening { backlog, pending, cred }`, `Stream { rx, tx, peer_addr }`,
   `Dgram { tx: Weak, peer_addr }`.
 - `Channel` (`ChannelRef`) — one direction: a queue of `Packet`s, byte count (capacity 212992),
   `eof`, `closed`, `arrivals`/`taken` counters, and for a datagram socket's queue `max_qlen` and
-  `peer` (the queue of the socket it is connected to, set by `set_dgram_link`); `Packet` — data, read offset, passed `FileRef`s,
-  sender `Ucred`, sender address; `Received` — one read's result (`len` may exceed the copied data).
+  `peer` (the queue of the socket it is connected to, set by `set_dgram_link`), and `reset` (the
+  receiver's pending `ECONNRESET`); `Packet` — data, read offset, passed `FileRef`s, sender `Ucred`,
+  sender address; `Received` — one read's result (`len` may exceed the copied data).
 - `Ucred` — pid (global tgid), uid, gid (kernel ids).
-- `Name` — `Path(Ino)` or `Abstract(namespace id, bytes)`; `Names` — the kernel-wide table of weak
-  socket references plus the autobind counter.
+- `Name` — `Path(Ino)` or `Abstract(namespace id, socket type, bytes)`; `Names` — the kernel-wide
+  table of weak socket references plus the autobind counter.
 - `Kernel::unix_inflight` — weak references to channels that have queued files.
 
 ## Public entry points
@@ -66,15 +68,16 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 - Addresses: over 128 bytes `EINVAL` (generic layer), then 2..110 bytes and `AF_UNIX`; an empty
   path is unnamed, a leading NUL abstract (all bytes kept), otherwise a path cut at the first NUL.
-- bind: already bound `EINVAL`. Unnamed: autobind to a sequential `\0%05x` name in the socket's
-  namespace (`EADDRINUSE` when exhausted). Abstract: inserted in the table (`EADDRINUSE` while a
-  live socket holds it). Path: the parent is resolved; `.`/`..` as the last name `EADDRINUSE`;
+- bind: already bound `EINVAL`. Unnamed: autobind to a sequential `\0%05x` name free in the
+  socket's namespace for its type (`EADDRINUSE` when exhausted). Abstract: inserted in the table
+  under the namespace and the socket type (`EADDRINUSE` while a live socket of that type holds
+  it), as Linux's `unix_abstract_hash` mixes the type in. Path: the parent is resolved; `.`/`..` as the last name `EADDRINUSE`;
   creation checks (search, `EEXIST` → `EADDRINUSE`, `EROFS`, write+search), owner and mode
   `0o777 & ~umask` with setgid-directory rules, tmpfs room (`ENOSPC`), then an `S_IFSOCK` node in
   the store, an inotify `IN_CREATE`, and the name `Path(ino)`.
 - Path names are keyed by inode only, so hard links, bind mounts and renames reach the same socket
   and path names are shared by all network namespaces; abstract names and autobind are per
-  namespace (the socket's creation namespace). Names die with their socket (pruned lazily); path
+  namespace (the socket's creation namespace) and socket type. Names die with their socket (pruned lazily); path
   nodes stay in the store.
 
 ### Connections
@@ -84,8 +87,9 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   blocked on a full backlog when the backlog grows.
 - connect (stream/seqpacket): listening `EINVAL`, connected `EISCONN`; the target is found by
   path (following symlinks; a store socket node needs write permission; anything else
-  `ECONNREFUSED`) or by abstract name in the caller's namespace (no live socket `ECONNREFUSED`);
-  self or not listening `ECONNREFUSED`; type mismatch `EPROTOTYPE`. With room (backlog + 1 pending)
+  `ECONNREFUSED`) or by abstract name among the caller's namespace's sockets of its type (none
+  `ECONNREFUSED`, so another type's socket of that name is never found); self or not listening
+  `ECONNREFUSED`; a path socket of another type `EPROTOTYPE`. With room (backlog + 1 pending)
   a server end is created in the client's namespace and queued; credentials are exchanged (client
   gets the listener's listen-time credentials). A full queue blocks (`EAGAIN` nonblocking or after
   `SO_SNDTIMEO`, `ERESTARTSYS` on signals) until an accept or the listener closing.
@@ -100,7 +104,11 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   on datagram sockets the flags are local.
 - close: wakes waiters; the peer's receive side gets EOF and the own receive queue (with its
   files) is discarded, so the peer's writes get `EPIPE`; a listener's pending ends are dropped (their
-  clients see EOF/`EPIPE`). No `ECONNRESET` exists anywhere and `SO_ERROR` is always 0.
+  clients see EOF/`EPIPE`). A stream or seqpacket end closed with anything left in its own receive
+  queue, or as a pending end never accepted, resets the connection (6.1's `unix_release_sock`):
+  the peer's `reset` is reported once as `ECONNRESET` by its next read (a stream one once its own
+  queue is empty, a seqpacket one before anything queued) or `SO_ERROR`, and polls `POLLERR`
+  until then.
 
 ### Sending and receiving
 
@@ -117,6 +125,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   back to the sender, the target holding more datagrams than its `max_qlen` (6.1's
   `unix_recvq_full`; `net.unix.max_dgram_qlen` of the namespace the target was created in, 10 by
   default), so 11 queue and the 12th waits.
+- Stream and seqpacket sends record the sender's bound name (none when unbound), which recvfrom
+  returns: a stream read the first message's, as `unix_stream_read_generic` copies it.
 - Stream receive merges packets in order, stopping after the first packet with files and before a
   packet whose credentials differ (even without `SO_PASSCRED`); a read of nothing returns 0 at
   once when something is queued, taking the first message's files (blocking or `EAGAIN` on an
@@ -141,14 +151,16 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   sockets: negative times and times of at least `KTIME_MAX` mean none), the generic options
   `SockOpts` records (buffer sizes, linger, keepalive, rcvlowat, priority and the like, by
   Linux's rules); other `SOL_SOCKET` names are accepted and ignored; other levels `EOPNOTSUPP`.
-  getsockopt: `SO_TYPE`, `SO_DOMAIN` 1, `SO_PROTOCOL` 0, `SO_ERROR` 0, `SO_PASSCRED`,
+  getsockopt: `SO_TYPE`, `SO_DOMAIN` 1, `SO_PROTOCOL` 0, `SO_ERROR` (a pending reset's
+  `ECONNRESET` once, else 0), `SO_PASSCRED`,
   `SO_ACCEPTCONN`, timeouts, `SO_PEERCRED` (pid, euid, egid recorded at pair/connect time, or a
   listener's own from its last listen, translated into the caller's pid and user namespaces; pid 0
   and uid/gid -1 without either), the recorded generic options; others `ENOPROTOOPT`.
 - Readiness: `POLLIN` when data or EOF is readable, `POLLOUT` when the queue is under a quarter of
   the capacity (or the peer is gone, so writers get `EPIPE`) and, for a connected datagram socket,
   its peer does not hold back its datagrams (`unix_dgram_poll`), `POLLRDHUP`/`POLLHUP` from shutdown
-  state (a datagram socket's `POLLHUP` once both directions are shut), never `POLLERR`; listeners are readable with pending connections. `FIONREAD` (`unix_inq_len`):
+  state (a datagram socket's `POLLHUP` once both directions are shut), `POLLERR` while a reset is
+  pending; listeners are readable with pending connections. `FIONREAD` (`unix_inq_len`):
   every byte queued on a stream or seqpacket connection, the next datagram's length, `EINVAL` on
   a listener; `SIOCOUTQ` is not implemented.
 - `/proc/net/unix`: sockets from fd tables plus in-flight ones, filtered by the reader's namespace;
@@ -192,9 +204,6 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 ## Confirmed bugs / technical debt
 
-- **No `ECONNRESET`:** closing a socket with unread data (or a listener with pending connections)
-  gives the peer only EOF and `EPIPE`; Linux sets `ECONNRESET` on the peer (its next read,
-  `SO_ERROR` and `POLLERR`). `SO_ERROR` is always 0 and `POLLERR` never appears.
 - **Connected datagram sends skip the may-send check:** a send without an address to a peer that
   has since connected to a third socket goes through, where Linux's `unix_may_send` makes it
   `EPERM` (connect and addressed sends do check).
@@ -224,12 +233,12 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   anyway (past the end of a file mapping), is taken off the queue and lost when the copy fails
   (Linux keeps a stream message queued); a datagram whose copy would fault is kept, where Linux
   drops it.
-- **No sender address on connections:** recvfrom/recvmsg on stream and seqpacket sockets return an
-  empty address, where Linux returns the sending socket's bound name as it is at receive time.
-- **Abstract names ignore the socket type:** Linux keys abstract names by name and socket type, so
-  a stream and a datagram socket can bind the same name and a connect with the wrong type finds
-  nothing (`ECONNREFUSED`); here the name alone is the key, so the second bind is `EADDRINUSE` and
-  the wrong-type connect is `EPROTOTYPE`.
+- **Sender addresses are taken when sent:** recvfrom gives the sender's name as it was bound when
+  it sent, where Linux reads the sending socket's name at receive time, so a sender bound between
+  its send and the receive shows no name here.
+- **Connected datagram sockets are never reset:** Linux's `unix_dgram_disconnected` gives a datagram
+  socket `ECONNRESET` when the peer it is connected to disconnects or reconnects with this
+  socket's datagrams still queued; here none is reported.
 
 ## Open questions
 

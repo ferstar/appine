@@ -7,15 +7,4 @@
 # kernel/unix: buffer sizes are only recorded (a send buffer does not limit what is queued)
 SKIP="AllUnixDomainSockets/StreamUnixSocketPairTest.SendBufferOverflow/*"
 SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/*"
-# kernel/unix: no ECONNRESET
-SKIP="$SKIP:AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/*"
-# kernel/unix: connections carry no sender address; abstract names ignore the socket type
-# (variants 4 to 7 are the abstract ones)
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BoundSenderAddr/*"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BindAfterConnectSenderAddr/*"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.BindAfterAcceptSenderAddr/*"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.ConnectWithWrongType/4"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.ConnectWithWrongType/5"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.ConnectWithWrongType/6"
-SKIP="$SKIP:AllUnixDomainSockets/AllSocketPairTest.ConnectWithWrongType/7"
 sh /tmp/difftest-files/gtest/run.sh gvisor "$SKIP" socket_unix_stream_test accept_bind_test

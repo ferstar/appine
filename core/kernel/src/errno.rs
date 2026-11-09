@@ -128,6 +128,8 @@ impl Errno {
     pub const ENETUNREACH: Errno = Errno(101);
     /// Connection aborted (a FUSE request in flight when its connection was aborted).
     pub const ECONNABORTED: Errno = Errno(103);
+    /// Connection reset by peer (an AF_UNIX connection closed with data it had not read).
+    pub const ECONNRESET: Errno = Errno(104);
     /// Already connected.
     pub const EISCONN: Errno = Errno(106);
     /// Not connected.

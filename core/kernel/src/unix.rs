@@ -39,6 +39,7 @@ pub const SOCKADDR_UN_LEN: usize = 110;
 
 const POLLIN: i16 = 0x001;
 const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
 const POLLHUP: i16 = 0x010;
 const POLLRDNORM: i16 = 0x040;
 const POLLWRNORM: i16 = 0x100;
@@ -112,6 +113,9 @@ pub(crate) struct UnixSocket {
     pub shut_wr: bool,
     /// The number of connections a listening socket has received (`EPOLLET` triggers on each).
     pub connections: u64,
+    /// The server end of a connection not accepted yet (Linux's embryo): closing it with its
+    /// listener resets the connection.
+    pub embryo: bool,
     /// The new network namespace it was created in, if any (abstract addresses are kept apart by
     /// it, and interface ioctls look at its lo).
     pub net: Option<Rc<crate::nsproxy::NetNs>>,
@@ -139,6 +143,7 @@ impl UnixSocket {
             sndtimeo: None,
             shut_wr: false,
             connections: 0,
+            embryo: false,
             net: None,
             opts: crate::net::SockOpts::default(),
         }
@@ -207,6 +212,7 @@ impl UnixSocket {
         // network namespace
         server.net = self.net.clone();
         server.addr = server_addr.to_vec();
+        server.embryo = true;
         server.link = Link::Stream {
             rx: up.clone(),
             tx: down.clone(),
@@ -250,6 +256,10 @@ impl UnixSocket {
                 let mut ev = 0;
                 if !r.packets.is_empty() {
                     ev |= POLLIN | POLLRDNORM;
+                }
+                // The peer closed with data it had not read (unix_poll's sk_err)
+                if r.reset {
+                    ev |= POLLERR;
                 }
                 if r.eof {
                     ev |= POLLIN | POLLRDNORM | POLLRDHUP;
@@ -389,12 +399,17 @@ impl UnixSocket {
 impl Drop for UnixSocket {
     /// The peer reads EOF and its writes fail, connections waiting for accept close with it, and
     /// connects waiting for room in the backlog check again ([`UnixSocket::wake_objects`] includes
-    /// its own receive queue).
+    /// its own receive queue). A connection closed with data this end had not read, or never
+    /// accepted, is reset: the peer's next read once its data is read, `SO_ERROR` and `POLLERR`
+    /// report `ECONNRESET` (Linux's `unix_release_sock`).
     fn drop(&mut self) {
         self.wake();
         let stale = match &self.link {
             Link::Stream { rx, tx, .. } => {
-                tx.borrow_mut().eof = true;
+                let mut t = tx.borrow_mut();
+                t.eof = true;
+                t.reset |= self.embryo || !rx.borrow().packets.is_empty();
+                drop(t);
                 rx.borrow_mut().discard()
             }
             _ => self.rx.borrow_mut().discard(),
@@ -415,10 +430,11 @@ pub fn unnamed() -> Vec<u8> {
 pub(crate) enum Name {
     /// A path address: the inode of the socket node in the store.
     Path(Ino),
-    /// An abstract address: the number of its network namespace and all bytes of `sun_path`
-    /// (starting with NUL). As on Linux, abstract addresses of different network namespaces are
-    /// unrelated, while path addresses are not kept apart.
-    Abstract(u64, Vec<u8>),
+    /// An abstract address: the number of its network namespace, the socket type and all bytes
+    /// of `sun_path` (starting with NUL). As on Linux, abstract addresses of different network
+    /// namespaces or socket types are unrelated (`unix_abstract_hash` mixes the type in), while
+    /// path addresses are not kept apart.
+    Abstract(u64, i32, Vec<u8>),
 }
 
 /// Bound addresses (kernel-wide). After a socket closes its weak reference dies, and the address
@@ -431,13 +447,13 @@ pub(crate) struct Names {
 
 impl Names {
     /// Autobind: as on Linux, allocates in network namespace `net` an abstract address of `\0`
-    /// followed by 5 hex digits.
-    pub fn autobind(&mut self, net: u64, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
+    /// followed by 5 hex digits, free among sockets of type `ty`.
+    pub fn autobind(&mut self, net: u64, ty: i32, sock: &Rc<RefCell<Socket>>) -> Option<Vec<u8>> {
         for _ in 0..0x100000 {
             self.next_auto = (self.next_auto + 1) & 0xfffff;
             let mut path = vec![0u8];
             path.extend_from_slice(format!("{:05x}", self.next_auto).as_bytes());
-            if self.insert(Name::Abstract(net, path.clone()), sock) {
+            if self.insert(Name::Abstract(net, ty, path.clone()), sock) {
                 return Some(path);
             }
         }
@@ -514,6 +530,10 @@ pub(crate) struct Channel {
     /// The receive queue of the socket this one's datagram socket is connected to (Linux's
     /// `unix_peer`).
     pub peer: Weak<RefCell<Channel>>,
+    /// The sending end of a connection closed without reading everything sent to it, or before
+    /// it was accepted: the receiver's pending `ECONNRESET` (its `sk_err`), cleared once reported
+    /// ([`Channel::take_reset`]).
+    pub reset: bool,
 }
 
 pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
@@ -522,6 +542,11 @@ impl Channel {
     /// The bytes that still fit.
     pub fn space(&self) -> usize {
         CAPACITY.saturating_sub(self.bytes)
+    }
+
+    /// Reports the pending `ECONNRESET` once (Linux's `sock_error`).
+    pub fn take_reset(&mut self) -> bool {
+        std::mem::take(&mut self.reset)
     }
 
     pub fn push(&mut self, p: Packet) {
@@ -537,8 +562,13 @@ impl Channel {
         let mut data = Vec::new();
         let mut fds = Vec::new();
         let mut cred = None;
+        // The sender's address, from the first message read (unix_stream_read_generic)
+        let mut from = None;
         let mut i = 0;
         while let Some(p) = self.packets.get_mut(i) {
+            if from.is_none() {
+                from = Some(p.from.clone());
+            }
             let room = max - data.len();
             // A read of nothing still takes the first message's files and leaves its data, as
             // Linux detaches them before looking at the length
@@ -588,7 +618,7 @@ impl Channel {
             data,
             fds,
             cred: cred.unwrap_or_default(),
-            from: Vec::new(),
+            from: from.unwrap_or_default(),
         }
     }
 
@@ -990,10 +1020,10 @@ mod tests {
     fn abstract_names_are_released_with_the_socket() {
         let mut names = Names::default();
         let s = Rc::new(RefCell::new(Socket::Unix(UnixSocket::new(SOCK_STREAM))));
-        let name = Name::Abstract(0, b"\0test".to_vec());
+        let name = Name::Abstract(0, SOCK_STREAM, b"\0test".to_vec());
         assert!(names.insert(name.clone(), &s));
         assert!(!names.insert(name.clone(), &s));
-        let auto = names.autobind(0, &s).unwrap();
+        let auto = names.autobind(0, SOCK_STREAM, &s).unwrap();
         assert_eq!(auto, b"\x0000001");
         drop(s);
         assert!(names.lookup(&name).is_none());
