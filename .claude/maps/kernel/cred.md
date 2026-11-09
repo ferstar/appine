@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' owners; ptrace access, ptracer credentials; seccomp pids; v3 file capabilities; vDSO seccomp bypass; shared fs context at execve; per-thread credentials last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' owners; ptrace access and credentials; seccomp pids; v3 file caps; vDSO seccomp bypass; shared fs at execve; per-thread credentials; personality clearing last)
 
 ## Responsibilities
 
@@ -136,7 +136,10 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   permitted ⊄ ambient)).
 - After the transition: secureexec sets `AT_SECURE` and caps the stack rlimit at 8 MB; dumpable is
   cleared when ids differ or permitted grew, else set from whether the caller can read the file;
-  pdeathsig is cleared in those cases.
+  pdeathsig is cleared in those cases. A setuid or setgid program, or one whose file capabilities
+  would grant more than the caller had (judged before no_new_privs or an unsafe execution takes
+  the gain away), clears the personality flags in `PER_CLEAR_ON_SETID` (Linux's
+  `bprm->per_clear`).
 - Writes, truncation and chown remove file caps (and set-id bits) from the inode (in the store).
 
 ### Access decisions
@@ -242,8 +245,6 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   them); `PR_CAPBSET_DROP` beyond 40 is `EINVAL` before `EPERM`.
 - **setns into a foreign user namespace keeps dumpable.** Entering a namespace not owned by the
   caller's euid skips Linux's dumpable and pdeathsig reset (until the next execve).
-- `PER_CLEAR_ON_SETID` personality flags are not cleared on privileged exec (the flags have no
-  effect, so only `personality(0xffffffff)` shows it).
 
 ## Open questions
 

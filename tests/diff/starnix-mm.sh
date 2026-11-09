@@ -19,13 +19,8 @@ SKIP="$SKIP:All/AnonInodeTest.*/BpfMap:All/AnonInodeTest.*/Userfaultfd"
 SKIP="$SKIP:All/MlockProtTest.MlockApplied/None_*:MlockProcTest.MlockStopsPopulatingAtProtNoneMapping"
 SKIP="$SKIP:MlockProcTest.MlockAfterForkCopiesPrivatePages"
 SKIP="$SKIP:MlockProcTest.MlockPrefaultsOnlyWritablePrivateAnonymousMappings"
-# kernel/vfs: MFD_NOEXEC_SEAL is accepted but not enforced
-SKIP="$SKIP:MemfdTest.ChmodWithNOEXEC"
-# kernel/mm: READ_IMPLIES_EXEC is ignored
-SKIP="$SKIP:PersonalityTest.ReadImpliesExecMmap:PersonalityTest.ReadImpliesExecMmapIoUring"
-SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotect:PersonalityTest.ReadImpliesExecMprotectAfterFork"
-SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotectFile"
-SKIP="$SKIP:PersonalityTest.ReadImpliesExecMprotectMixedMappings"
+# io_uring is ENOSYS (docs/starnix.md), so this skips itself on Appine
+SKIP="$SKIP:PersonalityTest.ReadImpliesExecMmapIoUring"
 # kernel/mm: pagemap reports no frame numbers, not even to CAP_SYS_ADMIN (after that check fails,
 # the fallback test crashes in gtest's own allocation)
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMappedAndUnmapped:ProcTestBase.ProcSelfPagemapMultiChunkBoundary"

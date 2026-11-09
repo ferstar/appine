@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: I/O flags; locks; owners; loop; timerfd; suite findings; splice; holes; overlayfs; AIO; clones; FUSE; collection; ACLs; Files app writers; mounts and their propagation last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: I/O flags, locks, owners; loop; timerfd; splice, holes; overlayfs; AIO; clones; FUSE; collection; ACLs; Files app writers; mount propagation; memfd seals, pivot_root, deleted bind roots last)
 
 ## Responsibilities
 
@@ -56,7 +56,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `Mount` — id, namespace, filesystem, root node, mount point (`None` for a tree root or an
   unmounted mount), the node and dentry it sits on, per-mount `MS_*` flags, device number, source,
   `MNT_EXPIRE` mark, pinned namespace, locks (`lock`: Linux's `MNT_LOCKED` and `MNT_LOCK_*`),
-  propagation (`Propagation`: peer group, master group, unbindable).
+  propagation (`Propagation`: peer group, master group, unbindable), and for its root the
+  directory and name of a bound file (`root_at`) and whether that name was removed
+  (`root_gone`).
 - `Mounts` — the global list (also the mountinfo order), detached mounts, id and device counters,
   per-instance side tables (tmpfs, procfs pid namespaces, mqueue devices, devpts instances).
 - `Fs` — Store, Tmpfs, Proc, Pts, Sys, Cgroup, Nsfs, Mqueue, Overlay, Fuse; which kinds get a new
@@ -288,8 +290,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   a mount point (`detach_mounts`) and namespace teardown do not propagate. Copies are appended to
   the mount list in target order, so mountinfo lists them in a different order than Linux (which
   commits them in reverse).
-- `MS_MOVE` (a mount locked in place `EINVAL`), `pivot_root` (6.1's checks after resolving both
-  paths, a locked `new_root` `EINVAL`; the old root's lock moves to the new root, so the old one
+- `MS_MOVE` (a mount locked in place `EINVAL`), `pivot_root` (each path looked up as a directory
+  in turn, so a file `new_root` is `ENOTDIR` whatever `put_old` is; then 6.1's checks, a locked
+  `new_root` `EINVAL`; the old root's lock moves to the new root, so the old one
   can then be detached; `chroot_fs_refs` for tasks whose root or cwd was the old root in the same
   namespace), `chroot` (`CAP_SYS_CHROOT` in the caller's user namespace and search permission).
 - `open_tree` (without `OPEN_TREE_CLONE`: an `O_PATH` fd; with it: `CAP_SYS_ADMIN`, a detached
@@ -319,8 +322,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `PROT_EXEC` mmap `EPERM`), nosuid (exec ignores set-id bits and file caps), nodev (device opens
   `EACCES`), nosymfollow (`ELOOP`); atime flags are only recorded and reported.
 - Removing or renaming a mount point in the caller's namespace is `EBUSY`; mounts on it in other
-  namespaces are detached. Rename and link across mounts are `EXDEV`, even between binds of one
-  filesystem.
+  namespaces are detached. Removing the name a mount's root is (a bound directory, or the name a
+  bound file was found at, even with other links left) marks that mount in any namespace
+  (`roots_removed`): mountinfo's root column then shows the former path followed by `//deleted`,
+  as Linux's `dentry_path` shows an unlinked dentry. Rename and link across mounts are `EXDEV`,
+  even between binds of one filesystem.
 
 ### Mount namespaces and cleanup
 
@@ -473,7 +479,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   and effective user IDs for the delivery check (`kernel/poll`); a number no pid has, or one the
   caller's pid namespace cannot see, is `ESRCH` (Linux's `find_vpid`), 0 removes the owner, an
   owner no longer in the caller's namespace reads back as 0, and `F_SETOWN(INT_MIN)` is `EINVAL`.
-  `F_SETSIG`, pipe size and seals are also handled in fcntl.
+  `F_SETSIG`, pipe size and seals are also handled in fcntl. memfd_create takes 6.3's
+  `MFD_NOEXEC_SEAL` (mode 0666, sealed with `F_SEAL_EXEC`, sealing allowed) or `MFD_EXEC`, not both
+  (`EINVAL`); `F_ADD_SEALS` with `F_SEAL_EXEC` on a memfd with an execute bit also adds the shrink,
+  grow, write and future-write seals (6.3's `memfd_add_seals`).
 - Boot: with host stdio, fds 0–2 wrap the host's fds (`FileKind::Host`, reads poll the host fd
   and read without the BKL; writes ignore guest `O_NONBLOCK`); with a console, the PTY slave.
 - ioctl: `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`, the clone and dedupe requests, socket
@@ -614,7 +623,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - access/faccessat: real IDs unless `AT_EACCESS` (capabilities only when the real uid is root in
   the caller's namespace); `EROFS` for `W_OK` after the permission check.
 - chmod drops `S_ISGID` when the caller is not in the file's group and lacks `CAP_FSETID` over
-  it. chown needs mapped IDs (`EINVAL`) and either `CAP_CHOWN` over the file or an owner keeping
+  it; on a memfd sealed with `F_SEAL_EXEC` a change of any execute bit is `EPERM` after the owner
+  check (6.3's `shmem_setattr`). chown needs mapped IDs (`EINVAL`) and either `CAP_CHOWN` over the file or an owner keeping
   the uid and choosing one of its groups; an argument of -1 always passes. On a store
   non-directory it then clears setuid, setgid when group-executable or when the caller is neither
   in the file's group nor has `CAP_FSETID` (Linux 6.2's `setattr_should_drop_sgid`; 6.1 cleared
@@ -1071,16 +1081,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   precedes the fault, where Linux commits only whole copied pages (a sub-page writev fails with
   `EFAULT` and writes nothing); and a write or vmsplice whose buffer faults after its first page
   fails with `EFAULT` instead of returning the pages copied.
-- **`MFD_NOEXEC_SEAL` is accepted but not enforced:** memfd_create takes 6.3's
-  `MFD_NOEXEC_SEAL`/`MFD_EXEC` and F_ADD_SEALS takes `F_SEAL_EXEC` (6.1 rejects all three with
-  `EINVAL`), but chmod never checks the seal, so a memfd its creator sealed non-executable can be
-  made executable again.
-- **pivot_root resolves both paths before checking them:** a non-directory `new_root` with a missing
-  `put_old` is `ENOENT` instead of `ENOTDIR`.
-- **mountinfo loses the root of a bind whose source was removed:** the fourth column shows `/` once
-  the bound directory is deleted, where Linux shows its old path followed by `//deleted`, so tools
-  reading bind sources from mountinfo (findmnt, container runtimes) see a bind of the whole
-  filesystem.
 - **No superblock flags:** read-only, sync, dirsync, lazytime and mandlock given to a new mount are
   flags of that mount only, so a tmpfs mounted read-only becomes writable through a bind remount
   (Linux keeps the superblock read-only and every mount of it with it), binds do not inherit a

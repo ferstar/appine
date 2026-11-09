@@ -13,9 +13,8 @@ SKIP="$SKIP:FcntlTest.NoatimePermission"
 SKIP="$SKIP:TmpfsTest.CasefoldDisabledByDefault"
 # kernel/procfs: /sys/block/loop<n> entries are directories, not links into /sys/devices
 SKIP="$SKIP:LoopTest.SysfsDeviceDirectoryRemovalAndReplacement"
-# kernel/vfs: umount ignores mappings; pivot_root resolves both paths before checking them;
-# mountinfo loses the root of a bind whose source was removed
-SKIP="$SKIP:MountTest.BusyWithMmap:MountTest.PivotRootErrors:MountTest.ProcMountInfoRoot"
+# kernel/vfs: umount ignores mappings
+SKIP="$SKIP:MountTest.BusyWithMmap"
 # kernel/vfs: a filesystem has no superblock flags of its own (a tmpfs mounted read-only becomes
 # writable through a bind remount, and mountinfo's super options are always rw)
 SKIP="$SKIP:MountTest.RemountReadOnlyToReadWriteIgnored:MountTest.RemountBindReadOnlyFlagInheritance"

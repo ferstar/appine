@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect; code and data bounds; mremap at the map-count limit last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; OOM; futex keys, shm; process_mrelease; vDSO; FUSE fills; CoW mprotect; READ_IMPLIES_EXEC last)
 
 ## Responsibilities
 
@@ -224,6 +224,12 @@ dumps and the host abstraction layer (`core/hal`).
 ### mmap and host backing
 
 - Lengths round up to a page; zero is `EINVAL`.
+- With personality(2)'s `READ_IMPLIES_EXEC` (which every execve clears, as arm64's
+  `SET_PERSONALITY` does), a readable mmap is made executable unless it maps a file on a noexec
+  mount (do_mmap), mprotect adds execution to each VMA that may execute (`may_exec`, as
+  do_mprotect_pkey does per VMA, so one call can leave mixed permissions), and brk's heap is
+  executable (arm64's `VM_DATA_DEFAULT_FLAGS`); a heap grown with other permissions than its last
+  part becomes a VMA of its own.
 - `MAP_FIXED` / `MAP_FIXED_NOREPLACE`: the address must be aligned and the end at most `1 << 48`;
   below `vm.mmap_min_addr` it is `EPERM` without `CAP_SYS_RAWIO` (checked by the syscall, after
   the file's `EBADF`/`EINVAL`; also for a `MREMAP_FIXED` target). `NOREPLACE` on an occupied range
@@ -749,10 +755,6 @@ signals may still be delivered).
   `/proc/<pid>/maps` and mremap's one-VMA rule can still differ in such cases, and
   `MREMAP_DONTUNMAP` of one Linux VMA in several pieces needs room for a VMA per piece; `shmat`
   below `vm.mmap_min_addr` is not refused.
-- **`READ_IMPLIES_EXEC` is ignored:** personality flags are only recorded, so with
-  `READ_IMPLIES_EXEC` set (`setarch --read-implies-exec`, legacy programs that expect readable data
-  to be executable) mmap and mprotect with `PROT_READ` do not add `PROT_EXEC` and jumping into such
-  memory faults, where Linux 6.1 adds execute permission except on noexec mounts.
 - **mlock never fails on inaccessible ranges:** `mlock`/`mlock2` over a range that includes a
   `PROT_NONE` mapping succeeds and keeps populating the mappings after it, where Linux 6.1 locks the
   whole range but stops populating at the `PROT_NONE` mapping and returns `ENOMEM`.

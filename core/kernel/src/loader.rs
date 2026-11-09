@@ -1236,7 +1236,7 @@ mod tests {
             mm.read(UserSlice::new(image.entry, 4), &mut insn).unwrap();
             assert_eq!(insn, 0xd503201fu32.to_le_bytes());
             // The program break follows right after the last segment
-            assert_eq!(mm.brk(0), 0x424000);
+            assert_eq!(mm.brk(0, false), 0x424000);
         }
     }
 

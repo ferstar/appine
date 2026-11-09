@@ -2298,8 +2298,11 @@ impl Mm {
         Ok(())
     }
 
-    /// Implements brk(2): returns the new break, or the old one on failure.
-    pub fn brk(&mut self, new: u64) -> u64 {
+    /// Implements brk(2): returns the new break, or the old one on failure. The heap is readable
+    /// and writable, and executable too with `exec` (`READ_IMPLIES_EXEC`, Linux's
+    /// `VM_DATA_DEFAULT_FLAGS`).
+    pub fn brk(&mut self, new: u64, exec: bool) -> u64 {
+        let heap = prot::READ | prot::WRITE | if exec { prot::EXEC } else { 0 };
         if new < self.brk_start {
             return self.brk;
         }
@@ -2311,11 +2314,9 @@ impl Mm {
             if !self.is_free(old_end, grow) {
                 return self.brk;
             }
-            let grown = self.grow_heap(old_end, grow)
-                || self.start_heap(old_end, grow)
-                || self
-                    .map_anonymous(old_end, grow, prot::READ | prot::WRITE)
-                    .is_ok();
+            let grown = self.grow_heap(old_end, grow, heap)
+                || self.start_heap(old_end, grow, heap)
+                || self.map_anonymous(old_end, grow, heap).is_ok();
             if !grown {
                 return self.brk;
             }
@@ -2328,26 +2329,34 @@ impl Mm {
 
     /// When the heap is not mapped yet, maps `len` bytes at `start` and reserves [`HEAP_RESERVE`]
     /// of host address space.
-    fn start_heap(&mut self, start: u64, len: u64) -> bool {
+    fn start_heap(&mut self, start: u64, len: u64, heap: u32) -> bool {
         if start != page_up(self.brk_start).unwrap_or(0) || len > HEAP_RESERVE {
             return false;
         }
         let Ok((region, host)) = Self::new_anonymous(HEAP_RESERVE, false) else {
             return false;
         };
-        let rw = prot::READ | prot::WRITE;
-        self.insert(start, len, len, rw, Backing::Anonymous, true, region, host)
-            .is_ok()
+        self.insert(
+            start,
+            len,
+            len,
+            heap,
+            Backing::Anonymous,
+            true,
+            region,
+            host,
+        )
+        .is_ok()
     }
 
-    /// Lengthens the heap VMA ending at `end` by `grow` bytes if its host memory has room after it.
-    fn grow_heap(&mut self, end: u64, grow: u64) -> bool {
+    /// Lengthens the heap VMA ending at `end` by `grow` bytes if its host memory has room after it
+    /// and it has the heap's permissions `heap`.
+    fn grow_heap(&mut self, end: u64, grow: u64, heap: u32) -> bool {
         let Some((&s, v)) = self.vmas.range(..end).next_back() else {
             return false;
         };
-        let rw = prot::READ | prot::WRITE;
         let compatible = v.backing == Backing::Anonymous
-            && v.prot == rw
+            && v.prot == heap
             && v.locked == self.lock_future
             && v.name.is_none();
         if s + v.len != end || !compatible {
@@ -2372,7 +2381,7 @@ impl Mm {
         let host = unsafe { NonNull::new_unchecked(lo as *mut u8) };
         // Grown again after shrinking: what was written before must read as zero again
         unsafe { discard_host(host, hi) };
-        if Self::map_pages(&mut self.mmu, end, host, grow, rw, false).is_err() {
+        if Self::map_pages(&mut self.mmu, end, host, grow, heap, false).is_err() {
             return false;
         }
         let v = self.vmas.get_mut(&s).unwrap();
@@ -2460,7 +2469,7 @@ impl Mm {
     /// mprotect(2) without `PROT_GROWSDOWN` or `PROT_GROWSUP` ([`Mm::protect`]).
     #[cfg(test)]
     pub fn mprotect(&mut self, addr: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        self.protect(addr, len, prot, 0)
+        self.protect(addr, len, prot, 0, false)
     }
 
     /// Implements mprotect(2) as Linux's do_mprotect_pkey does. The VMAs from the one holding
@@ -2468,8 +2477,16 @@ impl Mm {
     /// ENOMEM, a permission the VMA may never have (`may_write`, `may_exec`) EACCES. With
     /// `PROT_GROWSDOWN` in `grows` the range starts instead at the start of the Linux VMA
     /// ([`same_vma`]) it begins in, which must grow down (EINVAL); arm64 has no grows-up mappings,
-    /// so `PROT_GROWSUP` is always EINVAL once the range is found.
-    pub fn protect(&mut self, addr: u64, len: u64, prot: u32, grows: u32) -> Result<(), Errno> {
+    /// so `PROT_GROWSUP` is always EINVAL once the range is found. With `implies_exec`
+    /// (`READ_IMPLIES_EXEC`) a readable request makes each VMA that may execute executable too.
+    pub fn protect(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u32,
+        grows: u32,
+        implies_exec: bool,
+    ) -> Result<(), Errno> {
         const PROT_GROWSDOWN: u32 = 0x0100_0000;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(Errno::EINVAL);
@@ -2504,7 +2521,9 @@ impl Mm {
         } else if grows != 0 {
             return Err(Errno::EINVAL);
         }
-        let (mut stop, mut error) = (start, None);
+        // The parts to change, each with its permissions (READ_IMPLIES_EXEC adds execution only
+        // where the VMA may execute, as do_mprotect_pkey does per VMA)
+        let (mut stop, mut error, mut parts) = (start, None, Vec::<(u64, u64, u32)>::new());
         for (&s, v) in self.vmas.range(from..end) {
             if s > stop {
                 error = Some(Errno::ENOMEM);
@@ -2514,14 +2533,25 @@ impl Mm {
                 error = Some(Errno::EACCES);
                 break;
             }
+            let p = if implies_exec && prot & prot::READ != 0 && v.may_exec {
+                prot | prot::EXEC
+            } else {
+                prot
+            };
+            let (a, b) = (s.max(start), (s + v.len).min(end));
+            match parts.last_mut() {
+                Some(last) if last.1 == a && last.2 == p => last.1 = b,
+                _ => parts.push((a, b, p)),
+            }
             stop = s + v.len;
         }
-        let stop = stop.min(end);
         if error.is_none() && stop < end {
             error = Some(Errno::ENOMEM);
         }
-        if stop > start {
-            self.set_protection(start, stop, prot)?;
+        for (a, b, p) in parts {
+            if b > a {
+                self.set_protection(a, b, p)?;
+            }
         }
         error.map_or(Ok(()), Err)
     }
@@ -6640,7 +6670,7 @@ mod tests {
         assert!(!mm.grow_for(low - 3 * PAGE_SIZE, 8, u64::MAX));
         mm.mprotect(low - 2 * PAGE_SIZE, PAGE_SIZE, prot::READ)
             .unwrap();
-        mm.protect(low, PAGE_SIZE, prot::READ, PROT_GROWSDOWN)
+        mm.protect(low, PAGE_SIZE, prot::READ, PROT_GROWSDOWN, false)
             .unwrap();
         let prots: Vec<u32> = (-3..2)
             .map(|i: i64| prot_at(&mm, low.wrapping_add_signed(i * PAGE_SIZE as i64)))
@@ -6649,7 +6679,7 @@ mod tests {
         assert_eq!(prots, [RW, r, r, r, RW]);
         let other = mm.mmap(0x1000_0000, PAGE_SIZE, RW, fixed, None).unwrap();
         assert_eq!(
-            mm.protect(other, PAGE_SIZE, r, PROT_GROWSDOWN),
+            mm.protect(other, PAGE_SIZE, r, PROT_GROWSDOWN, false),
             Err(Errno::EINVAL)
         );
         let anon = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS;
@@ -6975,10 +7005,10 @@ mod tests {
     fn brk_grows_and_shrinks() {
         let mut mm = Mm::new();
         mm.set_brk(0x50_0123);
-        assert_eq!(mm.brk(0), 0x50_0123);
-        assert_eq!(mm.brk(0x50_3000), 0x50_3000);
+        assert_eq!(mm.brk(0, false), 0x50_0123);
+        assert_eq!(mm.brk(0x50_3000, false), 0x50_3000);
         mm.write_kernel(0x50_2ff0, &[1; 16]).unwrap();
-        assert_eq!(mm.brk(0x50_1000), 0x50_1000);
+        assert_eq!(mm.brk(0x50_1000, false), 0x50_1000);
         assert!(mm.mmu().translate(0x50_2000, 0).is_none());
     }
 
@@ -6987,12 +7017,15 @@ mod tests {
         let mut mm = Mm::new();
         mm.set_brk(0x50_0000);
         for i in 1..=64 {
-            assert_eq!(mm.brk(0x50_0000 + i * PAGE_SIZE), 0x50_0000 + i * PAGE_SIZE);
+            assert_eq!(
+                mm.brk(0x50_0000 + i * PAGE_SIZE, false),
+                0x50_0000 + i * PAGE_SIZE
+            );
         }
         assert_eq!(mm.vmas.len(), 1);
         mm.write_kernel(0x53_f000, b"old").unwrap();
-        mm.brk(0x52_0000);
-        mm.brk(0x54_0000);
+        mm.brk(0x52_0000, false);
+        mm.brk(0x54_0000, false);
         assert_eq!(mm.vmas.len(), 1);
         let mut buf = [1u8; 3];
         mm.read(UserSlice::new(0x53_f000, 3), &mut buf).unwrap();
@@ -7003,7 +7036,7 @@ mod tests {
         let mut buf = [0u8; 4];
         {
             let mut child = child.borrow_mut();
-            assert_eq!(child.brk(0x58_0000), 0x58_0000);
+            assert_eq!(child.brk(0x58_0000, false), 0x58_0000);
             assert_eq!(child.vmas.len(), 1);
             child.read(UserSlice::new(0x50_0000, 4), &mut buf).unwrap();
             assert_eq!(&buf, b"heap");
@@ -7017,7 +7050,7 @@ mod tests {
             .read(UserSlice::new(0x50_0000, 4), &mut buf)
             .unwrap();
         assert_eq!(&buf, b"heap");
-        assert_eq!(mm.brk(0x60_0000), 0x60_0000);
+        assert_eq!(mm.brk(0x60_0000, false), 0x60_0000);
         assert_eq!(mm.vmas.len(), 2);
         let regions = mm.regions();
         assert_eq!(regions.len(), 2);

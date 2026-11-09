@@ -7,7 +7,7 @@ use appine_engine::{PAGE_SIZE, prot};
 use super::SysResult;
 use crate::cred::cap;
 use crate::errno::Errno;
-use crate::fd::FileKind;
+use crate::fd::{FileKind, OpenFile};
 use crate::kernel::Cx;
 use crate::mm::flags;
 use crate::process::RLIMIT_MEMLOCK;
@@ -68,7 +68,10 @@ pub(super) fn mmap(
     if prot & !(PROT_MASK | PROT_GROWS) != 0 {
         return Err(Errno::EINVAL);
     }
-    let prot = prot & PROT_MASK;
+    let mut prot = prot & PROT_MASK;
+    // READ_IMPLIES_EXEC: a readable mapping is executable too, unless it is a file on a noexec
+    // mount (do_mmap)
+    let implies_exec = prot & prot::READ != 0 && read_implies_exec(cx);
     if !offset.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
@@ -103,6 +106,9 @@ pub(super) fn mmap(
         if low && len != 0 {
             return Err(Errno::EPERM);
         }
+        if implies_exec {
+            prot |= prot::EXEC;
+        }
         None
     } else {
         let file = cx.fds().get(fd)?;
@@ -114,20 +120,17 @@ pub(super) fn mmap(
         if low {
             return Err(Errno::EPERM);
         }
+        if implies_exec && !on_noexec(cx, &file.borrow()) {
+            prot |= prot::EXEC;
+        }
         // A shared mapping that can be made writable writes the file's object in place, and a
         // mapping does not follow a file to another object: a held file gets its own first
         if kind == flags::MAP_SHARED && file.borrow().readable() && file.borrow().writable() {
             super::fs::prepare_write(cx, &file, None)?;
         }
         // A shared writable mapping, or an executable one on a noexec mount, is refused below
-        let refused = {
-            let f = file.borrow();
-            let noexec = f
-                .node()
-                .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
-                .is_some_and(|m| m & ms::NOEXEC != 0);
-            kind == flags::MAP_SHARED && prot & prot::WRITE != 0 || noexec && prot & prot::EXEC != 0
-        };
+        let refused = kind == flags::MAP_SHARED && prot & prot::WRITE != 0
+            || on_noexec(cx, &file.borrow()) && prot & prot::EXEC != 0;
         fuse_fill = super::fuse::map_fill(cx, &file, kind == flags::MAP_SHARED, refused)?;
         let f = file.borrow();
         let shared_write = kind == flags::MAP_SHARED && prot & prot::WRITE != 0;
@@ -144,11 +147,7 @@ pub(super) fn mmap(
                 }
                 // Files on a noexec mount cannot be mapped executable, now or later (Linux's
                 // do_mmap clears VM_MAYEXEC)
-                let noexec = f
-                    .node()
-                    .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
-                    .is_some_and(|m| m & ms::NOEXEC != 0);
-                if noexec {
+                if on_noexec(cx, &f) {
                     if prot & prot::EXEC != 0 {
                         return Err(Errno::EPERM);
                     }
@@ -194,11 +193,7 @@ pub(super) fn mmap(
                 if !f.readable() || shared_write {
                     return Err(Errno::EACCES);
                 }
-                let noexec = f
-                    .node()
-                    .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
-                    .is_some_and(|m| m & ms::NOEXEC != 0);
-                if noexec {
+                if on_noexec(cx, &f) {
                     if prot & prot::EXEC != 0 {
                         return Err(Errno::EPERM);
                     }
@@ -413,9 +408,24 @@ pub(super) fn mprotect(cx: &mut Cx<'_>, addr: u64, len: u64, prot: u32) -> SysRe
     if prot & !(PROT_MASK | PROT_GROWS) != 0 || prot & PROT_GROWS == PROT_GROWS {
         return Err(Errno::EINVAL);
     }
+    let implies_exec = read_implies_exec(cx);
     cx.mm_mut()
-        .protect(addr, len, prot & PROT_MASK, prot & PROT_GROWS)
+        .protect(addr, len, prot & PROT_MASK, prot & PROT_GROWS, implies_exec)
         .map(|()| 0)
+}
+
+/// The calling process has personality(2)'s `READ_IMPLIES_EXEC`: readable memory it maps
+/// (mmap, mprotect, brk) is executable too where it may be.
+pub(super) fn read_implies_exec(cx: &Cx<'_>) -> bool {
+    cx.t.group.borrow().personality & crate::process::READ_IMPLIES_EXEC != 0
+}
+
+/// The open file is on a noexec mount (Linux's `path_noexec`): it can never be mapped
+/// executable.
+fn on_noexec(cx: &Cx<'_>, f: &OpenFile) -> bool {
+    f.node()
+        .and_then(|n| cx.vfs().ok()?.mount_flags(&n))
+        .is_some_and(|m| m & ms::NOEXEC != 0)
 }
 
 /// Whether mapping at `addr` is refused: below `vm.mmap_min_addr` without `CAP_SYS_RAWIO`

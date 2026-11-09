@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits and waits; namespaces; rlimits; futexes and PI; execve and loader; BKL watchdog; vDSO; timers; FUSE, mount and overlay hooks; per-thread credentials; sched_yield; vfork freezing last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; futexes, PI; execve, loader; BKL watchdog; vDSO; timers; FUSE, mount, overlay hooks; per-thread credentials; sched_yield; vfork freezing; exec personality last)
 
 ## Responsibilities
 
@@ -253,9 +253,11 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   waiting; only the caller being killed can still fail it, with `EINTR`); a non-leader takes over
   the tgid. Then: enter the time namespace for children, unshare and close-on-exec the fd table,
   release locks, sample RSS, record the new `exe_file`, apply dumpable/pdeathsig rules and
-  credentials, clear POSIX timers and AIO, unshare and reset signal handlers, release the old
-  address space (reaping shm segments marked for removal it held last), reset the CPU state for
-  the new page table (re-kicking if interrupted), and set PC and SP. The run loop then re-attaches the translator.
+  credentials, clear `READ_IMPLIES_EXEC` from the personality (arm64's `SET_PERSONALITY`) and on a
+  privileged exec the other `PER_CLEAR_ON_SETID` flags (`kernel/cred`), clear POSIX timers and
+  AIO, unshare and reset signal handlers, release the old address space (reaping shm segments
+  marked for removal it held last), reset the CPU state for the new page table (re-kicking if
+  interrupted), and set PC and SP. The run loop then re-attaches the translator.
 
 ### ELF loader
 

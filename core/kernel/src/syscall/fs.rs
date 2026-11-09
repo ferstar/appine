@@ -1631,7 +1631,9 @@ pub(super) fn memfd_create(cx: &mut Cx<'_>, name: u64, flags: u32) -> SysResult 
     const MFD_NOEXEC_SEAL: u32 = 0x8;
     const MFD_EXEC: u32 = 0x10;
     // MFD_HUGETLB is not supported
-    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 {
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0
+        || flags & (MFD_NOEXEC_SEAL | MFD_EXEC) == MFD_NOEXEC_SEAL | MFD_EXEC
+    {
         return Err(Errno::EINVAL);
     }
     let name = cx.mm().read_cstr(name, 249).map_err(|e| {
@@ -1779,12 +1781,17 @@ pub(super) fn fcntl(cx: &mut Cx<'_>, fd: i32, cmd: u32, arg: u64) -> SysResult {
             if cmd == F_GET_SEALS {
                 return Ok(*seals as u64);
             }
-            let add = arg as u32;
+            let mut add = arg as u32;
             if add & !F_SEAL_ALL != 0 {
                 return Err(Errno::EINVAL);
             }
             if !f.writable() || *seals & F_SEAL_SEAL != 0 {
                 return Err(Errno::EPERM);
+            }
+            // Sealing an executable memfd's execute bits also seals its contents, W^X from then
+            // on (6.3's memfd_add_seals)
+            if add & F_SEAL_EXEC != 0 && cx.vfs()?.store().attrs(ino)?.mode & 0o111 != 0 {
+                add |= F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
             }
             // Writes cannot be sealed while writable shared mappings exist
             if add & F_SEAL_WRITE != 0 && writably_mapped(cx, &f) {
@@ -6590,10 +6597,12 @@ fn release_if_closed(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>) {
 }
 
 /// `name` in directory `dir` (formerly `ino`) has been deleted: the mounts on it in other
-/// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename).
+/// namespaces are detached (`detach_mounts` in Linux's vfs_rmdir, vfs_unlink and vfs_rename),
+/// and mounts of it show it as deleted.
 fn detach_points(cx: &Cx<'_>, vfs: &Vfs, ino: Option<Ino>, (dir, name): (Ino, &[u8])) {
     if let Some(ino) = ino {
         vfs.detach_store_point((ino, dir, name));
+        vfs.roots_removed((ino, dir, name));
         cx.shared.fast_changed();
     }
 }
@@ -6791,7 +6800,14 @@ fn chmod(cx: &mut Cx<'_>, target: &Attrs, perm: u32) -> SysResult {
         }
     }
     match target {
-        Attrs::Store(ino) => cx.vfs()?.store().set_mode(*ino, perm)?,
+        Attrs::Store(ino) => {
+            // A memfd sealed with F_SEAL_EXEC keeps its execute bits (6.3's shmem_setattr)
+            let sealed = cx.kr().seals.get(ino).is_some_and(|s| s & F_SEAL_EXEC != 0);
+            if sealed && (target.stat(cx)?.mode ^ perm) & 0o111 != 0 {
+                return Err(Errno::EPERM);
+            }
+            cx.vfs()?.store().set_mode(*ino, perm)?
+        }
         Attrs::Overlay(o) => {
             let vfs = cx.vfs()?;
             let ino = vfs.overlay_upper(*o, crate::vfs::overlay::CopyUp::All)?;

@@ -340,8 +340,12 @@ pub(crate) struct Mount {
     /// recorded at mount time.
     pub at: Option<Dentry>,
     /// When a file in the store is bind-mounted, the directory and name it was found at (the
-    /// fourth column of mountinfo is computed from it).
+    /// fourth column of mountinfo is computed from it); once the root's name is removed, where
+    /// it was ([`Vfs::roots_removed`]).
     pub root_at: Option<Dentry>,
+    /// The root's name has been removed (Linux's `d_unlinked` mount root): mountinfo shows its
+    /// former path followed by `//deleted`.
+    pub root_gone: bool,
     /// Flags from [`ms`].
     pub flags: u64,
     /// Device number of the instance ([`Fs::own_dev`]).
@@ -579,6 +583,7 @@ impl Mounts {
             point: Some(point),
             at: None,
             root_at: None,
+            root_gone: false,
             flags,
             dev,
             source: source.to_vec(),
@@ -895,6 +900,7 @@ impl Vfs {
                 point: None,
                 at: None,
                 root_at: None,
+                root_gone: false,
                 flags: ROOT_FLAGS,
                 dev: ROOT_DEV,
                 source: b"appine".to_vec(),
@@ -1906,6 +1912,7 @@ impl Vfs {
                 point: m.point.as_ref().map(tag),
                 at: m.at.as_ref().map(|(d, n)| (tag(d), n.clone())),
                 root_at: m.root_at.as_ref().map(|(d, n)| (tag(d), n.clone())),
+                root_gone: m.root_gone,
                 expiring: false,
                 locks,
                 // Copies of shared mounts are their peers, or in a less privileged namespace
@@ -1963,6 +1970,7 @@ impl Vfs {
             point: None,
             at: None,
             root_at: found,
+            root_gone: false,
             expiring: false,
             // As in __do_loopback, the copy's own root is not locked (the mounts copied below it
             // keep their locks)
@@ -2068,6 +2076,33 @@ impl Vfs {
             .collect();
         for id in ids {
             self.remove_mount(id);
+        }
+    }
+
+    /// `name` (inode `ino`) in store directory `dir` was deleted: the mounts, in any namespace or
+    /// detached, whose root is that name keep where it was and are marked gone
+    /// ([`Mount::root_gone`]). A bound file is matched by the name it was found at; a root
+    /// recorded without one (a directory, which has a single name) once the inode has no links
+    /// left.
+    pub(crate) fn roots_removed(&self, (ino, dir, name): (Ino, Ino, &[u8])) {
+        let unlinked = self.store.stat(ino).map_or(true, |st| st.nlink == 0);
+        let mut mounts = self.mounts.borrow_mut();
+        let Mounts { list, detached, .. } = &mut *mounts;
+        for m in list.iter_mut().chain(detached.iter_mut()) {
+            let Node::Store(mnt, root) = m.root else {
+                continue;
+            };
+            if root != ino || m.root_gone {
+                continue;
+            }
+            match &m.root_at {
+                Some((d, n)) => m.root_gone = d.ino() == Some(dir) && n.as_slice() == name,
+                None if unlinked => {
+                    m.root_at = Some((Node::Store(mnt, dir), name.to_vec()));
+                    m.root_gone = true;
+                }
+                None => {}
+            }
         }
     }
 
@@ -2285,8 +2320,10 @@ impl Vfs {
 
     /// The path in the filesystem of the part the mount sees (the fourth column of mountinfo:
     /// which directory or file a bind mount bound).
+    /// A root whose name was removed shows that path followed by `//deleted`, as Linux's
+    /// `dentry_path` shows an unlinked dentry.
     pub(crate) fn root_path(&self, ps: &dyn Pseudo, m: &Mount) -> Vec<u8> {
-        match &m.root_at {
+        let mut p = match &m.root_at {
             Some((dir, name)) => {
                 let mut p = self.fs_path(ps, dir);
                 if p != b"/" {
@@ -2296,7 +2333,11 @@ impl Vfs {
                 p
             }
             None => self.fs_path(ps, &m.root),
+        };
+        if m.root_gone {
+            p.extend_from_slice(b"//deleted");
         }
+        p
     }
 
     /// The directory's path in its filesystem. Namespace files look like `net:[number]` (Linux
@@ -2570,6 +2611,7 @@ impl Vfs {
             point: Some(point),
             at,
             root_at: None,
+            root_gone: false,
             flags: flags & ms::PER_MOUNT,
             dev,
             source,
@@ -2636,6 +2678,7 @@ impl Vfs {
                 point: Some(point),
                 at,
                 root_at: c.root_at.clone(),
+                root_gone: c.root_gone,
                 flags: c.flags & ms::PER_MOUNT,
                 dev: c.dev,
                 source: c.source.clone(),

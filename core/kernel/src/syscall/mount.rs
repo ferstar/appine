@@ -1196,18 +1196,22 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
     if !may_mount(cx) {
         return Err(Errno::EPERM);
     }
-    let new = read_path(cx, new_root)?;
-    let new = lookup_at(cx, AT_FDCWD, &new, true)?;
-    let old = read_path(cx, put_old)?;
-    let old = lookup_at(cx, AT_FDCWD, &old, true)?;
+    // Each path is looked up as a directory before the next (LOOKUP_DIRECTORY): a file as new_root
+    // is ENOTDIR whatever put_old is
+    let dir = |cx: &mut Cx<'_>, path: u64| {
+        let path = read_path(cx, path)?;
+        let node = lookup_at(cx, AT_FDCWD, &path, true)?;
+        let vfs = cx.vfs()?;
+        if !vfs.is_dir(&cx.view(&vfs), &node)? {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(node)
+    };
+    let new = dir(cx, new_root)?;
+    let old = dir(cx, put_old)?;
     let root = cx.root();
     let vfs = cx.vfs()?;
     let view = cx.view(&vfs);
-    for node in [&new, &old] {
-        if !vfs.is_dir(&view, node)? {
-            return Err(Errno::ENOTDIR);
-        }
-    }
     // When something is mounted on put_old, use the topmost one (lock_mount)
     let old = vfs.mounted(old);
     check_mnt(cx, &vfs, new.mnt())?;

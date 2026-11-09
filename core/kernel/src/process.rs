@@ -258,6 +258,13 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// personality(2)'s `READ_IMPLIES_EXEC`: readable mappings are made executable too (by mmap,
+/// mprotect and brk), except those that may never execute (Linux's `VM_MAYEXEC`).
+pub(crate) const READ_IMPLIES_EXEC: u32 = 0x040_0000;
+/// The personality flags a privileged execve clears (Linux's `PER_CLEAR_ON_SETID`):
+/// `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` and `MMAP_PAGE_ZERO`.
+pub(crate) const PER_CLEAR_ON_SETID: u32 = READ_IMPLIES_EXEC | 0x004_0000 | 0x020_0000 | 0x010_0000;
+
 /// `RLIMIT_CPU` (seconds).
 pub(crate) const RLIMIT_CPU: u32 = 0;
 /// `RLIMIT_FSIZE`.
@@ -394,8 +401,10 @@ pub(crate) struct ThreadGroup {
     /// Changed along with the main thread's ([`crate::kernel::Cx::set_cred`]), kept after it ends,
     /// and set from the thread that calls execve, which takes its place.
     pub cred: Cred,
-    /// The execution domain and flags of personality(2): only recorded, kept by both fork and
-    /// execve.
+    /// The execution domain and flags of personality(2), kept by fork and by execve except that
+    /// every execve clears [`READ_IMPLIES_EXEC`] (arm64's `SET_PERSONALITY`) and a privileged one
+    /// [`PER_CLEAR_ON_SETID`]. Of the flags only `READ_IMPLIES_EXEC` has an effect
+    /// (`syscall::mem`); the rest are recorded.
     pub personality: u32,
     /// Has called execve (the parent can no longer setpgid it); a forked process starts at false.
     pub execed: bool,

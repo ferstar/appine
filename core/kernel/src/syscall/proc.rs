@@ -832,13 +832,19 @@ fn exec(
                     .is_ok_and(|r| Rc::ptr_eq(&r.fs, &cx.t.fs))
         });
     let mut new_cred = cred.clone();
-    let secure = new_cred.exec(
+    let (setuid, setgid) = (
         setid(mode::S_ISUID).then_some(st.uid),
         setid(mode::S_ISGID | 0o010).then_some(st.gid),
-        fcaps,
-        no_new_privs,
-        ptraced || shared_fs,
-    )?;
+    );
+    let secure = new_cred.exec(setuid, setgid, fcaps, no_new_privs, ptraced || shared_fs)?;
+    // Linux's bprm->per_clear: a setuid or setgid program, or one whose file capabilities grant
+    // more than the caller had (counted before no_new_privs or an unsafe execution takes the gain
+    // away), drops the personality flags that weaken a program's protections
+    let clear_personality = setuid.is_some() || setgid.is_some() || {
+        let mut c = cred.clone();
+        c.exec(setuid, setgid, fcaps, false, false).is_ok()
+            && c.cap_permitted & !cred.cap_permitted != 0
+    };
     // As on Linux, a privileged exec's stack size limit is at most the default, so the caller
     // cannot use it to influence the new program's address-space layout; the new value is written
     // back after execve succeeds
@@ -965,6 +971,12 @@ fn exec(
         }
         if secure {
             cx.task.pdeathsig.set(0);
+        }
+        // arm64's SET_PERSONALITY drops READ_IMPLIES_EXEC for every 64-bit program, so the flag
+        // lasts only until the next execve
+        g.personality &= !process::READ_IMPLIES_EXEC;
+        if clear_personality {
+            g.personality &= !process::PER_CLEAR_ON_SETID;
         }
         // The thread is the main thread now (kill_other_threads)
         g.cred = new_cred.clone();
