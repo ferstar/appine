@@ -162,6 +162,7 @@ pub(super) fn socket(cx: &mut Cx<'_>, domain: i32, ty: u32, protocol: i32) -> Sy
             let mut s = unix::socket(base, protocol)?;
             if let Socket::Unix(u) = &mut s {
                 u.net = net;
+                u.set_max_qlen(unix::max_dgram_qlen(cx));
             }
             s
         }

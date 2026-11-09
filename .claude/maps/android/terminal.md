@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 2 independent verifiers — 5 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping, which predates libghostty-vt: Termux replaced by it; bars, extra keys, themes; mouse; insets; tab animations; scrolling; links; unwired libghostty-vt features, Kitty graphics; selection handles; panics caught in VtNative; kill reports; bell, OSC 52, notifications, cursor blink last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping, which predates libghostty-vt: it replacing Termux; bars, keys, themes; mouse; insets; tab animations; scrolling; links; Kitty graphics; handles; panics; kill reports; bell, OSC 52, notifications, blink last)
 
 ## Responsibilities
 

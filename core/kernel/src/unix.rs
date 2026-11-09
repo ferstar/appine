@@ -30,6 +30,10 @@ pub const SOCK_SEQPACKET: i32 = 5;
 /// The most bytes buffered per direction, the same as Linux's default `SO_SNDBUF` (208 KiB).
 pub const CAPACITY: usize = 212_992;
 
+/// The default `net.unix.max_dgram_qlen`: datagrams a socket's queue holds before senders other
+/// than its peer wait.
+pub(crate) const MAX_DGRAM_QLEN: usize = 10;
+
 /// The length of a `sockaddr_un`.
 pub const SOCKADDR_UN_LEN: usize = 110;
 
@@ -117,12 +121,18 @@ pub(crate) struct UnixSocket {
 }
 
 impl UnixSocket {
+    /// A new socket; a datagram socket's queue takes Linux's default limit
+    /// ([`UnixSocket::set_max_qlen`] applies the namespace's).
     pub fn new(ty: i32) -> UnixSocket {
+        let rx = ChannelRef::default();
+        if ty == SOCK_DGRAM {
+            rx.borrow_mut().max_qlen = Some(MAX_DGRAM_QLEN);
+        }
         UnixSocket {
             ty,
             addr: Vec::new(),
             link: Link::None,
-            rx: ChannelRef::default(),
+            rx,
             peer_cred: None,
             passcred: false,
             rcvtimeo: None,
@@ -134,19 +144,37 @@ impl UnixSocket {
         }
     }
 
+    /// A datagram socket's queue limit (`net.unix.max_dgram_qlen` of the namespace it is created
+    /// in, as an unsigned number like `sk_max_ack_backlog`).
+    pub fn set_max_qlen(&mut self, qlen: i64) {
+        if self.ty == SOCK_DGRAM {
+            self.rx.borrow_mut().max_qlen = Some(qlen as u32 as usize);
+        }
+    }
+
+    /// Connects a datagram socket (`Link::Dgram`) or disconnects it (`Link::None`), noting the
+    /// peer in its own queue for senders ([`Channel::holds_back`]).
+    pub fn set_dgram_link(&mut self, link: Link) {
+        self.rx.borrow_mut().peer = match &link {
+            Link::Dgram { tx, .. } => tx.clone(),
+            _ => Weak::new(),
+        };
+        self.link = link;
+    }
+
     /// socketpair: two sockets connected to each other.
     pub fn pair(ty: i32, cred: Ucred) -> (UnixSocket, UnixSocket) {
         let mut a = UnixSocket::new(ty);
         let mut b = UnixSocket::new(ty);
         if ty == SOCK_DGRAM {
-            a.link = Link::Dgram {
+            a.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&b.rx),
                 peer_addr: unnamed(),
-            };
-            b.link = Link::Dgram {
+            });
+            b.set_dgram_link(Link::Dgram {
                 tx: Rc::downgrade(&a.rx),
                 peer_addr: unnamed(),
-            };
+            });
         } else {
             let (ab, ba) = (ChannelRef::default(), ChannelRef::default());
             a.link = Link::Stream {
@@ -249,8 +277,13 @@ impl UnixSocket {
                         ev |= POLLHUP;
                     }
                 }
+                // unix_dgram_poll: also not writable while a peer that is not connected back to
+                // this socket holds more datagrams than its limit
                 let peer_full = match &self.link {
-                    Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| !c.borrow().writable()),
+                    Link::Dgram { tx, .. } => tx.upgrade().is_some_and(|c| {
+                        let c = c.borrow();
+                        !c.writable() || c.holds_back(&Rc::downgrade(&self.rx))
+                    }),
                     _ => false,
                 };
                 if !peer_full {
@@ -474,6 +507,13 @@ pub(crate) struct Channel {
     /// The number of times it was still writable after the receiver took data: Linux wakes the
     /// sender on every read (`unix_write_space`), and the sender's `EPOLLET` triggers once more.
     pub taken: u64,
+    /// A datagram socket's receive queue: the messages it holds before senders wait (Linux's
+    /// `sk_max_ack_backlog`, from `net.unix.max_dgram_qlen` when the socket was created), except
+    /// its own peer ([`Channel::holds_back`]); None for stream channels.
+    pub max_qlen: Option<usize>,
+    /// The receive queue of the socket this one's datagram socket is connected to (Linux's
+    /// `unix_peer`).
+    pub peer: Weak<RefCell<Channel>>,
 }
 
 pub(crate) type ChannelRef = Rc<RefCell<Channel>>;
@@ -588,6 +628,13 @@ impl Channel {
     /// capacity.
     pub fn writable(&self) -> bool {
         self.bytes * 4 <= CAPACITY
+    }
+
+    /// Whether a datagram from the socket receiving into `sender` must wait (Linux's
+    /// `unix_recvq_full` for a receiver whose peer is not that socket): this queue holds more than
+    /// its limit.
+    pub fn holds_back(&self, sender: &Weak<RefCell<Channel>>) -> bool {
+        self.max_qlen.is_some_and(|m| self.packets.len() > m) && !Weak::ptr_eq(&self.peer, sender)
     }
 
     /// The receiver closed: discard the buffered messages. The messages are handed to the caller

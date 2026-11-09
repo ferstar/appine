@@ -224,11 +224,14 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
         if t.tracer.is_some() {
             return Err(Errno::EPERM);
         }
+        // Hardware breakpoints and watchpoints an earlier tracer left armed stay (ptrace::detach)
         *t = Trace {
             tracer: Some(cx.tgid()),
             cred: Some(cx.cred()),
             seized: seize,
             options,
+            hw: t.hw,
+            hw_changed: t.hw_changed,
             ..Trace::default()
         };
         // The thread group is already stopped: stop and report at once as a group-stop (Linux's

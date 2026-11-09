@@ -1072,6 +1072,10 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     if crate::bug::catch(|| drop((group, task))).is_none() {
         failed(&k, "releasing its resources");
     }
+    // FUSE releases that found their connection borrowed: sent while the BKL is held
+    if crate::bug::catch(crate::vfs::fuse::flush_released).is_none() {
+        failed(&k, "releasing FUSE files");
+    }
     // After the fd table's unix sockets are closed, only in-flight cycles may remain
     if last
         && !k.unix_inflight.is_empty()

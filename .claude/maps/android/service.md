@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: sessions on libghostty-vt; start, exit and tab saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; unimplemented paths in reports; BKL stalls; programs' bells, clipboard writes and notifications last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: libghostty-vt sessions; start, exit, saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; report paths; BKL stalls; programs' bells, clipboard, notifications last)
 
 ## Responsibilities
 

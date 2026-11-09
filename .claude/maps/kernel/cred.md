@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: new files' modes and owners; ptrace access and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities; the vDSO's seccomp bypass last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' modes and owners; ptrace access and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities; the vDSO's seccomp bypass; a shared fs context at execve last)
 
 ## Responsibilities
 
@@ -102,15 +102,19 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   no_new_privs, a mount without nosuid, owner and group mapped in the caller's namespace (setgid
   also needs group exec); file caps are read unless the mount is nosuid (parse errors fail exec with
   `EINVAL`) and apply only when their root (kernel uid 0 for v1/v2, the rootid for v3) is the root
-  of the caller's user namespace or an ancestor's (`rootid_owns_currentns`); "traced" means a tracer whose credentials when tracing began (Linux's
-  `ptracer_cred`) lack `CAP_SYS_PTRACE` over the caller's user namespace (`ptracer_capable`).
+  of the caller's user namespace or an ancestor's (`rootid_owns_currentns`). The execution is
+  unsafe (Linux's `bprm->unsafe`) when traced by a tracer whose credentials when tracing began
+  (`ptracer_cred`) lack `CAP_SYS_PTRACE` over the caller's user namespace (`ptracer_capable`),
+  or when a task of another thread group shares the caller's fs context (clone with `CLONE_FS`
+  but not `CLONE_THREAD`; `LSM_UNSAFE_SHARE`), found by scanning the tasks when the context has
+  more references than one thread's two.
 - `Cred::exec` (Linux 6.1 `bprm_fill_uid` + `cap_bprm_creds_from_file`): euid/egid from the file;
   permitted = (bounding ∩ file permitted) | (inheritable ∩ file inheritable), `EPERM` when the file's
   effective bit is set and not all file permitted capabilities were granted; root emulation unless
   `NOROOT` (and not for a non-root running a setuid-root binary that has file caps): a root euid or
   ruid gives permitted = bounding | inheritable, a root euid sets the effective bit; gains (setid or
-  more permitted) under no_new_privs or an unprivileged tracer reset euid/egid and limit permitted
-  to the old set; saved and filesystem ids follow the effective ones; ambient is cleared for setid
+  more permitted) under no_new_privs or an unsafe execution limit permitted to the old set and
+  reset euid/egid (unsafe ones only without `CAP_SETUID`); saved and filesystem ids follow the effective ones; ambient is cleared for setid
   or file-caps programs, then permitted |= ambient and effective = file effective ? permitted :
   ambient; `KEEP_CAPS` is cleared; secureexec = setid or (non-root real uid and (file effective or
   permitted ⊄ ambient)).
@@ -213,9 +217,6 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
   not broadcast `setfsuid`/`setfsgid` or raw id syscalls; threaded file servers that switch
   filesystem ids per thread (Samba, nfs-ganesha, FUSE servers, Go raw syscalls) would have one
   thread's checks run as another thread's user.
-- **A shared fs context does not block privilege gains.** Nothing models Linux's
-  `LSM_UNSAFE_SHARE`: a process sharing `CLONE_FS` with a setuid program can still change its cwd,
-  root or umask.
 - **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.

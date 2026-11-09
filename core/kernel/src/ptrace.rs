@@ -774,12 +774,17 @@ fn notify_info(signo: Signal, si_code: i32, pid: Tid, uid: u32) -> [u8; 128] {
 /// taking it; the delivery as usual that ptrace(2) describes holds only while it is not yet
 /// taken); if not taken, it is delivered as usual ([`stop`]). When delve exits after attaching
 /// without detaching, the process stays stopped by the attach's SIGSTOP. When the thread group is
-/// stopped, the thread returns to the group-stop.
+/// stopped, the thread returns to the group-stop. Hardware breakpoints and watchpoints stay set,
+/// as on arm64 Linux (its `ptrace_disable` leaves them; only execve flushes them), so a later
+/// tracer reads the slots that still trap.
 pub(crate) fn detach(task: &Task, sig: Option<i32>) {
     {
         let mut t = task.trace.borrow_mut();
         let (stop, regs, reported, syscallno) = (t.stop, t.regs.take(), t.reported, t.syscallno);
+        let (hw, hw_changed) = (t.hw, t.hw_changed);
         *t = Trace::default();
+        t.hw = hw;
+        t.hw_changed = hw_changed;
         if stop.is_some() {
             t.stop = stop;
             t.regs = regs;

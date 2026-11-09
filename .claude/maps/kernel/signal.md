@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO; debug slots across detach last)
 
 ## Responsibilities
 
@@ -280,8 +280,10 @@ procfs.
   `SIGTRAP`/`TRAP_TRACE`; a stepped `svc` reports after the syscall.
 - Register sets: `NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_TLS`, `NT_ARM_SYSTEM_CALL`,
   `NT_ARM_HW_BREAK` (6 slots), `NT_ARM_HW_WATCH` (4 slots); nothing for SVE, PAC, MTE, SME. Debug
-  slots are handed to the engine (`set_hw_debug`): breakpoints force Tier 0, watchpoints keep
-  Tier 1 with watched pages out of the TLB.
+  slots are handed to the engine (`set_hw_debug`) when the tracee resumes: breakpoints force Tier
+  0, watchpoints keep Tier 1 with watched pages out of the TLB. As on arm64 Linux, whose
+  `ptrace_disable` leaves them, detaching and the tracer's exit keep the slots (still applied if
+  set during the last stop) and a later attach finds them; only execve clears them.
 - Memory: `PEEK*`/`POKE*` on a tracee that is not dumpable are `EIO` unless the tracer had
   `CAP_SYS_PTRACE` over the tracee's user namespace when it attached (`ptrace_access_vm`).
   `POKETEXT`/`POKEDATA` and `/proc/<pid>/mem` writes use forced writes (private copies of
@@ -421,9 +423,6 @@ procfs.
 - **Coalesced standard signals report the last sender:** a second send overwrites the pending
   siginfo (Linux keeps the first), e.g. `SIGCHLD` from several children reports the last; a unit test
   pins the current behaviour.
-- **Detach leaves hardware debug slots armed but invisible:** detaching resets the recorded
-  breakpoints and watchpoints while the CPU keeps them until the next exec, so a later tracer reads
-  empty regsets while hits still raise `SIGTRAP`.
 - **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
   skipped syscall (number -1), the step is not reported at syscall return.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`

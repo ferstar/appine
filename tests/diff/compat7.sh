@@ -1,8 +1,9 @@
 # docker-run-options: --privileged
 # The sequel to compat6.sh (difftest passes the whole script as one argument of sh -c, which must
 # not exceed 128 KB): process_mrelease, /proc/<pid>/oom_score, /proc/swaps, /proc/locks, and ss
-# reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries, and ETXTBSY for running a
-# `#!` script that is open for writing
+# reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries, ETXTBSY for running a
+# `#!` script that is open for writing, setuid programs run with a shared fs context, and the layout
+# fields of /proc/<pid>/stat, and the length limit of AF_UNIX datagram queues
 set -e
 cd /tmp
 # Linux's swap_show header, then the host's swap areas, which a container sees too
@@ -248,3 +249,133 @@ os.close(fd)
 PY
 /tmp/etxt.sh
 rm /tmp/etxt.sh
+
+# A setuid program gains nothing while another process shares the caller's fs context (clone with
+# CLONE_FS but not CLONE_THREAD), which could change its root, cwd or umask (LSM_UNSAFE_SHARE): run
+# by nobody, it keeps nobody's effective ID; with a fs context of its own it gets root's
+cat >euid.c <<'C'
+#include <stdio.h>
+#include <unistd.h>
+int main(void)
+{
+    printf("euid %d\n", (int)geteuid());
+    return 0;
+}
+C
+cat >sharefs.c <<'C'
+#define _GNU_SOURCE
+#include <sched.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static char stack[65536];
+static int run(void *arg)
+{
+    (void)arg;
+    execl("/tmp/euid", "euid", (char *)0);
+    _exit(127);
+}
+int main(int argc, char **argv)
+{
+    (void)argv;
+    int status;
+    pid_t p = clone(run, stack + sizeof stack, SIGCHLD | (argc > 1 ? CLONE_FS : 0), 0);
+    waitpid(p, &status, 0);
+    return 0;
+}
+C
+gcc -o euid euid.c
+gcc -o sharefs sharefs.c
+chmod 4755 euid
+su -s /bin/sh nobody -c '/tmp/sharefs; /tmp/sharefs shared'
+rm -f euid euid.c sharefs sharefs.c
+
+# /proc/<pid>/stat's layout fields (6.1's do_task_stat): a process's own show where its code, stack,
+# data, heap, arguments and environment are; another user's show 1 for the code's bounds and 0 for
+# the rest, without the ptrace read check
+cat >/tmp/statf.py <<'PY'
+import os, sys
+def stat(pid):
+    s = open(f"/proc/{pid}/stat").read()
+    post = s[s.rfind(")") + 2:].split()
+    return lambda n: int(post[n - 3])
+if len(sys.argv) > 1:
+    f = stat(sys.argv[1])
+    print("another user's process:", [f(n) for n in (26, 27, 28)], [f(n) for n in range(45, 52)])
+    sys.exit()
+f = stat("self")
+code, stack = (f(26), f(27)), f(28)
+data, brk, args, env = (f(45), f(46)), f(47), (f(48), f(49)), (f(50), f(51))
+maps = [l.split() for l in open("/proc/self/maps")]
+def within(a, pred):
+    for m in maps:
+        lo, hi = (int(x, 16) for x in m[0].split("-"))
+        if lo <= a < hi:
+            return pred(m)
+    return False
+exe = os.readlink("/proc/self/exe")
+print("code in the program's executable mapping", within(code[0], lambda m: "x" in m[1] and m[-1] == exe),
+      code[0] < code[1])
+print("stack in [stack]", within(stack, lambda m: m[-1] == "[stack]"))
+print("data from the code on", code[0] <= data[0] <= data[1], "heap after the data", brk >= data[1])
+print("arguments, then the environment, on the stack", args[0] < args[1] <= env[0] < env[1],
+      within(args[0], lambda m: m[-1] == "[stack]"))
+PY
+python3 /tmp/statf.py
+sleep 5 &
+sp=$!
+su -s /bin/sh nobody -c "python3 /tmp/statf.py $sp"
+kill $sp 2>/dev/null || true
+rm -f /tmp/statf.py
+
+# A datagram receiver not connected back to the sender holds net.unix.max_dgram_qlen + 1 messages,
+# then the sender waits (EAGAIN when nonblocking) and does not poll writable until one is read
+# (unix_recvq_full); a socket's own peer is held back only by bytes; a new socket takes the
+# namespace's current limit
+python3 - <<'PY'
+import os, select, socket
+def fill(s, send, most=100):
+    n = 0
+    try:
+        while n < most:
+            send(s)
+            n += 1
+    except BlockingIOError:
+        pass
+    return n
+def receiver(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    r = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    r.bind(path)
+    return r
+r = receiver("/tmp/dq.sock")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.connect("/tmp/dq.sock")
+s.setblocking(False)
+print("queued before EAGAIN:", fill(s, lambda s: s.send(b"x")))
+p = select.poll()
+p.register(s, select.POLLOUT)
+print("writable while full:", bool(p.poll(0)))
+u = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+u.setblocking(False)
+print("unconnected sendto:", fill(u, lambda u: u.sendto(b"y", "/tmp/dq.sock")))
+r.recv(10)
+print("writable after a read:", bool(p.poll(0)))
+a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+a.setblocking(False)
+print("to its own peer:", fill(a, lambda a: a.send(b"z")))
+q = "/proc/sys/net/unix/max_dgram_qlen"
+old = open(q).read()
+open(q, "w").write("3")
+r2 = receiver("/tmp/dq2.sock")
+s.close()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.setblocking(False)
+print("with max_dgram_qlen 3:", fill(s, lambda s: s.sendto(b"x", "/tmp/dq2.sock")))
+open(q, "w").write(old)
+os.unlink("/tmp/dq.sock")
+os.unlink("/tmp/dq2.sock")
+PY

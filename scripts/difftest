@@ -245,7 +245,10 @@ run_group() {
         dir=/tmp/difftest-files/$files
         unpack="rm -rf $dir && mkdir -p $dir && echo $blob | base64 -d | tar -xzof - -C $dir && "
     fi
-    script="exec 2>&1; $unpack$(cat "tests/diff/$name.sh")"
+    # Both sides start from an empty $HOME: the native image has no /root at all, and the Appine
+    # store kept what earlier runs left there (Go's and uv's caches under /root/.cache)
+    home="rm -rf /root && mkdir -m 700 /root && "
+    script="exec 2>&1; $home$unpack$(cat "tests/diff/$name.sh")"
     # The whole script is handed over as one argument of sh -c, and Linux does not allow a single
     # argument over 128 KB (MAX_ARG_STRLEN): beyond that neither side can execute it (E2BIG), the
     # outputs match, and it would count as passed

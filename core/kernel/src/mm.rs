@@ -520,6 +520,12 @@ pub struct Mm {
     /// image, and for the host's once a process using this address space is in a time namespace
     /// with offsets ([`Mm::vdso_syscalls`]).
     pub vdso_svc: bool,
+    /// The main program's code (Linux's `start_code`, `end_code`: its executable segments, to
+    /// the end of their file contents) and data (`start_data`, `end_data`: the start of its last
+    /// segment, the end of the file contents of all), as the loader mapped them; shown in
+    /// `/proc/<pid>/stat`.
+    pub code: (u64, u64),
+    pub data: (u64, u64),
     /// Range of the argv strings on the initial stack (`/proc/<pid>/cmdline`).
     pub args: (u64, u64),
     /// Range of the envp strings on the initial stack (`/proc/<pid>/environ`).
@@ -583,6 +589,8 @@ impl Mm {
             dbt_regs: appine_engine::DbtRegs::Default,
             vdso: 0,
             vdso_svc: false,
+            code: (0, 0),
+            data: (0, 0),
             args: (0, 0),
             env: (0, 0),
             auxv: Rc::from([]),
@@ -701,6 +709,16 @@ impl Mm {
     pub fn set_brk(&mut self, start: u64) {
         self.brk_start = start;
         self.brk = start;
+    }
+
+    /// Where the heap starts (Linux's `start_brk`).
+    pub fn brk_start(&self) -> u64 {
+        self.brk_start
+    }
+
+    /// The initial stack pointer (Linux's `start_stack`).
+    pub fn start_stack(&self) -> u64 {
+        self.start_stack
     }
 
     /// Maps the main thread's initial stack `[STACK_TOP - len, STACK_TOP)` (used by the loader):
@@ -3044,6 +3062,8 @@ impl Mm {
         child.brk = self.brk;
         child.vdso = self.vdso;
         child.vdso_svc = self.vdso_svc;
+        child.code = self.code;
+        child.data = self.data;
         child.args = self.args;
         child.env = self.env;
         // membarrier registrations last until execve (a new Mm), as Linux copies the mm's

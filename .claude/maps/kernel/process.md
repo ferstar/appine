@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries, page reads and node sweeps; mount collection last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds last)
 
 ## Responsibilities
 
@@ -228,8 +228,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
   interpreter is opened) or to the final executable.
 - Credentials: setuid/setgid apply unless `no_new_privs`, nosuid, or the owner/group are unmapped;
-  file capabilities come from the xattr. A secure exec clamps the stack limit to 8 MB (written back
-  to `RLIMIT_STACK`).
+  file capabilities come from the xattr; a fs context shared with another process makes the
+  execution unsafe, so it gains nothing (`kernel/cred`). A secure exec clamps the stack limit to
+  8 MB (written back to `RLIMIT_STACK`).
 - Under the BKL the main ELF is parsed and the interpreter file opened and read; then the BKL is
   released while the interpreter's headers are parsed and a new address space (sharing the kernel's
   read-only file mappings, the vDSO image, host random bytes) and initial stack are built. Back
@@ -260,6 +261,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `AT_CLKTCK` (100), `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, `AT_UID`,
   `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_RANDOM`, `AT_HWCAP2`, `AT_EXECFN`, `AT_PLATFORM`
   (`aarch64`), `AT_NULL`. IDs are mapped into the process's user namespace.
+- The main program's code and data bounds (Linux 6.1's `start_code`, `end_code`, `start_data`,
+  `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
 - A Go build-ID note in the main program selects the translator's Go register set (`engine`).
 - Opened executables are cached (32 entries, checked against the host file's identity).
 
@@ -574,8 +577,10 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   credential, mount and pid-for-children changes in place. A pidfd `setns` combining
   `CLONE_NEWNS` with other types while the fs is shared switches the mount namespace of every fs
   sharer (Linux switches only the caller's).
-- **`ETXTBSY` checks only the final ELF:** executing a script, or a program whose interpreter, that is
-  open for writing succeeds where Linux returns `ETXTBSY`.
+- **`ETXTBSY` misses the ELF interpreter and nested scripts:** the script itself and the final
+  program are checked, but running a program whose `PT_INTERP` interpreter is open for writing, or
+  a script whose interpreter is another script open for writing, succeeds where Linux returns
+  `ETXTBSY`.
 - **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
   whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
 - **No PI futexes:** `FUTEX_LOCK_PI`, `LOCK_PI2`, `UNLOCK_PI`, `TRYLOCK_PI` and the requeue-PI

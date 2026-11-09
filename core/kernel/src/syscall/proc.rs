@@ -806,13 +806,24 @@ fn exec(
         let t = cx.task.trace.borrow();
         t.tracer.is_some() && !t.tracer_capable(&cred.user_ns)
     };
+    // Another process shares the fs context (clone with CLONE_FS but not CLONE_THREAD) and could
+    // change the new program's root, cwd or umask, so it gains no privileges either (Linux's
+    // LSM_UNSAFE_SHARE from check_unsafe_exec). Each thread holds two references (TaskState and
+    // TaskRes), so with no more than that nothing else can
+    let shared_fs = Rc::strong_count(&cx.t.fs) > 2
+        && cx.kr().tasks.values().any(|t| {
+            t.tgid != cx.tgid()
+                && t.res
+                    .try_borrow()
+                    .is_ok_and(|r| Rc::ptr_eq(&r.fs, &cx.t.fs))
+        });
     let mut new_cred = cred.clone();
     let secure = new_cred.exec(
         setid(mode::S_ISUID).then_some(st.uid),
         setid(mode::S_ISGID | 0o010).then_some(st.gid),
         fcaps,
         no_new_privs,
-        ptraced,
+        ptraced || shared_fs,
     )?;
     // As on Linux, a privileged exec's stack size limit is at most the default, so the caller
     // cannot use it to influence the new program's address-space layout; the new value is written

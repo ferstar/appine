@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: socket timeouts; reads of nothing; shutdowns; gVisor deviations; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, generic options, control buffers last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: socket timeouts; reads of nothing; shutdowns; gVisor deviations; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, generic options, control buffers; datagram queue length last)
 
 ## Responsibilities
 
@@ -34,7 +34,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 - `Link` — `None`, `Listening { backlog, pending, cred }`, `Stream { rx, tx, peer_addr }`,
   `Dgram { tx: Weak, peer_addr }`.
 - `Channel` (`ChannelRef`) — one direction: a queue of `Packet`s, byte count (capacity 212992),
-  `eof`, `closed`, `arrivals`/`taken` counters; `Packet` — data, read offset, passed `FileRef`s,
+  `eof`, `closed`, `arrivals`/`taken` counters, and for a datagram socket's queue `max_qlen` and
+  `peer` (the queue of the socket it is connected to, set by `set_dgram_link`); `Packet` — data, read offset, passed `FileRef`s,
   sender `Ucred`, sender address; `Received` — one read's result (`len` may exceed the copied data).
 - `Ucred` — pid (global tgid), uid, gid (kernel ids).
 - `Name` — `Path(Ino)` or `Abstract(namespace id, bytes)`; `Names` — the kernel-wide table of weak
@@ -112,7 +113,10 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   capacity `EMSGSIZE`, otherwise waits until the whole packet fits. Datagram (never `SIGPIPE`):
   after `SHUT_WR` `EPIPE`; dead or closed target `ECONNREFUSED`, and a dead connected peer also
   disconnects the socket (then `ENOTCONN`); a target connected to another socket `EPERM`; a target shut down for reading
-  `EPIPE`; over the capacity `EMSGSIZE`; blocks for room (bytes only, no queue-length limit).
+  `EPIPE`; over the capacity `EMSGSIZE`; blocks for room: bytes, and unless the target is connected
+  back to the sender, the target holding more datagrams than its `max_qlen` (6.1's
+  `unix_recvq_full`; `net.unix.max_dgram_qlen` of the namespace the target was created in, 10 by
+  default), so 11 queue and the 12th waits.
 - Stream receive merges packets in order, stopping after the first packet with files and before a
   packet whose credentials differ (even without `SO_PASSCRED`); a read of nothing returns 0 at
   once when something is queued, taking the first message's files (blocking or `EAGAIN` on an
@@ -142,7 +146,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   listener's own from its last listen, translated into the caller's pid and user namespaces; pid 0
   and uid/gid -1 without either), the recorded generic options; others `ENOPROTOOPT`.
 - Readiness: `POLLIN` when data or EOF is readable, `POLLOUT` when the queue is under a quarter of
-  the capacity (or the peer is gone, so writers get `EPIPE`), `POLLRDHUP`/`POLLHUP` from shutdown
+  the capacity (or the peer is gone, so writers get `EPIPE`) and, for a connected datagram socket,
+  its peer does not hold back its datagrams (`unix_dgram_poll`), `POLLRDHUP`/`POLLHUP` from shutdown
   state (a datagram socket's `POLLHUP` once both directions are shut), never `POLLERR`; listeners are readable with pending connections. `FIONREAD` (`unix_inq_len`):
   every byte queued on a stream or seqpacket connection, the next datagram's length, `EINVAL` on
   a listener; `SIOCOUTQ` is not implemented.
@@ -202,7 +207,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 - **Delayed collection:** files dropped by `MSG_CTRUNC` or with a dropped socket's queue do not
   trigger the collector, so their cycles wait for the next unix close or exit (and stay listed in
   `/proc/net/unix` meanwhile).
-- **Smaller deviations:** no `SIOCOUTQ`; datagram queues have no length limit; non-`SOL_SOCKET`
+- **Smaller deviations:** no `SIOCOUTQ`; a datagram queue counts payload bytes, not Linux's
+  per-message `truesize` against the sender's buffer; non-`SOL_SOCKET`
   control messages are rejected instead of skipped; signal-interrupted timed waits return
   `ERESTARTSYS` (Linux `EINTR` with a timeout); `/proc/net/unix` shows connected datagram sockets
   as state 3; buffer sizes are only recorded: the capacity stays 212992, so a small send buffer

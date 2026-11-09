@@ -428,8 +428,10 @@ impl Cred {
     /// The credentials after execve (Linux's `bprm_fill_uid`, `cap_bprm_creds_from_file`).
     /// `setuid` and `setgid` are the program file's setuid owner and setgid group (the caller
     /// passes neither under `no_new_privs`), and `fcaps` its file capabilities; under
-    /// `no_new_privs`, or when traced by a tracer without `CAP_SYS_PTRACE` (`ptraced`), no
-    /// capabilities that were not held before can be gained.
+    /// `no_new_privs`, or when the execution is unsafe (`unsafe_exec`, Linux's `bprm->unsafe`:
+    /// traced by a tracer without `CAP_SYS_PTRACE`, or sharing the fs context with another
+    /// process), no capabilities that were not held before can be gained, and the set-id
+    /// effective IDs are kept only with `CAP_SETUID` (never under `no_new_privs`).
     ///
     /// - The permitted set is (bounding & file permitted) | (inheritable & file inheritable) |
     ///   ambient; when the effective or real user ID is 0 (without `SECBIT_NOROOT`) both file sets
@@ -449,7 +451,7 @@ impl Cred {
         setgid: Option<u32>,
         fcaps: Option<FileCaps>,
         no_new_privs: bool,
-        ptraced: bool,
+        unsafe_exec: bool,
     ) -> Result<bool, Errno> {
         let old = self.clone();
         let mut new = self.clone();
@@ -485,7 +487,7 @@ impl Cred {
         // As in Linux's __is_setuid, the new effective IDs are compared with the old real IDs
         let setid = new.euid != old.ruid || new.egid != old.rgid;
         let gained = new.cap_permitted & !old.cap_permitted != 0;
-        if (setid || gained) && (no_new_privs || ptraced) {
+        if (setid || gained) && (no_new_privs || unsafe_exec) {
             if !old.capable_here(cap::SETUID) || no_new_privs {
                 new.euid = new.ruid;
                 new.egid = new.rgid;
@@ -1296,12 +1298,16 @@ mod tests {
             Err(Errno::EPERM)
         );
         assert_eq!(c, before);
-        // no_new_privs, an unprivileged tracer: no new capabilities
-        for (nnp, traced) in [(true, false), (false, true)] {
+        // no_new_privs, an unsafe execution (an unprivileged tracer, a shared fs context): no new
+        // capabilities, and a setuid program keeps the caller's effective ID
+        for (nnp, unsafe_exec) in [(true, false), (false, true)] {
             let mut c = user(1000, 100);
-            c.exec(None, None, caps(NET_RAW, 0, true), nnp, traced)
+            c.exec(None, None, caps(NET_RAW, 0, true), nnp, unsafe_exec)
                 .unwrap();
             assert_eq!(c.cap_permitted, 0);
+            let mut c = user(1000, 100);
+            c.exec(Some(0), None, None, nnp, unsafe_exec).unwrap();
+            assert_eq!((c.euid, c.cap_permitted), (1000, 0));
         }
         // root still gets every capability; a setuid-root program with file capabilities run by
         // non-root gets only the file's

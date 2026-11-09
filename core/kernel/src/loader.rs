@@ -450,6 +450,25 @@ impl<'a> Elf<'a> {
         Ok(elf)
     }
 
+    /// Linux's `start_code`, `end_code`, `start_data` and `end_data` with bias `bias`, as 6.1's
+    /// `load_elf_binary` computes them: the lowest start of an executable segment, the highest end
+    /// of one's file contents, the highest segment start, the highest end of file contents.
+    fn code_and_data(&self, bias: u64) -> ((u64, u64), (u64, u64)) {
+        let (mut start_code, mut end_code, mut start_data, mut end_data) = (u64::MAX, 0, 0, 0);
+        for s in &self.segments {
+            let exec = s.prot & prot::EXEC != 0;
+            let file_end = s.vaddr + s.filesz as u64;
+            if exec {
+                start_code = start_code.min(s.vaddr);
+                end_code = end_code.max(file_end);
+            }
+            start_data = start_data.max(s.vaddr);
+            end_data = end_data.max(file_end);
+        }
+        let b = |a: u64| a.wrapping_add(bias);
+        ((b(start_code), b(end_code)), (b(start_data), b(end_data)))
+    }
+
     /// Maps the segments into `mm` with bias `bias`.
     fn map(&self, mm: &mut Mm, bias: u64) -> Result<Loaded, LoadError> {
         let (_, hi) = self.span();
@@ -708,6 +727,7 @@ pub fn load_prepared(
     mm.dbt_regs = dbt_regs(exe.go);
 
     mm.set_brk(main.end);
+    (mm.code, mm.data) = exe.code_and_data(main.bias);
     let mut random = [0u8; 16];
     appine_hal::fill_random(&mut random).map_err(|e| LoadError::Memory(Errno(e)))?;
     // arm64's ARCH_DLINFO (AT_SYSINFO_EHDR, AT_MINSIGSTKSZ) comes first

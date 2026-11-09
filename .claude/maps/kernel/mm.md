@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect; code and data bounds last)
 
 ## Responsibilities
 
@@ -51,7 +51,8 @@ dumps and the host abstraction layer (`core/hal`).
   (`vmas: BTreeMap<start, Vma>`), the `graveyard` of host regions awaiting shootdown, brk and
   layout fields (`brk_start`, `brk`, `mmap_top`, `start_stack`, `stack_low`), the consistency
   counters, CoW state, the code-group membership, and fields consumed elsewhere (`exe`, `dbt_regs`,
-  `vdso`, `vdso_svc`, `args`, `env`, `auxv`, `membarrier`, `lock_future`, `lock_onfault`). Used
+  `vdso`, `vdso_svc`, `code` and `data` (the loader's bounds, for `/proc/<pid>/stat`), `args`,
+  `env`, `auxv`, `membarrier`, `lock_future`, `lock_onfault`). Used
   only under the BKL, as `Rc<RefCell<Mm>>`.
 - `Vma` — one mapping: length, guest prot, `Backing`, `may_write`/`may_exec` (Linux
   `VM_MAYWRITE`/`VM_MAYEXEC`), `Arc<HostRegion>` plus host pointer, `name`/`ino` for maps,

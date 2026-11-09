@@ -1054,6 +1054,92 @@ int main(void)
 }
 C
 gcc -O1 -o hw3 hw3.c && ./hw3
+# Hardware watchpoints outlive PTRACE_DETACH on arm64 (only execve flushes them): one set at the
+# stop the tracer detaches from still stops the next write with SIGTRAP, and a tracer attaching
+# later reads the armed slot from NT_ARM_HW_WATCH
+cat > hw4.c <<'C'
+#define _GNU_SOURCE
+#include <elf.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+struct dbg { uint32_t info, pad; struct { uint64_t addr; uint32_t ctrl, pad; } regs[16]; };
+static volatile long word;
+
+static void watch(pid_t pid, int on)
+{
+    struct dbg d;
+    memset(&d, 0, sizeof d);
+    d.regs[0].addr = (uint64_t)&word;
+    d.regs[0].ctrl = on ? 0xff << 5 | 2 << 3 | 2 << 1 | 1 : 0;
+    struct iovec iov = {&d, 8 + 16};
+    if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_HW_WATCH, &iov) < 0)
+        perror("SETREGSET");
+}
+
+static void status(const char *what, int st)
+{
+    if (WIFEXITED(st))
+        printf("%s: exit %d\n", what, WEXITSTATUS(st));
+    else
+        printf("%s: signal %d\n", what, WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+}
+
+int main(void)
+{
+    int st;
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        word = 1;
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    watch(pid, 1);
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    waitpid(pid, &st, 0);
+    status("write after PTRACE_DETACH", st);
+    int p[2];
+    pipe(p);
+    pid = fork();
+    if (pid == 0) {
+        char b;
+        close(p[1]);
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        raise(SIGSTOP);
+        read(p[0], &b, 1);
+        word = 2;
+        _exit(0);
+    }
+    close(p[0]);
+    waitpid(pid, &st, 0);
+    watch(pid, 1);
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    usleep(100000);
+    ptrace(PTRACE_ATTACH, pid, 0, 0);
+    waitpid(pid, &st, 0);
+    struct dbg d;
+    struct iovec iov = {&d, sizeof d};
+    memset(&d, 0, sizeof d);
+    ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_WATCH, &iov);
+    printf("a later tracer reads the slot: addr %d enabled %d\n",
+           d.regs[0].addr == (uint64_t)&word, d.regs[0].ctrl & 1);
+    watch(pid, 0);
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    write(p[1], "x", 1);
+    waitpid(pid, &st, 0);
+    status("write after clearing it", st);
+    return 0;
+}
+C
+gcc -O1 -o hw4 hw4.c && ./hw4
 
 # Single-stepping with a signal: stops at the first instruction of the handler (ptrace_notify's
 # SIGTRAP, with si_code also SIGTRAP), and only the next single step executes it; when stopped in

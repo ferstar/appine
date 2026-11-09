@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`; `/proc/<tid>`; `/sys/block`; mm fields; names; test-suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; `stat`; overlay; oom, swaps, locks; missing names; FUSE types; `drop_caches` last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `drop_caches`; `stat` layout last)
 
 ## Responsibilities
 
@@ -157,8 +157,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - `oom_score` is the OOM killer's badness scaled against the host's RAM plus swap (`kernel/mm`'s
   `proc_score`): 0 to 2000, 0 for the built-in init, `oom_score_adj` -1000, a process without
   live threads and a vfork child its parent still waits for.
-- `stat`: all 52 fields; fault counters, code/stack addresses, `wchan`, `processor`, priority and
-  policy are 0; start time in clock ticks plus the reader's time-namespace boottime offset; the
+- `stat`: all 52 fields; the layout fields (code bounds, start of stack, data bounds, start of
+  heap, arguments, environment; `kernel/mm`) go to readers passing the ptrace read check with
+  filesystem credentials (6.1's `do_task_stat`), others getting 1 for the code bounds and 0 for the
+  rest (0 everywhere for a process without an address space); fault counters, `kstkesp`,
+  `kstkeip`, `wchan`, `processor`, priority and policy are 0; start time in clock ticks plus the reader's time-namespace boottime offset; the
   thread's or the group's CPU times depending on the view; `tty_nr` from the controlling terminal.
 - `status`: ids translated into the reader's user namespace, `NStgid`/`NSpid`/`NSpgid`/`NSsid`
   from the instance's namespace down, capabilities, `NoNewPrivs`, `Seccomp`, signal masks; memory
@@ -433,11 +436,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
-- **`stat` address fields ignore the ptrace check:** `/proc/<pid>/stat` reports the code, stack,
-  data and brk addresses as 0 for everyone and the argument and environment addresses to everyone,
-  where Linux 6.1 shows real values only to readers passing the ptrace-read check (others see 1/1
-  for code and 0 elsewhere), so debuggers and profilers reading the layout get zeros and any user
-  learns other processes' argument and environment addresses.
 - **A reaped process's held directory behaves like a live or missing one:** through a kept
   `/proc/<pid>` fd, lookups give `ENOENT` (Linux `ESRCH`), listing still succeeds (Linux
   `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as

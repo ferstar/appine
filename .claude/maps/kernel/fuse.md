@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed last)
 
 ## Responsibilities
 
@@ -144,7 +144,10 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 - One wake object per side: every reply wakes every waiter of the connection, every new request
   every reader.
 - `background` queues RELEASE and RELEASEDIR with nobody waiting (an open file's last reference
-  dropping), unless the connection is refused or aborted; their replies are dropped.
+  dropping), unless the connection is refused or aborted; their replies are dropped. When the
+  connection is borrowed as the last reference goes, the release and the node's open count wait in
+  a per-thread queue (`Released`) that `flush_released` empties at the end of the syscall or at
+  thread exit, with the BKL held.
 
 ### The device
 
@@ -396,8 +399,6 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 - **inotify gaps:** path-based chmod, chown, utimensat, truncate, ftruncate and xattr changes
   report no `IN_ATTRIB`/`IN_MODIFY`, an `O_TRUNC` open no `IN_MODIFY`, and creating through the
   MKNOD fallback reports `IN_CREATE` twice.
-- **Releases:** a RELEASE is silently lost if the connection is borrowed when the last reference
-  drops.
 - **Directory changes run concurrently:** creations, removals and renames in one directory reach
   the daemon in parallel where Linux serializes them under the directory's lock; only the
   create-after-create race is handled (EEXIST without `O_EXCL` opens the file).

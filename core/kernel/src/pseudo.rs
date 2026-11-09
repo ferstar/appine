@@ -2648,11 +2648,24 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
     let (pending, blocked) = task.as_ref().map_or((0, 0), |t| {
         (t.pending.borrow().set() | g.pending.set(), t.sigmask.get())
     });
-    let (args, env) = task.as_ref().map_or(((0, 0), (0, 0)), |t| {
+    // The layout goes only to readers passing the ptrace read check (6.1's do_task_stat):
+    // others see 1 for the code's bounds and 0 for the rest
+    let permitted = ps.may_read(pid);
+    let layout = task.as_ref().map(|t| {
         let res = t.res.borrow();
         let mm = res.mm.borrow();
-        (mm.args, mm.env)
+        let (code, data) = (mm.code, mm.data);
+        let rest = [mm.brk_start(), mm.args.0, mm.args.1, mm.env.0, mm.env.1];
+        (code, mm.start_stack(), data, rest)
     });
+    let (code, stack, tail) = match layout {
+        Some((code, stack, data, rest)) if permitted => {
+            let tail = [data.0, data.1, rest[0], rest[1], rest[2], rest[3], rest[4]];
+            (code, stack, tail)
+        }
+        Some(_) => ((1, 1), 0, [0; 7]),
+        None => ((0, 0), 0, [0; 7]),
+    };
     // The name as raw bytes, as Linux's proc_task_name without escaping
     let mut out = format!("{} (", v(tid.unwrap_or(pid))).into_bytes();
     out.extend(comm_of(&g, task.as_deref(), pid, tid));
@@ -2678,10 +2691,11 @@ fn pid_stat(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<Vec
         rss,
     )
     .unwrap();
+    let tail = tail.map(|v| v.to_string()).join(" ");
     writeln!(
         s,
-        " 0 0 0 0 0 {pending} {blocked} {sigign} {sigcgt} 0 0 0 {} 0 0 0 0 0 0 0 0 0 {} {} {} {} 0",
-        g.exit_signal, args.0, args.1, env.0, env.1
+        " {} {} {stack} 0 0 {pending} {blocked} {sigign} {sigcgt} 0 0 0 {} 0 0 0 0 0 0 {tail} 0",
+        code.0, code.1, g.exit_signal
     )
     .unwrap();
     out.extend(s.into_bytes());

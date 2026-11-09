@@ -61,12 +61,26 @@ pub(super) fn socket(ty: i32, protocol: i32) -> Result<Socket, Errno> {
 /// socketpair(2): two sockets connected to each other.
 pub(super) fn pair(cx: &Cx<'_>, ty: i32, protocol: i32) -> Result<(Socket, Socket), Errno> {
     let (mut a, mut b) = UnixSocket::pair(socket_type(ty, protocol)?, cx.ucred());
+    let qlen = max_dgram_qlen(cx);
+    a.set_max_qlen(qlen);
+    b.set_max_qlen(qlen);
     let net = cx.task.ns.borrow().net.clone();
     if net.host_net.is_some() {
         a.net = Some(net.clone());
         b.net = Some(net);
     }
     Ok((Socket::Unix(a), Socket::Unix(b)))
+}
+
+/// `net.unix.max_dgram_qlen` of the caller's network namespace, which a datagram socket takes when
+/// created (Linux's `unix_create1`).
+pub(super) fn max_dgram_qlen(cx: &Cx<'_>) -> i64 {
+    let net = cx.task.ns.borrow().net.clone();
+    let conf = &net.devs.borrow().conf;
+    crate::netconf::sysctl_read(conf, "unix/max_dgram_qlen")
+        .trim()
+        .parse()
+        .unwrap_or(crate::unix::MAX_DGRAM_QLEN as i64)
 }
 
 /// Checks the socket type and protocol and returns the actual type.
@@ -265,7 +279,7 @@ pub(super) fn connect(
 fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), Errno> {
     // AF_UNSPEC: disconnect
     if addr.len() >= 2 && addr[..2] == [0, 0] {
-        with(sock, |u| u.link = Link::None);
+        with(sock, |u| u.set_dgram_link(Link::None));
         return Ok(());
     }
     let target = find(cx, sock, addr)?;
@@ -282,7 +296,7 @@ fn connect_dgram(cx: &mut Cx<'_>, sock: &SocketRef, addr: &[u8]) -> Result<(), E
         Socket::Unix(_) => return Err(Errno::EPROTOTYPE),
         _ => return Err(Errno::ECONNREFUSED),
     };
-    with(sock, |u| u.link = link);
+    with(sock, |u| u.set_dgram_link(link));
     Ok(())
 }
 
@@ -465,7 +479,7 @@ fn send_dgram(
     let disconnect = |tx: &Weak<_>| {
         with(sock, |u| {
             if matches!(&u.link, Link::Dgram { tx: t, .. } if Weak::ptr_eq(t, tx)) {
-                u.link = Link::None;
+                u.set_dgram_link(Link::None);
             }
         });
         Errno::ECONNREFUSED
@@ -509,7 +523,9 @@ fn send_dgram(
             if c.eof {
                 return Err(Errno::EPIPE);
             }
-            if c.space() >= data.len() {
+            // Room for the bytes, and unless the receiver is connected back to this socket, for
+            // one more datagram (unix_dgram_sendmsg's unix_recvq_full wait)
+            if c.space() >= data.len() && !c.holds_back(&own_rx) {
                 let files = files.take().unwrap_or_default();
                 if !files.is_empty() {
                     crate::unix::note_inflight(cx.k(), &rx);

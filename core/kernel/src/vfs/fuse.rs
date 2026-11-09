@@ -1946,25 +1946,82 @@ impl Handle {
 }
 
 impl Drop for Handle {
+    /// Uncounts the handle and queues its release; when the connection is borrowed at that
+    /// moment, both wait until the syscall ends ([`flush_released`]).
     fn drop(&mut self) {
-        if let Ok(mut c) = self.conn.try_borrow_mut()
-            && let Some(k) = c.opens.get_mut(&self.nodeid)
-        {
+        let release = (!self.no_release).then(|| {
+            let opcode = if self.dir {
+                op::RELEASEDIR
+            } else {
+                op::RELEASE
+            };
+            let args = Args::default().u64(self.fh).u32(self.flags).u32(0).u64(0);
+            (opcode, args.0)
+        });
+        let r = Released {
+            conn: self.conn.clone(),
+            nodeid: self.nodeid,
+            release,
+        };
+        if !r.send() {
+            RELEASED.with(|q| q.borrow_mut().0.push(r));
+        }
+    }
+}
+
+/// An open file's last reference went ([`Handle`]): its node's open count goes down and the
+/// daemon gets `FUSE_RELEASE`/`FUSE_RELEASEDIR` (`release`, None without an open).
+struct Released {
+    conn: Rc<RefCell<Conn>>,
+    nodeid: u64,
+    release: Option<(u32, Vec<u8>)>,
+}
+
+impl Released {
+    /// Done now, or false when the connection is borrowed (nothing done then).
+    fn send(&self) -> bool {
+        let Ok(mut c) = self.conn.try_borrow_mut() else {
+            return false;
+        };
+        if let Some(k) = c.opens.get_mut(&self.nodeid) {
             *k -= 1;
             if *k == 0 {
                 c.opens.remove(&self.nodeid);
             }
         }
-        if self.no_release {
-            return;
+        drop(c);
+        if let Some((opcode, args)) = &self.release {
+            background(&self.conn, *opcode, self.nodeid, args);
         }
-        let opcode = if self.dir {
-            op::RELEASEDIR
-        } else {
-            op::RELEASE
-        };
-        let args = Args::default().u64(self.fh).u32(self.flags).u32(0).u64(0);
-        background(&self.conn, opcode, self.nodeid, &args.0);
+        true
+    }
+}
+
+/// Releases waiting for their connection ([`Handle`]'s drop). Emptied under the BKL before the
+/// thread's syscall ends or the thread exits; one left at thread exit is leaked rather than
+/// dropped without the BKL (Rc counts are not atomic).
+struct ReleasedQueue(Vec<Released>);
+
+impl Drop for ReleasedQueue {
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.0));
+    }
+}
+
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static RELEASED: std::cell::RefCell<ReleasedQueue> =
+        const { std::cell::RefCell::new(ReleasedQueue(Vec::new())) };
+}
+
+/// Sends the releases that found their connection borrowed: at the end of every syscall and at
+/// thread exit, with the BKL held and no connection borrowed.
+pub(crate) fn flush_released() {
+    let queued = RELEASED.with(|q| std::mem::take(&mut q.borrow_mut().0));
+    for r in queued {
+        if !r.send() {
+            RELEASED.with(|q| q.borrow_mut().0.push(r));
+        }
     }
 }
 
@@ -2284,6 +2341,39 @@ mod tests {
             .u32(4096)
             .u32(0)
             .0
+    }
+
+    #[test]
+    fn a_release_waits_while_its_connection_is_borrowed() {
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        let handle = Handle {
+            conn: c.clone(),
+            id: 1,
+            nodeid: 5,
+            fh: 9,
+            open_flags: 0,
+            flags: 0,
+            dir: false,
+            no_release: false,
+        }
+        .counted();
+        let releases = |c: &Rc<RefCell<Conn>>| {
+            let c = c.borrow();
+            c.pending
+                .iter()
+                .filter(|u| c.requests[u].message[4..8] == op::RELEASE.to_le_bytes())
+                .count()
+        };
+        // The last reference goes while the connection is borrowed: nothing is lost, only delayed
+        let borrowed = c.borrow();
+        drop(handle);
+        drop(borrowed);
+        assert_eq!(
+            (c.borrow().opens.get(&5).copied(), releases(&c)),
+            (Some(1), 0)
+        );
+        flush_released();
+        assert_eq!((c.borrow().opens.get(&5).copied(), releases(&c)), (None, 1));
     }
 
     #[test]

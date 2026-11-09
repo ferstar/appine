@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest lock, cases and export; Starnix and gVisor suites; stop signals; survey; overlay and FUSE cases; watchdog knob; CI and its appine-run build last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest lock, cases and export; Starnix and gVisor suites; stop signals; survey; overlay and FUSE cases; watchdog knob; CI and its appine-run build; an empty `$HOME` per case last)
 
 ## Responsibilities
 
@@ -135,7 +135,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   `fuse-tools` cases, whose native side needs `--device /dev/fuse`); a tool check aborts if any is
   missing; its `bin etc lib sbin usr tmp` are exported from inside Appine and imported as
   the docker image `appine-difftest` (first run or `-r`).
-- Each case script runs with stderr merged into stdout on both sides: natively with
+- Each case script runs with stderr merged into stdout on both sides, after `/root` (`$HOME`) is
+  removed and made again empty with mode 700, so caches earlier runs left in the store (Go's,
+  uv's) do not make the sides differ: natively with
   `docker run` plus the case's `# docker-run-options:`, and as `/bin/sh -c` under `appine-run` plus
   its `# appine-options:`; an `exit N` line is appended to each output. A case passes when the two
   outputs are byte-identical and `appine-run`'s own stderr has no `appine: internal error` line;
@@ -326,10 +328,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 
 ## Confirmed bugs / technical debt
 
-- **The two difftest sides start from different files.** The native image lacks `/root`, `/var`,
-  `/opt`, `/home` and `/run`, while the Appine store keeps `/tmp` and `/root` between runs, so
-  caches such as `/root/.cache` (Go, uv) exist only on the Appine side; cases clean `/tmp` by hand
-  and nothing handles `$HOME` (one epoll case assumes an empty uv cache).
+- **The two difftest sides start from different files.** The native image lacks `/var`, `/opt`,
+  `/home` and `/run`, while the Appine store has them and keeps `/tmp` between runs; cases clean
+  `/tmp` by hand.
 - **A forced PTY on a terminal with piped stdout is half set up.** Raw mode needs both fds to be
   terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
   stops `appine-run` itself), line-buffers input and
