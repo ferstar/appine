@@ -665,6 +665,24 @@ fn shootdowns_wait_only_for_threads_they_kicked() {
 }
 
 #[test]
+fn mprotect_never_makes_copy_on_write_pages_writable() {
+    // tests/guest/cowprot.c: after fork one process keeps giving the pages it lent or borrowed
+    // read-write permission while its other thread wakes from short sleeps (so no shootdown kicks
+    // it) and writes them; the other process must never see those writes
+    let Some(program) = build_c_guest("cowprot") else {
+        return;
+    };
+    for tier in TIERS {
+        let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier])
+            .arg(&program)
+            .output()
+            .expect("failed to run appine-run");
+        assert_eq!(stdout(&out), "done\n", "tier {tier}: {}", stderr(&out));
+    }
+}
+
+#[test]
 fn ipc_timers_credentials_and_scheduling() {
     // System V message queues, semaphores (SEM_UNDO) and shared memory across fork, POSIX timers
     // (overrun counts, SIGEV_THREAD, CPU clocks), clocks (no-BKL and locked ones agree), mremap,

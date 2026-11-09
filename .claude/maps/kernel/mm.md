@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stack growth; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; shootdown waits; FUSE mappings read on demand last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect last)
 
 ## Responsibilities
 
@@ -321,8 +321,10 @@ signals may still be delivered).
   is `EINVAL`. A `cow` VMA is copied (`unshare`, which sets `dirty`; a `Fill` VMA maps its host
   file privately again, copies the pages it changed after reading them and drops its entries)
   before it becomes writable, and a `reserved` region gets real host memory (`back_reserved`) before it becomes
-  accessible. Otherwise only a permission downgrade sets `dirty`; a range containing fork CoW pages
-  gets an immediate `shootdown` either way.
+  accessible. Otherwise only a permission downgrade sets `dirty`. A private anonymous VMA holding
+  fork CoW pages first gets the new permissions without write, then its CoW pages get read-only
+  entries (lent ones at its own host pages, borrowed ones at the owner's, built even where a
+  `PROT_NONE` VMA had none), and only then do its other pages get write permission.
 - `mremap` follows Linux's order: no mapping at the old address is `EFAULT`; a `MREMAP_FIXED`
   target is validated (`EINVAL`) and unmapped and a shrunk tail unmapped; then the rest of the old
   range must lie in one Linux VMA (`EFAULT`, `same_vma`, as Linux before 6.17). Shrinking without
@@ -398,9 +400,11 @@ signals may still be delivered).
 - `quiesce` kicks every other user of the mm and spins until none is in guest code. The kick is
   sticky, so a thread returning from a no-BKL fast syscall stops at its next guest entry.
 - `shootdown` is the immediate form used when a PTE is re-pointed (CoW copy, return of a borrowed
-  page, mprotect over CoW pages): it bumps the TLB generation, kicks only users in guest code, and
-  waits until none is in guest code, kicking again any it still finds there (one that entered
-  after the first kicks, which nothing else would stop).
+  page): it bumps the TLB generation, kicks only users in guest code, and waits until none is in
+  guest code, kicking again any it still finds there (one that entered after the first kicks,
+  which nothing else would stop). It does not hold users back: one that enters guest code after
+  the wait has passed it (such as a thread waking from a no-BKL fast-path sleep) runs with a
+  flushed TLB while the caller still holds the BKL.
 - The run loop sets `in_guest`, then reads the counters (a SeqCst store-then-load pairing with the
   mutator's bump-then-read). If `space` changed it re-attaches to a new `CodeSpace`; if `tlb`
   changed it flushes its TLB; if `code` changed it invalidates Tier 1 blocks for the ranges it
@@ -463,8 +467,9 @@ signals may still be delivered).
   copy first (`cow_settle`).
 - When the last borrower returns a page, the owner's entries are restored at once (`repossess`),
   in runs that never cross VMAs, without a flush.
-- mprotect over CoW pages stops other threads first, so none can write into a lent page between
-  granting and removing write permission.
+- mprotect over CoW pages never gives a CoW page write permission or a borrowed page an entry at
+  the borrower's own host page, not even between steps (see mprotect above), since other threads
+  may run guest code meanwhile.
 - Futex keys of private memory are the address space's id and the address, so a futex on a
   borrowed page does not copy it; a private operation's key needs no mapping at all (Linux checks
   only that it is a user address); shared anonymous memory is keyed by host address and shared
@@ -661,6 +666,9 @@ signals may still be delivered).
 - After an unmap, a permission downgrade or re-pointing an entry, every other thread of the address
   space must flush before the old host memory is released. Adding permissions never requires a
   flush: a stale TLB half only misses.
+- Only `quiesce` (sticky kicks to every user) keeps other threads out of guest code until the BKL
+  is released; after a `shootdown` other threads may run guest code at once, so every page-table
+  change made under the BKL must leave entries valid for guest code at each step.
 - Waiting for users to leave guest code (`quiesce`, `shootdown`) holds the BKL, so it must kick
   every user it waits for: an unkicked one may run guest code indefinitely, such as a spin waiting
   for a thread that waits for that BKL, and the whole kernel stops (LTP shmctl05). Kicks are sticky,
@@ -707,11 +715,6 @@ signals may still be delivered).
 
 ## Confirmed bugs / technical debt
 
-- **A shootdown does not stop users that enter guest code after it has passed them:** it waits for
-  each user in turn, so one that marks itself as running only after the wait has looked at it runs
-  guest code (with a flushed TLB) while the caller still holds the BKL; `set_protection`, which
-  gives copy-on-write pages new permissions before taking write permission from lent ones, assumes
-  no thread runs guest code in between, and such a thread could write a lent page there.
 - **FUSE mappings read on demand are not Linux's page cache:** a page keeps what was read when first
   touched, so writes through the mount or by another process are not seen and separate mmap calls
   read separately; the size is fixed at mmap (growth not seen, truncation never `SIGBUS`); mlock,

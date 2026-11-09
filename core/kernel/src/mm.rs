@@ -2467,12 +2467,6 @@ impl Mm {
         self.room_for(self.splits(&[addr, end]))?;
         self.split_at(addr);
         self.split_at(end);
-        // Copy-on-write pages below first get the new permissions and then lose write permission:
-        // no other thread may run guest code in between, or it could write into a lent page
-        let cow = self.has_cow(addr, end);
-        if cow {
-            self.shootdown();
-        }
         if prot & prot::WRITE != 0 {
             let shared: Vec<u64> = self
                 .vmas
@@ -2507,24 +2501,44 @@ impl Mm {
             // refilled on a miss, so no flush is needed
             let (old, new) = (mmu_prot(v.prot), mmu_prot(prot));
             self.dirty |= old & !new != 0;
+            // Fork's copy-on-write pages never get write permission, and borrowed ones keep
+            // pointing at the owner's host pages. Other threads may run guest code meanwhile (a
+            // shootdown does not hold back one entering guest code after it), so no entry may be
+            // writable or point elsewhere even for a moment: the VMA first gets the new
+            // permissions without write, then the copy-on-write pages their entries, and only
+            // then the other pages write permission
+            let cow = self.cow.borrow();
+            let cow_pages = match v.backing {
+                Backing::Anonymous => Self::cow_pages(&cow, s, s + v.len),
+                _ => Vec::new(),
+            };
+            let first = match cow_pages.is_empty() {
+                true => new,
+                false => new & !prot::WRITE,
+            };
             // Change the permissions of existing entries; when all permissions are removed the
             // entries stay with permissions cleared (the host page may have contents, and fork's
             // lending and resident-memory measurement find pages by entry, see
             // [`Mm::touched_windows`]). A new PROT_NONE mapping has no entries
             // ([`Mm::map_pages`]), so they are added when it goes from no permissions to some
             // (file mappings only up to the end of the file, and large ones on demand at access)
-            self.mmu.protect(s, v.len, new).map_err(map_err)?;
+            self.mmu.protect(s, v.len, first).map_err(map_err)?;
+            if first != 0 {
+                Self::cow_entries(&self.mmu, &cow, s, v, &cow_pages, first);
+            }
             if old == 0 && new != 0 {
+                // Fills only pages without entries, so copy-on-write pages keep theirs
                 let file = v.backing != Backing::Anonymous;
                 Self::map_pages(&mut self.mmu, s, v.host, v.file_len, prot, file)?;
             }
+            if first != new {
+                Self::write_around(&mut self.mmu, s, v.len, &cow_pages, new)?;
+            }
+            drop(cow);
             v.prot = prot;
             if prot & prot::WRITE != 0 {
                 v.written.set(true);
             }
-        }
-        if cow {
-            self.cow_protect(addr, end);
         }
         Ok(())
     }
@@ -4863,44 +4877,48 @@ impl Mm {
         self.return_loans(pages.into_iter().map(|(page, b)| (page, b.host)), true);
     }
 
-    /// Whether `[start, end)` has copy-on-write pages.
-    fn has_cow(&self, start: u64, end: u64) -> bool {
-        let c = self.cow.borrow();
-        c.lent.range(start..end).next().is_some() || c.borrowed.range(start..end).next().is_some()
+    /// The copy-on-write pages (lent and borrowed) in `[start, end)`, in order: for mprotect
+    /// ([`Mm::set_protection`]).
+    fn cow_pages(c: &Cow, start: u64, end: u64) -> Vec<u64> {
+        let mut pages: Vec<u64> = c.lent.range(start..end).copied().collect();
+        pages.extend(c.borrowed.range(start..end).map(|(&p, _)| p));
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
-    /// After mprotect changed the entries of `[start, end)`: copy-on-write pages still cannot be
-    /// written, and borrowed pages still point at the owner's host pages.
-    fn cow_protect(&self, start: u64, end: u64) {
-        let c = self.cow.borrow();
-        for &page in c.lent.range(start..end) {
-            if let Some((s, v)) = self.anon_vma(page)
-                && Self::read_only(v) != 0
-            {
-                // Build the entry, not just change its permissions: a PROT_NONE mapping may have
-                // had no entry
-                // SAFETY: the host page belongs to this VMA
-                let _ = unsafe {
-                    self.mmu.map_shared(
-                        page,
-                        Self::own_page(s, v, page),
-                        PAGE_SIZE,
-                        Self::read_only(v),
-                    )
-                };
-            }
+    /// mprotect of private anonymous VMA `v` at `s`, once its entries have page-table permissions
+    /// `prot` (without write permission): copy-on-write `pages` get entries with `prot`, lent
+    /// ones at our own host pages and borrowed ones at the owner's. Built, not just changed: a
+    /// `PROT_NONE` VMA may have had none.
+    fn cow_entries(mmu: &Mmu, c: &Cow, s: u64, v: &Vma, pages: &[u64], prot: u32) {
+        for &page in pages {
+            let host = match c.borrowed.get(&page) {
+                Some(b) => b.host,
+                None => Self::own_page(s, v, page),
+            };
+            // SAFETY: the host page belongs to this VMA, or b.region holds the borrowed one
+            let _ = unsafe { mmu.map_shared(page, host, PAGE_SIZE, prot) };
         }
-        for (&page, b) in c.borrowed.range(start..end) {
-            if let Some((_, v)) = self.anon_vma(page)
-                && Self::read_only(v) != 0
-            {
-                // SAFETY: b.region holds the borrowed host page
-                let _ = unsafe {
-                    self.mmu
-                        .map_shared(page, b.host, PAGE_SIZE, Self::read_only(v))
-                };
+    }
+
+    /// Then the other pages of VMA `[s, s + len)`, around copy-on-write `pages` (in order), get
+    /// page-table permissions `prot`, which include write permission.
+    fn write_around(
+        mmu: &mut Mmu,
+        s: u64,
+        len: u64,
+        pages: &[u64],
+        prot: u32,
+    ) -> Result<(), Errno> {
+        let mut from = s;
+        for &page in pages.iter().chain(&[s + len]) {
+            if page > from {
+                mmu.protect(from, page - from, prot).map_err(map_err)?;
             }
+            from = page + PAGE_SIZE;
         }
+        Ok(())
     }
 
     /// When the address space is destroyed: pages of private anonymous memory that are not lent go
@@ -5039,6 +5057,9 @@ impl Mm {
     /// The immediate shootdown after a page-table entry is re-pointed: bump the generation first so
     /// users flush their TLBs before re-entering guest code; kick those running guest code and wait
     /// for them to leave (the approach of [`Mm::sync`], but the caller uses that page right after).
+    /// It does not hold users back: one entering guest code after the wait has passed it runs with
+    /// a flushed TLB while the caller still holds the BKL, so every step the caller takes must leave
+    /// the page table valid for guest code.
     fn shootdown(&self) {
         if self.users.is_empty() {
             return;
@@ -5054,8 +5075,7 @@ impl Mm {
             }
         }
         // Every user found in guest code is waited for, also one that entered after the kicks
-        // above (callers such as set_protection rely on no user running guest code afterwards).
-        // Such a user was not kicked and may run guest code for as long as it likes, such as a
+        // above (its TLB may predate the bump). Such a user was not kicked and may run guest code for as long as it likes, such as a
         // spin on a thread that waits for the BKL held here (LTP shmctl05): kick it too
         for u in &self.users {
             while u.in_guest.load(Ordering::SeqCst) {
