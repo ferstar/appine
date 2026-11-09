@@ -2584,6 +2584,21 @@ impl Vfs {
         self.mounts_changed();
     }
 
+    /// Whether a mount this thread let go of since the last call ([`released`]) is detached, so
+    /// that [`Vfs::collect`] may now drop it.
+    pub(crate) fn released_detached(&self) -> bool {
+        let released = RELEASED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+        if released.is_empty() {
+            return false;
+        }
+        let any = released[0] == ANY_MOUNT;
+        self.mounts
+            .borrow()
+            .detached
+            .iter()
+            .any(|m| any || released.contains(&m.id))
+    }
+
     /// Drops detached mounts not in `in_use` (no process's root or current directory and no
     /// open file is in them) and not connected below one that is. tmpfs instances no mount can
     /// see any more are deleted with their files.
@@ -2886,6 +2901,36 @@ fn tree_of(list: &[Mount], id: MountId) -> Vec<MountId> {
         i += 1;
     }
     out
+}
+
+thread_local! {
+    /// The mounts of the open files, current directories and roots this thread let go of since
+    /// [`Vfs::released_detached`] last looked ([`released`]); [`ANY_MOUNT`] alone when more went.
+    #[allow(clippy::missing_const_for_thread_local)] // already const; Android clippy misfires
+    static RELEASED: std::cell::RefCell<Vec<MountId>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`RELEASED`] held too many: any detached mount may have lost its last use.
+pub(crate) const ANY_MOUNT: MountId = MountId::MAX;
+
+/// An open file, current directory or root in mount `mnt` went away. When that was the last use
+/// of a detached mount, the mount goes at the end of the syscall or of the thread (Linux drops
+/// it with its last reference, so a lazily unmounted FUSE mount aborts its connection then and
+/// its daemon exits; `syscall::mount::collect_unused`).
+pub(crate) fn released(mnt: MountId) {
+    RELEASED.with(|r| {
+        let Ok(mut r) = r.try_borrow_mut() else {
+            return;
+        };
+        if r.first() == Some(&ANY_MOUNT) || r.contains(&mnt) {
+            return;
+        }
+        if r.len() < 16 {
+            r.push(mnt);
+        } else {
+            *r = vec![ANY_MOUNT];
+        }
+    });
 }
 
 /// Moves the attached mounts that `gone` picks to the detached list (Linux's `umount_tree`

@@ -122,8 +122,9 @@ pub(super) fn new_mnt_ns(vfs: Option<&Vfs>, fs: &mut FsContext, owner: Rc<UserNs
         Some(&id) => n.clone().in_mount(id),
         None => n.clone(),
     };
-    fs.root = remap(&fs.root);
-    fs.cwd = remap(&fs.cwd);
+    let (root, cwd) = (remap(&fs.root), remap(&fs.cwd));
+    fs.set_root(root);
+    fs.set_cwd(cwd);
     fs.mnt_ns = ns;
 }
 
@@ -405,8 +406,8 @@ fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     }
     if let (Some(ns), Some(root)) = (set.mnt, root) {
         let mut fs = cx.t.fs.borrow_mut();
-        fs.root = root.clone();
-        fs.cwd = root;
+        fs.set_root(root.clone());
+        fs.set_cwd(root);
         fs.mnt_ns = ns;
         drop(fs);
         cx.shared.fast_changed();

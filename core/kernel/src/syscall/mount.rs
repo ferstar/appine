@@ -1219,10 +1219,10 @@ pub(super) fn pivot_root(cx: &mut Cx<'_>, new_root: u64, put_old: u64) -> SysRes
         let res = task.res.borrow();
         let mut fs = res.fs.borrow_mut();
         if fs.root == root {
-            fs.root = new.clone();
+            fs.set_root(new.clone());
         }
         if fs.cwd == root {
-            fs.cwd = new.clone();
+            fs.set_cwd(new.clone());
         }
     }
     cx.shared.fast_changed();
@@ -1284,37 +1284,61 @@ fn busy(cx: &Cx<'_>, vfs: &Vfs, id: MountId) -> bool {
     !vfs.children(id).is_empty() || in_use(cx.kr()).contains(&id)
 }
 
-/// Some mount namespace is no longer used (the last process using it exited): unmount its mounts
-/// and drop those nobody uses.
-pub(crate) fn collect_namespaces(k: &crate::kernel::Kernel, vfs: &Vfs) {
-    if vfs.has_dead_ns() {
-        vfs.collect(&in_use(k));
+/// When a thread exits: a mount namespace no longer used (the last process using it exited)
+/// takes its mounts down, and the detached mounts whose last use were the thread's files or
+/// directories go ([`collect_released`]).
+pub(crate) fn collect_unused(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    if vfs.released_detached() || vfs.has_dead_ns() {
+        collect_now(k, vfs);
+    }
+}
+
+/// At the end of a syscall: a detached mount this thread let go of the last use of goes
+/// ([`crate::vfs::released`]; a lazily unmounted FUSE mount then aborts its connection, so its
+/// daemon exits).
+pub(super) fn collect_released(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    if vfs.released_detached() {
+        collect_now(k, vfs);
+    }
+}
+
+fn collect_now(k: &crate::kernel::Kernel, vfs: &Vfs) {
+    match try_in_use(k) {
+        Some(used) => vfs.collect(&used),
+        // Something is borrowed (not expected between syscalls): another time
+        None => crate::vfs::released(crate::vfs::ANY_MOUNT),
     }
 }
 
 /// The mounts that processes' root directories, cwds and open files are in.
 fn in_use(k: &crate::kernel::Kernel) -> HashSet<MountId> {
+    try_in_use(k).expect("a task's directories or fd table are borrowed")
+}
+
+/// [`in_use`], or None when some task's directories, fd table or open file is borrowed.
+fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
     let mut used = HashSet::new();
     for task in k.tasks.values() {
-        let res = task.res.borrow();
+        let res = task.res.try_borrow().ok()?;
         {
-            let fs = res.fs.borrow();
+            let fs = res.fs.try_borrow().ok()?;
             used.insert(fs.root.mnt());
             used.insert(fs.cwd.mnt());
         }
-        let fds = res.fds.borrow();
+        let fds = res.fds.try_borrow().ok()?;
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
-            if let Some(node) = file.borrow().node() {
+            let file = file.try_borrow().ok()?;
+            if let Some(node) = file.node() {
                 used.insert(node.mnt());
             }
-            if let crate::fd::FileKind::Pty(end) = &file.borrow().kind
+            if let crate::fd::FileKind::Pty(end) = &file.kind
                 && end.pin
             {
                 used.insert(end.mnt);
             }
         }
     }
-    used
+    Some(used)
 }
 
 /// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and

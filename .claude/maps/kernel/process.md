@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries, page reads and node sweeps last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits, timeouts; namespaces and their limits; rlimits; sched_setattr, CAP_SYS_NICE; kcmp; futexes, shm; the timer thread's AIO; vfork; BKL watchdog; vDSO; scripts' ETXTBSY; FUSE retries, page reads and node sweeps; mount collection last)
 
 ## Responsibilities
 
@@ -165,7 +165,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   buffers of read, write, pread64, pwrite64 and the vector forms are read into FUSE mappings
   (`kernel/fuse`'s `prefault`), since those consume input before copying. ptrace's entry and exit
   stops and seccomp see one syscall. After the handler, between syscalls, the FUSE node cache may
-  be swept (`kernel/fuse`'s `sweep`).
+  be swept (`kernel/fuse`'s `sweep`), and detached mounts whose last use the syscall let go of
+  are collected (`kernel/vfs`).
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
 
@@ -183,8 +184,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   remove
   the task and its pid, and reap SysV shm segments marked for removal whose last attachment that
   was (`kernel/ipc`); hand this thread's children to another live thread (non-last) or finish
-  the group (last); drop references under the BKL; request an `EXITED` wake. The engine CPU state is
-  freed after the BKL is released.
+  the group (last); drop references under the BKL; collect unix sockets in flight, IPC
+  namespaces and the mounts of dead mount namespaces or detached mounts the thread was the last
+  user of; request an `EXITED` wake. The engine CPU state is freed after the BKL is released.
 - `finish_group`: release AIO; reparent children to the nearest `PR_SET_CHILD_SUBREAPER` ancestor
   in the same pid-namespace level that still has live threads (one in the middle of exiting can be
   chosen, as on Linux), else the pid-namespace init while it has not exited, else the virtual init

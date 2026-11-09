@@ -5058,7 +5058,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
         let cred = cx.cred();
         super::fuse::may_chdir(cx, &vfs, &cred, f)?;
     }
-    cx.t.fs.borrow_mut().cwd = node;
+    cx.t.fs.borrow_mut().set_cwd(node);
     cx.shared.fast_changed();
     Ok(0)
 }
@@ -5094,7 +5094,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
     if !cred.capable_here(cap::SYS_CHROOT) {
         return Err(Errno::EPERM);
     }
-    cx.t.fs.borrow_mut().root = node;
+    cx.t.fs.borrow_mut().set_root(node);
     cx.shared.fast_changed();
     Ok(0)
 }

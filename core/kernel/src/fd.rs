@@ -371,8 +371,15 @@ impl Drop for OpenFile {
     /// connection), and no thread waits for objects such as epoll, eventfd, inotify and message
     /// queues when they are closed (blocked sends and receives on them hold the open file and, as
     /// on Linux, do not wake because someone else closed the fd). A shell closes several files on
-    /// every exec and exit, and each close used to wake the processes reading pipes.
+    /// every exec and exit, and each close used to wake the processes reading pipes. The mount it
+    /// was in may have been detached and now be unused ([`crate::vfs::released`]).
     fn drop(&mut self) {
+        crate::vfs::released(self.mnt);
+        if let FileKind::Pty(end) = &self.kind
+            && end.pin
+        {
+            crate::vfs::released(end.mnt);
+        }
         match &self.kind {
             FileKind::Socket(s)
                 if !s

@@ -48,6 +48,30 @@ pub(crate) struct FsContext {
     pub mnt_ns: Rc<crate::vfs::MntNs>,
 }
 
+impl FsContext {
+    /// Changes the current directory. The old one may have kept a detached mount in use
+    /// ([`crate::vfs::released`]).
+    pub fn set_cwd(&mut self, node: Node) {
+        crate::vfs::released(self.cwd.mnt());
+        self.cwd = node;
+    }
+
+    /// Changes the root directory, as [`FsContext::set_cwd`] does the current one.
+    pub fn set_root(&mut self, node: Node) {
+        crate::vfs::released(self.root.mnt());
+        self.root = node;
+    }
+}
+
+impl Drop for FsContext {
+    /// The last thread using it exited or took another: its directories may have kept a detached
+    /// mount in use.
+    fn drop(&mut self) {
+        crate::vfs::released(self.root.mnt());
+        crate::vfs::released(self.cwd.mnt());
+    }
+}
+
 /// The address space, fd table and current directory the thread is using. They really live in
 /// [`TaskState`]; this is a copy other threads can read too (for procfs), kept in sync by
 /// [`Cx::set_mm`](crate::kernel::Cx::set_mm) and the like when they are replaced.
@@ -1058,9 +1082,9 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
     // The last thread using an IPC namespace exited: drop the objects in it
     k.collect_ipc();
     // The last thread using a mount namespace exited: take down its mounts (the tmpfs in them
-    // are deleted with them)
+    // are deleted with them); detached mounts whose last use was its files or directories go too
     if let Some(vfs) = &vfs
-        && crate::bug::catch(|| crate::syscall::collect_namespaces(&k, vfs)).is_none()
+        && crate::bug::catch(|| crate::syscall::collect_unused(&k, vfs)).is_none()
     {
         failed(&k, "collecting mount namespaces");
     }

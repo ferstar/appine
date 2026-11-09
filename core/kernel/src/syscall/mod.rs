@@ -39,7 +39,7 @@ pub(crate) use inotify::{Inotify, Opened, Registry, host_change};
 pub(crate) use lease::Lease;
 pub(crate) use loopdev::{LoopOpen, Loops};
 pub(crate) use misc::Restart;
-pub(crate) use mount::collect_namespaces;
+pub(crate) use mount::collect_unused;
 pub(crate) use mqueue::{
     Limits as MqLimits, MessageQueue, MqDir, closed as mqueue_closed, find as mqueue_find,
 };
@@ -573,6 +573,10 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
     };
     // Between syscalls nothing holds a FUSE node but what in_use finds
     fuse::sweep(cx);
+    // A detached mount whose last open file or directory this syscall let go of
+    if let Ok(vfs) = cx.vfs() {
+        mount::collect_released(cx.kr(), &vfs);
+    }
     // pids returned by set_tid_address, getpgid, getsid, setsid, getpid, getppid and gettid, and
     // the pid or negative process group ID returned by fcntl(F_GETOWN) (wait4's are translated
     // before reaping)

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts last)
 
 ## Responsibilities
 
@@ -123,8 +123,9 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
   mounter's namespace), `default_permissions`, `allow_other`, `max_read` (at least 4096) when
   given. statfs reports `FUSE_SUPER_MAGIC`; `/proc/filesystems` lists `nodev fuse`.
 - Aborting (6.1's `fuse_abort_conn`): the last attached device file closing, or `Vfs::collect`
-  finding no attached or detached mount of the instance (umount, a dying mount namespace), which
-  also forgets the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
+  finding no attached or detached mount of the instance (umount, a dying mount namespace, or the
+  last open file, cwd or root in a lazily unmounted one going, `kernel/vfs`), which also forgets
+  the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
   ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
 
 ### Requests and waiting
@@ -400,8 +401,6 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 - **Directory changes run concurrently:** creations, removals and renames in one directory reach
   the daemon in parallel where Linux serializes them under the directory's lock; only the
   create-after-create race is handled (EEXIST without `O_EXCL` opens the file).
-- **Lazily detached mounts:** a FUSE mount detached with `MNT_DETACH` while files are open stays
-  connected after the last one closes, until some later umount or namespace death collects it.
 - **Retries cost:** an uncached path of n components takes n retries, each walking again from the
   start; any error but ENOENT of a lookup ends the syscall even where the walk would tolerate it.
 - **Small fidelity gaps:** fstat asks `FUSE_GETATTR` without the open file's handle; seeking a

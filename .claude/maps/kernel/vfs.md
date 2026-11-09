@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks and node holders last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts, propagation; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use last)
 
 ## Responsibilities
 
@@ -301,9 +301,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   tmpfs instances with no remaining mount, forgets overlay instances (and their nodes) with none,
   aborts and forgets FUSE instances with none (their daemons' reads then fail with `ENODEV`), and
   repeats if releasing pins killed another namespace.
-  It runs on every `umount2`, and at task exit only when some mount namespace has lost its last
-  reference; closing fds never triggers it, so reclaim of unused detached mounts, open_tree clones
-  and tmpfs trees waits for the next such event (or the next boot).
+  It runs on every `umount2`; at task exit when some mount namespace has lost its last reference;
+  and at the end of a syscall or of a thread when that thread let go of an open file, cwd or root
+  in a detached mount (`released`, recorded per thread by open files' drop and `FsContext`'s
+  `set_cwd`, `set_root` and drop), so a lazily unmounted mount, an open_tree clone or a tmpfs tree
+  goes once its last use does, as with Linux's last `mntput`.
 
 ### tmpfs
 
@@ -829,7 +831,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - The syscall dispatcher; `kernel/procfs` (`/proc/locks`, fdinfo `lock:` lines); `kernel/process`
   (clone/unshare/setns, execve's fd-table handling and
-  mount-flag checks, task exit's `collect`, the fast-path `Cached` resolver, AIO release at execve
+  mount-flag checks, collection at syscall end and task exit, the fast-path `Cached` resolver, AIO release at execve
   and exit, the timer thread's check of AIO polls with eventfds); `kernel/mm` (mmap `PROT_EXEC` on noexec); `kernel/procfs` (mountinfo, fd links,
   fdinfo, sysctls for pipes, leases, inotify, AIO and `protected_*`, the `/sys/block` view of the
   loop devices); `kernel/unix` (AF_UNIX bind
@@ -859,6 +861,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - A node's mount is part of its identity: `..`, root checks, `BENEATH`, `EXDEV` and busy checks
   all compare mounts, so binds of one filesystem are distinct.
 - Mount ids are never reused; nodes in detached mounts keep their ids and devices.
+- Whatever can keep a detached mount in use must say when it lets go (`released`): a task's root
+  and cwd change only through `FsContext::set_root`/`set_cwd`, and a new kind of holder counted by
+  `syscall::mount`'s `in_use` needs the same, or its mount lingers until another collection.
 - `Node` values are held without counting (cwds, roots, open files, mounts, inotify watches):
   `kernel/fuse` may forget a FUSE node between syscalls only when its scan finds none of them, so a
   new long-lived holder of FUSE nodes must be added to that scan.
@@ -1060,8 +1065,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - Is skipping search permission on synthetic directories intended (only `/proc/<pid>/fd` and
   `fdinfo` gate access, by the ptrace-read check)?
 - Should `protected_regular`, `protected_fifos` and `O_TMPFILE` be implemented?
-- Should unused detached mounts, open_tree clones and tmpfs instances be reclaimed when the last fd
-  closes rather than at the next `umount2` or task exit?
 
 ## To verify
 

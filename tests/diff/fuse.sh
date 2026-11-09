@@ -8,7 +8,8 @@
 # far-apart pages, read(2) and write(2) on mapped buffers, fork, MADV_DONTNEED, mremap,
 # MAP_POPULATE, SIGBUS past the end, a library loaded from the mount), nodes forgotten after
 # drop_caches unless open or a current directory (a daemon of its own), the errors the daemon and the
-# kernel return, the daemon leaving when the mount goes, ENOTCONN once the daemon is killed, and
+# kernel return, the daemon leaving when the mount goes and when a lazily unmounted one is no
+# longer used, ENOTCONN once the daemon is killed, and
 # the errors of mount options and of /dev/fuse before a mount. The layers are on one tmpfs on
 # both sides. Not compared: inode numbers (fuse-overlayfs takes them from the layers' files) and
 # times
@@ -279,6 +280,25 @@ sleep 1
 ls m 2>&1
 stat m 2>&1 | head -1
 umount m && echo unmounted
+echo "-- lazy unmount"
+# The connection lasts while a file or a current directory is in the detached mount, and is
+# aborted (the daemon exits) when the last one goes
+fuse-overlayfs -o lowerdir=/tmp/fuse/l,upperdir=/tmp/fuse/u,workdir=/tmp/fuse/w m || exit 1
+exec 3< m/a.txt
+umount -l m && echo detached
+sleep 1
+pgrep -x fuse-overlayfs > /dev/null && echo "daemon still serving"
+cat <&3
+exec 3<&-
+sleep 1
+pgrep -x fuse-overlayfs || echo "daemon gone"
+fuse-overlayfs -o lowerdir=/tmp/fuse/l,upperdir=/tmp/fuse/u,workdir=/tmp/fuse/w m || exit 1
+sh -c 'cd /tmp/fuse/m && umount -l /tmp/fuse/m && echo "detached from inside"
+sleep 1
+pgrep -x fuse-overlayfs > /dev/null && echo "daemon still serving"
+head -1 a.txt'
+sleep 1
+pgrep -x fuse-overlayfs || echo "daemon gone"
 echo "-- forgetting nodes"
 # A daemon speaking the protocol itself, recording for each name the lookups not yet forgotten
 cat > fz.py <<'EOF'
