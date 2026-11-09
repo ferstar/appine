@@ -7,15 +7,16 @@
 # reason recorded in a map, or that cannot be compared, are skipped, with the reason above them.
 # kernel/process: the ELF loader disagrees with Linux on unusual program headers
 SKIP="ExecTest.ElfWithNoLoadSegments:ExecTest.ElfWithUnalignedLoadOffset"
-# kernel/process: PI operations are ENOSYS
-SKIP="$SKIP:FutexTest.LockPi*"
+# kernel/process: PI futexes inherit no priority (the second fails natively in this container too)
+SKIP="$SKIP:FutexTest.LockPiBoostsOwnerPriorityInProcStat"
+SKIP="$SKIP:FutexTest.LockPiRealtimeWaiterBoostsOwnerPriorityInProcStat"
 # kernel/vfs: splice into a file stops quietly at RLIMIT_FSIZE
 SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileTruncatedByFSize"
 SKIP="$SKIP:SetRLimitTest.SpliceToRegularFileWithExplicitOffset"
-# kernel/procfs: absent per-process files (attr/, clear_refs, io, oom_adj, oom_score, sched,
-# schedstat, timerslack_ns, wchan)
+# kernel/procfs: absent per-process files (attr/, clear_refs, io, oom_adj, sched, schedstat,
+# timerslack_ns, wchan)
 SKIP="$SKIP:ZombieProcTest.Attr*:ZombieProcTest.ClearRefs:ZombieProcTest.Io:ZombieProcTest.OomAdj"
-SKIP="$SKIP:ZombieProcTest.OomScore:ZombieProcTest.Sched:ZombieProcTest.Schedstat"
+SKIP="$SKIP:ZombieProcTest.Sched:ZombieProcTest.Schedstat"
 SKIP="$SKIP:ZombieProcTest.TimerslackNs:ZombieProcTest.Wchan"
 # Cannot be compared: the native kernel fails reading a zombie leader's auxv and environ, where the
 # test (and Appine) expect them empty

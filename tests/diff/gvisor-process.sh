@@ -14,13 +14,12 @@ SKIP="$SKIP:$P.PrctlSetPtracerRespectsTracerThreadID:$P.PrctlClearPtracerDoesNot
 SKIP="$SKIP:$P.PrctlNotInherited:$P.TraceParentNotAllowed:$P.TraceNonDescendantNotAllowed"
 SKIP="$SKIP:$P.ExecvePtraceLockStress"
 # kernel/signal: threads killed by another thread's execve report no PTRACE_EVENT_EXIT; detaching
-# at an attach-time group stop reports the stop again
+# at an attach-time group stop reports the stop again (the second fails only when the whole case
+# runs, not on its own)
 SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClone_TraceExit/*"
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
 # kernel/cred D2: no ACLs
 SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
-# kernel/signal: rt_sigqueueinfo to a zombie is ESRCH
-SKIP="$SKIP:RtSignalTest.InvalidCodes"
 # Hang on both sides until the 60 s timeout (only the timeout would be compared)
 SKIP="$SKIP:SigtimedwaitTest.NullTimeoutReturnsEINTR:PidfdTest.SendSignalToStoppedChildSucceeds"
 # Slow by design (they sleep 10 to 30 s each to show that nothing happens), left out for the time
