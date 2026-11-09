@@ -92,6 +92,9 @@ internal object Rootfs {
     /** An account in `/etc/passwd`. */
     data class Account(val name: String, val uid: Int, val gid: Int, val home: String)
 
+    /** The first argument that makes `login.sh` only rewrite the NOPASSWD rules ([dirsChanged]). */
+    private const val REFRESH_RULES = "--refresh-rules"
+
     /** The most bytes and time a probe downloads. */
     private const val PROBE_BYTES = 512 * 1024
     private const val PROBE_TIMEOUT_MS = 5000
@@ -562,6 +565,20 @@ netns = "host"
             val gid = f[3].toIntOrNull() ?: return@mapNotNull null
             Account(f[0], uid, gid, f[5]) to f[6]
         }
+    }
+
+    /**
+     * The guest changed the entries of [dirs] ([Native.takeChangedDirs], polled by the service):
+     * when `/etc` is among them (passwd, chpasswd and adduser replace `/etc/shadow`, addgroup and
+     * deluser `/etc/group`), the login's NOPASSWD rules are rewritten from the passwords and groups
+     * now, by `login.sh --refresh-rules` run as root on the running [machine], so a password set in
+     * a running session counts without a new tab. Returns the refresh's pid (it is not waited for:
+     * the guest's init reaps it), or -1 when nothing needed refreshing.
+     */
+    fun dirsChanged(context: Context, machine: Long, dirs: Array<String>): Int {
+        if ("/etc" !in dirs) return -1
+        val argv = ConsolePty.argv(ConsolePty.script(context), REFRESH_RULES)
+        return Native.spawn(machine, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT)
     }
 
     /**

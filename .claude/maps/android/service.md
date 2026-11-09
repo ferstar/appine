@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 10 claims checked by 1 independent verifier — 8 confirmed and 2 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: libghostty-vt sessions; start, exit, saving; tab names; kill reports; the name Appine; resumed imports; auto tabs; containers file; report paths; BKL stalls; programs' bells, clipboard, notifications last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: vt sessions; start, exit, saving; tab names; kill reports; resumed imports; auto tabs; containers file; report paths; BKL stalls; bells, clipboard; NOPASSWD refresh last)
 
 ## Responsibilities
 
@@ -99,7 +99,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
   applied on the main thread only if the kernel is still the same.
 - Reboot → `restart()`; halt/poweroff → `exitAll()`; no running sessions (tabs whose shell ended
   do not count; restored tabs not shown yet do), no listeners and no guest processes →
-  `exitAll()`. Changed directories go to `Documents.dirsChanged`.
+  `exitAll()`. Changed directories go to `Documents.dirsChanged`, then, on the worker, to
+  `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
 
 ### Stopping, restarting, replacing
 
@@ -212,7 +213,8 @@ the tab bar and the PTY adapter (`android/terminal`); the Files app provider
 ### Outbound
 
 - `Native` (start, boot, shutdown, stop, trim, poll calls, routes, spawn, waitFor, consoleCwd);
-  `Rootfs` (prepare, download, mirrors, ensure-files, access lock, reset, failed services); `Tabs`;
+  `Rootfs` (prepare, download, mirrors, ensure-files, access lock, reset, failed services, rules
+  refresh); `Tabs`;
   `ActivityManager` (exit records);
   `ConsolePty` and `VtSession`; `Documents` (`rootsChanged`, `dirsChanged`).
 

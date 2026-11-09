@@ -126,7 +126,7 @@ class TerminalService : Service() {
      *   refuses was moved, so the user must be told which one to connect to;
      * - the guest's power requests (busybox's reboot, halt, poweroff);
      * - directories the guest changed: the Files app is told to refresh them (the android/documents
-     *   map);
+     *   map), and a change in `/etc` rewrites the login's NOPASSWD rules (the android/setup map);
      * - whether guest processes remain when there are no sessions and no UI: if none, exit (the
      *   android/service map).
      *
@@ -144,7 +144,10 @@ class TerminalService : Service() {
                     val kills = Native.takeKills(m)
                     val power = Native.takePower(m)
                     val processes = Native.processes(m)
-                    Native.takeChangedDirs(m)?.let { Documents.dirsChanged(this@TerminalService, it) }
+                    Native.takeChangedDirs(m)?.let {
+                        Documents.dirsChanged(this@TerminalService, it)
+                        runCatching { Rootfs.dirsChanged(this@TerminalService, m, it) }
+                    }
                     main.post {
                         if (machine != m) return@post
                         lines?.forEach(::notifyListen)

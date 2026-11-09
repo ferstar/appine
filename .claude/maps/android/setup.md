@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refresh at root logins; admins recorded once; mirrors recorded after writing; downloads stop past the pinned length; resumed imports; rootless podman's network; containers' storage left to the packages last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refreshed at root logins and /etc changes; admins recorded once; mirrors after writing; download length; resumed imports; podman setup)
 
 ## Responsibilities
 
@@ -106,7 +106,12 @@ Outside the module: when imports, switches and logins happen (`android/service`)
     with NOPASSWD lines for recorded admins still in the group that have no password: a shadow
     field that, after any leading `!`s, is empty or `*` (`adduser -D` writes `!`); `passwd -l`'s `!`
     before a hash still counts as a password, and so do a missing shadow entry and an unreadable
-    `/etc/shadow`;
+    `/etc/shadow`; the file is written beside it and renamed into place;
+  - `--refresh-rules` as the first argument only rewrites the rules: `Rootfs.dirsChanged` runs
+    it as root, without a console and without waiting, when the service's poll finds `/etc`
+    among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
+    `/etc/shadow`; group changes replace `/etc/group`), so a password set in a running session
+    makes escalating ask for it within about one poll (2 s);
   - root: `cd` to the directory and `exec` root's passwd shell as a login shell;
   - a regular account the first time (not in `/var/lib/appine/admins`, matched literally): add it
     to wheel (Alpine, with `permit persist :wheel`) or sudo (Debian) and record it once it really is
@@ -162,9 +167,10 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ## Confirmed bugs / technical debt
 
-- **A password set in a running session keeps NOPASSWD for a while.** The rules are rewritten only
-  when a tab logs in, so after `passwd` the account still escalates without one until the next tab
-  opens.
+- **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
+  (an append, a text editor writing the file itself) changes no entry of `/etc`, and a burst of
+  more than 256 changed directories between two polls stops recording the rest, so such a change
+  waits for the next login; while the app is not running there is nothing to refresh.
 
 ## Open questions
 

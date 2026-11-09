@@ -374,6 +374,42 @@ class MachineTest {
     }
 
     /**
+     * A password set while the session runs (the android/setup map): until then alice escalates
+     * without one; chpasswd replaces `/etc/shadow`, the changed `/etc` (what the service takes with
+     * [Native.takeChangedDirs]) makes [Rootfs.dirsChanged] rewrite the rules, and from then on doas
+     * asks for the password without a new login. A change elsewhere refreshes nothing.
+     */
+    @Test
+    fun rulesFollowAPasswordSetLater() {
+        Rootfs.ensureLoginTools(context)
+        val machine = start(1)
+        val escalate = "su alice -c 'doas -n id -un' 2>&1"
+        try {
+            assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
+            val first = login(machine, "id -un; id -nG; doas -n id -un; exit\n")
+            assertTrue(first, becameAdmin(first, "wheel"))
+            Native.takeChangedDirs(machine)
+            assertEquals(-1, Rootfs.dirsChanged(context, machine, arrayOf("/home/alice")))
+            assertEquals(0, sh(machine, "echo alice:secret | chpasswd").second)
+            val before = sh(machine, escalate).first
+            assertTrue(before, before.lines().any { it.trim() == "root" })
+            val dirs = Native.takeChangedDirs(machine) ?: emptyArray()
+            assertTrue(dirs.joinToString(), "/etc" in dirs)
+            val pid = Rootfs.dirsChanged(context, machine, dirs)
+            assertTrue(pid > 0)
+            Native.waitFor(machine, pid)
+            val after = sh(machine, escalate).first
+            assertTrue(after, after.contains("doas: Authentication required"))
+        } finally {
+            sh(
+                machine,
+                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
+                    "rm -rf /var/lib/appine /etc/doas.d",
+            )
+        }
+    }
+
+    /**
      * In the login script's output: `id -un` is alice, `id -nG` contains [group],
      * `doas`/`sudo -n id -un` is root (compared by line, as terminal output has control sequences
      * and CRs mixed in).

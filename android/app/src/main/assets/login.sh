@@ -11,8 +11,10 @@
 # (needs the network; if it cannot be installed, it is retried at every later login). Accounts added
 # to the group are recorded in /var/lib/appine/admins; if the user later takes one out of the group,
 # it is not added back. With a password set, escalating asks for the password, following the
-# distro's convention; without one (adduser -D) it does not ask, and the rule is rewritten at every
-# login according to the password at that time.
+# distro's convention; without one (adduser -D) it does not ask. The rule is rewritten at every
+# login according to the password at that time, and, while Appine runs, within a few seconds of the
+# guest changing /etc (passwd replaces /etc/shadow): the app then runs this script with
+# --refresh-rules as $1, which only rewrites the rules.
 # The install commands all read from /dev/null: what the user types before the prompt appears is
 # left for the login shell.
 #
@@ -45,6 +47,58 @@ first() {
 
 field() { awk -F: -v u="$1" -v f="$2" '$1 == u { print $f; exit }' "$3"; }
 
+admins=/var/lib/appine/admins
+if [ -f /etc/alpine-release ]; then
+    group=wheel
+    tool=doas
+    rules=/etc/doas.d/30-appine.conf
+else
+    group=sudo
+    tool=sudo
+    rules=/etc/sudoers.d/appine
+fi
+ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
+
+# Admins without a password (still in the group) are not asked for a password when escalating. The
+# rules are rewritten at every login, root's included, and with --refresh-rules, according to the
+# passwords at that time. No password means a shadow field that is empty or only "!" or "*"
+# (adduser -D writes "!"); passwd -l puts "!" in front of a hash, and that account still has a
+# password. Without a shadow entry, or without a readable /etc/shadow, an account counts as having
+# a password. The file is written beside and renamed into place, so a login and a refresh running
+# at once never leave it half written (doas reads only *.conf, sudo skips names with a dot)
+refresh_rules() {
+    nopass=
+    if [ -f "$admins" ]; then
+        while read -r u; do
+            ingroup "$u" || continue
+            pw=$(awk -F: -v u="$u" '$1 == u { sub(/^!+/, "", $2); print "=" $2; exit }' /etc/shadow 2>/dev/null)
+            case $pw in '=' | '=*') nopass="$nopass $u" ;; esac
+        done <"$admins"
+    fi
+    if [ -n "$nopass" ] && [ -d "${rules%/*}" ]; then
+        tmp=$rules.new.$$
+        {
+            echo "# Written by Appine at each login and when /etc changes: administrators without a password ($admins)."
+            for u in $nopass; do
+                if [ "$group" = wheel ]; then
+                    echo "permit nopass $u"
+                else
+                    echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
+                fi
+            done
+        } >"$tmp" && chmod 0440 "$tmp" && mv -f "$tmp" "$rules"
+        rm -f "$tmp"
+    else
+        rm -f "$rules"
+    fi
+}
+
+# Only the rules: the app asks for this when the guest changed /etc
+if [ "$want" = --refresh-rules ]; then
+    refresh_rules
+    exit 0
+fi
+
 case $want in
 auto)
     u=$(first)
@@ -59,49 +113,6 @@ root) ;;
     fi
     ;;
 esac
-
-admins=/var/lib/appine/admins
-if [ -f /etc/alpine-release ]; then
-    group=wheel
-    tool=doas
-    rules=/etc/doas.d/30-appine.conf
-else
-    group=sudo
-    tool=sudo
-    rules=/etc/sudoers.d/appine
-fi
-ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
-
-# Admins without a password (still in the group) are not asked for a password when escalating. The
-# rules are rewritten at every login, root's included, according to the passwords at that time. No
-# password means a shadow field that is empty or only "!" or "*" (adduser -D writes "!"); passwd -l
-# puts "!" in front of a hash, and that account still has a password. Without a shadow entry, or
-# without a readable /etc/shadow, an account counts as having a password
-refresh_rules() {
-    nopass=
-    if [ -f "$admins" ]; then
-        while read -r u; do
-            ingroup "$u" || continue
-            pw=$(awk -F: -v u="$u" '$1 == u { sub(/^!+/, "", $2); print "=" $2; exit }' /etc/shadow 2>/dev/null)
-            case $pw in '=' | '=*') nopass="$nopass $u" ;; esac
-        done <"$admins"
-    fi
-    if [ -n "$nopass" ] && [ -d "${rules%/*}" ]; then
-        {
-            echo "# Written by Appine at each login: administrators without a password ($admins)."
-            for u in $nopass; do
-                if [ "$group" = wheel ]; then
-                    echo "permit nopass $u"
-                else
-                    echo "$u ALL=(ALL:ALL) NOPASSWD: ALL"
-                fi
-            done
-        } >"$rules"
-        chmod 0440 "$rules"
-    else
-        rm -f "$rules"
-    fi
-}
 
 if [ "$user" = root ]; then
     refresh_rules
