@@ -260,7 +260,7 @@ impl NsSet {
         let group = p.group(k).ok_or(Errno::ESRCH)?;
         let task = k.tasks.get(&p.tgid).cloned().ok_or(Errno::ESRCH)?;
         let g = group.borrow();
-        if !super::proc::may_ptrace(cx, &g) {
+        if !super::proc::may_ptrace(cx, g.tgid) {
             return Err(Errno::EPERM);
         }
         let want = |kind: NsKind| flags & kind.clone_flag() != 0;
@@ -401,8 +401,9 @@ fn validate(cx: &Cx<'_>, set: &NsSet, flags: u64) -> Result<Option<Node>, Errno>
 /// be changed (Linux's `timens_commit`).
 fn commit(cx: &mut Cx<'_>, set: NsSet, root: Option<Node>) {
     if let Some(ns) = set.user {
-        cx.t.group.borrow_mut().cred.enter_user_ns(ns);
-        cx.shared.fast_changed();
+        let mut cred = cx.cred();
+        cred.enter_user_ns(ns);
+        cx.set_cred(cred);
     }
     if let (Some(ns), Some(root)) = (set.mnt, root) {
         let mut fs = cx.t.fs.borrow_mut();

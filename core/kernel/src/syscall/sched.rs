@@ -81,7 +81,7 @@ pub(super) fn setpriority(cx: &mut Cx<'_>, which: i32, who: i32, nice: i32) -> S
         // Another's process needs the same effective user ID or CAP_SYS_NICE over its user
         // namespace (set_one_prio); raising priority (lowering nice) must be within the target's
         // RLIMIT_NICE, or needs CAP_SYS_NICE (Linux's can_nice, in the initial namespace)
-        if !owner_or_nice_over(&cred, &g.cred) {
+        if !owner_or_nice_over(&cred, &cred_of(t.as_ref())) {
             result = Err(Errno::EPERM);
         } else if nice < current
             && (20 - nice) as u64 > g.rlimits[RLIMIT_NICE as usize].0
@@ -148,13 +148,12 @@ fn targets(cx: &Cx<'_>, which: i32, who: i32) -> Result<Vec<Target>, Errno> {
             } else {
                 cx.cred().uid_in(who as u32)
             };
+            // Each thread by its own real user ID (Linux's for_each_process_thread)
             k.groups
                 .values()
-                .filter(|g| {
-                    let g = g.borrow();
-                    Some(g.cred.ruid) == uid && cx.pid_out(g.tgid) != 0
-                })
+                .filter(|g| cx.pid_out(g.borrow().tgid) != 0)
                 .flat_map(threads)
+                .filter(|(t, _)| Some(cred_of(t.as_ref()).ruid) == uid)
                 .collect()
         }
         _ => return Err(Errno::EINVAL),
@@ -189,11 +188,11 @@ pub(super) fn ioprio_set(cx: &mut Cx<'_>, which: i32, who: i32, ioprio: i32) -> 
     let uid = (which == IOPRIO_WHO_USER)
         .then(|| cred.uid_in(who as u32))
         .flatten();
-    for (t, g) in ioprio_targets(cx, which, who, uid)? {
+    for (t, _) in ioprio_targets(cx, which, who, uid)? {
         // set_task_ioprio: the target's real user ID must equal the caller's effective or real
         // user ID, or CAP_SYS_NICE is needed; for a process group or user the first failure
         // returns, with the earlier ones already changed
-        let target = g.borrow().cred.ruid;
+        let target = cred_of(t.as_ref()).ruid;
         if target != cred.euid && target != cred.ruid && !cred.capable(cap::SYS_NICE) {
             return Err(Errno::EPERM);
         }
@@ -351,11 +350,9 @@ fn ioprio_targets(
             Some(uid) => k
                 .groups
                 .values()
-                .filter(|g| {
-                    let g = g.borrow();
-                    g.cred.ruid == uid && cx.pid_out(g.tgid) != 0
-                })
+                .filter(|g| cx.pid_out(g.borrow().tgid) != 0)
                 .flat_map(threads)
+                .filter(|(t, _)| cred_of(t.as_ref()).ruid == uid)
                 .collect(),
             None => Vec::new(),
         },
@@ -557,7 +554,7 @@ fn set_deadline(
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
-    if !same_owner(&cred, &cred_of(cx, task)) || !cred.capable(cap::SYS_NICE) {
+    if !same_owner(&cred, &cred_of(task)) || !cred.capable(cap::SYS_NICE) {
         return Err(Errno::EPERM);
     }
     if let Some(t) = task {
@@ -584,7 +581,7 @@ fn set_policy(
         return Err(Errno::EINVAL);
     }
     let cred = cx.cred();
-    if !same_owner(&cred, &cred_of(cx, task)) || rt && !cred.capable(cap::SYS_NICE) {
+    if !same_owner(&cred, &cred_of(task)) || rt && !cred.capable(cap::SYS_NICE) {
         return Err(Errno::EPERM);
     }
     // Without CAP_SYS_NICE (__sched_setscheduler): SCHED_IDLE counts as nice 20, so leaving it
@@ -664,7 +661,7 @@ pub(super) fn sched_setaffinity(cx: &mut Cx<'_>, pid: i32, len: usize, mask: u64
         .read(crate::uaccess::UserSlice::new(mask, n), &mut b[..n])?;
     let task = affinity_target(cx, pid)?;
     let new = u64::from_le_bytes(b) & online_cpus();
-    if !owner_or_nice_over(&cx.cred(), &cred_of(cx, task.as_ref())) {
+    if !owner_or_nice_over(&cx.cred(), &cred_of(task.as_ref())) {
         return Err(Errno::EPERM);
     }
     if new == 0 {
@@ -816,10 +813,9 @@ fn target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     }
 }
 
-/// The credentials of the thread's process.
-fn cred_of(cx: &Cx<'_>, task: Option<&Rc<Task>>) -> Cred {
-    task.and_then(|t| cx.kr().groups.get(&t.tgid))
-        .map_or_else(Cred::root, |g| g.borrow().cred.clone())
+/// The credentials of a target thread; the built-in init, which has none, is root.
+fn cred_of(task: Option<&Rc<Task>>) -> Cred {
+    task.map_or_else(Cred::root, |t| t.cred.borrow().clone())
 }
 
 /// Whether the scheduling parameters of a process with credentials `target` may be changed

@@ -1161,7 +1161,7 @@ pub(super) fn prlimit(cx: &mut Cx<'_>, pid: i32, resource: u32, new: u64, old: u
     } else {
         let g = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
         // Another user's process: its user and group IDs must all equal the caller's real IDs
-        let t = g.borrow().cred.clone();
+        let t = cx.kr().cred_of(pid).ok_or(Errno::ESRCH)?;
         let same = [t.ruid, t.euid, t.suid].iter().all(|&u| u == cred.ruid)
             && [t.rgid, t.egid, t.sgid].iter().all(|&g| g == cred.rgid);
         if !same && !cred.capable(cap::SYS_RESOURCE) {
@@ -1275,34 +1275,41 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
         }
         PR_GET_KEEPCAPS => Ok(cx.cred().keep_caps() as u64),
         PR_SET_KEEPCAPS if arg <= 1 => {
-            let c = &mut cx.t.group.borrow_mut().cred;
+            let mut c = cx.cred();
             if c.securebits & secbit::KEEP_CAPS_LOCKED != 0 {
                 return Err(Errno::EPERM);
             }
             c.securebits = (c.securebits & !secbit::KEEP_CAPS) | (arg as u32 * secbit::KEEP_CAPS);
+            cx.set_cred(c);
             Ok(0)
         }
         PR_GET_SECUREBITS => Ok(cx.cred().securebits as u64),
         PR_SET_SECUREBITS => {
             let bits = u32::try_from(arg).map_err(|_| Errno::EPERM)?;
-            cx.t.group.borrow_mut().cred.set_securebits(bits)?;
+            let mut c = cx.cred();
+            c.set_securebits(bits)?;
+            cx.set_cred(c);
             Ok(0)
         }
         PR_GET_SECCOMP => Ok(u64::from(cx.task.seccomp.borrow().mode)),
         PR_SET_SECCOMP => crate::seccomp::prctl_set(cx, arg, args[1]),
         PR_CAPBSET_READ if arg <= CAP_LAST_CAP => Ok((cx.cred().cap_bounding >> arg) & 1),
         PR_CAPBSET_DROP if arg <= CAP_LAST_CAP => {
-            if !cx.cred().capable_here(cap::SETPCAP) {
+            let mut c = cx.cred();
+            if !c.capable_here(cap::SETPCAP) {
                 return Err(Errno::EPERM);
             }
-            cx.t.group.borrow_mut().cred.cap_bounding &= !(1 << arg);
+            c.cap_bounding &= !(1 << arg);
+            cx.set_cred(c);
             Ok(0)
         }
         // Ambient capabilities (capabilities(7))
         PR_CAP_AMBIENT => match arg {
             PR_CAP_AMBIENT_CLEAR_ALL => {
                 unused(1)?;
-                cx.t.group.borrow_mut().cred.cap_ambient = 0;
+                let mut c = cx.cred();
+                c.cap_ambient = 0;
+                cx.set_cred(c);
                 Ok(0)
             }
             PR_CAP_AMBIENT_IS_SET | PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER => {
@@ -1310,15 +1317,14 @@ pub(super) fn prctl(cx: &mut Cx<'_>, option: i32, args: [u64; 4]) -> SysResult {
                 if args[1] > CAP_LAST_CAP {
                     return Err(Errno::EINVAL);
                 }
-                let c = &mut cx.t.group.borrow_mut().cred;
+                let mut c = cx.cred();
                 match arg {
-                    PR_CAP_AMBIENT_IS_SET => Ok((c.cap_ambient >> args[1]) & 1),
-                    PR_CAP_AMBIENT_RAISE => c.raise_ambient(args[1] as u32).map(|()| 0),
-                    _ => {
-                        c.cap_ambient &= !(1 << args[1]);
-                        Ok(0)
-                    }
+                    PR_CAP_AMBIENT_IS_SET => return Ok((c.cap_ambient >> args[1]) & 1),
+                    PR_CAP_AMBIENT_RAISE => c.raise_ambient(args[1] as u32)?,
+                    _ => c.cap_ambient &= !(1 << args[1]),
                 }
+                cx.set_cred(c);
+                Ok(0)
             }
             _ => Err(Errno::EINVAL),
         },
@@ -1405,12 +1411,7 @@ pub(super) fn get_robust_list(cx: &mut Cx<'_>, pid: i32, head: u64, len: u64) ->
     } else {
         let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
         // As with ptrace: only threads of the same user can be inspected
-        let target = cx
-            .kr()
-            .groups
-            .get(&task.tgid)
-            .map(|g| g.borrow().cred.clone())
-            .ok_or(Errno::ESRCH)?;
+        let target = task.cred.borrow().clone();
         let cred = cx.cred();
         if cred.ruid != target.ruid && !cred.ns_capable(&target.user_ns, cap::SYS_PTRACE) {
             return Err(Errno::EPERM);

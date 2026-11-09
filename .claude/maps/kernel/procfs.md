@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes; change notifications last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes; change notifications; per-thread credentials last)
 
 ## Responsibilities
 
@@ -92,8 +92,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   to root of the user namespace owning the network namespace when it maps one
   (`net_ctl_set_ownership`). Stat reports
   `st_blksize` 1024 for procfs and devpts nodes (their superblocks' block size), 4096 elsewhere. Owners: per-process
-  entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the process's
-  euid/egid, or the root of its credentials' user namespace when not dumpable; the entries inside
+  entries (including the `fd/`, `fdinfo/`, `ns/`, `net/` directories) belong to the euid/egid of
+  the thread (under `task/<tid>`) or the main thread, or the root of those credentials' user
+  namespace when the process is not dumpable; the entries inside
   `fdinfo/`, `ns/` and `net/`, reopened open files and everything else belong to root.
 - Names path resolution does not find (`View::missing`, Starnix's `not_found`) are counted as
   unimplemented paths (`kernel/signal`) when Linux would have them: under the procfs root (not
@@ -175,7 +176,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   rest (0 everywhere for a process without an address space); fault counters, `kstkesp`,
   `kstkeip`, `wchan`, `processor`, priority and policy are 0; start time in clock ticks plus the reader's time-namespace boottime offset; the
   thread's or the group's CPU times depending on the view; `tty_nr` from the controlling terminal.
-- `status`: ids translated into the reader's user namespace, `NStgid`/`NSpid`/`NSpgid`/`NSsid`
+- `status`: the thread's ids (the main thread's for `/proc/<pid>`) translated into the reader's
+  user namespace (the reading thread's credentials), `NStgid`/`NSpid`/`NSpgid`/`NSsid`
   from the instance's namespace down, capabilities, `NoNewPrivs`, `Seccomp`, signal masks; memory
   lines approximate (`VmPeak` = `VmSize` = `VmData`, `VmHWM` from max RSS, `VmRSS` the sum of
   `RssAnon`, `RssFile` and `RssShmem` from `Mm::resident_split`, `VmStk` the grows-down mappings,

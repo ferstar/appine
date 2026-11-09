@@ -117,7 +117,7 @@ fn kill_thread(cx: &mut Cx<'_>, tgid: Option<i32>, tid: i32, sig: i32) -> SysRes
     }
     let cred = cx.cred();
     let sid = cx.t.group.borrow().sid;
-    if !may_kill(cx, &cred, sid, task.tgid, sig) {
+    if !may_kill(cx, &cred, sid, tid, sig) {
         return Err(Errno::EPERM);
     }
     if let Some(sig) = sig {
@@ -246,7 +246,7 @@ pub(super) fn sigqueueinfo(
             if task.tgid != tgid {
                 return Err(Errno::ESRCH);
             }
-            if !may_kill(cx, &cred, sid, tgid, sig) {
+            if !may_kill(cx, &cred, sid, tid, sig) {
                 return Err(Errno::EPERM);
             }
             if full(cx) {
@@ -300,14 +300,18 @@ fn queue_info(b: &[u8; 128]) -> SigInfo {
     }
 }
 
-/// Whether process `tgid` may be sent signal `sig` (`check_kill_permission`): the credentials
-/// allow it, or it is the same process, or it is SIGCONT sent within the same session.
-fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, tgid: Tid, sig: Option<Signal>) -> bool {
-    let Some(target) = cx.kr().groups.get(&tgid) else {
+/// Whether thread `target` (a thread ID, or a pid when signalling the process, which goes by its
+/// main thread's credentials) may be sent signal `sig` (`check_kill_permission`): its credentials
+/// allow it, or it is in the same process, or it is SIGCONT sent within the same session.
+fn may_kill(cx: &Cx<'_>, cred: &Cred, sid: Tid, target: Tid, sig: Option<Signal>) -> bool {
+    let k = cx.kr();
+    let Some(group) = crate::pseudo::group_of(k, target) else {
         return false;
     };
-    let t = target.borrow();
-    t.tgid == cx.tgid() || cred.may_signal(&t.cred) || (sig == Some(Signal::CONT) && t.sid == sid)
+    let g = group.borrow();
+    g.tgid == cx.tgid()
+        || k.cred_of(target).is_some_and(|t| cred.may_signal(&t))
+        || (sig == Some(Signal::CONT) && g.sid == sid)
 }
 
 pub(super) fn rt_sigaction(

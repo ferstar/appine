@@ -136,8 +136,8 @@ fn core_name(cx: &Cx<'_>, sig: Signal) -> Vec<u8> {
             }
             b'i' => vnr(cx.tid()),
             b'I' => cx.tid().to_string(),
-            b'u' => g.cred.ruid.to_string(),
-            b'g' => g.cred.rgid.to_string(),
+            b'u' => cx.cred().ruid.to_string(),
+            b'g' => cx.cred().rgid.to_string(),
             b's' => sig.number().to_string(),
             b't' => std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -155,11 +155,8 @@ pub(super) fn capget(cx: &mut Cx<'_>, hdr: u64, data: u64) -> SysResult {
     let cred = if pid == 0 {
         cx.cred()
     } else {
-        let pid = cx.pid_in(pid);
-        let k = cx.kr();
-        let task = k.tasks.get(&pid).ok_or(Errno::ESRCH)?;
-        let group = k.groups.get(&task.tgid).ok_or(Errno::ESRCH)?;
-        group.borrow().cred.clone()
+        // The thread's own, or a main thread's that has ended and is still a zombie
+        cx.kr().cred_of(cx.pid_in(pid)).ok_or(Errno::ESRCH)?
     };
     for i in 0..words {
         let mut b = [0u8; 12];
@@ -209,28 +206,19 @@ fn cap_header(cx: &Cx<'_>, hdr: u64) -> Result<(usize, i32), Errno> {
 
 // ---- Committing credentials ----
 
-/// Modifies the current process's credentials: if `f` fails, the credentials stay unchanged. As
+/// Modifies the current thread's credentials: if `f` fails, the credentials stay unchanged. As
 /// with Linux's `commit_creds`, when the effective or filesystem user or group changes, or new
 /// capabilities are gained, the process is no longer dumpable (the files in `/proc/<pid>` then
-/// belong to root), and it no longer gets a signal when its parent exits.
+/// belong to root), and the thread's children no longer get a signal when it exits.
 fn update<T>(cx: &Cx<'_>, f: impl FnOnce(&mut Cred) -> Result<T, Errno>) -> Result<T, Errno> {
     let mut cred = cx.cred();
     let old = cred.clone();
     let r = f(&mut cred)?;
     let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
-    let mut g = cx.t.group.borrow_mut();
     if ids(&cred) != ids(&old) || cred.cap_permitted & !old.cap_permitted != 0 {
-        g.dumpable = false;
-        // Credentials are kept per process, so all threads changed together: on Linux libc has
-        // each thread commit_creds separately, clearing each one's pdeath_signal
-        for t in &g.threads {
-            if let Some(t) = cx.kr().tasks.get(t) {
-                t.pdeathsig.set(0);
-            }
-        }
+        cx.t.group.borrow_mut().dumpable = false;
+        cx.task.pdeathsig.set(0);
     }
-    g.cred = cred;
-    drop(g);
-    cx.shared.fast_changed();
+    cx.set_cred(cred);
     Ok(r)
 }

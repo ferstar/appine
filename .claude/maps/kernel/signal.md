@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO; debug slots across detach; coalesced siginfo last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending; frames, siginfo; ptrace, TRACEME credentials; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS, stubs; watchdog; host vDSO; coalesced siginfo last)
 
 ## Responsibilities
 
@@ -105,7 +105,8 @@ procfs.
 - Retargeting (Linux's `retarget_shared_pending`): at the end of `deliver`, process-directed
   signals still pending that the thread now blocks wake a thread that does not; a thread leaving
   a live process does the same for every process-directed signal pending.
-- Permissions: `may_signal` (same user or `CAP_KILL`); `kill` handles `-1` (all except init and
+- Permissions: `may_signal` (same user or `CAP_KILL`) against the target thread's credentials
+  for tkill/tgkill and the main thread's for a process; `kill` handles `-1` (all except init and
   self), `0` and negative process groups; pid 1 is handled by `kernel/process` (power requests).
 
 ### Delivery
@@ -257,9 +258,12 @@ procfs.
 - Tracees are threads; the tracer is a process (any of its threads may issue requests; tracees are
   released only when the whole tracer process exits). No Yama restrictions. Tracing pid 1 is
   `ESRCH`; `PTRACE_TRACEME` under init is `EPERM`. Access needs the same user (and dumpable, with a
-  capability subset) or `CAP_SYS_PTRACE`. Attach and `TRACEME` keep the tracer's credentials of
-  that moment (Linux's `ptracer_cred`), judged later with `CAP_SYS_PTRACE` over the relevant user
-  namespace.
+  capability subset) or `CAP_SYS_PTRACE` against the target thread's own credentials. The
+  credentials of whoever asked for the relationship are kept as the tracer's (Linux's
+  `ptracer_cred` through `ptrace_link`): the attaching thread's for `ATTACH`/`SEIZE`, the tracee's
+  own for `TRACEME` (since the fix for CVE-2019-13272, so an unprivileged child of a privileged
+  parent gains nothing from a setuid program), inherited by auto-attached children; they are
+  judged later with `CAP_SYS_PTRACE` over the relevant user namespace.
 - Attaching: `ATTACH` sends `SIGSTOP`; `SEIZE` takes options and never stops. Requests other than
   `KILL` and `INTERRUPT` need the tracee in a ptrace stop (else `ESRCH`); unknown requests are `EIO`.
 - Every ptrace stop saves a copy of the registers; the tracer reads and writes the copy and it is

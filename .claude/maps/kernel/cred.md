@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' modes and owners; ptrace access and ptracer credentials; seccomp notification and TSYNC pids; v3 file capabilities; the vDSO's seccomp bypass; a shared fs context at execve last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: new files' owners; ptrace access, ptracer credentials; seccomp pids; v3 file capabilities; vDSO seccomp bypass; shared fs context at execve; per-thread credentials last)
 
 ## Responsibilities
 
@@ -32,9 +32,10 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 - `Cred` — `ruid`/`euid`/`suid`/`fsuid`, the four gids, sorted `groups`, `cap_effective`,
   `cap_permitted`, `cap_inheritable`, `cap_bounding`, `cap_ambient` (u64), `securebits`,
-  `user_ns`. All ids are kernel (initial-namespace) ids. Kept per thread group
-  (`ThreadGroup.cred`), alongside the group's `dumpable` and `no_new_privs`; umask lives in the fs
-  context, not here.
+  `user_ns`. All ids are kernel (initial-namespace) ids. Kept per thread (`Task.cred`), as on
+  Linux; the thread group keeps a copy of its main thread's (`ThreadGroup.cred`), which is what
+  other processes go by and outlives the main thread. `dumpable` and `no_new_privs` stay per
+  thread group; umask lives in the fs context, not here.
 - `cap` constants (`LAST` = 40, `CAP_FULL`), `secbit` (NOROOT, NO_SETUID_FIXUP, KEEP_CAPS,
   NO_CAP_AMBIENT_RAISE and their locks), `MAY_EXEC`/`MAY_WRITE`/`MAY_READ`.
 - `FileCaps` — parsed `security.capability` (permitted, inheritable, effective).
@@ -64,15 +65,30 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 ### Credentials and id syscalls
 
 - The first process gets root credentials (all ids 0, permitted/effective/bounding full) in the
-  initial user namespace. Readers take a cheap by-value snapshot; fork copies the group's
-  credentials (moved into a new user namespace with `CLONE_NEWUSER`); all threads of a group share
-  one credential, so even raw per-thread id syscalls affect every thread.
+  initial user namespace. Readers take a cheap by-value snapshot (`Cx::cred`, the calling
+  thread's); clone gives a new thread or process the creating thread's credentials (moved into a
+  new user namespace with `CLONE_NEWUSER`). Every change goes through `Cx::set_cred`, which also
+  updates `ThreadGroup.cred` when the caller is the main thread (tid equal to tgid) and marks the
+  no-BKL path's snapshot stale; execve sets both, the caller being the main thread by then.
+  libc's set*id functions run the syscall on every thread, so they change all threads; raw
+  syscalls and `setfsuid`/`setfsgid` change only the caller.
+- Whose credentials a check uses: the caller's own thread for its permission checks, new-file
+  owners, `SO_PEERCRED`/`SCM_CREDENTIALS`, procfs's reader, the no-BKL resolver and the core file
+  name; a target
+  thread's own (`Kernel::cred_of`: the live thread, else the process's copy) for tgkill and
+  F_SETOWN to a thread, ptrace access (attach, process_vm, kcmp, procfs views and memory files
+  under `task/<tid>`), capget, prlimit, get_robust_list, the sched and priority calls and
+  `PRIO_USER`/`IOPRIO_WHO_USER` matching, `RLIMIT_NPROC` counting, and procfs status and owners
+  (under `task/<tid>` the thread's, under `/proc/<pid>` the main thread's); the process's copy (its
+  main thread's) for kill and signals to a process, wait's `si_uid`, OOM reports and the core
+  file's process info.
 - Set syscalls map guest ids through the caller's user namespace (`-1` means unchanged; unmapped
   `EINVAL`), apply Linux 6.1's rules with `capable_here` (`CAP_SETUID`/`CAP_SETGID` in the caller's
-  own namespace), and commit through `update`, which — like `commit_creds` — clears dumpable and
-  every thread's pdeathsig when effective or filesystem ids change or permitted grows, and
-  refreshes the fast path. `unshare(CLONE_NEWUSER)` and setns into a user namespace replace the
-  credential directly, without these side effects (correct for unshare, as in Linux).
+  own namespace), and commit through `update`, which — like `commit_creds` — clears the process's
+  dumpable flag and the calling thread's pdeathsig when effective or filesystem ids change or
+  permitted grows. The capability prctls commit without these side effects, as Linux's do not
+  trigger them. `unshare(CLONE_NEWUSER)` and setns into a user namespace (both single-threaded
+  only) replace the credential without them either (correct for unshare, as in Linux).
 - Capability fixups on uid changes (`cap_emulate_setxuid`, root meaning uid 0 of the credential's
   namespace): leaving root on all three uids clears permitted and effective unless `KEEP_CAPS`
   and always clears ambient; euid root → non-root clears effective, non-root → root sets
@@ -210,13 +226,12 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 - `Seccomp` is touched only under the BKL; the fast path reads the published atomics (a stale
   bitmap during TSYNC belongs to the older, looser chain).
 - `in_group` relies on `setgroups` keeping the list sorted.
+- Credentials change only through `Cx::set_cred` (or execve, which sets both copies): writing
+  `Task.cred` alone leaves the process's copy stale when the main thread changes, and writing
+  `ThreadGroup.cred` alone changes nothing the caller's own checks see.
 
 ## Confirmed bugs / technical debt
 
-- **Per-thread id changes leak to every thread.** Credentials are per thread group, and libc does
-  not broadcast `setfsuid`/`setfsgid` or raw id syscalls; threaded file servers that switch
-  filesystem ids per thread (Samba, nfs-ganesha, FUSE servers, Go raw syscalls) would have one
-  thread's checks run as another thread's user.
 - **seccomp logging is incomplete.** Logged actions reach only Appine's debug stderr (not the guest
   kernel log, where Linux's audit records appear without auditd), and USER_NOTIF is never logged
   although `SECCOMP_FILTER_FLAG_LOG` asks for it.
@@ -232,8 +247,9 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 ## Open questions
 
-- Are per-thread-group credentials a permanent simplification even for raw per-thread id
-  syscalls (threaded file servers using `setfsuid`, Go's `AllThreadsSyscall`)?
+- `no_new_privs` is kept per thread group, while Linux keeps it per thread (prctl sets only the
+  caller's; seccomp TSYNC spreads it): does anything set it on one thread only and rely on the
+  others staying free of it?
 
 ## To verify
 

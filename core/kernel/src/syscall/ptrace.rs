@@ -177,13 +177,15 @@ pub(super) fn ptrace(cx: &mut Cx<'_>, request: i64, pid: i32, addr: u64, data: u
 }
 
 /// PTRACE_TRACEME: be traced by the parent. Nobody can trace it when the parent is the built-in
-/// init.
+/// init. The credentials kept as the tracer's are the caller's own, as Linux records those of
+/// whoever asks for the relationship (`ptrace_link`, since the fix for CVE-2019-13272): a parent
+/// that is privileged now may later run code its child controls.
 fn traceme(cx: &mut Cx<'_>) -> SysResult {
     let ppid = cx.t.group.borrow().ppid;
     if ppid == INIT || !cx.kr().groups.contains_key(&ppid) {
         return Err(Errno::EPERM);
     }
-    let tracer = cx.kr().groups[&ppid].borrow().cred.clone();
+    let tracer = cx.cred();
     let mut t = cx.task.trace.borrow_mut();
     if t.tracer.is_some() {
         return Err(Errno::EPERM);
@@ -213,7 +215,7 @@ fn attach(cx: &mut Cx<'_>, pid: i32, seize: bool, addr: u64, data: u64) -> SysRe
         .get(&task.tgid)
         .cloned()
         .ok_or(Errno::ESRCH)?;
-    if task.tgid == cx.tgid() || !may_ptrace(cx, &group.borrow()) {
+    if task.tgid == cx.tgid() || !may_ptrace(cx, task.tid.get()) {
         return Err(Errno::EPERM);
     }
     if group.borrow().exiting.is_some() || task.killed.get() {
@@ -575,13 +577,7 @@ pub(super) fn process_vm(
     }
     let remote = iovecs(cx, remote, remote_count)?;
     let task = cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-    let group = cx
-        .kr()
-        .groups
-        .get(&task.tgid)
-        .cloned()
-        .ok_or(Errno::ESRCH)?;
-    if !may_ptrace(cx, &group.borrow()) {
+    if !may_ptrace(cx, task.tid.get()) {
         return Err(Errno::EPERM);
     }
     let target: Rc<_> = task.res.borrow().mm.clone();

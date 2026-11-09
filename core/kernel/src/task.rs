@@ -112,6 +112,11 @@ pub(crate) struct Task {
     /// created this process exits, 0 meaning none ([`crate::process::pdeath_signals`]). As on
     /// Linux it is kept per thread; new threads and processes start at 0, and execve keeps it.
     pub pdeathsig: Cell<i32>,
+    /// The thread's credentials, kept per thread as on Linux: libc's set*id functions change every
+    /// thread's, but setfsuid and raw system calls only the caller's. A new thread or process
+    /// starts with its creator's; the leader's are also the process's ([`ThreadGroup::cred`]),
+    /// both changed through [`Cx::set_cred`].
+    pub cred: RefCell<crate::cred::Cred>,
     /// The thread is waiting in the kernel ([`Task::asleep`], load average). Set before the BKL is
     /// released and cleared after it is taken again; waits without the BKL (`syscall::fast`) set
     /// it too.
@@ -231,7 +236,7 @@ pub(crate) struct TaskState {
 }
 
 impl Task {
-    /// Creates a thread for `cpu`.
+    /// Creates a thread for `cpu`, with its thread group's credentials.
     pub fn new(
         tid: Tid,
         tgid: Tid,
@@ -243,6 +248,7 @@ impl Task {
     ) -> Result<Rc<Task>, Errno> {
         let event = Event::new().map_err(|_| Errno::EAGAIN)?;
         let vfork = state.vfork_done.is_some();
+        let cred = state.group.borrow().cred.clone();
         let res = TaskRes {
             mm: state.mm.clone(),
             fds: state.fds.clone(),
@@ -259,6 +265,7 @@ impl Task {
             killed: Cell::new(false),
             frozen: Cell::new(false),
             pdeathsig: Cell::new(0),
+            cred: RefCell::new(cred),
             sleeping: AtomicBool::new(false),
             comm: Cell::new(comm),
             nice: Cell::new(0),
@@ -1040,7 +1047,7 @@ fn exit(shared: &Arc<Shared>, task: Rc<Task>, state: &CpuState, stats: Option<Db
             .collect();
         let signals = crate::process::pdeath_signals(&k, &mine);
         crate::process::hand_thread_children(&k, &group, tid, to);
-        let ruid = group.borrow().cred.ruid;
+        let ruid = task.cred.borrow().ruid;
         crate::process::send_pdeath(&k, signals, tgid, ruid);
         // Signals sent to the process may have been meant for this thread: wake one that takes
         // them (Linux's exit_signals)

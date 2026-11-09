@@ -757,8 +757,8 @@ fn open_pseudo(
         | pseudo::Entry::Pagemap),
     ) = node
     {
-        let group = cx.kr().groups.get(&pid).cloned().ok_or(Errno::ESRCH)?;
-        if !super::proc::may_ptrace_fs(cx, &group.borrow()) {
+        cx.kr().groups.get(&pid).ok_or(Errno::ESRCH)?;
+        if !super::proc::may_ptrace_fs(cx, tid.unwrap_or(pid)) {
             return Err(Errno::EACCES);
         }
         // mem and pagemap work on the named thread's address space: one that has exited (a
@@ -7983,7 +7983,7 @@ fn check_seals(
 /// ([`Store::remove_privs`]): the setuid and setgid bits are removed when the caller lacks
 /// `CAP_FSETID`, and file capabilities are always removed.
 fn remove_privs(cx: &Cx<'_>, ino: Ino) -> Result<(), Errno> {
-    let keep_setid = cx.t.group.borrow().cred.capable(cap::FSETID);
+    let keep_setid = cx.cred().capable(cap::FSETID);
     cx.vfs()?.store().remove_privs(ino, keep_setid)
 }
 

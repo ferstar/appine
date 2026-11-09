@@ -360,11 +360,7 @@ pub(crate) fn signal_stop(
     let info = if new.number() != signo {
         // The signal was replaced without a siginfo: treat it as sent by the tracer with kill
         let tracer = cx.task.trace.borrow().tracer.unwrap_or(0);
-        let uid = cx
-            .kr()
-            .groups
-            .get(&tracer)
-            .map_or(0, |g| g.borrow().cred.ruid);
+        let uid = cx.kr().cred_of(tracer).map_or(0, |c| c.ruid);
         // Linux's ptrace_signal: the tracer's real user ID as seen in the tracee's namespace
         SigInfo::kill(code::SI_USER, cx.pid_out(tracer), cx.cred().uid_out(uid))
     } else if now == raw {
@@ -750,10 +746,10 @@ fn notify(k: &Kernel, task: &Task) {
         _ => code::CLD_TRAPPED,
     };
     let pid = k.pid_seen_by(tracer, task.tid.get());
-    let Some(me) = k.groups.get(&task.tgid) else {
+    if !k.groups.contains_key(&task.tgid) {
         return;
-    };
-    let info = signal::child_info(&me.borrow().cred, &g.borrow().cred, |uid| {
+    }
+    let info = signal::child_info(&task.cred.borrow(), &g.borrow().cred, |uid| {
         SigInfo::child_event(pid, uid, why, exit_code & 0x7f)
     });
     signal::send_to_group(k, tracer, Signal::CHLD, info);
@@ -876,7 +872,7 @@ pub(crate) fn tracee_exited(
         pgid: group.pgid,
         status,
         process: false,
-        cred: group.cred.clone(),
+        cred: task.cred.borrow().clone(),
     };
     report_exit(k, exit);
 }

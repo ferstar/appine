@@ -104,7 +104,7 @@ impl Fast {
         // Resolve only in the boot root filesystem: in other mounts `..` must go through the
         // mount point
         let paths = match (&t.vfs, &fs.root) {
-            (Some(vfs), &Node::Store(ROOT_MOUNT, root)) if t.group.borrow().cred.searches_all() => {
+            (Some(vfs), &Node::Store(ROOT_MOUNT, root)) if task.cred.borrow().searches_all() => {
                 let vfs = vfs.cached();
                 vfs.usable.then(|| Paths {
                     vfs,

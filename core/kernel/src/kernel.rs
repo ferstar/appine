@@ -644,6 +644,16 @@ impl Kernel {
         self.pid_ns_of(viewer).vnr(g).unwrap_or(0)
     }
 
+    /// The credentials of thread `tid` (a thread ID, or a pid standing for its main thread): its
+    /// own while it runs, otherwise its process's, which keep the main thread's after it ended
+    /// ([`ThreadGroup::cred`]). None for a thread that does not exist.
+    pub fn cred_of(&self, tid: Tid) -> Option<crate::cred::Cred> {
+        match self.tasks.get(&tid) {
+            Some(t) => Some(t.cred.borrow().clone()),
+            None => self.groups.get(&tid).map(|g| g.borrow().cred.clone()),
+        }
+    }
+
     /// The pid namespace that process `tgid` is in.
     pub fn pid_ns_of(&self, tgid: Tid) -> Rc<crate::pidns::PidNs> {
         self.groups
@@ -1390,23 +1400,34 @@ impl<'a> Cx<'a> {
         self.pid_ns().find(l).unwrap_or(crate::syscall::NO_PID)
     }
 
-    /// The current process's credentials.
+    /// The current thread's credentials.
     pub fn cred(&self) -> crate::cred::Cred {
-        self.t.group.borrow().cred.clone()
+        self.task.cred.borrow().clone()
     }
 
-    /// AF_UNIX `SO_PEERCRED`: the pid and the effective user and group IDs (kernel IDs, Linux's
-    /// `cred_to_ucred`).
+    /// Replaces the current thread's credentials (without the side effects of Linux's
+    /// `commit_creds`, which `syscall::cred` adds): the main thread's are also the process's
+    /// ([`ThreadGroup::cred`]). The no-BKL path records them ([`Shared::fast_changed`]).
+    pub fn set_cred(&self, cred: crate::cred::Cred) {
+        if self.tid() == self.tgid() {
+            self.t.group.borrow_mut().cred = cred.clone();
+        }
+        *self.task.cred.borrow_mut() = cred;
+        self.shared.fast_changed();
+    }
+
+    /// AF_UNIX `SO_PEERCRED`: the pid and the current thread's effective user and group IDs
+    /// (kernel IDs, Linux's `cred_to_ucred`).
     pub fn ucred(&self) -> crate::unix::Ucred {
-        let g = self.t.group.borrow();
-        crate::unix::Ucred::of(self.tgid(), g.cred.euid, g.cred.egid)
+        let c = self.task.cred.borrow();
+        crate::unix::Ucred::of(self.tgid(), c.euid, c.egid)
     }
 
-    /// The `SCM_CREDENTIALS` attached when none is declared: the pid and the real user and group
-    /// IDs (Linux's `maybe_add_creds` uses `current_uid_gid`).
+    /// The `SCM_CREDENTIALS` attached when none is declared: the pid and the current thread's real
+    /// user and group IDs (Linux's `maybe_add_creds` uses `current_uid_gid`).
     pub fn scm_cred(&self) -> crate::unix::Ucred {
-        let g = self.t.group.borrow();
-        crate::unix::Ucred::of(self.tgid(), g.cred.ruid, g.cred.rgid)
+        let c = self.task.cred.borrow();
+        crate::unix::Ucred::of(self.tgid(), c.ruid, c.rgid)
     }
 
     /// File-creation mask.

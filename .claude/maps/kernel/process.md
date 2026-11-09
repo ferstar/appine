@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds; cgroup2 notifications last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds; cgroup2 notifications; per-thread credentials last)
 
 ## Responsibilities
 
@@ -36,7 +36,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 ### Tasks and processes
 
-- `Task` — one guest thread: tid, `killed`, `pdeathsig`, exit status, CPU-clock bookkeeping, nice,
+- `Task` — one guest thread: tid, its own credentials (`kernel/cred`), `killed`, `pdeathsig`, exit
+  status, CPU-clock bookkeeping, nice,
   affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`, `vfork` (its
   vfork completion is still pending, for the OOM killer), `syscall` (the BKL syscall it is in: its
   number in the global `SYSCALLS` count and the syscall number); thread-private `TaskState` (address
@@ -47,7 +48,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie`, `exit_signal`, own and children's CPU time and
   max RSS, `child_subreaper`, rlimits (Linux's defaults; `RLIMIT_MSGQUEUE` starts at 819200 but is
-  not enforced), credentials, pid namespace, timers.
+  not enforced), the main thread's credentials (what other processes go by, kept after it ends),
+  pid namespace, timers.
 - `ExitStatus` — exited with a code or killed by a signal; encoded for wait.
 - `CpuTime` — total and system nanoseconds from the host thread CPU clock.
 - `task::pool` — pooled host threads (at most 8 idle, kept 5 s).

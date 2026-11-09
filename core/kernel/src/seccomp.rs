@@ -423,9 +423,10 @@ fn set_filter(cx: &mut Cx<'_>, flags: u32, args: u64) -> Result<u64, Errno> {
     {
         // Without no_new_privs, CAP_SYS_ADMIN is needed in our own user namespace (Linux's
         // seccomp_prepare_filter uses ns_capable, so root in a user namespace is enough)
-        let g = cx.t.group.borrow();
-        let cred = &g.cred;
-        if !g.no_new_privs && !cred.ns_capable(&cred.user_ns, crate::cred::cap::SYS_ADMIN) {
+        let cred = cx.cred();
+        if !cx.t.group.borrow().no_new_privs
+            && !cred.ns_capable(&cred.user_ns, crate::cred::cap::SYS_ADMIN)
+        {
             return Err(Errno::EACCES);
         }
     }

@@ -1043,14 +1043,13 @@ impl<'a> View<'a> {
         (ns as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
     }
 
-    /// The reader's credentials (of the process `self` points to, or the opener's given with the
+    /// The reader's credentials (of the thread `self` points to, or the opener's given with the
     /// view): IDs in procfs are translated through its user namespace.
     pub(crate) fn reader(&self) -> Cred {
         if let Some(c) = &self.cred {
             return (**c).clone();
         }
-        self.group(self.tgid)
-            .map_or_else(Cred::root, |g| g.borrow().cred.clone())
+        self.k.cred_of(self.tid).unwrap_or_else(Cred::root)
     }
 
     /// `/proc/<pid>/task/<tid>` uses the given thread, otherwise the representative thread.
@@ -1665,11 +1664,16 @@ impl View<'_> {
     }
 
     /// Whether the reader may look at the root directory, current directory, program file and
-    /// namespaces of process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`).
+    /// namespaces of thread or process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
+    /// on the thread, or the main thread).
     fn may_read(&self, pid: Tid) -> bool {
         self.group(pid).is_some_and(|g| {
             let g = g.borrow();
-            g.tgid == self.tgid || self.reader().may_ptrace(&g.cred, g.dumpable, true)
+            g.tgid == self.tgid
+                || self
+                    .k
+                    .cred_of(pid)
+                    .is_some_and(|c| self.reader().may_ptrace(&c, g.dumpable, true))
         })
     }
 
@@ -1902,25 +1906,29 @@ fn is_net_sysctl(node: &PseudoNode) -> bool {
     }
 }
 
-/// A node's owner and group: under `/proc/<pid>` the process's effective user and group IDs, for
-/// `/dev/pts/<n>` what is recorded on the terminal ([`Tty::owner`]), and root for the rest.
+/// A node's owner and group: under `/proc/<pid>` the effective user and group IDs of the thread
+/// (`/proc/<pid>/task/<tid>`) or the main thread, for `/dev/pts/<n>` what is recorded on the
+/// terminal ([`Tty::owner`]), and root for the rest.
 fn owner_of(k: &Kernel, node: &PseudoNode) -> (u32, u32) {
     match node {
         // Files of a non-dumpable process belong to root in its user namespace (Linux's
         // task_dump_owner)
-        PseudoNode::Pid(pid, _) | PseudoNode::Entry(pid, ..) | PseudoNode::Fd(pid, _) => {
-            group_of(k, *pid).map_or((0, 0), |g| {
-                let g = g.borrow();
-                let c = &g.cred;
-                if g.dumpable {
-                    (c.euid, c.egid)
-                } else {
-                    (c.uid_in(0).unwrap_or(0), c.gid_in(0).unwrap_or(0))
-                }
-            })
+        PseudoNode::Pid(pid, tid) | PseudoNode::Entry(pid, tid, _) => {
+            dump_owner(k, tid.unwrap_or(*pid))
         }
+        PseudoNode::Fd(pid, _) => dump_owner(k, *pid),
         PseudoNode::Pts(fs, n) => pty(k, *fs, *n).map_or((0, 0), |t| t.borrow().owner),
         PseudoNode::Cgroup(id, _) => k.cgroups.get(*id).map_or((0, 0), |g| (g.uid, g.gid)),
+        _ => (0, 0),
+    }
+}
+
+/// The owner of thread `tid`'s procfs files (Linux's `task_dump_owner`): its effective user and
+/// group IDs, root in its user namespace when the process is not dumpable.
+fn dump_owner(k: &Kernel, tid: Tid) -> (u32, u32) {
+    match (group_of(k, tid), k.cred_of(tid)) {
+        (Some(g), Some(c)) if g.borrow().dumpable => (c.euid, c.egid),
+        (Some(_), Some(c)) => (c.uid_in(0).unwrap_or(0), c.gid_in(0).unwrap_or(0)),
         _ => (0, 0),
     }
 }
@@ -2804,8 +2812,9 @@ fn pid_status(ps: &View<'_>, ns: &PidNs, pid: Tid, tid: Option<Tid>) -> Result<V
         tracer.map_or(0, v)
     )
     .unwrap();
-    // IDs are translated through the reader's user namespace (Linux's seq_user_ns)
-    let c = &g.cred;
+    // The thread's credentials, or the main thread's; IDs are translated through the reader's
+    // user namespace (Linux's seq_user_ns)
+    let c = &ps.k.cred_of(tid).unwrap_or_else(|| g.cred.clone());
     let r = ps.reader();
     let u = |k: u32| r.uid_out(k);
     let gi = |k: u32| r.gid_out(k);
@@ -3787,7 +3796,7 @@ pub(crate) fn format_uuid(b: &[u8; 16]) -> String {
 
 // ---- /proc/<pid>/net ----
 
-/// All open sockets (each counted once), sorted by inode, with the fsuid of the first process
+/// All open sockets (each counted once), sorted by inode, with the fsuid of the first thread
 /// found holding each in its fd table (Linux shows the creator's), or 0 for sockets that are only
 /// in SCM_RIGHTS messages. Sockets waiting to be accepted do not count.
 pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
@@ -3799,10 +3808,7 @@ pub(crate) fn sockets(k: &Kernel) -> Vec<(SocketRef, u32)> {
         if !tables.insert(Rc::as_ptr(&fds)) {
             continue;
         }
-        let uid = k
-            .groups
-            .get(&task.tgid)
-            .map_or(0, |g| g.borrow().cred.fsuid);
+        let uid = task.cred.borrow().fsuid;
         let fds = fds.borrow();
         for file in fds.open_fds().into_iter().filter_map(|fd| fds.get(fd).ok()) {
             if let FileKind::Socket(s) = &file.borrow().kind

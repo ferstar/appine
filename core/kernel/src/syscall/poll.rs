@@ -1261,9 +1261,9 @@ pub(crate) fn check_fasync(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)
 
 /// Sends a signal to the owner recorded by `F_SETOWN_EX`; none when there is no owner (pid 0).
 /// `ids` are the real and effective user IDs of whoever set the owner ([`OpenFile::owner_ids`]):
-/// a process gets the signal only when the effective one is root or either one is its real or
-/// saved user ID (Linux's `sigio_perm`, checked for each process of a group), so no one can point
-/// a file at another user's process and signal it.
+/// a thread or process (by its main thread) gets the signal only when the effective one is root or
+/// either one is its real or saved user ID (Linux's `sigio_perm`, checked for each process of a
+/// group), so no one can point a file at another user's process and signal it.
 pub(crate) fn send_to_owner(
     k: &crate::kernel::Kernel,
     (ty, pid): (i32, i32),
@@ -1276,15 +1276,14 @@ pub(crate) fn send_to_owner(
     if pid <= 0 {
         return;
     }
-    let allowed = |tgid: crate::kernel::Tid| {
-        k.groups.get(&tgid).is_some_and(|g| {
-            let c = &g.borrow().cred;
+    let allowed = |tid: crate::kernel::Tid| {
+        k.cred_of(tid).is_some_and(|c| {
             euid == 0 || [uid, euid].iter().any(|&id| id == c.ruid || id == c.suid)
         })
     };
     match ty {
         F_OWNER_TID => {
-            if let Some(t) = k.tasks.get(&pid).filter(|t| allowed(t.tgid)) {
+            if let Some(t) = k.tasks.get(&pid).filter(|_| allowed(pid)) {
                 signal::send_to_task(k, t, sig, info);
             }
         }

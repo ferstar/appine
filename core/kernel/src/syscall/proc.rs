@@ -387,7 +387,7 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         g.no_new_privs = parent.no_new_privs;
         g.oom_score_adj = parent.oom_score_adj;
         g.oom_score_adj_min = parent.oom_score_adj_min;
-        g.cred = child_cred;
+        g.cred = child_cred.clone();
         g.personality = parent.personality;
         g.thp_disable = parent.thp_disable;
         g.coredump_filter = parent.coredump_filter;
@@ -498,6 +498,8 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
         cx.task.sigmask.get(),
         cx.task.comm.get(),
     )?;
+    // A new thread starts with its creator's credentials, which may differ from the process's
+    *task.cred.borrow_mut() = child_cred;
     task.affinity.set(cx.task.affinity.get());
     let (sched, nice) = super::sched::inherit(cx.task.sched.get(), cx.task.nice.get());
     task.sched.set(sched);
@@ -599,12 +601,10 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
 
 /// The number of threads whose real user ID is `uid` (`RLIMIT_NPROC`).
 fn user_threads(k: &crate::kernel::Kernel, uid: u32) -> u64 {
-    k.groups
+    k.tasks
         .values()
-        .map(|g| g.borrow())
-        .filter(|g| g.cred.ruid == uid)
-        .map(|g| g.threads.len() as u64)
-        .sum()
+        .filter(|t| t.cred.borrow().ruid == uid)
+        .count() as u64
 }
 
 // ---- execve ----
@@ -939,9 +939,9 @@ fn exec(
         // (begin_new_exec), except when the program file is not readable by the caller
         // (would_dump)
         let ids = |c: &Cred| (c.euid, c.egid, c.fsuid, c.fsgid);
-        let gained = new_cred.cap_permitted & !g.cred.cap_permitted != 0;
+        let gained = new_cred.cap_permitted & !cred.cap_permitted != 0;
         if (new_cred.euid, new_cred.egid) != (new_cred.ruid, new_cred.rgid)
-            || ids(&new_cred) != ids(&g.cred)
+            || ids(&new_cred) != ids(&cred)
             || gained
         {
             g.dumpable = false;
@@ -952,7 +952,9 @@ fn exec(
         if secure {
             cx.task.pdeathsig.set(0);
         }
-        g.cred = new_cred;
+        // The thread is the main thread now (kill_other_threads)
+        g.cred = new_cred.clone();
+        *cx.task.cred.borrow_mut() = new_cred;
         cx.shared.fast_changed();
         g.rlimits[process::RLIMIT_STACK as usize].0 = stack_limit;
         g.posix_timers.clear();
@@ -1587,7 +1589,8 @@ pub(super) fn pidfd_getfd(cx: &mut Cx<'_>, pidfd: i32, target: i32, flags: u32) 
         .first()
         .copied()
         .ok_or(Errno::ESRCH)?;
-    if !may_ptrace(cx, &group.borrow()) {
+    let tgid = group.borrow().tgid;
+    if !may_ptrace(cx, tgid) {
         return Err(Errno::EPERM);
     }
     let task = cx.kr().tasks.get(&leader).cloned().ok_or(Errno::ESRCH)?;
@@ -1618,8 +1621,7 @@ pub(super) fn kcmp(
     let task = |pid: i32| cx.kr().tasks.get(&pid).cloned().ok_or(Errno::ESRCH);
     let (t1, t2) = (task(pid1)?, task(pid2)?);
     for t in [&t1, &t2] {
-        let group = cx.kr().groups.get(&t.tgid).cloned().ok_or(Errno::ESRCH)?;
-        if !may_ptrace(cx, &group.borrow()) {
+        if !may_ptrace(cx, t.tid.get()) {
             return Err(Errno::EPERM);
         }
     }
@@ -1688,16 +1690,28 @@ pub(super) fn kcmp(
     })
 }
 
-/// Whether `target` may be accessed as with ptrace (`PTRACE_MODE_ATTACH_REALCREDS`): it is the
-/// caller itself, or [`Cred::may_ptrace`].
-pub(super) fn may_ptrace(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
-    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, false)
+/// Whether thread `tid` (or a process, by its main thread's pid) may be accessed as with ptrace
+/// (`PTRACE_MODE_ATTACH_REALCREDS`): it is in the caller's process, or [`Cred::may_ptrace`] allows
+/// it with the thread's credentials ([`crate::kernel::Kernel::cred_of`]).
+pub(super) fn may_ptrace(cx: &Cx<'_>, tid: Tid) -> bool {
+    ptrace_access(cx, tid, false)
 }
 
 /// The same with the filesystem credentials (`PTRACE_MODE_*_FSCREDS`), as for opening a process's
 /// memory views in procfs (Linux's `proc_mem_open`).
-pub(super) fn may_ptrace_fs(cx: &Cx<'_>, target: &ThreadGroup) -> bool {
-    target.tgid == cx.tgid() || cx.cred().may_ptrace(&target.cred, target.dumpable, true)
+pub(super) fn may_ptrace_fs(cx: &Cx<'_>, tid: Tid) -> bool {
+    ptrace_access(cx, tid, true)
+}
+
+fn ptrace_access(cx: &Cx<'_>, tid: Tid, fscreds: bool) -> bool {
+    let k = cx.kr();
+    let Some(group) = crate::pseudo::group_of(k, tid) else {
+        return false;
+    };
+    let g = group.borrow();
+    g.tgid == cx.tgid()
+        || k.cred_of(tid)
+            .is_some_and(|c| cx.cred().may_ptrace(&c, g.dumpable, fscreds))
 }
 
 // ---- unshare ----
@@ -1790,8 +1804,7 @@ pub(super) fn unshare(cx: &mut Cx<'_>, flags: u64) -> SysResult {
         cx.set_fs(Rc::new(RefCell::new(copy)));
     }
     if flags & CLONE_NEWUSER != 0 {
-        cx.t.group.borrow_mut().cred = new_cred.clone();
-        cx.shared.fast_changed();
+        cx.set_cred(new_cred.clone());
     }
     if flags & CLONE_NEWNS != 0 {
         let owner = new_cred.user_ns.clone();

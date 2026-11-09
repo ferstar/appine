@@ -389,7 +389,10 @@ pub(crate) struct ThreadGroup {
     /// The lowest value `oom_score_adj` can be set to without `CAP_SYS_RESOURCE`: the value
     /// written by a writer with that capability, inherited by fork.
     pub oom_score_adj_min: i32,
-    /// Credentials, inherited by fork.
+    /// The main thread's credentials (each thread has its own, [`crate::task::Task::cred`]): what
+    /// other processes go by (signal permission, ptrace access, `/proc/<pid>`, wait's `si_uid`).
+    /// Changed along with the main thread's ([`crate::kernel::Cx::set_cred`]), kept after it ends,
+    /// and set from the thread that calls execve, which takes its place.
     pub cred: Cred,
     /// The execution domain and flags of personality(2): only recorded, kept by both fork and
     /// execve.
