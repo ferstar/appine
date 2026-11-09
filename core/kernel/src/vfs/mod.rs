@@ -20,7 +20,7 @@ pub mod import;
 pub mod overlay;
 pub mod store;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -87,6 +87,9 @@ impl Node {
 
 /// A directory and one name in it.
 pub(crate) type Dentry = (Node, Vec<u8>);
+
+/// Where a mount is mounted: [`Mount::point`] and [`Mount::at`].
+type Place = (Option<Node>, Option<Dentry>);
 
 /// Mount id (the first column of mountinfo, `mnt_id` in fdinfo), numbered across all mount
 /// namespaces together.
@@ -365,6 +368,18 @@ pub(crate) struct Propagation {
     /// The peer group it is a slave of (`master:N`), 0 when not a slave.
     pub master: u32,
     pub unbindable: bool,
+}
+
+/// A mount a tree attached elsewhere is copied to ([`Vfs::propagation_targets`]): the place
+/// there, its namespace and own peer group, and the chain of groups from its master up to the
+/// group the tree was attached in (empty for a peer of that mount).
+#[derive(Clone, Debug)]
+pub(crate) struct Target {
+    pub ns: u64,
+    pub point: Node,
+    pub at: Option<Dentry>,
+    group: u32,
+    masters: Vec<u32>,
 }
 
 /// What `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` make a mount.
@@ -1638,14 +1653,33 @@ impl Vfs {
         let mut node = node;
         // Detached mounts have a mount point only while they stay on a detached parent
         // ([`detach`]), so only nodes of detached mounts find them
-        while let Some(m) = mounts
-            .list
-            .iter()
-            .rev()
-            .chain(mounts.detached.iter().rev())
-            .find(|m| m.point.as_ref() == Some(&node))
-        {
-            node = m.root.clone();
+        let on = |node: &Node| {
+            mounts
+                .list
+                .iter()
+                .rev()
+                .chain(mounts.detached.iter().rev())
+                .find(|m| m.point.as_ref() == Some(node))
+        };
+        for _ in 0..8 {
+            match on(&node) {
+                Some(m) => node = m.root.clone(),
+                None => return node,
+            }
+        }
+        // A deep stack (propagation can pile thousands of mounts on one directory) is climbed
+        // through an index built once, the later mount on a point winning as above
+        let mut tops: HashMap<&Node, &Node> = HashMap::new();
+        for m in mounts.detached.iter().chain(&mounts.list) {
+            if let Some(point) = &m.point {
+                tops.insert(point, &m.root);
+            }
+        }
+        for _ in 0..=tops.len() {
+            match tops.get(&node) {
+                Some(root) => node = (*root).clone(),
+                None => break,
+            }
         }
         node
     }
@@ -1860,20 +1894,11 @@ impl Vfs {
                 .in_mount(map.get(&n.mnt()).copied().unwrap_or(n.mnt()))
         };
         for m in old {
-            let mut locks = m.locks;
-            if lock_all {
-                locks |= lock::MOUNT | lock::ATIME;
-                for (f, l) in [
-                    (ms::RDONLY, lock::READONLY),
-                    (ms::NODEV, lock::NODEV),
-                    (ms::NOSUID, lock::NOSUID),
-                    (ms::NOEXEC, lock::NOEXEC),
-                ] {
-                    if m.flags & f != 0 {
-                        locks |= l;
-                    }
-                }
-            }
+            let locks = if lock_all {
+                locked_tree(m.flags, m.locks)
+            } else {
+                m.locks
+            };
             let copy = Mount {
                 id: map[&m.id],
                 ns: ns.id,
@@ -2843,8 +2868,9 @@ impl Vfs {
         } else {
             vec![id]
         };
+        let mut groups = GroupAlloc::of(&mounts);
         for id in ids {
-            mounts.change_propagation(id, kind);
+            mounts.change_propagation(id, kind, &mut groups);
         }
         drop(mounts);
         self.mounts_changed();
@@ -2852,8 +2878,8 @@ impl Vfs {
 
     /// Mount `id` was just attached (a new mount, a bind, a move): under a shared parent it and
     /// the mounts below it become shared, each without a peer group getting one of its own (6.1's
-    /// `attach_recursive_mnt`; the copies Linux then propagates to the parent's peers and slaves
-    /// are not made).
+    /// `attach_recursive_mnt`; [`Vfs::propagate`] then copies them to the parent's peers and
+    /// slaves).
     pub(crate) fn attached(&self, id: MountId) {
         let mut mounts = self.mounts.borrow_mut();
         let Some(parent) = mounts.all().find(|m| m.id == id).and_then(Mount::parent) else {
@@ -2862,8 +2888,9 @@ impl Vfs {
         if !mounts.all().any(|m| m.id == parent && m.prop.group != 0) {
             return;
         }
+        let mut groups = GroupAlloc::of(&mounts);
         for id in mounts.subtree(id) {
-            mounts.change_propagation(id, PropagationType::Shared);
+            mounts.change_propagation(id, PropagationType::Shared, &mut groups);
         }
     }
 
@@ -2874,6 +2901,317 @@ impl Vfs {
             .all()
             .find(|m| m.id == id)
             .map_or_else(Propagation::default, |m| m.prop)
+    }
+
+    // ---- Propagation of mount events (fs/pnode.c) ----
+
+    /// The mounts a tree attached on `point` (`at` when it is a file in the store) gets copied to
+    /// (Linux's `propagate_mnt`): when the mount `point` is in is shared, its peers and slaves,
+    /// recursively, that see the mount point (`propagate_one` skips the others), each with the
+    /// place there. Planned before attaching: the tree's own mounts are not among them.
+    pub(crate) fn propagation_targets(
+        &self,
+        ps: &dyn Pseudo,
+        (point, at): (&Node, Option<&Dentry>),
+    ) -> Vec<Target> {
+        let planned: Vec<(MountId, u64, Node, u32, Vec<u32>)> = {
+            let mounts = self.mounts.borrow();
+            let index = Index::of(&mounts.list);
+            index
+                .propagation_of(&mounts.list, point.mnt())
+                .into_iter()
+                .map(|(i, masters)| {
+                    let m = &mounts.list[i];
+                    (m.id, m.ns, m.root.clone(), m.prop.group, masters)
+                })
+                .collect()
+        };
+        planned
+            .into_iter()
+            .filter_map(|(mount, ns, root, group, masters)| {
+                let point = point.clone().in_mount(mount);
+                // On the mount's root the directory it was found in is outside the mount
+                let at = at
+                    .filter(|_| matches!(point, Node::Store(..)) && point != root)
+                    .map(|(dir, name)| (dir.clone().in_mount(mount), name.clone()));
+                let from = at.as_ref().map_or(&point, |(dir, _)| dir);
+                let seen = point == root || self.is_under(ps, from, &root);
+                seen.then_some(Target {
+                    ns,
+                    point,
+                    at,
+                    group,
+                    masters,
+                })
+            })
+            .collect()
+    }
+
+    /// Mount `id` and the mounts below it were attached where `targets` were planned
+    /// ([`Vfs::propagation_targets`]): each target gets a copy of the tree at the same place
+    /// (the rest of Linux's `propagate_one` and `attach_recursive_mnt`). A copy in a peer of the
+    /// parent is a peer of the original; one in a slave is a slave of the copy in the nearest group
+    /// above it that got one (of the original when none did), and when that slave is shared, the
+    /// copies in its group are peers of each other. A mount already on that place is moved onto
+    /// the copy's root (tucked under it). In a namespace owned by another user namespace than
+    /// `owner` (the caller's mount namespace's) every copy is locked (`lock_mnt_tree`); the root of
+    /// each copy is never locked in place.
+    pub(crate) fn propagate(&self, id: MountId, targets: &[Target], owner: u64) {
+        if targets.is_empty() {
+            return;
+        }
+        let owners: HashMap<u64, Option<u64>> = targets
+            .iter()
+            .map(|t| (t.ns, self.find_ns(t.ns).map(|ns| ns.owner.id)))
+            .collect();
+        let mut mounts = self.mounts.borrow_mut();
+        let pos: HashMap<MountId, usize> = mounts
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id, i))
+            .collect();
+        // The tree in the order to copy it (each after its parent), with each one's parent index
+        let tree: Vec<Mount> = tree_of(&mounts.list, id)
+            .iter()
+            .filter_map(|i| pos.get(i).map(|&p| mounts.list[p].clone()))
+            .collect();
+        let in_tree: HashMap<MountId, usize> =
+            tree.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+        let parents: Vec<Option<usize>> = tree
+            .iter()
+            .map(|m| {
+                (m.id != id)
+                    .then(|| m.parent().and_then(|p| in_tree.get(&p).copied()))
+                    .flatten()
+            })
+            .collect();
+        // What is on each place now: a copy goes under it
+        let index = Index::of(&mounts.list);
+        // The groups of the copies made in each group of the propagation tree, by position in
+        // the tree; the parent's own group has the original
+        let top = tree[0]
+            .parent()
+            .and_then(|p| pos.get(&p))
+            .map_or(0, |&i| mounts.list[i].prop.group);
+        let mut copies: HashMap<u32, Vec<u32>> =
+            HashMap::from([(top, tree.iter().map(|m| m.prop.group).collect())]);
+        let mut groups = GroupAlloc::of(&mounts);
+        for t in targets {
+            let props: Vec<Propagation> = if t.masters.is_empty() {
+                tree.iter().map(|m| m.prop.of_bind()).collect()
+            } else {
+                let masters = t
+                    .masters
+                    .iter()
+                    .find_map(|g| copies.get(g))
+                    .cloned()
+                    .unwrap_or_default();
+                let own: Vec<u32> = match t.group {
+                    0 => vec![0; tree.len()],
+                    g => copies
+                        .entry(g)
+                        .or_insert_with(|| tree.iter().map(|_| groups.take()).collect())
+                        .clone(),
+                };
+                masters
+                    .into_iter()
+                    .zip(own)
+                    .map(|(master, group)| Propagation {
+                        group,
+                        master,
+                        unbindable: false,
+                    })
+                    .collect()
+            };
+            let lock = owners.get(&t.ns).copied().flatten() != Some(owner);
+            let mut ids: Vec<MountId> = Vec::with_capacity(tree.len());
+            for (i, m) in tree.iter().enumerate() {
+                let new = mounts.next;
+                mounts.next += 1;
+                let (point, at) = match parents[i] {
+                    None => (t.point.clone(), t.at.clone()),
+                    Some(p) => (
+                        m.point.clone().unwrap_or(Node::ROOT).in_mount(ids[p]),
+                        m.at.clone().map(|(dir, name)| (dir.in_mount(ids[p]), name)),
+                    ),
+                };
+                let mut locks = if lock {
+                    locked_tree(m.flags, m.locks)
+                } else {
+                    m.locks
+                };
+                if i == 0 {
+                    locks &= !lock::MOUNT;
+                }
+                mounts.list.push(Mount {
+                    id: new,
+                    ns: t.ns,
+                    root: m.root.clone().in_mount(new),
+                    point: Some(point),
+                    at,
+                    expiring: false,
+                    locks,
+                    prop: props.get(i).copied().unwrap_or_default(),
+                    ..m.clone()
+                });
+                ids.push(new);
+            }
+            if let Some(q) = index.at_place(&mounts.list, &t.point, t.at.as_ref()) {
+                let root = tree[0].root.clone().in_mount(ids[0]);
+                let q = &mut mounts.list[q];
+                q.point = Some(root);
+                q.at = None;
+            }
+        }
+        drop(mounts);
+        self.mounts_changed();
+    }
+
+    /// Whether unmounting mount `id` without `MNT_DETACH` would take down a mount in use
+    /// elsewhere (Linux's `propagate_mount_busy`): in each mount its parent propagates to, the
+    /// mount on the same place, when nothing is mounted on it except one mount covering its root,
+    /// is in `in_use`.
+    pub(crate) fn propagated_busy(
+        &self,
+        id: MountId,
+        in_use: &std::collections::HashSet<MountId>,
+    ) -> bool {
+        let mounts = self.mounts.borrow();
+        let index = Index::of(&mounts.list);
+        let Some(m) = index.pos.get(&id).map(|&i| &mounts.list[i]) else {
+            return false;
+        };
+        let Some(parent) = m.parent() else {
+            return false;
+        };
+        index
+            .propagation_of(&mounts.list, parent)
+            .iter()
+            .any(|&(to, _)| {
+                let Some(c) = index.on_spot(&mounts.list, m, mounts.list[to].id) else {
+                    return false;
+                };
+                let kids = index.children(c.id);
+                let topper =
+                    kids.len() == 1 && mounts.list[kids[0]].point.as_ref() == Some(&c.root);
+                (kids.is_empty() || topper) && in_use.contains(&c.id)
+            })
+    }
+
+    /// Unmounts mount `id` and the mounts below it (Linux's `umount_tree` with
+    /// `UMOUNT_PROPAGATE`): for each of them whose parent is shared, the mount on the same place
+    /// in each mount the parent's group propagates to goes too (`propagate_umount`), once nothing
+    /// is mounted on it but mounts going with it and one mount covering its root, and unless it
+    /// is locked in place; what stays but was mounted on a mount that goes (one covering its
+    /// root) moves to the place of the nearest mount above it that stays (`restore_mounts`).
+    pub(crate) fn umount_tree(&self, id: MountId) {
+        let mut mounts = self.mounts.borrow_mut();
+        let list = &mounts.list;
+        let index = Index::of(list);
+        let order = tree_of(list, id);
+        let gone: std::collections::HashSet<MountId> = order.iter().copied().collect();
+        // The mounts on the same places elsewhere, each place of a peer group visited once
+        let mut visited = std::collections::HashSet::new();
+        let mut candidates: Vec<usize> = Vec::new();
+        let mut is_candidate = std::collections::HashSet::new();
+        for m in order.iter().rev().filter_map(|m| index.pos.get(m)) {
+            let m = &list[*m];
+            let Some(parent) = m.parent().and_then(|p| index.pos.get(&p)) else {
+                continue;
+            };
+            let group = list[*parent].prop.group;
+            if group == 0 {
+                continue;
+            }
+            let place = (
+                m.point.clone().map(|p| p.in_mount(0)),
+                m.at.clone().map(|(dir, name)| (dir.in_mount(0), name)),
+            );
+            if !visited.insert((group, place)) {
+                continue;
+            }
+            for to in index.group_tree(list, group) {
+                if let Some(c) = index.on_spot(list, m, list[to].id)
+                    && !gone.contains(&c.id)
+                    && is_candidate.insert(c.id)
+                {
+                    candidates.push(index.pos[&c.id]);
+                }
+            }
+        }
+        // Marked: nothing is mounted on it but one covering its root, mounts going with the tree
+        // and marked mounts; deepest first, each marked one letting its parent be checked again
+        let covers = |c: usize, k: usize| list[k].point.as_ref() == Some(&list[c].root);
+        let mut blocking: HashMap<usize, usize> = HashMap::new();
+        let mut ready: Vec<usize> = Vec::new();
+        for &c in &candidates {
+            let n = index
+                .children(list[c].id)
+                .iter()
+                .filter(|&&k| !covers(c, k) && !gone.contains(&list[k].id))
+                .count();
+            blocking.insert(c, n);
+            if n == 0 {
+                ready.push(c);
+            }
+        }
+        let mut marked = std::collections::HashSet::new();
+        while let Some(c) = ready.pop() {
+            if !marked.insert(c) {
+                continue;
+            }
+            if let Some(&p) = list[c].parent().and_then(|p| index.pos.get(&p))
+                && !covers(p, c)
+                && let Some(n) = blocking.get_mut(&p)
+            {
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(p);
+                }
+            }
+        }
+        // The marked ones not locked in place go, with everything mounted on them but what covers
+        // a root
+        let mut out: std::collections::HashSet<MountId> = gone.clone();
+        let mut extra: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|c| marked.contains(c) && list[*c].locks & lock::MOUNT == 0)
+            .collect();
+        while let Some(c) = extra.pop() {
+            if !out.insert(list[c].id) {
+                continue;
+            }
+            extra.extend(
+                index
+                    .children(list[c].id)
+                    .iter()
+                    .filter(|&&k| !covers(c, k)),
+            );
+        }
+        // What stays but was mounted on one that goes moves up
+        let mut moves: Vec<(usize, Place)> = Vec::new();
+        for &o in &out {
+            for &k in index.children(o) {
+                if out.contains(&list[k].id) {
+                    continue;
+                }
+                let mut spot = (list[k].point.clone(), list[k].at.clone());
+                let mut up = index.pos.get(&o).copied();
+                while let Some(p) = up.filter(|&p| out.contains(&list[p].id)) {
+                    spot = (list[p].point.clone(), list[p].at.clone());
+                    up = list[p].parent().and_then(|q| index.pos.get(&q)).copied();
+                }
+                moves.push((k, spot));
+            }
+        }
+        for (k, (point, at)) in moves {
+            (mounts.list[k].point, mounts.list[k].at) = (point, at);
+        }
+        detach(&mut mounts, |m| out.contains(&m.id));
+        drop(mounts);
+        self.mounts_changed();
     }
 
     /// The mount whose root `node` is, attached or detached.
@@ -3078,6 +3416,24 @@ pub(crate) fn released(mnt: MountId) {
     });
 }
 
+/// The locks of a mount made for a less privileged user namespace (Linux's `lock_mnt_tree`): it
+/// is locked in place, its access-time flags are locked, and so are its read-only, nodev, nosuid
+/// and noexec flags where set.
+fn locked_tree(flags: u64, locks: u64) -> u64 {
+    let mut locks = locks | lock::MOUNT | lock::ATIME;
+    for (f, l) in [
+        (ms::RDONLY, lock::READONLY),
+        (ms::NODEV, lock::NODEV),
+        (ms::NOSUID, lock::NOSUID),
+        (ms::NOEXEC, lock::NOEXEC),
+    ] {
+        if flags & f != 0 {
+            locks |= l;
+        }
+    }
+    locks
+}
+
 /// Moves the attached mounts that `gone` picks to the detached list (Linux's `umount_tree`
 /// without `UMOUNT_SYNC`): each is disconnected from its mount point, except a mount locked in
 /// place whose parent is detached with it, which stays on that parent (`disconnect_mount`), so an
@@ -3097,9 +3453,7 @@ fn detach(mounts: &mut Mounts, gone: impl Fn(&Mount) -> bool) {
         mounts.detached.push(m);
     }
     // Unmounted mounts leave their peer groups (umount_tree's change_mnt_propagation(MS_PRIVATE))
-    for id in ids {
-        mounts.change_propagation(id, PropagationType::Private);
-    }
+    mounts.make_private(&ids);
 }
 
 // ---- Propagation types (fs/pnode.c) ----
@@ -3122,22 +3476,12 @@ impl Mounts {
         tree_of(&all, id)
     }
 
-    /// A peer group number no mount uses (`mnt_alloc_group_id`: the smallest free one).
-    fn new_group(&self) -> u32 {
-        let used: std::collections::HashSet<u32> = self
-            .all()
-            .flat_map(|m| [m.prop.group, m.prop.master])
-            .collect();
-        (1..).find(|g| !used.contains(g)).unwrap_or(u32::MAX)
-    }
-
-    /// Linux's `change_mnt_propagation`.
-    fn change_propagation(&mut self, id: MountId, kind: PropagationType) {
+    /// Linux's `change_mnt_propagation`, new peer groups coming from `groups`.
+    fn change_propagation(&mut self, id: MountId, kind: PropagationType, groups: &mut GroupAlloc) {
         if kind == PropagationType::Shared {
-            let group = self.new_group();
             if let Some(m) = self.get_mut(id) {
                 if m.prop.group == 0 {
-                    m.prop.group = group;
+                    m.prop.group = groups.take();
                 }
                 m.prop.unbindable = false;
             }
@@ -3175,6 +3519,194 @@ impl Mounts {
             m.prop.group = 0;
             m.prop.master = if peers { group } else { master };
         }
+    }
+
+    /// Unmounted mounts `ids` all become private at once (`umount_tree`'s
+    /// `change_mnt_propagation(MS_PRIVATE)` for each): a peer group left without members hands its
+    /// slaves to its own master, and on up when that group is left empty too.
+    fn make_private(&mut self, ids: &std::collections::HashSet<MountId>) {
+        let mut left: HashMap<u32, u32> = HashMap::new();
+        for m in self.list.iter_mut().chain(self.detached.iter_mut()) {
+            if ids.contains(&m.id) {
+                if m.prop.group != 0 {
+                    left.insert(m.prop.group, m.prop.master);
+                }
+                m.prop = Propagation::default();
+            }
+        }
+        let alive: std::collections::HashSet<u32> = self.all().map(|m| m.prop.group).collect();
+        left.retain(|g, _| !alive.contains(g));
+        if left.is_empty() {
+            return;
+        }
+        let resolve = |mut g: u32| {
+            for _ in 0..=left.len() {
+                match left.get(&g) {
+                    Some(&up) => g = up,
+                    None => break,
+                }
+            }
+            g
+        };
+        for m in self.list.iter_mut().chain(self.detached.iter_mut()) {
+            if left.contains_key(&m.prop.master) {
+                m.prop.master = resolve(m.prop.master);
+            }
+        }
+    }
+}
+
+/// Peer group numbers handed out during one change (`mnt_alloc_group_id`: the smallest free one
+/// each time), without scanning every mount for each one.
+struct GroupAlloc {
+    used: std::collections::HashSet<u32>,
+    next: u32,
+}
+
+impl GroupAlloc {
+    fn of(mounts: &Mounts) -> GroupAlloc {
+        GroupAlloc {
+            used: mounts
+                .all()
+                .flat_map(|m| [m.prop.group, m.prop.master])
+                .collect(),
+            next: 1,
+        }
+    }
+
+    fn take(&mut self) -> u32 {
+        while self.used.contains(&self.next) {
+            self.next += 1;
+        }
+        self.used.insert(self.next);
+        self.next
+    }
+}
+
+/// Lookups over the attached mounts (`Mounts::list`), built once for an operation that visits
+/// many of them: a peer group grown to thousands of mounts would make a scan per visit quadratic.
+struct Index {
+    /// Position in the list of each mount.
+    pos: HashMap<MountId, usize>,
+    /// The members of each peer group.
+    members: HashMap<u32, Vec<usize>>,
+    /// The slaves of each peer group.
+    slaves: HashMap<u32, Vec<usize>>,
+    /// The mounts mounted in each mount.
+    children: HashMap<MountId, Vec<usize>>,
+    /// The mounts on each mount point.
+    spots: HashMap<Node, Vec<usize>>,
+}
+
+impl Index {
+    fn of(list: &[Mount]) -> Index {
+        let mut index = Index {
+            pos: HashMap::with_capacity(list.len()),
+            members: HashMap::new(),
+            slaves: HashMap::new(),
+            children: HashMap::new(),
+            spots: HashMap::new(),
+        };
+        for (i, m) in list.iter().enumerate() {
+            index.pos.insert(m.id, i);
+            if m.prop.group != 0 {
+                index.members.entry(m.prop.group).or_default().push(i);
+            }
+            if m.prop.master != 0 {
+                index.slaves.entry(m.prop.master).or_default().push(i);
+            }
+            if let Some(parent) = m.parent().filter(|&p| p != m.id) {
+                index.children.entry(parent).or_default().push(i);
+            }
+            if let Some(point) = &m.point {
+                index.spots.entry(point.clone()).or_default().push(i);
+            }
+        }
+        index
+    }
+
+    fn children(&self, of: MountId) -> &[usize] {
+        self.children.get(&of).map_or(&[], Vec::as_slice)
+    }
+
+    /// The mount in mount `to` on the place where `m` is in its parent.
+    fn on_spot<'a>(&self, list: &'a [Mount], m: &Mount, to: MountId) -> Option<&'a Mount> {
+        let point = m.point.clone()?.in_mount(to);
+        let at = m.at.clone().map(|(dir, name)| (dir.in_mount(to), name));
+        self.at_place(list, &point, at.as_ref()).map(|i| &list[i])
+    }
+
+    /// The mount on `point`: of several (links of one file), the one found through `at`, else
+    /// the first (a directory has one place; `at` is kept for directories too, in the parent
+    /// mount when the point is a mount's root).
+    fn at_place(&self, list: &[Mount], point: &Node, at: Option<&Dentry>) -> Option<usize> {
+        let found = self.spots.get(point)?;
+        found
+            .iter()
+            .copied()
+            .find(|&i| list[i].at.as_ref() == at)
+            .or_else(|| found.first().copied())
+    }
+
+    /// The mounts an event in mount `of` propagates to, in the order of Linux's `propagate_mnt`:
+    /// its peers, then the slaves of its group, each slave group with its members together and
+    /// followed by its own slaves (depth first). Each comes with the chain of groups from its
+    /// master up to `of`'s group, empty for a peer. None when `of` is not shared.
+    fn propagation_of(&self, list: &[Mount], of: MountId) -> Vec<(usize, Vec<u32>)> {
+        let Some(top) = self
+            .pos
+            .get(&of)
+            .map(|&i| list[i].prop.group)
+            .filter(|&g| g != 0)
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<(usize, Vec<u32>)> = self.members[&top]
+            .iter()
+            .filter(|&&i| list[i].id != of)
+            .map(|&i| (i, Vec::new()))
+            .collect();
+        let mut seen = std::collections::HashSet::from([top]);
+        self.slaves_of(list, &[top], &mut seen, &mut out);
+        out
+    }
+
+    /// The slaves of group `chain[0]` for [`Index::propagation_of`], `chain` leading up to the
+    /// group of the event.
+    fn slaves_of(
+        &self,
+        list: &[Mount],
+        chain: &[u32],
+        seen: &mut std::collections::HashSet<u32>,
+        out: &mut Vec<(usize, Vec<u32>)>,
+    ) {
+        for &i in self.slaves.get(&chain[0]).into_iter().flatten() {
+            match list[i].prop.group {
+                0 => out.push((i, chain.to_vec())),
+                group if seen.insert(group) => {
+                    out.extend(self.members[&group].iter().map(|&p| (p, chain.to_vec())));
+                    let below: Vec<u32> = std::iter::once(group)
+                        .chain(chain.iter().copied())
+                        .collect();
+                    self.slaves_of(list, &below, seen, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The members of peer group `group` and every mount it propagates to.
+    fn group_tree(&self, list: &[Mount], group: u32) -> Vec<usize> {
+        let Some(first) = self.members.get(&group).and_then(|m| m.first()) else {
+            return Vec::new();
+        };
+        let mut out = vec![*first];
+        out.extend(
+            self.propagation_of(list, list[*first].id)
+                .into_iter()
+                .map(|(i, _)| i),
+        );
+        out
     }
 }
 
@@ -3720,6 +4252,50 @@ mod tests {
         // Ids of detached mounts are not reused
         assert!(vfs.add_mount(Fs::Sys, Fs::Sys.root(), (usr, None), 0, Vec::new(), None) > s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn propagates_binds_to_peers() {
+        // /usr bound onto itself and made shared, then bound onto /bin (its peer): a mount on
+        // /usr is copied onto the peer's root, and unmounting it takes the copy down too
+        let (vfs, _dir) = sample("propagate");
+        let ps = &Empty;
+        let cred = &Cred::root();
+        let r = |p: &[u8]| {
+            vfs.resolve(ps, cred, &Node::ROOT, &Node::ROOT, p, true)
+                .unwrap()
+        };
+        let (usr, bin, ubin) = (r(b"/usr"), r(b"/bin"), r(b"/usr/bin"));
+        let ino = |n: &Node| n.ino().unwrap();
+        let bind = |src: &Node, at: &Node| {
+            let id = vfs.add_mount(
+                Fs::Store,
+                src.clone(),
+                (at.clone(), None),
+                0,
+                Vec::new(),
+                Some(ROOT_DEV),
+            );
+            let prop = vfs.propagation(src.mnt()).of_bind();
+            vfs.update_mount(id, |m| m.prop = prop);
+            vfs.attached(id);
+            id
+        };
+        let shared = bind(&usr, &usr);
+        vfs.set_propagation(shared, PropagationType::Shared, false);
+        let top = Node::Store(shared, ino(&usr));
+        let peer = bind(&top, &bin);
+        assert_eq!(vfs.propagation(peer).group, vfs.propagation(shared).group);
+        let targets = vfs.propagation_targets(ps, (&top, None));
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        let id = bind(&ubin, &top);
+        vfs.propagate(id, &targets, 0);
+        let copy = vfs.mounted(Node::Store(peer, ino(&usr)));
+        assert_eq!(copy.ino(), Some(ino(&ubin)));
+        assert_ne!(copy.mnt(), id);
+        assert_eq!(r(b"/bin"), copy);
+        vfs.umount_tree(id);
+        assert_eq!(r(b"/bin"), Node::Store(peer, ino(&usr)));
     }
 
     #[test]

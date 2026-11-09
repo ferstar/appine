@@ -26,13 +26,6 @@ SKIP="$SKIP:Openat2Test.BeneathRaceWithRename:Openat2Test.InRootRaceWithRename"
 # kernel/vfs: anonymous pipes and sockets cannot change owner
 SKIP="$SKIP:ChownTest.FchownPipeFileSucceeds:ChownTest.FchownPipeFileFails"
 M=MountTest
-# mount_test. kernel/vfs: mount and unmount events do not propagate between peers and slaves (only
-# the types are recorded and shown)
-SKIP="$SKIP:$M.BindSharedOnShared:$M.BindSlaveToShared:$M.LargeTreePropagationEvent"
-SKIP="$SKIP:$M.MountNamespacePropagation:$M.MountNamespaceSlavesNewUserNamespace"
-SKIP="$SKIP:$M.PropagateMountEvent:$M.RecursiveBindPropagation:$M.UmountIgnoresPeersWithChildren"
-SKIP="$SKIP:$M.UmountPropagatedSubtreeFromPrivilegedNS:$M.MaxMounts:$M.MaxMountsWithSlave"
-SKIP="$SKIP:$M.FailedBindDoesNotBreakPropagation"
 # kernel/procfs: sysfs has no /sys/kernel
 SKIP="$SKIP:$M.LockedMountStopsOverlayOfSysfs"
 SKIP="$SKIP:$M.UserNamespaceSysfsMountRevealingLockedMount"

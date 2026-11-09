@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes; mount events, cgroup2 watches; Files app writers last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: I/O flags; locks; owners; loop; timerfd; suite findings; splice; holes; overlayfs; AIO; clones; FUSE; collection; ACLs; Files app writers; mounts and their propagation last)
 
 ## Responsibilities
 
@@ -208,7 +208,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   never reused; the list order is the mountinfo order.
 - A namespace holds at most `fs.mount-max` mounts (`Kernel::mount_max`, default 100000, as Linux's
   `count_mounts`): a new mount, a bind with the submounts it copies, or attaching a detached tree
-  that would pass it is `ENOSPC`. Detached trees in anonymous namespaces are not limited.
+  that would pass it, in its own namespace or in any namespace its propagated copies go to, is
+  `ENOSPC` before anything changes (`plan_attach`). Detached trees in anonymous namespaces are
+  not limited.
 - Boot (`Vfs::open`): when it is the store's only user, the store clears its `/dev/shm` and
   `/run` (not `/tmp`). Mounts, in order: `/` (id 1, store, no mount point — Linux's invisible
   rootfs), `/proc` (2), `/dev` tmpfs (7, `mode=755`, nosuid and relatime only — neither nodev nor
@@ -267,8 +269,25 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   mount attached under a shared mount (new, bind, move) becomes shared with the mounts below it
   (`attach_recursive_mnt`); unmounted mounts become private. `MS_MOVE` of a mount in a shared
   parent, or of a tree holding an unbindable mount onto a shared one, and `pivot_root` with
-  put_old's mount or the parent of new_root or of the root shared, are `EINVAL`. Only the types
-  change: mount and unmount events do not propagate to peers and slaves.
+  put_old's mount or the parent of new_root or of the root shared, are `EINVAL`.
+- Mount events (`fs/pnode.c`): a tree attached under a shared mount (new mount, bind, nsfs bind,
+  `MS_MOVE`, `move_mount`) is copied to every mount the parent propagates to that sees the mount
+  point (`Vfs::propagation_targets`, planned before attaching): its peers, then each slave group,
+  depth first. Copies in peers are peers of the original's mounts; copies in a slave are slaves
+  of the copies in the nearest group above that got some, and peers of each other when the slave
+  group is shared (masters are kept per group, so this matches `propagate_one`'s `last_source`
+  walk). A mount already on the place in a target goes on top of the copy (tucked under it). In a
+  namespace owned by a user namespace other than the caller's mount namespace's owner, copies are
+  locked as by `lock_mnt_tree`, except their root's lock in place. `umount2` (`Vfs::umount_tree`)
+  also takes down, for each unmounted mount with a shared parent, the mount on the same place in
+  each mount of the parent group's propagation tree, once nothing is mounted on it but one mount
+  covering its root and other mounts going (marked deepest first) and unless locked in place
+  (locked ones stay); a mount covering the root of one that goes moves to the place of the
+  nearest mount above that stays (`restore_mounts`). Without `MNT_DETACH`, such a mount in use
+  (no submounts but a covering one) makes the unmount `EBUSY` (`propagate_mount_busy`). Removing
+  a mount point (`detach_mounts`) and namespace teardown do not propagate. Copies are appended to
+  the mount list in target order, so mountinfo lists them in a different order than Linux (which
+  commits them in reverse).
 - `MS_MOVE` (a mount locked in place `EINVAL`), `pivot_root` (6.1's checks after resolving both
   paths, a locked `new_root` `EINVAL`; the old root's lock moves to the new root, so the old one
   can then be detached; `chroot_fs_refs` for tasks whose root or cwd was the old root in the same
@@ -916,15 +935,25 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   lifting to mounts (`mounted`) and climbing out of a mount root (`root_point`) search the detached
   list too, while everything acting on attached mounts (`mount`, `mount_root`, `children`,
   mountinfo) looks at the attached list only.
-- Locks are per mount and only ever added by copying a namespace into one with another owner or
-  by binding; a bind's own root drops `lock::MOUNT`, so code that creates a mount from another
-  must decide which locks it inherits (`clone_mount`, `bind`, `add_copies` keep or clear them).
+- Locks are per mount and only ever added by copying a namespace into one with another owner,
+  by binding, or by propagating into such a namespace; a bind's own root drops `lock::MOUNT`, so
+  code that creates a mount from another must decide which locks it inherits (`clone_mount`,
+  `bind`, `add_copies`, `propagate` keep or clear them).
 - splice and vmsplice put what they read into the output pipe whole even when a writer took the
   room while the BKL was released for the read (Linux holds the pipe's lock throughout), so a pipe
   can briefly hold more than its capacity.
 - The mount table is a list, and a namespace may hold 100000 mounts: anything that visits many
-  mounts indexes them once (by parent in `plan_copies` and `tree_of`, by id in `mounts_from`),
-  since a scan of the table per mount holds the BKL for tens of seconds at that size.
+  mounts indexes them once (by parent in `plan_copies` and `tree_of`, by id in `mounts_from`, by
+  id, group, master, parent and mount point in `Index` for propagation and unmounting, group
+  numbers handed out by `GroupAlloc`), since a scan of the table per mount holds the BKL for tens
+  of seconds at that size. Propagation stacks thousands of mounts on one directory, so `mounted`
+  climbs past eight stacked mounts through an index.
+- Every attach path in `syscall::mount` pairs `plan_attach` (before attaching: the targets, and
+  `ENOSPC` for every namespace concerned) with `propagate` (after); planning first keeps the
+  tree's own mounts out of the targets. A mount on another mount's root keeps in `at` the
+  directory it was found in, which is in the parent mount; targets whose point is their own root
+  therefore carry no `at`, and places are matched by mount point, `at` only telling links of one
+  file apart.
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   the same mount; the process root itself is never lifted (as in Linux, a mount on `/` is not seen
   by absolute lookups).
@@ -1071,11 +1100,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Anonymous pipes and sockets cannot change owner:** fchown on them always succeeds and changes
   nothing, even for an unprivileged caller that Linux refuses with `EPERM`, and fstat shows the
   caller as owner rather than the creator.
-- **Mount events do not propagate:** peer groups and slaves are recorded and shown, but a mount or
-  unmount under a shared mount is not repeated under its peers and slaves (Linux's `propagate_mnt`,
-  `propagate_umount`), so a bind with `rshared` propagation, a container sharing mounts back to
-  the host, or `MS_SHARED` between mount namespaces never sees the other side's mounts; mount
-  counts include no propagated copies.
 
 - **Private mappings do not follow a file to its own object:** a private mapping made while its
   file shared an object keeps the shared data in the pages it has not copied after the file is

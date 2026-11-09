@@ -26,8 +26,8 @@ use crate::nsproxy::{Counted, NsRef};
 use crate::pseudo::NsKind;
 use crate::vfs::store::{Ino, mode};
 use crate::vfs::{
-    Dentry, Fs, Mount, MountId, Node, PropagationType, Pseudo, PseudoNode, TmpfsParams, Vfs, fuse,
-    lock, ms, overlay,
+    Dentry, Fs, Mount, MountId, Node, PropagationType, Pseudo, PseudoNode, Target, TmpfsParams,
+    Vfs, fuse, lock, ms, overlay,
 };
 
 const MS_REMOUNT: u64 = 0x20;
@@ -212,16 +212,16 @@ fn new_mount(
     };
     if fs == Fs::Overlay {
         let ((layers, pins), options) = overlay_layers(cx, &vfs, data)?;
-        room_for(cx, &vfs, target.mnt(), 1)?;
+        let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
         let cred = cx.cred();
-        vfs.new_overlay(
+        let id = vfs.new_overlay(
             (target, at),
             flags,
             source.unwrap_or_default(),
             (layers, (cred.fsuid, cred.fsgid), pins),
             options,
         );
-        cx.shared.fast_changed();
+        propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
     if fs == Fs::Fuse {
@@ -230,9 +230,9 @@ fn new_mount(
     if fs == Fs::Tmpfs {
         let params = tmpfs_options(data, &cx.cred())?;
         let source = source.unwrap_or_default();
-        room_for(cx, &vfs, target.mnt(), 1)?;
-        vfs.new_tmpfs((target, at), flags, source, params)?;
-        cx.shared.fast_changed();
+        let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
+        let id = vfs.new_tmpfs((target, at), flags, source, params)?;
+        propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
     let (root, dev) = match fs {
@@ -248,7 +248,7 @@ fn new_mount(
         ),
         _ => (fs.root(), (!fs.own_dev()).then(|| fs.dev())),
     };
-    room_for(cx, &vfs, target.mnt(), 1)?;
+    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
     let id = vfs.add_mount(
         fs,
         root,
@@ -279,7 +279,7 @@ fn new_mount(
     if fs == Fs::Proc && pid_ns.level > 0 {
         vfs.set_proc_pid_ns(id, pid_ns);
     }
-    cx.shared.fast_changed();
+    propagate(cx, &vfs, id, &targets);
     Ok(0)
 }
 
@@ -325,9 +325,9 @@ fn fuse_mount(
         if vfs.fuse().conn(dev).is_none() {
             return Err(Errno::ENOTCONN);
         }
-        room_for(cx, vfs, target.mnt(), 1)?;
-        vfs.add_fuse_mount((target, at), flags, source.unwrap_or_default(), dev)?;
-        cx.shared.fast_changed();
+        let targets = plan_attach(cx, vfs, (&target, at.as_ref()), 1, 1)?;
+        let id = vfs.add_fuse_mount((target, at), flags, source.unwrap_or_default(), dev)?;
+        propagate(cx, vfs, id, &targets);
         return Ok(0);
     }
     let (Some(_), Some(_), Some(_)) = (opts.rootmode, opts.user_id, opts.group_id) else {
@@ -337,11 +337,12 @@ fn fuse_mount(
         FileKind::FuseDev(d) if Rc::ptr_eq(&d.opener_ns, &cred.user_ns) => {}
         _ => return Err(Errno::EINVAL),
     }
-    room_for(cx, vfs, target.mnt(), 1)?;
+    let targets = plan_attach(cx, vfs, (&target, at.as_ref()), 1, 1)?;
     let pid_ns = cx.pid_ns();
-    let (_, conn) = vfs.new_fuse((target, at), flags, source.unwrap_or_default(), |dev| {
+    let (id, conn) = vfs.new_fuse((target, at), flags, source.unwrap_or_default(), |dev| {
         fuse::Conn::new(dev, opts, &cred, pid_ns)
     });
+    propagate(cx, vfs, id, &targets);
     if let FileKind::FuseDev(d) = &mut file.borrow_mut().kind {
         d.attach(&conn);
     }
@@ -558,7 +559,8 @@ fn bind(
     // source, the new mount is not copied into itself
     let inside = if recursive { vfs.mounts() } else { Vec::new() };
     let plan = plan_copies(&vfs, &view, &inside, &src)?;
-    room_for(cx, &vfs, target.mnt(), 1 + plan.len())?;
+    let size = 1 + plan.len();
+    let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?;
     let id = vfs.add_mount(
         m.fs,
         src.clone(),
@@ -579,7 +581,7 @@ fn bind(
     });
     vfs.add_copies(id, &plan);
     vfs.attached(id);
-    cx.shared.fast_changed();
+    propagate(cx, &vfs, id, &targets);
     Ok(0)
 }
 
@@ -618,10 +620,11 @@ fn bind_ns(
     if vfs.is_dir(&cx.view(vfs), &target)? {
         return Err(Errno::ENOTDIR);
     }
+    let targets = plan_attach(cx, vfs, (&target, at.as_ref()), 1, 1)?;
     let fs = Fs::Nsfs;
     let id = vfs.add_mount(fs, src, (target, at), 0, b"nsfs".to_vec(), Some(fs.dev()));
     vfs.update_mount(id, |m| m.pin = Some(ns));
-    cx.shared.fast_changed();
+    propagate(cx, vfs, id, &targets);
     Ok(0)
 }
 
@@ -1304,10 +1307,10 @@ pub(super) fn umount2(cx: &mut Cx<'_>, target: u64, flags: u32) -> SysResult {
     if vfs.mount(id).is_some_and(|m| m.point.is_none()) {
         return Err(if detach { Errno::EINVAL } else { Errno::EBUSY });
     }
-    if !detach && (own_root || busy(cx, &vfs, id)) {
+    if !detach && (own_root || busy(cx, &vfs, id) || vfs.propagated_busy(id, &in_use(cx.kr()))) {
         return Err(Errno::EBUSY);
     }
-    vfs.remove_mount(id);
+    vfs.umount_tree(id);
     vfs.collect(&in_use(cx.kr()));
     cx.shared.fast_changed();
     Ok(0)
@@ -1537,14 +1540,42 @@ fn plan_copies<'a>(
     Ok(plan)
 }
 
-/// Linux's `count_mounts`: adding `n` mounts to the namespace of mount `parent` must leave it
-/// within `fs.mount-max`, otherwise ENOSPC.
-fn room_for(cx: &Cx<'_>, vfs: &Vfs, parent: MountId, n: usize) -> Result<(), Errno> {
-    let have = vfs.mount_ns(parent).map_or(0, |ns| vfs.count_in(ns));
-    if have + n > cx.kr().mount_max {
+/// Before a tree of `size` mounts is attached on `place`: where it is to be copied as well
+/// ([`Vfs::propagation_targets`]), after checking that the namespace of the mount `place` is in
+/// (gaining `own` mounts, 0 when the tree is in it already) and the namespace of every target
+/// (gaining a copy of the tree for each) stay within `fs.mount-max` (Linux's `count_mounts` in
+/// `attach_recursive_mnt` and `propagate_one`), otherwise ENOSPC with nothing changed.
+fn plan_attach(
+    cx: &Cx<'_>,
+    vfs: &Vfs,
+    place: (&Node, Option<&Dentry>),
+    own: usize,
+    size: usize,
+) -> Result<Vec<Target>, Errno> {
+    let targets = vfs.propagation_targets(&cx.view(vfs), place);
+    let mut added: HashMap<u64, usize> = HashMap::new();
+    if let Some(ns) = vfs.mount_ns(place.0.mnt()) {
+        *added.entry(ns).or_default() += own;
+    }
+    for t in &targets {
+        *added.entry(t.ns).or_default() += size;
+    }
+    if added
+        .into_iter()
+        .any(|(ns, n)| n > 0 && vfs.count_in(ns) + n > cx.kr().mount_max)
+    {
         return Err(Errno::ENOSPC);
     }
-    Ok(())
+    Ok(targets)
+}
+
+/// Mount `id` was attached where [`plan_attach`] planned `targets`: copies of its tree go to
+/// each ([`Vfs::propagate`]), locked in namespaces not owned by the caller's mount namespace's
+/// owner.
+fn propagate(cx: &Cx<'_>, vfs: &Vfs, id: MountId, targets: &[Target]) {
+    let owner = cx.t.fs.borrow().mnt_ns.owner.id;
+    vfs.propagate(id, targets, owner);
+    cx.shared.fast_changed();
 }
 
 /// Moves the mount rooted at `src` onto `target` (Linux's `do_move_mount`, shared by `MS_MOVE` and
@@ -1588,18 +1619,24 @@ fn move_tree(cx: &mut Cx<'_>, src: &Node, (target, at): (Node, Option<Dentry>)) 
     {
         return Err(Errno::EINVAL);
     }
-    if anon {
+    // An attached tree is in the namespace already; its copies count anyway
+    let targets = if anon {
         let size = vfs.mount_ns(id).map_or(0, |ns| vfs.count_in(ns));
-        room_for(cx, &vfs, target.mnt(), size)?;
-        vfs.attach_tree(id, (target, at), cx.mnt_ns());
+        plan_attach(cx, &vfs, (&target, at.as_ref()), size, size)?
     } else {
         if vfs.is_under(&view, &target, src) {
             return Err(Errno::ELOOP);
         }
+        let size = vfs.subtree(id).len();
+        plan_attach(cx, &vfs, (&target, at.as_ref()), 0, size)?
+    };
+    if anon {
+        vfs.attach_tree(id, (target, at), cx.mnt_ns());
+    } else {
         vfs.move_mount(id, Some((target, at)));
     }
     vfs.attached(id);
-    cx.shared.fast_changed();
+    propagate(cx, &vfs, id, &targets);
     Ok(0)
 }
 

@@ -255,6 +255,8 @@ In `starnix-io`, the native side of `Pty.EchoModes` failed once on 2026-11-08 in
 
 In `mount-locks`, Appine's side failed once on 2026-11-08 in a full Tier 0 run with four lanes: right after `waitpid` returned for a child that had entered a new user and mount namespace and sent an fd into it, a listing through that fd still showed the mount over `hidden` (`['secret']`), which Linux has taken down by then. The group passed 3 of 3 reruns alone. Presumably the dead namespace's mounts are sometimes collected only after the parent's wait returns (the vfs map's collection at task exit); the cause was not investigated.
 
+In `pty`, Appine's side of the packet-mode `^C` lines differed once on 2026-11-09 in a full run with four lanes: the master's first read after `^C` returned `\x03` (both flush bits) and the read after the `NOFLSH` `^C` found nothing (`EAGAIN`), where the native side reports the write flush first and the read flush on the next read. The group passed 5 of 5 runs alone. Which bits the first read sees depends on when it comes; the cause was not investigated.
+
 
 ## R1 measurements
 
