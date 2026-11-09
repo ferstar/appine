@@ -5,8 +5,8 @@
 # are handled only after the thaw, and SIGKILL still kills; the frozen field of cgroup.events
 # (empty cgroups, child cgroups following their ancestors), processes stop when migrated in and
 # resume when migrated out, a child placed into a frozen cgroup by clone3 does not run, and
-# cgroup.kill kills frozen processes. The native side is a privileged container; only the t
-# created here is compared
+# cgroup.kill kills frozen processes; a parent waiting for its vfork child counts as frozen. The
+# native side is a privileged container; only the t created here is compared
 cd /sys/fs/cgroup
 mkdir t t/f t/f/c t/o
 cat > /tmp/freeze.c <<'C'
@@ -144,6 +144,19 @@ static void pauser(int out)
     dprintf(out, "pauser got signal %d", got);
 }
 
+static void vforker(int out)
+{
+    // The vfork child sleeps until after the freeze; the parent waits for it meanwhile, which
+    // Linux's wait_for_vfork_done counts as frozen
+    pid_t v = vfork();
+    if (v == 0) {
+        struct timespec ts = {0, 600000000};
+        syscall(SYS_nanosleep, &ts, NULL);
+        _exit(0);
+    }
+    dprintf(out, "vfork returned %d", v > 0);
+}
+
 // Wait at most 3 seconds: if the kernel is wrong, the test case fails instead of hanging
 static void result(const char *what, int fd)
 {
@@ -261,6 +274,17 @@ int main(void)
     while (wait(NULL) > 0)
         ;
     show("f/cgroup.events");
+    // A cgroup whose vfork child is frozen before its execve is frozen: its parent's wait counts
+    int r10;
+    child("f", &r10, vforker);
+    usleep(200000);
+    put("f/cgroup.freeze", "1");
+    usleep(200000);
+    show("f/cgroup.events");
+    put("f/cgroup.freeze", "0");
+    result("vfork parent", r10);
+    while (wait(NULL) > 0)
+        ;
     // SIGKILL and cgroup.kill kill frozen processes
     int r8, r9;
     pid_t c8 = child("f", &r8, pauser);

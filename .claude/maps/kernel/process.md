@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits and waits; namespaces; rlimits; futexes and PI; execve and loader; BKL watchdog; vDSO; timers; FUSE, mount and overlay hooks; per-thread credentials; sched_yield last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits and waits; namespaces; rlimits; futexes and PI; execve and loader; BKL watchdog; vDSO; timers; FUSE, mount and overlay hooks; per-thread credentials; sched_yield; vfork freezing last)
 
 ## Responsibilities
 
@@ -149,7 +149,9 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   address space's users and the kernel's task table. A failure releases the pid and the pidfd.
 - vfork: the parent waits (interest none) until the child execs or exits, or it is killed; until
   the completion is signalled (`release_mm`, at execve or exit) the child's `Task::vfork` is set,
-  so the OOM killer can pass it over (`kernel/mm`).
+  so the OOM killer can pass it over (`kernel/mm`). The waiting parent counts as frozen for
+  `cgroup.events` (`Task::frozen`, as Linux's `wait_for_vfork_done`), and stays counted after the
+  wait while its cgroup is freezing, until it stops on the way out (`kernel/procfs`).
 
 ### Run loop
 

@@ -590,9 +590,23 @@ fn do_clone(cx: &mut Cx<'_>, cpu: &mut Cpu, args: CloneArgs) -> SysResult {
     // (Linux's TASK_KILLABLE). Both wake this thread directly (task::release_mm,
     // signal::group_exit)
     if let Some(done) = vfork_done {
-        while !done.get() && !cx.task.killed.get() {
-            cx.wait_alone(None)?;
+        // The wait counts as frozen for cgroup.events, as Linux's wait_for_vfork_done enters the
+        // frozen state for it: a child frozen before its execve would otherwise keep a freezing
+        // cgroup from ever reporting frozen (runc pause waits for that). While the cgroup is
+        // freezing the thread stays counted until it stops on its way out (cgroup_leave_frozen)
+        cx.task.frozen.set(true);
+        let waited = loop {
+            if done.get() || cx.task.killed.get() {
+                break Ok(());
+            }
+            if let Err(e) = cx.wait_alone(None) {
+                break Err(e);
+            }
+        };
+        if !cx.t.group.borrow().frozen {
+            cx.task.frozen.set(false);
         }
+        waited?;
         let pid = crate::ptrace::tracer_pid_of(cx, tid);
         crate::ptrace::event(cx, cpu, crate::ptrace::event::VFORK_DONE, pid as u64);
     }

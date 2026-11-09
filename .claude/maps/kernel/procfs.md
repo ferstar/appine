@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes; change notifications; per-thread credentials last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay, mountinfo; change notifications; per-thread credentials; vfork freezing last)
 
 ## Responsibilities
 
@@ -368,11 +368,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   limit and measurement; a child's usage is its members' RSS, checked periodically by the OOM
   killer and immediately when a lower limit is written; `memory.oom.group` widens the kill),
   `cgroup.freeze` (threads stop before returning to guest code, waits return and restart after
-  thaw; `cgroup.events` reports frozen once every task has stopped — a vfork parent waiting for
-  its child never does), `cgroup.kill` (SIGKILL to every live process in the subtree),
-  `cgroup.max.depth`/`max.descendants`, the device programs. Everything else (`memory.high`,
-  `cpu.max`, `cpuset.cpus`, …) is format-checked and stored. `pids.current` counts live threads
-  plus one per zombie group.
+  thaw; `cgroup.events` reports frozen once every task has stopped or is a vfork parent waiting
+  for its child, as Linux counts that wait), `cgroup.kill` (SIGKILL to every live process in the
+  subtree), `cgroup.max.depth`/`max.descendants`, the device programs. Everything else
+  (`memory.high`, `cpu.max`, `cpuset.cpus`, …) is format-checked and stored. `pids.current` counts
+  live threads plus one per zombie group.
 - `/proc/<pid>/cgroup` is `0::<path>` relative to the reader's cgroup-namespace root;
   `/proc/cgroups` reports hierarchy 0 for the v1 controller names.
 
@@ -439,8 +439,6 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
   watched; sysctl poll (`hostname`, `domainname`) never reports `POLLPRI`; other synthetic files
   report no inotify events (opens, reads, writes).
-- **`frozen 1` never appears while a vfork parent waits:** the waiting parent never counts as frozen,
-  so runtimes that wait for `cgroup.events` to report frozen (runc pause) can wait until thaw.
 - **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
   the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
   looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another

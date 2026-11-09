@@ -106,7 +106,8 @@ pub(crate) struct Task {
     /// The thread has been asked to exit (whole-group exit, execve ending the other threads).
     pub killed: Cell<bool>,
     /// The thread stopped before signal delivery because its cgroup is frozen
-    /// ([`crate::signal::deliver`]): the frozen field of `cgroup.events` looks at it.
+    /// ([`crate::signal::deliver`]), or waits for its vfork child (which Linux counts as frozen
+    /// too): the frozen field of `cgroup.events` looks at it.
     pub frozen: Cell<bool>,
     /// `PR_SET_PDEATHSIG`: the signal sent to this process when the thread in the parent that
     /// created this process exits, 0 meaning none ([`crate::process::pdeath_signals`]). As on
