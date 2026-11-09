@@ -5057,7 +5057,7 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
     if !vfs.is_dir(&cx.view(&vfs), &node)? {
         return Err(Errno::ENOTDIR);
     }
-    if let Some(st) = searched_attrs(&vfs, &node)? {
+    if let Some(st) = searched_attrs(&vfs, &cx.view(&vfs), &node)? {
         cx.cred().permission(&st, MAY_EXEC)?;
     }
     if let Node::Fuse(_, f) = node {
@@ -5070,14 +5070,15 @@ fn set_cwd(cx: &mut Cx<'_>, node: Node) -> SysResult {
 }
 
 /// The attributes chdir and chroot check search permission on: a store directory's, or those of
-/// the store directory behind an overlay one; None for synthetic directories, which are always
-/// searchable.
-fn searched_attrs(vfs: &Vfs, node: &Node) -> Result<Option<Stat>, Errno> {
+/// the store directory behind an overlay one; for synthetic directories what their view says
+/// ([`Pseudo::searched`]: cgroup directories; the others are always searchable).
+fn searched_attrs(vfs: &Vfs, view: &dyn Pseudo, node: &Node) -> Result<Option<Stat>, Errno> {
     Ok(match node {
         Node::Store(_, ino) => Some(vfs.store().attrs(*ino)?),
         Node::Overlay(_, o) => Some(vfs.store().attrs(vfs.overlay().node(*o).real())?),
+        Node::Pseudo(_, p) => view.searched(p),
         // Checked by the daemon or on its attributes ([`super::fuse::may_chdir`])
-        Node::Pseudo(..) | Node::Fuse(..) => None,
+        Node::Fuse(..) => None,
     })
 }
 
@@ -5091,7 +5092,7 @@ pub(super) fn chroot(cx: &mut Cx<'_>, path: u64) -> SysResult {
         return Err(Errno::ENOTDIR);
     }
     let cred = cx.cred();
-    if let Some(st) = searched_attrs(&vfs, &node)? {
+    if let Some(st) = searched_attrs(&vfs, &cx.view(&vfs), &node)? {
         cred.permission(&st, MAY_EXEC)?;
     }
     if let Node::Fuse(_, f) = node {
@@ -5637,7 +5638,7 @@ pub(crate) fn dev_ino(f: &OpenFile) -> (u64, u64) {
 
 pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
     let path = read_path(cx, path)?;
-    if let Some(r) = cgroup_mkdir(cx, dirfd, &path) {
+    if let Some(r) = cgroup_mkdir(cx, dirfd, &path, perm) {
         return r.map(|()| 0);
     }
     if let Some((mnt, dir, name)) = super::fuse::parent(cx, dirfd, &path)? {
@@ -5664,10 +5665,11 @@ pub(super) fn mkdirat(cx: &mut Cx<'_>, dirfd: i32, path: u64, perm: u32) -> SysR
     Ok(0)
 }
 
-/// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]). The
-/// order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount EROFS, no
-/// write permission on the directory EACCES.
-fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), Errno>> {
+/// mkdir in a cgroup directory: creates a child cgroup ([`crate::cgroup::Cgroups::mkdir`]) with
+/// the permission bits `perm` gives after the umask (vfs_mkdir's `S_IRWXUGO|S_ISVTX`, which kernfs
+/// keeps). The order follows Linux: `.`, `..` and existing names are EEXIST, a read-only mount
+/// EROFS, no write permission on the directory EACCES.
+fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8], perm: u32) -> Option<Result<(), Errno>> {
     let (dir, id, st, name) = cgroup_parent(cx, dirfd, path)?;
     Some((|| {
         let vfs = cx.vfs()?;
@@ -5684,7 +5686,8 @@ fn cgroup_mkdir(cx: &mut Cx<'_>, dirfd: i32, path: &[u8]) -> Option<Result<(), E
         }
         let cred = cx.cred();
         cred.permission(&st, MAY_WRITE | MAY_EXEC)?;
-        cx.k().cgroups.mkdir(id, name, &cred).map(|_| ())
+        let mode = perm & 0o1777 & !cx.umask();
+        cx.k().cgroups.mkdir(id, name, &cred, mode).map(|_| ())
     })())
 }
 

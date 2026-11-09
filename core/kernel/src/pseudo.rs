@@ -1526,6 +1526,11 @@ impl Pseudo for View<'_> {
         self.k.protected_symlinks
     }
 
+    /// A cgroup directory is searched by its mode, as kernfs checks it (mkdir gives it one).
+    fn searched(&self, node: &PseudoNode) -> Option<Stat> {
+        matches!(node, PseudoNode::Cgroup(_, b"")).then(|| stat(self, node).ok())?
+    }
+
     fn follow(&self, mnt: MountId, node: &PseudoNode) -> Option<Result<Node, Errno>> {
         match node {
             PseudoNode::Ns(pid, tid, k) => {
@@ -1772,6 +1777,10 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
     let kind = ps.kind(node)?;
     let sysfs = matches!(fs_of(node), Fs::Sys | Fs::Cgroup);
     let perm = match (kind, node) {
+        // A cgroup directory has the mode mkdir gave it
+        (mode::S_IFDIR, PseudoNode::Cgroup(id, b"")) => {
+            ps.k.cgroups.get(*id).ok_or(Errno::ENOENT)?.mode
+        }
         (mode::S_IFDIR, _) if sysfs => 0o755,
         (_, PseudoNode::Cgroup(_, name)) if !name.is_empty() => {
             crate::cgroup::file_mode(name).unwrap_or(0o444)

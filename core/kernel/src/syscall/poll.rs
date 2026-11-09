@@ -1073,10 +1073,14 @@ fn gate_enter(cx: &mut Cx<'_>, files: &[FileRef], event: &Arc<appine_hal::Event>
 
 /// The timer thread watches files for `EPOLLEXCLUSIVE` waiters ([`ExGate`]): every change wakes
 /// the timer thread (it registers on all channels while there are exclusive gates), newly arrived
-/// data on host sockets is seen through their [`HostEdges`], and these host fds are returned for
-/// the timer thread to wait on as well. Gates with no waiters or whose file is closed are removed.
-pub(crate) fn check_exclusive(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i16)> {
+/// data on host sockets is seen through their [`HostEdges`], and a timerfd expires at its
+/// deadline; these host fds and the earliest such deadline are returned for the timer thread to
+/// wait on as well. Gates with no waiters or whose file is closed are removed.
+pub(crate) fn check_exclusive(
+    k: &mut crate::kernel::Kernel,
+) -> (Vec<(i32, i16, i16)>, Option<Instant>) {
     let mut host = Vec::new();
+    let mut due: Option<Instant> = None;
     k.ex_gates.retain_mut(|g| {
         let Some(file) = g.file.upgrade().filter(|_| !g.sleepers.is_empty()) else {
             return false;
@@ -1088,9 +1092,15 @@ pub(crate) fn check_exclusive(k: &mut crate::kernel::Kernel) -> Vec<(i32, i16, i
         if let Some(e) = &f.host_edges {
             host.push((e.fd(), POLLIN, 0));
         }
+        // Brought up to date by the edge check: the next expiry, if armed
+        if let FileKind::TimerFd(t) = &f.kind
+            && let Some(d) = t.borrow().deadline.map(crate::itimer::Expiry::instant)
+        {
+            due = Some(due.map_or(d, |e| e.min(d)));
+        }
         true
     });
-    host
+    (host, due)
 }
 
 /// After waiting: removes `event` from the exclusive gates of `files` (a woken one has already

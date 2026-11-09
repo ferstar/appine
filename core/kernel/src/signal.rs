@@ -402,8 +402,9 @@ impl SigInfo {
 }
 
 /// Pending signals (Linux's `struct sigpending`). A standard signal is pending at most once per
-/// kind, and later instances merge into it; every instance of a real-time signal is queued and
-/// delivered in the order generated, each with its own siginfo.
+/// kind, and later instances are dropped, so it keeps the first one's siginfo (`legacy_queue`);
+/// every instance of a real-time signal is queued and delivered in the order generated, each with
+/// its own siginfo.
 #[derive(Default)]
 pub(crate) struct Pending {
     set: u64,
@@ -422,11 +423,14 @@ impl Pending {
     /// (`RLIMIT_SIGPENDING` exceeded): as on Linux, the signal is still made pending and the
     /// siginfo is dropped.
     pub fn add(&mut self, sig: Signal, info: SigInfo, room: bool) {
-        if sig.is_realtime() || self.set & sig.bit() == 0 {
+        let new = self.set & sig.bit() == 0;
+        if sig.is_realtime() || new {
             self.arrivals += 1;
         }
         if !sig.is_realtime() {
-            self.info[sig.index()] = info;
+            if new {
+                self.info[sig.index()] = info;
+            }
         } else if room {
             self.queue.push_back((sig, info));
         }
@@ -1760,7 +1764,8 @@ mod tests {
         // Cannot be queued: the signal is still made pending and the siginfo dropped
         p.add(rt, value(5), false);
         assert_eq!(p.queued(), 2);
-        assert_eq!(p.take(Signal::USR1), value(4));
+        // A standard signal already pending keeps its first siginfo
+        assert_eq!(p.take(Signal::USR1), value(2));
         assert_eq!(p.set(), rt.bit());
         assert_eq!(p.take(rt), value(1));
         assert_eq!(p.set(), rt.bit());

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe; cgroup directory modes last)
 
 ## Responsibilities
 
@@ -82,7 +82,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - Inode numbers hash the node (low bit set); roots are 1; nodes under a pid mix in the thread
   group's serial, so a reused pid gets new inodes; nsfs files use the namespace id. Inodes are
   stable within one run, not across runs.
-- Modes: directories 0555 (0755 on sysfs and cgroup), `fd/<n>` links by the open mode as
+- Modes: directories 0555 (0755 on sysfs, a cgroup's from its mkdir), `fd/<n>` links by the open mode as
   `proc_fd_instantiate` (0500 readable, 0300 writable, 0700 both, 0 for `O_PATH`), other symlinks
   0777, `mem` 0600, recorded sysctls Linux's (`vm.drop_caches` 0200, `vm.mmap_rnd_bits` 0600),
   other writable files 0644, `pagemap`, `auxv` and kmsg 0400, everything else 0444 (so `fd/`,
@@ -321,7 +321,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   write and search on the parent; newline in the name `EINVAL`; ancestors' `cgroup.max.depth` /
   `max.descendants` `EAGAIN`; the new cgroup and its files belong to the creator's fsuid/fsgid,
   which is the only way to own one (path chown/chmod `EACCES`, or `EROFS` on ro mounts; fd-based
-  `EBADF`). The root is 0:0 0755, so only privileged processes create top-level cgroups.
+  `EBADF`), and the directory has the mode mkdir gave (umask applied, `S_IRWXUGO|S_ISVTX`), which
+  path lookups through it, chdir and chroot check for search, as kernfs does. The root is 0:0
+  0755, so only privileged processes create top-level cgroups.
   rmdir: write and search on the parent; children or live processes `EBUSY`; the root `EBUSY`.
 - Membership: every process starts in the root; fork places the child in the parent's cgroup or a
   `clone3(CLONE_INTO_CGROUP)` target after `pids_charge` (`EAGAIN`) and starts it frozen if the
@@ -430,8 +432,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `/sys/class/net` follows the reader rather than the mounter's network namespace; procfs mount
   options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
   standard files are absent; `kernel/pid_max` writes are ignored; `status` has no
-  `Cpus_allowed` mask line; cgroup directories are always 0755, ignoring the mkdir mode, so a
-  private 0700 cgroup is searchable by everyone.
+  `Cpus_allowed` mask line.
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.

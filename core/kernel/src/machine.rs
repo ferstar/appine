@@ -893,7 +893,12 @@ fn timers(shared: Arc<Shared>) {
         // EPOLLEXCLUSIVE exclusive gates: this thread watches the files for the waiting threads,
         // and a new edge wakes only one
         match crate::bug::catch(|| crate::syscall::check_exclusive(&mut k)) {
-            Some(fds) => host.extend(fds),
+            Some((fds, due)) => {
+                host.extend(fds);
+                if let Some(due) = due {
+                    next = Some(next.map_or(due, |n| n.min(due)));
+                }
+            }
             None => {
                 crate::bug::report(format_args!(
                     "kernel panic in EPOLLEXCLUSIVE wakeups; waking every exclusive waiter"

@@ -9,9 +9,6 @@
 SKIP="VdsoProcTest.*"
 # kernel/cred: the vDSO bypass covers every clock; capset does not mask bits above CAP_LAST_CAP
 SKIP="$SKIP:SeccompTest.NonVdsoClockGettimeFiltered:CapsTest.CapsetMasksReservedBits"
-# kernel/signal: coalesced standard signals report the last sender (the forced SIGSYS replaces the
-# pending SI_TKILL one)
-SKIP="$SKIP:SeccompTest.RetTrapBlockedUnmasksAndResetsHandlerAtSendTime"
 # kernel/vfs: security.capability writes check the magic under a mask and accept any v2 or v3
 # size, so malformed values are stored
 SKIP="$SKIP:FileCapTest.MalformedAndRevision1FileCapabilitiesRejected"

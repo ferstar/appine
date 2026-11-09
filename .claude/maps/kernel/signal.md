@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO; debug slots across detach last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending, retargeting; frames, siginfo; ptrace; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS list, unimplemented paths; watchdog records; the host's vDSO; debug slots across detach; coalesced siginfo last)
 
 ## Responsibilities
 
@@ -39,8 +39,8 @@ procfs.
   kills); `SigHandlers` — the 64-entry table, shared under `CLONE_SIGHAND`.
 - `SigInfo` — code, typed fields (kill, child, queue, timer, fault, poll, sys, raw), the synthesized
   ESR for faults, sender and user-namespace data for translation; encodes the 128-byte siginfo.
-- `Pending` — a set plus one siginfo per standard signal (coalesced) and a FIFO queue for real-time
-  signals; per thread and per thread group.
+- `Pending` — a set plus one siginfo per standard signal (the first sender's, sends while pending
+  being dropped) and a FIFO queue for real-time signals; per thread and per thread group.
 - `AltStack` — sp, size, flags; thread-private.
 - Thread state: `pending`, `sigmask`, `saved_sigmask`, `killed`; group state: `pending`,
   `sighand`, `stopped`, `stop_signal`, stop/continue reports, `exiting`.
@@ -92,7 +92,8 @@ procfs.
 - Otherwise: a stop signal discards pending `SIGCONT`; `SIGCONT` discards pending stop signals,
   ends a group stop and reports `CLD_CONTINUED`. An ignored signal that is not blocked and not
   traced is discarded at send time.
-- Standard signals coalesce (one pending instance; a later send replaces the stored siginfo);
+- Standard signals coalesce (one pending instance; a send while it is pending is dropped, so the
+  first siginfo stays, as `legacy_queue` does);
   real-time signals queue in order, limited by `RLIMIT_SIGPENDING` (default 16384), counting only
   queued real-time entries per thread group. When the queue is full, `kill` and kernel-generated
   signals still set the pending bit but lose the siginfo; `tkill`/`tgkill` of a real-time signal,
@@ -420,9 +421,6 @@ procfs.
 - **`CLD_STOPPED` is reported early:** the parent is notified as soon as the first thread starts a
   group stop, while siblings may still be running (Linux notifies once the last thread has
   stopped).
-- **Coalesced standard signals report the last sender:** a second send overwrites the pending
-  siginfo (Linux keeps the first), e.g. `SIGCHLD` from several children reports the last; a unit test
-  pins the current behaviour.
 - **Single-step over some syscalls reports one instruction late:** after `rt_sigreturn`, execve or a
   skipped syscall (number -1), the step is not reported at syscall return.
 - **ptrace reads are not forced:** `PTRACE_PEEK*` and `/proc/<pid>/mem` reads fail on `PROT_NONE`

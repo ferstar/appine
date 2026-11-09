@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse` last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse`; exclusive timerfds last)
 
 ## Responsibilities
 
@@ -140,8 +140,8 @@ signal delivery (`kernel/signal`).
 - `EPOLLEXCLUSIVE`: an edge is the file's drain and arrival counts; each edge is claimed by one
   epoll (level-triggered exclusive interests keep reporting to the claiming epoll). Exclusive
   waiters do not wait on the file: they queue on its `ExGate`, and the timer thread (subscribed to
-  every kernel change while gates exist, and to the host edges) wakes only the first waiter when a
-  new edge appears; woken waiters requeue at the back.
+  every kernel change while gates exist, to the host edges, and woken at the next expiry of a gated
+  timerfd) wakes only the first waiter when a new edge appears; woken waiters requeue at the back.
 
 ### eventfd
 
@@ -193,11 +193,9 @@ signal delivery (`kernel/signal`).
 - **select's fd table size is estimated:** Linux's table never shrinks and a forked child's is
   sized by its parent's open fds, while here it is computed from the highest fd open now, so a set
   bit on a closed fd just above that can be ignored where Linux returns `EBADF`.
-- **`EPOLLEXCLUSIVE` timerfds may never fire:** gated interests skip collecting timerfd deadlines
-  and the timer thread does not watch them, so expiry is noticed only when something unrelated
-  wakes the timer thread or the epoll times out. Gate wakeups also ignore the interest's
-  direction (spurious wakeups, and with mixed masks a matching waiter can miss an edge consumed by
-  another) and rotate waiters instead of keeping Linux's order.
+- **Exclusive gates ignore direction and order:** gate wakeups ignore the interest's direction
+  (spurious wakeups, and with mixed masks a matching waiter can miss an edge consumed by another)
+  and rotate waiters instead of keeping Linux's order.
 - **epoll results lost on `EFAULT`:** events are marked reported (ONESHOT disarmed, exclusive
   claims taken) before the copy-out, so a bad buffer loses them; Linux requeues them and returns a
   partial count.

@@ -458,6 +458,11 @@ pub(crate) trait Pseudo {
     /// Path resolution found no `name` in directory `dir` (ENOENT): the view counts the names
     /// Linux would have as unimplemented paths ([`crate::stub`]).
     fn missing(&self, _dir: &Node, _name: &[u8]) {}
+    /// The attributes search permission on directory `node` is checked against; None for
+    /// directories anyone may search.
+    fn searched(&self, _node: &PseudoNode) -> Option<store::Stat> {
+        None
+    }
 }
 
 /// The `resolve` of openat2's `struct open_how` (Linux's `RESOLVE_*`, matching path
@@ -1120,7 +1125,7 @@ impl Vfs {
             if !self.is_dir(ps, &dir)? {
                 return Err(Errno::ENOTDIR);
             }
-            self.may_search(cred, &dir)?;
+            self.may_search(ps, cred, &dir)?;
             if comp == b"." {
                 continue;
             }
@@ -1224,9 +1229,14 @@ impl Vfs {
     }
 
     /// Whether a process with credentials `cred` can look up in directory `dir`. Directories of
-    /// synthetic filesystems always can.
-    fn may_search(&self, cred: &Cred, dir: &Node) -> Result<(), Errno> {
+    /// synthetic filesystems can unless their view says otherwise ([`Pseudo::searched`]: cgroup
+    /// directories).
+    fn may_search(&self, ps: &dyn Pseudo, cred: &Cred, dir: &Node) -> Result<(), Errno> {
         match dir {
+            Node::Pseudo(_, p) if !cred.searches_all() => match ps.searched(p) {
+                Some(st) => cred.permission(&st, MAY_EXEC),
+                None => Ok(()),
+            },
             Node::Store(_, ino) if !cred.searches_all() => {
                 cred.permission(&self.store.stat(*ino)?, MAY_EXEC)
             }

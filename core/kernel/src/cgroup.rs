@@ -133,6 +133,8 @@ pub(crate) struct Cgroup {
     /// Linux's `cgroup_kn_set_ugid`).
     pub uid: u32,
     pub gid: u32,
+    /// The directory's permission bits, as mkdir gave them (the umask applied); the root's 0755.
+    pub mode: u32,
     /// Values of the interface files written (the limits), in the format Linux shows; files not
     /// written show their defaults.
     pub values: BTreeMap<&'static [u8], String>,
@@ -159,7 +161,7 @@ pub(crate) struct Cgroup {
 }
 
 impl Cgroup {
-    fn new(name: Vec<u8>, parent: Option<u64>, (uid, gid): (u32, u32)) -> Cgroup {
+    fn new(name: Vec<u8>, parent: Option<u64>, (uid, gid): (u32, u32), mode: u32) -> Cgroup {
         Cgroup {
             name,
             parent,
@@ -167,6 +169,7 @@ impl Cgroup {
             subtree_control: 0,
             uid,
             gid,
+            mode,
             values: BTreeMap::new(),
             pids_events: 0,
             mem_events: Events::default(),
@@ -187,7 +190,7 @@ pub(crate) struct Cgroups {
 
 impl Default for Cgroups {
     fn default() -> Cgroups {
-        let root = Cgroup::new(Vec::new(), None, (0, 0));
+        let root = Cgroup::new(Vec::new(), None, (0, 0), 0o755);
         Cgroups {
             map: BTreeMap::from([(ROOT, root)]),
             next: ROOT + 1,
@@ -197,9 +200,16 @@ impl Default for Cgroups {
 
 impl Cgroups {
     /// Creates child cgroup `name` under `parent` (Linux's `cgroup_mkdir`), owned by `cred`'s
-    /// fsuid and fsgid. An existing name is EEXIST; a newline in the name is EINVAL; exceeding an
-    /// ancestor's `cgroup.max.depth` or `cgroup.max.descendants` is EAGAIN.
-    pub fn mkdir(&mut self, parent: u64, name: &[u8], cred: &Cred) -> Result<u64, Errno> {
+    /// fsuid and fsgid, with permission bits `mode` (umask applied). An existing name is EEXIST; a
+    /// newline in the name is EINVAL; exceeding an ancestor's `cgroup.max.depth` or
+    /// `cgroup.max.descendants` is EAGAIN.
+    pub fn mkdir(
+        &mut self,
+        parent: u64,
+        name: &[u8],
+        cred: &Cred,
+        mode: u32,
+    ) -> Result<u64, Errno> {
         let p = self.map.get(&parent).ok_or(Errno::ENOENT)?;
         if p.children.contains_key(name) || self.files(parent).any(|f| f == name) {
             return Err(Errno::EEXIST);
@@ -226,7 +236,7 @@ impl Cgroups {
         self.next += 1;
         self.map.insert(
             id,
-            Cgroup::new(name.to_vec(), Some(parent), (cred.fsuid, cred.fsgid)),
+            Cgroup::new(name.to_vec(), Some(parent), (cred.fsuid, cred.fsgid), mode),
         );
         self.map
             .get_mut(&parent)
@@ -1184,18 +1194,21 @@ mod tests {
     fn tree_and_paths() {
         let mut c = Cgroups::default();
         let cred = Cred::root();
-        let t = c.mkdir(ROOT, b"t", &cred).unwrap();
-        assert_eq!(c.mkdir(ROOT, b"t", &cred), Err(Errno::EEXIST));
-        assert_eq!(c.mkdir(ROOT, b"cgroup.procs", &cred), Err(Errno::EEXIST));
-        assert_eq!(c.mkdir(ROOT, b"a\nb", &cred), Err(Errno::EINVAL));
+        let t = c.mkdir(ROOT, b"t", &cred, 0o755).unwrap();
+        assert_eq!(c.mkdir(ROOT, b"t", &cred, 0o755), Err(Errno::EEXIST));
+        assert_eq!(
+            c.mkdir(ROOT, b"cgroup.procs", &cred, 0o755),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(c.mkdir(ROOT, b"a\nb", &cred, 0o755), Err(Errno::EINVAL));
         // t has no memory enabled, so a child cgroup named memory.max can be created
         assert!(!c.files(t).any(|f| f == b"memory.max"));
-        assert!(c.mkdir(t, b"memory.max", &cred).is_ok());
+        assert!(c.mkdir(t, b"memory.max", &cred, 0o755).is_ok());
         c.map.get_mut(&ROOT).unwrap().subtree_control = 1 << 3;
         assert!(c.files(t).any(|f| f == b"memory.max"));
         assert!(!c.files(t).any(|f| f == b"pids.max"));
-        let a = c.mkdir(t, b"a", &cred).unwrap();
-        let b = c.mkdir(t, b"b", &cred).unwrap();
+        let a = c.mkdir(t, b"a", &cred, 0o755).unwrap();
+        let b = c.mkdir(t, b"b", &cred, 0o755).unwrap();
         assert_eq!(c.path(a, ROOT), "/t/a");
         assert_eq!(c.path(a, a), "/");
         assert_eq!(c.path(b, a), "/../b");
@@ -1209,19 +1222,19 @@ mod tests {
     fn depth_and_descendant_limits() {
         let mut c = Cgroups::default();
         let cred = Cred::root();
-        let t = c.mkdir(ROOT, b"t", &cred).unwrap();
+        let t = c.mkdir(ROOT, b"t", &cred, 0o755).unwrap();
         c.map
             .get_mut(&t)
             .unwrap()
             .values
             .insert(b"cgroup.max.depth", "1".to_owned());
-        let a = c.mkdir(t, b"a", &cred).unwrap();
-        assert_eq!(c.mkdir(a, b"x", &cred), Err(Errno::EAGAIN));
+        let a = c.mkdir(t, b"a", &cred, 0o755).unwrap();
+        assert_eq!(c.mkdir(a, b"x", &cred, 0o755), Err(Errno::EAGAIN));
         let g = c.map.get_mut(&t).unwrap();
         g.values.remove(&b"cgroup.max.depth"[..]);
         g.values.insert(b"cgroup.max.descendants", "2".to_owned());
-        assert!(c.mkdir(a, b"x", &cred).is_ok());
-        assert_eq!(c.mkdir(t, b"b", &cred), Err(Errno::EAGAIN));
+        assert!(c.mkdir(a, b"x", &cred, 0o755).is_ok());
+        assert_eq!(c.mkdir(t, b"b", &cred, 0o755), Err(Errno::EAGAIN));
     }
 
     /// Interface file values are checked and converted in Linux's format.

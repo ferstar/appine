@@ -181,14 +181,24 @@ for suite in starnix gvisor; do
     fi
 done
 
+# The store's top-level directories that go into the image (docker provides /dev, /proc and
+# /sys, and each case makes /root and /tmp again), so both sides start from the same files; the
+# image is labelled with the list and exported again when it changes
+exported="bin etc home lib media mnt opt run sbin srv tmp usr var"
+label=$(echo "$exported" | tr ' ' ,)
+if [ "$(docker image inspect --format '{{index .Config.Labels "appine.export"}}' "$image" \
+    2>/dev/null)" != "$label" ]; then
+    rebuild=1
+fi
 if [ "$rebuild" = 1 ] || ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "exporting the root filesystem of $store"
-    # /tmp needs only the directory itself: what earlier runs left in the store's /tmp (possibly
-    # gigabytes) need not go into the image
+    # /tmp and /var/tmp need only the directories themselves: what earlier runs left there
+    # (possibly gigabytes) need not go into the image
     old=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)
-    appine --tier 1 --rootfs "$store" -- /bin/tar -c -f - -C / --exclude='tmp/*' \
-        bin etc lib sbin usr tmp 2>/dev/null |
-        docker import --platform linux/arm64 - "$image" >/dev/null
+    appine --tier 1 --rootfs "$store" -- /bin/sh -c "cd / && exec tar -c -f - \
+        --exclude='tmp/*' --exclude='var/tmp/*' \$(ls -d $exported 2>/dev/null)" 2>/dev/null |
+        docker import --platform linux/arm64 --change "LABEL appine.export=$label" - \
+            "$image" >/dev/null
     # The replaced image is left untagged and would keep its gigabytes in the VM until the disk
     # fills; a container still using it keeps it (rmi refuses)
     if [ -n "$old" ] && [ "$old" != "$(docker image inspect --format '{{.Id}}' "$image")" ]; then
@@ -245,10 +255,10 @@ run_group() {
         dir=/tmp/difftest-files/$files
         unpack="rm -rf $dir && mkdir -p $dir && echo $blob | base64 -d | tar -xzof - -C $dir && "
     fi
-    # Both sides start from an empty $HOME: the native image has no /root at all, and the Appine
-    # store kept what earlier runs left there (Go's and uv's caches under /root/.cache)
-    home="rm -rf /root && mkdir -m 700 /root && "
-    script="exec 2>&1; $home$unpack$(cat "tests/diff/$name.sh")"
+    # Both sides start from an empty $HOME and /tmp: the Appine store kept what earlier runs left
+    # there (Go's and uv's caches under /root/.cache, files cases made in /tmp)
+    fresh="rm -rf /root /tmp && mkdir -m 700 /root && mkdir -m 1777 /tmp && "
+    script="exec 2>&1; $fresh$unpack$(cat "tests/diff/$name.sh")"
     # The whole script is handed over as one argument of sh -c, and Linux does not allow a single
     # argument over 128 KB (MAX_ARG_STRLEN): beyond that neither side can execute it (E2BIG), the
     # outputs match, and it would count as passed

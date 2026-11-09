@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs; ACL attributes last)
 
 ## Responsibilities
 
@@ -155,8 +155,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `walk_resolve` runs `walk_in` inside one store read snapshot. Empty components are dropped; a
   trailing `/` appends `.`, forcing a directory and following a trailing symlink.
 - Per component: name over 255 bytes is `ENAMETOOLONG`; the current node must be a directory
-  (`ENOTDIR`); search permission (store directories and the store directory behind an overlay
-  one; skipped when the credentials have
+  (`ENOTDIR`); search permission (store directories, the store directory behind an overlay
+  one, and what a synthetic filesystem's view asks, `Pseudo::searched`: cgroup directories;
+  skipped when the credentials have
   `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE`); `.` is skipped; `..` follows Linux's
   `follow_dotdot` (stays at the process root, climbs stacked mount points at a mount root, takes
   the parent, enters anything mounted there; a namespace-tree root or detached root stays put);
@@ -625,18 +626,29 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   directory takes `SEEK_SET` and `SEEK_CUR` everywhere; `SEEK_END`, `SEEK_DATA` and `SEEK_HOLE`
   count from the end as the filesystem's `llseek` does: store directories end at the largest
   position (ext4's hashed directories), procfs, sysfs and cgroup2 ones at 0, and tmpfs, devpts and
-  mqueue directories refuse them (`EINVAL`). chdir/fchdir/chroot check search only on store
-  directories. umask lives in the fs context.
+  mqueue directories refuse them (`EINVAL`). chdir/fchdir/chroot check search on store and
+  overlay directories and on cgroup directories. umask lives in the fs context.
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
   `protected_fifos` do not.
 
 ### Extended attributes
 
 - Names need a `security.`, `system.`, `trusted.` or `user.` prefix (`EOPNOTSUPP` otherwise); bad
-  name lengths `ERANGE`; values over 64 KiB `E2BIG`. `system.*` (including POSIX ACL names) is
-  stored raw with no ACL semantics and no permission check of its own, so anyone who can resolve
-  a file can set or remove them; unprivileged `trusted.*` reads `ENODATA`, writes `EPERM` and is
-  hidden from listings.
+  name lengths `ERANGE`; values over 64 KiB `E2BIG`. Unprivileged `trusted.*` reads `ENODATA`,
+  writes `EPERM` and is hidden from listings.
+- `system.*` holds only the POSIX ACL attributes, `system.posix_acl_access` and
+  `system.posix_acl_default` (6.1's ext4 and tmpfs handlers; any other name `EOPNOTSUPP`).
+  Setting or removing one follows `posix_acl_xattr_set` and `set_posix_acl`: `EROFS`, then a
+  malformed value `EINVAL` (a short header, a length not header plus 8-byte entries, an unknown
+  tag, a named user or group unmapped in the caller's namespace) or `EOPNOTSUPP` (a version other
+  than 2), a symlink `EOPNOTSUPP`, a default ACL on anything but a directory `EACCES` (removing it
+  succeeds), not the owner nor capable over it (`CAP_FOWNER`) `EPERM`, and an ACL out of
+  `posix_acl_valid`'s order or with bits beyond rwx `EINVAL`; an empty ACL and removing a missing
+  one succeed, and `XATTR_CREATE`/`XATTR_REPLACE` are ignored. An access ACL of only the owner,
+  group and other entries is a chmod (set-group-ID dropped as `posix_acl_update_mode` drops it)
+  and is not stored; any other is stored with named users and groups as kernel IDs and read back
+  in the reader's user namespace (an unmapped one as -1, other entries' IDs undefined). Reads
+  need nothing, and symlinks have none (`EOPNOTSUPP`).
 - `security.capability` (6.1's `cap_convert_nscap`, `cap_inode_getsecurity`): writes accept
   v2/v3 (the magic is checked under a mask, so stray flag bits pass) and need `CAP_SETFCAP` over
   the file (in the writer's namespace, owner and group mapped there; removal too); a v2 written
@@ -910,7 +922,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   the same mount; the process root itself is never lifted (as in Linux, a mount on `/` is not seen
   by absolute lookups).
-- Synthetic directories are always searchable; procfs gates per-process data in readlink/follow.
+- Synthetic directories are searchable by everyone except cgroup directories (their mkdir mode);
+  procfs gates per-process data in readlink/follow.
 - An overlay node's store inodes may be in lower layers that must never change, so `Node::ino` is
   None for it and nothing may turn an overlay file's store inode back into a `Node::Store`: an
   open file reaches its node through `OpenFile::ovl` (`OpenFile::node`, `/proc/<pid>/fd`), and
@@ -967,9 +980,11 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
   exec, as 6.1 does, while chown follows 6.2 and also clears it when the caller is outside the
   file's group without `CAP_FSETID`; since 6.2 Linux's writes do the same as its chown.
-- **`system.*` xattrs are unprotected:** any user who can resolve a file can set or remove its
-  `system.*` attributes, including POSIX ACL names, which are stored raw and never enforced (Linux
-  requires the owner or `CAP_FOWNER` and validates ACLs).
+- **POSIX ACLs are not enforced:** an ACL with named users, groups or a mask is stored but never
+  consulted by permission checks, and the mode does not take the mask as its group bits (Linux
+  sets them; here that would widen the owning group's access without the ACL's limits), so named
+  entries grant nothing, chmod leaves a stored ACL as it is, and new files never inherit a
+  directory's default ACL.
 - **File position races:** lseek and `O_APPEND` writes change the position without the
   `pos_busy` lock, so a concurrent unlocked read or write on the same open file can overwrite the
   new position (Linux takes `f_pos_lock` in lseek too).
@@ -1091,8 +1106,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 - Is losing renames in `/proc/<pid>/fd/N` (path frozen at open) acceptable, given Linux computes
   `d_path` at readlink?
-- Is skipping search permission on synthetic directories intended (only `/proc/<pid>/fd` and
-  `fdinfo` gate access, by the ptrace-read check)?
+- Is skipping search permission on synthetic directories other than cgroup ones intended (only
+  `/proc/<pid>/fd` and `fdinfo` gate access, by the ptrace-read check)?
 - Should `protected_regular`, `protected_fifos` and `O_TMPFILE` be implemented?
 
 ## To verify

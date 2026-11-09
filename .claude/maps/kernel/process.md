@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds last)
 
 ## Responsibilities
 
@@ -407,7 +407,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   timers and CPU-time limits; run the OOM check, the translator code-view release, load-average sampling, deferred
   store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks, AIO polls that signal eventfds
   (`kernel/vfs`), DNS stub answers (`kernel/net`) and raw ICMP taps; then wait (BKL released) until
-  the earliest deadline (timerfds of those AIO polls included) or its event. It listens on `OTHER`
+  the earliest deadline (timerfds of those AIO polls and of exclusive gates included) or its
+  event. It listens on `OTHER`
   (or all channels while `O_ASYNC` files, exclusive gates or such AIO polls exist).
 - Setting a timer writes the deadline into the thread group and signals the timer thread's event.
   POSIX timers on wall clocks keep an `Expiry`, so absolute realtime and boottime timers fire by

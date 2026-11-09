@@ -6,11 +6,13 @@
 //! filesystem, such as pipes and sockets, do not support them. Permissions are checked as in
 //! Linux's `xattr_permission` and commoncap's hooks ([`permission`]); program file capabilities,
 //! `security.capability`, are format-checked on write and converted on read by
-//! [`FileCaps::xattr_for_reader`].
+//! [`FileCaps::xattr_for_reader`]. Of `system.*` only the POSIX ACL attributes exist, as on ext4
+//! and tmpfs ([`change_acl`]): checked, kept with kernel IDs and shown in the reader's user
+//! namespace, but not enforced.
 
 use super::fs::{AT_FDCWD, attrib_at, attrib_fd, lookup_at};
 use super::{SysResult, inotify, read_path};
-use crate::cred::{FileCaps, MAY_READ, MAY_WRITE, XATTR_NAME_CAPS, cap};
+use crate::cred::{Cred, FileCaps, MAY_READ, MAY_WRITE, XATTR_NAME_CAPS, cap};
 use crate::errno::Errno;
 use crate::fd::oflags;
 use crate::kernel::Cx;
@@ -26,6 +28,10 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 /// Names must carry one of these namespace prefixes.
 const NAMESPACES: [&[u8]; 4] = [b"security.", b"system.", b"trusted.", b"user."];
+/// The only `system.*` attributes (6.1's `posix_acl_access_xattr_handler` and
+/// `posix_acl_default_xattr_handler`, the ones ext4 and tmpfs have).
+const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+const ACL_DEFAULT: &[u8] = b"system.posix_acl_default";
 
 /// The object operated on.
 #[derive(Clone, Copy)]
@@ -55,6 +61,9 @@ pub(super) fn setxattr(
     let node = node_of(cx, target)?;
     if let Node::Fuse(_, f) = node {
         return fuse_change(cx, &node, f, &name, Some((&v, flags)));
+    }
+    if name.starts_with(b"system.") {
+        return change_acl(cx, target, node, &name, Some(&v));
     }
     let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
@@ -105,10 +114,30 @@ pub(super) fn getxattr(
     }
     let ino = readable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
-    permission(cx, &vfs.store().attrs(ino)?, &name, false)?;
+    let st = vfs.store().attrs(ino)?;
+    // Only the ACL attributes exist under system.*, and symlinks have none (posix_acl_xattr_get)
+    if name.starts_with(b"system.") && (!is_acl(&name) || st.kind() == mode::S_IFLNK) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    permission(cx, &st, &name, false)?;
     let mut v = vfs.store().get_xattr(ino, &name)?;
     if name == XATTR_NAME_CAPS {
         v = FileCaps::xattr_for_reader(&v, &cx.cred())?;
+    }
+    // ACL entries are kept with kernel IDs and shown in the reader's namespace
+    // (posix_acl_fix_xattr_to_user: an unmapped one as -1)
+    if is_acl(&name)
+        && let Ok(mut entries) = acl_entries(&v)
+    {
+        let cred = cx.cred();
+        for e in &mut entries {
+            e.2 = match e.0 {
+                ACL_USER => cred.user_ns.uid_map.borrow().up(e.2).unwrap_or(u32::MAX),
+                ACL_GROUP => cred.user_ns.gid_map.borrow().up(e.2).unwrap_or(u32::MAX),
+                _ => e.2,
+            };
+        }
+        v = acl_encode(&entries);
     }
     reply(cx, value, size, &v)
 }
@@ -155,6 +184,9 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     if let Node::Fuse(_, f) = node {
         return fuse_change(cx, &node, f, &name, None);
     }
+    if name.starts_with(b"system.") {
+        return change_acl(cx, target, node, &name, None);
+    }
     let ino = writable_ino(cx, node, &name)?;
     let vfs = cx.vfs()?;
     permission(cx, &vfs.store().attrs(ino)?, &name, true)?;
@@ -169,6 +201,201 @@ pub(super) fn removexattr(cx: &mut Cx<'_>, target: Target, name: u64) -> SysResu
     vfs.store().remove_xattr(ino, &name)?;
     attrib(cx, target, ino);
     Ok(0)
+}
+
+/// setxattr (`value` Some) or removexattr of a `system.*` attribute on a store or overlay node, as
+/// 6.1's `posix_acl_xattr_set` and `set_posix_acl` do on ext4 and tmpfs: EROFS on a read-only
+/// mount; names other than the two ACL attributes EOPNOTSUPP; a malformed ACL or one naming an ID
+/// unmapped in the caller's namespace EINVAL (`posix_acl_from_xattr`, an empty one counting as a
+/// removal); a symlink EOPNOTSUPP; a default ACL on anything but a directory EACCES (its removal
+/// succeeds); not being the owner or capable over it (`CAP_FOWNER`) EPERM; an invalid ACL
+/// EINVAL (`posix_acl_valid`). An access ACL that only restates the mode changes the mode, as a
+/// chmod would, and is not stored (`posix_acl_update_mode`); any other is stored with kernel IDs
+/// and changes nothing else: ACLs are not enforced, and the mode does not take the mask (that
+/// would widen the owning group's access without the ACL's limits). Removing an ACL that is not
+/// there succeeds, and `XATTR_CREATE` and `XATTR_REPLACE` are ignored, as Linux's ACL handlers
+/// ignore them.
+fn change_acl(
+    cx: &mut Cx<'_>,
+    target: Target,
+    node: Node,
+    name: &[u8],
+    value: Option<&[u8]>,
+) -> SysResult {
+    let vfs = cx.vfs()?;
+    if vfs.readonly(&node) {
+        return Err(Errno::EROFS);
+    }
+    if !is_acl(name) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let cred = cx.cred();
+    let acl = match value {
+        Some(v) => acl_from_user(v, &cred)?,
+        None => None,
+    };
+    let shown = match node {
+        Node::Store(_, ino) => vfs.store().attrs(ino)?,
+        Node::Overlay(_, o) => vfs.store().attrs(vfs.overlay().node(o).real())?,
+        Node::Pseudo(..) | Node::Fuse(..) => return Err(Errno::EOPNOTSUPP),
+    };
+    if shown.kind() == mode::S_IFLNK {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if name == ACL_DEFAULT && shown.kind() != mode::S_IFDIR {
+        return if acl.is_some() {
+            Err(Errno::EACCES)
+        } else {
+            Ok(0)
+        };
+    }
+    if !cred.owns(&shown) {
+        return Err(Errno::EPERM);
+    }
+    if let Some(e) = &acl {
+        acl_valid(e)?;
+    }
+    let ino = writable_ino(cx, node, name)?;
+    let store = vfs.store();
+    match acl {
+        // Only the owner, group and other entries: the mode says it all (posix_acl_equiv_mode);
+        // the set-group-ID bit goes as posix_acl_update_mode drops it
+        Some(e)
+            if name == ACL_ACCESS
+                && e.iter()
+                    .all(|x| matches!(x.0, ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_OTHER)) =>
+        {
+            let st = store.attrs(ino)?;
+            let perm = |tag| u32::from(e.iter().find(|x| x.0 == tag).map_or(0, |x| x.1));
+            let mut m = st.mode & 0o7000
+                | perm(ACL_USER_OBJ) << 6
+                | perm(ACL_GROUP_OBJ) << 3
+                | perm(ACL_OTHER);
+            if !cred.in_group(st.gid) && !cred.capable_wrt(&st, cap::FSETID) {
+                m &= !mode::S_ISGID;
+            }
+            store.set_mode(ino, m)?;
+            match store.remove_xattr(ino, name) {
+                Ok(()) | Err(Errno::ENODATA) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Some(e) => store.set_xattr(ino, name, &acl_encode(&e), false, false)?,
+        None => match store.remove_xattr(ino, name) {
+            Ok(()) | Err(Errno::ENODATA) => {}
+            Err(e) => return Err(e),
+        },
+    }
+    attrib(cx, target, ino);
+    Ok(0)
+}
+
+/// Whether `name` is one of the POSIX ACL attributes.
+fn is_acl(name: &[u8]) -> bool {
+    name == ACL_ACCESS || name == ACL_DEFAULT
+}
+
+// The tags of ACL entries (Linux's `ACL_USER_OBJ` and the rest)
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+/// The ID of entries that name none.
+const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+/// One ACL entry: tag, permissions and ID.
+type AclEntry = (u16, u16, u32);
+
+/// An ACL attribute's entries as (tag, permissions, ID), read as `posix_acl_from_xattr` reads
+/// them: a header (EINVAL when too short) of version 2 (EOPNOTSUPP otherwise), then 8-byte
+/// entries with known tags (EINVAL otherwise).
+fn acl_entries(v: &[u8]) -> Result<Vec<AclEntry>, Errno> {
+    if v.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    if v[..4] != 2u32.to_le_bytes() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if !(v.len() - 4).is_multiple_of(8) {
+        return Err(Errno::EINVAL);
+    }
+    v[4..]
+        .chunks_exact(8)
+        .map(|c| {
+            let tag = u16::from_le_bytes([c[0], c[1]]);
+            let perm = u16::from_le_bytes([c[2], c[3]]);
+            let id = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            match tag {
+                ACL_USER | ACL_GROUP => Ok((tag, perm, id)),
+                ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {
+                    Ok((tag, perm, ACL_UNDEFINED_ID))
+                }
+                _ => Err(Errno::EINVAL),
+            }
+        })
+        .collect()
+}
+
+/// An ACL as the caller wrote it, its named users and groups taken from the caller's user
+/// namespace to kernel IDs (posix_acl_fix_xattr_from_user; an unmapped one EINVAL); None for an
+/// ACL without entries, which removes it.
+fn acl_from_user(v: &[u8], cred: &Cred) -> Result<Option<Vec<AclEntry>>, Errno> {
+    let mut entries = acl_entries(v)?;
+    for e in &mut entries {
+        e.2 = match e.0 {
+            ACL_USER => cred.uid_in(e.2).ok_or(Errno::EINVAL)?,
+            ACL_GROUP => cred.gid_in(e.2).ok_or(Errno::EINVAL)?,
+            _ => e.2,
+        };
+    }
+    Ok((!entries.is_empty()).then_some(entries))
+}
+
+/// 6.1's `posix_acl_valid`: permissions within rwx, and the entries in the order owner, named
+/// users, owning group, named groups, mask, other, each of the owner, owning group and other once,
+/// and a mask when there are named entries.
+fn acl_valid(entries: &[AclEntry]) -> Result<(), Errno> {
+    let mut state = ACL_USER_OBJ;
+    let mut needs_mask = false;
+    for &(tag, perm, _) in entries {
+        if perm & !7 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        state = match (tag, state) {
+            (ACL_USER_OBJ, ACL_USER_OBJ) => ACL_USER,
+            (ACL_USER, ACL_USER) => {
+                needs_mask = true;
+                ACL_USER
+            }
+            (ACL_GROUP_OBJ, ACL_USER) => ACL_GROUP,
+            (ACL_GROUP, ACL_GROUP) => {
+                needs_mask = true;
+                ACL_GROUP
+            }
+            (ACL_MASK, ACL_GROUP) => ACL_OTHER,
+            (ACL_OTHER, ACL_OTHER) => 0,
+            (ACL_OTHER, ACL_GROUP) if !needs_mask => 0,
+            _ => return Err(Errno::EINVAL),
+        };
+    }
+    if state == 0 {
+        Ok(())
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// The attribute form of ACL entries (`posix_acl_to_xattr`).
+fn acl_encode(entries: &[AclEntry]) -> Vec<u8> {
+    let mut v = 2u32.to_le_bytes().to_vec();
+    for &(tag, perm, id) in entries {
+        v.extend_from_slice(&tag.to_le_bytes());
+        v.extend_from_slice(&perm.to_le_bytes());
+        v.extend_from_slice(&id.to_le_bytes());
+    }
+    v
 }
 
 /// setxattr (`value` Some) or removexattr on FUSE node `id`: EROFS on a read-only mount, the
@@ -279,7 +506,9 @@ fn readable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
 ///   ENODATA); on a sticky directory only the owner may write; reads and writes need read and
 ///   write permission, respectively, on the file itself;
 /// - `security.*` writes need `CAP_SYS_ADMIN` (the caller checks `CAP_SETFCAP` for
-///   `security.capability`), reads are unrestricted; `system.*` is unrestricted.
+///   `security.capability`), reads are unrestricted;
+/// - `system.*` (the ACLs) needs the owner or `CAP_FOWNER` to write ([`change_acl`] checks it
+///   first), reads are unrestricted.
 fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Errno> {
     let cred = cx.cred();
     let hidden = if write { Errno::EPERM } else { Errno::ENODATA };
@@ -305,6 +534,9 @@ fn permission(cx: &Cx<'_>, st: &Stat, name: &[u8], write: bool) -> Result<(), Er
         && name != XATTR_NAME_CAPS
         && !cred.capable(cap::SYS_ADMIN)
     {
+        return Err(Errno::EPERM);
+    }
+    if write && name.starts_with(b"system.") && !cred.owns(st) {
         return Err(Errno::EPERM);
     }
     Ok(())
