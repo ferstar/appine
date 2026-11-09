@@ -113,6 +113,10 @@ jobs:
       - name: Build gVisor's syscall tests
         run: scripts/build-gvisor-tests
 
+      # scripts/difftest does not build: it runs target/release/appine-run, which no other step builds
+      - name: Build appine-run
+        run: cargo build --release -p appine-run
+
       # M7's exit criterion: the same scripts give the same output on Appine (Tier 1) and on native
       # Alpine in docker. The first run installs the packages the test cases need with apk, which
       # depends on the internet. Appine turns the guest's raw ICMP sockets into host ping sockets:

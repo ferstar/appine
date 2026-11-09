@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest cases and lock; suite tarballs; Starnix and gVisor cases; image export; CI split; stop signals; survey; overlay cases; watchdog knob; FUSE cases and packages last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: rust-analyzer; LTP devices; difftest lock, cases and export; Starnix and gVisor suites; stop signals; survey; overlay and FUSE cases; watchdog knob; CI and its appine-run build last)
 
 ## Responsibilities
 
@@ -127,6 +127,9 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   and removes it on exit; its lanes run under it.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined); elsewhere through `scripts/dev`.
+  The binary is a prebuilt one, which difftest never builds: on aarch64 Linux `APPINE_RUN`, else
+  `target/linux-arm64/release/appine-run`, else `target/release/appine-run`; elsewhere always
+  `target/linux-arm64/release/appine-run`.
 - A store (`target/difftest/store`) is imported once and gets about 23 packages (fuse3,
   fuse-overlayfs, sshfs, openssh-sftp-server and rclone among them, for the `fuse` and
   `fuse-tools` cases, whose native side needs `--device /dev/fuse`); a tool check aborts if any is
@@ -258,10 +261,11 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
   hours, on pushes to master and on demand: the network test, a long lockstep run,
   `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
   `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by
-  the hash of the script, `tests/gvisor` and its program list), `scripts/difftest` at Tier 1 with
-  one lane, and the engine tests built with clang. Not in CI: LTP, the survey, instrumentation
-  tests (no KVM), Tier 0 difftest, parallel lanes, the performance probe (`appine-bench`; its
-  output check runs in `bench_programs` with small round counts).
+  the hash of the script, `tests/gvisor` and its program list), a release build of `appine-run`,
+  `scripts/difftest` at Tier 1 with one lane, and the engine tests built with clang. Not in CI:
+  LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes, the
+  performance probe (`appine-bench`; its output check runs in `bench_programs` with small round
+  counts).
 
 ## Dependencies (inbound / outbound)
 
@@ -311,6 +315,10 @@ downloads (`android/setup`). Design doc §13.3 keeps the overview of the five te
 - GitHub runs scheduled workflows only from the default branch (master): the nightly
   `full.yml` exists once master has it, and uses master's copy of the workflow while checking out
   develop.
+- `full.yml` must build release `appine-run` itself before the differential tests: no other step
+  there makes it (cargo test builds debug, lockstep builds only `appine-lockstep`), and without it
+  the run stops at its first `appine-run` call with docker's `stat …/target/release/appine-run: no
+  such file`.
 - busybox's `timeout` sends only `SIGTERM`: a test that ignores it, or a child that keeps the
   output pipe open, makes `$(timeout …)` wait forever on either side. `timeout -s KILL` with the
   output written to a file avoids both. Output that goes through `grep` inside the guest is
