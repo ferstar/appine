@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs last)
 
 ## Responsibilities
 
@@ -78,7 +78,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - `loader::Executable`, `ExeCache` (32 opened executables), `Args`, `Prepared` (the hand-off
   between the locked and unlocked exec phases), `Image`; `process::ExeFile` (the process's
-  `exe_file`).
+  `exe_file`: path, store mount and inode, dentry, host file, and for a program found through an
+  overlay its overlay node, held while recorded).
 - `itimer::ITimer`, `CpuTimer`, `PosixTimer`; `itimer::Expiry` — a wall-clock deadline on Linux's
   hrtimer base: `Mono(Instant)` (monotonic, and relative realtime) or `On(host clock, time)`
   (absolute realtime and TAI, boottime), compared with that clock whenever looked at; the global

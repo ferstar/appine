@@ -76,8 +76,9 @@ pub(crate) struct Overlays {
 static HELD: Mutex<BTreeMap<OvlId, usize>> = Mutex::new(BTreeMap::new());
 
 /// An open file's claim on an overlay node (the node it was opened through, the directory it was
-/// opened in): while one exists, [`Overlays::sweep`] keeps the node, wherever the open file is
-/// (fd tables, `SCM_RIGHTS` messages in flight, epoll sets, AIO, loop devices).
+/// opened in), or a running program's (`/proc/<pid>/exe`): while one exists, [`Overlays::sweep`]
+/// keeps the node, wherever the open file is (fd tables, `SCM_RIGHTS` messages in flight, epoll
+/// sets, AIO, loop devices).
 pub(crate) struct Hold(OvlId);
 
 impl Hold {
@@ -458,8 +459,8 @@ impl Overlays {
 
     /// Drops the removed nodes nothing can use any more, with what lies below them; returns how
     /// many nodes went. A node stays while it, or a node below it (whose parent links lead to
-    /// it), is in `keep` (processes' roots, cwds and programs' directories, mounts, inotify
-    /// watches) or held by an open file ([`Hold`]), and while it was removed at or after
+    /// it), is in `keep` (processes' roots and cwds, mounts, inotify watches) or held by an open
+    /// file or a running program ([`Hold`]), and while it was removed at or after
     /// `oldest`, the [`crate::task::SYSCALLS`] number of the earliest system call still running in
     /// another thread that may hold nodes it looked up before the removal.
     pub(crate) fn sweep(&mut self, keep: &HashSet<OvlId>, oldest: u64) -> usize {
@@ -908,6 +909,12 @@ impl Overlays {
     /// The node's parent directory (the root's is itself).
     pub(crate) fn parent(&self, id: OvlId) -> OvlId {
         self.node(id).parent
+    }
+
+    /// The store inode reads of node `id` go to ([`OvlNode::real`]); None once its instance is
+    /// gone.
+    pub(crate) fn real_of(&self, id: OvlId) -> Option<Ino> {
+        self.nodes.get(&id).map(OvlNode::real)
     }
 
     /// Whether node `id` is still where it was looked up (Linux's hashed dentry): its directory

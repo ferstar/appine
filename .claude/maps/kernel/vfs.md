@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 18 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: open and I/O flags; locks; owners, file caps; loop devices; timerfd; suite findings; mounts; splice; holes; overlayfs and its inotify; AIO; FIONREAD; clones; FUSE hooks; collection on last use; propagation types; removed overlay nodes, overlay programs last)
 
 ## Responsibilities
 
@@ -70,7 +70,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   and the lower ones (all merged lower directories for a directory, the topmost for anything else),
   the lower inode it was copied up from (`origin`), and the children already looked up; and the
   nodes whose names were removed (orphans), each with the system call count when it was.
-- `overlay::Hold` — an open file's claim on an overlay node, counted in one process-wide table.
+- `overlay::Hold` — an open file's or a running program's claim on an overlay node, counted in one
+  process-wide table.
 - `Cached` / `Pending` — the lock-free resolver used by fast-path stat (64-component stack).
 - `FdTable` — slots (`FileRef` plus per-fd `cloexec`), the soft `RLIMIT_NOFILE`, `holds_locks`.
 - `OpenFile` (`FileRef = Rc<RefCell<OpenFile>>`) — kind, access mode and status flags, position,
@@ -373,8 +374,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   replacing it) makes it an orphan that no lookup finds again; once 1024 orphans have gathered
   (then twice as many as the last sweep left), the end of a syscall sweeps them
   (`sweep_overlays`): an orphan goes, with every node below it, unless it or a node below it is
-  held by an open file (`Hold`), is a process's root or cwd, the directory a running program was
-  found in, a mount's root or point, or watched by inotify, or it was removed after another
+  held by an open file or a running program (`Hold`), is a process's root or cwd, a mount's root
+  or point, or watched by inotify, or it was removed after another
   thread's system call began, unless that system call waits only on files it holds (reads and
   writes, polls, waits for children and signals, sleeps, futexes, locks, receives, IPC, AIO
   events; `waits_on_files_only`), as `kernel/process` numbers system calls.
@@ -919,7 +920,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `may_create`), for mount flags.
 - Overlay nodes live while their names do, and a removed one while anything may still use it:
   every open file naming an overlay node must hold it (`OpenFile::hold`, or the kind's node at
-  creation), and every other long-lived holder must be in the sweep's scan, or the node goes from
+  creation), as `ExeFile` holds a program's, and every other long-lived holder must be in the
+  sweep's scan, or the node goes from
   under it; a system call that waits while keeping a node it looked up (an open waiting for a FIFO
   peer or a lease break) is kept safe only by staying out of `waits_on_files_only`.
 - An fd's display path is frozen at open; later renames do not change `/proc/<pid>/fd/N`.
@@ -1067,8 +1069,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   removals, renames and attribute changes there too); a hard link made through the overlay and
   then removed leaves the file's watch reporting its deletion with its last name, where Linux's
   overlay keeps the link counted on the file's inode and never does; `/proc/<pid>/exe` of a
-  program from an overlay is followed by its
-  path and never shows ` (deleted)` once the program's name is removed; nodes of names that still
+  program from an overlay whose name was removed can be run again but not opened (`ENOENT`;
+  Linux opens the original file, while here a descriptor of the store inode behind it would
+  change it behind the overlay's back); nodes of names that still
   exist are never freed while mounted, so walking a large tree keeps one per name looked up (Linux
   shrinks its dentry cache under pressure), and removed ones stay while a path-based system call
   that began before their removal still runs in another thread; the

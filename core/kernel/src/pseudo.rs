@@ -1448,9 +1448,11 @@ impl Pseudo for View<'_> {
                 }
                 let exe = g.borrow().exe.clone().ok_or(Errno::ENOENT)?;
                 let path = exe.path.to_vec();
-                Ok(match exe.node {
-                    Some((_, ino)) => mark_deleted(self.vfs.store(), ino, path),
-                    None => path,
+                Ok(match (exe.node, &exe.ovl) {
+                    (Some((_, ino)), _) => mark_deleted(self.vfs.store(), ino, path),
+                    // An overlay program whose name was removed
+                    (None, Some((_, o, _))) if !self.vfs.overlay().linked(*o) => with_deleted(path),
+                    _ => path,
                 })
             }
             Entry(pid, tid, self::Entry::Cwd) => {
@@ -1564,6 +1566,19 @@ impl Pseudo for View<'_> {
                 let Some(exe) = exe.filter(|_| self.task(*pid, *tid).is_some()) else {
                     return Some(Err(Errno::ENOENT));
                 };
+                // A program found through an overlay: its node while its name lasts. Once removed
+                // it can still be run through the recorded host file (OpenExe), but not opened
+                // (reopen_exe): a descriptor of the store inode behind it would change it behind
+                // the overlay's back
+                if let Some((m, o, _)) = &exe.ovl {
+                    return Some(if self.vfs.overlay().linked(*o) {
+                        Ok(Node::Overlay(*m, *o))
+                    } else if exe.host.is_some() {
+                        Ok(Node::Pseudo(mnt, PseudoNode::OpenExe(*pid)))
+                    } else {
+                        Err(Errno::ENOENT)
+                    });
+                }
                 let (m, ino) = exe.node?;
                 let deleted = self.vfs.store().attrs(ino).map_or(true, |st| st.nlink == 0);
                 return Some(Ok(if deleted && exe.host.is_some() {
@@ -3228,9 +3243,18 @@ fn map_line(store: &Store, r: &Region) -> String {
 /// removed while other hard links remain; here it does not. When apt upgrades, dpkg replaces old
 /// libraries with rename, and needrestart finds the processes to restart by the ` (deleted)` in
 /// maps.
-pub(crate) fn mark_deleted(store: &Store, ino: Ino, mut name: Vec<u8>) -> Vec<u8> {
+pub(crate) fn mark_deleted(store: &Store, ino: Ino, name: Vec<u8>) -> Vec<u8> {
+    if store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
+        with_deleted(name)
+    } else {
+        name
+    }
+}
+
+/// `name` with ` (deleted)` appended, unless it already ends with it.
+fn with_deleted(mut name: Vec<u8>) -> Vec<u8> {
     const DELETED: &[u8] = b" (deleted)";
-    if !name.ends_with(DELETED) && store.attrs(ino).is_ok_and(|st| st.nlink == 0) {
+    if !name.ends_with(DELETED) {
         name.extend_from_slice(DELETED);
     }
     name

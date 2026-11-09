@@ -906,6 +906,24 @@ fn exec(
         // The peak resident memory is kept across execve: sample once before replacing the
         // address space (before marking execed)
         g.sample_rss_at_exec(&cx.mm());
+        // A program found through an overlay (by the walk at execution, or the node or open file
+        // it was run through, or as the removed overlay program of the process whose exe it was
+        // run through) is recorded by its overlay node
+        let ovl = {
+            let overlays = vfs.overlay();
+            let ovl_of = |n: &Node| match *n {
+                Node::Overlay(m, o) if overlays.node(o).real() == st.ino => Some((m, o)),
+                _ => None,
+            };
+            walked
+                .as_ref()
+                .and_then(|(n, _)| ovl_of(n))
+                .or_else(|| ovl_of(&node).filter(|_| !script))
+                .or_else(|| {
+                    let (m, o, _) = from.as_deref().filter(|_| !script)?.ovl.as_ref()?;
+                    Some((*m, *o))
+                })
+        };
         g.exe = Some(Rc::new(process::ExeFile::new(
             exe.clone(),
             walked,
@@ -913,6 +931,7 @@ fn exec(
             from.as_deref().filter(|_| !script),
             Some(st.ino),
             &file,
+            ovl,
         )));
         // As with Linux's commit_creds, changing the effective IDs or gaining new capabilities
         // makes the process non-dumpable, and the parent's exit no longer signals it; a

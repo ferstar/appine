@@ -967,6 +967,8 @@ fn reopen_exe(
     flags: u32,
 ) -> Result<FileKind, Errno> {
     let exe = exe_file(cx, pid)?;
+    // A removed overlay program has no store node: it can be run (process::open_exe_file) but not
+    // opened, since a descriptor of the store inode behind it would bypass the overlay
     let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
         return Err(Errno::ENOENT);
     };

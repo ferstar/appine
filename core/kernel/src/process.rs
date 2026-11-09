@@ -18,6 +18,7 @@ use crate::loader::{self, Executable, LoadError};
 use crate::signal::{self, Pending, SigAction, SigHandlers, SigInfo, sa};
 use crate::terminal::Terminal;
 use crate::tty::Tty;
+use crate::vfs::overlay::{Hold, OvlId};
 use crate::vfs::store::{Ino, Stat, mode};
 use crate::vfs::{Dentry, MountId, Node, Pseudo, Vfs};
 
@@ -634,6 +635,10 @@ pub struct ExeFile {
     /// The open host file (the object in the store): after the program file is deleted the object
     /// is deleted too, and reopening or executing relies on it ([`open_exe_file`]).
     pub host: Option<Arc<File>>,
+    /// A program found through an overlay (its `node` is then None, as an overlay file's store
+    /// inode must not be reached directly): the mount and the overlay node, kept while recorded,
+    /// so the link leads to the node and shows ` (deleted)` once its name is removed.
+    pub ovl: Option<(MountId, OvlId, Hold)>,
 }
 
 impl ExeFile {
@@ -642,7 +647,8 @@ impl ExeFile {
     /// that fails (executing a deleted file through an fd), the opened node `opened` is used
     /// (absent when a script was executed: the program is the interpreter). When a deleted program
     /// is executed through another process's exe ([`crate::pseudo::PseudoNode::OpenExe`]), the
-    /// mount and inode are taken over from that process's `from`.
+    /// mount and inode are taken over from that process's `from`. `ovl` is the overlay node the
+    /// program was found as ([`ExeFile::ovl`]).
     pub(crate) fn new(
         path: Rc<[u8]>,
         walked: Option<(Node, Option<Dentry>)>,
@@ -650,6 +656,7 @@ impl ExeFile {
         from: Option<&ExeFile>,
         ino: Option<Ino>,
         file: &Executable,
+        ovl: Option<(MountId, OvlId)>,
     ) -> ExeFile {
         let (node, dentry) = match (walked, opened, from) {
             (Some((Node::Store(mnt, i), found)), ..) if Some(i) == ino => (Some((mnt, i)), found),
@@ -663,19 +670,29 @@ impl ExeFile {
             node,
             dentry,
             host: file.host(),
+            ovl: ovl.map(|(mnt, o)| (mnt, o, Hold::new(o))),
         }
     }
 }
 
 /// A deleted program file ([`crate::pseudo::PseudoNode::OpenExe`], obtained by following
 /// `/proc/<pid>/exe`): opened through the recorded host file, with the same checks as
-/// [`open_node`].
+/// [`open_node`]. A program from an overlay whose name was removed is run the same way, from the
+/// store inode behind its overlay node and with its overlay mount's flags.
 pub(crate) fn open_exe_file(
     vfs: &Vfs,
     cred: &Cred,
     exe: &ExeFile,
 ) -> Result<(Executable, Stat, bool), Errno> {
-    let (Some((mnt, ino)), Some(host)) = (exe.node, &exe.host) else {
+    let (ino, node) = match (exe.node, &exe.ovl) {
+        (Some((mnt, ino)), _) => (ino, Node::Store(mnt, ino)),
+        (None, Some((mnt, o, _))) => {
+            let ino = vfs.overlay().real_of(*o).ok_or(Errno::ENOENT)?;
+            (ino, Node::Overlay(*mnt, *o))
+        }
+        (None, None) => return Err(Errno::ENOENT),
+    };
+    let Some(host) = &exe.host else {
         return Err(Errno::ENOENT);
     };
     let st = vfs.store().stat_open(ino, host)?;
@@ -683,7 +700,7 @@ pub(crate) fn open_exe_file(
         return Err(Errno::EACCES);
     }
     cred.permission(&st, MAY_EXEC)?;
-    let flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
+    let flags = vfs.mount_flags(&node).unwrap_or(0);
     if flags & crate::vfs::ms::NOEXEC != 0 {
         return Err(Errno::EACCES);
     }

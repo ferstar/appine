@@ -2,10 +2,10 @@
 # overlayfs nodes of removed names: after thousands of files were made and removed through an
 # overlay (enough for Appine to drop the nodes behind them), what still uses a removed name works
 # as before: a file open after its unlink, an O_PATH descriptor and a cwd of removed directories,
-# /proc/<pid>/exe of a program whose directory was removed, and an open of a FIFO that waits for
-# a writer while its name is removed and the writer comes through another link. Not compared:
-# the ` (deleted)` Linux adds to that exe link (Appine follows an overlay program by its path,
-# kernel/vfs map)
+# /proc/<pid>/exe of a program whose directory was removed (read, and run again), and of one
+# renamed while it runs (opened), and an open of a FIFO that waits for a writer while its name is
+# removed and the writer comes through another link. Not compared: opening the removed program
+# through exe, which Linux allows and Appine refuses (ENOENT, kernel/vfs map)
 cd /tmp
 umount -R /tmp/ovs 2>/dev/null
 rm -rf ovs
@@ -68,6 +68,11 @@ static void *reader(void *arg)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "again") == 0) {
+        /* Run again through /proc/<pid>/exe */
+        printf("run again: %s\n", argv[0]);
+        return 0;
+    }
     if (argc > 1) {
         /* The program run from a directory removed later: waits for its parent */
         char c;
@@ -107,6 +112,7 @@ int main(int argc, char **argv)
         write(out, buf, n);
     close(in);
     close(out);
+    char path[64];
     pid_t exe_child = fork();
     if (exe_child == 0) {
         dup2(exe_pipe[0], 0);
@@ -114,18 +120,45 @@ int main(int argc, char **argv)
         _exit(127);
     }
     close(exe_pipe[0]);
+    /* One renamed while it runs: its exe still opens the program */
+    link("bin/prog", "bin/ren");
+    int ren_pipe[2];
+    pipe(ren_pipe);
+    pid_t ren_child = fork();
+    if (ren_child == 0) {
+        dup2(ren_pipe[0], 0);
+        execl("bin/ren", "ren", "wait", (char *)NULL);
+        _exit(127);
+    }
+    close(ren_pipe[0]);
     usleep(200000);
+    rename("bin/ren", "bin/ren2");
+    snprintf(path, sizeof path, "/proc/%d/exe", ren_child);
+    int exe_fd = open(path, O_RDONLY);
+    char magic[4] = "";
+    if (exe_fd >= 0)
+        read(exe_fd, magic, 4);
+    printf("renamed program opens: %s\n",
+           exe_fd < 0 ? strerror(errno) : memcmp(magic, "\177ELF", 4) ? "not ELF" : "ELF");
+    close(exe_fd);
+    write(ren_pipe[1], "x", 1);
+    waitpid(ren_child, NULL, 0);
+    unlink("bin/ren2");
     unlink("bin/prog");
     rmdir("bin");
     rmdir("cwd");
     churn(3000);
-    char path[64], target[256] = "";
+    char target[256] = "";
     snprintf(path, sizeof path, "/proc/%d/exe", exe_child);
     n = readlink(path, target, sizeof target - 1);
-    char *deleted = strstr(target, " (deleted)");
-    if (deleted)
-        *deleted = 0;
     printf("exe: %s\n", n < 0 ? strerror(errno) : target);
+    pid_t again = fork();
+    if (again == 0) {
+        execl(path, "prog", "again", (char *)NULL);
+        printf("run again: %s\n", strerror(errno));
+        _exit(1);
+    }
+    waitpid(again, NULL, 0);
     char data[8] = "";
     pread(held, data, 5, 0);
     printf("held: %s, %s", links(held, "", AT_EMPTY_PATH), data);

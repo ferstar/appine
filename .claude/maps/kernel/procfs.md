@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: `/proc/net`, `/proc/<tid>`; `/sys/block`; mm fields; names; suite findings; fd access; cgroups; write opens; block sizes, affinity, bpf; `/proc/sys`; overlay; oom, swaps, locks; FUSE types; `stat` layout; mountinfo tags; overlay programs' exe last)
 
 ## Responsibilities
 
@@ -183,6 +183,11 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   open file (`kernel/vfs`'s `fd_locks`; only for files or fd tables that have taken locks) and
   per-kind lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times,
   signalfd mask, pidfd pids).
+- `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
+  link is gone or, for a program found through an overlay, once that name is removed; following
+  it reaches the program itself even after a rename (an overlay program through its overlay node)
+  and a deleted program through the host file recorded at execve (`OpenExe`), which a removed
+  overlay program only runs from: opening it is `ENOENT`.
 - `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
   thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type as `Vfs::type_of`
   gives it (`fuse.<subtype>` for a FUSE mount with a subtype); mountinfo's optional fields are

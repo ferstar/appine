@@ -316,6 +316,7 @@ impl Machine {
             None,
             mm.exe,
             &file,
+            None,
         )));
         let fds = match stdio {
             Stdio::Host => FdTable::with_host_stdio(),
