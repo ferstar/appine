@@ -696,6 +696,13 @@ fn affinity_target(cx: &Cx<'_>, pid: i32) -> Result<Option<Rc<Task>>, Errno> {
     target(cx, pid)
 }
 
+/// sched_yield when the fast path cannot take it (tracing, a seccomp filter to run;
+/// `syscall::fast`): the host thread yields as there, with the BKL released.
+pub(super) fn sched_yield(cx: &mut Cx<'_>) -> SysResult {
+    cx.unlocked(std::thread::yield_now);
+    Ok(0)
+}
+
 pub(super) fn sched_priority_range(policy: i32, max: bool) -> SysResult {
     match policy {
         SCHED_FIFO | SCHED_RR => Ok(if max { 99 } else { 1 }),

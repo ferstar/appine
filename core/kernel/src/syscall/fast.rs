@@ -25,6 +25,8 @@
 //! neither by a futex wake nor by expiry (most likely a signal arrived), the call goes to the BKL
 //! path to be redone, which handles the signal and the restart.
 //!
+//! sched_yield is here too: it only yields the host thread, which needs no kernel state.
+//!
 //! For a thread with seccomp only two kinds of syscalls come here: numbers for which the filter
 //! always returns ALLOW (cached by number, [`crate::seccomp::always_allowed`]), and the vDSO stubs'
 //! reads of clocks Linux's vDSO reads in user space (which are not checked, as they do not enter
@@ -188,6 +190,7 @@ impl Fast {
                 let clock = a[0] as i32;
                 clock_nanosleep(task, cpu, (clock, self.offset(clock)), a[1] as u32, a[2])
             }
+            124 => Some(sched_yield(task)),
             113 => self.clock_gettime(cpu, a[0] as i32, a[1]),
             114 => clock_getres(cpu, a[0] as i32, a[1]),
             169 => gettimeofday(cpu, a[0], a[1]),
@@ -448,6 +451,17 @@ fn sleep(task: &Task, deadline: Option<Expiry>) -> bool {
         task.event.clear();
     }
     woke
+}
+
+/// sched_yield: the host thread yields its CPU, as Linux's `do_sched_yield` yields the guest
+/// thread's. Spinning threads wait with it (parking_lot's and crossbeam's backoff, Go's osyield,
+/// HotSpot's GC termination); when it took the BKL and only returned, eight threads passing a
+/// turn around with it went 230 times slower than natively, and spinners slowed every other
+/// thread's syscalls. It touches no guest memory, so it does not count as running guest code.
+fn sched_yield(task: &Task) -> SysResult {
+    task.sync.in_guest.store(false, Ordering::SeqCst);
+    std::thread::yield_now();
+    Ok(0)
 }
 
 /// Reads a `struct timespec` from guest memory (`super::read_timespec`). Returns None when it

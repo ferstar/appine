@@ -366,7 +366,7 @@ pub(crate) fn dispatch(cx: &mut Cx<'_>, cpu: &mut Cpu) -> Flow {
             121 => sched::sched_getparam(cx, a[0] as i32, a[1]),
             122 => sched::sched_setaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
             123 => sched::sched_getaffinity(cx, a[0] as i32, a[1] as usize, a[2]),
-            124 => Ok(0), // sched_yield
+            124 => sched::sched_yield(cx),
             125 | 126 => sched::sched_priority_range(a[0] as i32, nr == 125),
             127 => sched::sched_rr_get_interval(cx, a[0] as i32, a[1]),
             NR_RESTART_SYSCALL => misc::restart_syscall(cx),

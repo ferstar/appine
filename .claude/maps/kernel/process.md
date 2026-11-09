@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 23 claims checked by 3 independent verifiers — 17 confirmed, 5 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits, waits; namespaces; rlimits; scheduling, kcmp; futexes, shm; AIO timer; vfork; BKL watchdog; vDSO; ETXTBSY; FUSE retries and sweeps; mount collection; unsafe execve sharing, code bounds; PI futexes; syscall numbering, overlay programs; exclusive timerfds; cgroup2 notifications; per-thread credentials last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: exits and waits; namespaces; rlimits; futexes and PI; execve and loader; BKL watchdog; vDSO; timers; FUSE, mount and overlay hooks; per-thread credentials; sched_yield last)
 
 ## Responsibilities
 
@@ -289,7 +289,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   `Send` and so cannot touch kernel objects. Uses of `unlocked`: host fd I/O, regular-file
   `pread`/`pwrite` (one positional operation per open file at a time, like `f_pos_lock`), fsync,
   `sync_file_range`, msync, copy_file_range/sendfile copies, store metadata syncs, DNS stub queries,
-  and the execve image build. A guard re-takes the BKL on return and on unwinding.
+  the execve image build, and `sched_yield` when the fast path cannot take it. A guard re-takes the
+  BKL on return and on unwinding.
 - Acquisition: try once; otherwise up to half the host CPUs (1 to 4) spin for at most about 30 µs,
   reading only the `held` flag; the rest sleep on the mutex. The new holder sets `held` and records
   itself in `Hold` (relaxed stores on the same cache line, no clock read).
@@ -308,7 +309,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 - Without the BKL, a thread can run `futex` (WAIT, WAKE and the BITSET forms, `FUTEX_CLOCK_REALTIME`
   only with WAIT_BITSET, on a 4-byte-aligned address that translates writable and is not in a
   writable shared file mapping), `nanosleep`, `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME),
-  `clock_gettime` (host clocks or its own CPU clock), `clock_getres`, `gettimeofday`, and
+  `clock_gettime` (host clocks or its own CPU clock), `clock_getres`, `gettimeofday`,
+  `sched_yield` (yields the host thread, not counted as running guest code meanwhile), and
   `newfstatat`/`statx` (when the root and cwd are in the store's metadata cache, no synthetic
   filesystem or other mount is crossed, and the credentials can skip search-permission checks).
 - It is off while strace-tracing, under `PTRACE_SYSCALL`, single-stepping, or with a pending
@@ -493,7 +495,8 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
   root of a container may change its processes'; sched_setscheduler and sched_setattr need the same
   owner or `CAP_SYS_NICE` in the initial namespace (`__sched_setscheduler`), as does raising
   priority beyond `RLIMIT_NICE` (`can_nice`).
-- Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` returns at once.
+- Guest CPUs are the host's allowed CPUs (up to 64); `sched_yield` yields the host thread, on the
+  fast path or, while tracing or with a seccomp filter to run, with the BKL released.
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
 
@@ -637,7 +640,6 @@ network namespaces (`kernel/netns`), cgroups, the OOM policy.
 
 - Is the missing ASLR (fixed program, interpreter and vDSO bases) deliberate?
 - Is it intended that Android always shuts down as poweroff (runlevel 6 entries never run)?
-- Should `sched_yield` yield the host thread?
 
 ## To verify
 
