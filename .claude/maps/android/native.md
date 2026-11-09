@@ -3,23 +3,22 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/native.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 1 research concern; 6 claims checked by 1 independent verifier — 6 confirmed; bugs and debts recorded)
->
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: warnings fail the build; route parsing; tarballs by version; Fuchsia's notice; API level 30; panics caught in every JNI function; exception reports at start; `bklStall` last)
+> Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 
 ## Responsibilities
 
 `android/native` connects the Kotlin app to the Rust kernel and builds the APK:
 
 - the JNI library `libappine.so` (`hosts/android`): a handle table of kernels, one static function
-  per kernel or store operation, error mapping, stderr to logcat;
+  per kernel or store operation, error mapping, panic containment, stderr to logcat;
 - `Native.kt`, the Kotlin facade;
 - the Gradle build: the native library via cargo-ndk, the rootfs, doas and notice assets,
-  per-variant features, SDK levels, packaging;
+  per-variant features, SDK levels, packaging, warnings as errors;
 - building libghostty-vt, the terminal emulator, with Zig from the fetched Ghostty source;
-- the manifest and debug-only resources;
+- the manifest and the debug source set;
 - the instrumentation tests (`MachineTest`);
-- the source bundles released with the APK (`scripts/release-sources`).
+- the source bundles released with the APK (`scripts/release-sources`) and the licence texts in
+  `android/licenses/`.
 
 Root: `hosts/android/` (except `src/vt.c` and `src/vt.rs`),
 `android/app/src/main/java/io/github/mthli/appine/Native.kt`, `android/app/build.gradle.kts` and
@@ -29,174 +28,280 @@ the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app
 
 Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
 what the app does with them (the other `android/*` modules), including the libghostty-vt
-terminal's emulator shim, JNI functions, sessions and views (`android/terminal`).
+terminal's emulator shim, its JNI functions, sessions and views (`android/terminal`).
 
 ## Key types
 
-- `MACHINES` — a mutex-protected map from handle (`jlong`, monotonic from 1, never reused) to
-  `Arc<Machine>`.
-- `Native` — `internal object` with `@JvmStatic external` functions; loads the library and calls
-  `init(BuildConfig.DEBUG)` in its initialiser.
-- Gradle tasks: `CargoNdkTask`, `RootfsAssetTask`, `NoticesTask`.
+- `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
+  and never reused in a process) to `Arc<Machine>`; a poisoned lock is recovered. `vt.rs` looks
+  kernels up in the same table.
+- `Native` — `internal object` with 36 `@JvmStatic external` functions, 17 of them
+  `@Throws(IOException::class)`; its initialiser loads the library and calls the private
+  `init(BuildConfig.DEBUG)`.
+- `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
+  `(name, throws env, fallback, body)` for the functions Kotlin declares `@Throws`.
+- Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`), `RootfsAssetTask` (one
+  `rootfsAsset` shared by all variants), `NoticesTask` (one per variant,
+  `generateNotices<Variant>`); helpers `byVersion` (compares file names by their runs of digits,
+  then by how many runs) and `alpineBranch` (from the tarball's name, `edge` without one).
+- `MachineTest` — the only instrumentation test class.
 
 ## Public entry points
 
-- Init: `init(verbose)` (stderr redirect, debug log).
-- Store: `importRootfs`, `syncRootfs`, `writeFile`, `readFile` (null when missing).
+- Init: `init(verbose)` (private; stderr redirect, debug log).
+- Store: `importRootfs`, `syncRootfs`, `writeFile`, `readFile` (null on `ENOENT`).
 - Browse: `browseStat`, `browseList`, `browseOpen`, `browseSniff`, `browseSearch` (read);
   `browseCreate`, `browseRemove`, `browseRename`, `browseMove`, `browseOpenWrite`, `browseWritten`
-  (through the store's change path).
+  (through the store's change path; `browseWritten` is not `@Throws` and ignores every error).
 - Kernel: `start(store, tier)` (1 = Tier 1, else Tier 0; the kernel starts with
-  `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports),
-  `stop`, `boot`, `shutdown`, `takePower`,
-  `processes`, `trimMemory`, `setRoutes`, `takeKills`, `takeListens`, `takeChangedDirs`, and
-  `bklStall` (the latest too-long hold of the BKL as `<id>\t<seconds>\t<report>\t<end record or
-  empty>`, or null; it does not take the BKL).
+  `debug.exception-trace` at 1, so guest crashes reach the kernel log and with it the bug reports;
+  0 and an `IOException("cannot start: …")` on failure), `boot`, `setRoutes`, `takeListens`,
+  `takeKills`, `bklStall` (the latest too-long hold of the BKL as
+  `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
+  into spaces, or null; it does not take the BKL), `takePower`, `processes`, `takeChangedDirs`,
+  `trimMemory`, `shutdown`, `stop`.
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
-  `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`.
+  `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`. The app
+  itself no longer calls `read` or `resize` (the terminal's pump and resizes go through `vt.rs`);
+  `MachineTest` does.
+- Build: `./gradlew assembleDebug lintDebug` (what CI runs), `connectedDebugAndroidTest` (with
+  `-Pandroid.testInstrumentationRunnerArguments.network=true` for the download of a distribution),
+  `scripts/fetch-ghostty [dir]` (default `target/ghostty`), `scripts/release-sources [dir]` (default
+  `target/release-sources`).
 
 ## Data flow / lifecycle
 
 ### Handles
 
-- `start` creates a `Machine` and registers it; every call clones the `Arc` under the table lock,
-  drops the lock and works, so a blocked read keeps its kernel alive across a concurrent `stop`.
+- `start` builds `MachineOptions` (tier, exception trace), starts a `Machine` and registers it;
+  every call clones the `Arc` under the table lock and releases the lock before working, so a
+  blocked call keeps its kernel alive across a concurrent `stop`.
 - `stop` removes the handle and then kills everything; `shutdown` runs the inittab shutdown
-  (poweroff, 30 s) and then removes it. Both drop the removed `Arc` only after the table lock is
-  released, since the last reference's drop syncs the store and joins threads. Later calls find
-  nothing: reads and writes return −1, `waitFor` −9, `openConsole`/`spawn` throw, the rest do
-  nothing.
-- Errors become `IOException` (`FileNotFoundException` for browse calls) or sentinel values.
-- Callers are JVM threads (the service's worker and boot threads, the terminal's reader, writer and
-  waiter threads, the main thread, provider binder threads, the libghostty-vt tabs' pump
-  threads, which `vt.rs` calls back into Java from inside `pump`); guest and timer threads never
-  call back into Java.
+  (poweroff, 30 s) while the handle is still registered and then removes it. Both drop the removed
+  `Arc` only after the table lock is released, since the last reference's drop (`kill_all`, sync,
+  joining the timer thread, stopping the watchdog) can take long. Whichever thread finishes the
+  last call on a removed kernel runs that drop.
+- After the kernel is gone: `read` and `write` return −1, `waitFor` −9, `openConsole` and `spawn`
+  throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
+  arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, and the rest
+  (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
+- Errors become `IOException`, or `FileNotFoundException` for every browse error whatever its
+  errno, or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
+- `setRoutes` parses lines of `<hex destination>/<prefix> <hex gateway or -> <interface>` (later
+  fields ignored); hex fields must be ASCII and even, the destination 4 or 16 bytes and the gateway
+  the same length; the metric is 0 for IPv4, and for IPv6 1024 for a default route, else 256.
+  Malformed lines are dropped silently.
+
+### Callers
+
+- All callers are JVM threads; the bridge attaches no native thread to the JVM, and guest and timer
+  threads never call into Java. The main thread (`bklStall`, and `openConsole`/`spawn` from a tab's
+  start), `appine-start` (`start`), the service's worker (the poll's calls, `setRoutes`,
+  `consoleCwd`, `trimMemory`, `stop`, `shutdown`, the rules refresh's `spawn`), `appine-boot`
+  (`spawn`, `waitFor`, `boot`), each tab's `vt-writer` (`write`) and `vt-waiter` (`waitFor`), the
+  provider's binder threads (browse functions, `readFile`), and each tab's `vt-pump`, which reads
+  the console through `Machine::read_console` in `vt.rs` and calls back into Java from inside
+  `pump`.
 
 ### stderr and panics
 
-- `init` replaces fd 2 with a pipe read by a thread that writes lines to logcat (tag `appine`) and
-  sets `APPINE_LOG` when verbose.
-- Panics are contained where the kernel wraps the call (`host_call`, on whenever debug assertions
-  are off, which is always on Android), which turns them into errors of the call. Everything else
-  (`Machine::wait`, `try_wait`, `processes`, `take_power`, the wait loops of console reads and
-  writes, `boot`, `shutdown` and `kill_all`, `Machine`'s drop, `sync_store`, and the JNI code
-  itself, `vt.rs` included) is caught by `guarded!`, which wraps the body of every JNI function in
-  `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a line names the
-  function, and the call returns a failure value (-1 for console reads, writes and int results,
-  -9 from `waitFor`, 0 from `processes` and `takePower`, null for objects); the functions Kotlin
-  declares `@Throws` also throw `IOException("internal error in …")` unless an exception is
-  already pending. Kernel state a panic left half changed (a poisoned lock, a held BKL) is not
-  repaired, so later calls may fail or wait.
+- `init` redirects stderr once: fd 2 becomes a pipe read by a `stderr-log` thread that writes each
+  line to logcat (tag `appine`, priority INFO; lines containing NUL are dropped); a failing `pipe`
+  or `dup2` leaves stderr as it was. `verbose` sets `APPINE_LOG=1`.
+- Panics are contained at two layers. The kernel wraps most `Machine` methods in `host_call`,
+  which turns a panic into an error of the call when containment is on (`APPINE_ON_BUG=kill`, or
+  by default whenever debug assertions are off, which is always on Android) and aborts the process
+  otherwise. Everything else is caught by `guarded!`: `Machine::wait`, `processes`, `take_power`,
+  `stall`, `sync_store`, the Tier 1 pool trim, the wait loops of console reads and writes, the
+  unwrapped parts of `boot`, `shutdown`, `kill_all` and `Machine`'s drop (their wait loops, flags,
+  inittab plan parsing and thread joins; their signals, inittab reads, spawns and syncs run in
+  `host_call`), and the JNI code itself, `vt.rs` included. `guarded!` runs the body in
+  `catch_unwind`: the panic message reaches logcat through the panic hook's stderr, a
+  line names the function, and the call returns its fallback (−1 for console reads and writes,
+  `openConsole`, `spawn`, `browseOpen` and `browseOpenWrite`; 0 for `start`, `takePower` and
+  `processes`; −9 from `waitFor`; null for objects; nothing for unit). The 17 `@Throws` functions
+  also throw `IOException("internal error in …")` unless an exception is already pending. Kernel
+  state a panic left half changed (a poisoned lock, a held BKL) is not repaired, so later calls
+  may fail or wait.
 
 ### Build
 
-- cargo-ndk builds `arm64-v8a` for API 30, always in release, into `target/android`; debug variants
-  add the `test-hooks` and `borrow-check` features.
-- On an Android target, `build.rs` runs `zig build -Demit-lib-vt` (baseline CPU, ReleaseFast) on
-  the Ghostty 1.4.0 source in `target/ghostty` (or `APPINE_GHOSTTY_SRC`) into `OUT_DIR`, with the
-  proxy variables removed, then compiles `src/vt.c` with `cc` and links `libghostty-vt.a`
-  statically into `libappine.so` (with uucode, simdutf, Highway, Wuffs and Zig's compiler_rt;
-  about +2 MB stripped). Zig is `zig` on `PATH` or `ZIG` (0.17.0, which Ghostty 1.4.0 requires);
-  Ghostty's build finds the NDK through `ANDROID_NDK_HOME`. Every Android build, CI's included,
-  therefore needs Zig and the fetched source.
-- `scripts/fetch-ghostty [dir]` downloads the source release, checks its pinned sha256, unpacks it
-  and runs the build's configure phase with `build.rs`'s options (`--help`), which fetches the Zig
-  packages that build uses into the source's `zig-pkg/` (Zig checks them against the
-  `build.zig.zon` hashes), so the cargo build needs no network.
-- Android libraries: `androidx.core` and Material Components 1.14.0 (which brings AppCompat,
-  androidx.activity, CoordinatorLayout and the Error Prone annotations).
-- Assets: the newest Alpine minirootfs tarball by version (as `rootfs.tgz`, since AAPT would
-  unpack `.gz`), the newest `doas.apk` (both by `byVersion`, the numbers in the name), generated `notices/`, and the terminal font (`fonts/`, `android/terminal`);
-  `BuildConfig` carries the Alpine branch.
-- Notices (`NoticesTask`): Appine's notice, Fuchsia's BSD-style license for the line-discipline
-  parts adapted from Starnix (`kernel/tty`), then the terminal's components with their license
-  texts from `android/licenses/` (Ghostty, uucode with the Unicode and Hoehrmann licenses, simdutf,
-  Highway and Wuffs under their MIT or BSD option, Zig's compiler_rt, JetBrains Mono's OFL),
-  Alpine, the Android libraries, the crates, SQLite and full texts. Every Android library on the
-  runtime classpath must belong to a group known to be Apache-2.0 (AndroidX, Kotlin, kotlinx,
-  JetBrains annotations, Guava's listenablefuture, Material Components, Error Prone annotations,
-  JSpecify), or the task fails. The component texts and
-  versions are copies kept by hand and change with the Ghostty version.
-- SDK: min 30, compile and target 37; uncompressed native libraries (`useLegacyPackaging = false`)
-  so 16 KB-aligned `LOAD` segments (NDK 29's default) map directly from the APK.
+- `CargoNdkTask` runs `cargo ndk -t arm64-v8a --platform 30 -o <build/generated/rust/<variant>/jniLibs>
+  build --release -p appine-android`, with `CARGO_TARGET_DIR=target/android` and both
+  `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT` set to AGP's NDK, using `~/.cargo/bin/cargo` when it is
+  executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
+  features; the Rust side is always a release build.
+- On an Android target `build.rs` asserts the Ghostty source (`target/ghostty/ghostty-1.4.0`, or
+  `APPINE_GHOSTTY_SRC`), panics on any architecture but aarch64, and runs `$ZIG` (or `zig` on
+  `PATH`) `build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast
+  -Dtarget=aarch64-linux-android` into `OUT_DIR` with the six proxy variables removed; it then
+  compiles `src/vt.c` (C11, extra warnings) with `cc` and links `libghostty-vt.a` statically into
+  `libappine.so` (with uucode, simdutf, Highway, Wuffs and Zig's compiler_rt). Ghostty's build
+  finds the NDK through `ANDROID_NDK_HOME`, and Ghostty 1.4.0 requires Zig 0.17.0 (its
+  `minimum_zig_version`; neither `build.rs` nor `fetch-ghostty` checks the version). Every Android
+  build, CI's included, therefore needs Zig and the fetched source.
+- `scripts/fetch-ghostty [dir]` keeps a tarball whose sha256 matches the pin, else downloads it
+  (`curl --retry 3` to a `.part` file, checked, renamed), unpacks it only when `build.zig` is
+  missing, and runs the build's configure phase with `build.rs`'s options (`--help`, proxy
+  variables removed), which fetches the Zig packages that build uses into the source's `zig-pkg/`
+  (Zig checks them against the `build.zig.zon` hashes), so the cargo build needs no network.
+- Toolchain: AGP 9.4.1 with its built-in Kotlin, Gradle 9.8.2, Java 17, NDK 29.0.14206865; plugins
+  and dependencies from `google()` and `mavenCentral()` (project repositories fail the build); no
+  version catalog. Android libraries: `androidx.core` 1.19.1 and Material Components 1.14.0 (which
+  brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
+  1.3.0.
+- Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
+  since AAPT would unpack `.gz`) and the newest `doas.apk` (both by `byVersion`; `rootfsAsset`
+  fails with "run scripts/fetch-rootfs first" when either is missing), generated `notices/`, and
+  the terminal font (`fonts/`, `android/terminal`); `BuildConfig.ALPINE_BRANCH` carries the
+  branch.
+- SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
+  native libraries (`useLegacyPackaging = false`) so 16 KB-aligned `LOAD` segments (NDK 29's
+  default; the build sets no page-size flag) map directly from the APK.
 - Warnings fail: every Kotlin compilation (the app and the instrumentation tests, local builds
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
-  the checks that follow data outside the repository (newer libraries or AGP, the newest SDK
-  level, Play's target SDK deadlines, libraries marked outdated in the Play SDK Index), which are
-  informational.
-- Manifest: launcher, settings and licenses activities (the application theme `Theme.Appine`,
-  Material 3; the launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave
-  `uiMode` out of their configuration changes), the `specialUse` foreground service with its subtype
-  property, the documents provider, a handful of normal permissions (no storage permission); the
-  debug network security config allows cleartext to 127.0.0.1 only.
+  `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
+  `OutdatedLibrary`, which follow data outside the repository and are informational.
+- Release: signed with the debug key, not minified, versionCode 1 and versionName 0.0.0.
+
+### Notices
+
+- `NoticesTask` writes, in order: Appine (its notice and the repository's `LICENSE`); Fuchsia's
+  BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); the
+  terminal's components with their texts from `android/licenses/` (Ghostty 1.4.0, uucode with the
+  Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option, Zig's
+  compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
+  from the tarball's `lib/apk/db/installed`, plus doas's `.PKGINFO`); the Android libraries on the
+  runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
+  texts of GPL-3.0, GPL-2.0, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
+  file), which `LicensesActivity` reads.
+- Every Android library must belong to a group known to be Apache-2.0 (a prefix match against
+  AndroidX, Kotlin, kotlinx, JetBrains annotations, Guava's listenablefuture, Material Components,
+  Error Prone annotations, JSpecify), or the task fails.
+- Crates: `cargo metadata --locked --all-features --filter-platform aarch64-linux-android`, walked
+  from `appine-android` over normal dependencies, skipping proc-macros and workspace members; when a
+  crate's licence offers MIT, only the MIT (and unrelated) licence files are attached; a crate
+  without a licence file only warns.
+- The component texts and versions in `android/licenses/` (14 files, all used) are copies kept by
+  hand and change with the Ghostty version.
+
+### Manifest
+
+- Launcher, settings and licenses activities (the application theme `Theme.Appine`, Material 3; the
+  launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave `uiMode` out of
+  their configuration changes), the `specialUse` foreground service with its subtype property, the
+  documents provider, backup turned off (`allowBackup`, `fullBackupContent`, data extraction
+  rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` requests at run time;
+  no storage permission. The debug source set's network security config allows cleartext to
+  127.0.0.1 only (for the download tests).
 
 ### Released sources
 
-- `scripts/release-sources [dir]` (default `target/release-sources`) refuses to run with tracked
-  changes in the work tree and writes `appine-<rev>.tar.gz` (`git archive HEAD`),
-  `appine-<rev>-vendor.tar.gz` (`cargo vendor`), `ghostty-<version>.tar.gz` (the release as
+- `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
+  the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
+  (`cargo vendor --locked` of the whole workspace), `ghostty-<version>.tar.gz` (the release as
   published) with `ghostty-<version>-zig-packages.tar.gz` (the source's `zig-pkg/` after
-  `fetch-ghostty` with an empty Zig global cache, so only what the build fetches: uucode, Highway,
-  Wuffs with its test images, zlib and Ghostty's themes (configured, not linked), and the build
-  tools aro and translate-c), and
-  `alpine-<version>-gpl-sources.tar`: for each
-  GPL origin listed in the bundled minirootfs's `lib/apk/db/installed`, the aports directory at its
-  commit (GitLab archive by subdirectory) plus the upstream files named in the APKBUILD's
-  `sha512sums`, fetched from Alpine's distfiles mirror and checked against those sums; APKBUILDs
+  `fetch-ghostty` ran with an empty Zig global cache, so only what the build fetches), and
+  `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
+- The Alpine part takes the tarball `scripts/fetch-rootfs` prints last, picks packages whose
+  licence line in `lib/apk/db/installed` contains `GPL` (LGPL included), downloads each origin's
+  aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
+  APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
+  mirror (the branch's directory, then `edge`); any miss or mismatch stops the script. APKBUILDs
   are never executed.
 
 ### Tests
 
-- `MachineTest` runs on emulators with 4 KB and 16 KB pages: boot and shutdown by inittab, consoles,
-  login and doas, restore, documents, mirrors, downloads (some opt-in with network), memory trim,
-  kernel or engine bugs injected through the test hooks, and a guest crash reaching the kernel
-  log.
+- `MachineTest` runs in the debug app's own process against the app's real store and
+  preferences: `@Before` imports the bundled rootfs when no store is ready, `start(tier)` records
+  each handle and `@After` stops them; tests change guest files, accounts and preferences and put
+  them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
+  trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
+  the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas, NOPASSWD
+  rules following a password set later, saved tabs, the Files provider (home, no home, writes,
+  changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
+  mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
+  ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
+  reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
+  the notices. Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
+  from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
+  gate but fails without a default network with an IPv4 gateway.
+- The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
+  and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
+  not run the tests (they need KVM). Nothing here covers `Native.bklStall` (the stall itself is
+  tested in `hosts/cli`), the libghostty-vt terminal or the revocation of grants end to end.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `TerminalService`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; the terminal
-  (`android/terminal`) through the libghostty-vt build.
+- `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; `vt.rs`
+  (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` and `LicensesActivity`
+  through the assets and `BuildConfig`; CI's `android.yml` (`assembleDebug lintDebug`, clippy
+  through cargo-ndk); the terminal (`android/terminal`) through the libghostty-vt build.
 
 ### Outbound
 
-- `appine_kernel` (`Machine`, store and browse functions), `jni` 0.21, `libc`, Android `liblog`;
-  cargo-ndk and NDK 29; AGP; `androidx.core` and Material Components from Google's Maven
-  repository.
-- Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate.
+- `appine_kernel` (`Machine`, `MachineOptions`, routes, store and browse functions), `jni` 0.21,
+  `libc`, Android `liblog`; cargo-ndk and NDK 29; AGP, Gradle; `androidx.core`, Material Components
+  and androidx.test from Google's Maven repository and Maven Central.
+- Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate;
+  `scripts/fetch-rootfs`'s output in `target/rootfs`.
+- `scripts/release-sources`: git, `cargo vendor`, `scripts/fetch-ghostty` and `fetch-rootfs`,
+  gitlab.alpinelinux.org and distfiles.alpinelinux.org, curl, tar, awk and a SHA-512 tool.
 
 ## Invariants and gotchas
 
 - JNI symbol names hard-code `io.github.mthli.appine.Native` (and `VtNative` for the libghostty-vt
-  terminal's functions).
-- The crate is empty on non-Android hosts; `build.rs` does nothing there.
-- Every JNI function's body goes in `guarded!` (with `throws env` when Kotlin declares `@Throws`);
-  the macro is defined before `mod vt` so `vt.rs` can use it, and its closure moves the parameters,
-  so a `return` inside returns from the body.
-- Zig's HTTP client fails through some proxies (HTTP 400), so `scripts/fetch-ghostty` and `build.rs`
-  remove the proxy variables.
+  terminal's functions); each `external fun` has exactly one `Java_…` function.
+- The crate is `#![cfg(target_os = "android")]`, so it is empty on other hosts, where `build.rs`
+  only prints its rerun lines.
+- Every JNI function's body goes in `guarded!` (with `throws env` exactly when Kotlin declares
+  `@Throws`); the macro is defined before `mod vt` so `vt.rs` can use it, and its closure moves the
+  parameters, so a `return` inside returns from the body only.
+- Zig's HTTP client fails through some proxies (HTTP 400), so `scripts/fetch-ghostty` and
+  `build.rs` remove the proxy variables.
 - `build.rs` and `scripts/fetch-ghostty` pass the same `zig build` options and change together:
-  lazy Zig packages are fetched only for the options the configure phase sees.
+  lazy Zig packages are fetched only for the options the configure phase sees. `build.rs` reruns
+  only when `vt.c`, the source's `build.zig.zon`, `APPINE_GHOSTTY_SRC` or `ZIG` change, not for
+  other Ghostty files or `ANDROID_NDK_HOME`.
 - Zig 0.17 unpacks every package already in its global cache into `zig-pkg/`, needed or not; only
   an empty cache shows what a build uses.
 - The K2 compiler reports unused variables and never-read assignments only with its extra
   warnings, which are off: they flag a variable read only by a local function as never read.
+- The instrumentation tests are not isolated from the app: they use its store, preferences and
+  saved tabs (a store switched to another distribution breaks the Alpine assertions).
+- `release-sources` relies on `fetch-ghostty` printing `fetch-ghostty: <source>` and on
+  `fetch-rootfs` printing the tarball's path last.
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key and not minified; the Alpine tarball's checksum is
-  checked only in `scripts/fetch-rootfs`.
-- Local references are never deleted in loops that build arrays (harmless with ART's large table
-  on every supported version); a failed string conversion with no pending exception makes void
-  calls return silently (unreachable from the non-null Kotlin signatures).
+- The release build is signed with the debug key, not minified and versioned 1 / 0.0.0; the Alpine
+  tarball's checksum is checked only in `scripts/fetch-rootfs`.
+- Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
+  `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
+  version); a failed string conversion with no pending exception makes void calls return silently
+  (unreachable from the non-null Kotlin signatures). The comment on `parse_route` still says a
+  panic there aborts the app, which `guarded!` no longer allows. If the `stderr-log` thread fails
+  to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
 - `scripts/fetch-ghostty` checks only the pinned sha256; the release's minisign signature is to be
-  checked by hand once when upgrading, before pinning the new sha256.
+  checked by hand once when upgrading, before pinning the new sha256. It runs `zig` from `PATH`
+  even when `ZIG` names another one for `build.rs`.
+- `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball while the
+  APK bundles the newest tarball in `target/rootfs`, so the two can differ; it publishes nothing for
+  the bundled `doas.apk`; its aports path is fixed to `main/`; and it vendors the whole workspace
+  although its header speaks of the crates linked into the app.
 
 ## Open questions
 
-none
+- Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
+  `FileNotFoundException`?
+- Is the release variant meant to ship as configured, and should `doas.apk`'s sources be
+  published with the Alpine ones?
 
 ## To verify
 
-none
+- That NDK 29's default really gives 16 KB-aligned `LOAD` segments in `libappine.so` and that the
+  test suite passes on a 16 KB-page image today; ART's local-reference limit on API 30 and later.
+- Which Zig packages an empty global cache leaves in `zig-pkg/` (the script names uucode, Highway,
+  Wuffs and what the configure phase reads; a developer tree with a filled cache shows more).

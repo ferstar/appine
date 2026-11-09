@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts and clamps; loop devices; eventfd readv; test-suite findings; pipes, fasync, `F_SETOWN`; epoll and ppoll details; anonymous fd bits; AIO waits; `/dev/fuse`; exclusive timerfds; synthetic files last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: timeouts; loop devices; eventfd readv; suite findings; pipes, `F_SETOWN`; epoll, ppoll; anonymous fds; AIO; `/dev/fuse`; exclusive timerfds; synthetic files; per-thread SIGIO checks last)
 
 ## Responsibilities
 
@@ -167,9 +167,10 @@ signal delivery (`kernel/signal`).
   syscalls only — and arrivals), computes new events, adds host fds' not-yet-ready bits to its
   host poll, and sends: `SIGIO` with kernel siginfo, or the `F_SETSIG` signal with `POLL_*` code,
   band (Linux's band table) and fd. Owners are a thread, process or process group
-  (`send_to_owner`), stored as global ids with the setter's real and effective user IDs; a process
-  gets the signal only when that effective ID is root or either ID is its real or saved user ID
-  (Linux's `sigio_perm`, checked for each process of a group).
+  (`send_to_owner`), stored as global ids with the setter's real and effective user IDs; a thread
+  owner, or a process through its main thread's credentials (the process's once that thread is
+  gone), gets the signal only when that effective ID is root or either ID is its real or saved user
+  ID (Linux's `sigio_perm`, checked for each process of a group).
 
 ## Dependencies (inbound / outbound)
 
