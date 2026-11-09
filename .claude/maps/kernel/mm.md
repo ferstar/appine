@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 28 claims checked by 3 independent verifiers — 16 confirmed, 11 partial and 1 refuted, all corrected below; 14 bugs or debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect; code and data bounds last)
+> Maintained: 2026-11-09 (targeted verification only since the full mapping: madvise, mremap, mlock; VMA boundaries, stacks; RSS, smaps; fork; truncation, clones; idle checks; OOM; futex keys, shm; `process_mrelease`; vDSO; FUSE fills; shootdowns and CoW mprotect; code and data bounds; mremap at the map-count limit last)
 
 ## Responsibilities
 
@@ -336,6 +336,14 @@ signals may still be delivered).
   file for it). A move re-points the same host memory and moves the page-table entries with it.
   `MREMAP_DONTUNMAP` leaves at the old address of a `Fill` VMA its host file mapped privately
   again (what was read, as the page cache would give) instead of a `Refill`.
+- A move (growing with `MREMAP_MAYMOVE` and no room in place, `MREMAP_FIXED`,
+  `MREMAP_DONTUNMAP`) is `ENOMEM` before anything changes unless the address space stays more
+  than three VMAs below `vm.max_map_count` (`move_room`, 6.1's `move_vma`), with two more for a
+  target's unmapping (`mremap_to`); the moved pieces go back in without the count check
+  (`place_vma`), so a move never fails for room halfway. `MREMAP_DONTUNMAP` follows 6.1's order:
+  no mapping at the old address `EFAULT`, the target `EINVAL`, the margin `ENOMEM`, the target
+  unmapped, the one-VMA rule `EFAULT`; it splits nothing before these, and then also needs room
+  for the splits and for one VMA per piece left at the old address.
 - `mremap` with an old length of 0 duplicates (6.1's "duplicate shm area"): the VMA holding the
   address (`EFAULT` if none) must be shared (`EINVAL`; a `MREMAP_FIXED` target is validated and
   unmapped before this check), and without `MREMAP_MAYMOVE` it is `ENOMEM`. A shared file mapping
@@ -727,9 +735,6 @@ signals may still be delivered).
   but do nothing.
 - **Past-EOF faults ignore permissions:** a `PROT_NONE` or write-to-read-only access past EOF gets
   `SIGBUS` instead of `SIGSEGV`/`SEGV_ACCERR`, and private file mappings never see file growth.
-- **mremap can exceed or corrupt `max_map_count` handling:** `MREMAP_DONTUNMAP` splits VMAs before
-  validating the destination and keeps the splits on `EINVAL`; a move that hits the limit after its
-  entries were moved drops VMAs and leaves stale entries at the destination.
 - **pagemap reports lent pages as exclusive:** they are mapped by several address spaces, contrary
   to Linux and the function's own description of the bit.
 - **Latent CoW leak:** if `return_loans` ever ran while the owner was mutably borrowed, the page
@@ -741,8 +746,9 @@ signals may still be delivered).
 - **Linux VMA boundaries are approximated:** anonymous memory that has been writable counts as
   having an anon_vma although Linux creates one only at the first write fault, and anonymous pieces
   join regardless of Linux's page offsets (a VMA moved by mremap joins its new neighbours), so
-  `/proc/<pid>/maps` and mremap's one-VMA rule can still differ in such cases; `shmat` below
-  `vm.mmap_min_addr` is not refused.
+  `/proc/<pid>/maps` and mremap's one-VMA rule can still differ in such cases, and
+  `MREMAP_DONTUNMAP` of one Linux VMA in several pieces needs room for a VMA per piece; `shmat`
+  below `vm.mmap_min_addr` is not refused.
 - **`READ_IMPLIES_EXEC` is ignored:** personality flags are only recorded, so with
   `READ_IMPLIES_EXEC` set (`setarch --read-implies-exec`, legacy programs that expect readable data
   to be executable) mmap and mprotect with `PROT_READ` do not add `PROT_EXEC` and jumping into such

@@ -3,7 +3,8 @@
 # not exceed 128 KB): process_mrelease, /proc/<pid>/oom_score, /proc/swaps, /proc/locks, and ss
 # reading /proc/net quietly when NETLINK_SOCK_DIAG refuses its queries, ETXTBSY for running a
 # `#!` script that is open for writing, setuid programs run with a shared fs context, and the layout
-# fields of /proc/<pid>/stat, the length limit of AF_UNIX datagram queues, and PI futexes
+# fields of /proc/<pid>/stat, the length limit of AF_UNIX datagram queues, PI futexes, and mremap
+# at the map-count limit
 set -e
 cd /tmp
 # Linux's swap_show header, then the host's swap areas, which a container sees too
@@ -491,3 +492,88 @@ C
 gcc -O1 -pthread -o pi pi.c
 ./pi
 rm -f pi pi.c
+
+# mremap at the map-count limit: a move that would need more VMAs than are left is refused with
+# ENOMEM before anything changes (Linux's margin in move_vma and mremap_to), whether it moves the
+# middle of a mapping, a whole one that cannot grow in place, to a fixed target or with
+# MREMAP_DONTUNMAP, and the data stays at the old address; with room again the move goes ahead
+cat > maplimit.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
+static sigjmp_buf env;
+
+static void on_fault(int sig)
+{
+    siglongjmp(env, sig);
+}
+
+static const char *peek(volatile char *p)
+{
+    static char buf[5];
+    if (sigsetjmp(env, 1))
+        return "fault";
+    for (int i = 0; i < 4; i++)
+        buf[i] = p[i];
+    return buf;
+}
+
+static void report(const char *what, void *r)
+{
+    printf("%s: %s\n", what, r == MAP_FAILED ? strerror(errno) : "moved");
+}
+
+int main(void)
+{
+    signal(SIGSEGV, on_fault);
+    signal(SIGBUS, on_fault);
+    long pg = sysconf(_SC_PAGESIZE), max = 0;
+    FILE *f = fopen("/proc/sys/vm/max_map_count", "r");
+    fscanf(f, "%ld", &max);
+    fclose(f);
+    int rw = PROT_READ | PROT_WRITE, anon = MAP_PRIVATE | MAP_ANONYMOUS;
+    char *a = mmap(NULL, 4 * pg, rw, anon, -1, 0);
+    /* `w` cannot grow in place: a page of other permissions follows it */
+    char *w = mmap(NULL, 3 * pg, rw, anon, -1, 0);
+    mprotect(w + 2 * pg, pg, PROT_READ);
+    char *target = mmap(NULL, 4 * pg, PROT_NONE, anon, -1, 0);
+    munmap(target, 4 * pg);
+    memcpy(a + pg, "keep", 4);
+    memcpy(w, "keep", 4);
+    /* Single pages with gaps between them, cut out of one reservation until munmap may not split
+     * any more */
+    size_t n = 2 * (size_t)(max + 64);
+    char *fill = mmap(NULL, n * pg, PROT_NONE, anon | MAP_NORESERVE, -1, 0);
+    printf("start\n");
+    fflush(stdout);
+    size_t i = 1;
+    while (i < n && munmap(fill + i * pg, pg) == 0)
+        i += 2;
+    printf("filled: %s\n", i < n ? strerror(errno) : "no limit reached");
+    report("middle", mremap(a + pg, 2 * pg, 3 * pg, MREMAP_MAYMOVE));
+    report("whole", mremap(w, 2 * pg, 4 * pg, MREMAP_MAYMOVE));
+    report("fixed", mremap(a + pg, 2 * pg, 2 * pg, MREMAP_MAYMOVE | MREMAP_FIXED, target));
+    report("dontunmap", mremap(a + pg, 2 * pg, 2 * pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP, 0));
+    printf("kept: %s, %s\n", peek(a + pg), peek(w));
+    munmap(fill, 200 * pg);
+    char *b = mremap(a + pg, 2 * pg, 3 * pg, MREMAP_MAYMOVE);
+    report("with room", b);
+    if (b != MAP_FAILED)
+        printf("moved: %s, old address %s\n", peek(b), strcmp(peek(a + pg), "fault") ? "kept" : "gone");
+    munmap(fill, n * pg);
+    return 0;
+}
+C
+gcc -O1 -o maplimit maplimit.c
+./maplimit
+rm -f maplimit maplimit.c

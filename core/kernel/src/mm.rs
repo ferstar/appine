@@ -1818,7 +1818,20 @@ impl Mm {
             return Err(Errno::EINVAL);
         }
         let end = old.checked_add(len).ok_or(Errno::EINVAL)?;
-        // Linux's vma_to_resize: the range must lie in one VMA ([`same_vma`])
+        // In 6.1's order (the syscall's vma_lookup, then mremap_to): a mapping at old (EFAULT),
+        // the target (EINVAL), the map-count margin (ENOMEM), unmapping the target, and only then
+        // vma_to_resize's rule that the range lies in one VMA ([`same_vma`], EFAULT); nothing is
+        // split before these checks
+        if !self.is_mapped(old) {
+            return Err(Errno::EFAULT);
+        }
+        if let Some(d) = fixed {
+            Self::check_target(old, len, d, len)?;
+        }
+        self.move_room(2)?;
+        if let Some(d) = fixed {
+            self.munmap(d, len)?;
+        }
         if !self.in_one_vma(old, end) {
             return Err(Errno::EFAULT);
         }
@@ -1826,6 +1839,16 @@ impl Mm {
             Some(d) => d,
             None => self.find_free(len).ok_or(Errno::ENOMEM)?,
         };
+        // Unmerged pieces make more VMAs here than on Linux: besides the splits, every piece
+        // leaves a new VMA at the old address (Refills are mapped by the caller), so there must be
+        // room for all of them before anything moves
+        let pieces = self
+            .vmas
+            .range(..end)
+            .rev()
+            .take_while(|&(&s, v)| s + v.len > old)
+            .count();
+        self.room_for(self.splits(&[old, end]) + pieces)?;
         self.split_at(old);
         self.split_at(end);
         let (mut empty, mut alias, mut refill) = (Vec::new(), Vec::new(), Vec::new());
@@ -1855,7 +1878,7 @@ impl Mm {
                 }),
             }
         }
-        let new = self.mremap(old, len, len, true, Some(dst), None)?;
+        self.move_range(old, len, dst)?;
         for (start, len, prot) in empty {
             self.map_anonymous(start, len, prot)?;
             self.vmas.get_mut(&start).unwrap().locked = false;
@@ -1863,7 +1886,7 @@ impl Mm {
         for (start, v) in alias {
             self.insert_vma(start, v)?;
         }
-        Ok((new, refill))
+        Ok((dst, refill))
     }
 
     /// The store inode of the file mapped by the private file mapping at `addr` (None if it is not
@@ -1916,12 +1939,9 @@ impl Mm {
             mm.extension(v, old_end - s, grow, file).map(Some)
         };
         if let Some(dst) = fixed {
-            if !dst.is_multiple_of(PAGE_SIZE)
-                || dst.checked_add(new_len).is_none_or(|e| e > 1 << VA_BITS)
-                || dst < old_end && old < dst + new_len
-            {
-                return Err(Errno::EINVAL);
-            }
+            Self::check_target(old, old_len, dst, new_len)?;
+            // mremap_to's margin: unmapping the target and the shrunk tail may each split a VMA
+            self.move_room(2)?;
             self.munmap(dst, new_len)?;
             if new_len < old_len {
                 self.munmap(old + new_len, old_len - new_len)?;
@@ -1970,9 +1990,33 @@ impl Mm {
         }
         let dst = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
         let e = extension(self)?.unwrap();
+        self.move_room(0)?;
         self.move_range(old, old_len, dst)?;
         self.insert_vma(dst + old_len, e)?;
         Ok(dst)
+    }
+
+    /// mremap_to's checks of a target address: page-aligned, inside the address space and not
+    /// overlapping the old range (EINVAL).
+    fn check_target(old: u64, old_len: u64, dst: u64, new_len: u64) -> Result<(), Errno> {
+        if !dst.is_multiple_of(PAGE_SIZE)
+            || dst.checked_add(new_len).is_none_or(|e| e > 1 << VA_BITS)
+            || dst < old + old_len && old < dst + new_len
+        {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// The map-count margin Linux 6.1 keeps before moving (`move_vma`), with `extra` VMAs more for
+    /// `mremap_to`'s unmapping: ENOMEM unless the address space stays more than three VMAs below
+    /// `vm.max_map_count`, so a move never fails for room halfway, after its pieces left the old
+    /// address.
+    fn move_room(&self, extra: usize) -> Result<(), Errno> {
+        if self.vmas.len() + extra >= MAX_MAP_COUNT.load(Ordering::Relaxed).saturating_sub(3) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
     }
 
     /// mremap with an old length of 0, which Linux keeps for DOSEMU's "duplicate shm area": the same
@@ -2195,8 +2239,10 @@ impl Mm {
             }
             moved.push((dst + (s - old), v));
         }
+        // The pieces only move, so they take no room under `vm.max_map_count` (beyond the
+        // splits, which the callers' margins cover)
         for (s, v) in moved {
-            self.insert_vma(s, v)?;
+            self.place_vma(s, v)?;
         }
         self.dirty = true;
         Ok(())
@@ -4161,6 +4207,12 @@ impl Mm {
     /// Puts a whole VMA at `start`; the caller guarantees the range is free.
     fn insert_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         self.room_for(1)?;
+        self.place_vma(start, v)
+    }
+
+    /// [`Mm::insert_vma`] without the `vm.max_map_count` check, for a VMA that moves rather than
+    /// adds one.
+    fn place_vma(&mut self, start: u64, v: Vma) -> Result<(), Errno> {
         let file = v.backing != Backing::Anonymous;
         Self::map_pages(&mut self.mmu, start, v.host, v.file_len, v.prot, file)?;
         self.exec_changed |= v.prot & prot::EXEC != 0;
@@ -6817,6 +6869,72 @@ mod tests {
             mm.mremap(d, 2 * PAGE_SIZE, 2 * PAGE_SIZE, true, Some(0x800000), None),
             Ok(0x800000)
         );
+    }
+
+    #[test]
+    fn mremap_at_the_map_count_limit_changes_nothing() {
+        let mut mm = Mm::new();
+        let fixed = flags::MAP_PRIVATE | flags::MAP_ANONYMOUS | flags::MAP_FIXED;
+        let a = mm.mmap(0x100000, 4 * PAGE_SIZE, RW, fixed, None).unwrap();
+        let w = mm.mmap(0x200000, 2 * PAGE_SIZE, RW, fixed, None).unwrap();
+        mm.write_kernel(a + PAGE_SIZE, b"keep").unwrap();
+        mm.write_kernel(w, b"keep").unwrap();
+        // `w` cannot grow in place
+        mm.mmap(w + 2 * PAGE_SIZE, PAGE_SIZE, 0, fixed, None)
+            .unwrap();
+        let kept = |mm: &Mm, at: u64| {
+            let mut buf = [0u8; 4];
+            mm.read(UserSlice::new(at, 4), &mut buf).is_ok() && &buf == b"keep"
+        };
+        // Single-page reservations with gaps between them, up to the limit
+        let max = MAX_MAP_COUNT.load(Ordering::Relaxed);
+        let fillers = 0x1000_0000;
+        let mut at = fillers;
+        while mm.vmas.len() < max {
+            mm.mmap(at, PAGE_SIZE, 0, fixed, None).unwrap();
+            at += 2 * PAGE_SIZE;
+        }
+        // Moving the middle of `a` (split in three), a whole mapping that cannot grow in place, to
+        // a fixed target or with MREMAP_DONTUNMAP: refused before anything changes
+        let cases: [(u64, u64, u64, Option<u64>); 3] = [
+            (a + PAGE_SIZE, 2 * PAGE_SIZE, 3 * PAGE_SIZE, None),
+            (w, 2 * PAGE_SIZE, 4 * PAGE_SIZE, None),
+            (a + PAGE_SIZE, 2 * PAGE_SIZE, 2 * PAGE_SIZE, Some(0x800000)),
+        ];
+        for (old, old_len, new_len, target) in cases {
+            assert_eq!(
+                mm.mremap(old, old_len, new_len, true, target, None),
+                Err(Errno::ENOMEM)
+            );
+        }
+        assert_eq!(
+            mm.mremap_dontunmap(a + PAGE_SIZE, 2 * PAGE_SIZE, None)
+                .map(|r| r.0),
+            Err(Errno::ENOMEM)
+        );
+        assert!(kept(&mm, a + PAGE_SIZE) && kept(&mm, w));
+        assert_eq!(mm.vmas.len(), max);
+        // A bad target is EINVAL before the margin, and splits nothing
+        mm.munmap(fillers, 20 * PAGE_SIZE).unwrap();
+        let before = mm.vmas.len();
+        assert_eq!(
+            mm.mremap_dontunmap(a + PAGE_SIZE, 2 * PAGE_SIZE, Some(a + 2 * PAGE_SIZE))
+                .map(|r| r.0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(mm.vmas.len(), before);
+        // With room again the move goes ahead
+        let b = mm
+            .mremap(
+                a + PAGE_SIZE,
+                2 * PAGE_SIZE,
+                3 * PAGE_SIZE,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(kept(&mm, b) && !mm.is_mapped(a + PAGE_SIZE));
     }
 
     #[test]
