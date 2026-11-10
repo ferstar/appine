@@ -1252,18 +1252,28 @@ fn populated(k: &Kernel, id: u64) -> bool {
     members(k).any(|(_, c)| k.cgroups.is_within(c, id))
 }
 
-/// The sum of the resident memory of the processes in cgroup `id`'s subtree (bytes): a child
-/// cgroup's `memory.current`.
+/// The resident memory of the processes in cgroup `id`'s subtree (bytes): a child cgroup's
+/// `memory.current`. An address space several processes use (a vfork child and its parent,
+/// `CLONE_VM`) counts once, and so does memory several address spaces share
+/// ([`crate::mm::Usage`]: shared mappings, file pages, pages lent after fork), as Linux charges
+/// each page once.
 fn subtree_rss(k: &Kernel, id: u64) -> u64 {
-    members(k)
-        .filter(|&(_, c)| k.cgroups.is_within(c, id))
-        .filter_map(|(tgid, _)| {
-            let g = k.groups.get(&tgid)?.borrow();
-            let task = k.tasks.get(g.threads.first()?)?;
-            let pages = task.res.borrow().mm.borrow().resident_pages();
-            Some(pages * 4096)
-        })
-        .sum()
+    let mut usage = crate::mm::Usage::default();
+    let mut seen = std::collections::HashSet::new();
+    for (tgid, _) in members(k).filter(|&(_, c)| k.cgroups.is_within(c, id)) {
+        let Some(g) = k.groups.get(&tgid) else {
+            continue;
+        };
+        let g = g.borrow();
+        let Some(task) = g.threads.first().and_then(|t| k.tasks.get(t)) else {
+            continue;
+        };
+        let mm = task.res.borrow().mm.clone();
+        if seen.insert(std::rc::Rc::as_ptr(&mm)) {
+            usage.add(&mm.borrow());
+        }
+    }
+    usage.pages() * 4096
 }
 
 /// The number of tasks in cgroup `id`'s subtree (`pids.current`): as on Linux, tasks count until

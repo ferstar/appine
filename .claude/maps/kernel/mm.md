@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `uaccess.rs` registered here, mount flags read from kernel/mount last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `uaccess.rs` registered here, mount flags read from kernel/mount, then child cgroups' usage counting shared memory once)
 
 ## Responsibilities
 
@@ -149,6 +149,8 @@ layer (`core/hal`).
 - `Region` — one `/proc/<pid>/maps` / `smaps` line.
 - `RssPlan`, `FileResidency` — one RSS sample plan, and a process-wide cache of file-mapping
   residency (1 s, 1024 entries, emptied when full).
+- `Usage` — the resident memory of several address spaces together (a child cgroup's): their host
+  spans and the file pieces already counted.
 - `DumpRegion`, `dump_filter` — core-dump segments and the `coredump_filter` bits (default `0x33`).
 
 ### OOM killer
@@ -195,7 +197,8 @@ layer (`core/hal`).
 - **SysV shm**: `SharedMemory::new`, `attach_shm`, `detach_shm`, `shm_attachments`.
 - **Introspection**: `regions`, `resident_in`, `cow_shared`, `residency`, `pagemap`, `size`,
   `stack_bytes` (VmStk), `resident_pages`, `resident_split`, `peak_resident_pages`,
-  `locked_bytes`, `locked_in`, `dump_regions`, `dump_page`.
+  `locked_bytes`, `locked_in`, `dump_regions`, `dump_page`; `Usage::add` and `pages` (child
+  cgroups).
 - **BKL hooks**: `defer_unmaps` when the BKL is taken; `release_unmapped`, then `spare::refill`
   when it is released.
 - **Machine**: `FileMaps::clear` from `Machine::trim_memory`.
@@ -658,11 +661,17 @@ signals may still be delivered).
   private file mappings as anonymous (all of a written file mapping, where Linux counts only its
   copied pages), shared anonymous memory, SysV shm, memfds and deleted files as shmem
   (`shmem_like`, also used by core dumps' `ANON_SHARED`), other file mappings as file.
-- `resident_pages` (statm, stat, child cgroups, OOM victim choice) skips `[vvar]` and private
+- `resident_pages` (statm, stat, OOM victim choice) skips `[vvar]` and private
   anonymous VMAs never writable nor written by the kernel, measures private anonymous VMAs over 1 MB only over windows with entries, and uses the 1 s
   file-residency cache for unwritten private file mappings and all shared mappings with a file
   identity (so they can lag by a second). `resident_in` (smaps, OOM kill log) uses the same windows
   but no skip and no cache.
+- `Usage` (child cgroups' usage) measures address spaces as `resident_pages` does, but together:
+  each file piece measured from the page cache counts once (device, inode, offset and length, so
+  overlapping but different pieces of one file count separately), and the other spans, with every
+  borrowed page as the owner's host page, are united before one mincore pass, so shared anonymous
+  memory, SysV shm, `FileMaps` mappings and pages lent for copy-on-write, which are the same host
+  pages in every address space, count once, and a borrowed page counts only while resident.
 - `peak_resident_pages` feeds `ru_maxrss` and VmHWM, assuming spans totalling at most 256 pages
   are resident instead of measuring them; it is sampled at last-thread exit, before execve (cheaply
   for a process younger than a tick that has not execed), on getrusage (at most every 10 ms, not
@@ -688,9 +697,9 @@ signals may still be delivered).
 - The root (whole-app) usage is the app process's host RssAnon + RssShmem + VmSwap (VmRSS and no
   shmem on kernels without RssAnon), minus Tier 1 code written through the writable view and not
   yet unmapped: it includes translations and kernel-layer metadata and excludes host file pages.
-  A child cgroup with the memory controller enabled and a numeric `memory.max` uses the sum of its
-  processes' `resident_pages` (an address space shared by several processes counts once per
-  process).
+  A child cgroup with the memory controller enabled and a numeric `memory.max` uses `Usage` over
+  its processes' address spaces, each address space once (a vfork child and its parent,
+  `CLONE_VM` processes).
 - `check` runs under the BKL each time the timer thread wakes. With no root limit and no cgroup
   limit it does nothing; otherwise it measures every 20 ms, every 5 ms once a scope is above 3/4 of
   its limit, and never more often than 20 times the measurement's own time. The root is measured
@@ -829,7 +838,7 @@ signals may still be delivered).
 - Page-table memory only grows over an address space's lifetime.
 - The OOM killer uses two measures: the root counts the whole app process (translations, metadata,
   swap, no file pages), while cgroups and victim scores count guest resident pages (file pages
-  included, swap excluded, shared pages once per process).
+  included, swap excluded; shared pages once per cgroup, but once per process in victim scores).
 - The OOM killer polls, so a process that allocates and exits within one interval is never seen,
   and under Tier 1 a guest can touch gigabytes between polls: the limit needs headroom.
 - `failcnt` in the OOM log is the domain's hierarchical `max` count, including its descendants'.
@@ -880,10 +889,6 @@ signals may still be delivered).
   of its range when building them fails, so an mprotect making a small `PROT_NONE` anonymous VMA
   accessible again can lose the entries kept for its pages (fork and RSS then miss them), and a
   move failing there loses the moved VMA; this needs a host allocation failure.
-- **Child cgroups count shared memory more than once:** their usage (`memory.current`, the OOM
-  check) adds each process's `resident_pages`, so an address space several processes share (a
-  vfork child and its parent, `CLONE_VM` processes) counts once per process, and pages lent after
-  fork count in owner and borrowers.
 - **A FUSE mapping's short read is taken as a whole window:** `store` records the whole window as
   read even when the daemon returned less (a short reply, or an error after the first chunk), so
   the rest stays zeros and is never asked for again.

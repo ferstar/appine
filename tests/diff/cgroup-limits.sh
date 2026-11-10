@@ -3,7 +3,8 @@
 # pids.current counts zombies, where pids.events records events, migration ignores the limit,
 # disabling and re-enabling the controller returns to the defaults; exceeding memory.max kills
 # processes, memory.events (accumulated upwards) and .local, lowering memory.max kills those over
-# it, memory.oom.group kills the whole group. The native side is a privileged container whose
+# it, memory.oom.group kills the whole group, and memory several processes share counts once
+# against memory.max. The native side is a privileged container whose
 # root is not the real root, and controllers cannot be enabled while it has processes, so first
 # move all processes into init as docker-in-docker does (Appine's root is the real root, and
 # does the same). For memory only the event counts are compared (max is the number of times the
@@ -161,5 +162,48 @@ echo 1 > t/g/memory.oom.group
 sh -c 'echo $$ > /sys/fs/cgroup/t/g/cgroup.procs; sleep 10 & /tmp/eat; echo "eat in group $?"; wait; echo "sleep $?"'
 echo "group shell status $?"
 echo "g events: $(events t/g/memory.events exact)"
+# Memory several processes share counts once, as Linux charges each page to one cgroup: 64 MiB of
+# shared memory and 32 MiB of private memory written by one process and read by four forked
+# children (which borrow the private pages until they write them) stay below a 150 MiB memory.max
+mkdir t/s
+echo 150M > t/s/memory.max
+echo 0 > t/s/memory.swap.max
+cat > /tmp/share.c <<'C'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void)
+{
+    size_t len = 64 << 20;
+    char *shared = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *private = mmap(NULL, len / 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memset(shared, 1, len);
+    memset(private, 2, len / 2);
+    for (int i = 0; i < 4; i++)
+        if (fork() == 0) {
+            long sum = 0;
+            for (size_t o = 0; o < len; o += 4096)
+                sum += shared[o];
+            for (size_t o = 0; o < len / 2; o += 4096)
+                sum += private[o];
+            // Long enough for the OOM killer, which polls, to look
+            sleep(1);
+            _exit(sum == (long)(len / 4096 + len / 4096) ? 0 : 1);
+        }
+    int done = 0, status;
+    while (wait(&status) > 0)
+        done += WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    printf("children done: %d\n", done);
+    return 0;
+}
+C
+gcc -O1 -o /tmp/share /tmp/share.c
+sh -c 'echo $$ > /sys/fs/cgroup/t/s/cgroup.procs; exec /tmp/share'
+echo "share status $?"
+echo "s events: $(events t/s/memory.events exact)"
 echo "t events: $(events t/memory.events)"
 echo "root events: $(events memory.events)"

@@ -3889,9 +3889,36 @@ impl Mm {
     /// What [`Mm::resident_pages`] measures: pages known without mincore, and the host ranges to
     /// mincore.
     fn rss_plan(&self) -> RssPlan {
-        // Borrowed pages are counted, like copy-on-write pages on Linux
-        let mut total = self.cow.borrow().borrowed.len() as u64;
+        self.plan(None)
+    }
+
+    /// [`Mm::rss_plan`], or with `counted` the part of a [`Usage`]: file pieces in `counted`
+    /// already count for another address space and are skipped (those not in it are added), and
+    /// borrowed pages become spans of the owner's host pages, which the union of the spans counts
+    /// once with the owner's own and other borrowers'.
+    fn plan(&self, mut counted: Option<&mut std::collections::HashSet<FilePiece>>) -> RssPlan {
+        let mut total = 0;
         let mut spans = Vec::with_capacity(self.vmas.len());
+        let cow = self.cow.borrow();
+        if counted.is_none() {
+            // Borrowed pages are counted, like copy-on-write pages on Linux
+            total = cow.borrowed.len() as u64;
+        } else {
+            // In runs of contiguous host pages
+            let mut run: Option<(usize, usize)> = None;
+            for b in cow.borrowed.values().map(|b| b.host.as_ptr() as usize) {
+                run = match run {
+                    Some((start, n)) if start + n == b => Some((start, n + PAGE_SIZE as usize)),
+                    Some(r) => {
+                        spans.push(r);
+                        Some((b, PAGE_SIZE as usize))
+                    }
+                    None => Some((b, PAGE_SIZE as usize)),
+                };
+            }
+            spans.extend(run);
+        }
+        drop(cow);
         let now = std::time::Instant::now();
         for (&s, v) in &self.vmas {
             if v.foreign() {
@@ -3916,9 +3943,12 @@ impl Mm {
             let span = (v.host.as_ptr() as usize, v.len as usize);
             match v.file_id {
                 Some((dev, ino, offset)) if page_cache => {
-                    total += FileResidency::get((dev, ino, offset, v.len), now, || {
-                        appine_hal::resident_pages(v.host.as_ptr(), span.1) as u64
-                    });
+                    let piece = (dev, ino, offset, v.len);
+                    if counted.as_mut().is_none_or(|c| c.insert(piece)) {
+                        total += FileResidency::get(piece, now, || {
+                            appine_hal::resident_pages(v.host.as_ptr(), span.1) as u64
+                        });
+                    }
                 }
                 _ => spans.push(span),
             }
@@ -5243,6 +5273,50 @@ fn shmem_like(v: &Vma) -> bool {
                 .is_some_and(|n| n.starts_with(b"/memfd:") || n.ends_with(b" (deleted)")))
 }
 
+/// The resident memory of several address spaces together (a child cgroup's `memory.current`):
+/// memory they share counts once, as Linux charges a page to one cgroup. Shared anonymous memory,
+/// SysV shm, read-only private file mappings and pages lent for copy-on-write are the same host
+/// pages in every address space using them, so the spans' union measures each once; file
+/// mappings measured from the page cache count once per piece of file (device, inode, offset,
+/// length), so overlapping but different pieces of one file count separately.
+#[derive(Default)]
+pub struct Usage {
+    fixed: u64,
+    spans: Vec<(usize, usize)>,
+    counted: std::collections::HashSet<FilePiece>,
+}
+
+impl Usage {
+    /// Adds address space `mm`; one used by several processes is to be added once.
+    pub fn add(&mut self, mm: &Mm) {
+        let plan = mm.plan(Some(&mut self.counted));
+        self.fixed += plan.fixed;
+        self.spans.extend(plan.spans);
+    }
+
+    /// Resident 4K pages of everything added.
+    pub fn pages(mut self) -> u64 {
+        self.spans.sort_unstable();
+        // The union of the host ranges: overlapping ones merge, contiguous ones are merged by
+        // the measurement
+        let mut union: Vec<(usize, usize)> = Vec::with_capacity(self.spans.len());
+        for (start, len) in self.spans {
+            match union.last_mut() {
+                Some((s, l)) if start < *s + *l => *l = (*l).max(start + len - *s),
+                _ => union.push((start, len)),
+            }
+        }
+        RssPlan {
+            fixed: self.fixed,
+            spans: union,
+        }
+        .measure()
+    }
+}
+
+/// A piece of a file mapping as [`FileResidency`] caches it: device, inode, file offset, length.
+type FilePiece = (u64, u64, u64, u64);
+
 struct RssPlan {
     /// 4K pages known without mincore: borrowed pages and cached file mappings.
     fixed: u64,
@@ -6215,6 +6289,56 @@ mod tests {
         // Mappings are allocated top down: right above private is the upper bound of the mmap
         // area, with nothing mapped
         assert!(child.is_mapped(private) && !child.is_mapped(private + 2 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn usage_counts_shared_memory_once() {
+        let mut mm = Mm::new();
+        let private = mm
+            .mmap(
+                0,
+                8 * PAGE_SIZE,
+                RW,
+                flags::MAP_PRIVATE | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        let shared = mm
+            .mmap(
+                0,
+                4 * PAGE_SIZE,
+                RW,
+                flags::MAP_SHARED | flags::MAP_ANONYMOUS,
+                None,
+            )
+            .unwrap();
+        for i in 0..8 {
+            mm.write_kernel(private + i * PAGE_SIZE, b"p").unwrap();
+        }
+        for i in 0..4 {
+            mm.write_kernel(shared + i * PAGE_SIZE, b"s").unwrap();
+        }
+        let usage = |spaces: &[&Mm]| {
+            let mut u = Usage::default();
+            for &mm in spaces {
+                u.add(mm);
+            }
+            u.pages()
+        };
+        let alone = usage(&[&mm]);
+        assert_eq!(alone, mm.resident_pages());
+        assert!(alone >= 12);
+        // After fork the child borrows the private pages and maps the same shared memory: each
+        // process counts them, together they count once
+        let child = mm.fork().unwrap();
+        assert!(mm.resident_pages() + child.borrow().resident_pages() >= 2 * alone);
+        assert_eq!(usage(&[&mm, &child.borrow()]), alone);
+        // A page the child writes becomes its own copy, which counts as well
+        child
+            .borrow_mut()
+            .write_kernel(private + 3 * PAGE_SIZE, b"c")
+            .unwrap();
+        assert_eq!(usage(&[&mm, &child.borrow()]), alone + 1);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay; change notifications; thread credentials; vfork freezing; mount options, kernel/mount last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; /proc/sys; locks; FUSE, overlay; change notifications; thread credentials; vfork freezing; mount options, kernel/mount; cgroups last)
 
 ## Responsibilities
 
@@ -368,7 +368,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 - On the root and on the writer's namespace root only `cgroup.procs`, `cgroup.threads` and
   `cgroup.subtree_control` are writable (`EPERM` otherwise). Writing a read-only file is `EINVAL`.
 - Enforced: `pids.max` (fork and thread creation), `memory.max` (the root shows the OOM killer's
-  limit and measurement; a child's usage is its members' RSS, checked periodically by the OOM
+  limit and measurement; a child's usage is its members' resident memory with what they share
+  counted once (`kernel/mm`'s `Usage`), checked periodically by the OOM
   killer and immediately when a lower limit is written; `memory.oom.group` widens the kill),
   `cgroup.freeze` (threads stop before returning to guest code, waits return and restart after
   thaw; `cgroup.events` reports frozen once every task has stopped or is a vfork parent waiting
