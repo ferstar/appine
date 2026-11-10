@@ -397,6 +397,9 @@ pub(crate) fn start(
     cpu: Cpu,
 ) -> Result<(), Errno> {
     let tid = task.tid.get();
+    if crate::bug::fails(crate::bug::Trap::ThreadStart, crate::bug::HOST) {
+        return Err(Errno::EAGAIN);
+    }
     let thread_shared = shared.clone();
     // No JoinHandle is kept: at the end of a session what is waited for is kernel.tasks becoming
     // empty, and after that the thread only has its own Cpu and translation cache left to free

@@ -320,11 +320,15 @@ pub(crate) enum Trap {
     Fast,
     /// Waiting on a futex (after registering as a waiter): planted for a process (pid).
     FutexWait,
+    /// Creating the host thread of a guest thread ([`crate::task::start`]): planted for
+    /// [`HOST`], it fails ([`fails`]) instead of panicking, as when the host has no thread to
+    /// give, whichever process the thread is for.
+    ThreadStart,
 }
 
 /// Bugs planted by the test hooks: the tid or pid planted for on each [`Trap`], 0 for none.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
-static ARMED: [AtomicI32; 7] = [const { AtomicI32::new(0) }; 7];
+static ARMED: [AtomicI32; 8] = [const { AtomicI32::new(0) }; 8];
 
 /// The step [`Trap::Finish`] is planted on (counting from 1).
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
@@ -350,19 +354,29 @@ pub(crate) fn trap_finish(tgid: Tid, step: u32) {
 /// [`HOST`]). Does nothing in builds without test hooks.
 #[inline]
 pub(crate) fn trap(at: Trap, id: Tid) {
+    if fails(at, id) {
+        panic!("panic injected by the test hook at {at:?}");
+    }
+}
+
+/// Whether a test hook has planted a failure on `at` for `id`, true once only: for places that
+/// fail with an error rather than a panic ([`Trap::ThreadStart`]). Always false in builds without
+/// test hooks.
+#[inline]
+pub(crate) fn fails(at: Trap, id: Tid) -> bool {
     #[cfg(any(debug_assertions, feature = "test-hooks"))]
     {
         let armed = &ARMED[at as usize];
-        if armed.load(Ordering::Relaxed) == id
+        armed.load(Ordering::Relaxed) == id
             && armed
                 .compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
-        {
-            panic!("panic injected by the test hook at {at:?}");
-        }
     }
     #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
-    let _ = (at, id);
+    {
+        let _ = (at, id);
+        false
+    }
 }
 
 /// The test hook's syscall number, far outside Linux's numbers. Exists only in debug builds and in
@@ -391,7 +405,10 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 ///     thread is woken, `TFD_TIMER_CANCEL_ON_SET` timerfds are cancelled), which a test cannot
 ///     cause by setting the host's clock;
 /// 12. hold the BKL for `addr` milliseconds, as a kernel operation that takes too long, for the
-///     BKL watchdog ([`crate::watchdog`]).
+///     BKL watchdog ([`crate::watchdog`]);
+/// 13. the next host thread created for a guest thread, in any process or for the host's
+///     `Machine::spawn`, cannot be created ([`Trap::ThreadStart`]): the clone or spawn fails with
+///     EAGAIN.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -441,6 +458,7 @@ pub(crate) fn test_hook(
         10 => arm(Trap::FutexWait, cx.tgid()),
         11 => crate::itimer::clock_jumped(cx.kr()),
         12 => std::thread::sleep(std::time::Duration::from_millis(addr)),
+        13 => arm(Trap::ThreadStart, HOST),
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)

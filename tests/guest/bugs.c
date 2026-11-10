@@ -7,7 +7,8 @@
  *
  * With an argument it only plants a bug for the host's calls into Machine methods (for the Machine
  * tests): host-call-then-exit exits after planting it, host-call-then-read reads stdin after
- * planting it.
+ * planting it, and thread-start-fails-then-exit instead makes the next host thread for a guest
+ * thread fail to be created, so the host's next spawn fails.
  */
 #include <errno.h>
 #include <pthread.h>
@@ -31,6 +32,7 @@
 #define HOOK_PANIC_UNLOCKED 8  /* panic with the BKL released: unwinding must retake it first */
 #define HOOK_PANIC_FAST 9      /* the next no-BKL system call panics */
 #define HOOK_PANIC_IN_FUTEX 10 /* panic on the next futex wait, after registering as a waiter */
+#define HOOK_THREAD_START_FAILS 13 /* the next host thread for a guest thread cannot be created */
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -102,6 +104,8 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
 
     if (argc > 1) {
+        if (strcmp(argv[1], "thread-start-fails-then-exit") == 0)
+            return syscall(TEST_SYSCALL, HOOK_THREAD_START_FAILS) == 0 ? 0 : 2;
         if (syscall(TEST_SYSCALL, HOOK_PANIC_IN_HOST) != 0)
             return 2;
         if (strcmp(argv[1], "host-call-then-read") == 0) {

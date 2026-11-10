@@ -318,10 +318,14 @@ impl Machine {
             &file,
             None,
         )));
+        // Whether the console had a session before this one, for giving it back on failure
+        let mut console = None;
         let fds = match stdio {
             Stdio::Host => FdTable::with_host_stdio(),
             Stdio::Console(id) => {
+                let attached = k.consoles.get(&id).is_some_and(|c| c.attached);
                 let (slave, tty) = terminal::attach(&mut k, id, tid).map_err(RunError::Console)?;
+                console = Some((id, attached));
                 group.ctty = Some(tty);
                 let mut table = FdTable::new();
                 for fd in 0..3 {
@@ -364,12 +368,22 @@ impl Machine {
             fast_sleep: None,
         };
         let ns = k.init_ns.clone();
-        let task = Task::new(tid, tid, &cpu, state, ns, 0, comm_of(program)).map_err(io_err)?;
+        let started = Task::new(tid, tid, &cpu, state, ns, 0, comm_of(program))
+            .and_then(|task| task::start(&self.shared, &mut k, task, cpu));
+        if let Err(e) = started {
+            // Nothing refers to the process yet, but the console has it as its session: give the
+            // console back, so a later spawn can attach to it
+            if let Some((id, attached)) = console {
+                terminal::detach(&mut k, id, tid, attached);
+            }
+            return Err(io_err(e));
+        }
+        // Registered only once its thread has started, as clone does: a process left without
+        // threads would keep its pid and its watched slot and never finish
         k.groups.insert(tid, group);
         k.groups[&INIT].borrow_mut().children.push(tid);
         k.forks += 1;
         k.watched.insert(tid, None);
-        task::start(&self.shared, &mut k, task, cpu).map_err(io_err)?;
         Ok(tid as u32)
     }
 

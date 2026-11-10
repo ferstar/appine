@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes, then consoles given back after a failed spawn)
 
 ## Responsibilities
 
@@ -67,8 +67,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - I/O: `syscall::tty::read`, `write`, `readiness`, `ioctl`.
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
   released).
-- Host console: `terminal::{open, attach, wake_objects, take_output, input_room, feed, fg_cwd,
-  resize, close, initial_size, bridge}`, wrapped by `Machine::{open_console, read_console,
+- Host console: `terminal::{open, attach, detach, wake_objects, take_output, input_room, feed,
+  fg_cwd, resize, close, initial_size, bridge}`, wrapped by `Machine::{open_console, read_console,
   write_console, resize_console, close_console, console_cwd}`, `Stdio::Console` at spawn and the
   kernel's `run`.
 
@@ -267,7 +267,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   leader its session and foreground and returns one slave file installed as fds 0–2 and the ctty
   (`ENOENT` for an unknown console, `EBUSY` while the terminal has a session: a guest session
   leader that opened it first, or a live attached one; after the leader's exit it can be attached
-  again).
+  again); when the spawn then fails, `detach` clears that session and puts back whether one was
+  ever attached.
 - The host takes output (`take_output`: bytes, nothing yet, or empty once a session was attached
   and the terminal's slaves are all closed, by any process), feeds input under `input_room`
   backpressure (`feed` delivers resulting signals), resizes (`SIGWINCH` on change), asks for the

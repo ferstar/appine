@@ -81,6 +81,23 @@ pub(crate) fn attach(
     Ok((slave, tty))
 }
 
+/// Undoes [`attach`] for `leader`, whose process could not be started: the console has no session
+/// again, and counts as attached only if it was before (`attached`), so its end of session is
+/// what it was.
+pub(crate) fn detach(k: &mut Kernel, id: u32, leader: Tid, attached: bool) {
+    let Some(console) = k.consoles.get_mut(&id) else {
+        return;
+    };
+    {
+        let mut t = console.master.tty.borrow_mut();
+        if t.session == Some(leader) {
+            t.session = None;
+            t.fg = None;
+        }
+    }
+    console.attached = attached;
+}
+
 /// The wake objects to register when waiting for console `id`'s output or for room in its input
 /// queue: its PTY. Closing a console requests a wake of the whole channel. None when the console
 /// does not exist.

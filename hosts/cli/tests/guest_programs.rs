@@ -278,7 +278,8 @@ fn clock_jumps_wake_wall_clock_waiters() {
 fn host_calls_survive_kernel_bugs() {
     // A kernel-layer panic while the host calls a Machine method (simulated by a test hook): only
     // that call fails, a call on a console also hangs up that console, and the Machine stays usable
-    // afterwards
+    // afterwards. A spawn whose thread cannot start fails without leaving its process or the
+    // console's session behind
     use appine_kernel::errno::Errno;
     use appine_kernel::{ExitStatus, KillReason, Machine, MachineOptions, RunError, Stdio, Tier};
     use std::os::unix::ffi::OsStrExt;
@@ -364,6 +365,33 @@ fn host_calls_survive_kernel_bugs() {
         let pid = machine
             .spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Console(id))
             .unwrap();
+        let (out, end) = read_all(&machine, id);
+        assert_eq!(
+            (out.as_str(), end),
+            ("Hello from appine!\r\n", Ok(())),
+            "{tier:?}"
+        );
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        // A spawn whose host thread cannot be created fails with EAGAIN, and the console is free
+        // for the next spawn (it used to stay EBUSY, held by a process that never ran)
+        let pid = machine
+            .spawn(
+                &path(&program),
+                &argv("thread-start-fails-then-exit"),
+                &[],
+                Stdio::Host,
+            )
+            .unwrap();
+        assert_eq!(machine.wait(pid), ExitStatus::Exited(0), "{tier:?}");
+        let id = machine.open_console(24, 80).unwrap();
+        let hello_on =
+            |id| machine.spawn(&path(&hello), &[b"hello".to_vec()], &[], Stdio::Console(id));
+        let r = hello_on(id);
+        assert!(
+            matches!(&r, Err(RunError::Io(e)) if e.raw_os_error() == Some(Errno::EAGAIN.0)),
+            "{tier:?}: {r:?}"
+        );
+        let pid = hello_on(id).unwrap();
         let (out, end) = read_all(&machine, id);
         assert_eq!(
             (out.as_str(), end),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record and failed host spawns last)
 
 ## Responsibilities
 
@@ -261,12 +261,14 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   unimplemented paths from `stub::top`) or `OutOfMemory` (from the OOM killer, `kernel/mm`). The
   host takes them with `Machine::take_kills` (`android/service`).
 - Test hooks exist only in debug builds and with the `test-hooks` feature, and answer `ENOSYS`
-  unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 12 panics at once, points a page
+  unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 13 panics at once, points a page
   at an inaccessible host page so the engine faults on the host, or plants a panic that fires once
   (`trap`) at the thread's exit, the next thread start, the next timer handling, the next host
   call, a step of process finish, right after releasing the BKL, the next no-BKL syscall or a futex
-  wait; it can also act as if the host's wall clock jumped, or hold the BKL for `addr`
-  milliseconds for the watchdog's tests. Any other `what` is `EINVAL`.
+  wait; it can also act as if the host's wall clock jumped, hold the BKL for `addr`
+  milliseconds for the watchdog's tests, or make the next host thread for a guest thread fail to
+  be created (`fails`: `task::start` returns `EAGAIN` for a clone or a host spawn). Any other
+  `what` is `EINVAL`.
 
 ### Exit and reaping
 
@@ -617,7 +619,9 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 
 - The virtual init is a thread group with no threads and no guest program. Host-started processes
   (each terminal tab's login shell) are its children; it adopts orphans and its children are never
-  zombies.
+  zombies. `Machine::spawn` registers such a process (in the group table, init's children and the
+  watched table) only once its host thread has started; when its task or thread cannot be
+  created, it gives the console it attached back (`kernel/tty`) and leaves nothing registered.
 - On request (the app always; `appine-run --init`) it boots from a subset of `/etc/inittab` (a
   store file; anything else is an empty table): `sysinit` (waited), then `boot` and `bootwait`
   together in file order (only `bootwait` waited), then `wait` (waited) and `once` (not waited) for
@@ -818,11 +822,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   `ENOSYS` (glibc since 2.25 and musl do not use them); an execve marks robust PI locks the thread
   holds owner-died with no owner but hands none to its waiters, which sleep until some thread exits
   or another locker takes and releases the word.
-- **A host spawn that fails to start its thread leaks the process:** `Machine::spawn` registers the
-  group with the virtual init, the watched table and (with a console) the terminal's session before
-  `task::start`, and undoes none of it when that fails, so a group without threads keeps its pid,
-  never finishes, never fills its watched slot, and leaves the console busy (`EBUSY`) for later
-  attaches; clone's path undoes the same failure.
 - **Doomed images:** `Machine::spawn` ignores `Image::doomed` and starts the program at pc 0 and
   sp 0 instead of failing the spawn; execve reports its ptrace exec event (and a successful syscall
   exit) for a doomed image, where Linux fails the exec before the event.
