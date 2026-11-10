@@ -389,12 +389,15 @@ typedef struct AppineVt {
   bool osc_open;
   uint8_t osc_head[OSC_HEAD];
   size_t osc_len;
-  // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
-  // or the end opposite the handle being dragged; tracked, so output does not move it
+  // The fixed end of a selection being dragged by a handle (appine_vt_select_to): the end opposite
+  // the handle, or a whole output selected; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
   GhosttyTrackedGridRef anchor_end;
-  // The anchor is a word (appine_vt_select_word), so a drag extends the selection by words
-  bool anchor_words;
+  // A press that selected a word or a line and the drag after it (appine_vt_gesture_*):
+  // libghostty-vt's selection gesture, which tracks the pressed cell, and its reusable events
+  GhosttySelectionGesture gesture;
+  GhosttySelectionGestureEvent gesture_press;
+  GhosttySelectionGestureEvent gesture_drag;
   // A cell in a command's output that a long press found (appine_vt_output_at), for the menu's
   // Select output; tracked, so output does not move it. NULL when none
   GhosttyTrackedGridRef output_at;
@@ -413,6 +416,12 @@ typedef struct AppineVt {
   // Scratch for the matches on the viewport's pages
   GhosttySelection *matches;
   size_t matches_cap;
+  // Scratch for all the search's matches and the rows they start on (appine_vt_search_rows),
+  // freed when the search ends
+  GhosttySelection *all_matches;
+  size_t all_matches_cap;
+  uint32_t *match_rows;
+  size_t match_rows_cap;
   // The search mark (MARK_*) of each viewport cell, row by row: as of this frame, and as last sent
   // (a row whose marks changed is sent again); marks_cells cells each, the grid's when allocated
   uint8_t *marks;
@@ -870,7 +879,14 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
       ghostty_key_event_new(NULL, &vt->event) != GHOSTTY_SUCCESS ||
       ghostty_mouse_encoder_new(NULL, &vt->mouse) != GHOSTTY_SUCCESS ||
       ghostty_mouse_event_new(NULL, &vt->mouse_event) != GHOSTTY_SUCCESS ||
-      ghostty_render_state_image_iterator_new(NULL, &vt->images) != GHOSTTY_SUCCESS) {
+      ghostty_render_state_image_iterator_new(NULL, &vt->images) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_new(NULL, &vt->gesture) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_new(NULL, &vt->gesture_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_new(NULL, &vt->gesture_drag,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG) !=
+          GHOSTTY_SUCCESS) {
     appine_vt_free(vt);
     return NULL;
   }
@@ -961,11 +977,16 @@ void appine_vt_free(AppineVt *vt) {
   if (vt == NULL) return;
   drop_anchor(vt);
   drop_output(vt);
-  // Before the terminal, so it releases what it tracks there
+  // Before the terminal, so they release what they track there
   if (vt->search) ghostty_search_free(vt->search);
+  if (vt->gesture) ghostty_selection_gesture_free(vt->gesture, vt->term);
+  if (vt->gesture_press) ghostty_selection_gesture_event_free(vt->gesture_press);
+  if (vt->gesture_drag) ghostty_selection_gesture_event_free(vt->gesture_drag);
   if (vt->images) ghostty_render_state_image_iterator_free(vt->images);
   free(vt->placed);
   free(vt->matches);
+  free(vt->all_matches);
+  free(vt->match_rows);
   free(vt->marks);
   free(vt->marks_sent);
   if (vt->mouse_event) ghostty_mouse_event_free(vt->mouse_event);
@@ -1893,7 +1914,6 @@ static void drop_anchor(AppineVt *vt) {
   if (vt->anchor_end) ghostty_tracked_grid_ref_free(vt->anchor_end);
   vt->anchor_start = NULL;
   vt->anchor_end = NULL;
-  vt->anchor_words = false;
 }
 
 // Tracks the cells at the screen coordinates (start, end) as the anchor
@@ -1922,8 +1942,8 @@ static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end
   return ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
 }
 
-// Installs a selection libghostty-vt derived (a word, a line) and anchors later drags to it; false
-// when it cannot be anchored.
+// Installs a selection libghostty-vt derived (a command's output) and anchors later drags to it;
+// false when it cannot be anchored.
 static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
   GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
   GhosttyPointCoordinate start, end;
@@ -1941,38 +1961,82 @@ static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
          set_selection(vt, a, b, false);
 }
 
-// Selects the word at viewport cell (x, y) and anchors later drags to it, which then extend the
-// selection by words (appine_vt_select_to); false when there is no word there (blank cells), with
-// any earlier selection cleared.
-bool appine_vt_select_word(AppineVt *vt, uint16_t x, uint16_t y) {
-  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
-  drop_anchor(vt);
-  GhosttyTerminalSelectWordOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
-  GhosttySelection word = GHOSTTY_INIT_SIZED(GhosttySelection);
-  if (!viewport_ref(vt, x, y, &options.ref) ||
-      ghostty_terminal_select_word(vt->term, &options, &word) != GHOSTTY_SUCCESS ||
-      !select_anchored(vt, &word)) {
-    return false;
+// A press that selects a word (a long press, a double tap) or a line (a triple tap), and dragging
+// on from it, go through libghostty-vt's selection gesture, Ghostty's own double- and triple-click
+// selection: the press selects the word or the line under it, and the drag extends the selection
+// by whole words or lines from the pressed cell (which the gesture tracks through output) to the
+// one under the finger. The view counts the taps itself, since on a touch screen a press is not
+// always a click (a finger drag scrolls), so each press is given to the gesture untimed, which
+// makes it a first click, with the behaviour the view asks for as a first click's.
+
+void appine_vt_select_clear(AppineVt *vt);
+
+// Starts a gesture at viewport cell (x, y), at pixel (px, py) from the grid's corner: selects the
+// word (behavior GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD) or the line (_LINE) there. A line is
+// Ghostty's triple-click line: the whole soft-wrapped line with its leading and trailing blanks
+// trimmed, stopping where a prompt mark (OSC 133) starts or ends a part of it, so a command is
+// selected without its prompt. False when there is none there (blank cells), with any earlier
+// selection cleared and the gesture ended.
+bool appine_vt_gesture_press(AppineVt *vt, int behavior, uint16_t x, uint16_t y, double px,
+                             double py) {
+  appine_vt_select_clear(vt);
+  GhosttySelectionGestureBehavior b = (GhosttySelectionGestureBehavior)behavior;
+  GhosttySelectionGestureBehaviors behaviors = {.single_click = b, .double_click = b,
+                                                .triple_click = b};
+  GhosttySurfacePosition at = {.x = px, .y = py};
+  GhosttyGridRef ref;
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (viewport_ref(vt, x, y, &ref) &&
+      ghostty_selection_gesture_event_set(vt->gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                          &ref) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->gesture_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                          &at) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->gesture_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS,
+                                          &behaviors) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event(vt->gesture, vt->term, vt->gesture_press, &sel) ==
+          GHOSTTY_SUCCESS &&
+      ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS) {
+    return true;
   }
-  vt->anchor_words = true;
-  return true;
+  ghostty_selection_gesture_reset(vt->gesture, vt->term);
+  return false;
 }
 
-// Selects the line at viewport cell (x, y), as Ghostty's triple click does: the whole soft-wrapped
-// line with its leading and trailing blanks trimmed, stopping where a prompt mark (OSC 133) starts
-// or ends a part of it, so a command is selected without its prompt; false when the line is blank,
-// with any earlier selection cleared.
-bool appine_vt_select_line(AppineVt *vt, uint16_t x, uint16_t y) {
-  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
-  drop_anchor(vt);
-  GhosttyTerminalSelectLineOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
-  // Off by default in the C API, on in Ghostty's own selectLine
-  options.semantic_prompt_boundary = true;
-  GhosttySelection line = GHOSTTY_INIT_SIZED(GhosttySelection);
-  return viewport_ref(vt, x, y, &options.ref) &&
-         ghostty_terminal_select_line(vt->term, &options, &line) == GHOSTTY_SUCCESS &&
-         select_anchored(vt, &line);
+// Drags the gesture on to viewport cell (x, y), at pixel (px, py) from the grid's corner: the
+// selection runs by whole words or lines from the pressed cell's to the cell's (passing over
+// blanks and punctuation, a word drag stays on the last word reached; over blank lines a line drag
+// stays on the last line). False, leaving the selection as it was, without a gesture, or when
+// there is nothing to select towards the cell or the pressed cell has gone (its screen changed).
+bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py) {
+  GhosttySelectionGestureGeometry geometry = {
+      .columns = vt->cols,
+      .cell_width = vt->cell_width,
+      .padding_left = 0,
+      .screen_height = (uint32_t)vt->height * vt->cell_height,
+  };
+  GhosttySurfacePosition at = {.x = px, .y = py};
+  GhosttyGridRef ref;
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  return viewport_ref(vt, x, y, &ref) &&
+         ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                             &ref) == GHOSTTY_SUCCESS &&
+         ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                             &at) == GHOSTTY_SUCCESS &&
+         ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
+                                             &geometry) == GHOSTTY_SUCCESS &&
+         ghostty_selection_gesture_event(vt->gesture, vt->term, vt->gesture_drag, &sel) ==
+             GHOSTTY_SUCCESS &&
+         ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
 }
+
+// Ends the gesture (the finger lifted), keeping its selection and releasing the pressed cell's
+// tracking.
+void appine_vt_gesture_end(AppineVt *vt) { ghostty_selection_gesture_reset(vt->gesture, vt->term); }
 
 // Starts dragging a selection handle: the other end becomes the anchor. end is the handle of the
 // selection's last cell, else its first. False when there is no selection.
@@ -1996,22 +2060,9 @@ static bool rectangular(AppineVt *vt) {
          sel.rectangle;
 }
 
-// The nearest word to `from` towards `to` (inclusive), as Ghostty's word drag looks for it
-static bool word_between(AppineVt *vt, GhosttyGridRef from, GhosttyGridRef to,
-                         GhosttySelection *out) {
-  GhosttyTerminalSelectWordBetweenOptions options =
-      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
-  options.start = from;
-  options.end = to;
-  *out = GHOSTTY_INIT_SIZED(GhosttySelection);
-  return ghostty_terminal_select_word_between(vt->term, &options, out) == GHOSTTY_SUCCESS;
-}
-
 // Extends the selection from the anchor to viewport cell (x, y): the anchor stays selected
-// whole, and the selection runs from its far side to the cell, or with a word as the anchor to
-// the end of the nearest word between the cell and the anchor, as Ghostty's double-click drag
-// does (passing over blanks and punctuation, it stays on the last word reached); a rectangle stays
-// one, with the anchor and the cell at opposite corners. False without an anchor.
+// whole, and the selection runs from its far side to the cell; a rectangle stays one, with the
+// anchor and the cell at opposite corners. False without an anchor.
 bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   if (vt->anchor_start == NULL || vt->anchor_end == NULL) return false;
   GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
@@ -2028,16 +2079,6 @@ bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   probe.start = start;
   probe.end = cell;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
-  GhosttySelection anchored, reached;
-  // The anchor's first cell stands for the press, as it lies in the word pressed; when the word
-  // has gone (cleared from the screen), the drag goes by cells
-  if (vt->anchor_words && !rectangle && word_between(vt, start, cell, &anchored) &&
-      word_between(vt, cell, start, &reached)) {
-    if (order == GHOSTTY_SELECTION_ORDER_REVERSE) {
-      return set_selection(vt, reached.start, anchored.end, false);
-    }
-    return set_selection(vt, anchored.start, reached.end, false);
-  }
   if (order == GHOSTTY_SELECTION_ORDER_REVERSE) return set_selection(vt, end, cell, rectangle);
   probe.start = end;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
@@ -2118,6 +2159,7 @@ bool appine_vt_select_output(AppineVt *vt) {
 void appine_vt_select_clear(AppineVt *vt) {
   drop_anchor(vt);
   drop_output(vt);
+  ghostty_selection_gesture_reset(vt->gesture, vt->term);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
 }
 
@@ -2355,10 +2397,75 @@ bool appine_vt_search_select(AppineVt *vt, bool older) {
   return ghostty_search_set(vt->search, option, NULL) == GHOSTTY_SUCCESS;
 }
 
+// The rows of the scroll bar (screen rows) the search's matches start on, for marks along it:
+// each row once, newest first, as many as *len says, and in *selected the selected match's row
+// (-1 for none). NULL with *len 0 without a search or a match. Valid until the next call or the
+// search's end. Rows are counted per page, whose rows follow one another, so only a page's first
+// row is looked up (counting the rows of the pages above it, which reads no compressed page),
+// not each match's.
+const uint32_t *appine_vt_search_rows(AppineVt *vt, size_t *len, int64_t *selected) {
+  *len = 0;
+  *selected = -1;
+  if (vt->search == NULL) return NULL;
+  GhosttySelection chosen = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate at;
+  if (ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &chosen) ==
+          GHOSTTY_SUCCESS &&
+      screen_point(vt, &chosen.start, &at)) {
+    *selected = at.y;
+  }
+  GhosttySelectionBuffer all = {.ptr = vt->all_matches, .cap = vt->all_matches_cap};
+  GhosttyResult r = ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_MATCHES, &all);
+  if (r == GHOSTTY_OUT_OF_SPACE) {
+    GhosttySelection *p = realloc(vt->all_matches, all.len * sizeof(*p));
+    if (p == NULL) return NULL;
+    vt->all_matches = p;
+    vt->all_matches_cap = all.len;
+    all = (GhosttySelectionBuffer){.ptr = p, .cap = all.len};
+    r = ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_MATCHES, &all);
+  }
+  if (r != GHOSTTY_SUCCESS || all.len == 0) return NULL;
+  if (all.len > vt->match_rows_cap) {
+    uint32_t *p = realloc(vt->match_rows, all.len * sizeof(*p));
+    if (p == NULL) return NULL;
+    vt->match_rows = p;
+    vt->match_rows_cap = all.len;
+  }
+  void *node = NULL;
+  bool found = false;
+  uint32_t first = 0;
+  size_t n = 0;
+  for (size_t i = 0; i < all.len; i++) {
+    GhosttyGridRef ref = all.ptr[i].start;
+    if (ref.node != node) {
+      node = ref.node;
+      GhosttyGridRef top = ref;
+      top.x = 0;
+      top.y = 0;
+      GhosttyPointCoordinate p;
+      found = screen_point(vt, &top, &p);
+      first = found ? p.y : 0;
+    }
+    if (!found) continue;
+    uint32_t row = first + ref.y;
+    // Newest first: the matches of a row come together
+    if (n > 0 && vt->match_rows[n - 1] == row) continue;
+    vt->match_rows[n++] = row;
+  }
+  *len = n;
+  return n > 0 ? vt->match_rows : NULL;
+}
+
 // Ends the search; the next frame sends the rows its marks were on again.
 void appine_vt_search_end(AppineVt *vt) {
   if (vt->search) ghostty_search_free(vt->search);
   vt->search = NULL;
+  free(vt->all_matches);
+  free(vt->match_rows);
+  vt->all_matches = NULL;
+  vt->all_matches_cap = 0;
+  vt->match_rows = NULL;
+  vt->match_rows_cap = 0;
 }
 
 // ---- Clearing and resetting ----

@@ -234,6 +234,23 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var searchSelected = 0
 
     /**
+     * The search's matches along the scroll bar ([drawMatchMarks]): the scroll bar rows they start
+     * on, newest first, and the selected match's (-1 for none), as taken ([takeMatchRows]) at the
+     * count, selected match and time noted with them; [matchRowsTotal] -1 asks for them again.
+     */
+    private var matchRows = IntArray(0)
+    private var matchSelectedRow = -1
+    private var matchRowsTotal = -1
+    private var matchRowsSelected = 0
+    private var matchRowsAt = 0L
+
+    /** The scrollable rows of the frame before, to tell when rows left the scrollback. */
+    private var lastScrollTotal = 0
+
+    /** The height of a match's mark along the scroll bar. */
+    private val matchMarkHeight = (2 * resources.displayMetrics.density).roundToInt().coerceAtLeast(1)
+
+    /**
      * Where the viewport was before a step to another match ([searchStep]) or prompt
      * ([jumpToPrompt]), -1 when none is under way: the next frame shows the scroll bar if the step
      * scrolled.
@@ -312,17 +329,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The touch under way stopped a fling, so its tap does nothing else. */
     private var stoppedFling = false
 
-    // Selection drags: by the long-pressed word, or by a handle; in mouse mode a long press held
-    // on may instead become a drag for the program
+    // Selection drags: by words from a long-pressed word or a double tap's, by lines from a triple
+    // tap's line (libghostty-vt's selection gesture), or by a handle; in mouse mode a long press
+    // held on may instead become a drag for the program
     private var drag = DRAG_NONE
     private var dragOffsetX = 0f
     private var dragOffsetY = 0f
     private var dragCellX = -1
     private var dragCellY = -1
 
-    /** Where a long press in mouse mode was: the program's drag starts there if the finger moves on. */
+    /**
+     * Where a long press in mouse mode was (the program's drag starts there if the finger moves
+     * on), or the press of a double or triple tap (a drag from there extends its selection).
+     */
     private var pressX = 0f
     private var pressY = 0f
+
+    /** The finger pressing a double or triple tap has moved past the touch slop: it drags. */
+    private var pressMoved = false
 
     /** The button of a mouse (not a finger) held down for a program tracking the mouse, or 0. */
     private var mouseButton = 0
@@ -348,7 +372,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             // By whole rows, the grid in its place
             scrollPx = 0
             VtNative.scroll(tab, autoscroll)
-            VtNative.selectTo(tab, autoscrollX, if (autoscroll < 0) 0 else rows - 1)
+            val y = if (autoscroll < 0) 0 else rows - 1
+            extendTo(autoscrollX, y, (autoscrollX + 0.5f) * cellWidth, (y + 0.5f) * cellHeight)
             awakenScrollBars()
             invalidate()
             postDelayed(this, AUTOSCROLL_MS)
@@ -424,6 +449,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         endSearch()
         session?.let { if (it.view === this) it.view = null }
         menu?.finish()
+        if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS) VtNative.gestureEnd(tab)
         drag = DRAG_NONE
         autoscroll = 0
         removeCallbacks(autoscrollTick)
@@ -467,6 +493,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (tab == 0L) return
         searching = true
         VtNative.search(tab, needle)
+        // Another needle can find as many matches elsewhere
+        matchRowsTotal = -1
         invalidate()
     }
 
@@ -488,6 +516,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         searching = false
         searchTotal = 0
         searchSelected = 0
+        matchRows = IntArray(0)
+        matchSelectedRow = -1
+        matchRowsTotal = -1
         if (tab != 0L) VtNative.searchEnd(tab)
         invalidate()
     }
@@ -626,6 +657,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             drawCursor(c)
             drawPreedit(c)
         }
+        drawMatchMarks(c)
         drawHandles(c)
         if (menuPending) {
             menuPending = false
@@ -690,7 +722,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 searchSelected = selectedMatch
                 host.onSearchCount(total, selectedMatch)
             }
+            // The matches' rows move only when rows leave the scrollback (at its limit, cleared)
+            // or the search changes; output goes on adding rows below them, taken again now and
+            // then in case as many rows left as came
+            val now = SystemClock.uptimeMillis()
+            if (total != matchRowsTotal || selectedMatch != matchRowsSelected || scrollTotal < lastScrollTotal ||
+                (b.get(4).toInt() != DIRTY_NONE && now - matchRowsAt >= MATCH_ROWS_MS)
+            ) {
+                takeMatchRows(total, selectedMatch, now)
+            }
         }
+        lastScrollTotal = scrollTotal
         if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
         updateBlink()
         if (cursorX != oldCursorX || cursorY != oldCursorY) restartBlink()
@@ -754,6 +796,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
             pos += n * 16 + extra * 4
         }
+    }
+
+    /** Takes the rows of the search's matches along the scroll bar, at a count and selected match. */
+    private fun takeMatchRows(total: Int, selectedMatch: Int, now: Long) {
+        val taken = VtNative.searchRows(tab) ?: return
+        matchSelectedRow = taken[0]
+        matchRows = taken.copyOfRange(1, taken.size)
+        matchRowsTotal = total
+        matchRowsSelected = selectedMatch
+        matchRowsAt = now
     }
 
     /** A u16 coordinate of the frame, -1 for 0xffff (none). */
@@ -1139,6 +1191,35 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         c.drawRect(l, t + underlineY, l + w, t + underlineY + light, fill)
     }
 
+    /**
+     * The search's matches along the scroll bar, as browsers mark found text: a mark as wide as
+     * the scroll bar where each row a match starts on lies among the scrollable rows, as the thumb
+     * lies over the rows shown (its top where the mark of the viewport's first row is, unless the
+     * thumb is held at its least length), the selected match's in its own colour, while a search
+     * runs and there is a scrollback to scroll. They do not fade, unlike the thumb drawn over them.
+     */
+    private fun drawMatchMarks(c: Canvas) {
+        if (!searching || scrollTotal <= scrollLen || (matchRows.isEmpty() && matchSelectedRow < 0)) return
+        val right = width.toFloat()
+        val left = right - verticalScrollbarWidth
+        val last = height - matchMarkHeight
+        val at = { row: Int -> (row.toLong() * height / scrollTotal).toInt().coerceIn(0, max(0, last)) }
+        fill.color = SEARCH_MATCH
+        var drawn = -1
+        for (row in matchRows) {
+            val top = at(row)
+            // Rows closer than a pixel share one mark
+            if (top == drawn) continue
+            drawn = top
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), fill)
+        }
+        if (matchSelectedRow >= 0) {
+            val top = at(matchSelectedRow)
+            fill.color = SEARCH_SELECTED
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), fill)
+        }
+    }
+
     // ---- Input ----
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
@@ -1483,13 +1564,28 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (cx == dragCellX && cy == dragCellY) return
         dragCellX = cx
         dragCellY = cy
-        if (VtNative.selectTo(tab, cx, cy)) {
+        extendTo(cx, cy, px, py + scrollPx)
+    }
+
+    /**
+     * Extends the selection to viewport cell ([cx], [cy]), at pixel ([px], [py]) from the grid's
+     * corner: by words or lines from a gesture's press ([VtNative.gestureDrag]), by cells from a
+     * handle's anchor ([VtNative.selectTo]).
+     */
+    private fun extendTo(cx: Int, cy: Int, px: Float, py: Float) {
+        val extended = if (drag == DRAG_WORD || drag == DRAG_TAPS) {
+            VtNative.gestureDrag(tab, cx, cy, px, py)
+        } else {
+            VtNative.selectTo(tab, cx, cy)
+        }
+        if (extended) {
             selected = true
             invalidate()
         }
     }
 
     private fun endDrag() {
+        if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS) VtNative.gestureEnd(tab)
         drag = DRAG_NONE
         autoscroll = 0
         removeCallbacks(autoscrollTick)
@@ -1709,6 +1805,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
             return true
         }
+        // So does a double or triple tap's press that selected: moved on, it drags the selection
+        if (event.actionMasked == MotionEvent.ACTION_DOWN && tapPress(event)) return true
+        if (drag == DRAG_TAPS) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_MOVE -> if (pressMoved || hypot(event.x - pressX, event.y - pressY) > touchSlop) {
+                    pressMoved = true
+                    dragTo(event.x, event.y)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endTaps(event)
+            }
+            return true
+        }
         scaler.onTouchEvent(event)
         if (!scaler.isInProgress) gestures.onTouchEvent(event)
         when (drag) {
@@ -1760,6 +1868,45 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
+    /**
+     * The press of the second or third tap in a row (each within the double-tap timeout and slop
+     * of the last tap's lift) without mouse tracking: selects the word or the line under it at
+     * once, and a drag on from it extends the selection by words or lines, as Ghostty's double-
+     * and triple-click drags do. False when it is no such press, or there is nothing to select
+     * there (blank cells): it then goes on as any touch, and its tap acts as a single one.
+     */
+    private fun tapPress(e: MotionEvent): Boolean {
+        if (tab == 0L || mouseTracking || stoppedFling) return false
+        val again = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
+            hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
+        if (!again) return false
+        val behavior = if (taps + 1 == 3) VtNative.GESTURE_LINE else VtNative.GESTURE_WORD
+        if (!VtNative.gesturePress(tab, behavior, cellX(e.x), cellY(e.y), e.x, e.y + scrollPx)) return false
+        taps++
+        selected = true
+        menuLink = null
+        menuOutput = false
+        startDrag(DRAG_TAPS, e.x, e.y)
+        pressX = e.x
+        pressY = e.y
+        pressMoved = false
+        invalidate()
+        return true
+    }
+
+    /**
+     * The finger lifted from a double or triple tap's press: the selection's menu comes up, and a
+     * press that did not drag counts as a tap, which the next may follow (after a third, a tap
+     * starts over).
+     */
+    private fun endTaps(e: MotionEvent) {
+        val tapped = e.actionMasked == MotionEvent.ACTION_UP && !pressMoved
+        endDrag()
+        lastTapTime = if (tapped && taps < 3) e.eventTime else 0L
+        lastTapX = e.x
+        lastTapY = e.y
+    }
+
     /** The finger moved on after a long press in mouse mode: the program gets a left-button drag. */
     private fun startMouseDrag(e: MotionEvent) {
         if (selected) clearSelection()
@@ -1783,8 +1930,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     /**
-     * Taps without a delay: each tap acts at once, the second of a double tap selects the word and
-     * the third of a triple tap the line.
+     * Taps without a delay: each tap acts at once, and the press of a double tap's second selects
+     * the word, of a triple tap's third the line ([tapPress], before the detector sees it).
      */
     private val gestures = GestureDetector(
         context,
@@ -1803,8 +1950,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 lastTapTime = if (taps < 3) e.eventTime else 0L
                 lastTapX = e.x
                 lastTapY = e.y
-                // In mouse mode every tap is a click, for the program's own double and triple clicks
-                if (taps > 1 && !mouseTracking && tab != 0L && selectAt(e, line = taps == 3)) return true
+                // In mouse mode every tap is a click, for the program's own double and triple
+                // clicks; without it a double or triple tap reaches here only on blank cells
                 if (selected || menu != null) {
                     clearSelection()
                     return true
@@ -1845,7 +1992,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             override fun onLongPress(e: MotionEvent) {
                 if (tab == 0L || scaler.isInProgress) return
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                val word = VtNative.selectWord(tab, cellX(e.x), cellY(e.y))
+                val word = VtNative.gesturePress(tab, VtNative.GESTURE_WORD, cellX(e.x), cellY(e.y), e.x, e.y + scrollPx)
                 menuLink = linkAt(e.x, e.y)
                 menuOutput = VtNative.outputAt(tab, cellX(e.x), cellY(e.y))
                 if (mouseTracking) {
@@ -1918,23 +2065,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
         }
         return super.onGenericMotionEvent(event)
-    }
-
-    /**
-     * A double tap's word or a triple tap's [line] under a tap, with the menu; false when there is
-     * none there (blank cells), and the tap acts as a single one.
-     */
-    private fun selectAt(e: MotionEvent, line: Boolean): Boolean {
-        val x = cellX(e.x)
-        val y = cellY(e.y)
-        if (!(if (line) VtNative.selectLine(tab, x, y) else VtNative.selectWord(tab, x, y))) return false
-        selected = true
-        menuLink = null
-        menuOutput = false
-        menuX = -1f
-        menuPending = true
-        invalidate()
-        return true
     }
 
     /** A left click at a tap, for a program tracking the mouse. */
@@ -2109,6 +2239,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val HEADER_BYTES = 64
         const val IMAGE_BYTES = 56
         const val ROW_HEADER_BYTES = 12
+        const val DIRTY_NONE = 0
         const val DIRTY_FULL = 2
         const val FLAG_MOUSE = 1
         const val FLAG_ALT_SCREEN = 1 shl 1
@@ -2169,6 +2300,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val DRAG_END = 3
         const val DRAG_PRESS = 4
         const val DRAG_MOUSE = 5
+        const val DRAG_TAPS = 6
         const val AUTOSCROLL_MS = 50L
 
         const val MENU_COPY = 1
@@ -2197,5 +2329,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val SEARCH_MATCH = 0xFFFFE082.toInt()
         const val SEARCH_SELECTED = 0xFFF2A57E.toInt()
         const val SEARCH_TEXT = 0xFF000000.toInt()
+
+        /** How often the rows of the search's matches are taken again while output goes on. */
+        const val MATCH_ROWS_MS = 500L
     }
 }

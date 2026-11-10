@@ -103,17 +103,23 @@ internal object VtNative {
     @JvmStatic external fun jumpPrompt(tab: Long, delta: Int)
 
     /**
-     * Selects the word at viewport cell ([x], [y]) and anchors later [selectTo] calls to it;
-     * false when there is no word there (the selection is then cleared).
+     * Starts a selection gesture (Ghostty's double- and triple-click selection) at viewport cell
+     * ([x], [y]), pixel ([px], [py]) from the grid's corner: selects the word ([GESTURE_WORD]) or
+     * the line ([GESTURE_LINE]: soft wraps joined, blanks at its ends left out, a prompt left out
+     * when OSC 133 marks it) there, for [gestureDrag] to extend; false when there is none there
+     * (the selection is then cleared).
      */
-    @JvmStatic external fun selectWord(tab: Long, x: Int, y: Int): Boolean
+    @JvmStatic external fun gesturePress(tab: Long, behavior: Int, x: Int, y: Int, px: Float, py: Float): Boolean
 
     /**
-     * Selects the line at viewport cell ([x], [y]) as Ghostty's triple click does (soft wraps
-     * joined, blanks at its ends left out, a prompt left out when OSC 133 marks it) and anchors
-     * later [selectTo] calls to it; false when the line is blank (the selection is then cleared).
+     * Drags the gesture [gesturePress] started on to viewport cell ([x], [y]), pixel ([px], [py]):
+     * the selection runs by whole words or lines from the pressed cell's to this one's. False when
+     * the selection stays as it was (nothing to select towards the cell, or no gesture).
      */
-    @JvmStatic external fun selectLine(tab: Long, x: Int, y: Int): Boolean
+    @JvmStatic external fun gestureDrag(tab: Long, x: Int, y: Int, px: Float, py: Float): Boolean
+
+    /** Ends the gesture (the finger lifted), keeping its selection. */
+    @JvmStatic external fun gestureEnd(tab: Long)
 
     /**
      * Starts dragging the handle of the selection's last cell ([end]) or first cell: the other end
@@ -122,9 +128,8 @@ internal object VtNative {
     @JvmStatic external fun selectGrab(tab: Long, end: Boolean): Boolean
 
     /**
-     * Extends the selection from its anchor to viewport cell ([x], [y]): by whole words when the
-     * anchor is a word [selectWord] selected, else to the cell; a rectangle stays one, with the
-     * anchor and the cell at opposite corners.
+     * Extends the selection from its anchor to viewport cell ([x], [y]); a rectangle stays one,
+     * with the anchor and the cell at opposite corners.
      */
     @JvmStatic external fun selectTo(tab: Long, x: Int, y: Int): Boolean
 
@@ -183,6 +188,14 @@ internal object VtNative {
      */
     @JvmStatic external fun searchSelect(tab: Long, older: Boolean): Boolean
 
+    /**
+     * The scroll bar rows (the frame header's scrollable rows, from the oldest) the search's
+     * matches start on, for marks along the scroll bar: the selected match's first (-1 for none),
+     * then each row a match starts on once, newest first (none without a search); null without the
+     * tab.
+     */
+    @JvmStatic external fun searchRows(tab: Long): IntArray?
+
     /** Ends the search; the next frame takes its marks away. */
     @JvmStatic external fun searchEnd(tab: Long)
 
@@ -236,6 +249,10 @@ internal object VtNative {
 
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)
+
+    // libghostty-vt's GhosttySelectionGestureBehavior ([gesturePress])
+    const val GESTURE_WORD = 1
+    const val GESTURE_LINE = 2
 
     // libghostty-vt's GhosttySelectionAdjust ([selectAdjust])
     const val ADJUST_LEFT = 0

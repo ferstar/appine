@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use appine_kernel::Machine;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jbyteArray, jfloat, jint, jlong, jobject, jstring};
+use jni::sys::{jboolean, jbyteArray, jfloat, jint, jintArray, jlong, jobject, jstring};
 
 use super::{machine, string, throw};
 
@@ -145,8 +145,16 @@ unsafe extern "C" {
         cap: usize,
     ) -> isize;
     fn appine_vt_focus(vt: *mut AppineVt, gained: bool, out: *mut c_char, cap: usize) -> isize;
-    fn appine_vt_select_word(vt: *mut AppineVt, x: u16, y: u16) -> bool;
-    fn appine_vt_select_line(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_gesture_press(
+        vt: *mut AppineVt,
+        behavior: i32,
+        x: u16,
+        y: u16,
+        px: f64,
+        py: f64,
+    ) -> bool;
+    fn appine_vt_gesture_drag(vt: *mut AppineVt, x: u16, y: u16, px: f64, py: f64) -> bool;
+    fn appine_vt_gesture_end(vt: *mut AppineVt);
     fn appine_vt_select_grab(vt: *mut AppineVt, end: bool) -> bool;
     fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_adjust(vt: *mut AppineVt, adjustment: i32) -> bool;
@@ -159,6 +167,7 @@ unsafe extern "C" {
     fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
     fn appine_vt_search(vt: *mut AppineVt, needle: *const u8, len: usize) -> bool;
     fn appine_vt_search_select(vt: *mut AppineVt, older: bool) -> bool;
+    fn appine_vt_search_rows(vt: *mut AppineVt, len: *mut usize, selected: *mut i64) -> *const u32;
     fn appine_vt_search_end(vt: *mut AppineVt);
     fn appine_vt_clear(vt: *mut AppineVt) -> i32;
     fn appine_vt_reset(vt: *mut AppineVt) -> bool;
@@ -1052,38 +1061,64 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_jumpPrompt<'l>(
     })
 }
 
-/// Selects the word at viewport cell (`x`, `y`) and anchors drags to it; false when there is no
-/// word there (the selection is then cleared).
+/// Starts a selection gesture at viewport cell (`x`, `y`), pixel (`px`, `py`) from the grid's
+/// corner: selects the word or the line there (`behavior`, libghostty-vt's
+/// `GhosttySelectionGestureBehavior`); false when there is none (the selection is then cleared).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectWord<'l>(
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_gesturePress<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
+    behavior: jint,
     x: jint,
     y: jint,
+    px: jfloat,
+    py: jfloat,
 ) -> jboolean {
-    guarded!("VtNative.selectWord", 0, {
-        tab(handle)
-            .is_some_and(|tab| unsafe { appine_vt_select_word(tab.term().0, cell(x), cell(y)) })
-            as jboolean
+    guarded!("VtNative.gesturePress", 0, {
+        tab(handle).is_some_and(|tab| unsafe {
+            appine_vt_gesture_press(
+                tab.term().0,
+                behavior,
+                cell(x),
+                cell(y),
+                px.into(),
+                py.into(),
+            )
+        }) as jboolean
     })
 }
 
-/// Selects the line at viewport cell (`x`, `y`) (soft wraps joined, blanks at its ends left out,
-/// a prompt left out when OSC 133 marks it) and anchors drags to it; false when the line is blank
-/// (the selection is then cleared).
+/// Drags the selection gesture on to viewport cell (`x`, `y`), pixel (`px`, `py`), extending the
+/// selection by words or lines; false when the selection stays as it was.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectLine<'l>(
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_gestureDrag<'l>(
     _: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
     x: jint,
     y: jint,
+    px: jfloat,
+    py: jfloat,
 ) -> jboolean {
-    guarded!("VtNative.selectLine", 0, {
-        tab(handle)
-            .is_some_and(|tab| unsafe { appine_vt_select_line(tab.term().0, cell(x), cell(y)) })
-            as jboolean
+    guarded!("VtNative.gestureDrag", 0, {
+        tab(handle).is_some_and(|tab| unsafe {
+            appine_vt_gesture_drag(tab.term().0, cell(x), cell(y), px.into(), py.into())
+        }) as jboolean
+    })
+}
+
+/// Ends the selection gesture, keeping its selection.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_gestureEnd<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    guarded!("VtNative.gestureEnd", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_gesture_end(tab.term().0) };
+        }
     })
 }
 
@@ -1283,6 +1318,44 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_searchSelect<'l>(
     guarded!("VtNative.searchSelect", 0, {
         tab(handle).is_some_and(|tab| unsafe { appine_vt_search_select(tab.term().0, older != 0) })
             as jboolean
+    })
+}
+
+/// The scroll bar rows the search's matches start on, for marks along it: the selected match's
+/// first (-1 for none), then each row a match starts on once, newest first (none without a
+/// search); null without the tab.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_searchRows<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jintArray {
+    guarded!("VtNative.searchRows", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let term = tab.term();
+        let mut len = 0usize;
+        let mut selected = -1i64;
+        let p = unsafe { appine_vt_search_rows(term.0, &mut len, &mut selected) };
+        let mut rows = Vec::with_capacity(len + 1);
+        rows.push(i32::try_from(selected).unwrap_or(-1));
+        if !p.is_null() {
+            // SAFETY: vt.c keeps len rows at p until its next call, which needs the lock held here
+            let found = unsafe { std::slice::from_raw_parts(p, len) };
+            rows.extend(found.iter().map(|&r| i32::try_from(r).unwrap_or(i32::MAX)));
+        }
+        drop(term);
+        let Ok(size) = i32::try_from(rows.len()) else {
+            return std::ptr::null_mut();
+        };
+        let Ok(array) = env.new_int_array(size) else {
+            return std::ptr::null_mut();
+        };
+        if env.set_int_array_region(&array, 0, &rows).is_err() {
+            return std::ptr::null_mut();
+        }
+        array.into_raw()
     })
 }
 
