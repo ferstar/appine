@@ -392,7 +392,9 @@ fn master_write(
 }
 
 /// A slave write: goes through output processing, and waits for the master to read when the
-/// output queue is full.
+/// output queue is full. Echoes that found no room go out ahead of each piece written (Linux
+/// calls `n_tty_write`, which starts with `process_echoes`, once per chunk of a write); reading
+/// the master alone does not send them, on Linux either.
 fn slave_write(
     cx: &mut Cx<'_>,
     tty: &Rc<RefCell<Tty>>,
@@ -413,10 +415,13 @@ fn slave_write(
             if t.masters == 0 || t.hung(false, born) {
                 return if done > 0 { Ok(done) } else { Err(Errno::EIO) };
             }
+            let echoed = t.echoes_before_write();
             let n = t.output_room().min(data.len() - done);
             if n > 0 {
                 t.write_output(&data[done..done + n]);
                 done += n;
+            }
+            if n > 0 || echoed {
                 request_wake_object(wake::of(tty));
             }
         }

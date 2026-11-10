@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/tty.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes)
 
 ## Responsibilities
 
@@ -126,8 +128,8 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   column it took (two for `^X`, none for a control character without `ECHOCTL`).
 - Echoes wait in `echoes` and are written at the end of each batch of input (a master write, even
   an empty one, a slave read that returned data, any termios change), on a slave `TIOCSTI` the line
-  discipline has room for, or when stopped output restarts, through output processing with the
-  column (`^X`, tab backspaces and an echoed 0xff bypass it).
+  discipline has room for, when stopped output restarts, or before each piece of a slave write,
+  through output processing with the column (`^X`, tab backspaces and an echoed 0xff bypass it).
 - Each batch that hands the line discipline at least one byte counts once as an arrival for the
   slave (as do a slave `TIOCSTI` with room and the console's injected EOF); epoll re-arms an
   edge-triggered slave watcher on it, but a canonical slave is readable only with a complete line.
@@ -167,10 +169,12 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   `EIO` without a master; `TOSTOP` background check.
 - While output is stopped, slave writes block and echoes wait; restarting writes them. Echoes also
   go out only while the output queue has room for each whole one (`__process_echoes`); the rest
-  wait for the next commit (not a master read), at most 4096 of them (the oldest dropped), and a
-  slave write's data goes out ahead of them. TCIOFF and TCION on the slave send their character
-  even through a ^S stop (reporting `STOP` again in packet mode); under TCOOFF, or with the output
-  queue full, it is lost, as Linux's `pty_write` refuses it.
+  wait for the next commit, at most 4096 of them (the oldest dropped): the next batch of input, or
+  the next slave write, which sends them ahead of each piece of its data (`n_tty_write` starts
+  with `process_echoes`); a master read does not send them, on Linux either. TCIOFF and TCION
+  on the slave send their character even through a ^S stop (reporting `STOP` again in packet
+  mode); under TCOOFF, or with the output queue full, it is lost, as Linux's `pty_write` refuses
+  it.
 - Master reads: a pending packet status byte is returned alone; otherwise `TIOCPKT_DATA` (in
   packet mode) plus the output. Once the slave has been opened and all slaves closed, master reads
   return `EIO` after draining and poll reports `POLLHUP`; a never-opened slave does not count, so
@@ -346,8 +350,6 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   so fstat reports the pts device (136:N, with the devpts inode and owner) instead of 5:0 (5:1 for
   `/dev/console`); programs that recognise the controlling-terminal device by its number see a
   different device than on Linux.
-- **Echoes held for output room wait for the next input**, not for the master to read; a slave
-  write's data goes out ahead of them.
 - **Fidelity gaps:** `IMAXBEL`, break handling, `HUPCL` and `VDISCARD` are not implemented;
   `TIOCEXCL` is a no-op; `TIOCGETD` is always 0; `TIOCGEXCL` and `TIOCGDEV` are `ENOTTY`;
   `FIONREAD` and `TIOCOUTQ` on the master count the whole output queue; flow-control characters

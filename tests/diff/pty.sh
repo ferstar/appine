@@ -496,3 +496,42 @@ print(os.read(r, 1000).decode())
 os.waitpid(pid, 0)
 print("nothing typed: slave reads", pending(s), "master reads", pending(m))
 PY
+
+# Echoes that found the output full wait until the slave's next write, which sends them ahead of
+# its own data (6.1's n_tty_write starts with process_echoes); reading the master alone does not
+# send them. The slave fills the output, the master types a character whose echo has no room,
+# reads everything, and the slave writes
+python3 - <<'PY'
+import fcntl, functools, os, select, time
+
+print = functools.partial(print, flush=True)
+
+
+def pending(fd):
+    out = b""
+    while select.select([fd], [], [], 0.3)[0]:
+        out += os.read(fd, 65536)
+    return out
+
+
+m, s = os.openpty()
+fcntl.fcntl(s, fcntl.F_SETFL, fcntl.fcntl(s, fcntl.F_GETFL) | os.O_NONBLOCK)
+full = False
+while not full:
+    try:
+        while True:
+            os.write(s, b"o" * 1024)
+    except BlockingIOError:
+        pass
+    time.sleep(0.2)
+    try:
+        os.write(s, b"o")
+    except BlockingIOError:
+        full = True
+os.write(m, b"x")
+time.sleep(0.2)
+drained = pending(m)
+print("output drained:", len(drained) > 0, "with the echo in it:", b"x" in drained)
+os.write(s, b"DATA")
+print("after the slave's write the master reads", pending(m))
+PY

@@ -1214,6 +1214,14 @@ impl Tty {
         OUTPUT_MAX.saturating_sub(self.output.len())
     }
 
+    /// Before a slave write's data: echoes still waiting for room go out first, as
+    /// `n_tty_write` starts with `process_echoes`. Whether any output was added.
+    pub fn echoes_before_write(&mut self) -> bool {
+        let before = self.output.len();
+        self.commit_echoes();
+        self.output.len() != before
+    }
+
     /// A slave write: goes through output processing into the output queue.
     pub fn write_output(&mut self, data: &[u8]) {
         for &c in data {
