@@ -535,3 +535,31 @@ print("output drained:", len(drained) > 0, "with the echo in it:", b"x" in drain
 os.write(s, b"DATA")
 print("after the slave's write the master reads", pending(m))
 PY
+
+# Non-canonical reads with VMIN and VTIME both set: VTIME is an inter-byte timer (n_tty_read sets
+# the timeout again after each arrival), so bytes 0.4 s apart keep a 1 s read waiting until VMIN
+# of them have come, and only a pause of VTIME ends it with fewer
+python3 - <<'PY'
+import functools, os, termios, threading, time, tty
+
+print = functools.partial(print, flush=True)
+m, s = os.openpty()
+tty.setraw(s)
+attrs = termios.tcgetattr(s)
+attrs[6][termios.VMIN] = 4
+attrs[6][termios.VTIME] = 10
+termios.tcsetattr(s, termios.TCSANOW, attrs)
+
+
+def typed(data, gap):
+    for c in data:
+        os.write(m, bytes([c]))
+        time.sleep(gap)
+
+
+for data, gap in ((b"abcd", 0.4), (b"xy", 0.1)):
+    writer = threading.Thread(target=typed, args=(data, gap), daemon=True)
+    writer.start()
+    print("read", os.read(s, 100))
+    writer.join()
+PY

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes, then consoles given back after a failed spawn)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes, consoles given back after a failed spawn, then VTIME as an inter-byte timer)
 
 ## Responsibilities
 
@@ -148,8 +148,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Canonical: one line per read. A line ended by `VEOF` returns its data without the mark when the
   buffer has room for both; a read filling the buffer exactly leaves the mark, and the next read
   returns 0 (EOF). Non-canonical: `VMIN`/`VTIME` (0/0 returns at once; 0/T times out from the
-  start of the read; N/0 waits for `min(VMIN, len)` bytes; N/T arms one deadline at the first byte
-  and never re-arms it, a total rather than Linux's inter-byte timer). With `EXTPROC` and
+  start of the read; N/0 waits for `min(VMIN, len)` bytes; N/T waits for the first byte and then
+  returns once `VTIME` passes with no new byte, Linux's inter-byte timer, waiting for a first byte
+  again when another reader or a flush took what had come). With `EXTPROC` and
   `ICANON` a read returns what has arrived, as with `VMIN` 1. Slave `POLLIN` (`poll_readable`,
   Linux's `input_available_p` for poll) needs `VMIN` bytes when `VTIME` is 0 and `VMIN` above 0,
   otherwise any; a nonblocking read takes what has arrived even below `VMIN`. A read makes room
@@ -338,7 +339,6 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 - **One slave write can overshoot the output limit** by its `ONLCR` and tab expansion (the write is
   clamped to the room before output processing).
-- **Non-canonical reads differ:** `VTIME` with `VMIN>0` is a total instead of an inter-byte timer.
 - **`TIOCSCTTY` returns 0 to a non-leader** whose controlling terminal it is: the "already the
   caller's ctty" test runs before the session-leader check, where Linux answers `EPERM`.
 - **`TIOCSPGRP` error codes:** `EPERM` instead of `ESRCH` for unknown groups, `ENOTTY` instead of

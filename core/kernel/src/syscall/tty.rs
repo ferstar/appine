@@ -265,6 +265,8 @@ fn slave_read(
     }
     check_background(cx, tty, Signal::TTIN)?;
     let mut deadline: Option<Instant> = None;
+    // Non-canonical bytes seen so far, to restart VTIME's inter-byte timer on each arrival
+    let mut seen = 0;
     // Reading makes room for input that was waiting, which may hold signal characters
     let deliver = |cx: &mut Cx<'_>, n: usize| {
         let signals = tty.borrow_mut().take_signals();
@@ -310,10 +312,17 @@ fn slave_read(
                 if vmin == 0 && (vtime.is_zero() || expired) {
                     return Ok(0);
                 }
-                // VTIME: with VMIN 0 it counts from the start of the read, otherwise from the
-                // first byte received
-                if !vtime.is_zero() && deadline.is_none() && (vmin == 0 || avail > 0) {
-                    deadline = Some(Instant::now() + vtime);
+                // VTIME: with VMIN 0 it counts from the start of the read; otherwise it is an
+                // inter-byte timer, started at the first byte and again whenever more arrive
+                // (n_tty_read sets the timeout again after copying what came), and with nothing
+                // left (taken by another reader or flushed) the read waits for a first byte again
+                if !vtime.is_zero() {
+                    if vmin == 0 {
+                        deadline.get_or_insert_with(|| Instant::now() + vtime);
+                    } else if avail != seen {
+                        deadline = (avail > 0).then(|| Instant::now() + vtime);
+                        seen = avail;
+                    }
                 }
             }
             if t.masters == 0 {
