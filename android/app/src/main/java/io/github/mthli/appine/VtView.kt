@@ -845,16 +845,23 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Releases matter only to programs using the Kitty keyboard protocol's event types. */
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
         val key = VtKeys.of(keyCode)
-        if (tab == 0L || event.isSystem || key == 0) return super.onKeyUp(keyCode, event)
+        if (tab == 0L || systemKey(event) || key == 0) return super.onKeyUp(keyCode, event)
         val bytes = VtNative.key(tab, key, VtKeys.mods(event.metaState), 0, VtKeys.ACTION_RELEASE, null, event.getUnicodeChar(0))
         if (bytes == null || bytes.isEmpty()) return super.onKeyUp(keyCode, event)
         send(bytes)
         return true
     }
 
+    /**
+     * A key the system keeps (Back, Home, volume, media): Android counts the menu key among them,
+     * but a hardware keyboard's context menu key goes to the program, as `CSI 29 ~` like Ghostty's
+     * (this activity has no options menu for it).
+     */
+    private fun systemKey(event: KeyEvent) = event.isSystem && event.keyCode != KeyEvent.KEYCODE_MENU
+
     /** Encodes a key press for the program; false for keys it does not take (Back, volume). */
     private fun key(event: KeyEvent): Boolean {
-        if (tab == 0L || event.isSystem) return false
+        if (tab == 0L || systemKey(event)) return false
         val key = VtKeys.of(event.keyCode)
         val action = if (event.repeatCount > 0) VtKeys.ACTION_REPEAT else VtKeys.ACTION_PRESS
         if (VtKeys.isModifier(event.keyCode)) {

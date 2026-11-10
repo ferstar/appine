@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, then the ⋮ button's description, the menu key and resize replies last)
 
 ## Responsibilities
 
@@ -169,7 +169,7 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier, a link that cannot be opened), cancelling the previous one.
-  TalkBack reads "Tab N: title" and the `×` and `+` buttons by name; `⋮` has no description.
+  TalkBack reads "Tab N: title" and the `×`, `+` and `⋮` buttons by name (`⋮` as "More options").
 - `×` and the menu's "Close other tabs" and "Close all tabs" close at once when no shell they
   close is running, else after a confirmation dialog ("Close this tab?" for one tab, else "Close N
   tabs?"); several tabs are closed with the current one last, so no other tab is shown (and its
@@ -338,7 +338,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   (cursor and keypad modes, Kitty keyboard protocol, including releases from `onKeyUp` and lone
   modifiers, which are sent only when the encoder emits something). An unmapped key that types a
   character goes as text without Ctrl or Alt, and to the encoder as an unidentified key with that
-  text with them; one that types nothing goes to the system. A key the encoder cannot encode is
+  text with them; one that types nothing goes to the system. System keys (Back, Home, volume,
+  media) go to the system, except the menu key, a hardware keyboard's context menu key, which goes
+  to the encoder (`CSI 29 ~` in the legacy encoding). A key the encoder cannot encode is
   swallowed and leaves the modifiers on.
 - CTRL, ALT and SHIFT on the extra keys (SHIFT only with the first page shown) apply to the next
   key or one typed character (turned back into a key event through the virtual keyboard's key
@@ -441,6 +443,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   Ghostty copies), puts it on the clipboard and ends the selection.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
   and resizes the terminal and then the console (SIGWINCH); the activity saves the new size.
+- A resize (`VtSession.resize`, from attaching and every regrid) takes the replies the terminal
+  made for it, the in-band size report of a program using mode 2048, and writes them through the
+  tab's writer at once, rather than leaving them for the pump's next read.
 
 ### Licenses
 
@@ -661,13 +666,6 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   (tab bar, extra keys, the terminal's font in pixels, `VtView`'s touch and double-tap slops,
   fling velocity and handle margin): `MainActivity` handles `density` itself and builds its views
   once in `onCreate`, so the new sizes apply only once the activity is created again.
-- **A resize's in-band size report** (mode 2048) waits in the replies until the pump's next read
-  or a paste takes it, so a program waiting only for that report after a resize stalls until it
-  writes something else.
-- **`VtKeys` maps `KEYCODE_MENU`**, which Android counts as a system key, so it never reaches the
-  encoder.
-- **The tab bar's `⋮` has no content description**, so TalkBack reads only the character, unlike
-  `×` and `+`.
 
 ## Open questions
 

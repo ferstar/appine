@@ -413,24 +413,34 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_frame<'l>(
     })
 }
 
-/// Resizes the terminal and then the console (whose foreground group gets SIGWINCH).
+/// Resizes the terminal and then the console (whose foreground group gets SIGWINCH); returns the
+/// replies the terminal has for the console, such as the in-band size report a program asked for
+/// with mode 2048 (empty when there are none, null when the tab is gone), for the caller to write
+/// after the resize: the pump would send them only after its next read.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_resize<'l>(
-    _: JNIEnv<'l>,
+    mut env: JNIEnv<'l>,
     _: JClass<'l>,
     handle: jlong,
     cols: jint,
     rows: jint,
     cell_width: jint,
     cell_height: jint,
-) {
-    guarded!("VtNative.resize", (), {
-        let Some(tab) = tab(handle) else { return };
+) -> jbyteArray {
+    guarded!("VtNative.resize", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
         let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
-        unsafe { appine_vt_resize(tab.term().0, cols, rows, cw, ch) };
+        let replies = {
+            let mut term = tab.term();
+            unsafe { appine_vt_resize(term.0, cols, rows, cw, ch) };
+            term.take_replies()
+        };
         if let Some(m) = tab.machine() {
             let _ = m.resize_console(tab.console, rows, cols);
         }
+        bytes_array(&mut env, &replies)
     })
 }
 

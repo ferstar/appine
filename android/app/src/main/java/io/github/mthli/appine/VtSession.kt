@@ -216,7 +216,10 @@ internal class VtSession(
         main.post { if (!released) events.onNotification(this, title, body) }
     }
 
-    /** The grid changed: the terminal reflows and the console's foreground group gets SIGWINCH. */
+    /**
+     * The grid changed: the terminal reflows, the console's foreground group gets SIGWINCH, and a
+     * program that asked for in-band size reports (mode 2048) gets one.
+     */
     fun resize(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int) {
         if (tab == 0L) return
         if (cols == this.cols && rows == this.rows && cellWidth == this.cellWidth && cellHeight == this.cellHeight) return
@@ -224,7 +227,10 @@ internal class VtSession(
         this.rows = rows
         this.cellWidth = cellWidth
         this.cellHeight = cellHeight
-        VtNative.resize(tab, cols, rows, cellWidth, cellHeight)
+        // Replies the resize made (the size report of a program using mode 2048) go out at once,
+        // not after the program's next output
+        val replies = VtNative.resize(tab, cols, rows, cellWidth, cellHeight)
+        if (replies != null && replies.isNotEmpty()) write(replies)
     }
 
     /** Input for the program, written on the tab's writer thread; dropped once the shell exited. */

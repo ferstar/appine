@@ -18,6 +18,7 @@
     <string name="listening_direct">Other devices on the network can connect to it.</string>
     <string name="new_tab">New tab</string>
     <string name="close_tab">Close tab</string>
+    <string name="more_options">More options</string>
     <string name="close_tab_title">Close this tab?</string>
     <string name="close_tab_message">Closing it hangs up its shell, which usually ends the programs running in it too.</string>
     <string name="close">Close</string>

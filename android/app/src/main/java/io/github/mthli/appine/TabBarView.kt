@@ -194,7 +194,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         addView(closeButton, item())
         addView(button("+") { target.newTab() }.apply { contentDescription = context.getString(R.string.new_tab) }, item())
-        addView(button("⋮") { target.menu(it) }, item())
+        addView(button("⋮") { target.menu(it) }.apply { contentDescription = context.getString(R.string.more_options) }, item())
     }
 
     // With gesture navigation, a slide from the screen's left edge over the tabs scrolls them

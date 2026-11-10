@@ -34,8 +34,11 @@ internal object VtNative {
      */
     @JvmStatic external fun frame(tab: Long, full: Boolean): ByteBuffer?
 
-    /** Resizes the terminal, then the console (SIGWINCH). */
-    @JvmStatic external fun resize(tab: Long, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int)
+    /**
+     * Resizes the terminal, then the console (SIGWINCH); returns the terminal's replies for the
+     * console, such as the size report of mode 2048 (empty when none, null when the tab is gone).
+     */
+    @JvmStatic external fun resize(tab: Long, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): ByteArray?
 
     /**
      * Encodes a key for the program ([VtKeys] has the key numbers and modifier bits); null when
