@@ -15,7 +15,9 @@
 //     u16 cols, u16 rows
 //     u8  dirty            0 nothing changed, 1 some rows, 2 every row
 //     u8  cursor_visible   1 when visible and inside the viewport
-//     u8  cursor_style     0 bar, 1 block, 2 underline, 3 hollow block
+//     u8  cursor_style     0 bar, 1 block, 2 underline, 3 hollow block, 4 lock (the console reads
+//                          a password: shown even when the program hid the cursor, never
+//                          blinking)
 //     u8  cursor_blinking
 //     u16 cursor_x, u16 cursor_y
 //     u32 foreground       0xAARRGGBB, the default colours (after OSC 10/11 and reverse video)
@@ -43,7 +45,8 @@
 //     u16 image_count      number of image placements that follow
 //     u8  overscan         rows captured below the viewport: 1 while it is scrolled back (there
 //                          is a row after it), else 0
-//     u8  reserved
+//     u8  pointer          the mouse pointer's shape the program asked for (OSC 22,
+//                          GhosttyMouseShape), text (an I-beam) by default
 //     u32 animation_ms     when to draw again for the next frame of an animated image, 0 when
 //                          none plays
 //   image_count image placements (Kitty graphics), in drawing order, 56 bytes each:
@@ -123,6 +126,9 @@
 #define FLAG_RECTANGLE 0x20
 #define FLAG_SEARCH_PENDING 0x40
 
+// The frame's cursor style while the console reads a password, after GhosttyCursorStyle's four
+#define CURSOR_LOCK 4
+
 // A cell's search mark (AppineVt.marks), shifted into its attrs at bit 14
 #define MARK_NONE 0
 #define MARK_MATCH 1
@@ -168,8 +174,23 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 #define NOTIFICATION_MAX ((size_t)4096)
 
 // How much of an OSC string's start appine_vt_feed keeps to find clipboard reads (OSC 52 with "?"
-// for data: "52;", the clipboards, ";?"), which fit with all eight clipboards named
-#define OSC_HEAD 32
+// for data: "52;", the clipboards, ";?", which fit with all eight clipboards named) and how the
+// shell moves its cursor (OSC 133;A with its options: Ghostty's bash integration sends
+// "133;A;redraw=last;cl=line;aid=" and the shell's pid)
+#define OSC_HEAD 64
+
+// How a tap on the input typed at the shell's prompt moves its cursor there
+// (appine_vt_prompt_click), as the last prompt's start (OSC 133;A) declared: not at all; with left
+// and right arrows within the input's line (cl=line, and cl=m, v and w, which Ghostty treats as
+// line too); or with a mouse press the shell places the cursor by itself (Kitty's click_events=1,
+// its row counted from the screen's top, =2 from the prompt's first row)
+#define PROMPT_CLICK_NONE 0
+#define PROMPT_CLICK_ARROWS 1
+#define PROMPT_CLICK_ABSOLUTE 2
+#define PROMPT_CLICK_RELATIVE 3
+
+// Rows above the cursor searched for the first row of the prompt it is at (appine_vt_prompt_click)
+#define PROMPT_ROWS 64
 
 // The memory each screen's Kitty images may take, decoded; beyond it libghostty-vt deletes the
 // oldest images no placement shows, and refuses an image that does not fit at all. About three
@@ -389,6 +410,9 @@ typedef struct AppineVt {
   bool osc_open;
   uint8_t osc_head[OSC_HEAD];
   size_t osc_len;
+  // How a tap on the shell's input moves its cursor (PROMPT_CLICK_*), as the primary screen's last
+  // prompt start declared it (osc_ended); a full reset forgets it, as libghostty-vt's screen does
+  uint8_t prompt_click;
   // The fixed end of a selection being dragged by a handle (appine_vt_select_to): the end opposite
   // the handle, or a whole output selected; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -405,6 +429,8 @@ typedef struct AppineVt {
   // again until it ends (or HOLD_LIMIT_NS passes)
   bool held;
   int64_t held_since;
+  // The console reads a password (appine_vt_set_password_input): frames give the cursor as a lock
+  bool password_input;
   // The cell of the last mouse event reported, to report motion once per cell rather than for
   // every pixel a drag or hover moves: the encoder's own deduplication forgets the cell whenever
   // its options are set, which appine_vt_mouse does for every event
@@ -645,6 +671,13 @@ static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   }
 }
 
+// A program's full reset (RIS): the screen forgets how its shell's prompt moves the cursor
+static void on_reset(GhosttyTerminal t, void *userdata) {
+  (void)t;
+  AppineVt *vt = userdata;
+  vt->prompt_click = PROMPT_CLICK_NONE;
+}
+
 // ---- PNG images (Kitty graphics) ----
 
 // Decodes a PNG image a program sent into RGBA (straight alpha) allocated from allocator, as
@@ -819,7 +852,8 @@ static void append(Buf *b, const char *s) {
 // margins, attributes, cursor and keypad modes and the palette; the modes it leaves alone are
 // reset by name (reverse video, mouse tracking, focus events, bracketed paste, synchronized
 // output, colour scheme and size reports, Kitty paste events; alternate scroll is set, its
-// default), as are the Kitty keyboard flags, an open hyperlink and the title. The cursor then
+// default), as are the Kitty keyboard flags, an open hyperlink, the title and the mouse pointer's
+// shape (OSC 22, which a full reset keeps). The cursor then
 // starts a line of its own with what follows marked as output, not as the input of a prompt the
 // snapshot was taken at (a resize at a prompt clears it for the shell to redraw), and nothing is
 // left below it.
@@ -836,7 +870,7 @@ static void settle(GhosttyTerminal term) {
   append(&seq, "\x1b[!p");
   // (1001, highlight tracking, is not implemented: resetting it would only log a warning)
   append(&seq, "\x1b[?5;9;1000;1002;1003;1004;1005;1006;1015;1016;2004;2026;2031;2048;5522l");
-  append(&seq, "\x1b[?1007h\x1b[<99u\x1b]8;;\x1b\\\x1b]0;\x1b\\");
+  append(&seq, "\x1b[?1007h\x1b[<99u\x1b]8;;\x1b\\\x1b]0;\x1b\\\x1b]22;\x1b\\");
   if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
   seq.len = 0;
   // Output first: a line feed in a prompt's input marks the next row as the prompt's
@@ -919,6 +953,7 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
                        (const void *)on_program_status);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
                        (const void *)on_semantic_prompt);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_RESET, (const void *)on_reset);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE,
                        (const void *)on_unknown_sequence);
   size_t unknown = UNKNOWN_MAX;
@@ -1016,6 +1051,7 @@ static void changed(AppineVt *vt) {
 }
 
 static void osc_ended(AppineVt *vt);
+static bool is_alternate(AppineVt *vt);
 bool appine_vt_at_prompt(AppineVt *vt);
 
 // Feeds console output to the terminal. It stops at the ends of OSC strings to find clipboard reads
@@ -1062,13 +1098,21 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
   changed(vt);
 }
 
-// An OSC string ended: a clipboard read (OSC 52 ; clipboards ; ?) is counted, with the clipboard it
+static void prompt_started(AppineVt *vt, const uint8_t *options, size_t len);
+
+// An OSC string ended: a prompt's start (OSC 133;A) on the primary screen tells how a tap moves
+// the shell's cursor; a clipboard read (OSC 52 ; clipboards ; ?) is counted, with the clipboard it
 // names first ('c' for the standard one, also when it names none; 'p' primary, 's' selection), which
 // the answer names as Ghostty's does
 static void osc_ended(AppineVt *vt) {
   const uint8_t *s = vt->osc_head;
   size_t n = vt->osc_len;
-  if (n > OSC_HEAD || n < 5 || memcmp(s, "52;", 3) != 0) return;
+  if (n > OSC_HEAD) return;
+  if (n >= 5 && memcmp(s, "133;A", 5) == 0 && (n == 5 || s[5] == ';')) {
+    if (!is_alternate(vt)) prompt_started(vt, s + 5, n - 5);
+    return;
+  }
+  if (n < 5 || memcmp(s, "52;", 3) != 0) return;
   size_t i = 3;
   for (; i < n && s[i] != ';'; i++) {
     bool clipboard = s[i] == 'c' || s[i] == 'p' || s[i] == 'q' || s[i] == 's' ||
@@ -1081,12 +1125,50 @@ static void osc_ended(AppineVt *vt) {
   vt->clipboard_reads++;
 }
 
+// The value of option key among an OSC 133 command's options (';'-separated key=value pairs), as
+// libghostty-vt reads them: the first pair with that key; NULL when there is none
+static const uint8_t *prompt_option(const uint8_t *s, size_t n, const char *key, size_t *len) {
+  size_t k = strlen(key);
+  for (size_t i = 0; i < n;) {
+    size_t end = i;
+    while (end < n && s[end] != ';') end++;
+    if (end - i > k && s[i + k] == '=' && memcmp(s + i, key, k) == 0) {
+      *len = end - i - k - 1;
+      return s + i + k + 1;
+    }
+    i = end + 1;
+  }
+  return NULL;
+}
+
+// A prompt started (OSC 133;A, with what follows the A): its options say how a tap moves the
+// cursor, read as libghostty-vt reads them: Kitty's click_events first, then cl, a value it does not
+// know counting as none; with neither, the way the last prompt declared stays
+static void prompt_started(AppineVt *vt, const uint8_t *options, size_t len) {
+  size_t n = 0;
+  const uint8_t *v = prompt_option(options, len, "click_events", &n);
+  if (v != NULL && n == 1 && (v[0] == '1' || v[0] == '2')) {
+    vt->prompt_click = v[0] == '1' ? PROMPT_CLICK_ABSOLUTE : PROMPT_CLICK_RELATIVE;
+    return;
+  }
+  v = prompt_option(options, len, "cl", &n);
+  if (v != NULL && ((n == 4 && memcmp(v, "line", 4) == 0) ||
+                    (n == 1 && (v[0] == 'm' || v[0] == 'v' || v[0] == 'w')))) {
+    vt->prompt_click = PROMPT_CLICK_ARROWS;
+  }
+}
+
 // The answers collected since the last call; valid until the next feed
 const uint8_t *appine_vt_take_replies(AppineVt *vt, size_t *len) {
   *len = vt->replies.len;
   vt->replies.len = 0;
   return vt->replies.ptr;
 }
+
+// Whether the console reads lines without echoing them (ICANON on, ECHO off, which the kernel
+// tells), as programs read passwords: frames then give the cursor as a lock, as Ghostty draws it at
+// password prompts (the C API cannot set libghostty-vt's own flag for it)
+void appine_vt_set_password_input(AppineVt *vt, bool on) { vt->password_input = on; }
 
 static void search_reselect(AppineVt *vt, size_t index);
 
@@ -1350,9 +1432,16 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   put_u16(h, vt->cols);
   put_u16(h + 2, vt->height);
   h[4] = (uint8_t)dirty;
-  h[5] = cursor.visible && cursor.viewport_has_value;
-  h[6] = (uint8_t)cursor.visual_style;
-  h[7] = cursor.blinking;
+  if (vt->password_input) {
+    // As Ghostty draws it: wherever the cursor is in the viewport, whatever the program asked
+    h[5] = cursor.viewport_has_value;
+    h[6] = CURSOR_LOCK;
+    h[7] = false;
+  } else {
+    h[5] = cursor.visible && cursor.viewport_has_value;
+    h[6] = (uint8_t)cursor.visual_style;
+    h[7] = cursor.blinking;
+  }
   if (cursor.viewport_has_value) {
     put_u16(h + 8, cursor.viewport_x);
     put_u16(h + 10, cursor.viewport_y);
@@ -1396,6 +1485,9 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   GhosttyRenderStateOverscan captured = {0};
   ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_OVERSCAN, &captured);
   h[58] = captured.below > 0;
+  GhosttyMouseShape pointer = GHOSTTY_MOUSE_SHAPE_TEXT;
+  ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_MOUSE_SHAPE, &pointer);
+  h[59] = (uint8_t)pointer;
   put_u32(h + 60, animation_ms);
   vt->frame.len = HEADER_BYTES;
 
@@ -2389,6 +2481,177 @@ const uint8_t *appine_vt_link(AppineVt *vt, uint16_t x, uint16_t y, size_t *len)
   return found ? vt->text.ptr : NULL;
 }
 
+// ---- Taps on the prompt ----
+//
+// A tap on the input typed at the shell's prompt moves the shell's cursor there, as Ghostty's
+// cursor-click-to-move does for a prompt that declares how (prompt_click): left or right arrows,
+// one for each input cell between the cursor and the tapped cell within the cursor's line (its soft
+// wraps joined), or a mouse press, for a shell that places the cursor itself. Only cells the prompt
+// marks call input count, so the prompt and blank cells are passed over as the shell's cursor
+// passes over them. Unlike Ghostty, which counts both cells of a wide character, a wide character
+// takes one arrow, as line editors move by characters.
+
+// Screen row y's prompt state (GHOSTTY_ROW_SEMANTIC_*) and whether it is a soft-wrapped row's
+// continuation and wraps onto the next row
+static bool prompt_row(AppineVt *vt, uint32_t y, GhosttyRowSemanticPrompt *prompt, bool *continues,
+                       bool *wraps) {
+  GhosttyGridRef ref;
+  GhosttyRow row;
+  *prompt = GHOSTTY_ROW_SEMANTIC_NONE;
+  *continues = false;
+  *wraps = false;
+  return screen_ref(vt, 0, y, &ref) && ghostty_grid_ref_row(&ref, &row) == GHOSTTY_SUCCESS &&
+         ghostty_row_get(row, GHOSTTY_ROW_DATA_SEMANTIC_PROMPT, prompt) == GHOSTTY_SUCCESS &&
+         ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP_CONTINUATION, continues) == GHOSTTY_SUCCESS &&
+         ghostty_row_get(row, GHOSTTY_ROW_DATA_WRAP, wraps) == GHOSTTY_SUCCESS;
+}
+
+// Whether screen cell (x, y) is input typed at a prompt, and its width (*wide)
+static bool input_cell(AppineVt *vt, uint16_t x, uint32_t y, GhosttyCellWide *wide) {
+  GhosttyGridRef ref;
+  GhosttyCell cell;
+  GhosttyCellSemanticContent content = GHOSTTY_CELL_SEMANTIC_OUTPUT;
+  *wide = GHOSTTY_CELL_WIDE_NARROW;
+  return screen_ref(vt, x, y, &ref) && ghostty_grid_ref_cell(&ref, &cell) == GHOSTTY_SUCCESS &&
+         ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, wide) == GHOSTTY_SUCCESS &&
+         ghostty_cell_get(cell, GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, &content) == GHOSTTY_SUCCESS &&
+         content == GHOSTTY_CELL_SEMANTIC_INPUT;
+}
+
+// Whether the cursor stops at screen cell (x, y) when the shell moves it by one character: input,
+// and not the second half of a wide character or the blank one leaves at a row's end
+static bool input_stop(AppineVt *vt, uint16_t x, uint32_t y) {
+  GhosttyCellWide wide;
+  return input_cell(vt, x, y, &wide) &&
+         (wide == GHOSTTY_CELL_WIDE_NARROW || wide == GHOSTTY_CELL_WIDE_WIDE);
+}
+
+// The first row of the prompt the cursor's row is in, found as libghostty-vt finds prompts going
+// up: the nearest prompt row at or above it, or the first of the continuation rows that lead up to
+// it when no prompt row begins them (it left the scrollback). False when there is none within
+// PROMPT_ROWS.
+static bool prompt_top(AppineVt *vt, uint32_t from, uint32_t *top) {
+  bool found = false;
+  for (uint32_t n = 0; n < PROMPT_ROWS && n <= from; n++) {
+    uint32_t y = from - n;
+    GhosttyRowSemanticPrompt prompt;
+    bool continues, wraps;
+    if (!prompt_row(vt, y, &prompt, &continues, &wraps)) break;
+    if (prompt == GHOSTTY_ROW_SEMANTIC_PROMPT) {
+      *top = y;
+      return true;
+    }
+    if (prompt == GHOSTTY_ROW_SEMANTIC_PROMPT_CONTINUATION) {
+      *top = y;
+      found = true;
+    } else if (found) {
+      break;
+    }
+  }
+  return found;
+}
+
+// Right arrows from the cursor to a cell after it (Ghostty's promptClickLine): the input after the
+// cursor up to and including that cell, over the rows that soft-wrap on from the cursor's and
+// continue its prompt; a cell past the line's input moves to the end of it (one more arrow when
+// the cursor is on input, to the cell after the last).
+static size_t moves_right(AppineVt *vt, GhosttyPointCoordinate cursor,
+                          GhosttyPointCoordinate click) {
+  size_t count = 0;
+  for (uint32_t y = cursor.y; y <= click.y; y++) {
+    GhosttyRowSemanticPrompt prompt;
+    bool continues, wraps;
+    if (!prompt_row(vt, y, &prompt, &continues, &wraps)) break;
+    if (y != cursor.y && prompt != GHOSTTY_ROW_SEMANTIC_PROMPT_CONTINUATION) break;
+    for (uint32_t x = y == cursor.y ? (uint32_t)cursor.x + 1 : 0; x < vt->cols; x++) {
+      if (!input_stop(vt, (uint16_t)x, y)) continue;
+      count++;
+      if (y == click.y && x == click.x) return count;
+    }
+    if (!wraps) {
+      GhosttyCellWide wide;
+      if (input_cell(vt, cursor.x, cursor.y, &wide)) count++;
+      break;
+    }
+  }
+  return count;
+}
+
+// Left arrows from the cursor to a cell before it: the input before the cursor down to and
+// including that cell, over the rows of the cursor's line above its row; a cell before the line's
+// input moves to the start of it.
+static size_t moves_left(AppineVt *vt, GhosttyPointCoordinate cursor,
+                         GhosttyPointCoordinate click) {
+  size_t count = 0;
+  for (uint32_t y = cursor.y;; y--) {
+    for (uint32_t x = y == cursor.y ? cursor.x : vt->cols; x-- > 0;) {
+      if (!input_stop(vt, (uint16_t)x, y)) continue;
+      count++;
+      if (y == click.y && x == click.x) return count;
+    }
+    GhosttyRowSemanticPrompt prompt;
+    bool continues, wraps;
+    if (y == click.y || y == 0 || !prompt_row(vt, y, &prompt, &continues, &wraps) || !continues) {
+      break;
+    }
+  }
+  return count;
+}
+
+// A tap on viewport cell (x, y): when the shell's prompt declared a way to move its cursor, the
+// cursor is at the prompt and the cell is not above the prompt's first row, the bytes that move the
+// cursor there are left in the replies (none when it is already there or no input lies between)
+// and it returns true; otherwise false, and the tap is no prompt's.
+bool appine_vt_prompt_click(AppineVt *vt, uint16_t x, uint16_t y) {
+  if (vt->prompt_click == PROMPT_CLICK_NONE || !appine_vt_at_prompt(vt)) return false;
+  if (x >= vt->cols) x = vt->cols - 1;
+  if (y >= vt->height) y = vt->height - 1;
+  uint16_t cx = 0;
+  uint16_t cy = 0;
+  GhosttyGridRef ref;
+  GhosttyPointCoordinate cursor, click;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_CURSOR_X, &cx) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &cy) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+  GhosttyPoint at = {.tag = GHOSTTY_POINT_TAG_ACTIVE, .value.coordinate = {.x = cx, .y = cy}};
+  if (ghostty_terminal_grid_ref(vt->term, at, &ref) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &ref, &cursor) || !viewport_ref(vt, x, y, &ref) ||
+      !screen_point(vt, &ref, &click)) {
+    return false;
+  }
+  // The rows above the cursor may be on a compressed page, which reading them restores
+  vt->compress_touched = true;
+  uint32_t top = 0;
+  if (!prompt_top(vt, cursor.y, &top) || click.y < top) return false;
+
+  if (vt->prompt_click != PROMPT_CLICK_ARROWS) {
+    // A left button press (SGR), as Kitty and Ghostty send it, without a release
+    uint32_t row = vt->prompt_click == PROMPT_CLICK_ABSOLUTE ? (uint32_t)y + 1 : click.y - top + 1;
+    char press[48];
+    snprintf(press, sizeof(press), "\x1b[<0;%u;%uM", (unsigned)x + 1, (unsigned)row);
+    append(&vt->replies, press);
+    return true;
+  }
+  // The second half of a wide character stands for the character
+  GhosttyCellWide wide;
+  input_cell(vt, click.x, click.y, &wide);
+  if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL && click.x > 0) click.x--;
+  if (click.x == cursor.x && click.y == cursor.y) return true;
+  bool right = click.y > cursor.y || (click.y == cursor.y && click.x > cursor.x);
+  size_t count = right ? moves_right(vt, cursor, click) : moves_left(vt, cursor, click);
+  // The arrows the program's cursor key mode (DECCKM) asks for, as Ghostty sends them
+  bool application = mode_on(vt, GHOSTTY_MODE_CURSOR_KEYS);
+  const char *arrow = right ? (application ? "\x1bOC" : "\x1b[C")
+                            : (application ? "\x1bOD" : "\x1b[D");
+  if (count == 0 || !buf_reserve(&vt->replies, count * 3)) return true;
+  for (size_t i = 0; i < count; i++) {
+    memcpy(vt->replies.ptr + vt->replies.len, arrow, 3);
+    vt->replies.len += 3;
+  }
+  return true;
+}
+
 // ---- Search ----
 //
 // One search per terminal, over the active screen and its scrollback (libghostty-vt keeps the
@@ -2558,8 +2821,10 @@ bool appine_vt_reset(AppineVt *vt) {
   bool prompt = appine_vt_at_prompt(vt);
   appine_vt_select_clear(vt);
   ghostty_terminal_reset(vt->term);
-  // A synchronized output hold ends with the modes
+  // A synchronized output hold ends with the modes, and the prompt's way of moving the cursor
+  // with the screen's prompt state (on_reset hears only a program's reset)
   vt->held = false;
+  vt->prompt_click = PROMPT_CLICK_NONE;
   changed(vt);
   return prompt;
 }

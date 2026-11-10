@@ -63,6 +63,13 @@ internal object VtNative {
     @JvmStatic external fun image(tab: Long, id: Int, generation: Long, bitmap: Bitmap): Boolean
 
     /**
+     * Whether the console reads a password now (lines without echo), noted for the frames, whose
+     * cursor is then a lock: the pump notes it at every read, and the view asks again while it
+     * shows the lock, since a program may turn echo back on without printing anything after.
+     */
+    @JvmStatic external fun passwordInput(tab: Long): Boolean
+
+    /**
      * Resizes the terminal, then the console (SIGWINCH); returns the terminal's replies for the
      * console, such as the size report of mode 2048 (empty when none, null when the tab is gone).
      */
@@ -172,6 +179,14 @@ internal object VtNative {
      * written there, soft wraps joined; null when there is none.
      */
     @JvmStatic external fun link(tab: Long, x: Int, y: Int): String?
+
+    /**
+     * A tap on viewport cell ([x], [y]) at the shell's prompt: the bytes that move the shell's
+     * cursor there (arrow keys, or a mouse press for a shell that places it itself), empty when it
+     * need not move; null when the tap is no prompt's (the prompt declared no way to move the
+     * cursor, the cursor is not at the prompt, the cell is above it).
+     */
+    @JvmStatic external fun promptClick(tab: Long, x: Int, y: Int): ByteArray?
 
     /**
      * Searches the screen and its scrollback for [needle] (ASCII letters in either case, all else

@@ -315,16 +315,16 @@ class MachineTest {
 
     /**
      * The profile gives the login shell (busybox ash) its shell integration (the android/terminal
-     * map): each prompt reports the last command's status (OSC 133 D) and starts the prompt (A),
-     * the typed command starts after it and ends with its line (I), and continuation lines are
-     * secondary prompts.
+     * map): each prompt reports the last command's status (OSC 133 D) and starts the prompt (A,
+     * whose cursor taps move with the arrows), the typed command starts after it and ends with its
+     * line (I), and continuation lines are secondary prompts.
      */
     @Test
     fun profileMarksPrompts() {
         val machine = start(1)
         val out = login(machine, "false\nfor i in 1; do\ntrue; done\nexit\n", ConsolePty.LOGIN_ROOT)
-        assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A\u0007"))
-        assertTrue(out, Regex("""\u001b]133;A\u0007.*# \u001b]133;I\u0007""").containsMatchIn(out))
+        assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;cl=line\u0007"))
+        assertTrue(out, Regex("""\u001b]133;A;cl=line\u0007.*# \u001b]133;I\u0007""").containsMatchIn(out))
         assertTrue(out, out.contains("\u001b]133;P;k=s\u0007> \u001b]133;I\u0007"))
         // The loop's status, after its continuation line
         assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))

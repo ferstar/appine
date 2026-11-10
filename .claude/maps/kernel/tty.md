@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: echoes sent before slave writes, consoles given back after a failed spawn, VTIME as an inter-byte timer, then the console's foreground group and its cwd for the app last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: echoes sent before slave writes, consoles given back after a failed spawn, VTIME as an inter-byte timer, the console's foreground group and its cwd for the app, then whether it reads a password last)
 
 ## Responsibilities
 
@@ -68,8 +68,9 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
   released).
 - Host console: `terminal::{open, attach, detach, wake_objects, take_output, input_room, feed,
-  fg_pgrp, fg_cwd, resize, close, initial_size, bridge}`, wrapped by `Machine::{open_console,
-  read_console, write_console, resize_console, close_console, console_foreground, console_cwd}`,
+  fg_pgrp, fg_cwd, password_input, resize, close, initial_size, bridge}`, wrapped by
+  `Machine::{open_console, read_console, write_console, resize_console, close_console,
+  console_foreground, console_cwd, console_password_input}`,
   `Stdio::Console` at spawn and the kernel's `run`.
 
 ## Data flow / lifecycle
@@ -275,7 +276,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   backpressure (`feed` delivers resulting signals), resizes (`SIGWINCH` on change), asks for the
   foreground group (`fg_pgrp`: its id as the kernel sees it, untranslated, `ESRCH` with none; the
   app drops what a program reported about its progress once another group has the terminal) and
-  its cwd (`fg_cwd`, where restored tabs and new tabs start), and closes (drop the master, hang up
+  its cwd (`fg_cwd`, where restored tabs and new tabs start), asks whether the line discipline
+  reads lines without echoing them (`password_input`: `ICANON` set and `ECHO` clear, as programs
+  read passwords and Ghostty tests; the app draws a lock for the cursor then), and closes (drop
+  the master, hang up
   immediately, so the number is free again at once, lowest-first, for consoles and `/dev/ptmx`).
   `write_console` keeps feeding input after the attached session has ended and fails with `EIO`
   only when the input room is 0, which in canonical mode without a complete line never happens.

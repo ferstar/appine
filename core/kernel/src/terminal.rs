@@ -20,6 +20,7 @@ use crate::fd::{FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Kernel, Shared, Tid, block_for, request_wake, request_wake_object, wake};
 use crate::process::Signal;
 use crate::signal::{self, SigInfo};
+use crate::tty::flags::{ECHO, ICANON};
 use crate::tty::{PtyEnd, Tty, Winsize};
 
 // ---- Consoles ----
@@ -175,6 +176,14 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
         cred: None,
     };
     vfs.path_of(&view, &root, &cwd)
+}
+
+/// Whether the console's line discipline reads whole lines without echoing them (ICANON on, ECHO
+/// off), as programs set it while reading a password: the app then draws the cursor as a lock, as
+/// Ghostty does by the same rule (the android/terminal map).
+pub(crate) fn password_input(k: &Kernel, id: u32) -> Result<bool, Errno> {
+    let lflag = tty_of(k, id)?.borrow().termios.lflag;
+    Ok(lflag & (ICANON | ECHO) == ICANON)
 }
 
 /// The window size changed: updates the PTY and sends SIGWINCH to the foreground process group.

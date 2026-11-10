@@ -27,6 +27,7 @@ import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
@@ -149,6 +150,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private val curl = Path()
     private val glyphs = VtGlyphs()
 
+    /** The lock drawn for the cursor while a password is read ([drawLock]). */
+    private val lockPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val shackle = Path()
+
     /** The font size in pixels; [MainActivity] keeps it across starts. */
     private var fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics)
     private var cellWidth = 1
@@ -205,6 +210,29 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
+    /**
+     * While the cursor is a lock (the console reads a password) and the window shows, the console
+     * is asked again every [PASSWORD_CHECK_MS] whether it still does: a program may turn echo back
+     * on without printing anything after (sudo prints its line break first), which no frame tells.
+     */
+    private var checkingPassword = false
+    private val passwordCheck = object : Runnable {
+        override fun run() {
+            if (tab != 0L && cursorStyle == CURSOR_LOCK && VtNative.passwordInput(tab)) {
+                postDelayed(this, PASSWORD_CHECK_MS)
+            } else {
+                checkingPassword = false
+                invalidate()
+            }
+        }
+    }
+
+    /**
+     * The input method was last told that what is typed is a password ([onCreateInputConnection]):
+     * while the cursor is a lock, as Ghostty turns macOS's secure input on at password prompts.
+     */
+    private var imePassword = false
+
     /** When the bell last vibrated ([bell]). */
     private var lastBell = 0L
 
@@ -213,6 +241,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var scrollTotal = 0
     private var scrollOffset = 0
     private var scrollLen = 0
+
+    /**
+     * The mouse pointer: the shape the program asked for (OSC 22, a `GhosttyMouseShape`; an
+     * I-beam by default), the cell a hovering mouse is over (-1 for none) and whether that is a
+     * link, which a click opens and the pointer shows with a hand, as in Ghostty; and the
+     * `PointerIcon` type set on the view (-1 for none yet).
+     */
+    private var pointerShape = POINTER_TEXT
+    private var hoverCell = -1
+    private var hoverLink = false
+    private var pointerSet = -1
 
     // Modes and the selection, as of the last frame (vt.c's header flags)
     private var mouseTracking = false
@@ -453,6 +492,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         drag = DRAG_NONE
         autoscroll = 0
         removeCallbacks(autoscrollTick)
+        stopPasswordCheck()
+        if (imePassword) {
+            // The other tab's frames say whether it reads one too
+            imePassword = false
+            restartInput()
+        }
+        hoverCell = -1
+        hoverLink = false
         scroller.forceFinished(true)
         scrollPx = 0
         selected = false
@@ -477,6 +524,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         imageCount = 0
         for (p in pictures.values) p.bitmap.recycle()
         pictures.clear()
+    }
+
+    /** Stops asking whether a password is still read ([passwordCheck]). */
+    private fun stopPasswordCheck() {
+        removeCallbacks(passwordCheck)
+        checkingPassword = false
+    }
+
+    /**
+     * Has the input method take a new connection ([onCreateInputConnection]), for whether a
+     * password is typed; nothing happens while the view is not the one it serves.
+     */
+    private fun restartInput() {
+        context.getSystemService(InputMethodManager::class.java).restartInput(this)
     }
 
     /** The session's shell started: take the whole screen. */
@@ -683,6 +744,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         cursorShown = b.get(5).toInt() != 0
         cursorStyle = b.get(6).toInt()
         cursorBlinking = b.get(7).toInt() != 0
+        if (cursorStyle == CURSOR_LOCK && !checkingPassword && windowVisibility == VISIBLE) {
+            checkingPassword = true
+            postDelayed(passwordCheck, PASSWORD_CHECK_MS)
+        }
+        // The input method takes what is typed at a password prompt as a password: no suggestions,
+        // nothing learnt. Posted, as restarting the input calls into the input method's service
+        if ((cursorStyle == CURSOR_LOCK) != imePassword) {
+            imePassword = !imePassword
+            post(::restartInput)
+        }
         cursorX = b.getShort(8).toInt() and 0xffff
         cursorY = b.getShort(10).toInt() and 0xffff
         val newFg = b.getInt(12)
@@ -708,6 +779,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         // Without a row after the viewport (at the bottom), or once scrolling no longer moves it
         // (mouse tracking, the alternate screen), the grid is in its place
         if (b.get(58).toInt() == 0 || scrollWay() != WAY_VIEWPORT) scrollPx = 0
+        pointerShape = b.get(59).toInt()
+        updatePointer()
         if (stepFrom >= 0) {
             if (scrollOffset != stepFrom) awakenScrollBars()
             stepFrom = -1
@@ -811,6 +884,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** A u16 coordinate of the frame, -1 for 0xffff (none). */
     private fun coordinate(b: ByteBuffer, at: Int): Int =
         (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
+
+    /**
+     * Shows a mouse over the view the pointer for its place: a hand over a link a click opens
+     * (without mouse tracking), else the shape the program asked for (OSC 22) as the closest of
+     * Android's system pointers. Set on the view, so it changes at once, the mouse still or not.
+     */
+    private fun updatePointer() {
+        val type = if (hoverLink && !mouseTracking) PointerIcon.TYPE_HAND else pointerType(pointerShape)
+        if (type == pointerSet) return
+        pointerSet = type
+        pointerIcon = PointerIcon.getSystemIcon(context, type)
+    }
 
     /**
      * Takes the frame's [count] image placements at [at] and copies the pixels of the images they
@@ -1132,6 +1217,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         fill.color = color
         stroke.color = color
         when {
+            // Composing text shows a block, as in Ghostty
+            cursorStyle == CURSOR_LOCK && preedit.isEmpty() -> drawLock(c, l, t, r, b, color)
             cursorStyle == CURSOR_BAR -> c.drawRect(l.toFloat(), t.toFloat(), (l + 2 * light).toFloat(), b.toFloat(), fill)
             cursorStyle == CURSOR_UNDERLINE -> c.drawRect(l.toFloat(), (b - 2 * light).toFloat(), r.toFloat(), b.toFloat(), fill)
             cursorStyle == CURSOR_HOLLOW || !hasFocus() ->
@@ -1144,6 +1231,34 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
             }
         }
+    }
+
+    /**
+     * The cursor while the console reads a password: a padlock in the cursor's colour, about as
+     * tall as a capital letter, standing on the baseline in the middle of its cell (or two), where
+     * Ghostty draws a lock glyph (U+F023 from its Nerd Font, which the bundled font lacks); not
+     * blinking, and shown without the focus too.
+     */
+    private fun drawLock(c: Canvas, l: Int, t: Int, r: Int, b: Int, color: Int) {
+        val w = min(cellWidth, b - t) * 0.85f
+        val h = w * 1.15f
+        val cx = (l + r) / 2f
+        val top = t + baseline - h
+        val bodyTop = top + h * 0.42f
+        lockPaint.color = color
+        lockPaint.style = Paint.Style.FILL
+        c.drawRoundRect(cx - w / 2f, bodyTop, cx + w / 2f, top + h, w * 0.12f, w * 0.12f, lockPaint)
+        // The shackle: an arch from the body's top, inset from its sides
+        val sw = max(light.toFloat(), w * 0.16f)
+        val radius = (w * 0.68f - sw) / 2f
+        shackle.rewind()
+        shackle.moveTo(cx - radius, bodyTop)
+        shackle.lineTo(cx - radius, top + sw / 2f + radius)
+        shackle.arcTo(cx - radius, top + sw / 2f, cx + radius, top + sw / 2f + 2 * radius, 180f, 180f, false)
+        shackle.lineTo(cx + radius, bodyTop)
+        lockPaint.style = Paint.Style.STROKE
+        lockPaint.strokeWidth = sw
+        c.drawPath(shackle, lockPaint)
     }
 
     /**
@@ -1398,14 +1513,30 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         blinkRunning = false
         blinkOn = true
         removeCallbacks(blinkTick)
+        stopPasswordCheck()
+    }
+
+    /** A hidden window asks the kernel nothing; the frame drawn when it shows again resumes it. */
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) {
+            stopPasswordCheck()
+        } else {
+            invalidate()
+        }
     }
 
     override fun onCheckIsTextEditor() = true
 
+    /** Text without suggestions, or a password while the console reads one ([imePassword]). */
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.inputType = if (imePassword) {
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        } else {
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_ACTION_NONE
+            EditorInfo.IME_ACTION_NONE or (if (imePassword) EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING else 0)
         return Connection()
     }
 
@@ -1964,7 +2095,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     host.onLink(link)
                     return true
                 }
-                if (tab != 0L && mouseTracking) click(e)
+                // A tap on the input typed at the shell's prompt moves the shell's cursor there, as
+                // Ghostty's cursor-click-to-move does; the keyboard comes up all the same
+                if (tab != 0L && mouseTracking) {
+                    click(e)
+                } else if (tab != 0L) {
+                    send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
+                }
                 requestFocus()
                 context.getSystemService(InputMethodManager::class.java).showSoftInput(this@VtView, 0)
                 return true
@@ -2044,6 +2181,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * Ghostty (nothing else scrolls sideways); a mouse moving with no button held goes to a
      * program tracking all motion (mode 1003).
      */
+    /**
+     * The pointer [updatePointer] set, also when the system resolves it again after it was set
+     * while the mouse rests (a program's OSC 22): that event comes from no mouse, and the view's
+     * own resolution returns the pointer for mouse events only, which would leave the default
+     * arrow. A stylus keeps its own.
+     */
+    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
+        val resolved = super.onResolvePointerIcon(event, pointerIndex)
+        return if (resolved != null || event.isFromSource(InputDevice.SOURCE_STYLUS)) resolved else pointerIcon
+    }
+
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) {
             when (event.actionMasked) {
@@ -2058,13 +2206,33 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     }
                     if (v != 0f || sideways) return true
                 }
-                MotionEvent.ACTION_HOVER_MOVE -> if (mouseTracking) {
-                    send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_NONE, VtKeys.mods(event.metaState), event.x, event.y, false))
-                    return true
+                MotionEvent.ACTION_HOVER_MOVE -> {
+                    hoverAt(event.x, event.y)
+                    if (mouseTracking) {
+                        send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_NONE, VtKeys.mods(event.metaState), event.x, event.y, false))
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    hoverCell = -1
+                    hoverLink = false
+                    updatePointer()
                 }
             }
         }
         return super.onGenericMotionEvent(event)
+    }
+
+    /**
+     * A mouse hovers at ([x], [y]): on coming to another cell, whether it is over a link is looked
+     * up again, for the pointer.
+     */
+    private fun hoverAt(x: Float, y: Float) {
+        val cell = cellY(y) * cols + cellX(x)
+        if (cell == hoverCell) return
+        hoverCell = cell
+        hoverLink = linkAt(x, y) != null
+        updatePointer()
     }
 
     /** A left click at a tap, for a program tracking the mouse. */
@@ -2234,6 +2402,39 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val CURSOR_BAR = 0
         const val CURSOR_UNDERLINE = 2
         const val CURSOR_HOLLOW = 3
+        const val CURSOR_LOCK = 4
+
+        /** `GhosttyMouseShape`'s text, the pointer's shape until a program asks for another. */
+        const val POINTER_TEXT = 8
+
+        /**
+         * Android's system pointer closest to a `GhosttyMouseShape` (OSC 22's names, CSS's
+         * cursors): progress shows as waiting, move as all-scroll, not-allowed as no-drop and the
+         * resize arrows by their axis, which Android's pointers do not tell apart by edge.
+         */
+        fun pointerType(shape: Int): Int = when (shape) {
+            0 -> PointerIcon.TYPE_ARROW
+            1 -> PointerIcon.TYPE_CONTEXT_MENU
+            2 -> PointerIcon.TYPE_HELP
+            3 -> PointerIcon.TYPE_HAND
+            4, 5 -> PointerIcon.TYPE_WAIT
+            6 -> PointerIcon.TYPE_CELL
+            7 -> PointerIcon.TYPE_CROSSHAIR
+            9 -> PointerIcon.TYPE_VERTICAL_TEXT
+            10 -> PointerIcon.TYPE_ALIAS
+            11 -> PointerIcon.TYPE_COPY
+            12, 17 -> PointerIcon.TYPE_ALL_SCROLL
+            13, 14 -> PointerIcon.TYPE_NO_DROP
+            15 -> PointerIcon.TYPE_GRAB
+            16 -> PointerIcon.TYPE_GRABBING
+            18, 21, 23, 28 -> PointerIcon.TYPE_HORIZONTAL_DOUBLE_ARROW
+            19, 20, 22, 29 -> PointerIcon.TYPE_VERTICAL_DOUBLE_ARROW
+            24, 27, 30 -> PointerIcon.TYPE_TOP_RIGHT_DIAGONAL_DOUBLE_ARROW
+            25, 26, 31 -> PointerIcon.TYPE_TOP_LEFT_DIAGONAL_DOUBLE_ARROW
+            32 -> PointerIcon.TYPE_ZOOM_IN
+            33 -> PointerIcon.TYPE_ZOOM_OUT
+            else -> PointerIcon.TYPE_TEXT
+        }
 
         // The frame format (vt.c)
         const val HEADER_BYTES = 64
@@ -2285,6 +2486,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** A blinking cursor's half period, as Android's text fields. */
         const val BLINK_MS = 500L
+
+        /** How often the console is asked whether it still reads a password, as Ghostty polls. */
+        const val PASSWORD_CHECK_MS = 200L
 
         /** The shortest time between two vibrations of the bell. */
         const val BELL_MS = 100L

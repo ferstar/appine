@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refreshed at root logins and /etc changes; admins recorded once; mirrors after writing; download length; resumed imports; podman setup; the profile's prompt marks last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; the profile's prompt marks and replaced versions last)
 
 ## Responsibilities
 
@@ -43,8 +43,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 - `profile.sh` — copied verbatim, comments included, into the guest as
-  `/etc/profile.d/appine.sh`; `Rootfs` keeps the earlier versions' texts (`OLD_PROFILE`,
-  `UNMARKED_PROFILE`) to recognise them.
+  `/etc/profile.d/appine.sh`; `Rootfs` keeps the texts of the versions without prompt marks
+  (`OLD_PROFILE`, `UNMARKED_PROFILE`) and the sha256s of the later ones (`REPLACED_PROFILES`) to
+  recognise them.
 
 ## Public entry points
 
@@ -87,7 +88,8 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`; a profile left exactly as an earlier version wrote it
-  (with `cd "$HOME"`, or without prompt marks) replaced by the current one, an edited one kept.
+  (with `cd "$HOME"`, without prompt marks, or with marks that do not declare `cl=line`) replaced
+  by the current one, an edited one kept.
   Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
@@ -100,12 +102,14 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   prompts with OSC 133:
   - bash: a `__appine_prompt` function put first in `PROMPT_COMMAND` (once) prints, before each
     prompt, the last command's end with its status (D) and the prompt's start on a fresh line (A,
-    `redraw=last`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2 (`k=s`), and
-    appends the output's start (C) to PS0, each again whenever it is missing, so a PS1 that
+    `redraw=last;cl=line`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2 (`k=s`),
+    and appends the output's start (C) to PS0, each again whenever it is missing, so a PS1 that
     `~/.bashrc` or anything later sets is wrapped from the next prompt on;
   - busybox ash, which has no hook before a command or a prompt: PS1 itself carries D with `$?`
-    (expanded at each prompt and redraw), A, and after the prompt I (the input ends with its
-    line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
+    (expanded at each prompt and redraw), A with `cl=line`, and after the prompt I (the input ends
+    with its line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
+  - `cl=line` tells the terminal that both line editors move the cursor with the left and right
+    arrows, so a tap on the typed command moves the cursor there.
 - Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
   for others); nested non-login shells and other shells get no marks.
 
@@ -186,9 +190,10 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - Preferences are written before the rename, so an existing store always has its distro record.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
-- `updateProfile` replaces only the texts it knows (`OLD_PROFILE`, `UNMARKED_PROFILE`), compared
-  whole: changing `profile.sh` must add the text it replaces to that list, or stores keep the
-  version they have; and the motd is written only at import, so it is never updated.
+- `updateProfile` replaces only the versions it knows, compared whole (`OLD_PROFILE` and
+  `UNMARKED_PROFILE` by text, later ones by sha256 in `REPLACED_PROFILES`): changing `profile.sh`
+  must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
+  the version they have; and the motd is written only at import, so it is never updated.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; android/terminal): bash and busybox ash do.
 

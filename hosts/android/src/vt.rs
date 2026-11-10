@@ -103,6 +103,7 @@ unsafe extern "C" {
     fn appine_vt_free(vt: *mut AppineVt);
     fn appine_vt_feed(vt: *mut AppineVt, data: *const u8, len: usize);
     fn appine_vt_take_replies(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_set_password_input(vt: *mut AppineVt, on: bool);
     fn appine_vt_resize(vt: *mut AppineVt, cols: u16, rows: u16, cell_width: u32, cell_height: u32);
     fn appine_vt_scroll(vt: *mut AppineVt, delta: i32);
     fn appine_vt_at_prompt(vt: *mut AppineVt) -> bool;
@@ -164,6 +165,7 @@ unsafe extern "C" {
     fn appine_vt_select_clear(vt: *mut AppineVt);
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
+    fn appine_vt_prompt_click(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_search(vt: *mut AppineVt, needle: *const u8, len: usize) -> bool;
     fn appine_vt_search_select(vt: *mut AppineVt, older: bool) -> bool;
     fn appine_vt_search_rows(vt: *mut AppineVt, len: *mut usize, selected: *mut i64) -> *const u32;
@@ -690,8 +692,13 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            // Whether a password is read now, for the cursor: programs turn echo off before they
+            // print their prompt, so it is known by the time this output shows. Asked before the
+            // tab's lock is taken, so the kernel's lock is not held under it
+            let password = m.console_password_input(tab.console).unwrap_or(false);
             let (replies, titled, effects) = {
                 let mut term = tab.term();
+                unsafe { appine_vt_set_password_input(term.0, password) };
                 let replies = term.feed(&buf[..n]);
                 let titled = unsafe { appine_vt_take_title_changed(term.0) };
                 (replies, titled, term.take_effects())
@@ -836,6 +843,28 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_image<'l>(
         // SAFETY: locked above; unlocking also tells the bitmap its pixels changed
         unsafe { AndroidBitmap_unlockPixels(raw, bitmap) };
         copied as jboolean
+    })
+}
+
+/// Whether the console reads a password now (lines without echo), noted for the frames' cursor;
+/// the pump notes it at every read, and the view asks again while it shows the lock, since a
+/// program may turn echo back on without printing anything after (sudo prints its line break
+/// first). False when the tab or its console is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_passwordInput<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("VtNative.passwordInput", 0, {
+        let Some(tab) = tab(handle) else {
+            return 0;
+        };
+        let password = tab
+            .machine()
+            .is_some_and(|m| m.console_password_input(tab.console).unwrap_or(false));
+        unsafe { appine_vt_set_password_input(tab.term().0, password) };
+        password as jboolean
     })
 }
 
@@ -1281,6 +1310,33 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_link<'l>(
         let mut len = 0;
         let p = unsafe { appine_vt_link(term.0, cell(x), cell(y), &mut len) };
         term.text(&mut env, p, len)
+    })
+}
+
+/// A tap on viewport cell (`x`, `y`) at the shell's prompt: the bytes that move the shell's cursor
+/// there (arrow keys, or a mouse press for a shell that places it itself), empty when it need not
+/// move; null when the tap is no prompt's (the prompt declared no way to move the cursor, the
+/// cursor is not at the prompt, the cell is above it) or the tab is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_promptClick<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jbyteArray {
+    guarded!("VtNative.promptClick", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let bytes = {
+            let mut term = tab.term();
+            if !unsafe { appine_vt_prompt_click(term.0, cell(x), cell(y)) } {
+                return std::ptr::null_mut();
+            }
+            term.take_replies()
+        };
+        bytes_array(&mut env, &bytes)
     })
 }
 

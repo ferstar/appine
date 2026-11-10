@@ -502,6 +502,16 @@ netns = "host"
     private val OLD_PROFILE = UNMARKED_PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
 
     /**
+     * The sha256s of the assets' `profile.sh` as later versions replaced it, whose texts (shell
+     * code full of `$`) are not kept here: the first with prompt marks, until taps on the prompt
+     * moved the cursor. A change to `profile.sh` adds the sha256 of the text it replaces
+     * (`git show HEAD:android/app/src/main/assets/profile.sh | shasum -a 256` before committing).
+     */
+    private val REPLACED_PROFILES = setOf(
+        "4a35d44e55e23aaf94543d87dc02deafcc7b324902e90ae18872fe20242642fc",
+    )
+
+    /**
      * Replaces the profile the app wrote into a previously imported store with the current one
      * ([profile]), if it is an earlier version left unchanged.
      */
@@ -509,7 +519,9 @@ netns = "host"
     fun updateProfile(context: Context) {
         val path = "/etc/profile.d/appine.sh"
         val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
-        if (String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE)) write(store(context).path, path, profile(context))
+        val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
+            hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
+        if (earlier) write(store(context).path, path, profile(context))
     }
 
     /**

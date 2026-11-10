@@ -552,6 +552,61 @@ fn machines_can_start_with_exception_reports_on() {
 }
 
 #[test]
+fn console_tells_password_input() {
+    // The app draws a lock for the cursor while a console reads lines without echoing them
+    // (ICANON on, ECHO off), as programs read passwords (Machine::console_password_input); not in
+    // non-canonical mode, where line editors turn echo off too
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Interpreter,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: None,
+        low_port_offset: None,
+        always_map_low_ports: false,
+        exception_trace: false,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let id = machine.open_console(24, 80).unwrap();
+    assert_eq!(machine.console_password_input(id), Ok(false));
+    let script = "stty -echo; echo off; read x; stty -icanon; echo raw; read x; \
+                  stty icanon echo; echo on; read x";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    // Each mark is printed after its stty has run
+    let read_until = |mark: &str| {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        while !String::from_utf8_lossy(&out).contains(mark) {
+            let n = machine.read_console(id, &mut buf).unwrap();
+            assert!(n > 0, "{}", String::from_utf8_lossy(&out));
+            out.extend_from_slice(&buf[..n]);
+        }
+    };
+    read_until("off");
+    assert_eq!(machine.console_password_input(id), Ok(true));
+    machine.write_console(id, b"secret\n").unwrap();
+    read_until("raw");
+    assert_eq!(machine.console_password_input(id), Ok(false));
+    machine.write_console(id, b"x\n").unwrap();
+    read_until("on");
+    assert_eq!(machine.console_password_input(id), Ok(false));
+    machine.write_console(id, b"x\n").unwrap();
+    read_console(&machine, id);
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    machine.close_console(id).unwrap();
+    assert_eq!(
+        machine.console_password_input(id),
+        Err(appine_kernel::errno::Errno::ENOENT)
+    );
+}
+
+#[test]
 fn each_step_of_finishing_a_process_survives_kernel_bugs() {
     // When a step of process finish hits a kernel-layer bug (simulated with the test hooks of debug
     // builds), only what that step does is lost, and the later steps are done all the same

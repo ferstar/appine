@@ -482,6 +482,17 @@ impl Machine {
             .unwrap_or(Err(Errno::EIO))
     }
 
+    /// Whether console `id` reads lines without echoing them (ICANON on, ECHO off), as programs
+    /// set it to read a password; the app draws the cursor as a lock then (the android/terminal
+    /// map).
+    pub fn console_password_input(&self, id: u32) -> Result<bool, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_password_input", || {
+            terminal::password_input(&k, id)
+        })
+        .unwrap_or(Err(Errno::EIO))
+    }
+
     /// Waits for a process started by [`Machine::spawn`] to end.
     pub fn wait(&self, pid: u32) -> ExitStatus {
         // This needs waking only when a process the host waits for ends; other processes ending
