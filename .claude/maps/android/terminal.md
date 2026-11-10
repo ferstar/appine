@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, then the ⋮ button's description, the menu key and resize replies last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, then the scrollback's byte limit last)
 
 ## Responsibilities
 
@@ -239,7 +239,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
   and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
   opens a console of the grid's size and spawns the login; `VtNative.create` makes the terminal
-  (scrollback 10,000 lines; grapheme clustering, mode 2027, on by default as in Ghostty; Kitty
+  (a scrollback line limit of 10,000, though libghostty-vt's default byte limit is reached first,
+  see the bugs; grapheme clustering, mode 2027, on by default as in Ghostty; Kitty
   graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is advertised and
   programs that probe fall back to text); restored text and queued messages are printed into it;
   then the writer, the pump and the waiter start.
@@ -624,6 +625,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   stay off.
 - With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
   emoji sequences; they can turn mode 2027 off.
+- libghostty-vt's C terminal starts with a scrollback byte limit of 10,000 bytes (the default of
+  its `Terminal.Options`, not Ghostty's 10 MB `scrollback-limit`), raised to its minimum of the
+  active area's pages plus one. The byte and line limits both apply, the first reached pruning
+  whole 400 KiB pages, so a line limit alone does not set how much scrollback is kept.
 - Grid references from libghostty-vt are valid only until the terminal changes, so every selection
   call takes fresh ones; the anchor of a drag is tracked. A changed selection makes the next frame a
   full one (the render state redraws everything when the screen's selection changes), as does
@@ -634,6 +639,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ## Confirmed bugs / technical debt
 
+- **The scrollback keeps far fewer than 10,000 lines**: vt.c sets only `SCROLLBACK_MAX_LINES`, so
+  libghostty-vt's default byte limit (see the gotcha) keeps two pages, about 1,860 rows at 45
+  columns, 1,020 at 80, 660 at 120 and 300 at 250. Removing it (`SCROLLBACK_MAX_BYTES` set to
+  NULL) reaches the line limit (9,150–9,990 rows) at 400 KiB a page, about 3.5 MiB a tab at 45
+  columns and 6.6 MiB at 80, which nothing reclaims while scrollback is not compressed (below).
 - **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
   (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
 - **libghostty-vt features not wired**: no callbacks for OSC 9;4 progress, OSC 7501 program
@@ -695,6 +705,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   and earlier get for a program's clipboard write (only tried on API 34, where the system shows
   its own); how tab notifications look and alert outside an API 34 emulator (there Android
   bundled them with the ongoing notification, so the first tap expands the bundle).
+- The scrollback's rows and memory at each limit on a device (the figures above come from a macOS
+  build of libghostty-vt 1.4.0 fed 30,000 lines, not from Android or 16 KB-page devices).
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
   `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
   also after a full reset and on the alternate screen, was checked on a macOS build of
