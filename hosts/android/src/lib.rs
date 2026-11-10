@@ -962,8 +962,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_waitFor<'l>(
     })
 }
 
-/// The current directory of the console's foreground process group (for restoring tabs after the
-/// app was killed): null when it cannot be had (the shell has exited, the handle is invalid). A
+/// The current directory of the console's foreground process group (where restored tabs and new
+/// tabs start): null when it cannot be had (the shell has exited, the handle is invalid). A
 /// path that is not UTF-8 is converted with UTF-8 replacement rules.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_consoleCwd<'l>(

@@ -35,6 +35,8 @@
     <string name="find_previous">上一个匹配</string>
     <string name="find_next">下一个匹配</string>
     <string name="find_close">关闭查找</string>
+    <string name="previous_prompt">上一个提示符</string>
+    <string name="next_prompt">下一个提示符</string>
     <string name="tab_ended">%1$s（已结束）</string>
     <string name="tab_description">标签页 %1$d：%2$s</string>
     <string name="tab_number">标签页 %1$d</string>
@@ -141,6 +143,7 @@
     <string name="open_link">打开链接</string>
     <string name="select_rectangle">矩形选择</string>
     <string name="select_lines">按行选择</string>
+    <string name="select_output">选中输出</string>
     <string name="link_no_app">没有能打开这个链接的应用</string>
     <string name="link_remote_file">这个文件在 %1$s 上，不在 Appine 里</string>
     <string name="link_hidden_file">家目录之外：请在设置里打开“在‘文件’App 里显示整个系统”</string>

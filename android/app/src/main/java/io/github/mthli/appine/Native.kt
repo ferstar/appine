@@ -191,8 +191,8 @@ internal object Native {
     external fun waitFor(machine: Long, pid: Int): Int
 
     /**
-     * The current directory of the console's foreground process group (to restore tabs after the
-     * app was killed); null once the shell has exited.
+     * The current directory of the console's foreground process group (where restored tabs and new
+     * tabs start); null once the shell has exited.
      */
     @JvmStatic
     external fun consoleCwd(machine: Long, console: Int): String?

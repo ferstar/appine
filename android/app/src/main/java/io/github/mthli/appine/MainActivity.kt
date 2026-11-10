@@ -341,10 +341,15 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     // ---- Sessions ----
 
+    /**
+     * Opens a tab in the current tab's directory (that of the program in its foreground, the shell
+     * at its prompt), as Ghostty's new tabs inherit the working directory; with no current tab, or
+     * one whose shell has ended, in the home directory.
+     */
     private fun newSession() {
         val s = service ?: return
         if (s.machine == 0L) return
-        show(s.createSession())
+        show(s.createSession(cwd = current?.cwd()))
     }
 
     /**
@@ -414,11 +419,12 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * `×` and the menu: closes [targets] at once when all their shells have ended, else after
-     * asking, as closing hangs a shell up and with it, usually, the programs it runs.
+     * `×` and the menu: closes [targets] at once when none is [busy][VtSession.busy] (their shells
+     * have ended or wait at their prompts), else after asking, as closing hangs a shell up and with
+     * it, usually, the programs it runs. A shell without prompt marks always counts as busy.
      */
     private fun confirmClose(targets: List<VtSession>) {
-        if (targets.none { it.isRunning }) {
+        if (targets.none { it.busy }) {
             close(targets)
             return
         }
@@ -516,12 +522,14 @@ class MainActivity : Activity(), TerminalService.Listener {
     /**
      * The shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
      * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
-     * previous one (going round), and Ctrl+Shift+F finds text in it (as in Ghostty on Linux). They
-     * are taken before the terminal sees them; false for any other key.
+     * previous one (going round), Ctrl+Shift+F finds text in it and Ctrl+Shift+↑ and ↓ scroll to
+     * the previous and the next prompt (as in Ghostty on Linux; on the alternate screen, which has
+     * no prompts, they go to the program). They are taken before the terminal sees them; false for
+     * any other key.
      */
     private fun shortcut(event: KeyEvent): Boolean {
         if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
-        // Holding Ctrl+Tab keeps switching; holding the others acts once
+        // Holding Ctrl+Tab or a jump keeps going; holding the others acts once
         val first = event.repeatCount == 0
         when {
             event.keyCode == KeyEvent.KEYCODE_TAB -> switchBy(if (event.isShiftPressed) -1 else 1)
@@ -529,6 +537,8 @@ class MainActivity : Activity(), TerminalService.Listener {
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
             event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
             event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
+            event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return screen.jumpToPrompt(-1)
+            event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return screen.jumpToPrompt(1)
             else -> return false
         }
         return true
@@ -560,7 +570,11 @@ class MainActivity : Activity(), TerminalService.Listener {
         data.add(
             KeyboardShortcutGroup(
                 getString(R.string.shortcuts_terminal),
-                listOf(KeyboardShortcutInfo(getString(R.string.find), KeyEvent.KEYCODE_F, ctrlShift)),
+                listOf(
+                    KeyboardShortcutInfo(getString(R.string.find), KeyEvent.KEYCODE_F, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.previous_prompt), KeyEvent.KEYCODE_DPAD_UP, ctrlShift),
+                    KeyboardShortcutInfo(getString(R.string.next_prompt), KeyEvent.KEYCODE_DPAD_DOWN, ctrlShift),
+                ),
             ),
         )
     }

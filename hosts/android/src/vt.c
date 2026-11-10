@@ -329,6 +329,9 @@ typedef struct AppineVt {
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
   GhosttyTrackedGridRef anchor_end;
+  // A cell in a command's output that a long press found (appine_vt_output_at), for the menu's
+  // Select output; tracked, so output does not move it. NULL when none
+  GhosttyTrackedGridRef output_at;
   // Synchronized output: the render state was captured when the hold began and is not updated
   // again until it ends (or HOLD_LIMIT_NS passes)
   bool held;
@@ -682,10 +685,12 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
 }
 
 static void drop_anchor(AppineVt *vt);
+static void drop_output(AppineVt *vt);
 
 void appine_vt_free(AppineVt *vt) {
   if (vt == NULL) return;
   drop_anchor(vt);
+  drop_output(vt);
   // Before the terminal, so it releases what it tracks there
   if (vt->search) ghostty_search_free(vt->search);
   if (vt->images) ghostty_render_state_image_iterator_free(vt->images);
@@ -771,6 +776,35 @@ void appine_vt_scroll(AppineVt *vt, int32_t delta) {
     s.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA;
     s.value.delta = delta;
   }
+  ghostty_terminal_scroll_viewport(vt->term, s);
+}
+
+// ---- Shell integration ----
+//
+// The shells' prompt marks (OSC 133, sent by /etc/profile.d/appine.sh for bash and busybox ash)
+// tell libghostty-vt which rows are prompts and which cells are a prompt, the input typed at it or
+// a command's output. Without them there are no prompts: the cursor is never at one, there is
+// nothing to scroll to, and no output to select.
+
+// Whether the cursor is at the shell's prompt or in the input typed at it, on the primary screen:
+// no command runs in the foreground, as far as the marks tell (closing the tab then ends nothing
+// the user is waiting for). False without the marks.
+bool appine_vt_at_prompt(AppineVt *vt) {
+  bool at = false;
+  return ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT, &at) ==
+             GHOSTTY_SUCCESS &&
+         at;
+}
+
+// Scrolls the viewport to the prompt delta prompts above (negative) or below its top, or as far as
+// there are prompts; nothing when there are none
+void appine_vt_jump_prompt(AppineVt *vt, int32_t delta) {
+  GhosttyTerminalScrollViewport s = {0};
+  s.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT;
+  s.value.delta_prompt = delta;
+  // Looking for prompts reads the scrollback's pages, which the activity token does not count
+  // when the viewport ends up where it was
+  vt->compress_touched = true;
   ghostty_terminal_scroll_viewport(vt->term, s);
 }
 
@@ -1666,8 +1700,54 @@ bool appine_vt_select_all(AppineVt *vt) {
          ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
 }
 
+static void drop_output(AppineVt *vt) {
+  if (vt->output_at) ghostty_tracked_grid_ref_free(vt->output_at);
+  vt->output_at = NULL;
+}
+
+// Whether viewport cell (x, y) is in a command's output, between the prompt marks of the command
+// and of the next one (see Shell integration), or above the first prompt; if so, the cell is
+// tracked for appine_vt_select_output, which the menu after a long press there offers.
+bool appine_vt_output_at(AppineVt *vt, uint16_t x, uint16_t y) {
+  drop_output(vt);
+  // Finding the output's ends reads the pages above and below the cell
+  vt->compress_touched = true;
+  GhosttyGridRef ref;
+  GhosttySelection output = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate cell;
+  if (!viewport_ref(vt, x, y, &ref) ||
+      ghostty_terminal_select_output(vt->term, ref, &output) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &ref, &cell)) {
+    return false;
+  }
+  GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = cell};
+  if (ghostty_terminal_grid_ref_track(vt->term, p, &vt->output_at) != GHOSTTY_SUCCESS) {
+    vt->output_at = NULL;
+    return false;
+  }
+  return true;
+}
+
+// Selects the whole output appine_vt_output_at found, as it is now (a command still running may
+// have added to it), and anchors drags to it; false, leaving the selection alone, when its cell
+// has left the scrollback or is no longer output (a full reset).
+bool appine_vt_select_output(AppineVt *vt) {
+  if (vt->output_at == NULL) return false;
+  vt->compress_touched = true;
+  GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttySelection output = GHOSTTY_INIT_SIZED(GhosttySelection);
+  bool selected =
+      ghostty_tracked_grid_ref_snapshot(vt->output_at, &ref) == GHOSTTY_SUCCESS &&
+      ghostty_terminal_select_output(vt->term, ref, &output) == GHOSTTY_SUCCESS &&
+      select_anchored(vt, &output);
+  // Only now: untracking may change the page list the references above point into
+  drop_output(vt);
+  return selected;
+}
+
 void appine_vt_select_clear(AppineVt *vt) {
   drop_anchor(vt);
+  drop_output(vt);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
 }
 

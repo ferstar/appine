@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refreshed at root logins and /etc changes; admins recorded once; mirrors after writing; download length; resumed imports; podman setup)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: NOPASSWD rules fail closed, refreshed at root logins and /etc changes; admins recorded once; mirrors after writing; download length; resumed imports; podman setup; the profile's prompt marks last)
 
 ## Responsibilities
 
@@ -14,7 +14,8 @@
 - the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
   importing them into a new store, and writing first-boot configuration;
 - files refreshed before every kernel start (network interfaces, the bundled doas package, the
-  profile script) and the osclock script run before boot;
+  profile script with its prompt marks for the terminal's shell integration) and the osclock
+  script run before boot;
 - package mirrors: built-in lists, speed probes, rewriting the sources file;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup;
@@ -22,7 +23,8 @@
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
-`android/app/src/main/assets/login.sh`, `scripts/fetch-rootfs`.
+`android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
+`scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches and logins happen (`android/service`); the import and
 `write_file`/`read_file` implementations (`kernel/store`, `kernel/vfs`); bundling the assets
@@ -40,6 +42,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   documents), Terminal (CJK characters filling two cells, `android/terminal`), Debugging (tier,
   debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
+- `profile.sh` — copied verbatim, comments included, into the guest as
+  `/etc/profile.d/appine.sh`; `Rootfs` keeps the earlier versions' texts (`OLD_PROFILE`,
+  `UNMARKED_PROFILE`) to recognise them.
 
 ## Public entry points
 
@@ -74,18 +79,35 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   next launch.
 - `configure` writes: package sources (apk `main` and `community`; Debian deb822 over http for
   trixie, -updates, -security), `hostname`, `hosts` (Alpine only when absent, Debian always),
-  Debian's `resolv.conf` pointing at the DNS stub, `motd`, and `/etc/profile.d/appine.sh` (motd,
-  `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, `PS1`).
+  Debian's `resolv.conf` pointing at the DNS stub, `motd`, and `/etc/profile.d/appine.sh` (the
+  assets' `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, and for bash and busybox ash
+  only a coloured prompt with prompt marks, below; other shells keep the distro's prompt).
 - Before every start: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`; an unmodified old profile (with `cd "$HOME"`) replaced.
+  `doas.apk` into `/var/cache/appine/`; a profile left exactly as an earlier version wrote it
+  (with `cd "$HOME"`, or without prompt marks) replaced by the current one, an edited one kept.
   Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
 - Before boot (`PREFER_OSCLOCK`): with OpenRC installed and no clock service in any runlevel, add
   osclock to boot.
+
+### Prompt marks
+
+- For the terminal's shell integration (android/terminal) the profile has login shells mark their
+  prompts with OSC 133:
+  - bash: a `__appine_prompt` function put first in `PROMPT_COMMAND` (once) prints, before each
+    prompt, the last command's end with its status (D) and the prompt's start on a fresh line (A,
+    `redraw=last`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2 (`k=s`), and
+    appends the output's start (C) to PS0, each again whenever it is missing, so a PS1 that
+    `~/.bashrc` or anything later sets is wrapped from the next prompt on;
+  - busybox ash, which has no hook before a command or a prompt: PS1 itself carries D with `$?`
+    (expanded at each prompt and redraw), A, and after the prompt I (the input ends with its
+    line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
+- Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
+  for others); nested non-login shells and other shells get no marks.
 
 ### Mirrors
 
@@ -164,6 +186,11 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - Preferences are written before the rename, so an existing store always has its distro record.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
+- `updateProfile` replaces only the texts it knows (`OLD_PROFILE`, `UNMARKED_PROFILE`), compared
+  whole: changing `profile.sh` must add the text it replaces to that list, or stores keep the
+  version they have; and the motd is written only at import, so it is never updated.
+- The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
+  rows on a resize; android/terminal): bash and busybox ash do.
 
 ## Confirmed bugs / technical debt
 
@@ -180,3 +207,6 @@ none
 
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`).
+- The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
+  26.04's bash 5.3; busybox ash's in the app and an instrumentation test), and with a
+  `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.

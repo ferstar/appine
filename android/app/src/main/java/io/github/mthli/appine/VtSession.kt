@@ -115,8 +115,23 @@ internal class VtSession(
     /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
     val title: String? get() = if (tab == 0L) null else VtNative.title(tab)
 
+    /**
+     * The current directory of the console's foreground process group (the shell's at its
+     * prompt), for a new tab to start in; null before the shell starts and once it has ended. Takes
+     * the kernel's BKL on the calling thread, as opening a console does.
+     */
+    fun cwd(): String? = if (isRunning && consoleOpen) Native.consoleCwd(machine, pty.console) else null
+
     /** True until the shell has exited (also before it starts). */
     val isRunning: Boolean get() = exit == null
+
+    /**
+     * Closing the tab would end something the user may be waiting for: the shell runs and is not
+     * at its prompt, as its prompt marks (OSC 133, sent from `/etc/profile.d/appine.sh`) tell, so a
+     * command runs; always so for a shell without the marks. A shell not started yet (a restored
+     * tab never shown) has nothing to end.
+     */
+    val busy: Boolean get() = isRunning && tab != 0L && !VtNative.atPrompt(tab)
 
     /**
      * The last progress report (OSC 9;4); null when there is none, it was removed, none came for

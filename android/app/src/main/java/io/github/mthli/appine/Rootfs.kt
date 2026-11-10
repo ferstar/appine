@@ -182,7 +182,7 @@ internal object Rootfs {
             download(context, distro, progress)
         }
         Native.importRootfs(tmp.path, tarball.path)
-        configure(tmp.path, distro)
+        configure(context, tmp.path, distro)
         if (store == store(context)) {
             // Written to disk before the rename: once the store is there, the record is its own
             prefs(context).edit(commit = true) {
@@ -204,7 +204,7 @@ internal object Rootfs {
     private fun tarball(context: Context, distro: Distro) = File(context.cacheDir, "${distro.name.lowercase()}.tar.gz")
 
     @Throws(IOException::class)
-    private fun configure(store: String, distro: Distro) {
+    private fun configure(context: Context, store: String, distro: Distro) {
         val (sources, content) = sources(distro, distro.mirrors[0])
         write(store, sources, content)
         write(store, "/etc/hostname", "localhost\n")
@@ -217,7 +217,7 @@ internal object Rootfs {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
-        write(store, "/etc/profile.d/appine.sh", PROFILE)
+        write(store, "/etc/profile.d/appine.sh", profile(context))
         val install = when (distro) {
             Distro.ALPINE -> "apk add git python3"
             Distro.DEBIAN -> "apt update && apt install git python3"
@@ -256,12 +256,21 @@ internal object Rootfs {
     }
 
     /**
-     * `/etc/profile.d/appine.sh`: shows the motd, sets the terminal and language environment
-     * variables and a coloured prompt. Which directory the shell starts in is decided by the
-     * assets' `login.sh` (tabs restored after the app was killed start in their original directory,
-     * the android/service map).
+     * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
+     * language environment variables, and gives bash and busybox ash a coloured prompt with shell
+     * integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
+     * android/terminal map). Which directory the shell starts in is decided by the assets'
+     * `login.sh` (restored tabs start in their original directory, the android/service map, new
+     * tabs in the current tab's, the android/terminal map).
      */
-    private val PROFILE = """
+    private fun profile(context: Context): String =
+        context.assets.open("profile.sh").bufferedReader().readText()
+
+    /**
+     * The copy written from round 194 until shell integration came: the coloured prompt for any
+     * shell (zsh and dash showed its bash escapes as they are), without prompt marks.
+     */
+    private val UNMARKED_PROFILE = """
         cat /etc/motd 2>/dev/null
         export TERM=xterm-256color
         export LANG=C.UTF-8
@@ -487,20 +496,20 @@ netns = "host"
     }
 
     /**
-     * The copy written before round 194: it ended with one more line, `cd "$HOME"`, which took
-     * restored tabs back to the home directory.
+     * The copy written before round 194: [UNMARKED_PROFILE] with one more line, `cd "$HOME"`, which
+     * took restored tabs back to the home directory.
      */
-    private val OLD_PROFILE = PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
+    private val OLD_PROFILE = UNMARKED_PROFILE.trimEnd('\n') + "\ncd \"${'$'}HOME\" 2>/dev/null\n"
 
     /**
-     * Replaces the profile the app wrote into a previously imported store with the current one, if
-     * it was not changed.
+     * Replaces the profile the app wrote into a previously imported store with the current one
+     * ([profile]), if it is an earlier version left unchanged.
      */
     @Throws(IOException::class)
     fun updateProfile(context: Context) {
         val path = "/etc/profile.d/appine.sh"
         val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
-        if (String(old) == OLD_PROFILE) write(store(context).path, path, PROFILE)
+        if (String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE)) write(store(context).path, path, profile(context))
     }
 
     /**

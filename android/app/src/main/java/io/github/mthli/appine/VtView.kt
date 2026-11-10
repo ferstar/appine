@@ -230,8 +230,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var searchSelected = 0
 
     /**
-     * Where the viewport was before a step to another match ([searchStep]), -1 when none is under
-     * way: the next frame shows the scroll bar if the step scrolled.
+     * Where the viewport was before a step to another match ([searchStep]) or prompt
+     * ([jumpToPrompt]), -1 when none is under way: the next frame shows the scroll bar if the step
+     * scrolled.
      */
     private var stepFrom = -1
 
@@ -351,6 +352,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The link under the long press that began the selection, which the menu offers to open. */
     private var menuLink: String? = null
 
+    /**
+     * The long press that began the selection was in a command's output ([VtNative.outputAt]),
+     * which the menu offers to select.
+     */
+    private var menuOutput = false
+
     /** The IME asked for cursor positions as they change (its candidate window follows them). */
     private var monitorCursor = false
 
@@ -459,6 +466,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         searchSelected = 0
         if (tab != 0L) VtNative.searchEnd(tab)
         invalidate()
+    }
+
+    /**
+     * Scrolls to the prompt [delta] prompts above (negative) or below the viewport's top, as the
+     * shell's prompt marks (OSC 133) find them; false on the alternate screen, which has none, so
+     * the key goes to the program there.
+     */
+    fun jumpToPrompt(delta: Int): Boolean {
+        if (tab == 0L || altScreen) return false
+        scroller.forceFinished(true)
+        stepFrom = scrollOffset
+        VtNative.jumpPrompt(tab, delta)
+        invalidate()
+        return true
     }
 
     /**
@@ -1417,8 +1438,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * The floating menu: Open link after a long press on one, Copy with a selection, Paste with
-     * text on the clipboard, Select all, and with a selection Rectangle (its ends become opposite
-     * corners) or, for a rectangle, Lines (back to a linear selection).
+     * text on the clipboard, Select output after a long press in a command's output, Select all,
+     * and with a selection Rectangle (its ends become opposite corners) or, for a rectangle, Lines
+     * (back to a linear selection).
      */
     private fun showMenu() {
         menu?.finish()
@@ -1429,9 +1451,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     if (menuLink != null) m.add(Menu.NONE, MENU_OPEN_LINK, 0, R.string.open_link)
                     if (selected) m.add(Menu.NONE, MENU_COPY, 1, android.R.string.copy)
                     if (clipboard.hasPrimaryClip()) m.add(Menu.NONE, MENU_PASTE, 2, android.R.string.paste)
-                    m.add(Menu.NONE, MENU_SELECT_ALL, 3, android.R.string.selectAll)
+                    if (menuOutput) m.add(Menu.NONE, MENU_SELECT_OUTPUT, 3, R.string.select_output)
+                    m.add(Menu.NONE, MENU_SELECT_ALL, 4, android.R.string.selectAll)
                     if (selected) {
-                        m.add(Menu.NONE, MENU_RECTANGLE, 4, if (rectangle) R.string.select_lines else R.string.select_rectangle)
+                        m.add(Menu.NONE, MENU_RECTANGLE, 5, if (rectangle) R.string.select_lines else R.string.select_rectangle)
                     }
                     return true
                 }
@@ -1449,9 +1472,23 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                             mode.finish()
                             pasteClipboard()
                         }
+                        MENU_SELECT_OUTPUT -> {
+                            menuOutput = false
+                            if (VtNative.selectOutput(tab)) {
+                                selected = true
+                                menuLink = null
+                                menuX = -1f
+                            }
+                            // The menu comes back, for the output once the frame has it, or without
+                            // this item when the output has gone
+                            menuPending = true
+                            mode.finish()
+                            invalidate()
+                        }
                         MENU_SELECT_ALL -> if (VtNative.selectAll(tab)) {
                             selected = true
                             menuLink = null
+                            menuOutput = false
                             menuX = -1f
                             menuPending = true
                             mode.finish()
@@ -1562,6 +1599,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (tab != 0L) VtNative.selectClear(tab)
         selected = false
         menuLink = null
+        menuOutput = false
         menu?.finish()
         invalidate()
     }
@@ -1651,6 +1689,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun startMouseDrag(e: MotionEvent) {
         if (selected) clearSelection()
         menuLink = null
+        menuOutput = false
         drag = DRAG_MOUSE
         send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, pressX, pressY, true))
         send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_LEFT, 0, e.x, e.y, true))
@@ -1725,6 +1764,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 val word = VtNative.selectWord(tab, cellX(e.x), cellY(e.y))
                 menuLink = linkAt(e.x, e.y)
+                menuOutput = VtNative.outputAt(tab, cellX(e.x), cellY(e.y))
                 if (mouseTracking) {
                     // Whether this selects the word or drags for the program waits for the finger
                     selected = word
@@ -1801,6 +1841,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (!(if (line) VtNative.selectLine(tab, x, y) else VtNative.selectWord(tab, x, y))) return false
         selected = true
         menuLink = null
+        menuOutput = false
         menuX = -1f
         menuPending = true
         invalidate()
@@ -1985,6 +2026,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val MENU_SELECT_ALL = 3
         const val MENU_OPEN_LINK = 4
         const val MENU_RECTANGLE = 5
+        const val MENU_SELECT_OUTPUT = 6
 
         /**
          * The schemes a tapped link may have: web pages, and from an OSC 8 link mail and guest

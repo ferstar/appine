@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback size, colours, DA1, OSC 5522, progress, status, TN, selection, search, compression, cell reads, Kitty graphics last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback, colours, DA1, OSC 5522, progress, status, TN, selection, search, compression, cell reads, Kitty graphics, shell integration last)
 
 ## Responsibilities
 
@@ -16,7 +16,8 @@
   (`TabBarView`), the search bar in its place while searching (`SearchBarView`) and the extra keys
   (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
-  what its programs report about their progress and status), `VtView` (drawing with the bundled
+  what its programs report about their progress and status, whether its shell waits at its prompt
+  and in which directory), `VtView` (drawing with the bundled
   JetBrains Mono, the images programs show, input, selection, search marks, gestures),
   `ProgressLine` (the current tab's progress over the terminal), `VtKeys`, `VtGlyphs`,
   `VtNative`, and the emulator shim and JNI in
@@ -91,7 +92,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   recently updated first, at most 64) and the one most in need of the user (`status`), a
   `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer` executor; `Events`
   (title changed, bell, clipboard write, notification, progress or status changed, finished) go
-  to the service on the main thread. Its companion holds
+  to the service on the main thread; `busy` (closing it would end something: the shell runs, has
+  started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
+  kernel). Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
   (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
@@ -110,7 +113,7 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 28 `@JvmStatic external` functions on the native library.
+- `VtNative` — 32 `@JvmStatic external` functions on the native library.
 - In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
   mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
   tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
@@ -125,7 +128,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   the last clipboard write, the last notification, the last progress report and every program
   status report, queued in a byte layout vt.rs reads; `AppineVtEffects` is how they are handed
   out; the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
-  each viewport cell's search mark for this frame and as last sent; the compression state: a pass
+  each viewport cell's search mark for this frame and as last sent; the cell of a command's output
+  a long press found, tracked for the menu's Select output; the compression state: a pass
   scheduled, the activity token last seen, a read that restored compressed pages since the last
   pass; whether the last transcript is still the screen's text; and the render state's image list
   as last read, in drawing order (`Placement`), with its placements generation). Process-wide: the
@@ -139,9 +143,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onTabStatus`, `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
-- `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `image`, `resize`, `key`, `paste`,
-  `mouse`, `focus`, `scroll`, `selectWord`, `selectLine`, `selectGrab`, `selectTo`,
-  `selectRectangle`, `selectAll`, `selectClear`, `copy`, `link`, `search`, `searchSelect`,
+- `VtNative`: `create`, `print`, `pump`, `title`, `atPrompt`, `frame`, `image`, `resize`, `key`,
+  `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`, `selectWord`, `selectLine`, `selectGrab`,
+  `selectTo`, `selectRectangle`, `selectAll`, `outputAt`, `selectOutput`, `selectClear`, `copy`,
+  `link`, `search`, `searchSelect`,
   `searchEnd`, `message`, `transcript`, `compressAll`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
   `onStatus` and `onForeground` back; `compressAll` runs on the service's worker, the rest on the
@@ -172,7 +177,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 ### The tab bar
 
 - One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes
-  the current tab; hidden while there is none), `+` (opens a session while the kernel runs) and
+  the current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
+  current tab's directory: its console's foreground group's, read from the kernel on the main
+  thread as a spawn is; the home directory without a current tab or once its shell ended) and
   `⋮` (a menu: "Find", disabled with no current tab, "Close other tabs", disabled when there is no
   other, "Close all tabs", disabled with no tabs, and Settings) over its end, every tab and button
   a 32 dp square with its label centred. The tabs pass under the buttons, which hide them, and an end padding as wide as the
@@ -217,9 +224,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   it reported in parentheses ("Waiting for your approval", "Done", "Failed", "Paused", "Working",
   with the percentage when there is one), and the `×`, `+` and `⋮` buttons by name (`⋮` as "More
   options").
-- `×` and the menu's "Close other tabs" and "Close all tabs" close at once when no shell they
-  close is running, else after a confirmation dialog ("Close this tab?" for one tab, else "Close N
-  tabs?"); several tabs are closed with the current one last, so no other tab is shown (and its
+- `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
+  they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
+  waits at its prompt as the prompt marks tell, see Shell integration), else after a confirmation
+  dialog ("Close this tab?" for one tab, else "Close N tabs?", counting all of them); a shell
+  without prompt marks always counts as busy. Several tabs are closed with the current one last,
+  so no other tab is shown (and its
   shell started) on the way, and closing all ends like closing the last tab. Ctrl+Shift+W closes
   the current tab without asking, even while its shell runs, and in an ended tab any input with a
   line break (Enter) closes it.
@@ -232,15 +242,16 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 ### Hardware-keyboard shortcuts
 
 - Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
-  matching key release, when the key event (from a hardware keyboard, or an IME sending key
-  events) has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab,
-  Ctrl+Shift+W closes the current one, Ctrl+Shift+F opens the search bar (these once per press;
-  repeats are swallowed), Ctrl+Tab and
+  matching key release, when the key event (from a hardware keyboard, or an IME sending key events)
+  has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab, Ctrl+Shift+W closes the current one,
+  Ctrl+Shift+F opens the search bar (these once per press; repeats are swallowed), Ctrl+Tab and
   Ctrl+Shift+Tab show the next and the previous one, going round and repeating while held (and
-  swallowed when there is nothing to switch to). They also work with the search bar's text
-  focused, and are listed in the system's keyboard shortcuts screen (Meta+/; the tab ones under
-  Tabs, Find under Terminal). The extra keys' modifiers do not make shortcuts: with them these keys
-  reach the program.
+  swallowed when there is nothing to switch to), and Ctrl+Shift+↑ and ↓ scroll to the previous and
+  the next prompt, repeating while held (Ghostty's `jump_to_prompt` keys on Linux; on the alternate
+  screen, which has no prompts, and without a terminal they reach the program). They also work with
+  the search bar's text focused, and are listed in the system's keyboard shortcuts screen (Meta+/;
+  the tab ones under Tabs, Find and the two prompt jumps under Terminal). The extra keys' modifiers
+  do not make shortcuts: with them these keys reach the program.
 
 ### Finding text
 
@@ -264,6 +275,29 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   second cell of a wide character with its first. Tapping the terminal while the bar is open gives
   the keyboard back to the terminal and leaves the bar and its marks; the extra keys always go to
   the terminal, the bar's text focused or not.
+
+### Shell integration
+
+- The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks
+  the prompt, the typed command and the output's start; busybox ash the prompt, and the command
+  ending with its line). libghostty-vt keeps the marks in the rows and cells it writes (prompt,
+  input, output) and the cursor's place among them; the app sets no OSC 133 callback and reads
+  only that state, through vt.c's shell integration functions. A shell without the marks (zsh,
+  fish, dash, a nested non-login shell, a remote one over ssh) leaves every cell output: it is
+  never at a prompt, there is nothing to jump to and no output to select.
+- At the prompt (`VtNative.atPrompt`, libghostty-vt's cursor-at-prompt: the cursor in a prompt or
+  the input after it, on the primary screen): `VtSession.busy` is false and closing asks nothing.
+  A command typed and entered ends the input at its line feed, so a running command, even a silent
+  one, counts as busy until the next prompt; jobs left in the background do not.
+- Jumping (`VtView.jumpToPrompt`, `VtNative.jumpPrompt`): libghostty-vt scrolls the viewport so the
+  prompt the given number of prompts above or below its top starts it, as far as there are
+  prompts (a jump past the newest returns to the bottom); a fling stops, and the next frame shows
+  the scroll bar if the viewport moved.
+- Output (`VtNative.outputAt`, `selectOutput`): a cell is in a command's output when libghostty-vt
+  can derive an output selection from it (the cell is output, after a prompt, or above the first
+  prompt); vt.c then tracks the cell, and selecting it later takes the whole output as it is then
+  (a command still running may have added to it), trailing blanks left out, anchored for drags
+  like a word.
 
 ### Extra keys
 
@@ -571,14 +605,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   ScrollView's; output alone does not show it, and with no scrollback (the alternate screen) it is
   never drawn.
 - A long press (ignored during a pinch, with a long-press haptic) selects the word under it
-  (`ghostty_terminal_select_word`, installed as the terminal's selection) and keeps it as the
-  anchor: moving on extends the selection from the far side of the word to the cell under the
-  finger. On blank cells it selects nothing and shows a menu with Paste (with a clipboard), Select
-  all and, on a link, Open link. When the program tracks the mouse, the long press selects the
-  same way, but what it becomes waits for the finger: lifted, it keeps the word (or the point
-  menu); moved on past the touch slop, the selection is dropped and the program gets a left-button
-  drag instead (press at the long-pressed point, motion while moving, release where the finger
-  lifts).
+  (`ghostty_terminal_select_word`, installed as the terminal's selection), notes whether the cell is
+  in a command's output (Shell integration) and keeps the word as the anchor: moving on extends the
+  selection from the far side of the word to the cell under the finger. On blank cells it selects
+  nothing and shows a menu with Paste (with a clipboard), Select all and, on a link, Open link. When
+  the program tracks the mouse, the long press selects the same way, but what it becomes waits for
+  the finger: lifted, it keeps the word (or the point menu); moved on past the touch slop, the
+  selection and the output found are dropped and the program gets a left-button drag instead (press
+  at the long-pressed point, motion while moving, release where the finger lifts).
 - A mouse or touchpad (not a finger) pressed while the program tracks the mouse goes to it as it
   is: the first button pressed (left, right or middle; a touchpad tap is left) with modifiers,
   motion while it is held and its release, bypassing the gestures (it clears a selection and takes
@@ -597,18 +631,22 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   its offset from the dragged cell; held above or below the grid (a handle or a long-press word
   drag), the viewport scrolls one row every 50 ms and the selection follows.
 - A floating action mode (`TYPE_FLOATING`) appears once the next frame is drawn after a selection
-  drag or long-press word ends, a double-tap word or Select all (at once, pinned at the press
-  point, after a long press on blanks or a mouse-mode long press that selected nothing), and offers
-  Open link (when the long press that began the selection was on a link, also in mouse mode), Copy
-  (with a selection), Paste (with a clipboard), Select all (scrollback included), and with a
-  selection Rectangle, or Lines for a rectangle, with the system's own labels but Open link's and
-  those last two, placed over the selected rows and moved with them on every draw; a frame without
-  a selection closes it. Open link ends the selection and opens the link. Rectangle makes the
-  selection's first and last cells opposite corners of a rectangle; Lines makes it linear again
-  from the rectangle's top left to its bottom right corner; the menu comes back with the other
-  item. Copy takes the selection as plain text with soft wraps joined (not in a rectangle, whose
-  rows are lines of their own) and trailing blanks trimmed (as Ghostty copies), puts it on the
-  clipboard and ends the selection.
+  drag or long-press word ends, a double-tap word or Select all (at once, pinned at the press point,
+  after a long press on blanks or a mouse-mode long press that selected nothing), and offers Open
+  link (when the long press that began the selection was on a link, also in mouse mode), Copy (with
+  a selection), Paste (with a clipboard), Select output (when that long press was in a command's
+  output), Select all (scrollback included), and with a selection Rectangle, or Lines for a
+  rectangle, with the system's own labels but Open link's, Select output's and the last two, placed
+  over the selected rows and moved with them on every draw; a frame without a selection closes it.
+  Open link ends the selection and opens the link. Select output selects the whole output (Shell
+  integration) and the menu comes back for it, without the item, which a double or triple tap,
+  Select all, clearing or a mouse-mode drag also drop; when the output has left the scrollback the
+  menu comes back without the item and the selection as it was. Rectangle makes the selection's
+  first and last cells opposite corners of a rectangle; Lines makes it linear again from the
+  rectangle's top left to its bottom right corner; the menu comes back with the other item. Copy
+  takes the selection as plain text with soft wraps joined (not in a rectangle, whose rows are lines
+  of their own) and trailing blanks trimmed (as Ghostty copies), puts it on the clipboard and ends
+  the selection.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
   and resizes the terminal and then the console (SIGWINCH); the activity saves the new size.
 - A resize (`VtSession.resize`, from attaching and every regrid) takes the replies the terminal
@@ -643,15 +681,17 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ### Outbound
 
-- `TerminalService` (`createSession`, `removeSession`, `current`, `fillWide`); `Native`
-  (`openConsole`, `spawn`, `write`, `closeConsole`, `waitFor`), hence the kernel's host console;
-  `login.sh`; `assets/notices`.
+- `TerminalService` (`createSession`, with the current tab's directory for a new tab,
+  `removeSession`, `current`, `fillWide`); `Native` (`openConsole`, `spawn`, `write`,
+  `closeConsole`, `waitFor`, `consoleCwd`), hence the kernel's host console; `login.sh`, and the
+  prompt marks of android/setup's profile (`profile.sh`); `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
-  encoding, selection with word and line derivation, search, plain-text formatting, title and
-  width, progress and program status reports, scrollback compression, Kitty graphics with their
+  encoding, selection with word, line and output derivation, search, plain-text formatting, title
+  and width, progress and program status reports, semantic prompts (cursor at a prompt, scrolling
+  by prompts), scrollback compression, Kitty graphics with their
   render-state image list and animation), and the Wuffs PNG decoder it carries, linked into
   `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
   pixels); `Machine::read_console`,
@@ -682,11 +722,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   reading blocks only its tab.
 - Console numbers are freed at close and reused lowest-first by the kernel, and a close carries no
   generation, so closing a stale number closes whichever console now has it.
-- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab typed on a
-  hardware keyboard with the modifiers held (the tab shortcuts); the release of the shortcut's key
-  is swallowed too, so the Kitty protocol sees no release without a press. Other releases are
-  never matched to presses: Ctrl+Shift+C/V's, or Esc's when the IME took the press, reach the
-  program alone.
+- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab typed on a hardware
+  keyboard with the modifiers held (the tab shortcuts), nor Ctrl+Shift+↑ and ↓ on the primary screen
+  (the prompt jumps, taken even when there are no prompts); the release of the shortcut's key is
+  swallowed too, so the Kitty protocol sees no release without a press. Other releases are never
+  matched to presses: Ctrl+Shift+C/V's, or Esc's when the IME took the press, reach the program
+  alone.
 - The tab bar's buttons sit over the row's end, so their group is clickable and black but for the
   left part of `×` the fade reaches into: a hidden (`INVISIBLE`) `×` takes no touches, and
   without the group's a tap there would reach a tab under it. The black is an `InsetDrawable`,
@@ -863,6 +904,16 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   could select another one.
 - The C API's line selection defaults to ignoring prompt marks; vt.c turns
   `semantic_prompt_boundary` on, as Ghostty's own triple click has it.
+- With prompt marks, every resize while the cursor is at a prompt (the keyboard showing or hiding
+  is one) clears the prompt's rows, from its first row down, for the shell to redraw them on
+  SIGWINCH (bash's marks ask for the last row only, `redraw=last`, as readline redraws). busybox
+  ash and bash redraw on every resize, rows only included; a shell given the marks that did not
+  would lose its prompt and typed input until the next one.
+- vt.c's tracked cell of an output frees its tracking only after the output's selection is
+  installed: untracking may change the page list the references taken from it point into.
+- Shell integration lives in the guest (`/etc/profile.d/appine.sh`): a tab's behaviour (closing
+  without asking, jumps, Select output) follows whatever the shell in it sends, so a user's own
+  prompt or shell changes it, and a remote shell over ssh can send marks too.
 - Up to Android 15 Back reaches `MainActivity.onBackPressed` (the manifest does not opt in to
   predictive back, so an `OnBackInvokedCallback` would be ignored there); from Android 16 on, the
   app targeting it, `onBackPressed` is never called and only the callback registered while
@@ -876,10 +927,17 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - **Each tab keeps its whole last transcript in the Java heap** (`VtSession.lastTranscript`),
   though saving writes only its last 256 K characters: for a full scrollback of plain text that is
   several hundred KB, about as much as the compressed scrollback itself.
-- **libghostty-vt features not wired**: no callbacks for OSC 7 working directories or OSC 133
-  prompts (both also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and
-  nushell but not ash, and Appine installs none; the progress and status records go by the
-  foreground process group instead of the prompt mark); tabs are restored from plain text, not
+- **Shell integration is partial**: only bash and busybox ash get prompt marks (not zsh, fish or
+  nested non-login shells); ash's mark the typed command as ending with its line, so the rows of a
+  command longer than the screen's width after the first count as output (ash breaks such lines
+  itself), and a PS1 set after the profile (ash's `~/.profile`) has none; the progress and status
+  records still go by the foreground process group rather than the next prompt; and a tap on the
+  input line does not move the cursor there (Ghostty's prompt click, `cl=` in the prompt mark: the
+  C API has no helper for it, so vt.c would count the arrow presses from the cells' semantic
+  content).
+- **libghostty-vt features not wired**: no callbacks for OSC 7 working directories (the profile
+  sends none; new tabs take the kernel's foreground directory) or OSC 133 prompt events (the marks
+  are read from the terminal's state instead); tabs are restored from plain text, not
   libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
   continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
   which vt.c leaves off; ENQ, the title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
@@ -887,9 +945,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   them would turn the IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into
   Kitty paste events for programs using mode 5522.
 - **More of libghostty-vt left unused**:
-  - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`,
-    `select_output` (needs OSC 133), and the selection gesture state machine (click counts to
-    cell, word, line or output selection), for which `VtView` has its own taps and long presses;
+  - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`
+    (keys extending a selection), and the selection gesture state machine (click counts to cell,
+    word, line or output selection), for which `VtView` has its own taps and long presses;
+  - input: a mouse's or touchpad's horizontal scrolling (`AXIS_HSCROLL`, the wheel buttons 6 and 7
+    for programs tracking the mouse) is not read;
   - drawing: overscan (rows captured beyond the viewport, to scroll by pixels; drags and flings
     move whole rows); the default palette and cursor style/blink options (the 256 colours are
     libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
@@ -899,7 +959,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
     `ghostty_render_state_row_cells_get` calls and a `ghostty_cell_get`, where
     `ghostty_render_state_row_cells_get_multi` takes several keys in one call (it stops at the
     first key that fails, so the colours, which may have no value, would go last, and the
-    grapheme buffer still needs its length first); the gain is unmeasured;
+    grapheme buffer still needs its length first); the gain is unmeasured; the search's list of
+    all matches (`GHOSTTY_SEARCH_DATA_MATCHES`, which could mark them along the scroll bar); the
+    colour utilities (`palette_generate`, the 256 colours from the first 16, and contrast and
+    luminance for a minimum contrast), of use only with themes;
   - the rest: no action to reset the terminal or clear the scrollback (`ghostty_terminal_reset`)
     and no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
     colours and OSC 8 links; the memory usage and the VT processing-error flag are never read;
@@ -928,6 +991,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   looks like the current tab's indicator, told apart only by the numbers' colours.
 - Should a status notification name the record's `app` when it has no title, as a key for grouping
   (the specification says it is not a label), rather than the tab's title?
+- Should zsh and fish get prompt marks too (Ghostty's bash script, derived from Kitty's, is
+  GPLv3; its zsh and fish scripts' licences were not checked), and should a background tab's
+  progress and status be dropped at the next prompt mark rather than when the foreground group
+  changes?
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
   while it has the keyboard, rather than on the terminal?
@@ -972,6 +1039,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `onBackPressed`: the Android 16 callback is untried. How long searching a full scrollback takes
   was measured only on a macOS build of libghostty-vt 1.4.0 (10,000 lines of 80 columns: about
   10 ms over three frames for 38,544 matches, then 0.5 ms a frame), not on a device.
+- Shell integration in the app only with busybox ash on a Pixel 4a API 34 emulator (`×` at the
+  prompt and while `sleep` ran, a new tab from `/etc`, Select output, Ctrl+Shift+↑ and ↓ from adb
+  over long outputs and on the alternate screen, the keyboard hidden and shown and a rotation with
+  half-typed input), plus vt.c on a macOS build of libghostty-vt fed recorded ash and bash bytes;
+  bash's marks were seen only in a Docker container (Ubuntu 26.04's bash 5.3), not in the app on
+  Debian, and not with real devices, hardware keyboards or TalkBack.
 - Kitty graphics with real programs beyond chafa (`chafa -f kitty`; its own detection picked
   symbols): yazi, timg, `kitten icat`, tmux passthrough with placeholders, and how programs that
   probe for the Glyph Protocol fall back. Tried on a Pixel 4a API 34 emulator with chafa and

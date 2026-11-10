@@ -146,8 +146,8 @@ pub(crate) fn fg_pgrp(k: &Kernel, id: u32) -> Result<Tid, Errno> {
     tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)
 }
 
-/// The current directory of the console's foreground process group (for restoring tabs after the
-/// app is killed, the android/service map): the leader's, or any process in the group's once the
+/// The current directory of the console's foreground process group (where restored tabs start after
+/// the app is killed, the android/service map, and new tabs, the android/terminal map): the leader's, or any process in the group's once the
 /// leader has exited; the path is relative to that process's root (as its `/proc/<pid>/cwd` is).
 /// ESRCH when there is no foreground process group (the shell has exited).
 pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {

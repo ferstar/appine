@@ -91,6 +91,8 @@ unsafe extern "C" {
     fn appine_vt_take_replies(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_resize(vt: *mut AppineVt, cols: u16, rows: u16, cell_width: u32, cell_height: u32);
     fn appine_vt_scroll(vt: *mut AppineVt, delta: i32);
+    fn appine_vt_at_prompt(vt: *mut AppineVt) -> bool;
+    fn appine_vt_jump_prompt(vt: *mut AppineVt, delta: i32);
     fn appine_vt_frame(vt: *mut AppineVt, full: bool, len: *mut usize) -> *const u8;
     fn appine_vt_image(
         vt: *mut AppineVt,
@@ -134,6 +136,8 @@ unsafe extern "C" {
     fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_rectangle(vt: *mut AppineVt, on: bool) -> bool;
     fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
+    fn appine_vt_output_at(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_output(vt: *mut AppineVt) -> bool;
     fn appine_vt_select_clear(vt: *mut AppineVt);
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
@@ -629,6 +633,19 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_title<'l>(
     })
 }
 
+/// Whether the shell is at its prompt (or the input typed at it), as its prompt marks (OSC 133)
+/// tell; false without them, on the alternate screen, or when the tab is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_atPrompt<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("VtNative.atPrompt", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_at_prompt(tab.term().0) }) as jboolean
+    })
+}
+
 /// Captures a frame (vt.c's format) of the rows that changed, or of all rows with `full`. The
 /// buffer stays valid until the next call, which only the main thread makes.
 #[unsafe(no_mangle)]
@@ -915,6 +932,22 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_scroll<'l>(
     })
 }
 
+/// Scrolls the viewport by `delta` prompts (negative: back), as the shell's prompt marks
+/// (OSC 133) find them; nothing without them.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_jumpPrompt<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    delta: jint,
+) {
+    guarded!("VtNative.jumpPrompt", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_jump_prompt(tab.term().0, delta) };
+        }
+    })
+}
+
 /// Selects the word at viewport cell (`x`, `y`) and anchors drags to it; false when there is no
 /// word there (the selection is then cleared).
 #[unsafe(no_mangle)]
@@ -1010,6 +1043,40 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectAll<'l>(
 ) -> jboolean {
     guarded!("VtNative.selectAll", 0, {
         tab(handle).is_some_and(|tab| unsafe { appine_vt_select_all(tab.term().0) }) as jboolean
+    })
+}
+
+/// Whether viewport cell (`x`, `y`) is in a command's output, as the shell's prompt marks
+/// (OSC 133) delimit it; if so, [`selectOutput`] selects that output.
+///
+/// [`selectOutput`]: Java_io_github_mthli_appine_VtNative_selectOutput
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_outputAt<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jboolean {
+    guarded!("VtNative.outputAt", 0, {
+        tab(handle)
+            .is_some_and(|tab| unsafe { appine_vt_output_at(tab.term().0, cell(x), cell(y)) })
+            as jboolean
+    })
+}
+
+/// Selects the whole output the last [`outputAt`] found and anchors drags to it; false when it is
+/// gone.
+///
+/// [`outputAt`]: Java_io_github_mthli_appine_VtNative_outputAt
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectOutput<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("VtNative.selectOutput", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_select_output(tab.term().0) }) as jboolean
     })
 }
 

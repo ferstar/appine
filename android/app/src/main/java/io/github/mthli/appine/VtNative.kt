@@ -33,6 +33,13 @@ internal object VtNative {
     @JvmStatic external fun title(tab: Long): String?
 
     /**
+     * Whether the shell is at its prompt or in the input typed at it, so no command runs in the
+     * foreground, as the shell's prompt marks (OSC 133, `/etc/profile.d/appine.sh`) tell; false
+     * without them and on the alternate screen.
+     */
+    @JvmStatic external fun atPrompt(tab: Long): Boolean
+
+    /**
      * The rows that changed since the last frame, all of them with [full] (the frame format is in
      * `hosts/android/src/vt.c`); valid until the next call. Main thread only.
      */
@@ -81,6 +88,12 @@ internal object VtNative {
     @JvmStatic external fun scroll(tab: Long, delta: Int)
 
     /**
+     * Scrolls the viewport to the prompt [delta] prompts above (negative) or below its top, or as
+     * far as there are prompts, which the shell's prompt marks (OSC 133) tell; nothing without them.
+     */
+    @JvmStatic external fun jumpPrompt(tab: Long, delta: Int)
+
+    /**
      * Selects the word at viewport cell ([x], [y]) and anchors later [selectTo] calls to it;
      * false when there is no word there (the selection is then cleared).
      */
@@ -113,6 +126,19 @@ internal object VtNative {
 
     /** Selects everything, scrollback included. */
     @JvmStatic external fun selectAll(tab: Long): Boolean
+
+    /**
+     * Whether viewport cell ([x], [y]) is in a command's output, between the prompt marks (OSC 133)
+     * of the command and of the next one, or above the first prompt; if so, the cell is kept, as
+     * output moves it, for [selectOutput].
+     */
+    @JvmStatic external fun outputAt(tab: Long, x: Int, y: Int): Boolean
+
+    /**
+     * Selects the whole output the last [outputAt] found, as it is now, and anchors later
+     * [selectTo] calls to it; false, leaving the selection alone, when it has left the scrollback.
+     */
+    @JvmStatic external fun selectOutput(tab: Long): Boolean
 
     @JvmStatic external fun selectClear(tab: Long)
 

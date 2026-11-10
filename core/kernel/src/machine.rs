@@ -473,9 +473,9 @@ impl Machine {
             .unwrap_or(Err(Errno::EIO))
     }
 
-    /// The current directory of console `id`'s foreground process group (when the app restores
-    /// tabs after being killed, the new shell starts here; the android/service map). ESRCH if the
-    /// shell has already exited.
+    /// The current directory of console `id`'s foreground process group (the shells of tabs the
+    /// app restores after being killed start here, the android/service map, and so do those of new
+    /// tabs, the android/terminal map). ESRCH if the shell has already exited.
     pub fn console_cwd(&self, id: u32) -> Result<Vec<u8>, Errno> {
         let k = self.shared.lock();
         crate::bug::host_call("Machine::console_cwd", || terminal::fg_cwd(&k, id))
