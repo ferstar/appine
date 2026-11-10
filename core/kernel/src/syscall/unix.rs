@@ -908,9 +908,11 @@ fn deadline(timeout: Option<Duration>) -> Option<Instant> {
     timeout.map(|t| Instant::now() + t)
 }
 
-/// The common part of blocking operations: EAGAIN when nonblocking or timed out, ERESTARTSYS on a
-/// signal, otherwise wait until some thread changes the state of channel `on` (a listening
-/// socket's connection queue is recorded on its receive queue).
+/// The common part of blocking operations: EAGAIN when nonblocking or timed out; on a signal,
+/// EINTR when `SO_RCVTIMEO`/`SO_SNDTIMEO` set a deadline and ERESTARTSYS otherwise (Linux's
+/// `sock_intr_errno`), so a timed wait is never restarted with its whole timeout again; otherwise
+/// wait until some thread changes the state of channel `on` (a listening socket's connection
+/// queue is recorded on its receive queue).
 fn block(
     cx: &mut Cx<'_>,
     nonblock: bool,
@@ -921,7 +923,11 @@ fn block(
         return Err(Errno::EAGAIN);
     }
     if cx.interrupted() {
-        return Err(Errno::ERESTARTSYS);
+        return Err(if deadline.is_some() {
+            Errno::EINTR
+        } else {
+            Errno::ERESTARTSYS
+        });
     }
     cx.wait_objects(deadline, &mut [], wake::FILE, &[wake::of(on)])
 }

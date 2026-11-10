@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 2 research concerns; 9 claims checked by 1 independent verifier — 8 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: timeouts; reads of nothing; shutdowns; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, options; datagram queue length; resets, typed abstract names, sender addresses last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: timeouts; reads of nothing; shutdowns; SO_PASSCRED at accept; send addresses; dead peers, listen credentials, options; datagram queue length; resets, typed abstract names, sender addresses; EINTR on timed waits last)
 
 ## Responsibilities
 
@@ -92,7 +92,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   `ECONNREFUSED`; a path socket of another type `EPROTOTYPE`. With room (backlog + 1 pending)
   a server end is created in the client's namespace and queued; credentials are exchanged (client
   gets the listener's listen-time credentials). A full queue blocks (`EAGAIN` nonblocking or after
-  `SO_SNDTIMEO`, `ERESTARTSYS` on signals) until an accept or the listener closing.
+  `SO_SNDTIMEO`, interrupted by signals as below) until an accept or the listener closing.
 - accept: not listening `EINVAL`; pops a pending end, turns on its `SO_PASSCRED` when the
   listener has it (`unix_sock_inherit_flags`), wakes blocked connectors, returns the peer name
   (2 bytes for unnamed clients); waits bounded by `SO_RCVTIMEO`.
@@ -143,7 +143,10 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   that the part of the iovecs the data already queued would fill lies in writable mappings
   (`EFAULT`, leaving the data queued). Control
   buffers are capped at 4096 bytes, data at 1 MiB per call.
-- Waits interrupted by a signal return `ERESTARTSYS`, even with a timeout set.
+- Waits interrupted by a signal return `EINTR` when `SO_RCVTIMEO`/`SO_SNDTIMEO` gave them a
+  timeout and `ERESTARTSYS` otherwise (Linux's `sock_intr_errno`), so `SA_RESTART` never restarts
+  a timed wait with its whole timeout; a stream send or `MSG_WAITALL` read that already moved data
+  returns the count instead.
 
 ### Options, readiness, listing
 
@@ -218,8 +221,7 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
   `/proc/net/unix` meanwhile).
 - **Smaller deviations:** no `SIOCOUTQ`; a datagram queue counts payload bytes, not Linux's
   per-message `truesize` against the sender's buffer; non-`SOL_SOCKET`
-  control messages are rejected instead of skipped; signal-interrupted timed waits return
-  `ERESTARTSYS` (Linux `EINTR` with a timeout); `/proc/net/unix` shows connected datagram sockets
+  control messages are rejected instead of skipped; `/proc/net/unix` shows connected datagram sockets
   as state 3; buffer sizes are only recorded: the capacity stays 212992, so a small send buffer
   does not make writes block and a larger one does not unblock them, and `SO_RCVLOWAT` does not
   change when stream reads return.
