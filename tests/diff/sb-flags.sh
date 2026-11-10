@@ -2,7 +2,8 @@
 # Superblock flags: read-only, sync, dirsync and lazytime given to a new tmpfs belong to the
 # instance (mountinfo's superblock options, /proc/mounts after ro/rw, statfs's f_flags) and are
 # shared by its binds; a bind remount changes only its mount, so a read-only instance stays
-# read-only through it; a remount without MS_BIND changes the instance (but not dirsync)
+# read-only through it; a remount without MS_BIND changes the instance (but not dirsync), and once
+# it is read-only again a bind with rw flags cannot open its files for writing either
 set -e
 cd /tmp
 cat > sb.c <<'C'
@@ -55,6 +56,14 @@ static void touch(const char *path)
         close(fd);
 }
 
+static void reopen(const char *path, int flags)
+{
+    int fd = open(path, flags);
+    printf("open %s 0%o: %s\n", path, flags, fd >= 0 ? "ok" : strerror(errno));
+    if (fd >= 0)
+        close(fd);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -76,6 +85,13 @@ int main(void)
     show("/tmp/sbb");
     touch("/tmp/sba/y");
     touch("/tmp/sbb/z");
+    // The instance read-only again without MS_BIND: the bind keeps its own rw flag, yet its
+    // files cannot be opened for writing or truncated (mnt_want_write checks both)
+    printf("remount ro: %d\n", mount(NULL, "/tmp/sba", NULL, MS_REMOUNT | MS_RDONLY, "size=1m"));
+    show("/tmp/sbb");
+    reopen("/tmp/sbb/y", O_WRONLY);
+    reopen("/tmp/sbb/y", O_RDONLY | O_TRUNC);
+    reopen("/tmp/sbb/y", O_RDONLY);
     umount("/tmp/sbb");
     umount("/tmp/sba");
     return 0;

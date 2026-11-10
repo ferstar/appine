@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 36 claims checked by 3 independent verifiers — 26 confirmed and 10 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: the mount table, mount syscalls and mount namespaces split out to kernel/mount last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: the mount table, mount syscalls and mount namespaces split out to kernel/mount, then write opens on read-only instances, splice out of a pipe and tmpfs recounts)
 
 ## Responsibilities
 
@@ -59,7 +59,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   table, the FUSE table (`kernel/fuse`'s connections and nodes) and the mount event counter.
 - `Mount`, `Mounts`, `Fs`, `MntNs`, `Index`, `GroupAlloc` — the mount table and its filesystem
   kinds (`kernel/mount`).
-- `TmpfsParams` / `Tmpfs` — options and usage (`(pages, inodes)`, counted lazily).
+- `TmpfsParams` / `Tmpfs` — options and usage (`(pages, inodes)`, counted lazily, and whether it
+  changed since it was last counted).
 - `Overlays` (`vfs/overlay.rs`) — overlay `Instance`s by device number (upper layer root, the
   mounter's filesystem IDs, the tmpfs instances its layers are in, parsed `Options`) and every
   `OvlNode` by `OvlId`: instance, parent and name (Linux's overlay dentry), the upper store inode
@@ -95,8 +96,8 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (one per kind with its own I/O, plus `Local`: regular files through `unlocked_io`, other local
   files while borrowed).
 - `Pipe` / `PipeEnd` — buffer, capacity, reader/writer counts and open counters, the room a
-  blocked writer needs (`writer_need`), the EPOLLET counters; FIFOs keyed by inode in a weak map
-  (`Kernel::fifos`).
+  blocked writer needs (`writer_need`), the EPOLLET counters, whether a splice is writing data
+  out of it (`splicing`); FIFOs keyed by inode in a weak map (`Kernel::fifos`).
 - `Kernel::unsharing` — inodes being given an object of their own, which other changes wait for.
 - `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, byte ranges, the taker's
   pid, waiters), `FlockHolder` (open file, exclusive, taker's pid), `Lease` (with its setter's
@@ -232,8 +233,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   (`readonly` includes `sb_readonly`: the instance's flag, or an overlay without an upper layer; `EROFS` in creation after
   `EEXIST`,
   before directory write permission; in unlink/rmdir/rename before lookup; attribute changes;
-  write opens of regular files, with `O_TRUNC` checked before permission, look at the mount's own
-  flags only — see Confirmed bugs), noexec (exec `EACCES`,
+  write opens of regular files, with `O_TRUNC` checked before permission), noexec (exec `EACCES`,
   `PROT_EXEC` mmap `EPERM`), nosuid (exec ignores set-id bits and file caps), nodev (device opens
   `EACCES`), nosymfollow (`ELOOP`); atime flags and the sync, dirsync, mand and lazytime
   superblock flags are only recorded and reported.
@@ -265,7 +265,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   they might not fit, less the pages the file has reserved and not written, which the host reports
   as holes) and is clipped where it runs out; reservations need room for all such pages
   of the range or fail whole; truncation is never limited; unlinking the last name frees
-  immediately. statfs and remount recount the whole tree; boot instances start uncounted, and
+  immediately. statfs and remount recount the whole tree, and so does a create, write or
+  reservation about to be refused or cut short when the recorded usage changed since the last
+  count (`tmpfs_recount`), once, before looking again; boot instances start uncounted, and
   charging does nothing until the first recount. Which instance a change counts against is decided
   by the mount's filesystem, so changes through an overlay never count against a tmpfs its upper
   layer is in.
@@ -422,7 +424,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   `EISDIR`;
   `O_TRUNC` on ro `EROFS`, else it adds `MAY_WRITE`; devices on nodev `EACCES`; permission; cgroup
   BPF device filter; `O_NOATIME` by a non-owner without `CAP_FOWNER` `EPERM`; write on ro
-  `EROFS` (the mount's own flags only); then the `O_DIRECT` rule, `EISDIR` for directories and
+  `EROFS` (ro being the mount's flag or its instance's, `readonly`); then the `O_DIRECT` rule, `EISDIR` for directories and
   `ENOTDIR` for `O_DIRECTORY` (after the checks above, where 6.1's `do_open` checks it before
   `may_open`); writing a file some task is executing `ETXTBSY`; break leases; `O_TRUNC` removes
   set-id bits and truncates, with `O_RDONLY` too (through a writable handle of its own), a held
@@ -495,7 +497,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   positions `EINVAL`; `sendfile`
   rejects `O_APPEND` output other than a pipe (`EINVAL`, as `do_splice_direct`). `splice`, `tee` and
   `vmsplice` copy through buffers (one side of `splice` must be a pipe; data leaves the pipe only
-  after the write succeeds); unknown flags are `EINVAL`; a zero length returns 0 first in splice,
+  after the write succeeds, and meanwhile every other consumer of that pipe, a read, readv,
+  vmsplice or another splice out of it, waits whatever `O_NONBLOCK` says, as for Linux's pipe
+  lock; writers do not wait); unknown flags are `EINVAL`; a zero length returns 0 first in splice,
   after the flags in tee, and in vmsplice after the flags, the fd's access mode and the iovecs
   (a non-pipe fd is `EBADF` only after that). splice checks the access modes (`EBADF`), then its
   `EINVAL` cases (no pipe, an `O_APPEND` output, FIFOs included, kinds that cannot splice), then
@@ -964,6 +968,10 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - splice and vmsplice put what they read into the output pipe whole even when a writer took the
   room while the BKL was released for the read (Linux holds the pipe's lock throughout), so a pipe
   can briefly hold more than its capacity.
+- A splice out of a pipe into a file, socket or FUSE file drains what it wrote only after the
+  write, which can release the BKL: any code that takes data out of a pipe must first wait while
+  `Pipe::splicing` is set (`wait_splice_done`), or the late drain removes bytes it never wrote.
+  Closing an end does not wait (Linux's close takes the pipe lock too).
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   the same mount; the process root itself is never lifted (as in Linux, a mount on `/` is not seen
   by absolute lookups).
@@ -1029,18 +1037,6 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 
 ## Confirmed bugs / technical debt
 
-- **Write opens ignore a read-only instance:** `open_store` takes `EROFS` for a write open or
-  `O_TRUNC` of an existing regular file from the mount's own flags, not the instance's superblock
-  flag (`Vfs::readonly`), and nothing later checks it. A bind of a mount whose instance was then
-  remounted read-only without `MS_BIND` keeps rw mount flags, so files opened through it can be
-  written and truncated. Creation, truncate(2), attribute changes and overlay opens do check the
-  instance; Linux's `mnt_want_write` checks both.
-- **splice from a pipe can drain the wrong bytes or panic:** splice from a pipe into a file,
-  socket or FUSE file copies the data out, writes it (`write_bytes`, which can release the BKL or
-  wait), and only then drains `n` bytes from the pipe with nothing excluding other readers of that
-  pipe; a reader that drains it meanwhile makes the late drain remove newer data, or panic when
-  `n` exceeds what is left (the panic ends the process, `kernel/process`'s bug handling). Linux
-  holds the pipe's lock across the write.
 - **`/proc/<pid>/fd` reopens skip open checks:** reopening a nameless target (deleted or memfd
   file, pipe, host fd) checks only permission against the host object (none for pipes and host
   fds, where Linux checks the pipe inode's 0600 mode and owner), not `EROFS`, `O_NOATIME`,
@@ -1055,8 +1051,9 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
 - **tmpfs charges drift for unlinked open files:** the last unlink gives back a file's pages, but
   later writes through a description still open are charged again and never given back (nothing
   uncharges at close; recounts skip unlinked files), while a truncation or hole punch of it
-  uncharges pages already given back; usage is right again only after a recount. Linux charges
-  until the inode is evicted at the last close.
+  uncharges pages already given back, so writes can pass the limit until the next recount (an
+  overcount is recounted before anything is refused). Linux charges until the inode is evicted
+  at the last close.
 - **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
   exec, as 6.1 does, while chown follows 6.2 and also clears it when the caller is outside the
   file's group without `CAP_FSETID`; since 6.2 Linux's writes do the same as its chown.

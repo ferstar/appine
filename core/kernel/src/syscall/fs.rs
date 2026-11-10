@@ -1199,7 +1199,9 @@ fn open_store(
     let st = store.attrs(ino)?;
     if created.is_none() {
         let mnt_flags = vfs.mount_flags(&Node::Store(mnt, ino)).unwrap_or(0);
-        let readonly = mnt_flags & ms::RDONLY != 0;
+        // Read-only means the mount's flag or its instance's (mnt_want_write checks both), so a
+        // bind keeping rw flags over an instance remounted read-only cannot write either
+        let readonly = vfs.readonly(&Node::Store(mnt, ino));
         let mut mask = open_mask(flags);
         match st.kind() {
             mode::S_IFLNK => return Err(Errno::ELOOP),
@@ -2583,9 +2585,18 @@ pub(super) fn splice(
             pipe_to_pipe(cx, &from, &to, len, nonblock, true)?
         }
         (Some((pipe, _)), None) => {
-            if !pipe_wait_data(cx, &pipe, nonblock || input.borrow().nonblocking())? {
-                return Ok(0);
+            let nonblock = nonblock || input.borrow().nonblocking();
+            loop {
+                if !pipe_wait_data(cx, &pipe, nonblock)? {
+                    return Ok(0);
+                }
+                if !wait_splice_done(cx, &pipe)? {
+                    break;
+                }
             }
+            // The data stays in the pipe until written; other consumers wait meanwhile, since
+            // writing can release the BKL or wait
+            let _splicing = Splicing::start(&pipe);
             let mut data: Vec<u8> = pipe.borrow().buf.iter().take(len).copied().collect();
             // A FUSE reply spliced from a pipe is the `len` bytes asked for (6.1's
             // fuse_dev_splice_write). libfuse vmsplices the header first and sets its length only
@@ -2599,6 +2610,11 @@ pub(super) fn splice(
             let n = write_bytes(cx, &output, &data, dst)?;
             let mut p = pipe.borrow_mut();
             let before = p.space();
+            debug_assert!(
+                n <= p.buf.len(),
+                "spliced data left the pipe while being written"
+            );
+            let n = n.min(p.buf.len());
             p.buf.drain(..n);
             if p.drained(before) {
                 request_wake_object(crate::pipe::object(&pipe));
@@ -2714,6 +2730,9 @@ fn pipe_to_pipe(
 ) -> Result<usize, Errno> {
     loop {
         pipe_wait_data(cx, src, nonblock)?;
+        if take && wait_splice_done(cx, src)? {
+            continue;
+        }
         wait_room(cx, dst, nonblock)?;
         let (mut s, mut d) = (src.borrow_mut(), dst.borrow_mut());
         if d.readers == 0 {
@@ -2902,6 +2921,39 @@ fn pipe_wait_data(
             return Err(Errno::ERESTARTSYS);
         }
         cx.wait_object(crate::pipe::object(pipe))?;
+    }
+}
+
+/// Waits while another task splices data out of the pipe ([`Pipe::splicing`]), whatever
+/// `O_NONBLOCK` says, as Linux's consumers wait for the pipe's lock. Returns whether it waited, so
+/// that the caller looks at the pipe again.
+fn wait_splice_done(cx: &mut Cx<'_>, pipe: &Rc<RefCell<Pipe>>) -> Result<bool, Errno> {
+    let mut waited = false;
+    while pipe.borrow().splicing {
+        if cx.interrupted() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        cx.wait_object(crate::pipe::object(pipe))?;
+        waited = true;
+    }
+    Ok(waited)
+}
+
+/// A splice writing data out of a pipe ([`Pipe::splicing`]) until dropped, which wakes the
+/// consumers that waited for it.
+struct Splicing(Rc<RefCell<Pipe>>);
+
+impl Splicing {
+    fn start(pipe: &Rc<RefCell<Pipe>>) -> Splicing {
+        pipe.borrow_mut().splicing = true;
+        Splicing(pipe.clone())
+    }
+}
+
+impl Drop for Splicing {
+    fn drop(&mut self) {
+        self.0.borrow_mut().splicing = false;
+        request_wake_object(crate::pipe::object(&self.0));
     }
 }
 
@@ -3860,6 +3912,9 @@ fn pipe_read(
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
     loop {
+        if !buf.is_empty() && wait_splice_done(cx, pipe)? {
+            continue;
+        }
         {
             let mut p = pipe.borrow_mut();
             if !p.buf.is_empty() || buf.is_empty() {
@@ -7317,17 +7372,19 @@ pub(super) fn fallocate(cx: &mut Cx<'_>, fd: i32, mode: u32, offset: i64, len: i
     // them one by one and undoes them on ENOSPC); punching needs none
     if let Some((dev, own)) = tmpfs
         && mode & FALLOC_FL_PUNCH_HOLE == 0
-        && let Some(room) = vfs.tmpfs_room(dev, own)?
-        && pages_needed(
-            host,
-            size,
-            offset,
-            end,
-            room.saturating_sub(own) + reserved_unwritten(host, size, own),
-        )
-        .is_err()
     {
-        return Err(Errno::ENOSPC);
+        let fits = || -> Result<bool, Errno> {
+            let Some(room) = vfs.tmpfs_room(dev, own)? else {
+                return Ok(true);
+            };
+            let free = room.saturating_sub(own) + reserved_unwritten(host, size, own);
+            Ok(pages_needed(host, size, offset, end, free).is_ok())
+        };
+        // A recorded usage that may have drifted is counted again before refusing
+        let room = fits()? || vfs.tmpfs_recount(dev)? && fits()?;
+        if !room {
+            return Err(Errno::ENOSPC);
+        }
     }
     remove_privs(cx, ino)?;
     // Store objects and tmpfs files are host files: the host reserves, punches (freeing the
@@ -7796,9 +7853,9 @@ fn tmpfs_write_room(
     let Some(t @ (dev, own)) = tmpfs_size(&vfs, &Node::Store(f.mnt, *ino), file)? else {
         return Ok((len, None));
     };
-    let Some(room) = vfs.tmpfs_room(dev, own)?.filter(|_| len > 0) else {
+    if len == 0 || vfs.tmpfs_room(dev, own)?.is_none() {
         return Ok((len, Some(t)));
-    };
+    }
     let size = file.metadata().map_err(host_errno)?.len();
     let pos = match offset {
         Some(off) => off,
@@ -7806,16 +7863,21 @@ fn tmpfs_write_room(
         None => f.pos,
     };
     let end = pos.saturating_add(len as u64);
-    // Looking for holes only when the pages the write spans might not all fit
-    let free = room.saturating_sub(own);
-    if end.div_ceil(TMPFS_PAGE) - pos / TMPFS_PAGE <= free {
-        return Ok((len, Some(t)));
-    }
-    let free = free + reserved_unwritten(file, size, own);
-    match pages_needed(file, size, pos, end, free) {
-        Ok(_) => Ok((len, Some(t))),
-        Err(stop) if stop <= pos => Err(Errno::ENOSPC),
-        Err(stop) => Ok(((stop - pos) as usize, Some(t))),
+    loop {
+        let room = vfs.tmpfs_room(dev, own)?.unwrap_or(u64::MAX);
+        // Looking for holes only when the pages the write spans might not all fit
+        let free = room.saturating_sub(own);
+        if end.div_ceil(TMPFS_PAGE) - pos / TMPFS_PAGE <= free {
+            return Ok((len, Some(t)));
+        }
+        let free = free + reserved_unwritten(file, size, own);
+        return match pages_needed(file, size, pos, end, free) {
+            Ok(_) => Ok((len, Some(t))),
+            // Short of room: the recorded usage may have drifted, so count it again first
+            Err(_) if vfs.tmpfs_recount(dev)? => continue,
+            Err(stop) if stop <= pos => Err(Errno::ENOSPC),
+            Err(stop) => Ok(((stop - pos) as usize, Some(t))),
+        };
     }
 }
 

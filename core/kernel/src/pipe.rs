@@ -52,6 +52,10 @@ pub struct Pipe {
     /// wakes the writers when it frees a full pipe, so a writer that wrote until a short count
     /// learns of the room.
     pub room: u64,
+    /// A splice is writing out data it takes from the pipe only once written: every other
+    /// consumer waits until it is done, as Linux's hold the pipe's lock across the write, so the
+    /// bytes it then removes are still the ones it wrote.
+    pub splicing: bool,
 }
 
 impl Pipe {
@@ -68,6 +72,7 @@ impl Pipe {
             writer_need: 0,
             writes: 0,
             room: 0,
+            splicing: false,
         }))
     }
 

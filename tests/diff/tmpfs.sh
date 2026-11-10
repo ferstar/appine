@@ -128,7 +128,8 @@ echo "left: $(show | wc -l)"
 # blocks and inodes follow usage (the root directory and each name take one inode, hard links
 # too; regular files count by pages, long symlinks take one page); filling it up is ENOSPC (when
 # part can be written, it writes until full), and once inodes run out, creating files, mkdir,
-# link and symlink are all ENOSPC; deleting and truncating free space again. Remounting can
+# link and symlink are all ENOSPC; deleting and truncating free space again, and so does closing
+# a deleted file written after its last name went, again and again. Remounting can
 # change size= and nr_inodes=: a value smaller than what is already used, or a limit on what was
 # unlimited, is EINVAL, and mode= and the like stay unchanged
 mkdir -p /tmp/quota
@@ -204,6 +205,18 @@ print("after unlink", err(os.mknod, D + "/again2"), err(os.write, fd, b"a" * 400
 os.close(fd)
 os.unlink(D + "/again")
 os.unlink(D + "/again2")
+# A deleted file that is still open is written and closed again and again, each time more than
+# half the instance: closed, it frees what it took, so the next one fits
+for how in ("write", "fallocate"):
+    for i in range(3):
+        fd = os.open(D + "/gone", os.O_RDWR | os.O_CREAT, 0o644)
+        os.unlink(D + "/gone")
+        if how == "write":
+            print("deleted file, write", i, err(os.write, fd, b"g" * 40000))
+        else:
+            print("deleted file, fallocate", i, err(os.posix_fallocate, fd, 0, 40000))
+        os.close(fd)
+usage("after the deleted files")
 PY
 grep ' /tmp/quota ' /proc/self/mountinfo | awk '{ for (i = 7; $i != "-"; i++) {} print $(i + 3) }'
 for o in size=16k size=4k nr_inodes=2 nr_inodes=20,mode=755,inode32 nr_inodes=0 size=0 size=1m; do

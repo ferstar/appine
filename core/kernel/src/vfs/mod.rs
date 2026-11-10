@@ -626,7 +626,16 @@ impl Mounts {
         self.boot(id, fs, Some(point), flags, source);
         // Usage is counted when needed ([`dev::populate`] created nodes in it)
         let used = None;
-        self.tmpfs.insert(dev, Tmpfs { root, params, used });
+        let changed = false;
+        self.tmpfs.insert(
+            dev,
+            Tmpfs {
+                root,
+                params,
+                used,
+                changed,
+            },
+        );
         Ok(root)
     }
 
@@ -735,6 +744,9 @@ pub(crate) struct Tmpfs {
     /// Recorded usage (pages, inodes), updated on create, delete, write and truncate, and counted
     /// afresh at statfs ([`Vfs::count_tmpfs`]); None means count it the next time it is needed.
     used: Option<(u64, u64)>,
+    /// The recorded usage changed since it was last counted, so it may have drifted (writes to
+    /// deleted files still open are charged and never given back): [`Vfs::tmpfs_recount`].
+    changed: bool,
 }
 
 /// What no-BKL path resolution needs (`syscall::fast`): the store's metadata cache and the mount
@@ -2151,15 +2163,38 @@ impl Vfs {
     }
 
     /// Whether `pages` more pages and `inodes` more inodes fit in tmpfs instance `dev` (Linux's
-    /// `shmem_reserve_inode`, `shmem_inode_acct_block`): ENOSPC when they do not. When they fit,
-    /// the caller accounts after it is done ([`Vfs::tmpfs_charge`]).
+    /// `shmem_reserve_inode`, `shmem_inode_acct_block`): ENOSPC when they do not, also once
+    /// counted again ([`Vfs::tmpfs_recount`]). When they fit, the caller accounts after it is done
+    /// ([`Vfs::tmpfs_charge`]).
     pub(crate) fn tmpfs_check(&self, dev: u64, pages: u64, inodes: u64) -> Result<(), Errno> {
-        let (p, used_pages, used_inodes) = self.tmpfs_usage(dev, false)?;
-        let over = |max: u64, used: u64, more: u64| max != 0 && more > 0 && used + more > max;
-        if over(p.blocks, used_pages, pages) || over(p.inodes, used_inodes, inodes) {
-            return Err(Errno::ENOSPC);
+        loop {
+            let (p, used_pages, used_inodes) = self.tmpfs_usage(dev, false)?;
+            let over = |max: u64, used: u64, more: u64| max != 0 && more > 0 && used + more > max;
+            if over(p.blocks, used_pages, pages) || over(p.inodes, used_inodes, inodes) {
+                if self.tmpfs_recount(dev)? {
+                    continue;
+                }
+                return Err(Errno::ENOSPC);
+            }
+            return Ok(());
         }
-        Ok(())
+    }
+
+    /// Before refusing or cutting short a change for lack of room in tmpfs instance `dev`: counts
+    /// its usage afresh when the recorded one changed since it was last counted, so drift cannot
+    /// make it full; returns whether it did, so the caller looks again. A full instance is counted
+    /// once, not at every refused change.
+    pub(crate) fn tmpfs_recount(&self, dev: u64) -> Result<bool, Errno> {
+        let changed = self
+            .mounts
+            .borrow()
+            .tmpfs
+            .get(&dev)
+            .is_some_and(|t| t.changed);
+        if changed {
+            self.tmpfs_usage(dev, true)?;
+        }
+        Ok(changed)
     }
 
     /// How many pages a file in tmpfs instance `dev` can still use: the `own` pages it already
@@ -2177,6 +2212,7 @@ impl Vfs {
         {
             *p = p.saturating_add_signed(pages);
             *i = i.saturating_add_signed(inodes);
+            t.changed = true;
         }
     }
 
@@ -2218,6 +2254,7 @@ impl Vfs {
                 let u = self.count_tmpfs(root)?;
                 if let Some(t) = self.mounts.borrow_mut().tmpfs.get_mut(&dev) {
                     t.used = Some(u);
+                    t.changed = false;
                 }
                 u
             }
@@ -2456,6 +2493,7 @@ impl Vfs {
                 params,
                 // Only the root directory
                 used: Some((0, 1)),
+                changed: false,
             },
         );
         Ok(id)
@@ -4681,6 +4719,11 @@ mod tests {
         vfs.tmpfs_charge(dev, 1, 0);
         assert_eq!(usage(false), (4, 5));
         assert_eq!(vfs.tmpfs_room(dev, 2), Ok(Some(2)));
+        // A refusal counts again first when the recorded usage changed since the last count (here
+        // the stray charge above), and only then
+        assert_eq!(vfs.tmpfs_check(dev, 1, 0), Ok(()));
+        assert_eq!(usage(false), (3, 5));
+        assert_eq!(vfs.tmpfs_recount(dev), Ok(false));
         // Counted afresh: the recorded usage follows
         assert_eq!(usage(true), (3, 5));
         assert_eq!(usage(false), (3, 5));

@@ -5,7 +5,8 @@
 # thread; /proc/vmstat; RLIMIT_MSGQUEUE; sched_setattr flags; membarrier after fork;
 # CLONE_PARENT exit signals; timers of exited threads; sendfile into O_APPEND files; thread
 # names as bytes; RssAnon, RssFile and RssShmem; AF_UNIX reads of nothing and shutdown; robust
-# mutexes on copy-on-write pages
+# mutexes on copy-on-write pages; when splice and tee wait; a pipe spliced out while another
+# thread reads it
 set -e
 cd /tmp
 # MSG_WAITALL on TCP waits for the whole length even when the data comes in pieces, and over 1 MiB;
@@ -1558,3 +1559,68 @@ int main(void) {
 C
 gcc -O1 -pthread -o splicewait splicewait.c && ./splicewait
 rm -f splicewait splicewait.c
+# A splice out of a pipe keeps the pipe to itself until its write is done (Linux holds the pipe's
+# lock): 1 MiB spliced into an AF_UNIX socket that nobody reads yet blocks, a reader of the same
+# pipe started meanwhile waits for the splice, and the socket and the reader then hold the stream
+# between them, in order, each byte once (the reader takes what the splice left, here nothing).
+# The write end is closed only once the socket is drained: Linux's close takes the pipe's lock too
+cat > splicerace.c <<'C'
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define SIZE (1 << 20)
+static int p[2], s[2];
+static unsigned char *want, *got_sock, *got_pipe;
+static long spliced, read_pipe;
+
+static void *splicer(void *arg)
+{
+    spliced = splice(p[0], NULL, s[0], NULL, SIZE, 0);
+    shutdown(s[0], SHUT_WR);
+    return arg;
+}
+
+static void *reader(void *arg)
+{
+    long n;
+    while ((n = read(p[0], got_pipe + read_pipe, SIZE - read_pipe)) > 0)
+        read_pipe += n;
+    return arg;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    want = malloc(SIZE), got_sock = malloc(SIZE), got_pipe = malloc(SIZE);
+    for (long i = 0; i < SIZE; i++)
+        want[i] = i * 7 + i / 251;
+    pipe(p);
+    printf("pipe size: %d\n", fcntl(p[1], F_SETPIPE_SZ, SIZE));
+    printf("filled: %ld\n", (long)write(p[1], want, SIZE));
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    pthread_t a, b;
+    pthread_create(&a, NULL, splicer, NULL);
+    usleep(200000);
+    pthread_create(&b, NULL, reader, NULL);
+    usleep(200000);
+    long total = 0, n;
+    while ((n = read(s[1], got_sock + total, SIZE - total)) > 0)
+        total += n;
+    pthread_join(a, NULL);
+    close(p[1]);
+    pthread_join(b, NULL);
+    int intact = spliced == total && total + read_pipe == SIZE && !memcmp(got_sock, want, total) &&
+                 !memcmp(got_pipe, want + total, read_pipe);
+    printf("socket and reader: %ld bytes, the stream intact: %s\n", total + read_pipe,
+           intact ? "yes" : "no");
+    return 0;
+}
+C
+gcc -O1 -pthread -o splicerace splicerace.c && ./splicerace
+rm -f splicerace splicerace.c
