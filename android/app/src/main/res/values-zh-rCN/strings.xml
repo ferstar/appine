@@ -30,6 +30,11 @@
     <string name="next_tab">下一个标签页</string>
     <string name="previous_tab">上一个标签页</string>
     <string name="shortcuts_tabs">标签页</string>
+    <string name="shortcuts_terminal">终端</string>
+    <string name="find">查找</string>
+    <string name="find_previous">上一个匹配</string>
+    <string name="find_next">下一个匹配</string>
+    <string name="find_close">关闭查找</string>
     <string name="tab_ended">%1$s（已结束）</string>
     <string name="tab_description">标签页 %1$d：%2$s</string>
     <string name="tab_number">标签页 %1$d</string>
@@ -134,6 +139,8 @@
     <string name="paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
     <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
     <string name="open_link">打开链接</string>
+    <string name="select_rectangle">矩形选择</string>
+    <string name="select_lines">按行选择</string>
     <string name="link_no_app">没有能打开这个链接的应用</string>
     <string name="link_remote_file">这个文件在 %1$s 上，不在 Appine 里</string>
     <string name="link_hidden_file">家目录之外：请在设置里打开“在‘文件’App 里显示整个系统”</string>

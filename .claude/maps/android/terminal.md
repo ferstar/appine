@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, scrollback limits, default colours, DA1 and OSC 5522's limit, then progress reports, program status and TN last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, the menu key and resize replies, scrollback limits, default colours, DA1, OSC 5522, progress, program status and TN, then line and rectangular selection and search last)
 
 ## Responsibilities
 
@@ -13,12 +13,13 @@
 
 - `MainActivity`: the screen's layout and status text, the current session and its successor,
   closing tabs, keyboard shortcuts, font zoom, insets and the IME, links, with the tab bar
-  (`TabBarView`) and the extra keys (`ExtraKeysView`);
+  (`TabBarView`), the search bar in its place while searching (`SearchBarView`) and the extra keys
+  (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
   what its programs report about their progress and status), `VtView` (drawing with the bundled
-  JetBrains Mono, input, selection, gestures), `ProgressLine` (the current tab's progress over the
-  terminal), `VtKeys`, `VtGlyphs`, `VtNative`, and the emulator shim and JNI in the native library
-  (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
+  JetBrains Mono, input, selection, search marks, gestures), `ProgressLine` (the current tab's
+  progress over the terminal), `VtKeys`, `VtGlyphs`, `VtNative`, and the emulator shim and JNI in
+  the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
@@ -29,8 +30,8 @@
 
 Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSession.kt`,
 `VtView.kt`, `VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `ConsolePty.kt`, `TabBarView.kt`,
-`ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `android/app/src/main/res/`,
-`android/app/src/main/assets/fonts/`, `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
+`SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`,
+`android/app/src/main/res/`, `android/app/src/main/assets/fonts/`, `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
 
 Outside the module: session ownership, saving, kill reports and where bells, notifications,
 program statuses and clipboard writes go (`android/service`); the host console in the kernel (`kernel/tty`); the
@@ -39,11 +40,17 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ## Key types
 
-- `MainActivity` — a `TerminalService.Listener` built in code: a black column of `TabBarView`, a
-  frame with the `VtView`, a status line and the `ProgressLine` along its top, and `ExtraKeysView`; adapters `Host : VtView.Host`,
-  `Bar : TabBarView.Target` and `Keys : ExtraKeysView.Target`; the current session and its index,
-  from which its successor is taken; a tab requested by a notification (`EXTRA_TAB`); the IME
-  animation callback `keysFollowIme`.
+- `MainActivity` — a `TerminalService.Listener` built in code: a black column of one bar's place
+  (`TabBarView`, or `SearchBarView` while searching), a frame with the `VtView`, a status line and
+  the `ProgressLine` along its top, and `ExtraKeysView`; adapters `Host : VtView.Host`,
+  `Bar : TabBarView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
+  current session and its index, from which its successor is taken; a tab requested by a
+  notification (`EXTRA_TAB`); the IME animation callback `keysFollowIme`; Back's callback while
+  the search bar is open (`closeSearchOnBack`, Android 16 and later).
+- `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
+  without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
+  shows the count it is given (`setCount`) and sends text changes, steps and closing to a
+  `Target` (`search`, `step`, `close`).
 - `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+` and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
@@ -84,12 +91,13 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   status changed, finished) go to the service on the main thread. Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
-  (codepoint, colours, attributes, grapheme clusters per cell, each row's selected columns), a
-  backing bitmap of the grid, the modes, scroll position and selection bounds of the last frame,
-  the IME connection, gestures and their drag states, the fling's `OverScroller`, selection
-  handles and the floating menu, the cursor's blink timer and the bell's last vibration. `Host`
-  (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift` and
-  `modifiersUsed`, and `onLink` (opens a link in another app).
+  (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
+  selected columns), a backing bitmap of the grid, the modes, scroll position and selection
+  bounds and shape of the last frame, whether a search runs and its count as last reported, the
+  IME connection, gestures (with the taps in a row) and their drag states, the fling's
+  `OverScroller`, selection handles and the floating menu, the cursor's blink timer and the bell's
+  last vibration. `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`,
+  `alt`, `shift` and `modifiersUsed`, `onLink` (opens a link in another app) and `onSearchCount`.
 - `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
   report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
   rectangle (`draw`, a fill or a sweep) and gives a report's fraction (`fractionOf`).
@@ -97,7 +105,7 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 21 `@JvmStatic external` functions on the native library.
+- `VtNative` — 26 `@JvmStatic external` functions on the native library.
 - In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
   flag) in a table `TABS` keyed by handles from 1, never reused; `Term` (owns the `AppineVt`,
   freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into `Effects` (with
@@ -105,10 +113,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and
   cell pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link
   and transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
-  selection drag, the last reported mouse cell, and the effects since they were last taken: bells,
+  selection drag, the last reported mouse cell, the effects since they were last taken: bells,
   the last clipboard write, the last notification, the last progress report and every program
   status report, queued in a byte layout vt.rs reads; `AppineVtEffects` is how they are handed
-  out).
+  out; and the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
+  each viewport cell's search mark for this frame and as last sent).
 
 ## Public entry points
 
@@ -119,8 +128,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `resize`, `key`, `paste`, `mouse`,
-  `focus`, `scroll`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`, `copy`,
-  `link`, `message`, `transcript`, `destroy`; `pump` runs on `vt-pump` and calls
+  `focus`, `scroll`, `selectWord`, `selectLine`, `selectGrab`, `selectTo`, `selectRectangle`,
+  `selectAll`, `selectClear`, `copy`, `link`, `search`, `searchSelect`, `searchEnd`, `message`,
+  `transcript`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
   `onStatus` and `onForeground` back; the rest run on the main thread.
 
@@ -150,9 +160,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes
   the current tab; hidden while there is none), `+` (opens a session while the kernel runs) and
-  `⋮` (a menu: "Close other tabs", disabled when there is no other, "Close all tabs", disabled
-  with no tabs, and Settings) over its end, every tab and button a 32 dp square with its label
-  centred. The tabs pass under the buttons, which hide them, and an end padding as wide as the
+  `⋮` (a menu: "Find", disabled with no current tab, "Close other tabs", disabled when there is no
+  other, "Close all tabs", disabled with no tabs, and Settings) over its end, every tab and button
+  a 32 dp square with its label centred. The tabs pass under the buttons, which hide them, and an end padding as wide as the
   buttons lets the last tab scroll out from under them; while more tabs lie beyond, the row fades
   out over 32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's right
   fading edge; the left edge does not fade).
@@ -211,11 +221,36 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Taken by the activity (`dispatchKeyEvent`) before the terminal sees them, together with the
   matching key release, when the key event (from a hardware keyboard, or an IME sending key
   events) has Ctrl without Alt or Meta: Ctrl+Shift+T opens a tab,
-  Ctrl+Shift+W closes the current one (both once per press; repeats are swallowed), Ctrl+Tab and
+  Ctrl+Shift+W closes the current one, Ctrl+Shift+F opens the search bar (these once per press;
+  repeats are swallowed), Ctrl+Tab and
   Ctrl+Shift+Tab show the next and the previous one, going round and repeating while held (and
-  swallowed when there is nothing to switch to). They are also listed in the system's keyboard
-  shortcuts screen (Meta+/). The extra keys' modifiers do not make shortcuts: with them these keys
+  swallowed when there is nothing to switch to). They also work with the search bar's text
+  focused, and are listed in the system's keyboard shortcuts screen (Meta+/; the tab ones under
+  Tabs, Find under Terminal). The extra keys' modifiers do not make shortcuts: with them these keys
   reach the program.
+
+### Finding text
+
+- "Find" (⋮) or Ctrl+Shift+F, with a current tab, puts the search bar in the tab bar's place
+  (the tab bar is gone, the place keeps its 32 dp, so the terminal keeps its rows) and brings the
+  keyboard up on its text, which is kept from the last search and selected, so typing replaces it;
+  that text is searched for again at once. Every change of the text searches anew (`VtView.search`,
+  `VtNative.search`): libghostty-vt matches ASCII letters in either case and everything else
+  exactly, in the screen and its scrollback (the primary screen's results are kept while a program
+  uses the alternate one). Empty text searches for nothing and clears the count.
+- No match is selected until a step: `↑`, Enter or the keyboard's Search key selects the next match
+  above (towards older output; the first step selects the newest), `↓` or Shift+Enter the one
+  below, going round at either end, and the viewport scrolls to it unless it is shown (the scroll
+  bar shows only when it scrolled). The count reads "selected/total", the selected one counted
+  from the newest, 0 before a step; it grows as a long scrollback is searched over several frames.
+- `×`, Esc in the text, or Back (after Back has hidden the keyboard) closes the bar: the search
+  ends and its marks go, the tab bar comes back, the terminal takes the focus and the viewport
+  stays where the search left it. Showing another tab (Ctrl+Tab while searching) or a restart
+  closes it too, as a search belongs to the tab it was opened in.
+- Matches are drawn as Ghostty draws them: black text on yellow, the selected match on orange, the
+  second cell of a wide character with its first. Tapping the terminal while the bar is open gives
+  the keyboard back to the terminal and leaves the bar and its marks; the extra keys always go to
+  the terminal, the bar's text focused or not.
 
 ### Extra keys
 
@@ -333,10 +368,13 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
   (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, updates the render
-  state (unless a synchronized-output hold is active), and writes a 48-byte header plus the dirty
-  rows (all rows when the view asks for a full frame) in the format documented in `vt.c` (12-byte
-  row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
-  `ByteBuffer` is valid until the next `frame`.
+  state (unless a synchronized-output hold is active), catches a running search up with the
+  terminal for at most 4 ms and marks its matches in the viewport, and writes a 56-byte header
+  plus the dirty rows and the rows whose search marks changed since the last frame (all rows when
+  the view asks for a full frame) in the format documented in `vt.c` (12-byte row headers, 16-byte
+  cells, a grapheme's extra codepoints after its row); the direct `ByteBuffer` is valid until the
+  next `frame`. A search not yet caught up sets a header flag, and the view draws again on the
+  next animation frame to go on.
 - A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
   full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
   rows, cursor and colours come from the capture while the header's modes, selection and scroll
@@ -346,10 +384,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
   also resizes the tab's terminal and console to the view's grid when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
-  focus events 1004, a selection exists), the selection's first and last cells in the viewport,
-  and the scroll position libghostty-vt reports for the scroll bar (the scrollable area in rows,
-  the viewport's first row in it and the rows it shows); each row carries its selected columns.
-  `VtView` reads neither the header's dirty byte nor the focus-events flag.
+  focus events 1004, a selection exists, it is a rectangle, the search is still catching up), the
+  selection's first and last cells in the viewport (a rectangle's top left and bottom right
+  corners), the scroll position libghostty-vt reports for the scroll bar (the scrollable area in
+  rows, the viewport's first row in it and the rows it shows) and the search's count (matches so
+  far, the selected one's place from the newest); each row carries its selected columns (a
+  rectangle's columns on each of its rows) and each cell its search mark (attributes bits 14 and
+  15). `VtView` reads neither the header's dirty byte nor the focus-events flag, and reports the
+  count to the activity when it changes.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
@@ -357,7 +399,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   ideograph when it has one), at least 1, or 1 with the setting off.
 - `onDraw` fills the view (the margin past the last whole cell included) with the default
   background, then each dirty row is repainted into the bitmap under a clip: default background,
-  runs of other backgrounds, the selection's translucent highlight, then text. Plain ASCII runs of
+  runs of other backgrounds (a search match's colour over a cell's own), the selection's
+  translucent highlight, then text (black in a search match). Plain ASCII runs of
   one paint, colour and decoration go out in one draw call; other glyphs are centred in their one
   or two cells, a wide cell's glyph enlarged evenly by the wide scale about the cell's vertical
   middle, and any glyph still wider than its cells shrunk evenly to fit (never stretched); single
@@ -431,11 +474,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   tap is on a link, it opens the link instead of the IME; otherwise it opens the IME and, when the
   program tracks the mouse, also sends a left click (press and release at the tap's pixel position,
   in the program's format). A tap that stopped a fling does nothing else. Taps act at once:
-  `VtView` tells a double tap itself (the second tap's press within the system's double-tap
-  timeout of the first's lift, the two lifts within its double-tap slop), so without mouse
-  tracking the second tap selects the word under it (with the menu), and with it both taps are
-  clicks, for the program's own double click; a third tap counts as a first, and so does a tap
-  after one that opened a link.
+  `VtView` counts taps in a row itself (each press within the system's double-tap timeout of the
+  last lift, the two lifts within its double-tap slop), so without mouse tracking the second tap
+  selects the word under it and the third the line (with the menu), and with it every tap is a
+  click, for the program's own double and triple clicks; a fourth tap counts as a first, and so
+  does a tap after one that opened a link. The line is Ghostty's triple-click line
+  (`ghostty_terminal_select_line`): the soft-wrapped line with blanks at its ends left out, cut
+  where an OSC 133 prompt mark starts or ends a part of it. A second or third tap on blanks acts as
+  a single tap.
 - A link is a cell's OSC 8 hyperlink, else an `http://` or `https://` URL written in the text
   (`VtNative.link`): vt.c joins the cell's soft-wrapped line (up to 64 rows above and below), takes
   the run's first scheme at or before the cell and runs on over ASCII URL characters (letters,
@@ -478,9 +524,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   encoder's choice by its mode (1000 none of the motion, 1002 motion with a button held, 1003
   all), and vt.c skips motion within the cell of the last event it encoded, press or release
   included (except in SGR-Pixels format).
-- The two handles (start below the first cell, end below the last, when in the viewport) drag the
-  selection's ends; the other end is the anchor, kept as tracked grid references so output does
-  not move it. A handle that would stick out of the view at the left edge (start) or right edge
+- The two handles (start below the first cell, end below the last, when in the viewport; a
+  rectangle's top left and bottom right corners) drag the selection's ends; the other end is the
+  anchor, kept as tracked grid references so output does not move it, and a rectangle stays one
+  with the anchor and the finger's cell at opposite corners. A handle that would stick out of the view at the left edge (start) or right edge
   (end) is drawn with the other handle's drawable, on the other side of the same point, so both
   stay on the screen, and the handles' areas (with an 8 dp margin) are excluded from the system's
   back gesture while they are shown, so a drag from the edge moves the handle. The finger keeps
@@ -490,16 +537,21 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   drag or long-press word ends, a double-tap word or Select all (at once, pinned at the press
   point, after a long press on blanks or a mouse-mode long press that selected nothing), and offers
   Open link (when the long press that began the selection was on a link, also in mouse mode), Copy
-  (with a selection), Paste (with a clipboard), Select all (scrollback included), with the
-  system's own labels but Open link's, placed over the selected rows and moved with them on every
-  draw; a frame without a selection closes it. Open link ends the selection and opens the link.
-  Copy takes the selection as plain text with soft wraps joined and trailing blanks trimmed (as
-  Ghostty copies), puts it on the clipboard and ends the selection.
+  (with a selection), Paste (with a clipboard), Select all (scrollback included), and with a
+  selection Rectangle, or Lines for a rectangle, with the system's own labels but Open link's and
+  those last two, placed over the selected rows and moved with them on every draw; a frame without
+  a selection closes it. Open link ends the selection and opens the link. Rectangle makes the
+  selection's first and last cells opposite corners of a rectangle; Lines makes it linear again
+  from the rectangle's top left to its bottom right corner; the menu comes back with the other
+  item. Copy takes the selection as plain text with soft wraps joined (not in a rectangle, whose
+  rows are lines of their own) and trailing blanks trimmed (as Ghostty copies), puts it on the
+  clipboard and ends the selection.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
   and resizes the terminal and then the console (SIGWINCH); the activity saves the new size.
 - A resize (`VtSession.resize`, from attaching and every regrid) takes the replies the terminal
   made for it, the in-band size report of a program using mode 2048, and writes them through the
-  tab's writer at once, rather than leaving them for the pump's next read.
+  tab's writer at once, rather than leaving them for the pump's next read. A search keeps its
+  selected match through a resize (the keyboard showing or hiding is one).
 
 ### Licenses
 
@@ -534,8 +586,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
-  encoding, selection, plain-text formatting, title and width, progress and program status
-  reports), linked into `libappine.so` (`android/native`); `Machine::read_console`,
+  encoding, selection with word and line derivation, search, plain-text formatting, title and
+  width, progress and program status reports), linked into `libappine.so` (`android/native`); `Machine::read_console`,
   `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly; the system
   clipboard; the app the system picks for a link (a browser, or a viewer or the Files app for a
@@ -705,6 +757,20 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   call takes fresh ones; the anchor of a drag is tracked. A changed selection makes the next frame a
   full one (the render state redraws everything when the screen's selection changes), as does
   scrolling the viewport.
+- libghostty-vt's render state keeps search highlights internally, but the C API does not expose
+  them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
+  ones fail for a match that starts above the viewport), and resends a row whose marks differ from
+  the last frame's, since the render state does not count them as a change.
+- A resize restarts libghostty-vt's search and drops its selected match. vt.c notes the match's
+  place from the newest before resizing, runs the search to the end afterwards and steps to that
+  place again (the steps scroll nothing but the last); a resize that changed which matches exist
+  could select another one.
+- The C API's line selection defaults to ignoring prompt marks; vt.c turns
+  `semantic_prompt_boundary` on, as Ghostty's own triple click has it.
+- Up to Android 15 Back reaches `MainActivity.onBackPressed` (the manifest does not opt in to
+  predictive back, so an `OnBackInvokedCallback` would be ignored there); from Android 16 on, the
+  app targeting it, `onBackPressed` is never called and only the callback registered while
+  searching closes the bar. Lint's GestureBackNavigation check is suppressed on the override.
 - Text the app prints does not consume the title-changed flag, so a title it sets is reported at
   the pump's next read; a notification cut at 4 KiB can split a UTF-8 sequence, which vt.rs decodes
   lossily.
@@ -714,12 +780,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - **A full scrollback holds 3.5–10 MiB a tab** (about 3.5 MiB at 45 columns, 6.6 MiB at 80 and the
   10 MiB byte limit from about 120 columns on), which nothing reclaims while scrollback is not
   compressed (below).
-- **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
-  (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
 - **libghostty-vt features not wired**: no callbacks for OSC 7 working directories or OSC 133
   prompts (both also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and
   nushell but not ash, and Appine installs none; the progress and status records go by the
-  foreground process group instead of the prompt mark); no search; no scrollback compression
+  foreground process group instead of the prompt mark); no scrollback compression
   (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
   libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
   continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
@@ -761,6 +825,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   looks like the current tab's indicator, told apart only by the numbers' colours.
 - Should a status notification name the record's `app` when it has no title, as a key for grouping
   (the specification says it is not a label), rather than the tab's title?
+- Should typing in the search bar select the newest match at once, as Chrome's find bar does,
+  rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
+  while it has the keyboard, rather than on the terminal?
 
 ## To verify
 
@@ -790,6 +857,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `printf` sequences on a Pixel 4a API 34 emulator (the progress line in each state, background
   tabs' marks, notifications, a kill from another tab, seeing a tab, the 15 s timeout, Chinese
   strings, TalkBack descriptions read through uiautomator, not heard).
+- Line and rectangular selection and the search bar were tried only on a Pixel 4a API 34 emulator
+  (taps from `sendevent`, drags and keys from adb, Gboard in English), so Back went through
+  `onBackPressed`: the Android 16 callback is untried. How long searching a full scrollback takes
+  was measured only on a macOS build of libghostty-vt 1.4.0 (10,000 lines of 80 columns: about
+  10 ms over three frames for 38,544 matches, then 0.5 ms a frame), not on a device.
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
   `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
   also after a full reset and on the alternate screen, was checked on a macOS build of

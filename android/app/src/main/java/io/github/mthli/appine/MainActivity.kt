@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ComponentName
@@ -23,6 +24,8 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -30,6 +33,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.isVisible
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -39,7 +43,8 @@ import kotlin.concurrent.thread
  * The terminal screen: the tab bar ([TabBarView]) on top, the terminal ([VtView]) in the middle,
  * and below it the keys the soft keyboard lacks ([ExtraKeysView]: Esc, Ctrl, arrows and so on).
  * Sessions belong to [TerminalService]; this only handles display and input: the bar shows every
- * tab, the view the current tab's [VtSession].
+ * tab, the view the current tab's [VtSession]. While the current tab is searched, the search bar
+ * ([SearchBarView]) takes the tab bar's place.
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
@@ -52,6 +57,9 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The current tab's progress (OSC 9;4), along the top of the terminal. */
     private lateinit var progressLine: ProgressLine
     private lateinit var tabBar: TabBarView
+
+    /** In the tab bar's place while the current tab is searched ([openSearch]). */
+    private lateinit var searchBar: SearchBarView
     private lateinit var status: TextView
     private lateinit var keys: ExtraKeysView
 
@@ -74,6 +82,12 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
     private var shortcutKey = 0
+
+    /**
+     * Back's callback while the search bar is open, from Android 16 on (an OnBackInvokedCallback,
+     * kept untyped for older versions); null otherwise. See [onBackPressed].
+     */
+    private var closeSearchOnBack: Any? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -165,7 +179,13 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
         progressLine = ProgressLine(this)
         tabBar = TabBarView(this, Bar())
+        searchBar = SearchBarView(this, Find()).apply { isVisible = false }
         keys = ExtraKeysView(this, Keys())
+        // One bar's place: the search bar, as tall as the tab bar, stands in for it
+        val bars = FrameLayout(this).apply {
+            addView(tabBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(searchBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(screen)
@@ -177,7 +197,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             setBackgroundColor(Color.BLACK)
             // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
             clipToPadding = false
-            addView(tabBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(bars, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             addView(keys)
         }
@@ -306,6 +326,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     override fun onRestarting() {
+        closeSearch()
         current = null
         progressLine.show(null, jump = true)
         screen.attach(null)
@@ -340,6 +361,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     private fun show(session: VtSession) {
+        // A search belongs to the tab it was opened in
+        closeSearch()
         current = session
         progressLine.show(session.progress, jump = true)
         service?.current = session
@@ -360,13 +383,20 @@ class MainActivity : Activity(), TerminalService.Listener {
         tabBar.render(sessions, shown)
     }
 
-    // ---- Closing tabs ----
+    // ---- The menu and closing tabs ----
 
-    /** `⋮`: closing the other tabs (none other: disabled) or all of them, and Settings. */
+    /**
+     * `⋮`: finding text in the current tab (none: disabled), closing the other tabs (none other:
+     * disabled) or all of them, and Settings.
+     */
     private fun showMenu(anchor: View) {
         val sessions = service?.sessions.orEmpty().toList()
         val others = sessions.filter { it != current }
         PopupMenu(this, anchor, Gravity.END, 0, R.style.Widget_Appine_MorePopup).apply {
+            menu.add(R.string.find).apply { isEnabled = current != null }.setOnMenuItemClickListener {
+                openSearch()
+                true
+            }
             menu.add(R.string.close_other_tabs).apply { isEnabled = others.isNotEmpty() }.setOnMenuItemClickListener {
                 confirmClose(others)
                 true
@@ -421,6 +451,52 @@ class MainActivity : Activity(), TerminalService.Listener {
         service?.removeSession(session)
     }
 
+    // ---- Finding text ----
+
+    /**
+     * Puts the search bar in the tab bar's place, with the keyboard on it, to search the current
+     * tab (the same height, so the terminal keeps its rows); Back closes it.
+     */
+    private fun openSearch() {
+        if (current == null) return
+        tabBar.isVisible = false
+        searchBar.open()
+        if (closeSearchOnBack == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            val callback = OnBackInvokedCallback { closeSearch() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
+            closeSearchOnBack = callback
+        }
+    }
+
+    /** Ends the search and brings the tab bar back; the terminal takes the keyboard again. */
+    private fun closeSearch() {
+        if (!searchBar.isVisible) return
+        searchBar.isVisible = false
+        tabBar.isVisible = true
+        screen.endSearch()
+        screen.requestFocus()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
+            (closeSearchOnBack as? OnBackInvokedCallback)?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+        }
+        closeSearchOnBack = null
+    }
+
+    /**
+     * Back closes the search bar first. Up to Android 15 the system calls this, as the app does
+     * not opt in to predictive back in its manifest (an OnBackInvokedCallback would be ignored
+     * there); from Android 16 on, apps targeting it get predictive back anyway, never call this,
+     * and [closeSearchOnBack] is called instead.
+     */
+    @SuppressLint("GestureBackNavigation") // Android 16 and later: closeSearchOnBack
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onBackPressed() {
+        if (searchBar.isVisible) {
+            closeSearch()
+            return
+        }
+        super.onBackPressed()
+    }
+
     // ---- Keyboard shortcuts ----
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -438,10 +514,10 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /**
-     * The tab shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
+     * The shortcuts of a hardware keyboard, as in desktop terminals: Ctrl+Shift+T opens a tab,
      * Ctrl+Shift+W closes the current one, Ctrl+Tab and Ctrl+Shift+Tab show the next and the
-     * previous one (going round). They are taken before the terminal sees them; false for any other
-     * key.
+     * previous one (going round), and Ctrl+Shift+F finds text in it (as in Ghostty on Linux). They
+     * are taken before the terminal sees them; false for any other key.
      */
     private fun shortcut(event: KeyEvent): Boolean {
         if (!event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
@@ -452,6 +528,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             !event.isShiftPressed -> return false
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
             event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
+            event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
             else -> return false
         }
         return true
@@ -465,7 +542,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         show(sessions[Math.floorMod(i + delta, sessions.size)])
     }
 
-    /** Lists the tab shortcuts in the system's keyboard shortcuts screen (Meta+/). */
+    /** Lists the shortcuts in the system's keyboard shortcuts screen (Meta+/). */
     override fun onProvideKeyboardShortcuts(data: MutableList<KeyboardShortcutGroup>, menu: Menu?, deviceId: Int) {
         val ctrl = KeyEvent.META_CTRL_ON
         val ctrlShift = KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
@@ -478,6 +555,12 @@ class MainActivity : Activity(), TerminalService.Listener {
                     KeyboardShortcutInfo(getString(R.string.next_tab), KeyEvent.KEYCODE_TAB, ctrl),
                     KeyboardShortcutInfo(getString(R.string.previous_tab), KeyEvent.KEYCODE_TAB, ctrlShift),
                 ),
+            ),
+        )
+        data.add(
+            KeyboardShortcutGroup(
+                getString(R.string.shortcuts_terminal),
+                listOf(KeyboardShortcutInfo(getString(R.string.find), KeyEvent.KEYCODE_F, ctrlShift)),
             ),
         )
     }
@@ -510,6 +593,8 @@ class MainActivity : Activity(), TerminalService.Listener {
         override val shift: Boolean get() = keys.shift
 
         override fun modifiersUsed() = keys.modifiersUsed()
+
+        override fun onSearchCount(total: Int, selected: Int) = searchBar.setCount(total, selected)
 
         /**
          * Opens it in the app the system picks: a web page or mail as a browsable intent, which
@@ -569,6 +654,15 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun menu(anchor: View) = showMenu(anchor)
 
         override fun notice(text: String) = showToast(text)
+    }
+
+    /** The search bar's text and buttons go to the view, which searches the current tab. */
+    private inner class Find : SearchBarView.Target {
+        override fun search(needle: String) = screen.search(needle)
+
+        override fun step(older: Boolean) = screen.searchStep(older)
+
+        override fun close() = closeSearch()
     }
 
     /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */

@@ -11,7 +11,7 @@
 // Frame format (little-endian), written by appine_vt_frame and read by VtView.kt; the two change
 // together:
 //
-//   header, 48 bytes:
+//   header, 56 bytes:
 //     u16 cols, u16 rows
 //     u8  dirty            0 nothing changed, 1 some rows, 2 every row
 //     u8  cursor_visible   1 when visible and inside the viewport
@@ -24,16 +24,22 @@
 //     u16 row_count        number of rows that follow
 //     u8  viewport_bottom  1 when the viewport shows the active area (not scrolled back)
 //     u8  flags            bit 0 mouse tracking on, 1 alternate screen, 2 alternate scroll
-//                          (mode 1007), 3 focus events (mode 1004), 4 a selection exists
+//                          (mode 1007), 3 focus events (mode 1004), 4 a selection exists,
+//                          5 it is rectangular, 6 the search has not caught up with the
+//                          terminal yet (draw again to go on)
 //     u16 selection_start_x, u16 selection_start_y
-//                          the selection's first cell (in terminal order) in the viewport,
-//                          0xffff for both when there is none or it is outside the viewport
+//                          the selection's first cell (in terminal order; a rectangle's top
+//                          left corner) in the viewport, 0xffff for both when there is none or
+//                          it is outside the viewport
 //     u16 selection_end_x, u16 selection_end_y
-//                          its last cell, likewise
+//                          its last cell (a rectangle's bottom right corner), likewise
 //     u32 scroll_total     the scrollable area in rows (scrollback and active area), as
 //                          GhosttyTerminalScrollbar has it
 //     u32 scroll_offset    the viewport's first row in that area
 //     u32 scroll_len       the rows the viewport shows
+//     u32 search_total     the search's matches on the active screen so far, 0 without a search
+//     u32 search_selected  the selected match's place counted from the newest (1 for the
+//                          newest), 0 when none is selected
 //   row_count rows:
 //     u16 y, u16 cell_count, u32 extra_count
 //     u16 selection_from, u16 selection_to
@@ -45,9 +51,12 @@
 //       u16 attrs          bit 0 bold, 1 italic, 2 faint, 3 blink, 4 inverse, 5 invisible,
 //                          6 strikethrough, 7 overline, 8-10 underline (GhosttySgrUnderline),
 //                          12-13 width (GhosttyCellWide: 0 narrow, 1 wide, 2 spacer tail,
-//                          3 spacer head)
+//                          3 spacer head), 14 in a search match, 15 in the selected match
 //       u16 extra          number of further codepoints in the grapheme
 //     extra_count u32 codepoints: the further codepoints of the row's cells, in cell order
+//
+// A row is sent when its cells changed or when its search marks did (a new needle, another
+// selected match, a match found), so the view's mirror always carries the marks.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -59,7 +68,7 @@
 
 #include <ghostty/vt.h>
 
-#define HEADER_BYTES 48
+#define HEADER_BYTES 56
 #define ROW_HEADER_BYTES 12
 #define CELL_BYTES 16
 
@@ -68,8 +77,20 @@
 #define FLAG_ALT_SCROLL 0x04
 #define FLAG_FOCUS_EVENTS 0x08
 #define FLAG_SELECTION 0x10
+#define FLAG_RECTANGLE 0x20
+#define FLAG_SEARCH_PENDING 0x40
+
+// A cell's search mark (AppineVt.marks), shifted into its attrs at bit 14
+#define MARK_NONE 0
+#define MARK_MATCH 1
+#define MARK_SELECTED 2
+#define MARK_SHIFT 14
 
 #define NONE16 0xffff
+
+// How long one frame may spend catching a search up with the terminal; the view draws again until
+// it has (FLAG_SEARCH_PENDING), so a search through a long scrollback does not hold up a frame
+#define SEARCH_BUDGET_NS (4LL * 1000 * 1000)
 
 // Scrollback kept per terminal: whichever limit is reached first prunes the oldest whole pages
 // (about 400 KiB each, libghostty-vt rounding up). A page holds fewer rows the wider the terminal,
@@ -232,6 +253,17 @@ typedef struct AppineVt {
   // its options are set, which appine_vt_mouse does for every event
   int mouse_x;
   int mouse_y;
+  // The search (appine_vt_search), NULL while none runs. Frames drive it: each one catches it up
+  // with the terminal and marks its matches in the viewport
+  GhosttySearch search;
+  // Scratch for the matches on the viewport's pages
+  GhosttySelection *matches;
+  size_t matches_cap;
+  // The search mark (MARK_*) of each viewport cell, row by row: as of this frame, and as last sent
+  // (a row whose marks changed is sent again); marks_cells cells each, the grid's when allocated
+  uint8_t *marks;
+  uint8_t *marks_sent;
+  size_t marks_cells;
 } AppineVt;
 
 // ---- Effects (called inside ghostty_terminal_vt_write, under vt.rs's lock) ----
@@ -485,6 +517,11 @@ static void drop_anchor(AppineVt *vt);
 void appine_vt_free(AppineVt *vt) {
   if (vt == NULL) return;
   drop_anchor(vt);
+  // Before the terminal, so it releases what it tracks there
+  if (vt->search) ghostty_search_free(vt->search);
+  free(vt->matches);
+  free(vt->marks);
+  free(vt->marks_sent);
   if (vt->mouse_event) ghostty_mouse_event_free(vt->mouse_event);
   if (vt->mouse) ghostty_mouse_encoder_free(vt->mouse);
   if (vt->event) ghostty_key_event_free(vt->event);
@@ -518,13 +555,38 @@ const uint8_t *appine_vt_take_replies(AppineVt *vt, size_t *len) {
   return vt->replies.ptr;
 }
 
+static void search_reselect(AppineVt *vt, size_t index);
+
+// Resizes the terminal. A search keeps its selected match: libghostty-vt drops it on a resize,
+// which here comes with every keyboard shown or hidden
 void appine_vt_resize(AppineVt *vt, uint16_t cols, uint16_t rows, uint32_t cell_width,
                       uint32_t cell_height) {
   vt->cols = cols;
   vt->height = rows;
   vt->cell_width = cell_width;
   vt->cell_height = cell_height;
+  size_t selected = 0;
+  bool reselect = vt->search != NULL &&
+                  ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &selected) ==
+                      GHOSTTY_SUCCESS;
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
+  if (reselect) search_reselect(vt, selected);
+}
+
+// Selects the match index places from the newest again, after a resize: the search has to catch
+// up first (a resize restarts it, the matches are the same text), then steps from the newest
+// without scrolling, but for the last step, which brings the match into view if it is not
+static void search_reselect(AppineVt *vt, size_t index) {
+  if (ghostty_search_run(vt->search) != GHOSTTY_SUCCESS) return;
+  GhosttySearchScroll quiet = GHOSTTY_SEARCH_SCROLL_NONE;
+  ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_SCROLL, &quiet);
+  for (size_t i = 0; i < index; i++) {
+    if (ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_NEXT, NULL) != GHOSTTY_SUCCESS) {
+      break;
+    }
+  }
+  ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_SCROLL, NULL);
+  ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_NEXT, NULL);
 }
 
 // Scrolls the viewport by delta rows (negative: back into the scrollback); 0 goes to the bottom
@@ -547,7 +609,9 @@ static bool mode_on(AppineVt *vt, GhosttyMode mode) {
 
 // ---- Frames ----
 
-static bool put_row(AppineVt *vt, uint16_t y) {
+// Writes the row the iterator is on as row y of the frame; marks is the row's search marks (NULL
+// for none)
+static bool put_row(AppineVt *vt, uint16_t y, const uint8_t *marks) {
   if (ghostty_render_state_row_get(vt->rows, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &vt->cells) !=
       GHOSTTY_SUCCESS) {
     return false;
@@ -589,6 +653,7 @@ static bool put_row(AppineVt *vt, uint16_t y) {
     GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
     uint16_t attrs = (uint16_t)(((uint32_t)wide & 0x3) << 12);
+    if (marks != NULL) attrs |= (uint16_t)((uint32_t)marks[count] << MARK_SHIFT);
 
     // Colours resolve through the palette; no value means the default colour
     GhosttyColorRgb c;
@@ -661,6 +726,9 @@ static void put_viewport(AppineVt *vt, uint8_t *p, const GhosttyGridRef *ref) {
   }
 }
 
+static bool search_catch_up(AppineVt *vt);
+static bool mark_matches(AppineVt *vt);
+
 // Captures the screen and writes a frame with the rows that changed since the last frame (all of
 // them when full is set); the result is valid until the next call. NULL when out of memory.
 const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
@@ -672,6 +740,21 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   }
   if (!vt->held && ghostty_render_state_update(vt->state, vt->term) != GHOSTTY_SUCCESS) {
     return NULL;
+  }
+  bool search_pending = vt->search != NULL && !search_catch_up(vt);
+  // Without memory for the marks, rows go without them
+  bool marked = mark_matches(vt);
+  uint32_t search_total = 0;
+  uint32_t search_selected = 0;
+  if (vt->search != NULL) {
+    size_t total = 0;
+    size_t index = 0;
+    ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_TOTAL_MATCHES, &total);
+    if (ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &index) ==
+        GHOSTTY_SUCCESS) {
+      search_selected = clamp_u32((uint64_t)index + 1);
+    }
+    search_total = clamp_u32(total);
   }
 
   GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
@@ -723,37 +806,132 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
       ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
                                          &ordered) == GHOSTTY_SUCCESS) {
     flags |= FLAG_SELECTION;
+    if (ordered.rectangle) flags |= FLAG_RECTANGLE;
     put_viewport(vt, h + 28, &ordered.start);
     put_viewport(vt, h + 32, &ordered.end);
   }
+  if (search_pending) flags |= FLAG_SEARCH_PENDING;
   h[27] = flags;
   put_u32(h + 36, clamp_u32(scrollbar.total));
   put_u32(h + 40, clamp_u32(scrollbar.offset));
   put_u32(h + 44, clamp_u32(scrollbar.len));
+  put_u32(h + 48, search_total);
+  put_u32(h + 52, search_selected);
   vt->frame.len = HEADER_BYTES;
 
   uint16_t count = 0;
-  if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE &&
-      ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &vt->rows) ==
-          GHOSTTY_SUCCESS) {
+  if (ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &vt->rows) ==
+      GHOSTTY_SUCCESS) {
     uint16_t y = 0;
     while (ghostty_render_state_row_iterator_next(vt->rows)) {
+      const uint8_t *marks = marked && y < vt->height ? vt->marks + (size_t)y * vt->cols : NULL;
       bool changed = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
-      if (!changed) {
+      if (!changed && dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
         ghostty_render_state_row_get(vt->rows, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &changed);
       }
+      if (!changed && marks != NULL) {
+        changed = memcmp(marks, vt->marks_sent + (size_t)y * vt->cols, vt->cols) != 0;
+      }
       if (changed) {
-        if (!put_row(vt, y)) return NULL;
+        if (!put_row(vt, y, marks)) return NULL;
         count++;
       }
       y++;
     }
   }
+  if (marked) memcpy(vt->marks_sent, vt->marks, vt->marks_cells);
   // put_row may have moved the buffer
   put_u16(vt->frame.ptr + 24, count);
   ghostty_render_state_clean(vt->state);
   *len = vt->frame.len;
   return vt->frame.ptr;
+}
+
+// Catches the search up with the terminal: feeds it what changed and works through what it has,
+// for at most SEARCH_BUDGET_NS. True once it is caught up, false when it needs more frames.
+static bool search_catch_up(AppineVt *vt) {
+  int64_t start = now_ns();
+  for (;;) {
+    if (ghostty_search_feed(vt->search) != GHOSTTY_SUCCESS) return true;
+    GhosttySearchStatus status = GHOSTTY_SEARCH_STATUS_COMPLETE;
+    do {
+      if (ghostty_search_tick(vt->search, &status) != GHOSTTY_SUCCESS) return true;
+    } while (status == GHOSTTY_SEARCH_STATUS_RUNNING && now_ns() - start < SEARCH_BUDGET_NS);
+    if (status == GHOSTTY_SEARCH_STATUS_COMPLETE) return true;
+    // Running out of time, or waiting for the next part of the scrollback
+    if (now_ns() - start >= SEARCH_BUDGET_NS) return false;
+  }
+}
+
+static bool viewport_ref(AppineVt *vt, uint16_t x, uint16_t y, GhosttyGridRef *out);
+static bool screen_point(AppineVt *vt, const GhosttyGridRef *ref, GhosttyPointCoordinate *out);
+
+// Marks the viewport cells match covers with mark (over any mark there before); top is the
+// viewport's first row in screen coordinates. Screen coordinates, unlike viewport ones, exist for a
+// match that begins above the viewport or ends below it, so it is cut to the rows shown.
+static void mark_match(AppineVt *vt, const GhosttySelection *match, uint32_t top, uint8_t mark) {
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate start, end;
+  if (ghostty_terminal_selection_ordered(vt->term, match, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &ordered.start, &start) || !screen_point(vt, &ordered.end, &end) ||
+      end.y < top || start.y >= top + vt->height) {
+    return;
+  }
+  for (uint32_t y = start.y < top ? top : start.y; y <= end.y && y < top + vt->height; y++) {
+    uint16_t from = y == start.y ? start.x : 0;
+    uint16_t to = y == end.y ? end.x : vt->cols - 1;
+    if (to >= vt->cols) to = vt->cols - 1;
+    uint8_t *row = vt->marks + (size_t)(y - top) * vt->cols;
+    for (uint16_t x = from; x <= to; x++) row[x] = mark;
+  }
+}
+
+// Fills vt->marks for this frame: the search's matches in the viewport and its selected match,
+// none without a search. False when the marks cannot be allocated.
+static bool mark_matches(AppineVt *vt) {
+  size_t cells = (size_t)vt->cols * vt->height;
+  if (cells != vt->marks_cells) {
+    // A new grid: its first frame is a full one, and every row is sent
+    free(vt->marks);
+    free(vt->marks_sent);
+    vt->marks = calloc(cells, 1);
+    vt->marks_sent = calloc(cells, 1);
+    if (vt->marks == NULL || vt->marks_sent == NULL) {
+      free(vt->marks);
+      free(vt->marks_sent);
+      vt->marks = NULL;
+      vt->marks_sent = NULL;
+      vt->marks_cells = 0;
+      return false;
+    }
+    vt->marks_cells = cells;
+  }
+  memset(vt->marks, MARK_NONE, cells);
+  GhosttyGridRef first;
+  GhosttyPointCoordinate top;
+  if (vt->search == NULL || !viewport_ref(vt, 0, 0, &first) || !screen_point(vt, &first, &top)) {
+    return true;
+  }
+  GhosttySelectionBuffer found = {.ptr = vt->matches, .cap = vt->matches_cap};
+  GhosttyResult r = ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &found);
+  if (r == GHOSTTY_OUT_OF_SPACE) {
+    GhosttySelection *p = realloc(vt->matches, found.len * sizeof(*p));
+    if (p == NULL) return true;
+    vt->matches = p;
+    vt->matches_cap = found.len;
+    found = (GhosttySelectionBuffer){.ptr = vt->matches, .cap = vt->matches_cap};
+    r = ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &found);
+  }
+  if (r == GHOSTTY_SUCCESS) {
+    for (size_t i = 0; i < found.len; i++) mark_match(vt, &vt->matches[i], top.y, MARK_MATCH);
+  }
+  GhosttySelection selected = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &selected) ==
+      GHOSTTY_SUCCESS) {
+    mark_match(vt, &selected, top.y, MARK_SELECTED);
+  }
+  return true;
 }
 
 // ---- Input ----
@@ -922,11 +1100,31 @@ static bool screen_point(AppineVt *vt, const GhosttyGridRef *ref, GhosttyPointCo
          GHOSTTY_SUCCESS;
 }
 
-static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end) {
+static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end, bool rectangle) {
   GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
   sel.start = start;
   sel.end = end;
+  sel.rectangle = rectangle;
   return ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
+}
+
+// Installs a selection libghostty-vt derived (a word, a line) and anchors later drags to it; false
+// when it cannot be anchored.
+static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate start, end;
+  if (ghostty_terminal_selection_ordered(vt->term, derived, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &ordered.start, &start) || !screen_point(vt, &ordered.end, &end)) {
+    return false;
+  }
+  // Tracking may change the terminal's page list, so it is selected from fresh references
+  GhosttyGridRef a = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef b = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  return set_anchor(vt, start, end) &&
+         ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &a) == GHOSTTY_SUCCESS &&
+         ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &b) == GHOSTTY_SUCCESS &&
+         set_selection(vt, a, b, false);
 }
 
 // Selects the word at viewport cell (x, y) and anchors later drags to it; false when there is no
@@ -936,22 +1134,25 @@ bool appine_vt_select_word(AppineVt *vt, uint16_t x, uint16_t y) {
   drop_anchor(vt);
   GhosttyTerminalSelectWordOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
   GhosttySelection word = GHOSTTY_INIT_SIZED(GhosttySelection);
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
-  GhosttyPointCoordinate start, end;
-  if (!viewport_ref(vt, x, y, &options.ref) ||
-      ghostty_terminal_select_word(vt->term, &options, &word) != GHOSTTY_SUCCESS ||
-      ghostty_terminal_selection_ordered(vt->term, &word, GHOSTTY_SELECTION_ORDER_FORWARD,
-                                         &ordered) != GHOSTTY_SUCCESS ||
-      !screen_point(vt, &ordered.start, &start) || !screen_point(vt, &ordered.end, &end)) {
-    return false;
-  }
-  // Tracking may change the terminal's page list, so the word is selected from fresh references
-  GhosttyGridRef a = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-  GhosttyGridRef b = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-  return set_anchor(vt, start, end) &&
-         ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &a) == GHOSTTY_SUCCESS &&
-         ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &b) == GHOSTTY_SUCCESS &&
-         set_selection(vt, a, b);
+  return viewport_ref(vt, x, y, &options.ref) &&
+         ghostty_terminal_select_word(vt->term, &options, &word) == GHOSTTY_SUCCESS &&
+         select_anchored(vt, &word);
+}
+
+// Selects the line at viewport cell (x, y), as Ghostty's triple click does: the whole soft-wrapped
+// line with its leading and trailing blanks trimmed, stopping where a prompt mark (OSC 133) starts
+// or ends a part of it, so a command is selected without its prompt; false when the line is blank,
+// with any earlier selection cleared.
+bool appine_vt_select_line(AppineVt *vt, uint16_t x, uint16_t y) {
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  drop_anchor(vt);
+  GhosttyTerminalSelectLineOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectLineOptions);
+  // Off by default in the C API, on in Ghostty's own selectLine
+  options.semantic_prompt_boundary = true;
+  GhosttySelection line = GHOSTTY_INIT_SIZED(GhosttySelection);
+  return viewport_ref(vt, x, y, &options.ref) &&
+         ghostty_terminal_select_line(vt->term, &options, &line) == GHOSTTY_SUCCESS &&
+         select_anchored(vt, &line);
 }
 
 // Starts dragging a selection handle: the other end becomes the anchor. end is the handle of the
@@ -969,13 +1170,22 @@ bool appine_vt_select_grab(AppineVt *vt, bool end) {
   return set_anchor(vt, fixed, fixed);
 }
 
+static bool rectangular(AppineVt *vt) {
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  return ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) ==
+             GHOSTTY_SUCCESS &&
+         sel.rectangle;
+}
+
 // Extends the selection from the anchor to viewport cell (x, y): the anchor stays selected
-// whole, and the selection runs from its far side to the cell. False without an anchor.
+// whole, and the selection runs from its far side to the cell; a rectangle stays one, with the
+// anchor and the cell at opposite corners. False without an anchor.
 bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   if (vt->anchor_start == NULL || vt->anchor_end == NULL) return false;
   GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
   GhosttyGridRef end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
   GhosttyGridRef cell;
+  bool rectangle = rectangular(vt);
   if (ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &start) != GHOSTTY_SUCCESS ||
       ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &end) != GHOSTTY_SUCCESS ||
       !viewport_ref(vt, x, y, &cell)) {
@@ -986,10 +1196,26 @@ bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   probe.start = start;
   probe.end = cell;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
-  if (order == GHOSTTY_SELECTION_ORDER_REVERSE) return set_selection(vt, end, cell);
+  if (order == GHOSTTY_SELECTION_ORDER_REVERSE) return set_selection(vt, end, cell, rectangle);
   probe.start = end;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
-  return set_selection(vt, start, order == GHOSTTY_SELECTION_ORDER_REVERSE ? end : cell);
+  return set_selection(vt, start, order == GHOSTTY_SELECTION_ORDER_REVERSE ? end : cell,
+                       rectangle);
+}
+
+// Turns the selection into a rectangle (on) with its first and last cells as opposite corners, or
+// back into a linear selection from the rectangle's top left to its bottom right corner. False
+// when there is no selection.
+bool appine_vt_select_rectangle(AppineVt *vt, bool on) {
+  drop_anchor(vt);
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
+                                         &ordered) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+  return set_selection(vt, ordered.start, ordered.end, on);
 }
 
 // Selects everything, scrollback included; false when there is nothing to select.
@@ -1162,6 +1388,44 @@ const uint8_t *appine_vt_link(AppineVt *vt, uint16_t x, uint16_t y, size_t *len)
   }
   free(cps);
   return found ? vt->text.ptr : NULL;
+}
+
+// ---- Search ----
+//
+// One search per terminal, over the active screen and its scrollback (libghostty-vt keeps the
+// primary screen's results while a program uses the alternate one). Frames drive it
+// (search_catch_up) and carry its count and marks; the matches themselves stay in libghostty-vt,
+// which keeps them on their text through output, resizes and pruned scrollback.
+
+// Searches for needle (UTF-8; ASCII letters match either case, all else exactly), restarting the
+// search when it changed; an empty needle leaves nothing found. The next frames find its matches,
+// none of them selected. False when the search cannot be made.
+bool appine_vt_search(AppineVt *vt, const uint8_t *needle, size_t len) {
+  if (vt->search == NULL) {
+    if (len == 0) return true;
+    if (ghostty_search_new(NULL, &vt->search, vt->term) != GHOSTTY_SUCCESS) {
+      vt->search = NULL;
+      return false;
+    }
+  }
+  GhosttyString s = {.ptr = needle, .len = len};
+  return ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_NEEDLE, len > 0 ? &s : NULL) ==
+         GHOSTTY_SUCCESS;
+}
+
+// Selects the next match towards older output (older; the first call selects the newest match)
+// or towards newer output, going round at either end, and scrolls the viewport to it unless it is
+// shown already. False when there is no match (or no search).
+bool appine_vt_search_select(AppineVt *vt, bool older) {
+  if (vt->search == NULL) return false;
+  GhosttySearchOption option = older ? GHOSTTY_SEARCH_OPT_SELECT_NEXT : GHOSTTY_SEARCH_OPT_SELECT_PREV;
+  return ghostty_search_set(vt->search, option, NULL) == GHOSTTY_SUCCESS;
+}
+
+// Ends the search; the next frame sends the rows its marks were on again.
+void appine_vt_search_end(AppineVt *vt) {
+  if (vt->search) ghostty_search_free(vt->search);
+  vt->search = NULL;
 }
 
 // ---- Title, effects, messages, transcript ----

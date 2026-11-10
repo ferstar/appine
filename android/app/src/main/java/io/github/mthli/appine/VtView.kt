@@ -69,9 +69,13 @@ import kotlin.math.roundToInt
  * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
  * alternate screen (alternate scroll, mode 1007), and a fling goes on scrolling the same way; while
  * the scrollback scrolls, a scroll bar like a ScrollView's shows where the viewport is in it. A long
- * press selects a word, and dragging on extends the selection, as do its two handles; a floating
- * menu copies, pastes and selects all.
+ * press or a double tap selects a word and a triple tap a line, and dragging on after a long press
+ * extends the selection, as do its two handles; a floating menu copies, pastes, selects all and
+ * turns the selection into a rectangle and back.
  * The selection is the terminal's, so it stays on its text through output and scrolling.
+ *
+ * A search ([search], from the activity's search bar) marks its matches in yellow, the selected
+ * one in orange, as Ghostty does; libghostty-vt finds them and frames carry the marks.
  */
 @SuppressLint("ViewConstructor") // Created only in code
 internal class VtView(context: Context, private val host: Host) : View(context) {
@@ -97,6 +101,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** A link was tapped or chosen from the menu, to open in another app. */
         fun onLink(uri: String)
+
+        /**
+         * The search's count changed ([search]): [total] matches so far, the selected one [selected]
+         * counted from the newest (1 for the newest), 0 when none is selected.
+         */
+        fun onSearchCount(total: Int, selected: Int)
     }
 
     /** The tab shown, null for none. */
@@ -191,6 +201,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Whether the terminal has a selection; also set at once by the view's own changes. */
     private var selected = false
 
+    /** Whether the selection is a rectangle, as of the last frame. */
+    private var rectangle = false
+
+    /** Whether a search runs in the tab shown ([search]), and its count as last reported. */
+    private var searching = false
+    private var searchTotal = 0
+    private var searchSelected = 0
+
+    /**
+     * Where the viewport was before a step to another match ([searchStep]), -1 when none is under
+     * way: the next frame shows the scroll bar if the step scrolled.
+     */
+    private var stepFrom = -1
+
     /** The selection's first and last cell in the viewport, -1 when outside it. */
     private var selStartX = -1
     private var selStartY = -1
@@ -249,10 +273,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The button of a mouse (not a finger) held down for a program tracking the mouse, or 0. */
     private var mouseButton = 0
 
-    /** The last tap's lift, to tell the second tap of a double tap. */
+    /**
+     * The last tap's lift and how many taps came in a row before it (each within the double-tap
+     * timeout and slop of the one before), to tell a double and a triple tap.
+     */
     private var lastTapTime = 0L
     private var lastTapX = 0f
     private var lastTapY = 0f
+    private var taps = 0
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val doubleTapSlop = ViewConfiguration.get(context).scaledDoubleTapSlop
     private val minFling = ViewConfiguration.get(context).scaledMinimumFlingVelocity
@@ -327,10 +355,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
-     * again, and a selection drag, menu or fling of the previous tab ends.
+     * again, and a selection drag, menu, fling or search of the previous tab ends.
      */
     fun attach(s: VtSession?) {
         if (s === session) return
+        endSearch()
         session?.let { if (it.view === this) it.view = null }
         menu?.finish()
         drag = DRAG_NONE
@@ -355,6 +384,38 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The session's shell started: take the whole screen. */
     fun onStarted() {
         full = true
+        invalidate()
+    }
+
+    /**
+     * Searches the tab shown for [needle] as the search bar's text changes (empty: nothing); the
+     * frames that follow mark the matches and report their count ([Host.onSearchCount]).
+     */
+    fun search(needle: String) {
+        if (tab == 0L) return
+        searching = true
+        VtNative.search(tab, needle)
+        invalidate()
+    }
+
+    /**
+     * Selects the next match above ([older]) or below, going round, and scrolls to it unless it
+     * is shown already.
+     */
+    fun searchStep(older: Boolean) {
+        if (tab == 0L || !searching || !VtNative.searchSelect(tab, older)) return
+        scroller.forceFinished(true)
+        stepFrom = scrollOffset
+        invalidate()
+    }
+
+    /** Ends the search, taking its marks away. */
+    fun endSearch() {
+        if (!searching) return
+        searching = false
+        searchTotal = 0
+        searchSelected = 0
+        if (tab != 0L) VtNative.searchEnd(tab)
         invalidate()
     }
 
@@ -502,6 +563,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         altScroll = flags and FLAG_ALT_SCROLL != 0
         val hadSelection = selected
         selected = flags and FLAG_SELECTION != 0
+        rectangle = flags and FLAG_RECTANGLE != 0
         if (hadSelection && !selected && menuX < 0) menu?.finish()
         selStartX = coordinate(b, 28)
         selStartY = coordinate(b, 30)
@@ -510,6 +572,21 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollTotal = b.getInt(36)
         scrollOffset = b.getInt(40)
         scrollLen = b.getInt(44)
+        if (stepFrom >= 0) {
+            if (scrollOffset != stepFrom) awakenScrollBars()
+            stepFrom = -1
+        }
+        if (searching) {
+            // Searching a long scrollback takes more than one frame
+            if (flags and FLAG_SEARCH_PENDING != 0) postInvalidateOnAnimation()
+            val total = b.getInt(48)
+            val selectedMatch = b.getInt(52)
+            if (total != searchTotal || selectedMatch != searchSelected) {
+                searchTotal = total
+                searchSelected = selectedMatch
+                host.onSearchCount(total, selectedMatch)
+            }
+        }
         if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
         updateBlink()
         if (cursorX != oldCursorX || cursorY != oldCursorY) restartBlink()
@@ -678,13 +755,31 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
-    private fun bgOf(i: Int): Int =
-        if (attrs[i] and INVERSE != 0) fg[i].takeIf { it != 0 } ?: defaultFg else bg[i].takeIf { it != 0 } ?: defaultBg
+    /** A cell's background: a search match's colour, else its own (inverse swaps it with the text's). */
+    private fun bgOf(i: Int): Int = when (markOf(i)) {
+        MARK_MATCH -> SEARCH_MATCH
+        MARK_SELECTED -> SEARCH_SELECTED
+        else -> if (attrs[i] and INVERSE != 0) fg[i].takeIf { it != 0 } ?: defaultFg else bg[i].takeIf { it != 0 } ?: defaultBg
+    }
 
+    /** A cell's text colour: black on a search match, as in Ghostty, else its own. */
     private fun fgOf(i: Int): Int {
+        if (markOf(i) != MARK_NONE) return SEARCH_TEXT
         val a = attrs[i]
         val color = if (a and INVERSE != 0) bg[i].takeIf { it != 0 } ?: defaultBg else fg[i].takeIf { it != 0 } ?: defaultFg
         return if (a and FAINT != 0) (color and 0x00ffffff) or 0x80000000.toInt() else color
+    }
+
+    /**
+     * A cell's search mark (vt.c's attrs bits 14 and 15): [MARK_MATCH], [MARK_SELECTED] or
+     * [MARK_NONE]. The second cell of a wide character takes the first's, so a match ending on one
+     * covers the whole character.
+     */
+    private fun markOf(i: Int): Int {
+        val a = attrs[i]
+        val own = (a shr 14) and 3
+        if (own != MARK_NONE || (a shr 12) and 3 != SPACER_TAIL || i % cols == 0) return own
+        return (attrs[i - 1] shr 14) and 3
     }
 
     private fun paintOf(i: Int): Paint = paints[(attrs[i] and BOLD) or ((attrs[i] and ITALIC))]
@@ -1178,7 +1273,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * The floating menu: Open link after a long press on one, Copy with a selection, Paste with
-     * text on the clipboard, Select all.
+     * text on the clipboard, Select all, and with a selection Rectangle (its ends become opposite
+     * corners) or, for a rectangle, Lines (back to a linear selection).
      */
     private fun showMenu() {
         menu?.finish()
@@ -1190,6 +1286,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     if (selected) m.add(Menu.NONE, MENU_COPY, 1, android.R.string.copy)
                     if (clipboard.hasPrimaryClip()) m.add(Menu.NONE, MENU_PASTE, 2, android.R.string.paste)
                     m.add(Menu.NONE, MENU_SELECT_ALL, 3, android.R.string.selectAll)
+                    if (selected) {
+                        m.add(Menu.NONE, MENU_RECTANGLE, 4, if (rectangle) R.string.select_lines else R.string.select_rectangle)
+                    }
                     return true
                 }
 
@@ -1209,6 +1308,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                         MENU_SELECT_ALL -> if (VtNative.selectAll(tab)) {
                             selected = true
                             menuLink = null
+                            menuX = -1f
+                            menuPending = true
+                            mode.finish()
+                            invalidate()
+                        }
+                        // The menu comes back with the other item once the frame has the new shape
+                        MENU_RECTANGLE -> if (VtNative.selectRectangle(tab, !rectangle)) {
+                            rectangle = !rectangle
                             menuX = -1f
                             menuPending = true
                             mode.finish()
@@ -1417,7 +1524,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         showMenu()
     }
 
-    /** Taps without a delay: a double tap's first tap acts at once, its second selects the word. */
+    /**
+     * Taps without a delay: each tap acts at once, the second of a double tap selects the word and
+     * the third of a triple tap the line.
+     */
     private val gestures = GestureDetector(
         context,
         object : GestureDetector.OnGestureListener {
@@ -1428,21 +1538,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 // Only stops the fling, as a tap on a flinging ScrollView does
                 if (stoppedFling) return true
-                val second = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
+                val again = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
                     hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
-                // A third tap starts over
-                lastTapTime = if (second) 0L else e.eventTime
+                taps = if (again) taps + 1 else 1
+                // A fourth tap starts over
+                lastTapTime = if (taps < 3) e.eventTime else 0L
                 lastTapX = e.x
                 lastTapY = e.y
-                // In mouse mode both taps are clicks, for the program's own double click
-                if (second && !mouseTracking && tab != 0L && VtNative.selectWord(tab, cellX(e.x), cellY(e.y))) {
-                    selected = true
-                    menuLink = null
-                    menuX = -1f
-                    menuPending = true
-                    invalidate()
-                    return true
-                }
+                // In mouse mode every tap is a click, for the program's own double and triple clicks
+                if (taps > 1 && !mouseTracking && tab != 0L && selectAt(e, line = taps == 3)) return true
                 if (selected || menu != null) {
                     clearSelection()
                     return true
@@ -1541,6 +1645,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
         }
         return super.onGenericMotionEvent(event)
+    }
+
+    /**
+     * A double tap's word or a triple tap's [line] under a tap, with the menu; false when there is
+     * none there (blank cells), and the tap acts as a single one.
+     */
+    private fun selectAt(e: MotionEvent, line: Boolean): Boolean {
+        val x = cellX(e.x)
+        val y = cellY(e.y)
+        if (!(if (line) VtNative.selectLine(tab, x, y) else VtNative.selectWord(tab, x, y))) return false
+        selected = true
+        menuLink = null
+        menuX = -1f
+        menuPending = true
+        invalidate()
+        return true
     }
 
     /** A left click at a tap, for a program tracking the mouse. */
@@ -1656,12 +1776,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val CURSOR_HOLLOW = 3
 
         // The frame format (vt.c)
-        const val HEADER_BYTES = 48
+        const val HEADER_BYTES = 56
         const val ROW_HEADER_BYTES = 12
         const val FLAG_MOUSE = 1
         const val FLAG_ALT_SCREEN = 1 shl 1
         const val FLAG_ALT_SCROLL = 1 shl 2
         const val FLAG_SELECTION = 1 shl 4
+        const val FLAG_RECTANGLE = 1 shl 5
+        const val FLAG_SEARCH_PENDING = 1 shl 6
+
+        // A cell's search mark (attrs bits 14 and 15)
+        const val MARK_NONE = 0
+        const val MARK_MATCH = 1
+        const val MARK_SELECTED = 2
 
         // VtNative.mouse
         const val MOUSE_PRESS = 0
@@ -1700,6 +1827,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val MENU_PASTE = 2
         const val MENU_SELECT_ALL = 3
         const val MENU_OPEN_LINK = 4
+        const val MENU_RECTANGLE = 5
 
         /**
          * The schemes a tapped link may have: web pages, and from an OSC 8 link mail and guest
@@ -1712,5 +1840,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** The selection's highlight, over cell backgrounds and under text. */
         const val SELECTION = 0x604A90E2
+
+        /**
+         * Search matches, as Ghostty draws them (its search-background, search-selected-background
+         * and search-foreground): black text on yellow, the selected match on orange.
+         */
+        const val SEARCH_MATCH = 0xFFFFE082.toInt()
+        const val SEARCH_SELECTED = 0xFFF2A57E.toInt()
+        const val SEARCH_TEXT = 0xFF000000.toInt()
     }
 }

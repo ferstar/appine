@@ -14,8 +14,8 @@
 //!
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
-//! scrolls, encodes keys, mouse and focus events and pastes, selects and copies, and reads the title
-//! and transcript. The terminal is not thread-safe, so every call into vt.c holds the
+//! scrolls, encodes keys, mouse and focus events and pastes, selects, searches and copies, and
+//! reads the title and transcript. The terminal is not thread-safe, so every call into vt.c holds the
 //! tab's lock; the frame buffer it returns is only written by `frame`, which only the main thread
 //! calls, so the main thread may read it after the lock is released.
 //!
@@ -100,12 +100,17 @@ unsafe extern "C" {
     ) -> isize;
     fn appine_vt_focus(vt: *mut AppineVt, gained: bool, out: *mut c_char, cap: usize) -> isize;
     fn appine_vt_select_word(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_line(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_grab(vt: *mut AppineVt, end: bool) -> bool;
     fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_rectangle(vt: *mut AppineVt, on: bool) -> bool;
     fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
     fn appine_vt_select_clear(vt: *mut AppineVt);
     fn appine_vt_copy(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_link(vt: *mut AppineVt, x: u16, y: u16, len: *mut usize) -> *const u8;
+    fn appine_vt_search(vt: *mut AppineVt, needle: *const u8, len: usize) -> bool;
+    fn appine_vt_search_select(vt: *mut AppineVt, older: bool) -> bool;
+    fn appine_vt_search_end(vt: *mut AppineVt);
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
     fn appine_vt_take_effects(vt: *mut AppineVt, out: *mut RawEffects);
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -760,6 +765,24 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectWord<'l>(
     })
 }
 
+/// Selects the line at viewport cell (`x`, `y`) (soft wraps joined, blanks at its ends left out,
+/// a prompt left out when OSC 133 marks it) and anchors drags to it; false when the line is blank
+/// (the selection is then cleared).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectLine<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jboolean {
+    guarded!("VtNative.selectLine", 0, {
+        tab(handle)
+            .is_some_and(|tab| unsafe { appine_vt_select_line(tab.term().0, cell(x), cell(y)) })
+            as jboolean
+    })
+}
+
 /// Starts dragging the handle of the selection's last cell (`end`) or first cell: the other
 /// end becomes the anchor. False when there is no selection.
 #[unsafe(no_mangle)]
@@ -794,6 +817,21 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectTo<'l>(
 /// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
 fn cell(v: jint) -> u16 {
     v.clamp(0, 0xffff) as u16
+}
+
+/// Makes the selection a rectangle (`on`) with its ends at opposite corners, or linear again;
+/// false when there is no selection.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectRectangle<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    on: jboolean,
+) -> jboolean {
+    guarded!("VtNative.selectRectangle", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_select_rectangle(tab.term().0, on != 0) })
+            as jboolean
+    })
 }
 
 /// Selects everything, scrollback included.
@@ -859,6 +897,53 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_link<'l>(
         let mut len = 0;
         let p = unsafe { appine_vt_link(term.0, cell(x), cell(y), &mut len) };
         term.text(&mut env, p, len)
+    })
+}
+
+/// Searches the screen and its scrollback for `needle` (ASCII letters in either case), restarting
+/// when it changed; empty finds nothing. The frames that follow find the matches and carry their
+/// count and marks. False when the search cannot be made.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_search<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    needle: JString<'l>,
+) -> jboolean {
+    guarded!("VtNative.search", 0, {
+        let (Some(tab), Some(needle)) = (tab(handle), string(&mut env, &needle)) else {
+            return 0;
+        };
+        (unsafe { appine_vt_search(tab.term().0, needle.as_ptr(), needle.len()) }) as jboolean
+    })
+}
+
+/// Selects the next match towards older output (`older`) or newer, going round, and scrolls the
+/// viewport to it when needed; false when there is none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_searchSelect<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    older: jboolean,
+) -> jboolean {
+    guarded!("VtNative.searchSelect", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_search_select(tab.term().0, older != 0) })
+            as jboolean
+    })
+}
+
+/// Ends the search; the next frame takes its marks away.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_searchEnd<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    guarded!("VtNative.searchEnd", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_search_end(tab.term().0) };
+        }
     })
 }
 

@@ -78,13 +78,29 @@ internal object VtNative {
     @JvmStatic external fun selectWord(tab: Long, x: Int, y: Int): Boolean
 
     /**
+     * Selects the line at viewport cell ([x], [y]) as Ghostty's triple click does (soft wraps
+     * joined, blanks at its ends left out, a prompt left out when OSC 133 marks it) and anchors
+     * later [selectTo] calls to it; false when the line is blank (the selection is then cleared).
+     */
+    @JvmStatic external fun selectLine(tab: Long, x: Int, y: Int): Boolean
+
+    /**
      * Starts dragging the handle of the selection's last cell ([end]) or first cell: the other end
      * becomes the anchor of [selectTo]. False when there is no selection.
      */
     @JvmStatic external fun selectGrab(tab: Long, end: Boolean): Boolean
 
-    /** Extends the selection from its anchor to viewport cell ([x], [y]). */
+    /**
+     * Extends the selection from its anchor to viewport cell ([x], [y]); a rectangle stays one,
+     * with the anchor and the cell at opposite corners.
+     */
     @JvmStatic external fun selectTo(tab: Long, x: Int, y: Int): Boolean
+
+    /**
+     * Makes the selection a rectangle ([on]) with its first and last cells at opposite corners, or
+     * linear again from its top left to its bottom right corner; false when there is none.
+     */
+    @JvmStatic external fun selectRectangle(tab: Long, on: Boolean): Boolean
 
     /** Selects everything, scrollback included. */
     @JvmStatic external fun selectAll(tab: Long): Boolean
@@ -99,6 +115,24 @@ internal object VtNative {
      * written there, soft wraps joined; null when there is none.
      */
     @JvmStatic external fun link(tab: Long, x: Int, y: Int): String?
+
+    /**
+     * Searches the screen and its scrollback for [needle] (ASCII letters in either case, all else
+     * exactly), restarting when it changed; empty finds nothing. The frames that follow find its
+     * matches, mark them in their cells and carry their count; none is selected until
+     * [searchSelect]. False when the search cannot be made.
+     */
+    @JvmStatic external fun search(tab: Long, needle: String): Boolean
+
+    /**
+     * Selects the next match towards older output ([older]; the first selects the newest) or newer
+     * output, going round at either end, and scrolls the viewport to it unless it is shown; false
+     * when there is no match.
+     */
+    @JvmStatic external fun searchSelect(tab: Long, older: Boolean): Boolean
+
+    /** Ends the search; the next frame takes its marks away. */
+    @JvmStatic external fun searchEnd(tab: Long)
 
     /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the

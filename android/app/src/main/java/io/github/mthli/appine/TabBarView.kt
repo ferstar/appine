@@ -639,14 +639,14 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
 
     companion object {
-        /** The bar's height, and the side of its tabs and buttons. */
-        private const val BAR_DP = 32
+        /** The bar's height, and the side of its tabs and buttons (the search bar's too). */
+        const val BAR_DP = 32
 
         /**
          * The size of the buttons' labels. In dp, not sp: the bar's height is fixed, so its labels
-         * ignore the system font scale.
+         * ignore the system font scale. The search bar's text and buttons take it too.
          */
-        private const val BAR_LABEL_DP = 14f
+        const val BAR_LABEL_DP = 14f
 
         /** The size of the tabs' numbers (dp, like [BAR_LABEL_DP]). */
         private const val TAB_NUMBER_DP = 12f
