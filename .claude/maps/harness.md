@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process, then difftest's run lock and tool check last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process, difftest's run lock and tool check, then the headers of `ci.yml` and `scripts/survey` last)
 
 ## Responsibilities
 
@@ -379,8 +379,6 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   pipe; the size stays 24×80.
 - **Three waiters can still run together:** when one moves aside a lock another waiter has just
   made and a third makes its own before it is put back, the moved one's run goes on without it.
-- **Stale comments:** `ci.yml`'s header still says `full.yml` runs the performance probe, and
-  `scripts/survey`'s header says every script under `tests/survey/` runs without names.
 
 ## Open questions
 

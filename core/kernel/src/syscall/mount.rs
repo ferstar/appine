@@ -6,8 +6,9 @@
 //! (`MS_REC` brings the mounts inside along), and so can namespace files (nsfs; the mount keeps
 //! that namespace alive). Mount flags, remounting, `MS_MOVE`, unmounting (`MNT_DETACH`,
 //! `MNT_EXPIRE`), pivot_root and the various errors follow Linux 6.1's `path_mount`,
-//! `path_umount` and `pivot_root`. Propagation types can be set but are not emulated: there is no
-//! propagation between mounts, and all behave as private. Mounts must be in the caller's mount
+//! `path_umount` and `pivot_root`. Propagation follows `fs/pnode.c`: shared mounts have peer
+//! groups and slaves, and mounts and unmounts under them propagate ([`propagate`],
+//! [`crate::vfs::Vfs::umount_tree`]). Mounts must be in the caller's mount
 //! namespace (Linux's `check_mnt`); those in other namespaces (seen through `/proc/<pid>/root`)
 //! are EINVAL. A tmpfs is a tree in the store that does not hang under the root directory
 //! (`Vfs::new_tmpfs`). mqueue lists the POSIX message queues in the IPC namespace of the process
@@ -782,8 +783,8 @@ fn remount_tmpfs(vfs: &Vfs, dev: u64, data: &[u8]) -> Result<(), Errno> {
 }
 
 /// Changes the propagation type (Linux's `do_change_type`) of the mount whose root `target` is,
-/// attached in any namespace or detached, and with `MS_REC` of the mounts below it. Only the
-/// types change: mount events do not propagate ([`crate::vfs::Propagation`]).
+/// attached in any namespace or detached, and with `MS_REC` of the mounts below it; mounts and
+/// unmounts made afterwards propagate by the new types ([`crate::vfs::Propagation`]).
 fn change_type(cx: &mut Cx<'_>, target: &Node, flags: u64) -> SysResult {
     let vfs = cx.vfs()?;
     let id = vfs.any_mount_root(target).ok_or(Errno::EINVAL)?;
@@ -1042,8 +1043,8 @@ pub(super) fn open_tree(cx: &mut Cx<'_>, dirfd: i32, path: u64, flags: u32) -> S
 /// move_mount(2) (Linux 6.1): needs `CAP_SYS_ADMIN`; source and target are each resolved from a
 /// directory fd (with `F_EMPTY_PATH`/`T_EMPTY_PATH` they may be the fd itself, with
 /// `F_SYMLINKS`/`T_SYMLINKS` the last symlink is followed), and the move works as `MS_MOVE`
-/// ([`move_tree`]). Appine has no shared mounts, so `MOVE_MOUNT_SET_GROUP` is always EINVAL (as
-/// it is on Linux when the source is not shared).
+/// ([`move_tree`]). `MOVE_MOUNT_SET_GROUP` (putting the target in the source's peer group) is not
+/// implemented and always EINVAL, which Linux answers only when the source is not shared.
 pub(super) fn sys_move_mount(
     cx: &mut Cx<'_>,
     from: (i32, u64),
@@ -1068,8 +1069,8 @@ pub(super) fn sys_move_mount(
 /// mount_setattr(2) (Linux 6.1's `mount_setattr`, `build_mount_kattr`): changes the flags of a
 /// mount (with those below it under `AT_RECURSIVE`). `struct mount_attr` is at least 32 bytes,
 /// and anything beyond must be 0; changing the access time requires giving the whole
-/// `MOUNT_ATTR__ATIME` in attr_clr as well. Propagation types have no effect after being checked
-/// (Appine's mounts do not propagate to each other). Idmapped mounts (`MOUNT_ATTR_IDMAP`) are
+/// `MOUNT_ATTR__ATIME` in attr_clr as well. A propagation type is set after the flags, as
+/// `mount_setattr_commit` does. Idmapped mounts (`MOUNT_ATTR_IDMAP`) are
 /// EINVAL after the userns fd is checked, the same as for a filesystem that does not support
 /// them.
 pub(super) fn mount_setattr(

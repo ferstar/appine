@@ -744,8 +744,8 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_setRoutes<'l>(
 /// the same as for the same route on Linux: 0 for IPv4; for IPv6, 1024 for the default route (RA)
 /// and 256 for others (the networks the kernel adds for addresses).
 fn parse_route(line: &str) -> Option<HostRoute> {
-    // Slicing by bytes needs ASCII: a multi-byte character would split and panic, and a panic
-    // here aborts the app (the JNI layer catches none)
+    // Slicing by bytes needs ASCII: a multi-byte character would split and panic, which `guarded!`
+    // would turn into a failed setRoutes call setting none of the routes
     let hex = |s: &str| -> Option<Vec<u8>> {
         (s.is_ascii() && s.len().is_multiple_of(2))
             .then(|| {

@@ -13,8 +13,10 @@
 # ioctl requests, madvise advice, futex commands, names missing under /proc, /sys and /dev, devices
 # without a driver; core/kernel/src/stub.rs).
 # The output is for people to read: the script only prints results and does not compare with native.
-# Without names, everything under tests/survey/ runs. Each workload runs for at most SURVEY_TIMEOUT
-# seconds (1500 by default).
+# Without names, the scripts directly under tests/survey/ run (the container-engine ones too, which
+# need a store of their own: -s target/survey/docker or podman); those in subdirectories (glibc/,
+# suites/, ai/) run only by name. Each workload runs for at most SURVEY_TIMEOUT seconds (1500 by
+# default).
 #
 # -n image: run the same workloads natively in this docker image for comparison, with the output in
 # <name>.native.out and .native.err. The environment variable SURVEY_DOCKER_OPTS is added to the

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: instance owners and remount's capability check)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: instance owners and remount's capability check, then the stale propagation comments corrected)
 
 ## Responsibilities
 
@@ -392,16 +392,12 @@ Outside the module:
   not skip mounts of open_tree namespaces, so an unattached clone of a shared mount (its peer)
   receives copies of mounts made under the original, and unmount propagation and its busy check
   reach it too; 6.1's `propagate_one` skips them (`IS_MNT_NEW`).
-- **Quadratic mount operations and stale comments:** recursive propagation changes
+- **Quadratic mount operations:** recursive propagation changes
   (`set_propagation` through `change_propagation`/`make_slave`), `attached` (twice per bind),
   `move_tree`'s unbindable check and `mount_setattr` with `AT_RECURSIVE` (which also rebuilds the
   fast path's mount points per mount) scan the whole mount table once per mount in the subtree,
   and `propagation_targets` checks each target with `is_under`, which scans the table at each
-  step. Comments in `syscall/mount.rs` (its header, `change_type`, `MOVE_MOUNT_SET_GROUP`,
-  mount_setattr) and on `vfs::Propagation` still say mounts do not propagate,
-  `propagation_targets`' doc says the tree's own mounts are never targets, a
-  doc line about flags and the `MNT_EXPIRE` mark is left above `set_propagation`, and
-  `Fs::own_dev`'s doc leaves out overlay and FUSE.
+  step.
 - **Mount fidelity gaps:**
   - `MNT_EXPIRE` marks are never cleared by an access to the mount, and LTP umount2_02's
     mark-then-expire sequences fail;

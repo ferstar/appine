@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/native.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment corrected)
 
 ## Responsibilities
 
@@ -281,8 +283,7 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 - Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
   `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
   version); a failed string conversion with no pending exception makes void calls return silently
-  (unreachable from the non-null Kotlin signatures). The comment on `parse_route` still says a
-  panic there aborts the app, which `guarded!` no longer allows. If the `stderr-log` thread fails
+  (unreachable from the non-null Kotlin signatures). If the `stderr-log` thread fails
   to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
 - `scripts/fetch-ghostty` checks only the pinned sha256; the release's minisign signature is to be
   checked by hand once when upgrading, before pinning the new sha256. It runs `zig` from `PATH`

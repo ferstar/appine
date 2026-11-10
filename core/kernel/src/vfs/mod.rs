@@ -235,9 +235,10 @@ impl Fs {
         )
     }
 
-    /// Newly mounted instances have their own device numbers: procfs, tmpfs, and devpts (each
+    /// Newly mounted instances have their own device numbers: procfs, tmpfs, devpts (each
     /// instance has its own set of terminals, and the device number is the instance number,
-    /// [`crate::tty::PtsOptions`]).
+    /// [`crate::tty::PtsOptions`]), overlay and FUSE (a FUSE connection mounted again keeps its
+    /// number).
     pub(crate) const fn own_dev(self) -> bool {
         matches!(
             self,
@@ -376,8 +377,8 @@ pub(crate) struct Mount {
 }
 
 /// A mount's propagation (Linux's `mnt_group_id`, `mnt_master` and `MNT_UNBINDABLE`, by
-/// `fs/pnode.c`'s rules): recorded, changed and shown in mountinfo, while mount and unmount
-/// events do not propagate between mounts.
+/// `fs/pnode.c`'s rules): recorded, changed and shown in mountinfo, and followed by mount and
+/// unmount events ([`Vfs::propagation_targets`], [`Vfs::propagate`], [`Vfs::umount_tree`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Propagation {
     /// The peer group of a shared mount (`shared:N`), 0 when not shared.
@@ -2984,7 +2985,6 @@ impl Vfs {
         self.update_mount(id, |m| m.root_at = at);
     }
 
-    /// Changes the flags and the MNT_EXPIRE mark of mount `id`.
     /// Changes the propagation type of mount `id` (attached or detached), and with `recursive` of
     /// the mounts below it (Linux's `do_change_type`; for `Shared` every mount first gets a peer
     /// group of its own, `invent_group_ids`).
@@ -3035,7 +3035,9 @@ impl Vfs {
     /// The mounts a tree attached on `point` (`at` when it is a file in the store) gets copied to
     /// (Linux's `propagate_mnt`): when the mount `point` is in is shared, its peers and slaves,
     /// recursively, that see the mount point (`propagate_one` skips the others), each with the
-    /// place there. Planned before attaching: the tree's own mounts are not among them.
+    /// place there. Planned before attaching, so a new mount's or a bind's own mounts are not
+    /// among them; a moved attached tree or an open_tree clone is already in the table, and a mount
+    /// of its own that the place propagates to is one (it gets one copy of the tree).
     pub(crate) fn propagation_targets(
         &self,
         ps: &dyn Pseudo,
@@ -3347,6 +3349,8 @@ impl Vfs {
         mounts.all().find(|m| m.root == *node).map(|m| m.id)
     }
 
+    /// Changes attached mount `id` through `f` (its flags, the MNT_EXPIRE mark, its locks and the
+    /// like), keeping only per-mount flags, and reports a mount change.
     pub(crate) fn update_mount(&self, id: MountId, f: impl FnOnce(&mut Mount)) {
         if let Some(m) = self
             .mounts
