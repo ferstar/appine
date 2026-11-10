@@ -129,6 +129,16 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // Ghostty's own entry either way
 static const char TERMINFO_NAME[] = "xterm-256color";
 
+// What appine_vt_compress_step asks of vt.rs: nothing until the terminal changes again, another
+// step soon, or another idle interval first (the terminal changed since the last look)
+#define APPINE_COMPRESS_DONE 0
+#define APPINE_COMPRESS_STEP 1
+#define APPINE_COMPRESS_WAIT 2
+
+// The text buffer (AppineVt.text) a finished compression pass leaves allocated: a transcript or a
+// large copy grows it to their size, and it is not needed again until the next one
+#define TEXT_KEEP ((size_t)64 * 1024)
+
 // A program status report (OSC 7501) as appine_vt_take_effects queues it for vt.rs, which reads the
 // same layout: u8 state (GhosttyProgramStatusState), u8 kind (GhosttyProgramStatusKind), i8 progress
 // (0-100, -1 for none), u8 id length, u8 title length, u16 message length, then the id, title and
@@ -224,7 +234,8 @@ typedef struct AppineVt {
   size_t grapheme_cap;
   // Scratch for one row's further codepoints
   Buf extras;
-  // The last text handed out (copy, title, transcript), valid until the next such call
+  // The last text handed out (copy, title, transcript), valid until the next such call or the end
+  // of a compression pass, which frees it when large (release_text)
   Buf text;
   // A program set the title (OSC 0/2) since appine_vt_take_title_changed
   bool title_changed;
@@ -264,6 +275,13 @@ typedef struct AppineVt {
   uint8_t *marks;
   uint8_t *marks_sent;
   size_t marks_cells;
+  // Scrollback compression (see there): a pass is scheduled (vt.rs runs its steps), the activity
+  // token as last looked at, and a read restored compressed pages since the last pass
+  bool compress_scheduled;
+  uint64_t compress_seen;
+  bool compress_touched;
+  // The last transcript is still the screen's text: no output, message or resize came since
+  bool transcribed;
 } AppineVt;
 
 // ---- Effects (called inside ghostty_terminal_vt_write, under vt.rs's lock) ----
@@ -546,6 +564,7 @@ void appine_vt_free(AppineVt *vt) {
 
 void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
   ghostty_terminal_vt_write(vt->term, data, len);
+  vt->transcribed = false;
 }
 
 // The answers collected since the last call; valid until the next feed
@@ -570,6 +589,7 @@ void appine_vt_resize(AppineVt *vt, uint16_t cols, uint16_t rows, uint32_t cell_
                   ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &selected) ==
                       GHOSTTY_SUCCESS;
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
+  vt->transcribed = false;
   if (reselect) search_reselect(vt, selected);
 }
 
@@ -1221,6 +1241,8 @@ bool appine_vt_select_rectangle(AppineVt *vt, bool on) {
 // Selects everything, scrollback included; false when there is nothing to select.
 bool appine_vt_select_all(AppineVt *vt) {
   drop_anchor(vt);
+  // Finding the first and last non-blank cells reads the oldest and newest pages
+  vt->compress_touched = true;
   GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
   return ghostty_terminal_select_all(vt->term, &sel) == GHOSTTY_SUCCESS &&
          ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
@@ -1243,6 +1265,8 @@ const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
   options.trim = true;
   uint8_t *text = NULL;
   size_t text_len = 0;
+  // The formatter reads every page the selection spans
+  vt->compress_touched = true;
   if (ghostty_terminal_selection_format_alloc(vt->term, NULL, options, &text, &text_len) !=
       GHOSTTY_SUCCESS) {
     return NULL;
@@ -1344,7 +1368,9 @@ const uint8_t *appine_vt_link(AppineVt *vt, uint16_t x, uint16_t y, size_t *len)
     return vt->text.ptr;
   }
 
-  // The tapped row's line: up while the row above wraps onto it, down while it wraps onward
+  // The tapped row's line: up while the row above wraps onto it, down while it wraps onward. Rows
+  // above the viewport may be on a compressed page, which reading them restores
+  vt->compress_touched = true;
   uint32_t top = at.y;
   uint32_t bottom = at.y;
   while (top > 0 && at.y - top < LINK_ROWS && row_wraps(vt, top - 1)) top--;
@@ -1536,6 +1562,7 @@ bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
     seq.len += (size_t)tail_len;
     size_t replies = vt->replies.len;
     ghostty_terminal_vt_write(vt->term, seq.ptr, seq.len);
+    vt->transcribed = false;
     // Nothing above asks for an answer; keep the console's replies as they were
     vt->replies.len = replies;
   }
@@ -1545,10 +1572,12 @@ bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
 
 // The primary screen's text with its scrollback, soft-wrapped lines joined and trailing blanks
 // trimmed (saving tabs); valid until the next text call. NULL on the alternate screen, whose text
-// is not what the tab should come back with, and on failure.
+// is not what the tab should come back with, when the last transcript is still the screen's text
+// (the caller keeps it: formatting restores every compressed page), and on failure.
 const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
   *len = 0;
-  if (is_alternate(vt)) return NULL;
+  if (is_alternate(vt) || vt->transcribed) return NULL;
+  vt->compress_touched = true;
   GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
   options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
   options.unwrap = true;
@@ -1567,8 +1596,83 @@ const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
   if (data_len == 0) {
     // An empty screen: an empty transcript, not a failure
     ghostty_free(NULL, data, 0);
+    vt->transcribed = true;
     static const uint8_t empty = 0;
     return &empty;
   }
-  return keep_text(vt, data, data_len, len);
+  const uint8_t *text = keep_text(vt, data, data_len, len);
+  vt->transcribed = text != NULL;
+  return text;
+}
+
+// ---- Scrollback compression ----
+//
+// libghostty-vt compresses the primary screen's cold pages, those wholly in the scrollback and
+// outside the viewport, to about a fifth of their 400 KiB, and restores a page whenever something
+// reads it; scheduling is left to the embedder. As in Ghostty, vt.rs runs a pass in short steps
+// once the terminal has been idle for a moment, so output does not wait for it. Unlike Ghostty, a
+// pass waits for that only a few seconds: a tab whose output never pauses would otherwise never be
+// compressed, and the transcripts saved every minute restore all its pages. The activity token
+// changes with what can make work (rows moving into the scrollback, resizes, scrolling), but not
+// when a read restores pages, so the reads that restore them in bulk (the formatter for
+// transcripts and copies, select all, a link's line) mark the terminal touched. Drawing reads only
+// the viewport's pages, and searching keeps pages as they are.
+
+static uint64_t compression_activity(AppineVt *vt) {
+  uint64_t activity = 0;
+  ghostty_terminal_compression_activity(vt->term, &activity);
+  return activity;
+}
+
+// Frees the text buffer once a transcript or a large copy has grown it past TEXT_KEEP; whatever
+// it held was handed out under an earlier lock and is no longer read
+static void release_text(AppineVt *vt) {
+  if (vt->text.cap <= TEXT_KEEP) return;
+  free(vt->text.ptr);
+  vt->text = (Buf){0};
+}
+
+// Whether vt.rs should schedule a pass now: the terminal changed or a read restored pages since
+// the last pass, and none is scheduled yet. Marks it scheduled; vt.rs then calls
+// appine_vt_compress_step once the idle interval has passed.
+bool appine_vt_compress_wanted(AppineVt *vt) {
+  if (vt->compress_scheduled) return false;
+  uint64_t activity = compression_activity(vt);
+  if (activity == vt->compress_seen && !vt->compress_touched) return false;
+  vt->compress_seen = activity;
+  vt->compress_scheduled = true;
+  return true;
+}
+
+// One step of the scheduled pass (APPINE_COMPRESS_*): a bounded amount of work, unless the
+// terminal changed since the last look and the pass may still wait (may_wait), which postpones it
+// by another idle interval. The last step ends the pass and frees a large text buffer.
+int appine_vt_compress_step(AppineVt *vt, bool may_wait) {
+  uint64_t activity = compression_activity(vt);
+  if (activity != vt->compress_seen) {
+    vt->compress_seen = activity;
+    if (may_wait) return APPINE_COMPRESS_WAIT;
+  }
+  GhosttyTerminalCompressionResult result = GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE;
+  if (ghostty_terminal_compress(vt->term, GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL,
+                                &result) == GHOSTTY_SUCCESS &&
+      result == GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING) {
+    return APPINE_COMPRESS_STEP;
+  }
+  vt->compress_scheduled = false;
+  vt->compress_touched = false;
+  release_text(vt);
+  return APPINE_COMPRESS_DONE;
+}
+
+// Compresses every cold page at once, idle or not (the app trimming its memory), and frees a large
+// text buffer. A scheduled pass goes on as it was.
+void appine_vt_compress_all(AppineVt *vt) {
+  GhosttyTerminalCompressionResult result;
+  ghostty_terminal_compress(vt->term, GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL, &result);
+  if (!vt->compress_scheduled) {
+    vt->compress_seen = compression_activity(vt);
+    vt->compress_touched = false;
+  }
+  release_text(vt);
 }

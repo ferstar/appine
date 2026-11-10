@@ -106,7 +106,10 @@ internal class VtSession(
     private var cellWidth = 0
     private var cellHeight = 0
 
-    /** The last transcript of the primary screen, kept for saves while a full-screen program runs. */
+    /**
+     * The last transcript of the primary screen, kept for saves while a full-screen program runs
+     * or nothing changed the screen.
+     */
     private var lastTranscript: String? = null
 
     /** The title a program set (OSC 0/2), null when none (the tab bar then shows `sh`). */
@@ -152,8 +155,9 @@ internal class VtSession(
                 lastTranscript = it
                 return it
             }
-            // The alternate screen (vim, less): what the tab showed before it, not the program's
-            // screen without scrollback
+            // Unchanged since the last one, which formatting again would only make the scrollback
+            // decompress for; or the alternate screen (vim, less): what the tab showed before it,
+            // not the program's screen without scrollback
             return lastTranscript.orEmpty()
         }
 

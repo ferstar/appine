@@ -15,16 +15,20 @@
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
 //! scrolls, encodes keys, mouse and focus events and pastes, selects, searches and copies, and
-//! reads the title and transcript. The terminal is not thread-safe, so every call into vt.c holds the
-//! tab's lock; the frame buffer it returns is only written by `frame`, which only the main thread
-//! calls, so the main thread may read it after the lock is released.
+//! reads the title and transcript; the `vt-compress` thread compresses idle tabs' scrollback
+//! ([`compressor`]). The terminal is not thread-safe, so every call into vt.c holds the tab's lock;
+//! the frame buffer it returns is only written by `frame`, which only the main thread calls, so the
+//! main thread may read it after the lock is released.
 //!
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
 use std::collections::BTreeMap;
 use std::ffi::c_char;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use appine_kernel::Machine;
 use jni::JNIEnv;
@@ -62,6 +66,21 @@ const CLIPBOARD_CLEAR: i32 = 2;
 
 /// vt.c's `STATUS_HEADER_BYTES`: the fixed part of a queued program status report.
 const STATUS_HEADER_BYTES: usize = 7;
+
+/// vt.c's `APPINE_COMPRESS_STEP` and `APPINE_COMPRESS_WAIT` (`APPINE_COMPRESS_DONE` is any other).
+const COMPRESS_STEP: i32 = 1;
+const COMPRESS_WAIT: i32 = 2;
+
+/// How long a tab's terminal must stay unchanged before its scrollback is compressed, and the
+/// pause between two steps of a pass, in which the pump and the main thread get the lock: Ghostty's
+/// own intervals.
+const COMPRESS_IDLE: Duration = Duration::from_millis(250);
+const COMPRESS_STEP_GAP: Duration = Duration::from_millis(1);
+
+/// How long a scheduled pass waits for the terminal to be idle before it runs anyway (Ghostty
+/// waits for good): output that never pauses would otherwise keep a tab's scrollback, and what a
+/// transcript restored of it, uncompressed.
+const COMPRESS_MAX_WAIT: Duration = Duration::from_secs(5);
 
 // vt.c
 unsafe extern "C" {
@@ -116,6 +135,9 @@ unsafe extern "C" {
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_message(vt: *mut AppineVt, text: *const u8, len: usize) -> bool;
     fn appine_vt_transcript(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_compress_wanted(vt: *mut AppineVt) -> bool;
+    fn appine_vt_compress_step(vt: *mut AppineVt, may_wait: bool) -> i32;
+    fn appine_vt_compress_all(vt: *mut AppineVt);
 }
 
 /// Owns one vt.c terminal.
@@ -335,6 +357,8 @@ impl Effects {
 }
 
 struct Tab {
+    /// This tab's handle in [`TABS`], by which a compression pass is scheduled.
+    id: jlong,
     /// The kernel's handle in the crate root's table ([`machine`]).
     machine: jlong,
     console: u32,
@@ -357,13 +381,61 @@ impl Tab {
         true
     }
 
-    fn term(&self) -> MutexGuard<'_, Term> {
-        self.term.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The terminal, locked until the guard goes; letting it go schedules a compression pass when
+    /// the call left work for one.
+    fn term(&self) -> TermGuard<'_> {
+        TermGuard {
+            tab: self,
+            term: self.term.lock().unwrap_or_else(PoisonError::into_inner),
+        }
     }
 
     /// The kernel, for the duration of one call; None once it is stopped.
     fn machine(&self) -> Option<Arc<Machine>> {
         machine(self.machine)
+    }
+
+    /// One step of this tab's scheduled compression pass, which `may_wait` for the terminal to be
+    /// idle: the delay before the next one, None once the pass is over.
+    fn compress_step(&self, may_wait: bool) -> Option<Duration> {
+        // Not through term(), whose guard would schedule this very pass
+        let term = self.term.lock().unwrap_or_else(PoisonError::into_inner);
+        match unsafe { appine_vt_compress_step(term.0, may_wait) } {
+            COMPRESS_STEP => Some(COMPRESS_STEP_GAP),
+            COMPRESS_WAIT => Some(COMPRESS_IDLE),
+            _ => None,
+        }
+    }
+}
+
+/// A tab's locked terminal ([`Tab::term`]). Every call into vt.c goes through one, so when the
+/// lock goes, vt.c can tell whether the call made compression work (output moved rows into the
+/// scrollback, a resize, a read that restored compressed pages) and the pass is scheduled then.
+struct TermGuard<'a> {
+    tab: &'a Tab,
+    term: MutexGuard<'a, Term>,
+}
+
+impl Deref for TermGuard<'_> {
+    type Target = Term;
+
+    fn deref(&self) -> &Term {
+        &self.term
+    }
+}
+
+impl DerefMut for TermGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Term {
+        &mut self.term
+    }
+}
+
+impl Drop for TermGuard<'_> {
+    fn drop(&mut self) {
+        // Still under the tab's lock; the schedule's lock is only ever taken after it
+        if unsafe { appine_vt_compress_wanted(self.term.0) } {
+            compress_later(self.tab.id);
+        }
     }
 }
 
@@ -395,6 +467,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
         }
         let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
         let tab = Tab {
+            id,
             machine: handle,
             console: console as u32,
             term: Mutex::new(Term(raw)),
@@ -964,7 +1037,8 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_message<'l>(
 }
 
 /// The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed);
-/// null on the alternate screen or on failure.
+/// null on the alternate screen, when nothing changed the screen since the last transcript (whose
+/// text the caller keeps), or on failure.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
     mut env: JNIEnv<'l>,
@@ -979,6 +1053,28 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
         let mut len = 0;
         let p = unsafe { appine_vt_transcript(term.0, &mut len) };
         term.text(&mut env, p, len)
+    })
+}
+
+/// Compresses the cold scrollback of every tab at once, idle or not (the app trimming its memory),
+/// so a tab whose output never pauses is compressed too.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_compressAll<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+) {
+    guarded!("VtNative.compressAll", (), {
+        let tabs: Vec<Arc<Tab>> = TABS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for tab in tabs {
+            // Not through term(): the pass leaves nothing to schedule
+            let term = tab.term.lock().unwrap_or_else(PoisonError::into_inner);
+            unsafe { appine_vt_compress_all(term.0) };
+        }
     })
 }
 
@@ -1003,4 +1099,78 @@ fn tab(handle: jlong) -> Option<Arc<Tab>> {
         .unwrap_or_else(PoisonError::into_inner)
         .get(&handle)
         .cloned()
+}
+
+/// Tabs with a compression pass scheduled, by handle.
+static COMPRESS: Mutex<BTreeMap<jlong, Due>> = Mutex::new(BTreeMap::new());
+static COMPRESS_WAKE: Condvar = Condvar::new();
+static COMPRESSOR: Once = Once::new();
+
+/// A scheduled compression pass: when [`compressor`] looks at it next, and when it was scheduled.
+#[derive(Clone, Copy)]
+struct Due {
+    at: Instant,
+    since: Instant,
+}
+
+/// Schedules tab `id`'s compression pass an idle interval from now; the first call starts the
+/// `vt-compress` thread. vt.c has marked the pass scheduled, so this comes once per pass.
+fn compress_later(id: jlong) {
+    COMPRESSOR.call_once(|| {
+        if let Err(e) = thread::Builder::new()
+            .name("vt-compress".into())
+            .spawn(compressor)
+        {
+            eprintln!("appine: cannot start the scrollback compressor: {e}");
+        }
+    });
+    let now = Instant::now();
+    let due = Due {
+        at: now + COMPRESS_IDLE,
+        since: now,
+    };
+    COMPRESS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(id, due);
+    COMPRESS_WAKE.notify_one();
+}
+
+/// The `vt-compress` thread (vt.c's "Scrollback compression"): takes the scheduled tab due first
+/// and runs one step of its pass, which waits for the terminal to stay unchanged for
+/// [`COMPRESS_IDLE`] (for at most [`COMPRESS_MAX_WAIT`]) and then compresses in bounded steps
+/// [`COMPRESS_STEP_GAP`] apart, releasing the tab's lock between them. The schedule's lock is not
+/// held during a step, so scheduling, which happens under a tab's lock, never waits for one.
+fn compressor() {
+    let mut due = COMPRESS.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        let Some((id, next)) = due
+            .iter()
+            .min_by_key(|&(_, next)| next.at)
+            .map(|(&id, &next)| (id, next))
+        else {
+            due = COMPRESS_WAKE
+                .wait(due)
+                .unwrap_or_else(PoisonError::into_inner);
+            continue;
+        };
+        let now = Instant::now();
+        if next.at > now {
+            due = COMPRESS_WAKE
+                .wait_timeout(due, next.at - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            continue;
+        }
+        due.remove(&id);
+        drop(due);
+        let may_wait = now - next.since < COMPRESS_MAX_WAIT;
+        // A tab closed meanwhile is dropped from the schedule
+        let again = tab(id).and_then(|tab| tab.compress_step(may_wait));
+        due = COMPRESS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(delay) = again {
+            let at = Instant::now() + delay;
+            due.insert(id, Due { at, ..next });
+        }
+    }
 }

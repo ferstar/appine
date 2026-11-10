@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, the menu key and resize replies, scrollback limits, default colours, DA1, OSC 5522, progress, program status and TN, then line and rectangular selection and search last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback limits, colours, DA1, OSC 5522, progress, status, TN, selection, search, then scrollback compression last)
 
 ## Responsibilities
 
@@ -19,7 +19,8 @@
   what its programs report about their progress and status), `VtView` (drawing with the bundled
   JetBrains Mono, input, selection, search marks, gestures), `ProgressLine` (the current tab's
   progress over the terminal), `VtKeys`, `VtGlyphs`, `VtNative`, and the emulator shim and JNI in
-  the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
+  the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt, with the `vt-compress`
+  thread that compresses idle tabs' scrollback;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
@@ -84,11 +85,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   notification's intent), its `ConsolePty`, the terminal handle (0 until the shell starts, never
   reset), the view showing it (`view`, read on the pump thread), pending restored text and
   messages, its login and the account an `auto` login resolved to (`resolvedLogin`, written by the
-  service), the last transcript, the last progress report (`progress`, a `Progress`), the program
-  status records by id (`Status`, least recently updated first, at most 64) and the one most in
-  need of the user (`status`), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
-  `vt-writer` executor; `Events` (title changed, bell, clipboard write, notification, progress or
-  status changed, finished) go to the service on the main thread. Its companion holds
+  service), the last transcript (whole, also returned while the screen is unchanged), the last
+  progress report (`progress`, a `Progress`), the program status records by id (`Status`, least
+  recently updated first, at most 64) and the one most in need of the user (`status`), a
+  `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer` executor; `Events`
+  (title changed, bell, clipboard write, notification, progress or status changed, finished) go
+  to the service on the main thread. Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
   (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
@@ -105,19 +107,24 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 26 `@JvmStatic external` functions on the native library.
-- In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
-  flag) in a table `TABS` keyed by handles from 1, never reused; `Term` (owns the `AppineVt`,
-  freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into `Effects` (with
-  the `StatusReport`s decoded from vt.c's queue).
+- `VtNative` — 27 `@JvmStatic external` functions on the native library.
+- In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
+  mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
+  tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
+  `AppineVt`, freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into
+  `Effects` (with the `StatusReport`s decoded from vt.c's queue); the compression schedule
+  `COMPRESS` (a `Due` per tab: when to look at it next and when it was scheduled), served by the
+  `vt-compress` thread (`compressor`).
 - In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and
   cell pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link
   and transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
   selection drag, the last reported mouse cell, the effects since they were last taken: bells,
   the last clipboard write, the last notification, the last progress report and every program
   status report, queued in a byte layout vt.rs reads; `AppineVtEffects` is how they are handed
-  out; and the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
-  each viewport cell's search mark for this frame and as last sent).
+  out; the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
+  each viewport cell's search mark for this frame and as last sent; the compression state: a pass
+  scheduled, the activity token last seen, a read that restored compressed pages since the last
+  pass; and whether the last transcript is still the screen's text).
 
 ## Public entry points
 
@@ -130,9 +137,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `resize`, `key`, `paste`, `mouse`,
   `focus`, `scroll`, `selectWord`, `selectLine`, `selectGrab`, `selectTo`, `selectRectangle`,
   `selectAll`, `selectClear`, `copy`, `link`, `search`, `searchSelect`, `searchEnd`, `message`,
-  `transcript`, `destroy`; `pump` runs on `vt-pump` and calls
+  `transcript`, `compressAll`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
-  `onStatus` and `onForeground` back; the rest run on the main thread.
+  `onStatus` and `onForeground` back; `compressAll` runs on the service's worker, the rest on the
+  main thread.
 
 ## Data flow / lifecycle
 
@@ -356,13 +364,37 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   (writes already queued still run) and destroys the terminal handle; a running pump keeps the
   terminal until it returns.
 - Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
-  wraps joined, trailing blanks trimmed); on the alternate screen, or when formatting fails, it
-  returns the last transcript taken on the primary one ("" when none was).
+  wraps joined, trailing blanks trimmed); on the alternate screen, when nothing changed the screen
+  since the last transcript (no output, message or resize), or when formatting fails, it returns
+  the last transcript taken on the primary one ("" when none was).
 - Kill reports go through `VtNative.message` (a yellow line inserted above the cursor line: a CAN
   first when the parser is not at ground (`VT_GROUND`, which includes the UTF-8 decoder), so a
   program that died inside an OSC, DCS or APC string does not swallow it; then as many line feeds
   as the text needs rows, up again, save the cursor, insert lines, write, restore and move down,
   dropping any replies; skipped on the alternate screen) or are queued until the terminal exists.
+
+#### Scrollback compression
+
+- libghostty-vt compresses the primary screen's cold pages (wholly in the scrollback and outside
+  the viewport; the alternate screen keeps no scrollback) to about a fifth of their 400 KiB, and
+  restores a page when something reads it: drawing a viewport scrolled back over it, the formatter
+  (transcripts, copies), select all (which reads the oldest and newest pages) and a tapped link's
+  line; searching restores nothing. The scrollback limits count pages uncompressed, so the same
+  history is kept in less memory.
+- A pass is scheduled when a call into vt.c left work for one, which vt.c tells as the
+  `TermGuard` is released: libghostty-vt's activity token changed (rows moving into the
+  scrollback, a resize, scrolling), or one of the reads above restored pages, which vt.c marks
+  itself since the token does not change for them. The `vt-compress` thread looks at the tab
+  250 ms later and, while the terminal keeps changing, waits another 250 ms each time, but not
+  beyond 5 s from scheduling, so output that never pauses is compressed too. It then runs
+  libghostty-vt's incremental steps 1 ms apart, each under the tab's lock, until a pass finds
+  nothing left; the last step frees vt.c's text buffer if a transcript or copy grew it past
+  64 KiB.
+- Memory trimming (`VtNative.compressAll`, from android/service) compresses every tab's cold pages
+  at once, idle or not, one tab's lock at a time.
+- Saving does not format a transcript again while nothing changed the screen, since formatting
+  restores every compressed page; a tab whose text changed is formatted at each save and
+  compressed again afterwards.
 
 #### Frames and drawing
 
@@ -574,8 +606,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - `TerminalService` (creates and holds the `VtSession`s: `setRestored`, `showMessage`,
   `transcriptText`, `title`, `isRunning`, `console`, `login` and `resolvedLogin`, `id`,
-  `status`, `statusSeen`, `describe`, `release`; `current`, `focus`, `sessions`, listener callbacks, the notification intent with
-  `EXTRA_TAB`); `SettingsActivity` (licenses).
+  `status`, `statusSeen`, `describe`, `release`; `current`, `focus`, `sessions`, listener
+  callbacks, the notification intent with `EXTRA_TAB`), and its memory trimming
+  (`VtNative.compressAll`); `SettingsActivity` (licenses).
 
 ### Outbound
 
@@ -587,7 +620,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection with word and line derivation, search, plain-text formatting, title and
-  width, progress and program status reports), linked into `libappine.so` (`android/native`); `Machine::read_console`,
+  width, progress and program status reports, scrollback compression), linked into
+  `libappine.so` (`android/native`); `Machine::read_console`,
   `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly; the system
   clipboard; the app the system picks for a link (a browser, or a viewer or the Files app for a
@@ -716,7 +750,22 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock (recovered when
   poisoned); the frame buffer is written only by `frame`, which only the main thread calls, so the
   main thread reads it after the lock is released. vt.c's text buffer is shared by title, copy,
-  link and transcript, so each result is turned into a Java string under the lock.
+  link and transcript, so each result is turned into a Java string under the lock (the end of a
+  compression pass frees it when large).
+- Compression is scheduled only when a `TermGuard` is released, so every call into vt.c that can
+  make work must lock through `Tab::term`; the compressor and `compressAll` lock the mutex
+  directly because they make none (through the guard, a step would schedule its own pass). A tab's
+  lock is taken before the schedule's, never after: the compressor lets the schedule's lock go
+  before a step.
+- libghostty-vt's compression activity token does not change when a read restores compressed
+  pages, so a vt.c function that reads beyond the viewport (the formatter, select all, grid
+  references above or below it) must set `compress_touched`, or what it restored stays
+  uncompressed until other activity. A vt.c function that writes into the terminal must clear
+  `transcribed`, or saves keep the old transcript.
+- Compression gives page memory back with `MADV_DONTNEED` on ranges aligned to Zig's minimum page
+  size (4 KiB), which a 16 KB-page kernel rounds up. That stays harmless because every terminal
+  page, pooled or not, is a mapping of its own from Zig's page allocator, so the rounding never
+  reaches another page; a libghostty-vt that packed pages into shared mappings would break it.
 - The frame format is defined in `vt.c` and parsed in `VtView.apply`; the two change together. The
   key numbers in `VtKeys` are those of Ghostty 1.4.0's `key/event.h` and change with that header.
 - Since libghostty-vt 1.4, `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself, not its
@@ -777,14 +826,13 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ## Confirmed bugs / technical debt
 
-- **A full scrollback holds 3.5–10 MiB a tab** (about 3.5 MiB at 45 columns, 6.6 MiB at 80 and the
-  10 MiB byte limit from about 120 columns on), which nothing reclaims while scrollback is not
-  compressed (below).
+- **Each tab keeps its whole last transcript in the Java heap** (`VtSession.lastTranscript`),
+  though saving writes only its last 256 K characters: for a full scrollback of plain text that is
+  several hundred KB, about as much as the compressed scrollback itself.
 - **libghostty-vt features not wired**: no callbacks for OSC 7 working directories or OSC 133
   prompts (both also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and
   nushell but not ash, and Appine installs none; the progress and status records go by the
-  foreground process group instead of the prompt mark); no scrollback compression
-  (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
+  foreground process group instead of the prompt mark); tabs are restored from plain text, not
   libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
   continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
   which vt.c leaves off; ENQ, the title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
@@ -853,6 +901,13 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   macOS build of libghostty-vt 1.4.0 fed 30,000 lines, not from Android or 16 KB-page devices);
   the OSC 5522 limit was likewise tried only there. The default colours, DA1 and reverse video
   were also tried in the app on a Pixel 4a API 34 emulator.
+- Scrollback compression on 16 KB-page and real devices: it was tried only on a Pixel 4a API 34
+  emulator (4 KB pages; a full 45-column scrollback of `ls` and `seq` output went from 12 pages,
+  about 4.7 MiB, to about 0.6 MiB resident, a pass taking 1.5–8 ms in steps of at most 5 ms, and
+  output that never paused was compressed every 5 s), with scrolling back, a rotation, saves and a
+  trim; the 16 KB-page
+  emulator did not boot beside it. How a pass's steps and the scheduling thread show in battery
+  use is unmeasured.
 - Progress and status from real programs (cargo, systemd, AI coding CLIs): tried only with
   `printf` sequences on a Pixel 4a API 34 emulator (the progress line in each state, background
   tabs' marks, notifications, a kill from another tab, seeing a tab, the 15 s timeout, Chinese

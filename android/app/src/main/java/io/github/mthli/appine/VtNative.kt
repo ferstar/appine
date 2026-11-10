@@ -142,9 +142,17 @@ internal object VtNative {
 
     /**
      * The primary screen's text with its scrollback (soft wraps joined, trailing blanks trimmed),
-     * for saving tabs; null on the alternate screen or on failure.
+     * for saving tabs; null on the alternate screen, when nothing changed the screen since the
+     * last transcript (the caller keeps that one: formatting restores the compressed scrollback),
+     * or on failure.
      */
     @JvmStatic external fun transcript(tab: Long): String?
+
+    /**
+     * Compresses every tab's cold scrollback at once (memory trimming); otherwise a tab's is
+     * compressed once its terminal has been idle for a moment.
+     */
+    @JvmStatic external fun compressAll()
 
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)

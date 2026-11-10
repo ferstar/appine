@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel at the end, exit restarting by importing, kill reports to the open console, then status notifications last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exit restarting by importing, kill reports to the open console, status notifications, then scrollback trimming last)
 
 ## Responsibilities
 
@@ -42,10 +42,10 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
   (Settings included).
 - `worker` — a single-thread executor (`appine-worker`) for the calls that take a kernel handle
-  and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory`,
-  `shutdown`, `stop`), together with what must stay ordered with them: saving tabs, resolving an
-  `auto` login, changed directories, `Rootfs.setMirror`, and a replacement's mirror join and store
-  reset.
+  and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
+  the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
+  ordered with them: saving tabs, resolving an `auto` login, changed directories,
+  `Rootfs.setMirror`, and a replacement's mirror join and store reset.
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
@@ -179,8 +179,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 ### Memory
 
 - The last listener leaving saves tabs at once and starts a 60 s timer that trims memory
-  (`Native.trimMemory` on the worker); a returning listener cancels it. `onTrimMemory` at
-  `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately.
+  (on the worker: `Native.trimMemory`, the kernel's rebuildable caches, then
+  `VtNative.compressAll`, every tab's cold scrollback at once, android/terminal); a returning
+  listener cancels it. `onTrimMemory` at `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and
+  saves immediately. Tabs also compress their own scrollback within seconds of their output, so
+  the trim mostly finds what the last few seconds left.
 
 ### Sessions, saving and restore
 
@@ -288,8 +291,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 ### Outbound
 
 - `Native` (start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls, `bklStall`,
-  routes, `consoleCwd`); `Rootfs` (readiness, importing, prepare, download, mirrors, ensure-files,
-  profile, access lock, store, reset, failed services, rules refresh, login accounts); `Tabs`;
+  routes, `consoleCwd`); `VtNative.compressAll`; `Rootfs` (readiness, importing, prepare,
+  download, mirrors, ensure-files, profile, access lock, store, reset, failed services, rules
+  refresh, login accounts); `Tabs`;
   `VtSession` and `ConsolePty`; `Documents` (`rootsChanged`, `dirsChanged`).
 - Android: `ActivityManager` (exit records), `PowerManager`, `NotificationManager`,
   `ConnectivityManager`, `ClipboardManager`, the `settings` preferences, `BuildConfig`.

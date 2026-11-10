@@ -428,10 +428,10 @@ class TerminalService : Service() {
     /**
      * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
      * when all have stopped (switched to another app, screen off) and none has come back after
-     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released: since Android 14 a process
-     * with a foreground service no longer gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch
-     * whether the UI is there itself; when the user switches back quickly, nothing has to be
-     * translated again either.
+     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released and the tabs' scrollback is
+     * compressed ([trimMemory]): since Android 14 a process with a foreground service no longer
+     * gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch whether the UI is there itself; when
+     * the user switches back quickly, nothing has to be translated again either.
      */
     private val listeners = mutableListOf<Listener>()
 
@@ -1083,8 +1083,9 @@ class TerminalService : Service() {
 
     /**
      * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
-     * translations kept in the pool take up to 70–80 MB). Since Android 14 the `RUNNING_*` levels
-     * are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by [removeListener].
+     * translations kept in the pool take up to 70–80 MB) and compresses the tabs' scrollback.
+     * Since Android 14 the `RUNNING_*` levels are no longer sent; the UI being hidden
+     * (`UI_HIDDEN`) is handled by [removeListener].
      */
     @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
     override fun onTrimMemory(level: Int) {
@@ -1095,9 +1096,18 @@ class TerminalService : Service() {
         }
     }
 
+    /**
+     * Drops the kernel's rebuildable caches and compresses every tab's cold scrollback, including
+     * that of tabs whose output never paused long enough for the idle compression (`vt.rs`).
+     */
     private fun trimMemory() {
         val m = machine
-        if (m != 0L) worker.execute { Native.trimMemory(m) }
+        if (m != 0L) {
+            worker.execute {
+                Native.trimMemory(m)
+                VtNative.compressAll()
+            }
+        }
     }
 
     /**
