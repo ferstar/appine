@@ -1,7 +1,7 @@
 # kernel/mount Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/mount.md` for the paired decision history (not yet created; decisions from before the split are D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53 in `.claude/decisions/kernel/vfs.md`).
+> See `.claude/decisions/kernel/mount.md` for the paired decision history (decisions from before the split are D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 
