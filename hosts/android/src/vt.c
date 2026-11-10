@@ -49,7 +49,7 @@
 //   image_count image placements (Kitty graphics), in drawing order, 56 bytes each:
 //     u32 image_id         the image to draw, whose pixels appine_vt_image gives
 //     u8  layer            0 below the cell backgrounds, 1 below the text, 2 above it
-//                          (GhosttyRenderStateImageLayer)
+//                          (GhosttyImageLayer)
 //     u8  reserved[3]
 //     u64 generation       the image's pixels: a new value whenever they change
 //     i32 x, i32 y         the destination's top left corner in pixels from the grid's, which
@@ -569,7 +569,6 @@ static void on_notification(GhosttyTerminal t, void *userdata,
 static void on_progress(GhosttyTerminal t, void *userdata, const GhosttyTerminalProgressReport *r) {
   (void)t;
   AppineVt *vt = userdata;
-  if (r->size < offsetof(GhosttyTerminalProgressReport, progress) + sizeof(r->progress)) return;
   vt->progress_state = (int32_t)r->state;
   vt->progress = r->progress;
 }
@@ -584,7 +583,6 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
                               const GhosttyTerminalProgramStatus *s) {
   (void)t;
   AppineVt *vt = userdata;
-  if (s->size < offsetof(GhosttyTerminalProgramStatus, message) + sizeof(s->message)) return;
   size_t id = at_most(s->id.len, UINT8_MAX);
   size_t title = at_most(s->title.len, UINT8_MAX);
   size_t message = at_most(s->message.len, UINT16_MAX);
@@ -853,7 +851,7 @@ static void settle(GhosttyTerminal term) {
   if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
   free(seq.ptr);
   ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
-  GhosttyTerminalScrollViewport bottom = {.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM};
+  GhosttyTerminalScrollViewport bottom = {.tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM};
   ghostty_terminal_scroll_viewport(term, bottom);
 }
 
@@ -893,14 +891,14 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
   pthread_once(&sys_once, install_sys);
   // The row after the viewport too, which the view needs to draw the grid shifted by part of a row
   GhosttyRenderStateOverscan overscan = {.above = 0, .below = 1};
-  ghostty_render_state_set(vt->state, GHOSTTY_RENDER_STATE_OPTION_OVERSCAN, &overscan);
+  ghostty_render_state_set(vt->state, GHOSTTY_RENDER_STATE_OPT_OVERSCAN, &overscan);
   // Cell sizes are only known to libghostty-vt through resize (size reports, images)
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
   vt->mouse_x = -1;
   vt->mouse_y = -1;
   vt->progress_state = -1;
 
-  // The value itself is the userdata (since 1.4; it was read through *(void **)value before)
+  // The value itself is the userdata (since Ghostty 1.4; read through *(void **)value before)
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_USERDATA, vt);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (const void *)on_write_pty);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SIZE, (const void *)on_size);
@@ -960,8 +958,8 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &host_media);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, NULL);
   // Registered glyphs are never drawn (the C API gives no access to them), so the Glyph Protocol
-  // is not advertised: libghostty-vt answers its query with support by default, and programs
-  // would send glyphs that never appear instead of falling back to text
+  // is not advertised (libghostty-vt's default since 1.0, set so that it stays so): programs would
+  // send glyphs that never appear instead of falling back to text
   bool glyphs = false;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyphs);
   // A snapshot can then be taken while output stops inside a sequence (CONTINUATION_MAX)
@@ -1117,21 +1115,19 @@ static void search_reselect(AppineVt *vt, size_t index) {
   GhosttySearchScroll quiet = GHOSTTY_SEARCH_SCROLL_NONE;
   ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_SCROLL, &quiet);
   for (size_t i = 0; i < index; i++) {
-    if (ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_NEXT, NULL) != GHOSTTY_SUCCESS) {
-      break;
-    }
+    if (ghostty_search_select_next(vt->search) != GHOSTTY_SUCCESS) break;
   }
   ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_SCROLL, NULL);
-  ghostty_search_set(vt->search, GHOSTTY_SEARCH_OPT_SELECT_NEXT, NULL);
+  ghostty_search_select_next(vt->search);
 }
 
 // Scrolls the viewport by delta rows (negative: back into the scrollback); 0 goes to the bottom
 void appine_vt_scroll(AppineVt *vt, int32_t delta) {
   GhosttyTerminalScrollViewport s = {0};
   if (delta == 0) {
-    s.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM;
+    s.tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM;
   } else {
-    s.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA;
+    s.tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA;
     s.value.delta = delta;
   }
   ghostty_terminal_scroll_viewport(vt->term, s);
@@ -1158,7 +1154,7 @@ bool appine_vt_at_prompt(AppineVt *vt) {
 // there are prompts; nothing when there are none
 void appine_vt_jump_prompt(AppineVt *vt, int32_t delta) {
   GhosttyTerminalScrollViewport s = {0};
-  s.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA_PROMPT;
+  s.tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_DELTA_PROMPT;
   s.value.delta_prompt = delta;
   // Looking for prompts reads the scrollback's pages, which the activity token does not count
   // when the viewport ends up where it was
@@ -1199,9 +1195,16 @@ static bool put_row(AppineVt *vt, uint16_t y, const uint8_t *marks) {
         vt->grapheme = p;
         vt->grapheme_cap = len;
       }
-      ghostty_render_state_row_cells_get(vt->cells,
-                                         GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-                                         vt->grapheme);
+      GhosttyCodepointBuffer graphemes = {.ptr = vt->grapheme, .cap = vt->grapheme_cap};
+      if (ghostty_render_state_row_cells_get(vt->cells,
+                                             GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                                             &graphemes) != GHOSTTY_SUCCESS) {
+        graphemes.len = 0;
+      }
+      // Only what was written, which is all of the cell's codepoints: the buffer holds len
+      if (graphemes.len < len) len = (uint32_t)graphemes.len;
+    }
+    if (len > 0) {
       codepoint = vt->grapheme[0];
       extra = (uint16_t)(len - 1 > 0xffff ? 0xffff : len - 1);
       if (extra > 0) {
@@ -1236,18 +1239,18 @@ static bool put_row(AppineVt *vt, uint16_t y, const uint8_t *marks) {
                                              &c) == GHOSTTY_SUCCESS) {
         fg = argb(c);
       }
-      GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+      GhosttyStyle style = {0};
       ghostty_render_state_row_cells_get(vt->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE,
                                          &style);
-      if (style.bold) attrs |= 1u << 0;
-      if (style.italic) attrs |= 1u << 1;
-      if (style.faint) attrs |= 1u << 2;
-      if (style.blink) attrs |= 1u << 3;
-      if (style.inverse) attrs |= 1u << 4;
-      if (style.invisible) attrs |= 1u << 5;
-      if (style.strikethrough) attrs |= 1u << 6;
-      if (style.overline) attrs |= 1u << 7;
-      attrs |= (uint16_t)(((uint32_t)style.underline & 0x7) << 8);
+      if (style.flags & GHOSTTY_STYLE_FLAG_BOLD) attrs |= 1u << 0;
+      if (style.flags & GHOSTTY_STYLE_FLAG_ITALIC) attrs |= 1u << 1;
+      if (style.flags & GHOSTTY_STYLE_FLAG_FAINT) attrs |= 1u << 2;
+      if (style.flags & GHOSTTY_STYLE_FLAG_BLINK) attrs |= 1u << 3;
+      if (style.flags & GHOSTTY_STYLE_FLAG_INVERSE) attrs |= 1u << 4;
+      if (style.flags & GHOSTTY_STYLE_FLAG_INVISIBLE) attrs |= 1u << 5;
+      if (style.flags & GHOSTTY_STYLE_FLAG_STRIKETHROUGH) attrs |= 1u << 6;
+      if (style.flags & GHOSTTY_STYLE_FLAG_OVERLINE) attrs |= 1u << 7;
+      attrs |= (uint16_t)(((uint32_t)GHOSTTY_STYLE_UNDERLINE(style) & 0x7) << 8);
     }
 
     uint8_t *p = vt->frame.ptr + vt->frame.len;
@@ -1301,7 +1304,7 @@ static bool images_changed(AppineVt *vt);
 const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   *len = 0;
   if (vt->held && now_ns() - vt->held_since > HOLD_LIMIT_NS) {
-    GhosttyTerminalModeConfig sync = {.mode = GHOSTTY_MODE_SYNC_OUTPUT, .value = false};
+    GhosttyTerminalModeConfig sync = {.mode = GHOSTTY_MODE_SYNCHRONIZED_OUTPUT, .value = false};
     ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &sync);
     vt->held = false;
   }
@@ -1365,14 +1368,14 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
   ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
   if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE) flags |= FLAG_ALT_SCREEN;
-  if (mode_on(vt, GHOSTTY_MODE_ALT_SCROLL)) flags |= FLAG_ALT_SCROLL;
+  if (mode_on(vt, GHOSTTY_MODE_MOUSE_ALTERNATE_SCROLL)) flags |= FLAG_ALT_SCROLL;
   if (mode_on(vt, GHOSTTY_MODE_FOCUS_EVENT)) flags |= FLAG_FOCUS_EVENTS;
   put_u16(h + 28, NONE16);
   put_u16(h + 30, NONE16);
   put_u16(h + 32, NONE16);
   put_u16(h + 34, NONE16);
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
+  GhosttySelection ordered = {0};
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) == GHOSTTY_SUCCESS &&
       ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
                                          &ordered) == GHOSTTY_SUCCESS) {
@@ -1547,7 +1550,7 @@ static bool images_changed(AppineVt *vt) {
   };
   while (ghostty_render_state_image_iterator_next(vt->images)) {
     GhosttyImageProtocol protocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
-    GhosttyRenderStateImageLayer layer = GHOSTTY_RENDER_STATE_IMAGE_LAYER_ABOVE_TEXT;
+    GhosttyImageLayer layer = GHOSTTY_IMAGE_LAYER_ABOVE_TEXT;
     GhosttyRenderStateKittyPlacementKind kind = GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED;
     Placement p = {0};
     int32_t col = 0;
@@ -1568,9 +1571,9 @@ static bool images_changed(AppineVt *vt) {
     p.kind = (uint8_t)kind;
     GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, p.id);
     if (image == NULL ||
-        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &p.image_width) !=
-            GHOSTTY_SUCCESS ||
-        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
+        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH,
+                                         &p.image_width) != GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT,
                                          &p.image_height) != GHOSTTY_SUCCESS ||
         p.image_width == 0 || p.image_height == 0 || p.width == 0 || p.height == 0) {
       continue;
@@ -1609,26 +1612,26 @@ bool appine_vt_image(AppineVt *vt, uint32_t id, uint64_t generation, uint8_t *ou
   uint32_t w = 0;
   uint32_t h = 0;
   GhosttyKittyImageFormat format = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
-  const uint8_t *pixels = NULL;
-  size_t len = 0;
+  // GHOSTTY_NO_VALUE until all the image's pixels have arrived
+  GhosttyString data = {0};
   if (image == NULL ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &current) !=
-          GHOSTTY_SUCCESS ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION,
+                                       &current) != GHOSTTY_SUCCESS ||
       current != generation ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &w) !=
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH, &w) !=
           GHOSTTY_SUCCESS ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &h) !=
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT, &h) !=
           GHOSTTY_SUCCESS ||
       w != width || h != height || stride < (size_t)width * 4 ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format) !=
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT,
+                                       &format) != GHOSTTY_SUCCESS ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS, &data) !=
           GHOSTTY_SUCCESS ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &pixels) !=
-          GHOSTTY_SUCCESS ||
-      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &len) !=
-          GHOSTTY_SUCCESS ||
-      pixels == NULL) {
+      data.ptr == NULL) {
     return false;
   }
+  const uint8_t *pixels = data.ptr;
+  size_t len = data.len;
   size_t bpp;
   switch (format) {
     case GHOSTTY_KITTY_IMAGE_FORMAT_RGB:
@@ -1703,7 +1706,7 @@ static bool screen_point(AppineVt *vt, const GhosttyGridRef *ref, GhosttyPointCo
 // viewport's first row in screen coordinates. Screen coordinates, unlike viewport ones, exist for a
 // match that begins above the viewport or ends below it, so it is cut to the rows shown.
 static void mark_match(AppineVt *vt, const GhosttySelection *match, uint32_t top, uint8_t mark) {
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = {0};
   GhosttyPointCoordinate start, end;
   if (ghostty_terminal_selection_ordered(vt->term, match, GHOSTTY_SELECTION_ORDER_FORWARD,
                                          &ordered) != GHOSTTY_SUCCESS ||
@@ -1759,7 +1762,7 @@ static bool mark_matches(AppineVt *vt) {
   if (r == GHOSTTY_SUCCESS) {
     for (size_t i = 0; i < found.len; i++) mark_match(vt, &vt->matches[i], top.y, MARK_MATCH);
   }
-  GhosttySelection selected = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection selected = {0};
   if (ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &selected) ==
       GHOSTTY_SUCCESS) {
     mark_match(vt, &selected, top.y, MARK_SELECTED);
@@ -1771,16 +1774,19 @@ static bool mark_matches(AppineVt *vt) {
 
 // Encodes a key press into out; returns the length, or -1 when it does not fit (or fails). text
 // is the character the key types without Ctrl and Alt (NULL for none), unshifted the key's
-// character without Shift (0 for none).
+// character without Shift (0 for none). A key or action libghostty-vt does not know fails too:
+// its setters then leave the event as it was, the previous key.
 ptrdiff_t appine_vt_key(AppineVt *vt, int key, uint16_t mods, uint16_t consumed, int action,
-                        const char *text, size_t text_len, uint32_t unshifted, char *out,
+                        const uint8_t *text, size_t text_len, uint32_t unshifted, uint8_t *out,
                         size_t cap) {
-  ghostty_key_encoder_setopt_from_terminal(vt->encoder, vt->term);
-  ghostty_key_event_set_action(vt->event, (GhosttyKeyAction)action);
-  ghostty_key_event_set_key(vt->event, (GhosttyKey)key);
+  ghostty_key_encoder_set_from_terminal(vt->encoder, vt->term);
+  if (ghostty_key_event_set_action(vt->event, (GhosttyKeyAction)action) != GHOSTTY_SUCCESS ||
+      ghostty_key_event_set_key(vt->event, (GhosttyKey)key) != GHOSTTY_SUCCESS) {
+    return -1;
+  }
   ghostty_key_event_set_mods(vt->event, mods);
   ghostty_key_event_set_consumed_mods(vt->event, consumed);
-  ghostty_key_event_set_utf8(vt->event, text, text_len);
+  ghostty_key_event_set_utf8(vt->event, (GhosttyString){.ptr = text, .len = text_len});
   ghostty_key_event_set_unshifted_codepoint(vt->event, unshifted);
   size_t len = 0;
   if (ghostty_key_encoder_encode(vt->encoder, vt->event, out, cap, &len) != GHOSTTY_SUCCESS) {
@@ -1831,29 +1837,32 @@ int appine_vt_paste(AppineVt *vt, const uint8_t *data, size_t len, bool allow_un
 // (motion with no button held), 1 left, 2 right, 3 middle, 4 and 5 the wheel up and down, 6 and 7
 // left and right.
 ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, float x, float y,
-                          bool pressed, char *out, size_t cap) {
+                          bool pressed, uint8_t *out, size_t cap) {
   // The cell as the encoder takes it (clamped to the grid); SGR-Pixels reports every pixel
   int cx = x < 0 ? 0 : (int)(x / (float)vt->cell_width);
   int cy = y < 0 ? 0 : (int)(y / (float)vt->cell_height);
   if (cx >= vt->cols) cx = vt->cols - 1;
   if (cy >= vt->height) cy = vt->height - 1;
   if (action == GHOSTTY_MOUSE_ACTION_MOTION && cx == vt->mouse_x && cy == vt->mouse_y &&
-      !mode_on(vt, GHOSTTY_MODE_SGR_PIXELS_MOUSE)) {
+      !mode_on(vt, GHOSTTY_MODE_MOUSE_FORMAT_SGR_PIXELS)) {
     return 0;
   }
-  ghostty_mouse_encoder_setopt_from_terminal(vt->mouse, vt->term);
+  ghostty_mouse_encoder_set_from_terminal(vt->mouse, vt->term);
   GhosttyMouseEncoderSize size = GHOSTTY_INIT_SIZED(GhosttyMouseEncoderSize);
   size.screen_width = (uint32_t)vt->cols * vt->cell_width;
   size.screen_height = (uint32_t)vt->height * vt->cell_height;
   size.cell_width = vt->cell_width;
   size.cell_height = vt->cell_height;
-  ghostty_mouse_encoder_setopt(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
-  ghostty_mouse_encoder_setopt(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &pressed);
-  ghostty_mouse_event_set_action(vt->mouse_event, (GhosttyMouseAction)action);
-  if (button == 0) {
-    ghostty_mouse_event_clear_button(vt->mouse_event);
-  } else {
-    ghostty_mouse_event_set_button(vt->mouse_event, (GhosttyMouseButton)button);
+  ghostty_mouse_encoder_set(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
+  ghostty_mouse_encoder_set(vt->mouse, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED, &pressed);
+  // An action or button libghostty-vt does not know leaves the event as it was
+  if (ghostty_mouse_event_set_action(vt->mouse_event, (GhosttyMouseAction)action) !=
+          GHOSTTY_SUCCESS ||
+      (button == 0
+           ? ghostty_mouse_event_clear_button(vt->mouse_event)
+           : ghostty_mouse_event_set_button(vt->mouse_event, (GhosttyMouseButton)button)) !=
+          GHOSTTY_SUCCESS) {
+    return -1;
   }
   ghostty_mouse_event_set_mods(vt->mouse_event, mods);
   ghostty_mouse_event_set_position(vt->mouse_event, (GhosttyMousePosition){.x = x, .y = y});
@@ -1871,7 +1880,7 @@ ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, f
 
 // Encodes focus gained or lost when the program asked for focus events (mode 1004); returns the
 // length, 0 when it did not ask, -1 when it does not fit.
-ptrdiff_t appine_vt_focus(AppineVt *vt, bool gained, char *out, size_t cap) {
+ptrdiff_t appine_vt_focus(AppineVt *vt, bool gained, uint8_t *out, size_t cap) {
   if (!mode_on(vt, GHOSTTY_MODE_FOCUS_EVENT)) return 0;
   size_t len = 0;
   if (ghostty_focus_encode(gained ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST, out, cap, &len) !=
@@ -1905,7 +1914,7 @@ static bool viewport_ref(AppineVt *vt, uint16_t x, uint16_t y, GhosttyGridRef *o
   if (x >= vt->cols) x = vt->cols - 1;
   if (y >= vt->height) y = vt->height - 1;
   GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value.coordinate = {.x = x, .y = y}};
-  *out = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  *out = (GhosttyGridRef){0};
   return ghostty_terminal_grid_ref(vt->term, p, out) == GHOSTTY_SUCCESS;
 }
 
@@ -1935,7 +1944,7 @@ static bool screen_point(AppineVt *vt, const GhosttyGridRef *ref, GhosttyPointCo
 }
 
 static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end, bool rectangle) {
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   sel.start = start;
   sel.end = end;
   sel.rectangle = rectangle;
@@ -1945,7 +1954,7 @@ static bool set_selection(AppineVt *vt, GhosttyGridRef start, GhosttyGridRef end
 // Installs a selection libghostty-vt derived (a command's output) and anchors later drags to it;
 // false when it cannot be anchored.
 static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection ordered = {0};
   GhosttyPointCoordinate start, end;
   if (ghostty_terminal_selection_ordered(vt->term, derived, GHOSTTY_SELECTION_ORDER_FORWARD,
                                          &ordered) != GHOSTTY_SUCCESS ||
@@ -1953,8 +1962,8 @@ static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
     return false;
   }
   // Tracking may change the terminal's page list, so it is selected from fresh references
-  GhosttyGridRef a = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-  GhosttyGridRef b = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef a = {0};
+  GhosttyGridRef b = {0};
   return set_anchor(vt, start, end) &&
          ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &a) == GHOSTTY_SUCCESS &&
          ghostty_tracked_grid_ref_snapshot(vt->anchor_end, &b) == GHOSTTY_SUCCESS &&
@@ -1985,7 +1994,7 @@ bool appine_vt_gesture_press(AppineVt *vt, int behavior, uint16_t x, uint16_t y,
                                                 .triple_click = b};
   GhosttySurfacePosition at = {.x = px, .y = py};
   GhosttyGridRef ref;
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   if (viewport_ref(vt, x, y, &ref) &&
       ghostty_selection_gesture_event_set(vt->gesture_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
                                           &ref) == GHOSTTY_SUCCESS &&
@@ -2006,9 +2015,9 @@ bool appine_vt_gesture_press(AppineVt *vt, int behavior, uint16_t x, uint16_t y,
 
 // Drags the gesture on to viewport cell (x, y), at pixel (px, py) from the grid's corner: the
 // selection runs by whole words or lines from the pressed cell's to the cell's (passing over
-// blanks and punctuation, a word drag stays on the last word reached; over blank lines a line drag
-// stays on the last line). False, leaving the selection as it was, without a gesture, or when
-// there is nothing to select towards the cell or the pressed cell has gone (its screen changed).
+// blanks and punctuation, a word drag stays on the last word reached; a line drag takes in blank
+// lines too). False, leaving the selection as it was, without a gesture, or when there is nothing
+// to select towards the cell or the pressed cell has gone (its screen changed).
 bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py) {
   GhosttySelectionGestureGeometry geometry = {
       .columns = vt->cols,
@@ -2018,7 +2027,7 @@ bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, dou
   };
   GhosttySurfacePosition at = {.x = px, .y = py};
   GhosttyGridRef ref;
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   return viewport_ref(vt, x, y, &ref) &&
          ghostty_selection_gesture_event_set(vt->gesture_drag,
                                              GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
@@ -2041,8 +2050,8 @@ void appine_vt_gesture_end(AppineVt *vt) { ghostty_selection_gesture_reset(vt->g
 // Starts dragging a selection handle: the other end becomes the anchor. end is the handle of the
 // selection's last cell, else its first. False when there is no selection.
 bool appine_vt_select_grab(AppineVt *vt, bool end) {
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
+  GhosttySelection ordered = {0};
   GhosttyPointCoordinate fixed;
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS ||
       ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
@@ -2054,7 +2063,7 @@ bool appine_vt_select_grab(AppineVt *vt, bool end) {
 }
 
 static bool rectangular(AppineVt *vt) {
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   return ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) ==
              GHOSTTY_SUCCESS &&
          sel.rectangle;
@@ -2065,8 +2074,8 @@ static bool rectangular(AppineVt *vt) {
 // anchor and the cell at opposite corners. False without an anchor.
 bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   if (vt->anchor_start == NULL || vt->anchor_end == NULL) return false;
-  GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-  GhosttyGridRef end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyGridRef start = {0};
+  GhosttyGridRef end = {0};
   GhosttyGridRef cell;
   bool rectangle = rectangular(vt);
   if (ghostty_tracked_grid_ref_snapshot(vt->anchor_start, &start) != GHOSTTY_SUCCESS ||
@@ -2074,7 +2083,7 @@ bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
       !viewport_ref(vt, x, y, &cell)) {
     return false;
   }
-  GhosttySelection probe = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection probe = {0};
   GhosttySelectionOrder order = GHOSTTY_SELECTION_ORDER_FORWARD;
   probe.start = start;
   probe.end = cell;
@@ -2091,8 +2100,8 @@ bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
 // when there is no selection.
 bool appine_vt_select_rectangle(AppineVt *vt, bool on) {
   drop_anchor(vt);
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
-  GhosttySelection ordered = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
+  GhosttySelection ordered = {0};
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS ||
       ghostty_terminal_selection_ordered(vt->term, &sel, GHOSTTY_SELECTION_ORDER_FORWARD,
                                          &ordered) != GHOSTTY_SUCCESS) {
@@ -2106,7 +2115,7 @@ bool appine_vt_select_all(AppineVt *vt) {
   drop_anchor(vt);
   // Finding the first and last non-blank cells reads the oldest and newest pages
   vt->compress_touched = true;
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   return ghostty_terminal_select_all(vt->term, &sel) == GHOSTTY_SUCCESS &&
          ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
 }
@@ -2124,10 +2133,10 @@ bool appine_vt_output_at(AppineVt *vt, uint16_t x, uint16_t y) {
   // Finding the output's ends reads the pages above and below the cell
   vt->compress_touched = true;
   GhosttyGridRef ref;
-  GhosttySelection output = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection output = {0};
   GhosttyPointCoordinate cell;
   if (!viewport_ref(vt, x, y, &ref) ||
-      ghostty_terminal_select_output(vt->term, ref, &output) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_select_output(vt->term, &ref, &output) != GHOSTTY_SUCCESS ||
       !screen_point(vt, &ref, &cell)) {
     return false;
   }
@@ -2145,11 +2154,11 @@ bool appine_vt_output_at(AppineVt *vt, uint16_t x, uint16_t y) {
 bool appine_vt_select_output(AppineVt *vt) {
   if (vt->output_at == NULL) return false;
   vt->compress_touched = true;
-  GhosttyGridRef ref = GHOSTTY_INIT_SIZED(GhosttyGridRef);
-  GhosttySelection output = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyGridRef ref = {0};
+  GhosttySelection output = {0};
   bool selected =
       ghostty_tracked_grid_ref_snapshot(vt->output_at, &ref) == GHOSTTY_SUCCESS &&
-      ghostty_terminal_select_output(vt->term, ref, &output) == GHOSTTY_SUCCESS &&
+      ghostty_terminal_select_output(vt->term, &ref, &output) == GHOSTTY_SUCCESS &&
       select_anchored(vt, &output);
   // Only now: untracking may change the page list the references above point into
   drop_output(vt);
@@ -2167,7 +2176,7 @@ void appine_vt_select_clear(AppineVt *vt) {
 // next or previous non-blank cell, a row or a page up or down, the screen's start or end) and
 // scrolls the viewport to show it, as Ghostty does; false without a selection.
 bool appine_vt_select_adjust(AppineVt *vt, int adjustment) {
-  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection sel = {0};
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS) {
     return false;
   }
@@ -2180,7 +2189,7 @@ bool appine_vt_select_adjust(AppineVt *vt, int adjustment) {
     return false;
   }
   // From the selection as installed: references taken before are stale
-  GhosttySelection now = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection now = {0};
   GhosttyPointCoordinate end;
   GhosttyTerminalScrollbar bar = {0};
   if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &now) != GHOSTTY_SUCCESS ||
@@ -2190,7 +2199,7 @@ bool appine_vt_select_adjust(AppineVt *vt, int adjustment) {
   }
   // Screen rows are the scroll bar's rows: the end at the viewport's top when above it, at its
   // bottom when below
-  GhosttyTerminalScrollViewport s = {.tag = GHOSTTY_SCROLL_VIEWPORT_ROW};
+  GhosttyTerminalScrollViewport s = {.tag = GHOSTTY_TERMINAL_SCROLL_VIEWPORT_ROW};
   if (end.y < bar.offset) {
     s.value.row = (size_t)end.y;
   } else if (end.y >= bar.offset + bar.len) {
@@ -2202,24 +2211,39 @@ bool appine_vt_select_adjust(AppineVt *vt, int adjustment) {
   return true;
 }
 
+// Formats the selection, or the active screen with its scrollback when sel is NULL, as plain text
+// with soft-wrapped lines joined and trailing blanks trimmed, as Ghostty copies text: *data is
+// allocated by libghostty-vt (ghostty_free). False on failure.
+static bool format_plain(AppineVt *vt, const GhosttySelection *sel, uint8_t **data, size_t *len) {
+  GhosttyFormatter formatter = NULL;
+  if (ghostty_formatter_terminal_new(NULL, &formatter, vt->term) != GHOSTTY_SUCCESS) return false;
+  GhosttyFormatterFormat emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  bool on = true;
+  GhosttyResult r = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_EMIT, &emit);
+  if (r == GHOSTTY_SUCCESS) r = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_UNWRAP, &on);
+  if (r == GHOSTTY_SUCCESS) r = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_TRIM, &on);
+  if (r == GHOSTTY_SUCCESS && sel != NULL) {
+    r = ghostty_formatter_set(formatter, GHOSTTY_FORMATTER_OPT_SELECTION, sel);
+  }
+  if (r == GHOSTTY_SUCCESS) r = ghostty_formatter_format_alloc(formatter, NULL, data, len);
+  ghostty_formatter_free(formatter);
+  return r == GHOSTTY_SUCCESS;
+}
+
 // The selection as plain text, soft-wrapped lines joined and trailing blanks trimmed (as
 // Ghostty copies); NULL with len 0 when there is no selection or it is empty. Valid until the
 // next call.
 const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
   *len = 0;
-  GhosttyTerminalSelectionFormatOptions options =
-      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
-  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
-  options.unwrap = true;
-  options.trim = true;
+  GhosttySelection sel = {0};
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS) {
+    return NULL;
+  }
   uint8_t *text = NULL;
   size_t text_len = 0;
   // The formatter reads every page the selection spans
   vt->compress_touched = true;
-  if (ghostty_terminal_selection_format_alloc(vt->term, NULL, options, &text, &text_len) !=
-      GHOSTTY_SUCCESS) {
-    return NULL;
-  }
+  if (!format_plain(vt, &sel, &text, &text_len)) return NULL;
   return keep_text(vt, text, text_len, len);
 }
 
@@ -2235,7 +2259,7 @@ const uint8_t *appine_vt_copy(AppineVt *vt, size_t *len) {
 
 static bool screen_ref(AppineVt *vt, uint16_t x, uint32_t y, GhosttyGridRef *out) {
   GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_SCREEN, .value.coordinate = {.x = x, .y = y}};
-  *out = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  *out = (GhosttyGridRef){0};
   return ghostty_terminal_grid_ref(vt->term, p, out) == GHOSTTY_SUCCESS;
 }
 
@@ -2393,8 +2417,9 @@ bool appine_vt_search(AppineVt *vt, const uint8_t *needle, size_t len) {
 // shown already. False when there is no match (or no search).
 bool appine_vt_search_select(AppineVt *vt, bool older) {
   if (vt->search == NULL) return false;
-  GhosttySearchOption option = older ? GHOSTTY_SEARCH_OPT_SELECT_NEXT : GHOSTTY_SEARCH_OPT_SELECT_PREV;
-  return ghostty_search_set(vt->search, option, NULL) == GHOSTTY_SUCCESS;
+  GhosttyResult r =
+      older ? ghostty_search_select_next(vt->search) : ghostty_search_select_prev(vt->search);
+  return r == GHOSTTY_SUCCESS;
 }
 
 // The rows of the scroll bar (screen rows) the search's matches start on, for marks along it:
@@ -2407,7 +2432,7 @@ const uint32_t *appine_vt_search_rows(AppineVt *vt, size_t *len, int64_t *select
   *len = 0;
   *selected = -1;
   if (vt->search == NULL) return NULL;
-  GhosttySelection chosen = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttySelection chosen = {0};
   GhosttyPointCoordinate at;
   if (ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &chosen) ==
           GHOSTTY_SUCCESS &&
@@ -2661,21 +2686,9 @@ const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
   *len = 0;
   if (is_alternate(vt) || vt->transcribed) return NULL;
   vt->compress_touched = true;
-  GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
-  options.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
-  options.unwrap = true;
-  options.trim = true;
-  options.extra = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalExtra);
-  options.extra.screen = GHOSTTY_INIT_SIZED(GhosttyFormatterScreenExtra);
-  GhosttyFormatter formatter = NULL;
-  if (ghostty_formatter_terminal_new(NULL, &formatter, vt->term, options) != GHOSTTY_SUCCESS) {
-    return NULL;
-  }
   uint8_t *data = NULL;
   size_t data_len = 0;
-  GhosttyResult r = ghostty_formatter_format_alloc(formatter, NULL, &data, &data_len);
-  ghostty_formatter_free(formatter);
-  if (r != GHOSTTY_SUCCESS) return NULL;
+  if (!format_plain(vt, NULL, &data, &data_len)) return NULL;
   if (data_len == 0) {
     // An empty screen: an empty transcript, not a failure
     ghostty_free(NULL, data, 0);

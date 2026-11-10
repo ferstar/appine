@@ -22,10 +22,9 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
 
 Requirements: the Android SDK with NDK 29.0.14206865, JDK 17 or later,
 `rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, Zig 0.17.0 on `PATH`
-(or in `ZIG`), the rootfs tarball (`scripts/fetch-rootfs`) and the Ghostty source with the
-Zig packages its build uses (`scripts/fetch-ghostty`), both run from the repository root.
-Behind a proxy, `fetch-ghostty` and the build drop the proxy variables for Zig, whose HTTP
-client fails through some proxies.
+(or in `ZIG`), the rootfs tarball (`scripts/fetch-rootfs`) and the libghostty-vt source release
+with its Zig packages (`scripts/fetch-ghostty`), both run from the repository root. The Zig
+build then runs offline.
 
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device

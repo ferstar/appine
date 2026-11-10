@@ -4,7 +4,7 @@ import android.view.KeyEvent
 
 /**
  * Android key codes as libghostty-vt's physical keys (`GhosttyKey` in `ghostty/vt/key/event.h`,
- * Ghostty 1.4.0; the numbers change only with that header), and its modifier bits.
+ * whose numbers its stable ABI keeps since 1.0), and its modifier bits.
  */
 internal object VtKeys {
     const val ACTION_RELEASE = 0

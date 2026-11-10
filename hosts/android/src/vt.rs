@@ -25,7 +25,6 @@
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
 use std::collections::BTreeMap;
-use std::ffi::c_char;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError};
@@ -125,10 +124,10 @@ unsafe extern "C" {
         mods: u16,
         consumed: u16,
         action: i32,
-        text: *const c_char,
+        text: *const u8,
         text_len: usize,
         unshifted: u32,
-        out: *mut c_char,
+        out: *mut u8,
         cap: usize,
     ) -> isize;
     fn appine_vt_paste(vt: *mut AppineVt, data: *const u8, len: usize, allow_unsafe: bool) -> i32;
@@ -141,10 +140,10 @@ unsafe extern "C" {
         x: f32,
         y: f32,
         pressed: bool,
-        out: *mut c_char,
+        out: *mut u8,
         cap: usize,
     ) -> isize;
-    fn appine_vt_focus(vt: *mut AppineVt, gained: bool, out: *mut c_char, cap: usize) -> isize;
+    fn appine_vt_focus(vt: *mut AppineVt, gained: bool, out: *mut u8, cap: usize) -> isize;
     fn appine_vt_gesture_press(
         vt: *mut AppineVt,
         behavior: i32,
@@ -904,7 +903,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_key<'l>(
         } else {
             string(&mut env, &text).unwrap_or_default()
         };
-        let mut out = [0 as c_char; 128];
+        let mut out = [0u8; 128];
         let n = unsafe {
             appine_vt_key(
                 tab.term().0,
@@ -915,7 +914,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_key<'l>(
                 if text.is_empty() {
                     std::ptr::null()
                 } else {
-                    text.as_ptr().cast()
+                    text.as_ptr()
                 },
                 text.len(),
                 unshifted as u32,
@@ -978,7 +977,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouse<'l>(
         let Some(tab) = tab(handle) else {
             return std::ptr::null_mut();
         };
-        let mut out = [0 as c_char; 64];
+        let mut out = [0u8; 64];
         let n = unsafe {
             appine_vt_mouse(
                 tab.term().0,
@@ -1008,21 +1007,18 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_focus<'l>(
         let Some(tab) = tab(handle) else {
             return std::ptr::null_mut();
         };
-        let mut out = [0 as c_char; 16];
+        let mut out = [0u8; 16];
         let n = unsafe { appine_vt_focus(tab.term().0, gained != 0, out.as_mut_ptr(), out.len()) };
         encoded(&mut env, &out, n)
     })
 }
 
 /// The first `n` bytes of an encoder's output, null when it failed (`n` < 0).
-fn encoded(env: &mut JNIEnv<'_>, out: &[c_char], n: isize) -> jbyteArray {
-    let Ok(n) = usize::try_from(n) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: c_char and u8 have the same layout, and the encoder wrote n <= out.len() bytes
-    bytes_array(env, unsafe {
-        std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), n)
-    })
+fn encoded(env: &mut JNIEnv<'_>, out: &[u8], n: isize) -> jbyteArray {
+    match usize::try_from(n).ok().and_then(|n| out.get(..n)) {
+        Some(bytes) => bytes_array(env, bytes),
+        None => std::ptr::null_mut(),
+    }
 }
 
 fn bytes_array(env: &mut JNIEnv<'_>, bytes: &[u8]) -> jbyteArray {
@@ -1467,9 +1463,9 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_snapshot<'l>(
     })
 }
 
-/// The version saved snapshots are recorded with: the Ghostty source libghostty-vt was built from
-/// (its directory's name, from build.rs) and libghostty-vt's own version string. A snapshot from
-/// another version is not decoded: the format carries no compatibility guarantee yet.
+/// The version saved snapshots are recorded with: libghostty-vt's. A snapshot from another version
+/// is not decoded: the snapshot format is versioned apart from the library and is not covered by
+/// its ABI promise.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_version<'l>(
     env: JNIEnv<'l>,
@@ -1484,7 +1480,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_version<'l>(
             // SAFETY: vt.c returns len bytes of libghostty-vt's static version string
             String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
         };
-        env.new_string(format!("{}/{lib}", env!("APPINE_GHOSTTY")))
+        env.new_string(lib)
             .map_or(std::ptr::null_mut(), JString::into_raw)
     })
 }

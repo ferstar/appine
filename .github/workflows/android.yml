@@ -1,7 +1,7 @@
 name: Android
 
 # The APK build, on pushes that change what goes into it: the Rust workspace's core and Android
-# host, the app, and the scripts that fetch the rootfs and the Ghostty source. Changes to tests,
+# host, the app, and the scripts that fetch the rootfs and libghostty-vt. Changes to tests,
 # the command-line host or documentation do not run it.
 on:
   push:
@@ -88,9 +88,9 @@ jobs:
       - name: Fetch rootfs
         run: scripts/fetch-rootfs
 
-      # The terminal, libghostty-vt, is built with Zig from the Ghostty source release that
-      # scripts/fetch-ghostty downloads with the Zig packages it uses (the android/native map).
-      # The version and sha256 are those of ziglang.org/download/index.json
+      # The terminal, libghostty-vt, is built with Zig from the source release and the Zig packages
+      # that scripts/fetch-ghostty downloads (the android/native map). The version and sha256 are
+      # those of ziglang.org/download/index.json
       - name: Install Zig
         env:
           ZIG_VERSION: 0.17.0
@@ -103,15 +103,13 @@ jobs:
           tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components 1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
-      # The source with its zig-pkg/, and Zig's global cache (packages and build artifacts)
+      # The release tarballs, unpacked, with the Zig caches the build keeps in the source
       - uses: actions/cache@v6
         with:
-          path: |
-            target/ghostty
-            ~/.cache/zig
-          key: ghostty-${{ hashFiles('scripts/fetch-ghostty') }}
+          path: target/ghostty
+          key: libghostty-vt-${{ hashFiles('scripts/fetch-ghostty') }}
 
-      - name: Fetch the Ghostty source
+      - name: Fetch libghostty-vt
         run: scripts/fetch-ghostty
 
       # The NDK's clang also compiles the C engine here, so clang-specific warnings show up too

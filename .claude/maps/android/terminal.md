@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 19 claims checked by 3 independent verifiers — 16 confirmed and 3 partial, corrected below; a bug and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: word and line selection through libghostty-vt's selection gesture with double- and triple-tap drags, search marks along the scroll bar, the libghostty-vt API left unused)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: selection-gesture word and line drags, scroll-bar search marks, the libghostty-vt API left unused, then the port to libghostty-vt 1.0.0 last)
 
 ## Responsibilities
 
@@ -741,8 +741,9 @@ compiling libghostty-vt with Zig (`android/native`).
   press selects the word or line at its cell, which the gesture tracks through output, and a drag
   takes the selection from the pressed cell's word or line to the one under the finger
   (`selectWordBetween` both ways for words), so over blanks and punctuation a word drag stays on the
-  last word reached; a line drag over blank rows, and any drag once the pressed cell's screen has
-  changed (the alternate screen), leave the selection as it was. The view counts the taps itself, since a finger press may become a
+  last word reached, while a line drag takes in blank rows too (libghostty-vt 1.0's fix; before,
+  the selection stayed as it was); any drag once the pressed cell's screen has changed (the
+  alternate screen) leaves the selection as it was. The view counts the taps itself, since a finger press may become a
   scroll, so each press goes to the gesture untimed (a first click in libghostty-vt's count) with
   the behaviour the view asks for as a first click's. Lifting ends the gesture (its tracking goes,
   the selection stays); so does clearing the selection or attaching another tab during a drag.
@@ -853,7 +854,8 @@ compiling libghostty-vt with Zig (`android/native`).
 ### Licenses
 
 - The build writes `notices/` (Appine's licence; Fuchsia's for the line discipline; Ghostty's
-  libghostty-vt, uucode, simdutf, Highway, Wuffs, Zig's compiler_rt and JetBrains Mono; Alpine
+  libghostty-vt, uucode, simdutf, Highway, Wuffs, translate-c, Zig's compiler_rt and JetBrains
+  Mono; Alpine
   packages from the rootfs database, the doas package, Android libraries, Rust crates, SQLite,
   then full texts); a full text is monospace, selectable and sized so 74 columns fit (at most
   13 sp), scrolling sideways when it does not.
@@ -886,7 +888,8 @@ compiling libghostty-vt with Zig (`android/native`).
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
-- libghostty-vt 1.4.0 (the terminal state and its full reset, writes that stop at OSC strings'
+- libghostty-vt 1.0.0, Ghostty's terminal library released apart from the app (the terminal
+  state and its full reset, writes that stop at OSC strings'
   ends, render state with one overscan row, key and mouse encoders, paste, focus encoding,
   selection gestures (word and line presses and drags), output derivation and keyboard
   adjustment, search with the list of all its matches, plain-text formatting, title and width,
@@ -904,7 +907,9 @@ compiling libghostty-vt with Zig (`android/native`).
   upright and italic) in the assets, and the system's fallback fonts for everything else (CJK from
   Noto Sans CJK on AOSP images); the wide-cell setting `TerminalService.fillWide`.
 - Of libghostty-vt's C API, the terminal has no use for: the parsers that work without a terminal
-  (OSC and SGR) and the key and mouse events' getters; `wasm_*`, `type_json` and `build_info`;
+  (OSC and SGR) and the key and mouse events' getters; `wasm_*`, `type_json`, `ghostty_version`
+  and `build_info` but its version string (the same text); the formatter's extras (state added to
+  VT output); the cursor's SGR style;
   colour string parsing and the X11 colour names; iterating Kitty placements directly (the render
   state's image list is what is drawn); decoding a snapshot in steps and exporting its unfinished
   sequence (a snapshot is decoded at once and settled); the composing flag of key events (the
@@ -923,7 +928,7 @@ compiling libghostty-vt with Zig (`android/native`).
   sequence and the decoder replaces it. The report's cursor save overwrites one the program had
   saved.
 - libghostty-vt's mouse encoder deduplicates motion only when asked (off by default) and forgets
-  its last cell whenever `setopt_from_terminal` or the size option is set, which `appine_vt_mouse`
+  its last cell whenever `set_from_terminal` or the size option is set, which `appine_vt_mouse`
   does for every event; so vt.c keeps the last cell itself, updated only when an event was encoded.
 - `GestureDetector` with a double-tap listener (any `SimpleOnGestureListener`) gives the second
   tap of a double tap to that listener: `onSingleTapUp` never sees it and a drag starting there
@@ -1051,11 +1056,11 @@ compiling libghostty-vt with Zig (`android/native`).
   the snapshot carries the scrollback limits, default colours, default modes (2027's) and cursor
   defaults (older snapshots a steady cursor). vt.c sets every option on it as on a new terminal,
   after `settle`, so the app's values win.
-- Snapshots are recorded with the version that wrote them: the Ghostty source's directory name
-  (from build.rs) and libghostty-vt's own version string, which stays `0.1.0-dev` across Ghostty
-  releases. One from another version is not decoded, since the format carries no compatibility
-  guarantee yet, and an app update is the commonest way a run ends with tabs to restore; those
-  tabs come back from their transcripts.
+- Snapshots are recorded with the libghostty-vt version that wrote them (`1.0.0`; the copy in
+  Ghostty 1.4.0 recorded `ghostty-1.4.0/0.1.0-dev`). One from another version is not decoded,
+  since the snapshot format is versioned apart from the library and outside its ABI promise, and
+  an app update is the commonest way a run ends with tabs to restore; those tabs come back from
+  their transcripts.
 - libghostty-vt's clipboard-read callback must answer before it returns, which happens on the pump
   thread under the tab's lock: asking the user there would block every frame (the main thread
   takes the same lock). OSC 52 reads are therefore found by vt.c and answered later through the
@@ -1086,9 +1091,15 @@ compiling libghostty-vt with Zig (`android/native`).
   page, pooled or not, is a mapping of its own from Zig's page allocator, so the rounding never
   reaches another page; a libghostty-vt that packed pages into shared mappings would break it.
 - The frame format is defined in `vt.c` and parsed in `VtView.apply`; the two change together. The
-  key numbers in `VtKeys` are those of Ghostty 1.4.0's `key/event.h` and change with that header.
-- Since libghostty-vt 1.4, `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself, not its
-  address (older code passing `&ptr` crashes in the reply callback).
+  key numbers in `VtKeys` are `GhosttyKey` values, which `key/event.h` spells out and libghostty-vt's
+  ABI keeps from 1.0 on; key, action and mouse-button values it does not know make its setters
+  fail (vt.c then encodes nothing), where the copy in Ghostty 1.4.0 took them and could crash.
+- Since Ghostty 1.4's libghostty-vt, `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself, not
+  its address (older code passing `&ptr` crashes in the reply callback).
+- The `get` and `set` functions take `void *` values, so a value of the wrong type compiles: 1.0
+  changed some (a cell's graphemes come in a `GhosttyCodepointBuffer`, a Kitty image's pixels in a
+  `GhosttyString`), and an upgrade must check every key's documented type, not only what fails to
+  compile.
 - Without a DA reply, programs that probe for it (vim, tmux) wait for a timeout, so `vt.c` answers
   DA1 (132 columns, selective erase, ANSI colour, and clipboard access, 52, which Ghostty lists
   whenever clipboard writes are allowed and programs check before using OSC 52), DA2 (VT220), DA3
@@ -1118,15 +1129,17 @@ compiling libghostty-vt with Zig (`android/native`).
   or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
   answers the foreground. A full reset (RIS) resets the palette but keeps colours set with OSC 10,
   11 and 12, as Ghostty does.
-- libghostty-vt as a library turns the Glyph Protocol on, answering `fmt=glyf` to its query,
-  though the C API gives no access to registered glyphs; vt.c turns it off at create. A full reset
+- libghostty-vt leaves the Glyph Protocol off (since 1.0; the copy in Ghostty 1.4.0 turned it on
+  and answered `fmt=glyf` to its query), and the C API gives no access to registered glyphs; vt.c
+  turns it off at create all the same. A full reset
   keeps that setting, the Kitty storage limit and the allowed media (the alternate screen takes
   the primary's), so they stay as set. Its Kitty media default is data in the escape sequences
   only; vt.c sets it again so a library change cannot open the file media, whose paths would be
   the app's own files rather than the guest's.
 - As built for an app (`-Demit-lib-vt`), libghostty-vt has no PNG decoder unless one is installed
   (`ghostty_sys_set`, process-wide), though libghostty-vt.a contains Wuffs: vt.c's decoder calls
-  Wuffs's C functions in the archive, compiling against the header from Ghostty's Zig packages.
+  Wuffs's C functions in the archive, compiling against the header from the release's Zig
+  packages.
   Without it, PNG images (`f=100`, what most programs send) fail with `EINVAL`.
 - The render state's source rectangles are whole image pixels, so a virtual placement's rows,
   drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
@@ -1348,6 +1361,12 @@ compiling libghostty-vt with Zig (`android/native`).
   about 2.5 ms a frame, at most 12 ms), and on a macOS build of vt.c (queries, refused media,
   PNG with alpha, oversized and corrupt PNG, deletion, scrolling, full reset); not on real devices,
   16 KB-page devices, or with the 32 MiB storage filled.
+- The port to libghostty-vt 1.0.0 was checked on a Pixel 4a API 34 emulator (tabs saved by the
+  copy in Ghostty 1.4.0 coming back from their transcripts, every text style, DECIC, a 1.0
+  snapshot's round trip, keys) and by vt.c's macOS harnesses run against both versions (the same
+  output but for the version, slightly fewer scrollback rows for the byte limit and line drags
+  over blank rows); mouse, images, search and selection on a device only through those harnesses,
+  and not on 16 KB-page or real devices.
 - Snapshot restoring was tried only on a Pixel 4a API 34 emulator (a force-stop and an update
   reinstall, with coloured output, mouse tracking, bracketed paste and a title left on), and the
   encoding, settling and round trip on a macOS build of vt.c; not with images in a snapshot,

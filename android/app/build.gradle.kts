@@ -255,7 +255,7 @@ abstract class NoticesTask : DefaultTask() {
         // The terminal: libghostty-vt and what it links, and the font (texts in ../licenses, from
         // the sources scripts/fetch-ghostty downloads; change them together with its version)
         entry(
-            "Ghostty 1.4.0 (libghostty-vt)", "MIT · the terminal emulator", "ghostty.txt",
+            "libghostty-vt 1.0.0", "MIT · the terminal emulator", "ghostty.txt",
             wrap(GHOSTTY_NOTICE) + "\n\n" + text("ghostty-LICENSE"),
         )
         entry(
@@ -276,6 +276,12 @@ abstract class NoticesTask : DefaultTask() {
             "Wuffs", "MIT (also offered under Apache-2.0)", "wuffs.txt",
             "Wuffs (https://github.com/google/wuffs) at commit 7411f488fe2e2c205c3d3b3d28638b7356522930, " +
                 "used under the MIT license:\n\n" + text("wuffs-LICENSE-MIT"),
+        )
+        entry(
+            "translate-c 2.0.0", "MIT", "translate-c.txt",
+            "translate-c 2.0.0 (https://codeberg.org/ziglang/translate-c) at commit " +
+                "02ff0c523fb92a38939b04d0145c4a9602a74d56, whose helpers are compiled into libghostty-vt:\n\n" +
+                text("translate-c-LICENSE"),
         )
         entry(
             "Zig 0.17.0 compiler_rt", "MIT", "zig.txt",
@@ -504,10 +510,11 @@ abstract class NoticesTask : DefaultTask() {
         """.trimIndent()
 
         val GHOSTTY_NOTICE = """
-            The terminal emulator is libghostty-vt from Ghostty 1.4.0 (https://ghostty.org), built with
-            Zig 0.17.0 and linked into the app's native library together with what it uses: uucode,
-            simdutf, Highway and Wuffs (listed below) and Zig's compiler_rt. Their source code, as
-            built, is also published together with Appine's source code at $SOURCE. Ghostty's license:
+            The terminal emulator is libghostty-vt 1.0.0, Ghostty's terminal library
+            (https://ghostty.org), built with Zig 0.17.0 and linked into the app's native library
+            together with what it uses: uucode, simdutf, Highway, Wuffs and translate-c (listed below)
+            and Zig's compiler_rt. Their source code, as built, is also published together with
+            Appine's source code at $SOURCE. libghostty-vt's license:
         """.trimIndent()
 
         val SQLITE_BLESSING = """

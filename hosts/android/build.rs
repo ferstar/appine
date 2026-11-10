@@ -2,17 +2,18 @@
 //! (src/vt.rs), which also uses the Wuffs that libghostty-vt links. For a host other than Android
 //! (where the crate is empty) it does nothing.
 //!
-//! The Ghostty source comes from scripts/fetch-ghostty (target/ghostty/ghostty-<version>, or
-//! APPINE_GHOSTTY_SRC), which also fetched the Zig packages, so this build needs no network. The
-//! Zig binary is `zig` on PATH or ZIG; Ghostty's build finds the NDK through ANDROID_NDK_HOME,
-//! which the Gradle task sets.
+//! The libghostty-vt source comes from scripts/fetch-ghostty
+//! (target/ghostty/libghostty-vt-<version>, or APPINE_GHOSTTY_SRC), with the release's Zig
+//! packages beside it (the same path with `-deps`), which `zig build --system` takes, so this build
+//! needs no network. The Zig binary is `zig` on PATH or ZIG; the build finds the NDK through
+//! ANDROID_NDK_HOME, which the Gradle task sets.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GHOSTTY: &str = "ghostty-1.4.0";
+const GHOSTTY: &str = "libghostty-vt-1.0.0";
 
 fn main() {
     println!("cargo:rerun-if-changed=src/vt.c");
@@ -29,18 +30,25 @@ fn main() {
     );
     assert!(
         src.join("build.zig").is_file(),
-        "no Ghostty source at {}: run scripts/fetch-ghostty",
+        "no libghostty-vt source at {}: run scripts/fetch-ghostty",
         src.display()
+    );
+    let mut deps = src.clone().into_os_string();
+    deps.push("-deps");
+    let deps = PathBuf::from(deps);
+    assert!(
+        deps.is_dir(),
+        "no libghostty-vt packages at {}: run scripts/fetch-ghostty",
+        deps.display()
+    );
+    // The release's version and its packages' hashes
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("LIB_VERSION").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
         src.join("build.zig.zon").display()
-    );
-    // The source's name (ghostty-<version>) is part of the version the tabs' saved snapshots are
-    // recorded with (vt.rs): libghostty-vt's own version string does not follow Ghostty's releases
-    println!(
-        "cargo:rustc-env=APPINE_GHOSTTY={}",
-        src.file_name().unwrap_or_default().to_string_lossy()
     );
 
     let target = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
@@ -49,9 +57,11 @@ fn main() {
     };
     let prefix = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("ghostty");
     let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
-    // Zig's HTTP client fails through some proxies (scripts/fetch-ghostty); with the packages
-    // already fetched it should not need the network, but a missing one then fails clearly. The
-    // options are also in scripts/fetch-ghostty, which fetches what this build uses: change both
+    // --system takes the packages from the release's dependency tarball and never fetches. The
+    // global cache is the source's own, beside Zig's local cache in it (.zig-cache), so the
+    // builds of every profile share it: one that holds a package's archive, as the user's
+    // ~/.cache/zig may, crashes Zig 0.17's build with "reached unreachable code"
+    // (PACKAGING-LIBGHOSTTY.md)
     let status = Command::new(&zig)
         .current_dir(&src)
         .args([
@@ -61,14 +71,11 @@ fn main() {
             "-Doptimize=ReleaseFast",
         ])
         .arg(format!("-Dtarget={target}"))
+        .arg("--system")
+        .arg(&deps)
         .arg("--prefix")
         .arg(&prefix)
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
-        .env_remove("http_proxy")
-        .env_remove("https_proxy")
-        .env_remove("all_proxy")
+        .env("ZIG_GLOBAL_CACHE_DIR", src.join(".zig-global-cache"))
         .status()
         .unwrap_or_else(|e| panic!("cannot run {}: {e}", zig.to_string_lossy()));
     assert!(
@@ -79,7 +86,7 @@ fn main() {
     cc::Build::new()
         .file("src/vt.c")
         .include(prefix.join("include"))
-        .include(wuffs(&src))
+        .include(wuffs(&src, &deps))
         .std("c11")
         .warnings(true)
         .extra_warnings(true)
@@ -92,10 +99,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
 
-/// The directory of Wuffs's single-file C library among the source's Zig packages. libghostty-vt
+/// The directory of Wuffs's single-file C library among the release's Zig packages. libghostty-vt
 /// links Wuffs for Kitty graphics, and vt.c decodes PNG images with it, so it compiles against
-/// those declarations; the package is the one Ghostty's `pkg/wuffs/build.zig.zon` names by hash.
-fn wuffs(src: &Path) -> PathBuf {
+/// those declarations; the package is the one the source's `pkg/wuffs/build.zig.zon` names by hash.
+fn wuffs(src: &Path, deps: &Path) -> PathBuf {
     let zon = src.join("pkg/wuffs/build.zig.zon");
     let text =
         fs::read_to_string(&zon).unwrap_or_else(|e| panic!("cannot read {}: {e}", zon.display()));
@@ -105,7 +112,7 @@ fn wuffs(src: &Path) -> PathBuf {
         .and_then(|(_, rest)| rest.split_once('"'))
         .map(|(hash, _)| hash)
         .unwrap_or_else(|| panic!("no Wuffs package hash in {}", zon.display()));
-    let dir = src.join("zig-pkg").join(hash).join("release/c");
+    let dir = deps.join(hash).join("release/c");
     assert!(
         dir.join("wuffs-v0.4.c").is_file(),
         "no Wuffs at {}: run scripts/fetch-ghostty",

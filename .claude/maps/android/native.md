@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment, vt.c's Wuffs header, libjnigraphics, then the Ghostty source's name for vt.rs last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: `parse_route`'s comment, libjnigraphics, then the libghostty-vt 1.0.0 release's fetch, offline build, notices and released sources last)
 
 ## Responsibilities
 
@@ -16,7 +16,7 @@
 - `Native.kt`, the Kotlin facade;
 - the Gradle build: the native library via cargo-ndk, the rootfs, doas and notice assets,
   per-variant features, SDK levels, packaging, warnings as errors;
-- building libghostty-vt, the terminal emulator, with Zig from the fetched Ghostty source;
+- building libghostty-vt, the terminal emulator, with Zig from its fetched source release;
 - the manifest and the debug source set;
 - the instrumentation tests (`MachineTest`);
 - the source bundles released with the APK (`scripts/release-sources`) and the licence texts in
@@ -133,26 +133,26 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   `ANDROID_NDK_HOME` and `ANDROID_NDK_ROOT` set to AGP's NDK, using `~/.cargo/bin/cargo` when it is
   executable; it is never up to date. Debug variants add the `test-hooks` and `borrow-check`
   features; the Rust side is always a release build.
-- On an Android target `build.rs` asserts the Ghostty source (`target/ghostty/ghostty-1.4.0`, or
-  `APPINE_GHOSTTY_SRC`), panics on any architecture but aarch64, and runs `$ZIG` (or `zig` on
-  `PATH`) `build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast
-  -Dtarget=aarch64-linux-android` into `OUT_DIR` with the six proxy variables removed; it then
-  compiles `src/vt.c` (C11, extra warnings) with `cc`, against the installed headers and Wuffs's
-  single-file header in the source's Zig packages (`zig-pkg/<hash>/release/c`, the hash read from
-  Ghostty's `pkg/wuffs/build.zig.zon`; vt.c decodes PNG images with the Wuffs in the archive), and
-  links `libghostty-vt.a` statically into `libappine.so` (with uucode, simdutf, Highway, Wuffs and
-  Zig's compiler_rt); `vt.rs` also links the system's libjnigraphics. The source directory's name
-  (`ghostty-1.4.0`) goes to the crate as `APPINE_GHOSTTY`, part of the version vt.rs records the
-  tabs' saved snapshots with (libghostty-vt's own version string does not follow Ghostty's
-  releases). Ghostty's build
-  finds the NDK through `ANDROID_NDK_HOME`, and Ghostty 1.4.0 requires Zig 0.17.0 (its
-  `minimum_zig_version`; neither `build.rs` nor `fetch-ghostty` checks the version). Every Android
-  build, CI's included, therefore needs Zig and the fetched source.
-- `scripts/fetch-ghostty [dir]` keeps a tarball whose sha256 matches the pin, else downloads it
-  (`curl --retry 3` to a `.part` file, checked, renamed), unpacks it only when `build.zig` is
-  missing, and runs the build's configure phase with `build.rs`'s options (`--help`, proxy
-  variables removed), which fetches the Zig packages that build uses into the source's `zig-pkg/`
-  (Zig checks them against the `build.zig.zon` hashes), so the cargo build needs no network.
+- On an Android target `build.rs` asserts the libghostty-vt source (`build.zig` in
+  `target/ghostty/libghostty-vt-1.0.0`, or `APPINE_GHOSTTY_SRC`) and the release's Zig packages
+  beside it (the same path with `-deps`), panics on any architecture but aarch64, and runs `$ZIG`
+  (or `zig` on `PATH`) `build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast
+  -Dtarget=aarch64-linux-android --system <deps>` into `OUT_DIR`, so Zig takes the packages from
+  that directory and never fetches. Its global cache is the source's `.zig-global-cache`, beside
+  Zig's local `.zig-cache` there, so builds of every profile (Gradle's, clippy's) share both. It
+  then compiles `src/vt.c` (C11, extra warnings) with `cc`, against the installed headers and
+  Wuffs's single-file header among the packages (`<deps>/<hash>/release/c`, the hash read from the
+  source's `pkg/wuffs/build.zig.zon`; vt.c decodes PNG images with the Wuffs in the archive), and
+  links `libghostty-vt.a` statically into `libappine.so` (with uucode, simdutf, Highway, Wuffs, the
+  translate-c helpers and Zig's compiler_rt); `vt.rs` also links the system's libjnigraphics. The
+  build finds the NDK through `ANDROID_NDK_HOME`, and libghostty-vt 1.0.0 requires Zig 0.17.x,
+  which its own build checks (`minimum_zig_version`). Every Android build, CI's included,
+  therefore needs Zig and the fetched release.
+- `scripts/fetch-ghostty [dir]` handles the release's source tarball and its dependency tarball
+  (`release.files.ghostty.org/libghostty-vt/<version>/`, each with its own pinned sha256): it keeps
+  a tarball whose sha256 matches, else downloads it (`curl --retry 3` to a `.part` file, checked,
+  renamed), and unpacks each into `<name>.part` and moves its directory into place whole, only
+  when that directory is missing. It runs no Zig and needs no proxy handling.
 - Toolchain: AGP 9.4.1 with its built-in Kotlin, Gradle 9.8.2, Java 17, NDK 29.0.14206865; plugins
   and dependencies from `google()` and `mavenCentral()` (project repositories fail the build); no
   version catalog. Android libraries: `androidx.core` 1.19.1 and Material Components 1.14.0 (which
@@ -176,9 +176,9 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 
 - `NoticesTask` writes, in order: Appine (its notice and the repository's `LICENSE`); Fuchsia's
   BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); the
-  terminal's components with their texts from `android/licenses/` (Ghostty 1.4.0, uucode with the
-  Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option, Zig's
-  compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
+  terminal's components with their texts from `android/licenses/` (libghostty-vt 1.0.0, uucode
+  with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
+  translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
   from the tarball's `lib/apk/db/installed`, plus doas's `.PKGINFO`); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
   texts of GPL-3.0, GPL-2.0, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
@@ -190,8 +190,10 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   from `appine-android` over normal dependencies, skipping proc-macros and workspace members; when a
   crate's licence offers MIT, only the MIT (and unrelated) licence files are attached; a crate
   without a licence file only warns.
-- The component texts and versions in `android/licenses/` (14 files, all used) are copies kept by
-  hand and change with the Ghostty version.
+- The component texts and versions in `android/licenses/` (15 files, all used) are copies kept by
+  hand and change with the libghostty-vt version; the release's
+  `deps/libghostty-vt-third-party.json` lists which projects are linked (translate-c among them,
+  though nothing of it shows as an object of its own in `libghostty-vt.a`).
 
 ### Manifest
 
@@ -207,9 +209,9 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 
 - `scripts/release-sources` refuses to run with tracked changes in the work tree and writes, under
   the short `HEAD` revision: `appine-<rev>.tar.gz` (`git archive HEAD`), `appine-<rev>-vendor.tar.gz`
-  (`cargo vendor --locked` of the whole workspace), `ghostty-<version>.tar.gz` (the release as
-  published) with `ghostty-<version>-zig-packages.tar.gz` (the source's `zig-pkg/` after
-  `fetch-ghostty` ran with an empty Zig global cache, so only what the build fetches), and
+  (`cargo vendor --locked` of the whole workspace), `libghostty-vt-<version>.tar.gz` and
+  `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
+  `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
 - The Alpine part takes the tarball `scripts/fetch-rootfs` prints last, picks packages whose
   licence line in `lib/apk/db/installed` contains `GPL` (LGPL included), downloads each origin's
@@ -254,7 +256,7 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   `libc`, Android `liblog` and `libjnigraphics`; cargo-ndk and NDK 29; AGP, Gradle;
   `androidx.core`, Material Components and androidx.test from Google's Maven repository and Maven
   Central.
-- Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate;
+- Zig 0.17.x, the libghostty-vt 1.0.0 source release and its dependency tarball, the `cc` crate;
   `scripts/fetch-rootfs`'s output in `target/rootfs`.
 - `scripts/release-sources`: git, `cargo vendor`, `scripts/fetch-ghostty` and `fetch-rootfs`,
   gitlab.alpinelinux.org and distfiles.alpinelinux.org, curl, tar, awk and a SHA-512 tool.
@@ -268,25 +270,23 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 - Every JNI function's body goes in `guarded!` (with `throws env` exactly when Kotlin declares
   `@Throws`); the macro is defined before `mod vt` so `vt.rs` can use it, and its closure moves the
   parameters, so a `return` inside returns from the body only.
-- Zig's HTTP client fails through some proxies (HTTP 400), so `scripts/fetch-ghostty` and
-  `build.rs` remove the proxy variables.
-- `build.rs` and `scripts/fetch-ghostty` pass the same `zig build` options and change together:
-  lazy Zig packages are fetched only for the options the configure phase sees. `build.rs` reruns
-  only when `vt.c`, the source's `build.zig.zon`, `APPINE_GHOSTTY_SRC` or `ZIG` change, not for
-  other Ghostty files or `ANDROID_NDK_HOME`.
-- vt.c's Wuffs header is found through Ghostty's internals: the dependency named `wuffs` in
-  `pkg/wuffs/build.zig.zon`, Zig's `zig-pkg/<hash>` layout and the file `wuffs-v0.4.c`. A Ghostty
-  upgrade that changes any of them fails the build ("no Wuffs …" or no hash) until `build.rs`
-  follows; the package is there whenever libghostty-vt builds, since it links Wuffs for Kitty
-  graphics.
-- Zig 0.17 unpacks every package already in its global cache into `zig-pkg/`, needed or not; only
-  an empty cache shows what a build uses.
+- The global cache a `--system` build uses must never have held a package's archive: the user's
+  `~/.cache/zig` usually has, and Zig 0.17 then panics ("reached unreachable code"), so `build.rs`
+  gives the source a cache of its own, which nothing fetches into.
+- `build.rs` reruns only when `vt.c`, the source's `LIB_VERSION` or `build.zig.zon`,
+  `APPINE_GHOSTTY_SRC` or `ZIG` change, not for other libghostty-vt files or `ANDROID_NDK_HOME`.
+- vt.c's Wuffs header is found through the release's layout: the dependency named `wuffs` in
+  `pkg/wuffs/build.zig.zon`, the dependency tarball's `<hash>` directories and the file
+  `wuffs-v0.4.c`. An upgrade that changes any of them fails the build ("no Wuffs …" or no hash)
+  until `build.rs` follows; the package is there whenever libghostty-vt builds, since it links Wuffs
+  for Kitty graphics.
 - The K2 compiler reports unused variables and never-read assignments only with its extra
   warnings, which are off: they flag a variable read only by a local function as never read.
 - The instrumentation tests are not isolated from the app: they use its store, preferences and
   saved tabs (a store switched to another distribution breaks the Alpine assertions).
-- `release-sources` relies on `fetch-ghostty` printing `fetch-ghostty: <source>` and on
-  `fetch-rootfs` printing the tarball's path last.
+- `release-sources` relies on `fetch-ghostty` printing `fetch-ghostty: <source>` with the two
+  tarballs at `<source>.tar.gz` and `<source>-deps.tar.gz`, and on `fetch-rootfs` printing the
+  tarball's path last.
 
 ## Confirmed bugs / technical debt
 
@@ -297,9 +297,8 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   version); a failed string conversion with no pending exception makes void calls return silently
   (unreachable from the non-null Kotlin signatures). If the `stderr-log` thread fails
   to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
-- `scripts/fetch-ghostty` checks only the pinned sha256; the release's minisign signature is to be
-  checked by hand once when upgrading, before pinning the new sha256. It runs `zig` from `PATH`
-  even when `ZIG` names another one for `build.rs`.
+- `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
+  be checked by hand once when upgrading, before pinning the new sha256s.
 - `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball while the
   APK bundles the newest tarball in `target/rootfs`, so the two can differ; it publishes nothing for
   the bundled `doas.apk`; its aports path is fixed to `main/`; and it vendors the whole workspace
@@ -316,5 +315,3 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 
 - That NDK 29's default really gives 16 KB-aligned `LOAD` segments in `libappine.so` and that the
   test suite passes on a 16 KB-page image today; ART's local-reference limit on API 30 and later.
-- Which Zig packages an empty global cache leaves in `zig-pkg/` (the script names uucode, Highway,
-  Wuffs and what the configure phase reads; a developer tree with a filled cache shows more).

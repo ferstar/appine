@@ -236,8 +236,8 @@ internal object VtNative {
     @JvmStatic external fun snapshot(tab: Long): ByteArray?
 
     /**
-     * The version the snapshots are recorded with (the Ghostty source and libghostty-vt's own
-     * version): one from another version is not restored.
+     * The version the snapshots are recorded with (libghostty-vt's): one from another version is
+     * not restored.
      */
     @JvmStatic external fun version(): String?
 
