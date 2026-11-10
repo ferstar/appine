@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use super::fs::{AT_FDCWD, lookup_at, start_dir};
 use super::{SysResult, get, read_path};
-use crate::cred::cap;
+use crate::cred::{UserNs, cap};
 use crate::errno::Errno;
 use crate::fd::FileKind;
 use crate::kernel::Cx;
@@ -131,11 +131,20 @@ pub(super) fn mount(
     new_mount(cx, fstype, source, (node, at), (mnt, sb), &data)
 }
 
-/// The superblock flags `sb` of the instance mount `id` created (Linux's `fc->sb_flags`).
-fn new_superblock(vfs: &Vfs, id: MountId, sb: u64) {
+/// The superblock flags `sb` of the instance mount `id` created (Linux's `fc->sb_flags`), and
+/// the user namespace `owner` owning it (`fc->user_ns`, [`Mount::owner`]).
+fn new_superblock(vfs: &Vfs, id: MountId, sb: u64, owner: &Rc<UserNs>) {
     if let Some(m) = vfs.mount(id) {
         vfs.set_sb_flags(m.dev, sb);
     }
+    set_owner(vfs, id, owner);
+}
+
+/// Records `owner` as the user namespace owning mount `id`'s instance ([`Mount::owner`]; None
+/// for the initial one).
+fn set_owner(vfs: &Vfs, id: MountId, owner: &Rc<UserNs>) {
+    let owner = (owner.level > 0).then(|| owner.clone());
+    vfs.update_mount(id, |m| m.owner = owner);
 }
 
 /// A string argument of mount(2); None for a null pointer.
@@ -183,6 +192,15 @@ fn new_mount(
     if owner.is_some_and(|o| !cx.cred().ns_capable(&o, cap::SYS_ADMIN)) {
         return Err(Errno::EPERM);
     }
+    // The user namespace owning the instance (sget_fc's s_user_ns): procfs's pid namespace's
+    // owner and mqueue's IPC namespace's; sysfs and cgroup2 superblocks are global (fc->global),
+    // so the initial one owns them whatever namespace they show; otherwise the mounter's
+    let sb_owner = match fs {
+        Fs::Proc => cx.pid_ns().owner.clone(),
+        Fs::Mqueue => ipc.owner.clone(),
+        Fs::Sys | Fs::Cgroup => UserNs::init(),
+        _ => cx.cred().user_ns.clone(),
+    };
     let inherited = if matches!(fs, Fs::Proc | Fs::Sys) {
         visible_locks(cx, fs, flags)?
     } else {
@@ -232,7 +250,7 @@ fn new_mount(
             (layers, (cred.fsuid, cred.fsgid), pins),
             options,
         );
-        new_superblock(&vfs, id, sb);
+        new_superblock(&vfs, id, sb, &sb_owner);
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
@@ -244,7 +262,7 @@ fn new_mount(
         let source = source.unwrap_or_default();
         let targets = plan_attach(cx, &vfs, (&target, at.as_ref()), 1, 1)?;
         let id = vfs.new_tmpfs((target, at), flags, source, params)?;
-        new_superblock(&vfs, id, sb);
+        new_superblock(&vfs, id, sb, &sb_owner);
         propagate(cx, &vfs, id, &targets);
         return Ok(0);
     }
@@ -274,7 +292,9 @@ fn new_mount(
         vfs.update_mount(id, |m| m.locks = inherited);
     }
     if fs.new_instance() {
-        new_superblock(&vfs, id, sb);
+        new_superblock(&vfs, id, sb, &sb_owner);
+    } else {
+        set_owner(&vfs, id, &sb_owner);
     }
     // Every devpts mount is a new instance (since 4.7) with its own set of terminals, numbered by
     // the newly allocated device number
@@ -343,6 +363,8 @@ fn fuse_mount(
         }
         let targets = plan_attach(cx, vfs, (&target, at.as_ref()), 1, 1)?;
         let id = vfs.add_fuse_mount((target, at), flags, source.unwrap_or_default(), dev)?;
+        let owner = conn.borrow().user_ns().clone();
+        set_owner(vfs, id, &owner);
         propagate(cx, vfs, id, &targets);
         return Ok(0);
     }
@@ -358,7 +380,7 @@ fn fuse_mount(
     let (id, conn) = vfs.new_fuse((target, at), flags, source.unwrap_or_default(), |dev| {
         fuse::Conn::new(dev, opts, &cred, pid_ns)
     });
-    new_superblock(vfs, id, sb);
+    new_superblock(vfs, id, sb, &cred.user_ns);
     propagate(cx, vfs, id, &targets);
     if let FileKind::FuseDev(d) = &mut file.borrow_mut().kind {
         d.attach(&conn);
@@ -645,14 +667,13 @@ fn bind_ns(
     Ok(0)
 }
 
-/// Remount: changes the mount's flags (without `MS_BIND` Linux also changes the superblock's,
-/// which is shared between several mounts; here only this one mount changes). Without `MS_BIND`
-/// `data` holds options: tmpfs changes its superblock's size and inode count accordingly
-/// ([`remount_tmpfs`]). Going read-only while files are open for writing is EBUSY: through this
-/// mount for `MS_BIND` (`mnt_make_readonly`), through any mount of the same filesystem otherwise
+/// Remount: changes the mount's flags. With `data` (no `MS_BIND`, Linux's `do_remount`) the
+/// instance changes too, for every mount of it: its superblock flags `sb`, and for tmpfs the size
+/// and inode count in the options ([`remount_tmpfs`]); that needs `CAP_SYS_ADMIN` over the user
+/// namespace owning the instance ([`Mount::owner`]). Without it (`do_reconfigure_mnt`) only the
+/// mount's flags change. Going read-only while files are open for writing is EBUSY: through this
+/// mount for `MS_BIND` (`mnt_make_readonly`), through any mount of the same instance otherwise
 /// (`sb_prepare_remount_readonly`).
-/// remount: with `data` (no `MS_BIND`, Linux's `do_remount`) the filesystem's options and its
-/// superblock flags `sb` change too, otherwise (`do_reconfigure_mnt`) only the mount's flags.
 fn remount(
     cx: &mut Cx<'_>,
     target: &Node,
@@ -673,6 +694,21 @@ fn remount(
     // before the superblock is touched)
     if !m.keeps_locked(flags) {
         return Err(Errno::EPERM);
+    }
+    // Without MS_BIND the instance changes, which needs CAP_SYS_ADMIN over the user namespace
+    // owning it (6.1's do_remount: after parsing the options, before reconfigure_super's writer
+    // check), so root of a user namespace cannot remount the boot root or a shared tmpfs
+    if let Some((data, _)) = data {
+        if m.fs == Fs::Tmpfs {
+            parse_tmpfs(data)?;
+        }
+        let init = UserNs::init();
+        if !cx
+            .cred()
+            .ns_capable(m.owner.as_ref().unwrap_or(&init), cap::SYS_ADMIN)
+        {
+            return Err(Errno::EPERM);
+        }
     }
     // Going read-only: the superblock while no mount of it has writers (sb_prepare_remount_readonly),
     // or just this mount while it has none (mnt_make_readonly)

@@ -370,6 +370,9 @@ pub(crate) struct Mount {
     pub locks: u64,
     /// Its propagation type: shared (in a peer group), a slave, unbindable ([`Propagation`]).
     pub prop: Propagation,
+    /// The user namespace owning the instance (Linux's `s_user_ns`), None for the initial one: a
+    /// remount without `MS_BIND` needs `CAP_SYS_ADMIN` over it.
+    pub owner: Option<std::rc::Rc<crate::cred::UserNs>>,
 }
 
 /// A mount's propagation (Linux's `mnt_group_id`, `mnt_master` and `MNT_UNBINDABLE`, by
@@ -605,6 +608,7 @@ impl Mounts {
             pin: None,
             locks: 0,
             prop: Propagation::default(),
+            owner: None,
         });
     }
 
@@ -934,6 +938,7 @@ impl Vfs {
                 pin: None,
                 locks: 0,
                 prop: Propagation::default(),
+                owner: None,
             }],
             detached: Vec::new(),
             next: RUN_MOUNT + 1,
@@ -2696,6 +2701,7 @@ impl Vfs {
             pin: None,
             locks: 0,
             prop: Propagation::default(),
+            owner: None,
         });
         drop(mounts);
         self.mounts_changed();
@@ -2763,6 +2769,7 @@ impl Vfs {
                 pin: c.pin.clone(),
                 locks: c.locks,
                 prop: c.prop.of_bind(),
+                owner: c.owner.clone(),
             });
             ids.push(id);
         }

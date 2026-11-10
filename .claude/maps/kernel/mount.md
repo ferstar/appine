@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/mount.md` for the paired decision history (decisions from before the split are D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: instance owners and remount's capability check)
 
 ## Responsibilities
 
@@ -45,8 +47,9 @@ Outside the module:
   open_tree clone's root, or a detached mount not locked in place), the dentry it sits on (`at`),
   per-mount `MS_*` flags (`ms::PER_MOUNT`), device number, source, the `MNT_EXPIRE` mark
   (`expiring`), the namespace it pins (`pin`: nsfs and mqueue mounts), `locks` (`lock::*` bits:
-  Linux's `MNT_LOCKED` and `MNT_LOCK_*`), propagation (`prop`), and for its root the directory and
-  name of a bound file (`root_at`) and whether that name was removed (`root_gone`).
+  Linux's `MNT_LOCKED` and `MNT_LOCK_*`), propagation (`prop`), the user namespace owning its
+  instance (`owner`, Linux's `s_user_ns`; none for the initial one), and for its root the
+  directory and name of a bound file (`root_at`) and whether that name was removed (`root_gone`).
   `keeps_locked` is Linux's `can_change_locked_flags`.
 - `Mounts` — the attached list (also the mountinfo order; the root filesystem's entry stays
   first), the detached list, the id counter (from 11) and device counter (from 0x30), and
@@ -137,7 +140,11 @@ Outside the module:
   (tmpfs, procfs, devpts, overlay, a new FUSE connection) takes the read-only, sync, dirsync, mand
   and lazytime flags it is mounted with as its superblock flags (`Vfs::sb_flags`, by device
   number, shared by its binds); sysfs, cgroup2 and mqueue mounts reuse an instance and leave its
-  flags. sysfs, cgroup2 and same-IPC-namespace mqueue mounted on the
+  flags. Each mount records the user namespace owning its instance (`Mount::owner`, which binds,
+  copies and propagated copies keep): the mounter's for tmpfs, devpts, overlay and a new FUSE
+  connection, the owner of the pid namespace for procfs and of the IPC namespace for mqueue, the
+  initial one for sysfs and cgroup2 (Linux's are global superblocks), and a FUSE connection's
+  mounter's when it is mounted again. sysfs, cgroup2 and same-IPC-namespace mqueue mounted on the
   root of a mount of the same filesystem are `EBUSY` (sysfs and cgroup2 compared by filesystem
   only, whatever their namespaces).
   mqueue needs `CAP_SYS_ADMIN` over the IPC namespace, proc over the owner of the caller's pid
@@ -155,13 +162,15 @@ Outside the module:
   locked in place on or under it is `EINVAL` (`has_locked_children`); binding a namespace file
   creates an nsfs mount that pins the namespace (a mount-namespace file must be newer than the
   caller's namespace).
-- Remount needs the exact mount root of an attached mount in the caller's namespace (`EINVAL`) and
-  only `may_mount`: unlike 6.1's `do_remount`, no `CAP_SYS_ADMIN` over the user namespace owning
-  the instance is asked for, even when the superblock flags change; flags change on this mount
-  (atime bits are kept if none are given), and without `MS_BIND` the instance's superblock flags
-  too, for every bind and namespace copy of it (read-only, sync, mand and lazytime as given,
-  dirsync kept: Linux's `MS_RMT_MASK`); clearing a locked ro, nodev, nosuid or noexec or changing
-  locked atime flags is `EPERM` before anything changes (`can_change_locked_flags`); going
+- Remount needs the exact mount root of an attached mount in the caller's namespace (`EINVAL`);
+  clearing a locked ro, nodev, nosuid or noexec or changing locked atime flags is `EPERM` before
+  anything changes (`can_change_locked_flags`); without `MS_BIND` a tmpfs's options are parsed
+  (`EINVAL`) and then `CAP_SYS_ADMIN` over the user namespace owning the instance is needed
+  (`EPERM`, 6.1's `do_remount`), so root of a user namespace cannot remount the boot root, a
+  tmpfs of the initial namespace or a sysfs it mounted itself, while a bind remount only needs
+  `may_mount`. Flags change on this mount (atime bits are kept if none are given), and without
+  `MS_BIND` the instance's superblock flags too, for every bind and namespace copy of it
+  (read-only, sync, mand and lazytime as given, dirsync kept: Linux's `MS_RMT_MASK`); going
   read-only while regular or synthetic files are open for writing (in fd tables, or backing a loop
   device) is `EBUSY`: through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`),
   through any attached mount of the same device, in any namespace, when the instance turns
@@ -355,15 +364,12 @@ Outside the module:
   same mount namespace are moved.
 - `mounts_changed` does not bump the fast path's epoch: a caller that changes mounts must also call
   `fast_changed`.
+- A new way of creating a mount of a new instance must record its owner (`new_superblock` or
+  `set_owner`); a mount with none counts as owned by the initial user namespace, so remounting it
+  without `MS_BIND` then needs `CAP_SYS_ADMIN` there.
 
 ## Confirmed bugs / technical debt
 
-- **Remount needs no capability over the instance:** a remount without `MS_BIND` checks only
-  `may_mount` (the caller's mount namespace owner), and instances record no owning user namespace,
-  so root of a user namespace that unshared a mount namespace can make the shared boot root
-  filesystem read-only for every namespace (when nothing has a file open for writing there) or
-  resize a shared tmpfs; read-only is not a locked flag unless the copied mount already had it.
-  6.1's `do_remount` wants `CAP_SYS_ADMIN` over the superblock's user namespace (`EPERM`).
 - **umount ignores mappings and executables:** a mount whose files are only mapped, being executed
   or held by mqueue fds is not busy, so `umount2` succeeds where Linux returns `EBUSY` (and a tmpfs
   instance can then be reclaimed while still mapped).
@@ -391,10 +397,9 @@ Outside the module:
   `move_tree`'s unbindable check and `mount_setattr` with `AT_RECURSIVE` (which also rebuilds the
   fast path's mount points per mount) scan the whole mount table once per mount in the subtree,
   and `propagation_targets` checks each target with `is_under`, which scans the table at each
-  step. Comments in `syscall/mount.rs` (its header, remount, `change_type`,
-  `MOVE_MOUNT_SET_GROUP`, mount_setattr) and on `vfs::Propagation` still say mounts do not
-  propagate or that remount changes only one mount (remount also has a duplicated, contradictory
-  second paragraph), `propagation_targets`' doc says the tree's own mounts are never targets, a
+  step. Comments in `syscall/mount.rs` (its header, `change_type`, `MOVE_MOUNT_SET_GROUP`,
+  mount_setattr) and on `vfs::Propagation` still say mounts do not propagate,
+  `propagation_targets`' doc says the tree's own mounts are never targets, a
   doc line about flags and the `MNT_EXPIRE` mark is left above `set_propagation`, and
   `Fs::own_dev`'s doc leaves out overlay and FUSE.
 - **Mount fidelity gaps:**
@@ -422,6 +427,10 @@ Outside the module:
 
 ## To verify
 
+- Which user namespace owns each instance (procfs its pid namespace's owner, mqueue its IPC
+  namespace's, sysfs and cgroup2 the initial one through `fc->global`) comes from knowledge of
+  6.1's `fs_context` code; only the `EPERM` for remounting a sysfs mounted in a user namespace,
+  and for remounting the root and a tmpfs of the initial one, was observed on a native 6.8 kernel.
 - The remount `EBUSY` with writers found by Starnix's syscall tests was observed on a native 6.8
   kernel and attributed to 6.1 from knowledge of the kernel.
 - The 6.1 behaviour cited in the fidelity gaps and the propagation bug (`IS_MNT_NEW`,

@@ -8,7 +8,8 @@
 # the caller's pid and network namespace, and a mount namespace not owned by the initial user
 # namespace must already see the whole filesystem (mount_too_revealing): a locked mount over a
 # non-empty directory of it is EPERM, one on an empty mount point (/sys/fs/cgroup) is not;
-# cgroup2 needs CAP_SYS_ADMIN over the owner of the caller's cgroup namespace. A lazy unmount, or
+# cgroup2 needs CAP_SYS_ADMIN over the owner of the caller's cgroup namespace, and a remount without
+# MS_BIND over the user namespace owning the instance. A lazy unmount, or
 # the end of the namespace, leaves locked mounts on their detached parent (disconnect_mount), so an
 # fd kept in the detached tree still sees what hides a path, while unlocked mounts are
 # disconnected. The native side is privileged so that its /proc and /sys are rw and unmasked, as
@@ -201,6 +202,37 @@ def own_proc_sysfs():
 
 
 child(own_proc_sysfs)
+
+
+# A remount without MS_BIND changes the instance, which needs CAP_SYS_ADMIN over the user namespace
+# owning it (6.1's do_remount): root of a new user namespace cannot remount the root filesystem or
+# a tmpfs of the initial one (a bind remount still changes its own mount), nor even a sysfs it
+# mounted itself (sysfs and cgroup2 superblocks belong to the initial user namespace), but can
+# remount a tmpfs it mounted; the outside's tmpfs and /sys stay writable
+os.mkdir("/tmp/lk/s")
+show("shared tmpfs", mount("s", "/tmp/lk/s", "tmpfs", 0))
+
+
+def remount_owner():
+    enter_userns(os.CLONE_NEWNET)
+    show("== remounts in a new user namespace")
+    show("remount the root ro", mount(None, "/", None, MS_REMOUNT | MS_RDONLY))
+    show("remount the shared tmpfs ro", mount(None, "/tmp/lk/s", None, MS_REMOUNT | MS_RDONLY))
+    show("bind remount it ro", mount(None, "/tmp/lk/s", None, MS_REMOUNT | MS_BIND | MS_RDONLY))
+    show("own tmpfs", mount("o", "/tmp/lk/p", "tmpfs", 0))
+    show("remount it ro", mount(None, "/tmp/lk/p", None, MS_REMOUNT | MS_RDONLY, "size=1m"))
+    show("umount", umount("/tmp/lk/p"))
+    show("own sysfs", mount("sysfs", "/tmp/lk/p", "sysfs", 0))
+    show("remount it ro", mount(None, "/tmp/lk/p", None, MS_REMOUNT | MS_RDONLY))
+    show("its statvfs ro", bool(os.statvfs("/tmp/lk/p").f_flag & os.ST_RDONLY))
+    show("umount", umount("/tmp/lk/p"))
+
+
+child(remount_owner)
+open("/tmp/lk/s/written", "w").close()
+show("outside: the shared tmpfs and /sys still writable",
+     not os.statvfs("/tmp/lk/s").f_flag & os.ST_RDONLY,
+     not os.statvfs("/sys").f_flag & os.ST_RDONLY)
 # Something mounted over a non-empty directory of /proc and of /sys hides it
 show("mask /proc/sys", mount("m", "/proc/sys", "tmpfs", 0))
 show("mask /sys/class", mount("m", "/sys/class", "tmpfs", 0))
