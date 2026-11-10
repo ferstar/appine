@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
 - **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
 - **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `VTIME` timing the whole read when `VMIN` is above 0, one slave write overshooting the output limit by its expansion, `TIOCSPGRP` error codes and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
-- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297 and 5d7b936)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `VTIME` timing the whole read when `VMIN` is above 0, one slave write overshooting the output limit by its expansion, `TIOCSCTTY` returning 0 to a non-leader, `TIOCSPGRP` error codes, console input accepted after its session ended, held echoes waiting for the next input and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
+- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297, 5d7b936 and d9e1f0c)
 
 ### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
 - **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
@@ -138,8 +138,15 @@
 - **What**: `commit_echoes` outputs an echo only when it fits whole and keeps at most 4096 waiting (the oldest dropped), and `send_xchar` drops its character on a full queue.
 - **Why**: Echoes and `send_xchar` ignored the output limit, so a master that never read let the output grow without bound.
 - **Tradeoffs**: One slave write can still overshoot the limit by its output expansion.
-- **Watch out**: Echoes held while the output is full appear only after the master reads.
-- **Source**: 5d7b936
+- **Watch out**: Echoes held while the output is full wait for the next input rather than for the master to read, and a slave write's data goes out ahead of them (a bug in the map).
+- **Source**: 5d7b936, d9e1f0c (held echoes)
+
+### D20: Terminal ioctls Appine does not know are counted as unimplemented paths
+- **What**: `tty::ioctl`'s default arm counts the request on a terminal in kernel/signal's table of unimplemented paths (kernel/signal D24) before returning `ENOTTY`.
+- **Why**: Terminal ioctls Appine does not know ended in an unrecorded `ENOTTY`.
+- **Tradeoffs**: The `EIO` and `ENOTTY` of hung-up terminals are not counted.
+- **Watch out**: None known.
+- **Source**: 99b4216
 
 ## Superseded
 

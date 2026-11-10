@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -59,8 +59,8 @@
 - **What**: android/setup covers `Rootfs.kt`, `SettingsActivity.kt`, `login.sh` and `scripts/fetch-rootfs`, separate from android/service.
 - **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
 - **Tradeoffs**: The service drives switches and imports, so those flows span two maps, and D8's reason was never recorded.
-- **Watch out**: The map's open bugs include a password set in a running session keeping NOPASSWD until the next tab logs in; a switch interrupted by a kill no longer becomes Alpine (D17).
-- **Source**: 12c4afa (bug list since updated by 237d663)
+- **Watch out**: The map's open bug is a password change that renames nothing in `/etc` (an in-place shadow edit) keeping NOPASSWD until the next login (D19); a switch interrupted by a kill no longer becomes Alpine (D17).
+- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6)
 
 ### D10: The execution tier row exists only in debug builds
 - **What**: Settings creates the tier row only when `BuildConfig.DEBUG`, with its strings left in `main`, which references them.
@@ -86,9 +86,9 @@
 ### D13: Login rules, admin setup, mirror choice and downloads fail closed
 - **What**: NOPASSWD rules are refreshed at every login, root's included, and granted only when the account's shadow field after any leading `!` is empty or `*`; an admin is matched with `grep -F` and recorded only once `id -nG` shows the group (else retried at the next login); a failed mirror write leaves the sources and the record alone; and a download fails as soon as a source sends more than the pinned length.
 - **Why**: Locked accounts with a password, missing shadow entries and a missing `/etc/shadow` counted as passwordless, root logins never rewrote the rules, failed group changes were recorded, names were matched as regexes, a mirror that failed to write was recorded and fetch had no cap.
-- **Tradeoffs**: A password set inside a running session keeps NOPASSWD until the next tab logs in (map debt), and a locked account without a hash still counts as passwordless, as `adduser -D` accounts must.
+- **Tradeoffs**: A password set inside a running session keeps NOPASSWD until the refresh of D19 runs, or until the next login when nothing in `/etc` was renamed, and a locked account without a hash still counts as passwordless, as `adduser -D` accounts must.
 - **Watch out**: Shadow formats other than Alpine's and Debian's (`!`, `!!`, `*`, `!*`) are judged by the same rule, and the Debian sudo path was not run in a container, only shared with the Alpine path.
-- **Source**: 711b034
+- **Source**: 711b034; d03c9b6 (the refresh, D19)
 
 ### D14: Rootfs and Settings read in the order a start uses them
 - **What**: `Rootfs` runs types and constants, the store, the import, mirror probing and writing, the per-start files, boot, accounts, then downloads and reset; `SettingsActivity` runs lifecycle, row building, listener callbacks, display, then actions in the order of the rows.
@@ -125,7 +125,15 @@
 - **Watch out**: A distribution whose podman or docker package defaults to another driver, or a future default needing overlay features Appine lacks (redirects, metacopy, idmapped layers), would fail without the old fallback.
 - **Source**: 0eb9e19, 869de68
 
+### D19: A guest change to `/etc` rewrites the NOPASSWD rules without a login
+- **What**: `login.sh --refresh-rules` only rewrites the rules, written beside the file and renamed into place so a login and a refresh at once never leave a half-written file, and `Rootfs.dirsChanged` spawns it as root, without a console and without waiting, whenever `/etc` is among the changed directories the service's poll passes on (android/service D20).
+- **Why**: A password set in a running session did not stop NOPASSWD escalation until another tab logged in.
+- **Tradeoffs**: Up to one poll (2 s) of delay, and any rename in `/etc`, not only of shadow and group, runs a refresh.
+- **Watch out**: Changes that rename nothing in `/etc` (an in-place edit) or fall past the 256-directory limit between polls still wait for the next login (map debt), and changed directories are recorded only from the service's first take.
+- **Source**: d03c9b6
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
 - ~~`ensureContainersConfig` also chooses vfs in `/etc/containers/storage.conf` (rewriting an active `driver = "overlay"` line) and the native snapshotter in `/etc/docker/daemon.json` (0eb9e19)~~ → replaced by **D18** in 869de68 (2026-11-08)
+- ~~A password set inside a running session keeps NOPASSWD until the next tab logs in (D13's tradeoff, 711b034, and D9's watch-out, 12c4afa)~~ → replaced by **D19** in d03c9b6 (2026-11-09)

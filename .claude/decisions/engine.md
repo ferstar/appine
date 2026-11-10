@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: engine"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D18 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D18 were seeded by hand from the retired design
 > doc §4 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -168,3 +168,10 @@
 - **Tradeoffs**: One more instruction per table lookup from translated code.
 - **Watch out**: None known.
 - **Source**: b43ff37
+
+### D24: `CNTVCTSS_EL0` is read like `CNTVCT_EL0`, and ECV is advertised only where the host has it
+- **What**: `APPINE_HWCAP2_ECV` joins the host-gated integer features (D12), Tier 0 reads `CNTVCTSS_EL0` (S3_3_C14_C0_6) without an `isb` and Tier 1 copies it as it does `CNTVCT_EL0`, so a host vDSO patched for ECV runs in guests (kernel/signal D4).
+- **Why**: Since Linux 5.16 the host kernel patches its vDSO to read `CNTVCTSS_EL0` on CPUs with ECV (Armv8.6 on, as in recent phones), and guests now run a copy of the host's vDSO.
+- **Tradeoffs**: Guests on ECV hosts see `ecv` in `HWCAP2` and `/proc/cpuinfo`.
+- **Watch out**: The path is untested on ECV hardware, since colima and both emulators lack ECV.
+- **Source**: 16364c0

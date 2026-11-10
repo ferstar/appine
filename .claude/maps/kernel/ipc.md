@@ -1,7 +1,7 @@
 # kernel/ipc Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/ipc.md` for the paired decision history (not yet created).
+> See `.claude/decisions/kernel/ipc.md` for the paired decision history.
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -32,14 +32,15 @@
 - **What**: `scripts/release-sources` bundles Appine at a clean `HEAD`, the vendored crates, the aports directories plus checksum-verified upstream sources of the minirootfs's GPL packages, and the Ghostty release with the Zig packages its build fetches (D6).
 - **Why**: Under GPLv3/AGPLv3 the APK must come with the complete corresponding source, including statically linked crates, and the bundled busybox, apk-tools and other GPL packages need their sources too; evaluating an APKBUILD's `source=` would mean running downloaded shell code, so the files are found through its `sha512sums` instead.
 - **Tradeoffs**: Whether the repository is published or a written offer accompanies the APK is still the user's decision.
-- **Source**: rounds 192 (`192-license`), 200 (`200-release-sources`); b38d29c
+- **Watch out**: The bundles have gaps that matter for AGPL compliance once the APK ships: the Alpine sources follow `fetch-rootfs`'s pinned tarball while the APK bundles the newest one in `target/rootfs`, nothing is published for the bundled `doas.apk`, the aports path is fixed to `main/`, and the whole workspace is vendored rather than only the linked crates.
+- **Source**: rounds 192 (`192-license`), 200 (`200-release-sources`); b38d29c; d9e1f0c (gaps recorded)
 
 ### D5: The JNI bridge, the build and release packaging are one module
 - **What**: android/native holds `hosts/android` (except the vt.c/vt.rs terminal shim), `Native.kt`, the Gradle files, the manifest, the debug and instrumentation-test sources, `android/licenses` and the `fetch-ghostty` and `release-sources` scripts.
 - **Why**: JNI, Gradle and the manifest had no map (§11 only touched on them), and `scripts/release-sources` fit neither harness nor android/setup, since it packages the sources the APK release must ship.
 - **Tradeoffs**: `MachineTest` exercises every android module but is filed here; the module grew from the bridge and build to release packaging.
-- **Watch out**: None known; both risks recorded at mapping are fixed: `shutdown` drops the last `Arc<Machine>` outside the table lock (D1, 7f79758), and every JNI function catches panics (D15).
-- **Source**: 12c4afa, 16ac7a2
+- **Watch out**: The full refresh d9e1f0c recorded open debts: the release build is signed with the debug key, unminified and versioned 1 / 0.0.0, lib.rs's array loops never delete local references, and the release source bundles have gaps (D4) that matter for AGPL compliance once the APK ships; both risks recorded at the first mapping are fixed (D1, D15).
+- **Source**: 12c4afa, 16ac7a2; d9e1f0c (bug list)
 
 ### D6: libghostty-vt is built with Zig into every Android library and shipped with its notices and sources
 - **What**: For Android targets build.rs runs `zig build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast` (Zig 0.17.0, proxy variables removed) on the Ghostty 1.4.0 source that `scripts/fetch-ghostty` downloads with a pinned sha256, and links libghostty-vt.a and vt.c statically into libappine.so; fetch-ghostty fetches only the Zig packages the build uses by running its configure phase with build.rs's options; the notices list Ghostty, uucode (with the Unicode and Hoehrmann licences), simdutf, Highway, Wuffs, Zig's compiler_rt and JetBrains Mono from copies in `android/licenses`.
@@ -110,6 +111,27 @@
 - **Tradeoffs**: Kernel state a panic left half done (a poisoned lock, a held BKL) is not repaired, so later calls on that machine may fail or wait; Kotlin callers of non-throwing functions see an ordinary failure (an ended console or process) rather than a kernel-bug report.
 - **Watch out**: A new JNI function written without `guarded!` aborts again on a panic, and `return` inside a guarded body returns only from the body.
 - **Source**: be72f31
+
+### D16: Every kernel the app starts reports guest crashes in its kernel log
+- **What**: `Native.start` passes `exception_trace: true` (kernel/process D35) for every kernel start (app start, restart, distribution change), so unhandled guest faults are reported in the kernel log (kernel/signal D23) that copied bug reports carry, and `MachineTest.guestCrashesReachTheKernelLog` runs a one-instruction `udf #0` ELF and finds its report in dmesg.
+- **Why**: On Appine a guest crash is often Appine's own bug, as the shared-translation SIGILL was.
+- **Tradeoffs**: There is no switch in the app; a user who wants the reports off writes the sysctl after each start.
+- **Watch out**: The instrumentation test expects the mapping `undefined[400000+1000]`, which changes if the `elf()` helper's layout does.
+- **Source**: 7b7f73b
+
+### D17: Kill lines carry the unimplemented paths a buggy process reached
+- **What**: `takeKills` writes `KillReason::Bug::stubs` (kernel/signal D24), cleaned and joined by U+001E, as the kill line's last field, which android/service D6 appends to the bug report.
+- **Why**: The last field was empty for bugs, and the app needed the paths.
+- **Tradeoffs**: The paths are a snapshot taken when the process was killed.
+- **Watch out**: `MachineTest` does not check the new field.
+- **Source**: 99b4216 (with android/service D6)
+
+### D18: `Native.bklStall` reports a long BKL hold without taking the BKL
+- **What**: `Native.bklStall` returns `<id>\t<seconds>\t<report>\t<end record or empty>`, or null, from `Machine::stall` (kernel/process D38), guarded like every JNI function (D15).
+- **Why**: The app needs the watchdog's report while the hold lasts, when every call that takes the BKL waits.
+- **Tradeoffs**: One more JNI function, and the kernel keeps only the latest stall.
+- **Watch out**: The line format must stay in step with `TerminalService.reportStall` (android/service D18).
+- **Source**: 64a6107 (with android/service D18)
 
 ## Superseded
 

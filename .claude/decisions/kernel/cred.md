@@ -2,25 +2,25 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
 ## Active
 
-### D1: Credentials live in the thread group
-- **What**: One `Cred` (four uids, four gids, supplementary groups, capability sets, securebits, user namespace) per thread group; every thread reads and changes the same copy.
-- **Why**: libc's setuid family already makes every thread perform the call, so one copy per group gives the result libc users expect.
-- **Tradeoffs**: `setfsuid`/`setfsgid` (which libc does not broadcast) and raw per-thread id syscalls change every thread, unlike Linux; threaded file servers that switch ids per thread are the casualty.
-- **Watch out**: The group also holds `dumpable` and `no_new_privs`, while seccomp filters stay per thread as in Linux.
-- **Source**: round 08 (`08-m6`)
+### D1: Each thread has its own credentials
+- **What**: `Task.cred` is per thread and changes only through `Cx::set_cred`, which also updates `ThreadGroup.cred` when the main thread calls; the caller's own checks (DAC, `SO_PEERCRED`, `SCM_CREDENTIALS`, the no-BKL resolver, seccomp, the capability prctls, setns and unshare of user namespaces) use the calling thread's, `Kernel::cred_of` gives a target thread's own (else the process's copy) for signals, ptrace access, scheduling and priority, rlimits and `RLIMIT_NPROC` counting, and `commit_creds`' side effects clear only the calling thread's pdeathsig.
+- **Why**: Credentials were kept per thread group, so raw per-thread id syscalls and `setfsuid` (which libc does not broadcast) changed every thread, unlike Linux.
+- **Tradeoffs**: The main thread has two copies kept in step by one setter, and no_new_privs and dumpable stay per thread group (no_new_privs is per thread on Linux, an open question in the map), while seccomp filters are per thread as in Linux.
+- **Watch out**: Code that writes `Task.cred` or `ThreadGroup.cred` directly leaves the copies apart, and libc's set*id broadcast now matters (musl and glibc kill or abort the process when one thread's call fails after another's succeeded).
+- **Source**: round 08 (`08-m6`); 1be1142
 
 ### D2: Id changes, DAC and capability fixups follow Linux 6.1 and capabilities(7)
-- **What**: The set*id syscalls, `capset`, the capability prctls and securebits use Linux's rules; uid changes adjust capabilities as `cap_emulate_setxuid` does; changing effective or filesystem ids, or gaining capabilities, clears dumpable and pdeathsig as `commit_creds` does; DAC checks follow `generic_permission`, with root bypassing through capabilities.
+- **What**: The set*id syscalls, `capset`, the capability prctls and securebits use Linux's rules; uid changes adjust capabilities as `cap_emulate_setxuid` does; changing effective or filesystem ids, or gaining capabilities, clears the process's dumpable flag and the calling thread's pdeathsig as `commit_creds` does; DAC checks follow `generic_permission`, with root bypassing through capabilities.
 - **Why**: M6 replaced the all-root model so that dropping to an ordinary user is enforced (a rootfs test checks DAC after `su` to `nobody`); the `commit_creds` side effects were added with user namespaces, having happened only at execve before.
 - **Tradeoffs**: No ACLs, immutable or append-only attributes; `system.*` xattrs are stored but have no effect.
 - **Watch out**: Securebits were recorded but ineffective until round 100; new paths must honour `NOROOT`, `NO_SETUID_FIXUP` and `NO_CAP_AMBIENT_RAISE`.
-- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`)
+- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); 1be1142
 
 ### D3: Capability checks name their namespace, as in Linux
 - **What**: Three checks: `capable` (initial user namespace only), `capable_wrt` (own namespace, with the inode's owner and group mapped — DAC overrides, `CAP_FOWNER`, `CAP_CHOWN`, `CAP_FSETID`) and `ns_capable` (a given namespace — set*id, capset, mounts by the mount namespace's owner, ptrace and kill by the target's); "root" means uid 0 of the credential's own namespace.
@@ -30,18 +30,18 @@
 - **Source**: round 119 (`119-user-namespaces`)
 
 ### D4: execve transforms credentials like `cap_bprm_creds_from_file`, with file capabilities
-- **What**: Setuid/setgid bits (owner and group mapped, no nosuid, no no_new_privs), file capabilities from `security.capability` (v1–v3; v3 only where its root owns the namespace, D12), ambient capabilities, root emulation and `AT_SECURE` for privileged execution; no_new_privs or a tracer without `CAP_SYS_PTRACE` over the tracee's namespace (kernel/signal D20) blocks gains.
+- **What**: Setuid/setgid bits (owner and group mapped, no nosuid, no no_new_privs), file capabilities from `security.capability` (v1–v3; v3 only where its root owns the namespace, D12), ambient capabilities, root emulation and `AT_SECURE` for privileged execution; under no_new_privs, or in an unsafe execution (traced by a tracer without `CAP_SYS_PTRACE` over the tracee's namespace, kernel/signal D20, or sharing the fs context with another thread group), gains are capped at the old permitted set and set-id effective ids are kept only with `CAP_SETUID` (never under no_new_privs).
 - **Why**: Ordinary users (Debian `su`, sshd logins, a non-root login account) need file capabilities such as iputils-ping's `cap_net_raw`; before round 100 the xattr was stored and ignored at exec.
-- **Tradeoffs**: Sharing the fs context (`CLONE_FS`) does not suppress gains; no audit records.
+- **Tradeoffs**: An execve whose fs context has more than one thread's references scans the task table for a sharer; no audit records.
 - **Watch out**: File capabilities are only safe together with the xattr permission checks (`security.capability` needs `CAP_SETFCAP`, other `security.*` and `trusted.*` need `CAP_SYS_ADMIN`) and with privilege removal on write, truncate and chown; round 100 found all three missing and added them together.
-- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); f6a82cc, 2aca260
+- **Source**: rounds 08 (`08-m6`), 100 (`100-file-caps`), 119 (`119-user-namespaces`); f6a82cc, 2aca260, 6d9a9e8
 
 ### D5: Guest seccomp is implemented in the kernel layer with Linux 6.1 semantics
-- **What**: Strict mode and cBPF filters with Linux's program checks, chain size limit, action precedence, inheritance and TSYNC; filters run in an interpreter at syscall entry (after a `PTRACE_SYSCALL` entry stop); `PTRACE_EVENT_SECCOMP` and the notification fd (including `ADDFD`) are supported; `KILL_PROCESS`'s `SIGSYS` cannot be caught, as with `SA_IMMUTABLE`.
+- **What**: Strict mode and cBPF filters with Linux's program checks, chain size limit, action precedence, inheritance and TSYNC; filters run in an interpreter at syscall entry (after a `PTRACE_SYSCALL` entry stop), skipped only by the vDSO stubs for gettimeofday and the clocks Linux's vDSO reads in user space, while the host vDSO's own syscalls are filtered like any other (kernel/signal D4); `PTRACE_EVENT_SECCOMP` and the notification fd (including `ADDFD`) are supported; `KILL_PROCESS`'s `SIGSYS` cannot be caught, as with `SA_IMMUTABLE`.
 - **Why**: Programs that sandbox themselves either failed or ran without the sandbox; `strace --seccomp-bpf` and notification supervisors did not work.
-- **Tradeoffs**: The interpreter costs about 4.5 ns per instruction (Linux uses a JIT); `LOG` and logged actions go to Appine's debug log instead of audit; the vDSO clock stubs skip filters for every clock (Linux's vDSO handles only some); a `TRACE` re-check uses the chain from before the stop; `ADDFD` installs directly and never sees the target interrupted.
+- **Tradeoffs**: The interpreter costs about 4.5 ns per instruction (Linux uses a JIT); `LOG` and logged actions go to Appine's debug log instead of audit; a `TRACE` re-check uses the chain from before the stop; `ADDFD` installs directly and never sees the target interrupted.
 - **Watch out**: Every syscall entry, including the no-BKL fast path, must consult the filter; a fast path that misses `seccomp_on` bypasses filters silently, which the first tests did not catch.
-- **Source**: round 59 (`59-seccomp`)
+- **Source**: round 59 (`59-seccomp`); 16364c0
 
 ### D6: An always-allow cache keeps filtered threads on the fast path
 - **What**: Installing a filter emulates it for syscall numbers 0..511 with only the number and architecture known (`seccomp_is_const_allow`); numbers that always reach `ALLOW` form a bitmap ANDed with the previous filter's; the thread publishes it atomically, and those numbers plus the vDSO clock stubs skip the interpreter and keep the no-BKL fast path.
@@ -54,8 +54,8 @@
 - **What**: kernel/cred covers `cred.rs` except user namespaces, `syscall/cred.rs` and `seccomp.rs`, while user namespaces stay in kernel/process.
 - **Why**: §11.1's credential and seccomp design had to leave the retired design doc, and the user asked for a module of its own.
 - **Tradeoffs**: User namespaces sit in kernel/process although their code is in `cred.rs`, and the Linux 6.1 comparisons rest on the verifiers' knowledge of the kernel source rather than a side-by-side reading.
-- **Watch out**: Divergences recorded at the split await a separate review, among them per-thread id changes leaking to every thread, privilege gains despite a shared fs context and the vDSO bypassing seccomp for every clock, alarm clocks included.
-- **Source**: 12c4afa (bug list since updated by 4e64e74, and shortened by D9–D11 and kernel/process D33)
+- **Watch out**: Divergences recorded at the split or found since stay open in the map, among them incomplete seccomp logging, `for_access` ignoring `SECBIT_NO_SETUID_FIXUP`, errno-order differences in setgroups, capset and `PR_CAPBSET_DROP`, and setns into a foreign user namespace keeping dumpable.
+- **Source**: 12c4afa (bug list since updated by 4e64e74, and shortened by D1, D4, D5, D9–D11, D13 and kernel/process D33)
 
 ### D8: Credential and seccomp files read in the order their code runs
 - **What**: cred.rs runs credentials and file capabilities with the user namespace types (owned by kernel/process) last and `impl Cred`'s entry points before id translation and scope checks; syscall/cred.rs runs id syscalls, capabilities, then committing; seccomp.rs goes from installing filters through syscall entry, the sysctls, user notifications, ptrace and thread exit to the always-allow cache, cBPF and shared helpers; constants several sections use stay at the top.
@@ -92,7 +92,24 @@
 - **Watch out**: getxattr can now return `EOVERFLOW` to callers that only handled `ENODATA`.
 - **Source**: 2aca260
 
+### D13: A privileged execve clears the `PER_CLEAR_ON_SETID` personality flags
+- **What**: execve clears `PER_CLEAR_ON_SETID` when the program is setuid or setgid or its file capabilities would grant more than the caller had, judged by a second `Cred::exec` before no_new_privs or an unsafe execution (D4) takes the gain away, as `bprm_fill_uid` and `cap_bprm_creds_from_file` do.
+- **Why**: A privileged execve kept those flags, a difference without effect until READ_IMPLIES_EXEC took effect.
+- **Tradeoffs**: The capability gain is computed by a second credential transition.
+- **Watch out**: A change to `Cred::exec`'s rules must keep that second call meaningful.
+- **Source**: 5760479
+
+### D14: Unreadable programs tie the address space to the user namespace that can read them
+- **What**: `ThreadGroup::mm_user_ns` (unset until the first execve, copied at fork) is set at execve to the caller's user namespace, raised by `UserNs::holding` to the nearest ancestor where an unreadable program file or interpreter is owned by mapped ids, an unreadable interpreter also clears dumpable, and `Cred::may_ptrace` takes the group's `dump_scope()` and follows `__ptrace_may_access` with `cap_ptrace_access_check`: matching ids or `CAP_SYS_PTRACE` over the target, then dumpable or `CAP_SYS_PTRACE` over the address space's namespace, then the commoncap rule (D10).
+- **Why**: An interpreter the caller could not read left the process dumpable, and a tracer holding `CAP_SYS_PTRACE` only in a user namespace below the owner of an execute-only program could attach to it, both of which Linux's `would_dump` prevents.
+- **Tradeoffs**: The namespace is kept per process, as dumpable is, rather than per address space.
+- **Watch out**: A new caller of `may_ptrace` must pass the group's `dump_scope()`, since passing None lets the target's own namespace decide.
+- **Source**: ef68770
+
 ## Superseded
 
 - ~~The tracer's privilege is a single flag recorded at attach and checked in the initial namespace (D4 in part)~~ → replaced by **kernel/signal D20** in f6a82cc (2026-11-08)
 - ~~v3 file capabilities apply only with rootid 0 and are not converted when set inside a user namespace (D4 in part)~~ → replaced by **D12** in 2aca260 (2026-11-08)
+- ~~The vDSO clock stubs skip seccomp filters for every clock (D5's tradeoff, round 59)~~ → replaced by **D5** in 16364c0 (2026-11-08)
+- ~~Sharing the fs context (`CLONE_FS`) does not suppress execve's privilege gains (D4's tradeoff, round 119)~~ → replaced by **D4** in 6d9a9e8 (2026-11-09, no SUPERSEDES declared)
+- ~~Credentials live in the thread group, so per-thread id syscalls and `setfsuid` change every thread (D1, round 08)~~ → replaced by **D1** in 1be1142 (2026-11-09)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -29,12 +29,12 @@
 - **Watch out**: Every loop in translated code must pass through a kick check.
 - **Source**: design review 2026-10-24 (§7.3, §7.4), round 04 (`04-m3a`)
 
-### D4: vDSO time functions are `svc` stubs served without the BKL
-- **What**: `clock_gettime`, `gettimeofday` and `clock_getres` in the vDSO enter the kernel and take the no-BKL fast path; there is no vvar page.
-- **Why**: Clocks must go through the kernel layer (time namespaces, the thread CPU clock), and the fast path makes the entry cheap.
-- **Tradeoffs**: Each call costs a kernel entry, unlike Linux's userspace vDSO (a vvar page reading `CNTVCT_EL0` remains a possible future step).
-- **Watch out**: The stubs must not stop under ptrace or seccomp, as on Linux where they never enter the kernel.
-- **Source**: design review 2026-10-24 (§7.2), rounds 25 (`25-stat-without-bkl`), 38 (`38-split-bkl`)
+### D4: vDSO clock reads run the host's own vDSO code, with `svc` stubs as the fallback
+- **What**: The guest's vDSO is the host's `[vdso]` (hal D18) with every symbol but the clock functions and the sigreturn trampoline made undefined and its Linux note set to 6.1.0, used once the interpreter has run its clock functions against host readings; otherwise, and in time namespaces with offsets, the built image's `svc` stubs take the no-BKL fast path.
+- **Why**: Every vDSO clock read entered the kernel layer, about 70 ns on top of the host's 19 ns, and Go, the JVM and node read clocks constantly.
+- **Tradeoffs**: Guests see the host kernel's vDSO code, build id and vvar size, a host vDSO the engine cannot run falls back to the stubs silently, gettimeofday reports the host's timezone (the device's on Android, not 0), and time namespaces with offsets keep the stub speed.
+- **Watch out**: Time-namespace detection reads the clock mode as the second word of the host's vvar data (Linux 5.6 on), an instruction a future host vDSO needs and the engine lacks shows only as the fallback, and the stubs must still not stop under ptrace or seccomp.
+- **Source**: 16364c0 (replacing the stubs of design review 2026-10-24 §7.2 and rounds 25, 38)
 
 ### D5: ptrace follows Linux 6.1, with tracers as processes
 - **What**: strace, gdb, delve, lldb and valgrind work through a Linux-compatible ptrace in which any thread of the tracer process may issue requests; there are no Yama restrictions.
@@ -58,11 +58,11 @@
 - **Source**: round 43 (`43-coredump`)
 
 ### D8: The kernel layer keeps its own printk-style log
-- **What**: A 128 KB / 4096-record ring buffer, read through `/dev/kmsg`, `syslog(2)` and `/proc/kmsg`, fed by guest writes and kernel-layer events (OOM kills, bug kills).
+- **What**: A 128 KB / 4096-record ring buffer, read through `/dev/kmsg`, `syslog(2)` and `/proc/kmsg`, fed by guest writes and kernel-layer events (OOM kills, bug kills, unhandled-exception reports (D23), the BKL watchdog's record of a long hold (kernel/process D38), cgroup fork rejections, low-port remapping and permission warnings).
 - **Why**: Processes killed by the OOM killer or internal errors showed only "Killed" in the terminal, with the reason in host logcat; `dmesg` and programs writing `/dev/kmsg` had nothing to use.
 - **Tradeoffs**: The host kernel's log is not available (Android's app seccomp forbids `syslog`).
 - **Watch out**: Permission rules (`dmesg_restrict`, `CAP_SYSLOG`) must match Linux so unprivileged reads behave the same.
-- **Source**: rounds 140 (`140-ioprio-syslog-adjtimex`), 143 (`143-kmsg`)
+- **Source**: rounds 140 (`140-ioprio-syslog-adjtimex`), 143 (`143-kmsg`); writers since added by 7b7f73b and 64a6107
 
 ### D9: `uname` reports a fixed Linux 6.1 as the ABI contract
 - **What**: The guest always sees `6.1.0-appine`, and unspecified behaviour follows Linux 6.1; a few newer features are deliberate exceptions.
@@ -72,11 +72,11 @@
 - **Source**: design review 2026-10-24 (§7.5), round 10 (`10-m8`); contract review 2026-11-02
 
 ### D10: Unimplemented syscalls return ENOSYS and never crash
-- **What**: The dispatcher's default arm returns `ENOSYS` and optionally logs locally (`APPINE_LOG=1`); io_uring stays `ENOSYS`.
+- **What**: The dispatcher's default arm returns `ENOSYS` and counts the call among the unimplemented paths (D24); io_uring stays `ENOSYS`.
 - **Why**: Guest programs probe syscalls and fall back on `ENOSYS`; a crash would take down the session. io_uring was tried (about 3800 lines for the interface and 49 opcodes) and abandoned.
 - **Tradeoffs**: Programs that require a missing syscall fail with an error instead of working.
-- **Watch out**: Keep the list of `ENOSYS` numbers documented (round 139).
-- **Source**: rounds 19 (`19-deferred`), 139 (`139-unimplemented-syscalls`)
+- **Watch out**: Keep the list of `ENOSYS` numbers documented (round 139, with the map noting those implemented since, such as process_mrelease).
+- **Source**: rounds 19 (`19-deferred`), 139 (`139-unimplemented-syscalls`); 99b4216, 39ea702
 
 ### D11: The guest cannot change host time
 - **What**: Setting the clock or modifying `adjtimex` is `EPERM`, as if `CAP_SYS_TIME` were missing; `adjtimex` queries report the host's NTP state.
@@ -86,11 +86,11 @@
 - **Source**: round 140 (`140-ioprio-syslog-adjtimex`)
 
 ### D12: Signals, ptrace, core dumps, the kernel log and the ABI contract are one kernel/signal module
-- **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log and the Linux 6.1 ABI contract (uname, the ENOSYS policy, clock setting), leaving host-side signal handling to engine and auxv to kernel/process.
+- **What**: kernel/signal covers signal generation and delivery, frames and sigreturn, the vDSO, ptrace, core dumps, the kernel log, the Linux 6.1 ABI contract (uname, Linux's errno numbers, the ENOSYS policy and the count of unimplemented paths, clock setting) and the debug log and syscall trace, leaving host-side signal handling to engine and auxv to kernel/process.
 - **Why**: The retired design doc's §7 was the only current-state description of signals, ptrace, core dumps and the ABI contract, and it said nothing about generation and delivery semantics.
-- **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, coalesced siginfo, hardware slots left armed after detach, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread and a repeated stop report after detaching at an attach-time group stop.
-- **Source**: 9e5be2b (bug list since updated by 4e64e74, ce8a9ce and 5d7b936, and shortened by D18–D21)
+- **Tradeoffs**: The project-wide ABI contract lives in a module map rather than a design section, rounds keep § references to the deleted section, and the harness map also lists the debug log's environment variables.
+- **Watch out**: Bugs confirmed at the split or found by Starnix's and gVisor's tests stay open in the map, among them an early `CLD_STOPPED`, late single-step reports, unforced ptrace reads, no `PTRACE_EVENT_EXIT` for threads ended by another thread, a repeated stop report after detaching at an attach-time group stop, `SIGILL` frames carrying an `esr_context` with EC 0 where Linux 6.1 emits none, and synthesized abort ESRs that differ from Linux's.
+- **Source**: 9e5be2b, d2b1dc3 (bug list since updated by 4e64e74, ce8a9ce, 5d7b936 and 7b7f73b, and shortened by D17–D21 and D25)
 
 ### D13: pidfd_send_signal through a `/proc/<tid>` directory signals the thread group
 - **What**: A `/proc/<tid>` directory fd finds its process with `group_of` and the signal goes to its tgid, as `kill_pid_info` does for such an fd up to Linux 6.8.
@@ -120,12 +120,12 @@
 - **Watch out**: A thread that blocks a signal another thread is slow to take wakes that thread repeatedly until it does.
 - **Source**: 22e2b41
 
-### D17: Detaching at a syscall stop keeps the syscall number
-- **What**: Detach keeps `syscallno` with the stop and saved registers of a stopped thread, and a tracer's exit detaches through the same path.
-- **Why**: The number of a thread stopped at syscall entry lives in its trace state so the tracer can change it, and detach reset it to 0.
-- **Tradeoffs**: None known.
-- **Watch out**: Other trace-state fields a stopped thread reads after resuming would be lost the same way, since only stop, regs, resume and syscallno are kept.
-- **Source**: b877707
+### D17: Detach keeps the syscall number and the hardware debug slots
+- **What**: Detach keeps `syscallno` with the stop and saved registers of a stopped thread, detach and attach carry the recorded hardware debug slots and their pending change over the reset of the trace state, and a tracer's exit detaches through the same path.
+- **Why**: The number of a thread stopped at syscall entry lives in its trace state so the tracer can change it, and detach reset it to 0; detach also wiped the recorded debug slots while the CPU kept trapping on those already applied, where arm64 Linux keeps them.
+- **Tradeoffs**: As on Linux, a tracer that dies with watchpoints set leaves the tracee trapping into `SIGTRAP`.
+- **Watch out**: Other trace-state fields reset by detach and attach would be lost the same way, since only stop, regs, resume, syscallno and the debug slots are kept.
+- **Source**: b877707, 6d9a9e8
 
 ### D18: A signal frame that cannot be used forces SIGSEGV through normal delivery
 - **What**: When `setup_frame` fails, delivery puts back a swapped sigsuspend/ppoll mask, leaves the mask alone and forces `SIGSEGV` with `SI_KERNEL` (`force_fatal` when the signal was `SIGSEGV`) before continuing the delivery loop, with restart decided once by the first signal taken; rt_sigreturn with a bad frame forces `SIGSEGV` at SP (`SEGV_ACCERR` when `Mm::mapped_above`, else `SEGV_MAPERR`; kernel/mm D28) and returns before the syscall-exit stop and delivery.
@@ -142,11 +142,11 @@
 - **Source**: 5d23297
 
 ### D20: Tracers keep their credentials and are judged over the tracee's user namespace
-- **What**: `Trace::cred` holds the tracer's credentials from `PTRACE_ATTACH`, `PTRACE_SEIZE`, `PTRACE_TRACEME` and auto-attach, and `tracer_capable` checks `CAP_SYS_PTRACE` over a given user namespace, so `PEEK*`/`POKE*` on a non-dumpable tracee are `EIO` unless the tracer was capable over its namespace, and execve's suppression of privilege gains under a tracer (kernel/cred D4) uses the same check.
-- **Why**: A tracer attached without `CAP_SYS_PTRACE` kept reading and writing a process that later made itself non-dumpable (ssh-agent), and a tracer privileged only inside a user namespace was judged in the initial one.
-- **Tradeoffs**: Each traced thread holds a cloned `Cred`.
+- **What**: `Trace::cred` holds the tracer's credentials from `PTRACE_ATTACH`, `PTRACE_SEIZE` and auto-attach and the caller's own from `PTRACE_TRACEME`, as Linux's `ptrace_link` records them, and `tracer_capable` checks `CAP_SYS_PTRACE` over a given user namespace, so `PEEK*`/`POKE*` on a non-dumpable tracee are `EIO` unless the tracer was capable over its namespace, and execve's suppression of privilege gains under a tracer (kernel/cred D4) uses the same check.
+- **Why**: A tracer attached without `CAP_SYS_PTRACE` kept reading and writing a process that later made itself non-dumpable (ssh-agent), a tracer privileged only inside a user namespace was judged in the initial one, and `PTRACE_TRACEME` kept the parent's credentials, letting a privileged parent that later runs child-controlled code keep a privileged ptrace relationship (CVE-2019-13272).
+- **Tradeoffs**: Each traced thread holds a cloned `Cred`, and a traced unprivileged child of a root parent gains nothing from setuid programs, as on Linux.
 - **Watch out**: Linux checks against `mm->user_ns` while Appine checks the namespace of the tracee's current credentials, which differ after setns into another user namespace.
-- **Source**: f6a82cc
+- **Source**: f6a82cc, 1be1142
 
 ### D21: rt_sigaction masks unknown flags, and sender-supplied siginfo keeps its fields
 - **What**: rt_sigaction masks flags with `UAPI_SA_FLAGS`, and `InfoFields::User` keeps `si_errno`, `si_pid` and `si_uid` (converted like `Queue`'s) and bytes 24 to 48 of siginfo given by rt_sigqueueinfo and the like, which signalfd reports with its errno and value.
@@ -161,3 +161,35 @@
 - **Tradeoffs**: None known.
 - **Watch out**: None known.
 - **Source**: e6bfdf8
+
+### D23: Unhandled exceptions are reported in the kernel log as arm64's `arm64_show_signal` does
+- **What**: While `debug.exception-trace` is non-zero (0 by default as on arm64, kernel/procfs D16, and 1 from boot in the app, kernel/process D35), `show_unhandled` logs each synchronous exception that ends an untraced process whose handler is default or ignored (page faults, `SIGBUS` past EOF, alignment, undefined instructions, `brk`, hardware breakpoints and bad rt_sigreturn frames) with Linux 6.1's names, the faulting mapping and the registers, at most 10 per 5 s kernel-wide.
+- **Why**: Guest programs killed by a fault left nothing in the kernel log beyond the shell's "Segmentation fault", and the Starnix survey listed arm64's per-fault report as a small gain.
+- **Tradeoffs**: A report takes about 16 of the log's 4096 records, synthesized ESRs name other levels and fault kinds than native, there is no Hardware name line, a bad sigreturn frame shows the caller's registers (D18), and seccomp's `SIGSYS`, unwritable frames and single-step traps go unreported, as on Linux.
+- **Watch out**: A program crashing in a loop keeps adding 10 reports per 5 s, pushing older records out of the log that bug reports carry, and a fault path added later without a `show_unhandled` call goes unreported.
+- **Source**: 7b7f73b
+
+### D24: Unimplemented paths are counted per kernel and named in bug reports
+- **What**: `stub.rs` keeps a table of the paths Appine does not implement (syscalls, prctl options, fcntl commands, ioctl requests by kind of file, madvise advice, futex commands, missing paths and devices without a driver), each with its count and first command and at most 128 paths, whose ten most-called go into `KillReason::Bug`'s report while `APPINE_LOG` writes each path's first hit and nothing reaches the guest.
+- **Why**: Unimplemented paths ended in a bare error code, at best one `ENOSYS` line under `APPINE_LOG`, so neither bug reports nor surveys showed what a failing workload had asked for; Starnix counts them with `track_stub!`.
+- **Tradeoffs**: Invalid values from tests take table slots, counts run per kernel since boot and a full table names no new paths, `KillReason::Bug` gained a public field, and `APPINE_LOG` no longer prints every `ENOSYS` call.
+- **Watch out**: A default arm that also returns Linux's own refusals counts noise unless filtered, as prctl's refused arguments and terminal ioctls on files that are not terminals are.
+- **Source**: 99b4216, c008749 (the unit test's device without a driver)
+
+### D25: A pending standard signal keeps the siginfo of its first send
+- **What**: `Pending::add` stores a standard signal's siginfo only when the signal becomes pending, as Linux's `legacy_queue` drops later sends.
+- **Why**: Later sends replaced the pending siginfo, so `SIGCHLD` from several children reported the last one and a forced `SIGSYS` replaced a pending `SI_TKILL`.
+- **Tradeoffs**: A synchronous fault forced while the same signal is already pending loses its fault siginfo, as on Linux.
+- **Watch out**: Code that relied on a later send refreshing the siginfo must update it in place, as POSIX timers add overruns through `infos_mut`.
+- **Source**: f5c09f7
+
+### D26: Signal permission and ptrace reports use the thread's own credentials
+- **What**: Over per-thread credentials (kernel/cred D1), `may_kill` judges tkill, tgkill and rt_tgsigqueueinfo by the target thread's credentials and process signals by the main thread's, a traced thread's exit and stop reports carry its own real uid, a signal the tracer replaces names the tracer's, and a core file name's `%u` and `%g` are the dumping thread's.
+- **Why**: Kill permission and ptrace reports used the process's credentials for thread targets, unlike Linux.
+- **Tradeoffs**: None known.
+- **Watch out**: A guest relying on threads sharing one set of credentials for signal permission sees per-thread results, as on Linux.
+- **Source**: 1be1142
+
+## Superseded
+
+- ~~vDSO time functions are `svc` stubs served without the BKL, with no vvar page (D4, rounds 25, 38)~~ → replaced by **D4** in 16364c0 (2026-11-08)

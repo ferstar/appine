@@ -1,11 +1,11 @@
 # kernel/fuse Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/fuse.md` for the paired decision history (decision history (not yet created).)
+> See `.claude/decisions/kernel/fuse.md` for the paired decision history.
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed; key bits; mounts in kernel/mount last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: INIT flags, flushes, appends, racing creates; mapped pages on demand; forgetting nodes; lazy unmounts; borrowed releases; key bits; mounts in kernel/mount; read-only instances last)
 
 ## Responsibilities
 
@@ -229,8 +229,9 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 ### Opening and creating
 
 - Open (6.1's `may_open`, `fuse_open_common`): a symlink ELOOP; a directory with write access,
-  `O_CREAT` or `O_TRUNC` EISDIR; `O_TRUNC` on a read-only mount EROFS; a device on a nodev mount
-  EACCES; permission; `O_NOATIME` by a non-owner EPERM; a write open on a read-only mount EROFS;
+  `O_CREAT` or `O_TRUNC` EISDIR; `O_TRUNC` on a read-only mount or instance (`readonly`) EROFS; a
+  device on a nodev mount EACCES; permission; `O_NOATIME` by a non-owner EPERM; a write open of a
+  regular file on a read-only mount or instance EROFS;
   writing a program being run ETXTBSY; `O_DIRECTORY` on a non-directory ENOTDIR. Then
   `FUSE_OPENDIR` or `FUSE_OPEN` with the open flags less `O_CREAT`, `O_EXCL`, `O_NOCTTY` (and
   `O_TRUNC` without `ATOMIC_O_TRUNC`, which then is a SETATTR after the open). An ENOSYS answer

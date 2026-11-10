@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -23,11 +23,11 @@
 - **Source**: rounds 125 (`125-raw-icmp`), 128 (`128-traceroute`)
 
 ### D3: Netlink is answered in process; unimplemented protocols cannot be created
-- **What**: `NETLINK_ROUTE` replies are built from the host's `getifaddrs`, the synthesized routing table and the virtual devices, matching Linux's message layout; `NETLINK_GENERIC` has `nlctrl`; `NETLINK_KOBJECT_UEVENT` sockets never receive; any other protocol is `EPROTONOSUPPORT`.
+- **What**: `NETLINK_ROUTE` replies are built from the host's `getifaddrs`, the synthesized routing table and the virtual devices, matching Linux's message layout; `NETLINK_GENERIC` has `nlctrl`; `NETLINK_KOBJECT_UEVENT` sockets never receive; `NETLINK_SOCK_DIAG` opens (D24); any other protocol is `EPROTONOSUPPORT`.
 - **Why**: Apps cannot use the host's netlink fully on Android. Creating sockets for unimplemented protocols made PAM's libaudit wait 40 s for an ACK and fail every Debian/Ubuntu login; `EPROTONOSUPPORT` is what Linux returns without the subsystem. Generic netlink always exists on Linux, and programs (iw, ethtool, wg, iotop) expect the socket to open and then look up their family.
-- **Tradeoffs**: No multicast notifications; host interfaces and routes cannot be changed.
+- **Tradeoffs**: Multicast notifications only for rtnetlink's link, address and route changes (D26); host interfaces and routes cannot be changed.
 - **Watch out**: Single (non-dump) `RTM_GETLINK`/`RTM_GETROUTE` requests are used by iproute2 and scripts and must be answered.
-- **Source**: rounds 06 (`06-m4`), 83 (`83-netlink-protocols`), 91 (`91-generic-netlink`), 101 (`101-link-addr`)
+- **Source**: rounds 06 (`06-m4`), 83 (`83-netlink-protocols`), 91 (`91-generic-netlink`), 101 (`101-link-addr`); 39ea702, 7a13dd2
 
 ### D4: The routing table is synthesized like Linux's, from routes the app passes in
 - **What**: Main and local tables are built as Linux builds them without custom rules; on Android the main table comes from the default network's `LinkProperties.getRoutes()` through `Machine::set_routes`, elsewhere from the host's `/proc/net/route`; `ip route get` lets the host choose the source address.
@@ -68,8 +68,8 @@
 - **What**: kernel/net covers `net.rs`, `syscall/net.rs`, raw ICMP, the routing table, the port map, traffic counters and `SO_ORIGINAL_DST`, with host socket wrappers in hal and the namespace hooks described from kernel/netns's side.
 - **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits.
 - **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, netlink memberships that never receive and destination addresses that are ignored, one echo id per raw ICMP socket, raw ICMP sockets that cannot be bound to another address or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297 and 5d7b936)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, notifications for rtnetlink change requests only, netlink destination addresses that are ignored, one echo id per raw ICMP socket, raw ICMP sockets that cannot be bound to another address or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2)
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -165,9 +165,30 @@
 ### D23: Netlink options, getpeername and socketpair follow Linux's rules
 - **What**: `SockOpts` records generic options and reads them back by Linux's rules; netlink sockets gain a type, groups, flags, `SO_PASSCRED` and a send timeout, with bind, connect, autobind, `SOL_NETLINK` options, pktinfo and kernel credentials on receive; `SO_*TIMEO_NEW` map to the old options; getpeername reports the connected peer as Linux does; socketpair returns Linux's `EINVAL`, `ESOCKTNOSUPPORT` or `EPERM`; and rtnetlink change types up to `RTM_MAX` are `EPERM` without `CAP_NET_ADMIN`.
 - **Why**: Netlink options were misreported (`SO_TYPE` 0, no memberships, no autobind, `SO_PASSCRED` ignored), `SO_*TIMEO_NEW` had no effect, getpeername echoed the connect address, socketpair's errnos differed, and unprivileged rtnetlink changes answered `EOPNOTSUPP`.
-- **Tradeoffs**: Memberships and buffer sizes are only recorded, and autobind does not look for other sockets holding the tgid.
+- **Tradeoffs**: Buffer sizes are only recorded, memberships receive only rtnetlink's link, address and route notifications (D26), and autobind does not look for other sockets holding the tgid.
 - **Watch out**: Programs that relied on unknown netlink levels being accepted now get `ENOPROTOOPT`, and a wildcard connect from a socket bound to its own address reports the loopback.
-- **Source**: 5d7b936
+- **Source**: 5d7b936, 7a13dd2
+
+### D24: `NETLINK_SOCK_DIAG` opens and answers like a 6.1 kernel without its diag modules
+- **What**: `NETLINK_SOCK_DIAG` sockets open, and `sock_diag_request` answers `TCPDIAG`/`DCCPDIAG` with `EOPNOTSUPP`, `SOCK_DIAG_BY_FAMILY` and `SOCK_DESTROY` with `EINVAL` (short body, family at or past `AF_MAX`) or `ENOENT`, and other types with `EINVAL`, honouring `NETLINK_CAP_ACK` and acking non-requests only on `NLM_F_ACK`.
+- **Why**: ss printed "Cannot open netlink socket: Protocol not supported" for every table, since `NETLINK_SOCK_DIAG` sockets could not be created.
+- **Tradeoffs**: ss shows only what `/proc/net` gives, without socket memory, timers or diag-only details.
+- **Watch out**: A program that needs sock_diag data gets `ENOENT`, where it used to fail at socket().
+- **Source**: 39ea702
+
+### D25: Socket ioctls nothing takes are counted as unimplemented paths
+- **What**: The default arms of `interface_ioctl` and `netns_ioctl` count the request as on a socket in kernel/signal's table of unimplemented paths (kernel/signal D24), while netlink's `FIONREAD` stays uncounted, its `ENOTTY` being Linux's too.
+- **Why**: Socket ioctls the interface passthrough does not take (`SIOCOUTQ`, `SIOCGSTAMP`) and unhandled ones in a new network namespace went unrecorded.
+- **Tradeoffs**: Requests the host socket itself refuses are not counted.
+- **Watch out**: None known.
+- **Source**: 99b4216
+
+### D26: rtnetlink link, address and route changes are notified by diffing namespace snapshots
+- **What**: Every `NETLINK_ROUTE` socket is registered weakly in `Kernel::rtnl_sockets`, and a change request (an rtnetlink `RTM_NEW`/`DEL`/`SETLINK`, `NEW`/`DELADDR` or `NEW`/`DELROUTE` diffed in `KernelHost::configure`, or an interface, address or route ioctl) snapshots each namespace with a socket in groups 1, 5, 7, 9 or 11 before and after, encoded as dumps, and queues the difference as Linux-ordered `RTM_NEWLINK`, `DELADDR`/`NEWADDR`, `DELROUTE`/`NEWROUTE` and `DELLINK` on every member socket, the sender included, with the group in `nl_groups` and `NETLINK_PKTINFO`, and `ENOBUFS` after 1024 queued datagrams unless `NETLINK_NO_ENOBUFS`.
+- **Why**: Joined rtnetlink groups never received anything, so ip monitor, systemd-networkd's sd-netlink and libnl-based tools subscribed and waited forever.
+- **Tradeoffs**: The device layer stays untouched and unlistened namespaces cost nothing, but several steps of one request collapse, sysctl and host interface changes are not notified, seq, port and flags are 0, `NLM_F_ECHO` is ignored, the cap counts datagrams rather than `SO_RCVBUF` bytes, and no suite test could be unskipped because their multicast tests change host lo.
+- **Watch out**: Each change request with a listener rebuilds the namespace's link, address and route messages twice (quadratic for batches over thousands of addresses, with host getifaddrs and route reads in the boot namespace), and a dump encoding that varies between calls would notify spuriously.
+- **Source**: 7a13dd2
 
 ## Superseded
 

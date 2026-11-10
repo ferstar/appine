@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -33,8 +33,8 @@
 - **What**: kernel/unix covers `unix.rs` and `syscall/unix.rs`, separate from kernel/net.
 - **Why**: The retired design doc's §10 gave a single line to a full in-process socket family with its own garbage collector.
 - **Tradeoffs**: Its map was verified more lightly (two research concerns, one verifier) than the large modules'.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them no `ECONNRESET`, stream reads split and merged at the wrong places, credentials attached to messages sent without `SO_PASSCRED`, recvmsg copy faults that can still lose data, no sender address on connections and abstract names keyed without the socket type.
-- **Source**: c3df5d3 (bug list since updated by 2b72eeb and ce8a9ce)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them stream reads split and merged at the wrong places, credentials attached to messages sent without `SO_PASSCRED`, recvmsg copy faults that can still lose data, sender names taken when sent rather than when received and connected datagram sockets that are never reset.
+- **Source**: c3df5d3 (bug list since updated by 2b72eeb, ce8a9ce and 90a11cd)
 
 ### D5: AF_UNIX parses socket timeouts with kernel/net's parser
 - **What**: Unix sockets use net's `timeval()` for `SO_RCVTIMEO` and `SO_SNDTIMEO` instead of their own copy.
@@ -77,3 +77,24 @@
 - **Tradeoffs**: Data that arrives while recvmsg waits can still be lost on a copy fault, and connected sends skip the may-send check (both recorded in the map).
 - **Watch out**: The prefix check reads the queue length under the socket borrow before blocking.
 - **Source**: 5d7b936
+
+### D11: Binding a socket in an overlay reports `IN_CREATE` on the overlay directory
+- **What**: bind takes the overlay directory from `create_parent_at` and reports through `fs::created_events`, as mkdir, mknod and symlink do (kernel/vfs D46).
+- **Why**: Binding an AF_UNIX socket to a path in an overlay creates a name there, which watches on the overlay directory should see as `IN_CREATE`.
+- **Tradeoffs**: The upper directory also gets the `IN_CREATE`, as for the other creations.
+- **Watch out**: None known.
+- **Source**: d7076fc
+
+### D12: Datagram receive queues are limited by `max_dgram_qlen`
+- **What**: Each datagram socket records the namespace's `max_dgram_qlen` at creation and its connected peer (kept by `set_dgram_link`), and sends and a connected sender's `POLLOUT` wait while the receiver's queue holds more than the limit unless the receiver is connected back, as `unix_recvq_full` does.
+- **Why**: Datagram receivers had no message limit, so a logger kept sending 212992 one-byte messages to a stopped syslogd where Linux makes it wait after 11, and poll reported such a sender writable.
+- **Tradeoffs**: A peer's sends are still limited by payload bytes rather than Linux's per-message truesize, so a socketpair queues more small datagrams than Linux before blocking.
+- **Watch out**: Code that relinks a datagram socket without `set_dgram_link` leaves `peer` stale.
+- **Source**: 6d9a9e8
+
+### D13: Closing with unread data resets the peer, abstract names are keyed by type, and connections return sender names
+- **What**: Dropping a socket whose receive queue is not empty, or a server end not yet accepted, sets `Channel::reset` for its peer, reported once as `ECONNRESET` by a stream read after the queue empties, a seqpacket read before anything queued and `SO_ERROR`, and as `POLLERR` until then; abstract names are keyed by namespace, type and bytes, with autobind per type; and stream and seqpacket messages carry the sender's bound name, a stream read returning the first message's.
+- **Why**: Closing with unread data gave the peer only EOF where Linux reports `ECONNRESET`, which servers and clients use to tell a crash from an orderly close, recvfrom on a connection gave no sender name, and an abstract name taken by one socket type blocked every other type, so gVisor's tests for all three were skipped.
+- **Tradeoffs**: The sender's name is the one bound when it sent, not at receive time as on Linux, and connected datagram sockets still never get `unix_dgram_disconnected`'s `ECONNRESET` (both recorded in the map).
+- **Watch out**: Peers of a program that closes with unread data now see `ECONNRESET` before EOF, as on Linux, and a new way of closing a stream end that bypasses `Drop` would miss the reset.
+- **Source**: 90a11cd

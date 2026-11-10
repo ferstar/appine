@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -51,8 +51,8 @@
 - **What**: android/documents covers `Documents.kt`, while the store-side browse API stays in kernel/store.
 - **Why**: §11.3 of the retired design doc, shared storage, needed a home.
 - **Tradeoffs**: Reading out of the home through symlinks remains an accepted limitation.
-- **Watch out**: Grants outlive moved or deleted directories (open in the map).
-- **Source**: 12c4afa
+- **Watch out**: Transient grants on a moved or deleted directory's descendants outlive it (open in the map); persisted ones are revoked (D10).
+- **Source**: 12c4afa (bug list since updated by 3f761df)
 
 ### D8: Provider helpers follow the framework callbacks that use them
 - **What**: `Documents` keeps its framework callbacks in order (roots, queries, open, changes, search) and puts each helper after its first use, `closer` next to `openDocument`, its only user.
@@ -67,6 +67,13 @@
 - **Tradeoffs**: Files outside the home open only with "Show the whole system in Files" on; viewers can read but not save, so edits go through the Files app; `/proc`, `/dev` and other mounts are not in the store, so links into them count as missing.
 - **Watch out**: The Kotlin ID encoding must change together with the native `encode_path` (D2); the host is matched against `/etc/hostname`, not the running host name; `findDocumentPath` now also serves the Files app's own navigation.
 - **Source**: 1cc504b
+
+### D10: Moving or deleting a directory revokes the persisted grants below it
+- **What**: `revokeTree` revokes the source document's ID and then every persisted outgoing grant on this provider whose document (a tree URI by its tree's document) is the path or lies below it (`Documents.grantedUnder`).
+- **Why**: Grants on the descendants of a deleted or moved directory survived, and since IDs are paths (D2) they covered a file created at the same path later.
+- **Tradeoffs**: Transient grants, given for an activity, cannot be listed and last until that activity ends (map debt).
+- **Watch out**: A failing `getOutgoingPersistedUriPermissions` counts as no grants, and revoking the provider's own URIs relies on the framework's documented behaviour, not exercised end to end.
+- **Source**: 3f761df
 
 ## Superseded
 

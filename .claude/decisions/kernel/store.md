@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/store"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D9 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D9 were seeded by hand from the retired design doc
 > §8.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -75,8 +75,8 @@
 - **What**: kernel/store covers `vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs` and the host wrappers in `lib.rs` (the namespace and objects, deferred commits and power-loss ordering, the reaper and checkpoints, boot cleanup, the metadata cache, import and the browse API), with the VFS layer above it in kernel/vfs.
 - **Why**: The retired design doc's §8.1 described the store in prose that had drifted from the code.
 - **Tradeoffs**: The rationale lives only in this decisions file, and rounds keep § references to the design doc of their time.
-- **Watch out**: Bugs confirmed at the split stay open in the map: leaked objects and misreported import errors.
-- **Source**: c5236a1 (bug list since updated by 907b82b and c108be0)
+- **Watch out**: Bugs confirmed at the split stay open in the map (leaked objects and misreported import errors), and so do four debts of sharing (D17): shared mappings left on the old object by a Files app write, a deleted held file keeping its share until boot, reads never updating a held file's access time, and whole-file copies on the first change.
+- **Source**: c5236a1 (bug list since updated by 907b82b, c108be0, df6ee70 and 1f99a1c)
 
 ### D11: Boot cleanup keeps the numbers it removed away from the reaper
 - **What**: `remove_orphans` drops the inode numbers it just deleted from the doomed list, so the boot commit hands none of them to the reaper.
@@ -119,3 +119,10 @@
 - **Tradeoffs**: st_blocks varies with the host filesystem (APFS on a macOS development host frees zeroed ranges; f2fs keeps inline data).
 - **Watch out**: Hosts that report delayed allocation late would undercount tmpfs writes until the instance is recounted.
 - **Source**: 5d7b936
+
+### D17: Files share a store object until one is written
+- **What**: `share` makes a file use another's object, recorded in the `shared` table that the cached row joins, the first change to either side unshares it (`unshare`, `finish_unshare`, `abandon_unshare`, or `make_private` for all three under the BKL; in place when no other row uses the object, else into an object numbered by an nlink-0 row), boot drops the shares of deleted files and removes objects nothing uses, and `Store::host_writing` keeps an object the Files app has open for writing (`HOST_WRITERS`, kept by `browse::open_write` and `browse::written`) out of sharing, for kernel/vfs's clones and overlay copy-up (kernel/vfs D45 and D40).
+- **Why**: Copying files cost their whole data in time and flash although most copies are never changed, phones' host filesystems have no reflink, and a guest clone made while the Files app held the host object open for writing would have received the app's later writes.
+- **Tradeoffs**: Sharing is whole-file, so the first change copies everything; reads never update a held file's atime; a deleted held file that was open keeps its share until boot; a close the provider never reports keeps its object out of sharing until the process ends; an older build opening a store with shares reads the wrong objects.
+- **Watch out**: Nothing may write a held file's object in place, `drop_object` trusts without a query that no row uses a plain file's number, numbers used as objects must keep their rows at boot, browse callers must report every close through `written` with the path they opened, and a Files app write that unshares a file leaves the running kernel's shared mappings on the old object (a map bug).
+- **Source**: df6ee70, 1f99a1c

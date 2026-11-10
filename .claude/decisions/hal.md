@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -84,12 +84,12 @@
 - **Watch out**: Hosts that hide pagemap fall back to "has private pages".
 - **Source**: e03c0cc
 
-### D13: The host's `/proc/vmstat` is read through hal
-- **What**: `host_vmstat` returns the host's text, or None when it is unreadable or on non-Linux hosts (kernel/procfs D18).
-- **Why**: The kernel layer reads host files through hal.
+### D13: The host's `/proc/vmstat` and `/proc/swaps` are read through hal
+- **What**: `host_vmstat` and `host_swaps` return the host's text, or None when it is unreadable or empty, for the guest's `/proc/vmstat` (kernel/procfs D18) and `/proc/swaps` (kernel/procfs D30).
+- **Why**: The kernel layer reads host files through hal, and the guest's `/proc/swaps` copies the host's.
 - **Tradeoffs**: None.
-- **Watch out**: None known.
-- **Source**: 60921b2
+- **Watch out**: Android probably refuses `/proc/swaps` to apps, so phones show only its header.
+- **Source**: 60921b2, 39ea702
 
 ### D14: Host waits retry interrupts, and the hal's signal handlers keep errno
 - **What**: `poll_until` retries `EINTR` up to a deadline set once per server (once in all on Android), the SIGWINCH handler saves and restores errno, and `stop_notifier` catches SIGINT, SIGTERM and SIGHUP into a pipe for the CLI, undoing itself when a sigaction fails.
@@ -104,6 +104,34 @@
 - **Tradeoffs**: A host filesystem without a mode answers `EOPNOTSUPP` and the callers fall back.
 - **Watch out**: Android's app seccomp is assumed to allow fallocate and `MADV_REMOVE`; bionic exposes both, but this was checked only by building for the target.
 - **Source**: 5d7b936
+
+### D16: Stall reports ask the host what a stuck thread is doing
+- **What**: `thread_activity(tid)` returns a host thread's comm and whether it is running, in a host syscall (from `/proc/self/task/<tid>/syscall`) or in the state its `stat` shows, for the BKL watchdog's reports (kernel/process D38).
+- **Why**: A report of a stuck BKL holder needs to say whether its host thread spins or blocks in a host syscall, which the kernel's own records cannot show.
+- **Tradeoffs**: It gives no host backtrace, and the syscall file is readable only by the process itself.
+- **Watch out**: A host policy that refuses the syscall file silently falls back to the state letter.
+- **Source**: 64a6107
+
+### D17: A shared file mapping is re-pointed with one fixed host mapping
+- **What**: `map_file_over(base, len, fd, offset, writable)` maps a host file over an existing range with `MAP_FIXED`, so threads touching the range see the old file or the new one but never a hole, for shared mappings that follow a file to its own store object (kernel/mm D37).
+- **Why**: Re-pointing a shared file mapping at another host file in place needs a fixed mapping.
+- **Tradeoffs**: None known.
+- **Watch out**: The function is unsafe: a wrong range replaces unrelated memory.
+- **Source**: df6ee70
+
+### D18: The host's vDSO, vvar pages and timezone are found through hal
+- **What**: `host_vdso` takes the vDSO from `AT_SYSINFO_EHDR` and its length and the contiguous `[vvar*]` mappings below it from `/proc/self/maps`, and `timezone` makes the raw gettimeofday syscall, since glibc's wrapper zeroes the timezone (kernel/signal D4, kernel/mm D38).
+- **Why**: Guests run the host's vDSO for clock reads, which needs where the host mapped it and its data pages, and gettimeofday reports the host kernel's timezone.
+- **Tradeoffs**: Each kernel reads `/proc/self/maps` once.
+- **Watch out**: None known.
+- **Source**: 16364c0
+
+### D19: Host files in memory come from memfd_create
+- **What**: `memfd(name)` creates a close-on-exec memfd, available on Android 30+ and Linux, for the FUSE files copied for execve and the sparse files FUSE mappings read into (kernel/mm D40, kernel/fuse D1).
+- **Why**: FUSE files have no host object, so their mappings and execve need host files in memory.
+- **Tradeoffs**: The pages copied into them take the app's memory.
+- **Watch out**: None known.
+- **Source**: c008749
 
 ## Superseded
 

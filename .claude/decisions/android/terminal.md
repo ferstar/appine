@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -32,7 +32,8 @@
 - **What**: android/terminal holds `MainActivity`, `TabBarView`, the `Vt*` view and session files, `ConsolePty`, `ExtraKeysView`, `LicensesActivity`, `res/`, the terminal fonts and the vt.c/vt.rs shim; building libghostty-vt belongs to android/native.
 - **Why**: §11.5 of the retired design doc needed a map, and the app was split into modules by responsibility rather than folding the UI into android/service.
 - **Tradeoffs**: `ConsolePty` and `VtSession` are filed here although the service creates and owns them.
-- **Source**: 12c4afa (file list since updated by 394aecf, 6ffb912, b38d29c, d965886)
+- **Watch out**: The map's open debts are no triple-tap or rectangular selection, libghostty-vt features left unwired or unused (the OSC 9;4, 7501, 7 and 133 callbacks, search, scrollback compression, snapshot restore, some reports and a terminal reset), and views that keep the sizes they were built with after a display size change until the activity is created again.
+- **Source**: 12c4afa (file list since updated by 394aecf, 6ffb912, b38d29c, d965886; map fully refreshed in d9e1f0c)
 
 ### D7: Selection, paste, mouse and focus go through libghostty-vt
 - **What**: Under the tab's lock, vt.c keeps the selection as the terminal's own (a long press selects a word as a tracked anchor, finger or handle drags extend it and autoscroll beyond the grid), pastes through `ghostty_terminal_paste` (asking with a preview when it returns REJECTED), and encodes mouse clicks and wheel, alternate-scroll arrows (mode 1007) and focus (mode 1004); frame and row headers carry the selection for `VtView`'s highlight and handles, keys add releases and lone modifiers for the Kitty protocol, and the IME turns a lone newline into Enter and a multi-line commit into a paste.
@@ -42,11 +43,11 @@
 - **Source**: ee830a0; 62f6092 (mouse tracking and double taps replaced by D25); f77b591 (handles at the edges, D34)
 
 ### D8: libghostty-vt is the only terminal, and each tab is a `VtSession` owned by the service
-- **What**: `TerminalService` owns one `VtSession` per tab, which keeps parsing output without a view (starting its shell once a view knows the grid, printing restored text and queued messages first, with pump, waiter and writer threads); `MainActivity` has a single `VtView` that tabs attach to and closes an ended tab on Enter; the Termux libraries, `TermuxSession` and the `Session` interface are gone, `ConsolePty` keeps only start, waitFor and close, and the fonts are main assets.
+- **What**: `TerminalService` owns one `VtSession` per tab, which keeps parsing output without a view (starting its shell once a view knows the grid, printing restored text and queued messages first, with pump, waiter and writer threads) and tells the service's kill-report routing through `consoleOpen` (started and not hung up) whether its console is still open, since `console` keeps its number after close (android/service D8); `MainActivity` has a single `VtView` that tabs attach to and closes an ended tab on Enter; the Termux libraries, `TermuxSession` and the `Session` interface are gone, `ConsolePty` keeps only start, waitFor and close, and the fonts are main assets.
 - **Why**: The debug-only prototype screen could not be saved, restored, reached by kill reports or closed like a tab; once libghostty-vt tabs covered everything the Termux tabs did, keeping two emulators meant two code paths, a `Session` interface and GPL-3.0-only vendored code in the app.
-- **Tradeoffs**: Every Android build needs Zig 0.17.0 and the fetched Ghostty source (android/native D6); the bell and triple-tap or rectangular selection are still missing; `VtView`'s focus highlight is off, so keyboard focus is not shown.
+- **Tradeoffs**: Every Android build needs Zig 0.17.0 and the fetched Ghostty source (android/native D6); triple-tap and rectangular selection are still missing; `VtView`'s focus highlight is off, so keyboard focus is not shown.
 - **Watch out**: libghostty-vt has been tried only on a 4 KB-page emulator with Gboard in English; real devices, 16 KB pages and CJK input methods are unchecked.
-- **Source**: 6ffb912, b38d29c; 62f6092 and f77b591 (drags, double taps and edge-aware handles since added, D25 and D34)
+- **Source**: 6ffb912, b38d29c; 62f6092 and f77b591 (drags, double taps and edge-aware handles since added, D25 and D34); d89b5fa (the bell since wired, D36); 6560af6 (`consoleOpen`, for a bug d9e1f0c recorded)
 
 ### D13: The app is Material 3 with dynamic colours, the terminal always dark
 - **What**: `Theme.Appine` (Material 3 DayNight) serves Settings and the licences on shared page layouts and `Theme.Appine.Terminal` (Material 3 Dark, with a black window and system bars) serves `MainActivity`, both with DynamicColors; the terminal stays a framework `Activity` using Material dialogs and AppCompat's menus and list popup, and its hand-built tab bar and extra keys, black like the terminal, read the theme's colour roles through `MaterialColors`.
@@ -126,11 +127,11 @@
 - **Source**: 1cc504b
 
 ### D32: libghostty-vt does not advertise Kitty graphics or the Glyph Protocol
-- **What**: vt.c sets each terminal's Kitty image storage limit to 0 (the library then ignores the protocol and answers no queries) and turns the Glyph Protocol off; the other libghostty-vt features the terminal leaves unwired (OSC 52 and other OSC callbacks, search, scrollback compression, snapshot restore, cursor blinking and more) are listed in the map.
+- **What**: vt.c sets each terminal's Kitty image storage limit to 0 (the library then ignores the protocol and answers no queries) and turns the Glyph Protocol off; the other libghostty-vt features the terminal leaves unwired (the OSC 9;4, 7501, 7 and 133 callbacks, search, scrollback compression, snapshot restore and more) are listed in the map.
 - **Why**: libghostty-vt answers both protocols' queries positively by default while `VtView` draws only cells, so programs that probe (yazi, chafa, timg, `kitten icat`) would send images or glyphs that never appear instead of falling back to text.
 - **Tradeoffs**: No inline images until drawing them is implemented (a PNG decoder through `ghostty_sys_set`, the render state's image list and a frame format change); the library still carries both protocols' code.
 - **Watch out**: A libghostty-vt upgrade could change what a limit of 0 means or reset it on some path (a full reset keeps it today because the alternate screen copies the primary's limit); not yet tried with real image viewers on a device.
-- **Source**: fcf4c93, c510bee
+- **Source**: fcf4c93, c510bee; d89b5fa (OSC 52 and cursor blinking since wired, D36)
 
 ### D33: A kill report first returns the parser to ground with CAN
 - **What**: When `GHOSTTY_TERMINAL_DATA_VT_GROUND` says the parser is inside a sequence, `appine_vt_message` writes a CAN (0x18) before inserting the report as in D2.
@@ -153,6 +154,20 @@
 - **Watch out**: A panic inside the pump leaves that tab's output unread until it is reopened.
 - **Source**: be72f31
 
+### D36: Bells, OSC 52 clipboard writes, OSC 9/777 notifications and cursor blinking are wired
+- **What**: vt.c records effects during `feed` (a bell count, the last clipboard write as text/plain up to 256 KiB or a clear, the last notification's title and body up to 4 KiB), the pump takes them after each read (`appine_vt_take_effects`) and calls `VtSession.onBell`, `onClipboard` and `onNotification` (routed by android/service D19), clipboard reads go unanswered, `VtView.bell` vibrates with the REJECT haptic at most every 100 ms, the cursor blinks every 500 ms only while the program asks for it and the view and window have focus, and `MainActivity` shows the tab a notification names (`EXTRA_TAB`) once bound.
+- **Why**: Programs' bells, OSC 52 writes, OSC 9/777 notifications and blinking cursors were ignored though libghostty-vt reports them, so copying from tmux or neovim and noticing a CLI waiting for input in another tab were impossible.
+- **Tradeoffs**: Several notifications in one read keep only the last; only text clipboard contents are supported, and a write over 256 KiB is denied rather than cut; bells and notifications pass through the main thread's queue.
+- **Watch out**: The effects struct is shared by vt.c and vt.rs and must change on both sides; the vibration depends on the system's touch-feedback setting; real devices and Android 11 and 12 were not tried.
+- **Source**: d89b5fa (with android/service D19)
+
+### D37: ⋮ has a label, the menu key reaches programs and resize reports go out at once
+- **What**: ⋮ is described by the `more_options` string ("More options", "更多选项"); `VtView.systemKey` no longer counts `KEYCODE_MENU` as a system key, so its presses and releases reach `VtKeys`; `VtNative.resize` takes the replies (the mode 2048 size report) under the tab's lock after `appine_vt_resize` and returns them for `VtSession.resize` to send through `write`, as a paste's bytes are.
+- **Why**: ⋮ was the only tab bar button TalkBack could not name, a hardware keyboard's menu key never reached programs although `VtKeys` mapped it, and a resize's size report waited for the pump's next read.
+- **Tradeoffs**: The menu key no longer reaches the activity, which has no options menu, and resize replies can reach the console out of order with replies the pump takes later, as a paste's can.
+- **Watch out**: An IME or launcher sending `KEYCODE_MENU` now types `CSI 29 ~` into the program, and `VtNative.resize`'s signature changed in both vt.rs and VtNative.kt.
+- **Source**: 64e5c33 (bugs recorded in the full refresh d9e1f0c)
+
 ## Superseded
 
 - ~~D1: Termux's terminal libraries are vendored, with `TerminalSession` rewritten around a PTY interface~~ → replaced by **D8** in b38d29c (2026-11-04)
@@ -169,3 +184,4 @@
 - ~~The current tab told apart by the primary colour (D13 in part, d16025a), then boxed in a 2 dp outline with a bold number (1eac62e)~~ → replaced by **D20** in d48dd10 (2026-11-06)
 - ~~A long press always selects even when the program tracks the mouse, which gets only clicks and the wheel, and there is no double-tap selection (D7 in part, ee830a0)~~ → replaced by **D25** in 62f6092 (2026-11-07)
 - ~~Slid tabs cross-fade their numbers (200 ms), and the indicator jumps when another tab is shown (D24 in part, afd086a)~~ → replaced by **D24** in 1c6c1bc and 759d0b4 (2026-11-07)
+- ~~No bell (D8's tradeoff, b38d29c), and OSC 52 and cursor blinking among the libghostty-vt features left unwired (D32 in part, fcf4c93)~~ → replaced by **D36** in d89b5fa (2026-11-09)

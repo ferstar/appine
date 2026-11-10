@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-10 (HEAD = d2b1dc3)
+> Last distilled: 2026-11-10 (HEAD = 300d384)
 
 ## Active
 
@@ -17,8 +17,8 @@
 - **What**: Each migration commit's module-scope Decision becomes one scope entry, a block replacing part of an entry is merged into the chain's latest entry, supersessions without a SUPERSEDES line or recorded under another module are listed under Superseded and flagged at review, hand-seeded entries naming removed code get minimal edits with the new hashes in Source, and "Last distilled" says which entries were seeded by hand; a fix spanning modules gets one entry per module that refer to each other, blocks sharing one approach form one cluster entry, entries a later block refines are edited with its hash added to Source, scope entries' Watch out names only bugs still open in the map, and a revert without a Decision and replaced parts of entries or clusters become Superseded lines; distills read develop only, a block that only changes a map's bug records is folded into the scope entry's Watch out and Source, and a commit recording a deviation joins the cluster of the commit that fixes it; a snapshot past about 30 full entries gets a constraint index of one-line bullets whose full text a named commit holds, while entries edited or added in a batch stay in full.
 - **Why**: Five snapshots had Decision blocks committed after their hand seeding and knowledge-loop had none, distilling from commits for the first time raised cases the snapshots had no rule for, and the first distill of every module added cross-module fixes, test-only blocks and refinements of existing entries; the fourth distill (89 blocks from 44 commits) met commits only on explore/hybrid, map-only bug records and recording commits followed by their fixes.
 - **Tradeoffs**: Scope entries repeat part of `MODULES.md`, one-sentence fields and cluster entries drop details that stay in the source commits, a cross-module fix is spread over several snapshots, implicit and cross-module supersessions rest on judgment rather than SUPERSEDES lines, and the explore/hybrid commits' Decisions are in no snapshot.
-- **Watch out**: Edited hand-seeded entries keep their IDs, which later distills must preserve, and possible merges left separate (android/setup D13 and D5, kernel/netns D10 and D4) may want merging later, as may android/terminal D22 into D18, D14 with D15 and android/setup D15 into D12; the 2026-11-08 distill gave kernel/vfs, kernel/mm, kernel/process, android/terminal and harness constraint indexes, and kernel/procfs, at 29 entries, is next.
-- **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d
+- **Watch out**: Edited hand-seeded entries keep their IDs, which later distills must preserve, and possible merges left separate (android/setup D13 and D5, kernel/netns D10 and D4) may want merging later, as may android/terminal D22 into D18, D14 with D15 and android/setup D15 into D12; the 2026-11-08 distill gave kernel/vfs, kernel/mm, kernel/process, android/terminal and harness constraint indexes, and the 2026-11-10 distill indexed kernel/procfs and a second kernel/process batch, both pinned to 260512d; kernel/signal and kernel/net, at 26 entries each, are next.
+- **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d, a536142
 
 ### D3: A map's Maintained line is one sentence
 - **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh.

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-08 (HEAD = fffe1c1). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -41,31 +41,32 @@
 - **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038
 
 ### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
-- **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records); OpenRC services that failed at boot are notified too.
+- **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records, and the unimplemented paths the killed process reached); OpenRC services that failed at boot are notified too.
 - **Why**: Tabs used to show only "Killed" or "Segmentation fault", which does not tell an OOM kill from an Appine bug; after release the copied report is what a user can bring to the developer.
-- **Tradeoffs**: Reports are polled, so they arrive after the shell's prompt (hence the insertion above the cursor, `android/terminal` D2).
-- **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`)
+- **Tradeoffs**: Reports are polled, so they arrive after the shell's prompt (hence the insertion above the cursor, `android/terminal` D2), and only kernel-bug reports can list unimplemented paths, since a killed run's crash and ANR reports have no kernel left to ask.
+- **Watch out**: The unimplemented-paths section, read from the kill line's last field (android/native D17), was not exercised on a device or emulator.
+- **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216
 
 ### D7: The service is a module of its own, split from the app by responsibility
 - **What**: android/service holds `TerminalService.kt` and `Tabs.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
 - **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
 - **Tradeoffs**: The code stays in one Gradle module, so cross-module statics remain (the login setting, the store lock).
-- **Watch out**: None known; the restored "auto" tab logging in as another user, open at mapping, was fixed in 3beb038 (D5).
-- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038)
+- **Watch out**: A shell's kill report can reach a tab opened within the next poll that took the freed console number (open in the map); the switch-after-failed-start crash, notifications posted after `onDestroy` and reports sent to ended tabs, recorded by the full refresh d9e1f0c, were fixed in 6560af6 (D8, D9, D16).
+- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6)
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
-- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports find the tab by console; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
+- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
 - **Why**: The service held Termux `TerminalSession`s directly with a separate session → `ConsolePty` map, so the libghostty-vt terminal could not be one of its tabs (android/terminal D8).
-- **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly.
-- **Watch out**: None known; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
-- **Source**: 6ffb912; 89ad551
+- **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly; a kill of a tab's own shell goes to a tab that took its console number before the next poll.
+- **Watch out**: `ConsolePty.console` keeps its number after close, so routing must check `consoleOpen`; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
+- **Source**: 6ffb912; 89ad551; 6560af6 (reports to ended tabs, recorded in d9e1f0c)
 
 ### D9: Exit all, restart and replace finish around an ongoing start instead of racing it
-- **What**: While `starting` or `transitioning` is set, Exit all only marks and detaches and the start, restart or replace finishes the exit; the wake lock is held throughout, a download finished during a restart waits in `pendingReplace` until the new kernel is up or has failed, a failed start says so in the notification and stops the service once no UI is left, and kill notifications take ids counting up from 100000.
+- **What**: While `starting` or `transitioning` is set, Exit all only marks and detaches and the start, restart or replace finishes the exit; the wake lock is held throughout, a download finished during a restart waits in `pendingReplace` until the new kernel is up or has failed, a failed start says so in the notification and stops the service once no UI is left and no switch is downloading (checked again when a download fails or is cancelled), `onDestroy` cancels a switch and sets `destroyed`, after which `updateNotification` posts nothing, and kill notifications take ids counting up from 100000.
 - **Why**: Nothing tied the start thread, restart and replace to Exit all, the wake lock or a finished download, so an exit during a start left a kernel running after `onDestroy`, reboots dropped the wake lock and downloads finishing mid-reboot were lost.
-- **Tradeoffs**: An exit during a distro replacement still imports the chosen distro first (and waits for a long import), and a kill shown in a background tab now also notifies.
-- **Watch out**: Every new path that ends `starting` or `transitioning` must check `exiting` (a map invariant), and kill notification ids from a new service instance can still collide with old ones after wrapping.
-- **Source**: 89ad551
+- **Tradeoffs**: An exit during a distro replacement still imports the chosen distro first (and waits for a long import), a kill shown in a background tab now also notifies, and after a failed start the service and its notification stay without a UI while a switch downloads.
+- **Watch out**: Every new path that ends `starting` or `transitioning` must check `exiting` (a map invariant), every new way of posting notification 1 must go through `updateNotification`, and kill notification ids from a new service instance can still collide with old ones after wrapping.
+- **Source**: 89ad551; 6560af6 (a switch's completion crashing a destroyed service, recorded in d9e1f0c)
 
 ### D10: The execution tier is read from preferences only in debug builds
 - **What**: `TerminalService.tier` reads the `tier` preference only in a debug build and is 1 otherwise, `setTier` does nothing in a release build, and the copied bug report keeps "Tier N".
@@ -110,11 +111,11 @@
 - **Source**: 3f04bf5 (with android/terminal D28)
 
 ### D16: A launch without a ready store resumes the import of the recorded distro
-- **What**: Without a ready store `onCreate` calls `start(Rootfs.importing(this))`, the distro the interrupted import recorded (android/setup D17), and the existing fallback to Alpine with `switch_failed` covers a resumed import that cannot download or import.
-- **Why**: The service imported Alpine whenever no store was ready, so a switch interrupted by a kill silently became Alpine.
+- **What**: Without a ready store `startOrImport`, shared by `onCreate` and the restart that finishes Exit all, calls `start(Rootfs.importing(this))`, the distro the interrupted import recorded (android/setup D17), and the existing fallback to Alpine with `switch_failed` covers a resumed import that cannot download or import.
+- **Why**: The service imported Alpine whenever no store was ready, so a switch interrupted by a kill silently became Alpine, and `finishExit` restarted with `start(null)`, which never imports.
 - **Tradeoffs**: A resumed Debian import needs the network again when its tarball is gone from the cache.
 - **Watch out**: None known.
-- **Source**: 237d663
+- **Source**: 237d663; 6560af6
 
 ### D17: The containers configuration is written before every start
 - **What**: The start thread calls `Rootfs.ensureContainersConfig` after `ensureNetworkConfig` (android/setup D18), so stores imported by earlier versions get it too.
@@ -122,6 +123,27 @@
 - **Tradeoffs**: A store check, and a write when the file is missing, on every start.
 - **Watch out**: A store error while writing the file fails the start like the other ensure steps.
 - **Source**: 0eb9e19
+
+### D18: A long BKL hold is reported in a notification while it lasts
+- **What**: The 2 s poll first calls `Native.bklStall` (android/native D18) on the main thread; a new stall of the current kernel posts notification 4, "Appine's kernel is stuck", with its seconds and "Copy report", and once it has ended a notification still showing becomes "was stuck" with the total and the kernel log record in its report, without alerting again, while a dismissed one stays dismissed.
+- **Why**: A stuck kernel left the user with frozen tabs and no explanation or report to send.
+- **Tradeoffs**: A later stall replaces an earlier notification, and a stall that ended before any poll saw it is still reported once.
+- **Watch out**: `bklStall` is an exception to the map's rule that every BKL-taking native call goes through the worker, so it must never start taking the BKL; whether the notification should update its seconds during a stall is open in the map.
+- **Source**: 64a6107 (with kernel/process D38)
+
+### D19: Bells and OSC 9/777 notifications reach the user per tab; clipboard writes go through the service
+- **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front posts nothing; clipboard writes from any tab set or clear the clipboard, with a toast only before Android 13.
+- **Why**: Bells and notifications matter most when the user is not looking at the tab, which only the service knows, and the clipboard needs a context that outlives the Activity.
+- **Tradeoffs**: A notification asked for by the tab in front is dropped; the system may bundle tab notifications with the ongoing one, so the first tap expands the bundle; on Android 13 and later, background tabs can overwrite the clipboard with only the system's own confirmation.
+- **Watch out**: A bell flood still costs one main-thread post per console read, and the per-second limit is per tab, so many tabs can each notify.
+- **Source**: d89b5fa (with android/terminal D36)
+
+### D20: The poll hands the guest's changed directories to the NOPASSWD refresh
+- **What**: After `Documents.dirsChanged`, the poll's worker calls `Rootfs.dirsChanged` with the same directories (android/setup D19), ignoring its failures.
+- **Why**: The service is the one place that polls the directories the guest changed.
+- **Tradeoffs**: None beyond android/setup D19's delay of up to one poll.
+- **Watch out**: A refresh process counts as a guest process for the service's exit check while it runs.
+- **Source**: d03c9b6
 
 ## Superseded
 
