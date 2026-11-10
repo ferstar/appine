@@ -2,13 +2,13 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
 ## Constraint index (compressed active decisions)
 
-> Full text of D1, D4, D5, D7, D9–D11, D14, D16–D24 and D26–D29: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/kernel/vfs.md`
+> Full text of D1, D4, D5, D7, D9–D11, D14, D16–D21, D23, D24 and D26–D29: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/kernel/vfs.md`
 >
 > Full text of D25, D30, D31, D33–D38 and D41: `git show 260512d530d136e70f10564e248f7db876f07062:.claude/decisions/kernel/vfs.md`
 
@@ -26,7 +26,6 @@
 - **D19** — `exe_file` and `open_pseudo` find a pid node's process with `pseudo::group_of`, so `/proc/<tid>` works like its thread group's, and code treating a pid node's id as a thread-group id misses threads (kernel/procfs D12) (173da76)
 - **D20** — The VFS's Rust files read in the order their code runs (syscall/fs.rs from opening to its helpers, `impl Vfs` top-down), and code appended at the end of a file drifts from that order (866b1cf)
 - **D21** — Loop devices in `Kernel::loops` forward I/O through the backing open file at the device offset with 6.1's loop and block ioctl errors (no page cache, partitions, discard, mmap or mounting), differential cases must wait for native kernels after 6.1 to unbind an autoclear device, and a loop over a loop keeps the lower device open until the upper one is unbound (a26c8b4)
-- **D22** — readv and writev on pipes, terminals and sockets are one operation, as Linux's `read_iter`/`write_iter` split has it (sockets through kernel/net's `rw`, D13 there; one 64 KiB read for pipes, PTYs and eventfds; pipe and PTY writes in 64 KiB pieces), positional files keep the per-iovec loop, and open-file borrows must end before any socket or pipe call that can wait (b295644)
 - **D23** — A timerfd keeps an `Expiry` on its clock (kernel/process D19), and with `TFD_TIMER_CANCEL_ON_SET` a later realtime clock jump counts as one expiration and makes the next read return `ECANCELED` once while the timer stays armed (63b9e59)
 - **D24** — read_file and readv copy out through `Cx::write_user_partial`, growing a stack below the buffer first, and return the bytes copied (rewinding a regular file's position past the uncopied part) instead of `EFAULT`, though pipe and terminal data past the fault is still consumed (e03c0cc)
 - **D25** — F_SETOWN follows Linux's `f_setown` on global numbers (`INT_MIN` `EINVAL`, an unknown number `ESRCH`, 0 removes the owner, the setter's uids kept), owners are translated once by the dispatcher's `pid_args`, and lock ranges use an inclusive last byte in `flock64_to_posix_lock`'s order; syscalls listed in `pid_args` must not translate again (09188ec, 5656ada, f6a82cc)
@@ -93,7 +92,14 @@
 - **Why**: The map, read whole before every VFS change, had reached 1426 lines after its full refresh, and most VFS changes never touch the mount table, propagation or namespaces.
 - **Tradeoffs**: The boundary runs inside `vfs/mod.rs` and `syscall/mount.rs`, mount-flag checks stay here so read-only and remount changes read both maps, overlayfs stays, keeping this the largest map, and mount decisions made before the split keep their kernel/vfs tags in this snapshot (kernel/mount D2).
 - **Watch out**: Bugs confirmed by the 2026-11-10 full refresh stay open in the map, among them `/proc/<pid>/fd` reopens skipping open checks, leases lost across a copy-up, tmpfs undercounting a deleted open file that shrinks, file position races, `IN_EXCL_UNLINK` filtering the wrong events, execve reporting no inotify events and the overlay gaps.
-- **Source**: c5236a1, a536142 (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c and 9b99931)
+- **Source**: c5236a1, a536142 (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c, 9b99931 and a36860b)
+
+### D22: Vectored I/O on pipes, terminals, sockets and host stdio streams is one operation
+- **What**: Following Linux's split between `read_iter`/`write_iter` and plain operations (checked against 6.1), sockets go to kernel/net's `rw` (D13 there), pipe, PTY and eventfd reads do one 64 KiB read scattered over the iovecs, pipe and PTY writes go in 64 KiB pieces across iovecs until one is short, `stream_vectored` sends `appine-run`'s host stdio down the same pipe path unless `host_regular` finds a regular file on the host, and positional files and such regular files keep the per-iovec loop.
+- **Why**: readv and writev called the file's read or write once per iovec, so message boundaries, pipe readv waits and pipe write atomicity differed from Linux, and on host stdio a filled first iovec waited for more input and a small writev (musl flushes stdout with two iovecs) was not one write.
+- **Tradeoffs**: A pipe, terminal or host stdio readv still reads at most 64 KiB per call, and every readv or writev on host stdio costs one host fstat.
+- **Watch out**: Borrows of the open file must end before any socket or pipe call that can wait, a file kind whose Linux operations change between plain and iter needs its arm moved, and a host regular file that behaves like a stream would keep the per-iovec loop.
+- **Source**: b295644, a36860b
 
 ### D32: Inherited mounts are locked, and proc, sysfs and cgroup2 check their namespace's owner
 - **What**: Copying a mount namespace into one owned by another user namespace locks every copy (`Mount::locks`: the mount itself and its ro, nodev, nosuid, noexec and atime flags), so umount2, moves and pivot_root refuse a locked mount (`EINVAL`), remount and mount_setattr refuse to clear a locked flag (`EPERM`), and a non-recursive bind or clone of a tree with locked mounts below is `EINVAL`; lazy unmounts and namespace collection keep a locked mount on a parent detached with it, as 6.1's `disconnect_mount` does; proc, sysfs and cgroup2 need `CAP_SYS_ADMIN` over the owner of their pid, network or cgroup namespace, and outside the initial user namespace proc and sysfs also need a fully visible instance, whose locked flags the new mount takes over.
@@ -222,3 +228,4 @@
 - ~~`/proc/<pid>/exe` of a program in an overlay is followed by path with no `ETXTBSY` for its writers (D39's tradeoff, 2a244d2)~~ → changed by 9590431's kernel/procfs and kernel/process Decisions (2026-11-09, no SUPERSEDES declared)
 - ~~Copy-up copies data with the BKL held, so large copy-ups stall every process (D40, 4b4af75)~~ → replaced by **D45** in df6ee70 (2026-11-08, no SUPERSEDES declared)
 - ~~Mounts, fds, file syscalls, pipes, locks, devices and inotify are one kernel/vfs module (D15, c5236a1)~~ → replaced by **D15** in d2b1dc3 (2026-11-10)
+- ~~Host stdio fds stay per-iovec (D22's tradeoff, b295644)~~ → replaced by **D22** in a36860b (2026-11-10, no SUPERSEDES declared)

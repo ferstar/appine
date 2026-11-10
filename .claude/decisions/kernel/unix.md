@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/unix"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D3 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D3 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -34,7 +34,7 @@
 - **Why**: The retired design doc's §10 gave a single line to a full in-process socket family with its own garbage collector.
 - **Tradeoffs**: Its map was verified more lightly (two research concerns, one verifier) than the large modules'.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them stream reads split and merged at the wrong places, credentials attached to messages sent without `SO_PASSCRED`, recvmsg copy faults that can still lose data, sender names taken when sent rather than when received and connected datagram sockets that are never reset.
-- **Source**: c3df5d3 (bug list since updated by 2b72eeb, ce8a9ce and 90a11cd)
+- **Source**: c3df5d3 (bug list since updated by 2b72eeb, ce8a9ce, 90a11cd and 1a59520)
 
 ### D5: AF_UNIX parses socket timeouts with kernel/net's parser
 - **What**: Unix sockets use net's `timeval()` for `SO_RCVTIMEO` and `SO_SNDTIMEO` instead of their own copy.
@@ -98,3 +98,10 @@
 - **Tradeoffs**: The sender's name is the one bound when it sent, not at receive time as on Linux, and connected datagram sockets still never get `unix_dgram_disconnected`'s `ECONNRESET` (both recorded in the map).
 - **Watch out**: Peers of a program that closes with unread data now see `ECONNRESET` before EOF, as on Linux, and a new way of closing a stream end that bypasses `Drop` would miss the reset.
 - **Source**: 90a11cd
+
+### D14: Timed AF_UNIX waits end with EINTR on a signal
+- **What**: `block()` answers a signal with EINTR when its deadline came from `SO_RCVTIMEO` or `SO_SNDTIMEO` (every caller's does today) and ERESTARTSYS otherwise, while a stream send or `MSG_WAITALL` read that already moved data still returns its count, as Linux's `sock_intr_errno` does and kernel/net already did (kernel/net D16).
+- **Why**: A timed accept, connect, send or receive restarted with its whole timeout under `SA_RESTART`, so signals arriving more often than the timeout (SIGCHLD from busy children, interval timers) kept it from ever timing out.
+- **Tradeoffs**: Programs with `SA_RESTART` handlers now see EINTR from timed AF_UNIX calls, as on Linux.
+- **Watch out**: A future wait in this module bounded by something other than the socket timeouts must choose its own interrupt errno instead of passing its deadline to `block()`.
+- **Source**: 1a59520

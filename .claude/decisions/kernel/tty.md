@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -68,8 +68,8 @@
 - **What**: kernel/tty covers `tty.rs`, `syscall/tty.rs` and `terminal.rs` (PTY pairs, the line discipline, termios2, packet mode, job control and the host console), while setsid/setpgid and exit-time signals stay in kernel/process and stop rules in kernel/signal.
 - **Why**: The retired design doc's §9 summarised the terminal layer in five bullets that missed its limits and differences from Linux.
 - **Tradeoffs**: Job control is split across three modules, and the map's Linux comparisons come from knowledge of the kernel sources rather than a checkout.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them `VTIME` timing the whole read when `VMIN` is above 0, one slave write overshooting the output limit by its expansion, `TIOCSCTTY` returning 0 to a non-leader, `TIOCSPGRP` error codes, console input accepted after its session ended, held echoes waiting for the next input and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
-- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297, 5d7b936 and d9e1f0c)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them one slave write overshooting the output limit by its expansion, `TIOCSCTTY` returning 0 to a non-leader, `TIOCSPGRP` error codes, console input accepted after its session ended and `/dev/tty` and `/dev/console` reporting a pts device number instead of 5:0 and 5:1.
+- **Source**: 5d21cc4 (bug list since updated by 24ecd25, 4e64e74, 5d23297, 5d7b936, d9e1f0c, e5aae61 and ae1b507)
 
 ### D10: TIOCGPGRP and TIOCGSID on a master skip the controlling-terminal check
 - **What**: On a master, TIOCGPGRP and TIOCGSID answer without the ctty check (no session is still `ENOTTY` for TIOCGSID, no foreground group reads 0) and TIOCNOTTY is always `ENOTTY`, while the slave keeps the check, as on Linux.
@@ -120,12 +120,12 @@
 - **Watch out**: A program that leaves canonical mode with other lines queued before the EOF gets their data followed by the VEOF character, as it would have from the old resend.
 - **Source**: 117f927
 
-### D17: Non-canonical reads and readiness follow `input_available_p`
-- **What**: A nonblocking non-canonical read returns whatever input is there, and `poll_readable` waits for `VMIN` bytes only when `VTIME` is 0, as Linux decides for both read and poll.
-- **Why**: A nonblocking read below `VMIN` returned `EAGAIN` while `POLLIN` ignored `VMIN`, so event loops spun.
-- **Tradeoffs**: `VTIME` with `VMIN` above 0 is still a total timer rather than an inter-byte one.
+### D17: Non-canonical reads and readiness follow `input_available_p`, and `VTIME` is an inter-byte timer
+- **What**: A nonblocking non-canonical read returns whatever input is there and `poll_readable` waits for `VMIN` bytes only when `VTIME` is 0, as Linux decides for both read and poll; with `VMIN` above 0 `slave_read` restarts the `VTIME` deadline whenever the raw bytes it has seen change and clears it when none are left (another reader or a flush took them), while `VMIN` 0 times from the start of the read.
+- **Why**: A nonblocking read below `VMIN` returned `EAGAIN` while `POLLIN` ignored `VMIN`, so event loops spun, and `VTIME` timed the whole read from its first byte, unlike `n_tty_read`, cutting short input that arrived in a slow steady stream.
+- **Tradeoffs**: Bytes stay queued until the read returns, so another reader can still take them where Linux's reader has already copied them, and a deadline passing just as a byte arrives returns what is queued where Linux would copy it and wait again.
 - **Watch out**: None known.
-- **Source**: 5d23297
+- **Source**: 5d23297, ae1b507
 
 ### D18: The flushing and line ioctls check for background callers, and a leader's exit sends only SIGHUP
 - **What**: TCFLSH, TCXONC, TCSBRK, TCSBRKP and TIOCSETD run the background check, and `release_ctty` at a session leader's exit sends only `SIGHUP`.
@@ -134,12 +134,12 @@
 - **Watch out**: None known.
 - **Source**: 5d23297
 
-### D19: Echoes respect the output limit
-- **What**: `commit_echoes` outputs an echo only when it fits whole and keeps at most 4096 waiting (the oldest dropped), and `send_xchar` drops its character on a full queue.
-- **Why**: Echoes and `send_xchar` ignored the output limit, so a master that never read let the output grow without bound.
-- **Tradeoffs**: One slave write can still overshoot the limit by its output expansion.
-- **Watch out**: Echoes held while the output is full wait for the next input rather than for the master to read, and a slave write's data goes out ahead of them (a bug in the map).
-- **Source**: 5d7b936, d9e1f0c (held echoes)
+### D19: Echoes respect the output limit, and held echoes go out ahead of the next slave write
+- **What**: `commit_echoes` outputs an echo only when it fits whole and keeps at most 4096 waiting (the oldest dropped), `send_xchar` drops its character on a full queue, and `slave_write` commits held echoes through `Tty::echoes_before_write` at the top of each pass, before measuring the room for its data, and wakes the master when echoes or data went out, as `n_tty_write` starts with `process_echoes` (reading the master sends none, as on Linux).
+- **Why**: Echoes and `send_xchar` ignored the output limit, so a master that never read let the output grow without bound, and echoes held by a full queue then waited for the next input behind data the slave wrote meanwhile, so characters typed during a flood showed up after the next prompt.
+- **Tradeoffs**: One slave write can still overshoot the limit by its output expansion, and a blocked write sends held echoes before each piece it sends after waiting, where Linux processes them once per 2048-byte chunk.
+- **Watch out**: A zero-length write sends held echoes only if it reaches `slave_write`.
+- **Source**: 5d7b936, d9e1f0c (held echoes), e5aae61
 
 ### D20: Terminal ioctls Appine does not know are counted as unimplemented paths
 - **What**: `tty::ioctl`'s default arm counts the request on a terminal in kernel/signal's table of unimplemented paths (kernel/signal D24) before returning `ENOTTY`.
@@ -148,8 +148,17 @@
 - **Watch out**: None known.
 - **Source**: 99b4216
 
+### D21: A failed host spawn gives its console back
+- **What**: `terminal::detach` clears the console's session and foreground group when they are the failed leader's and restores whether a session was ever attached, so the console's end of session is reported as before (kernel/process D53).
+- **Why**: The console a failed spawn had attached kept that process as its session, so every later attach was EBUSY.
+- **Tradeoffs**: None.
+- **Watch out**: None known.
+- **Source**: 143bb86
+
 ## Superseded
 
 - ~~Output stopped by ^S kept in the queue behind a mark (`held_from`, D7 in part, round 75)~~ → replaced by **D13** in 8dc166b (2026-11-07)
 - ~~The line-discipline subset described at the module split (5d21cc4)~~ → replaced by **D13** in 8dc166b (2026-11-07)
 - ~~The bridge resends `VEOF` when the program left canonical mode before reading it (D8 in part, rounds 05, 102)~~ → replaced by **D16** in 117f927 (2026-11-07)
+- ~~`VTIME` with `VMIN` above 0 is a total timer from the first byte (D17's tradeoff, 5d23297)~~ → replaced by **D17** in ae1b507 (2026-11-10, no SUPERSEDES declared)
+- ~~Echoes held by a full queue wait for the next input and go out behind a slave write's data (D19's watch-out, 5d7b936, d9e1f0c)~~ → replaced by **D19** in e5aae61 (2026-11-10, no SUPERSEDES declared)

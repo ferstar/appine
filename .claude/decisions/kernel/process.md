@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -65,8 +65,8 @@
 - **What**: kernel/process covers tasks, execve and the ELF loader, syscall dispatch, the BKL with its watchdog and fast path, kernel bugs that end one process and their kill reports, waits and futexes, timers, PID 1 and namespaces, leaving mount trees to kernel/mount, network namespaces to kernel/netns and credentials to kernel/cred.
 - **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source (wake channels, fast-path coverage, timer-thread duties, boot plan, pid-namespace orphans).
 - **Tradeoffs**: The map is large because the module spans many files, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them a non-atomic `unshare`, PI futexes without priority inheritance or requeueing, a host spawn that fails to start leaking its process, doomed images started at pc 0 by `Machine::spawn`, a stale fast-path deadline ending a later sleep early and CPU-clock POSIX timers outliving their target.
-- **Source**: dd6c288, d2b1dc3 (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43 and D44)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them a non-atomic `unshare`, PI futexes without priority inheritance or requeueing, doomed images started at pc 0 by `Machine::spawn` and CPU-clock POSIX timers outliving their target.
+- **Source**: dd6c288, d2b1dc3 (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52 and D53)
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -222,8 +222,23 @@
 - **Watch out**: None known.
 - **Source**: 5760479
 
+### D52: A fast-path wait woken early hands its deadline to the BKL handler for one dispatch
+- **What**: When a signal wakes a no-BKL timed wait (futex relative and absolute, nanosleep, clock_nanosleep relative and absolute), the fast path records its deadline in `TaskState::fast_sleep`, the futex, nanosleep and clock_nanosleep handlers take it before checking or reading the time argument, and the run loop's `Exit::Svc` arm clears it after `dispatch` whatever the dispatch did.
+- **Why**: The handler redid the wait from the syscall's arguments, so time memory unmapped meanwhile turned EINTR into EFAULT where Linux's restart never rereads it, and a deadline whose handler did not run or failed first (the call skipped by seccomp or a tracer) ended the thread's next BKL-path wait early.
+- **Tradeoffs**: One store per BKL-path syscall, and a handed-over deadline is trusted as validated by the fast path, so a tracer rewriting the arguments at the entry stop cannot change a wait already begun (as on Linux).
+- **Watch out**: A new no-BKL wait that records no deadline, or a handler that reads its time before taking `fast_sleep`, brings the EFAULT back, and a hand-over meant to outlive one dispatch (through restart_syscall, say) needs a field of its own.
+- **Source**: 9593bae, 27609fe
+
+### D53: A host spawn registers its process only once its thread has started
+- **What**: `Machine::spawn` creates the task and starts its host thread before inserting the thread group, init's child and the watched slot, and a failure of `Task::new` or `task::start` detaches the console it attached (kernel/tty D21) and returns the error; test hook 13 arms `Trap::ThreadStart`, which `task::start` checks through `bug::fails` and answers with EAGAIN.
+- **Why**: A spawn whose task or thread could not be created left a process without threads registered with init and the watched table, never to finish, and its console EBUSY for later spawns.
+- **Tradeoffs**: A panic inside spawn after the console was attached still leaves its session set (`host_call` turns it into an error), and hook 13 fails whichever thread start comes next, a guest clone included.
+- **Watch out**: Code expecting the group in `k.groups` before `task::start` returns would break (none today, since the thread runs only after the BKL is released).
+- **Source**: 143bb86
+
 ## Superseded
 
 - ~~Deadlines stay plain `Instant`s (D15 in part, 96cd8bd)~~ → replaced by **D19** in 63b9e59 (2026-11-07)
 - ~~PI futexes stay `ENOSYS` (D33's tradeoff, 5d7b936)~~ → replaced by **D44** in edd7f95 (2026-11-09)
 - ~~bug.rs, debug.rs and syscall/mod.rs are filed in kernel/process though the registry does not list them (D18 in part, 0758e3c)~~ → replaced by **D14** in d2b1dc3 (2026-11-10)
+- ~~The futex handler re-reads the timeout of an interrupted wait, and only relative deadlines are handed over (9593bae's tradeoff)~~ → replaced by **D52** in 27609fe (2026-11-10, no SUPERSEDES declared)
