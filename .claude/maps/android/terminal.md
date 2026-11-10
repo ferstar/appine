@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, the scrollback's byte limit, then unwired libghostty-vt options and colours last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, unwired libghostty-vt options, then scrollback limits, default colours, DA1 and OSC 5522's limit last)
 
 ## Responsibilities
 
@@ -239,11 +239,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
   and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
   opens a console of the grid's size and spawns the login; `VtNative.create` makes the terminal
-  (a scrollback line limit of 10,000, though libghostty-vt's default byte limit is reached first,
-  see the bugs; grapheme clustering, mode 2027, on by default as in Ghostty; Kitty
-  graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is advertised and
-  programs that probe fall back to text); restored text and queued messages are printed into it;
-  then the writer, the pump and the waiter start.
+  (scrollback limited to 10,000 lines or 10 MiB, whichever is reached first: the lines up to about
+  120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
+  the cursor follows the foreground as in Ghostty; grapheme clustering, mode 2027, on by default as
+  in Ghostty; Kitty graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is
+  advertised and programs that probe fall back to text); restored text and queued messages are
+  printed into it; then the writer, the pump and the waiter start.
 - If opening the console or spawning fails, the reason is printed, the console is closed and the
   tab counts as ended (127), with no "Process completed" line and no writer. If the terminal cannot
   be made (the kernel is gone, libghostty-vt fails, a panic), the tab ends (127) without a word,
@@ -261,13 +262,15 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   read counts once); a clipboard write (OSC 52, OSC 1337, OSC 5522, to any location, as Ghostty's
   `clipboard-write = allow`): its first `text/plain…` representation up to 256 KiB (larger is
   denied, other types unsupported; those replies reach only OSC 5522 programs), or a request to
-  clear; a notification (OSC 9's body, OSC 777's title and body, up to 4 KiB each; only the last
-  of a read). Clipboard reads have no callback: OSC 52 `?` goes unanswered, OSC 5522 reads are
-  refused, and Kitty paste events are never sent, as with `clipboard-read = deny`. What the app
-  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. Where they go
-  is the service's choice (android/service): the bell of the tab in front vibrates through
-  `VtView.bell`, other bells (at most once a second) and notifications from tabs not in front
-  become the tab's notification, and clipboard writes always reach the clipboard.
+  clear (an OSC 5522 write of more than 1 MiB in all its representations fails with EFBIG inside
+  libghostty-vt, which buffers a write whole before handing it over); a notification (OSC 9's
+  body, OSC 777's title and body, up to 4 KiB each; only the last of a read). Clipboard reads have
+  no callback: OSC 52 `?` goes unanswered, OSC 5522 reads are refused, and Kitty paste events are
+  never sent, as with `clipboard-read = deny`. What the app prints itself (`VtNative.print`) asks
+  nothing: its replies and effects are dropped. Where they go is the service's choice
+  (android/service): the bell of the tab in front vibrates through `VtView.bell`, other bells (at
+  most once a second) and notifications from tabs not in front become the tab's notification, and
+  clipboard writes always reach the clipboard.
 - The waiter waits for the shell (−9, "signal 9", once the kernel is gone), gives the pump up to
   0.5 s to take the last output, then on the main thread closes the console (once), stops the
   writer and, unless the tab was released, prints "[Process completed (code N | signal N) - press
@@ -296,10 +299,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
   rows, cursor and colours come from the capture while the header's modes, selection and scroll
   position are read live.
-- The view asks for a full frame after a regrid, a new bitmap, new default colours, a change of
-  the wide-cell setting, attaching another tab or the attached tab's shell starting; a frame
-  captured at an old size is dropped and a full one requested. Attaching also resizes the tab's
-  terminal and console to the view's grid when it differs.
+- The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
+  reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
+  shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
+  also resizes the tab's terminal and console to the view's grid when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
   focus events 1004, a selection exists), the selection's first and last cells in the viewport,
   and the scroll position libghostty-vt reports for the scroll bar (the scrollable area in rows,
@@ -616,8 +619,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Since libghostty-vt 1.4, `GHOSTTY_TERMINAL_OPT_USERDATA` takes the pointer itself, not its
   address (older code passing `&ptr` crashes in the reply callback).
 - Without a DA reply, programs that probe for it (vim, tmux) wait for a timeout, so `vt.c` answers
-  DA1 (132 columns, selective erase, ANSI colour), DA2 (VT220), DA3 and XTVERSION ("appine") and
-  reports a dark colour scheme.
+  DA1 (132 columns, selective erase, ANSI colour, and clipboard access, 52, which Ghostty lists
+  whenever clipboard writes are allowed and programs check before using OSC 52), DA2 (VT220), DA3
+  and XTVERSION ("appine") and reports a dark colour scheme.
+- Without default foreground and background colours libghostty-vt treats them as unset: OSC 10
+  and 11 queries go unanswered, reverse video (DECSCNM) swaps nothing, and a colour set with OSC 10
+  or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
+  answers the foreground. A full reset (RIS) resets the palette but keeps colours set with OSC 10,
+  11 and 12, as Ghostty does.
 - libghostty-vt as a library turns Kitty graphics on with a 10 MB store and the Glyph Protocol on,
   answering `OK` and `fmt=glyf` to their queries, though frames carry no images and the C API
   gives no access to registered glyphs; vt.c turns both off at create. A full reset keeps the
@@ -626,9 +635,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
   emoji sequences; they can turn mode 2027 off.
 - libghostty-vt's C terminal starts with a scrollback byte limit of 10,000 bytes (the default of
-  its `Terminal.Options`, not Ghostty's 10 MB `scrollback-limit`), raised to its minimum of the
-  active area's pages plus one. The byte and line limits both apply, the first reached pruning
-  whole 400 KiB pages, so a line limit alone does not set how much scrollback is kept.
+  its `Terminal.Options`, not Ghostty's 50 MB `scrollback-limit-bytes`), raised to its minimum of
+  the active area's pages plus one, so a line limit alone keeps about two pages. The byte and line
+  limits both apply, the first reached pruning whole 400 KiB pages; a page holds fewer rows the
+  wider the terminal (about 1,000 at 45 columns, 580 at 80, 190 at 250).
 - Grid references from libghostty-vt are valid only until the terminal changes, so every selection
   call takes fresh ones; the anchor of a drag is tracked. A changed selection makes the next frame a
   full one (the render state redraws everything when the screen's selection changes), as does
@@ -639,11 +649,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ## Confirmed bugs / technical debt
 
-- **The scrollback keeps far fewer than 10,000 lines**: vt.c sets only `SCROLLBACK_MAX_LINES`, so
-  libghostty-vt's default byte limit (see the gotcha) keeps two pages, about 1,860 rows at 45
-  columns, 1,020 at 80, 660 at 120 and 300 at 250. Removing it (`SCROLLBACK_MAX_BYTES` set to
-  NULL) reaches the line limit (9,150–9,990 rows) at 400 KiB a page, about 3.5 MiB a tab at 45
-  columns and 6.6 MiB at 80, which nothing reclaims while scrollback is not compressed (below).
+- **A full scrollback holds 3.5–10 MiB a tab** (about 3.5 MiB at 45 columns, 6.6 MiB at 80 and the
+  10 MiB byte limit from about 120 columns on), which nothing reclaims while scrollback is not
+  compressed (below).
 - **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
   (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
 - **libghostty-vt features not wired**: no callbacks for OSC 9;4 progress, OSC 7501 program
@@ -655,20 +663,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
   continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
   which vt.c leaves off; no terminfo name is set, so XTGETTCAP `TN` goes unanswered; ENQ, the
-  title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered; DA1
-  leaves out 52 (clipboard access), which Ghostty adds whenever clipboard writes are allowed, as
-  they are here, so programs that look for it take OSC 52 as unsupported; clipboard reads are
-  refused where Ghostty's default (`clipboard-read = ask`) asks, and wiring them would turn the
-  IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into Kitty paste events
-  for programs using mode 5522; an OSC 5522
-  write is buffered up to the library's 64 MiB default (the protocol's minimum) before vt.c denies
-  anything over 256 KiB, so one write can make a tab hold 64 MiB.
-- **No default colours are given to libghostty-vt**: vt.c sets no foreground, background or
-  cursor colour (`GHOSTTY_TERMINAL_OPT_COLOR_*`), so the render state keeps its built-in white on
-  black and the terminal treats all three as unset: OSC 10, 11 and 12 queries go unanswered
-  (programs asking for the background to pick a light or dark theme get no reply), reverse video
-  (DECSCNM, mode 5, which visual bells flash) changes nothing, and a foreground or background a
-  program sets with OSC 10 or 11 shows only once the other is set too.
+  title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
+  clipboard reads are refused where Ghostty's default (`clipboard-read = ask`) asks, and wiring
+  them would turn the IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into
+  Kitty paste events for programs using mode 5522.
 - **More of libghostty-vt left unused**:
   - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`,
     `select_output` (needs OSC 133), and the selection gesture state machine (click counts to
@@ -720,8 +718,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   and earlier get for a program's clipboard write (only tried on API 34, where the system shows
   its own); how tab notifications look and alert outside an API 34 emulator (there Android
   bundled them with the ongoing notification, so the first tap expands the bundle).
-- The scrollback's rows and memory at each limit on a device (the figures above come from a macOS
-  build of libghostty-vt 1.4.0 fed 30,000 lines, not from Android or 16 KB-page devices).
+- The scrollback's rows and memory at each limit on a device (the figures above come from vt.c on a
+  macOS build of libghostty-vt 1.4.0 fed 30,000 lines, not from Android or 16 KB-page devices);
+  the OSC 5522 limit was likewise tried only there. The default colours, DA1 and reverse video
+  were also tried in the app on a Pixel 4a API 34 emulator.
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
   `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
   also after a full reset and on the alternate screen, was checked on a macOS build of

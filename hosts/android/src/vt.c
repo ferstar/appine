@@ -18,7 +18,7 @@
 //     u8  cursor_style     0 bar, 1 block, 2 underline, 3 hollow block
 //     u8  cursor_blinking
 //     u16 cursor_x, u16 cursor_y
-//     u32 foreground       0xAARRGGBB, the default colours (after OSC 10/11)
+//     u32 foreground       0xAARRGGBB, the default colours (after OSC 10/11 and reverse video)
 //     u32 background
 //     u32 cursor_color     0 when the program did not set one (OSC 12)
 //     u16 row_count        number of rows that follow
@@ -71,8 +71,20 @@
 
 #define NONE16 0xffff
 
-// Scrollback kept per terminal, in lines (libghostty-vt rounds up to whole pages)
+// Scrollback kept per terminal: whichever limit is reached first prunes the oldest whole pages
+// (about 400 KiB each, libghostty-vt rounding up). A page holds fewer rows the wider the terminal,
+// so the line limit applies up to about 120 columns and the byte limit, which bounds a tab's
+// memory, beyond. Both must be set: libghostty-vt's C terminal starts with a byte limit of 10,000
+// bytes, which it raises to two pages
 #define SCROLLBACK_LINES ((size_t)10000)
+#define SCROLLBACK_BYTES ((size_t)10 << 20)
+
+// The default colours, those of the render state's built-ins and the terminal's black window.
+// Unset, libghostty-vt answers no OSC 10 or 11 query, reverse video (DECSCNM) swaps nothing, and a
+// colour set with OSC 10 or 11 alone does not show. The cursor gets none, so it follows the
+// foreground, as in Ghostty without cursor-color (and an OSC 12 query answers the foreground)
+static const GhosttyColorRgb DEFAULT_FOREGROUND = {.r = 0xff, .g = 0xff, .b = 0xff};
+static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 
 // Synchronized output (mode 2026) holds the screen at most this long, so a program that never
 // ends its hold cannot freeze the tab
@@ -81,6 +93,12 @@
 // The largest clipboard write (OSC 52) taken: Android's clipboard goes through a binder
 // transaction, which fails beyond about 1 MB (the text is sent as UTF-16)
 #define CLIPBOARD_MAX ((size_t)256 * 1024)
+
+// The most an OSC 5522 write may carry in all its representations: libghostty-vt buffers a write
+// whole before handing it over, up to 64 MiB by default (the protocol's minimum), and fails one
+// beyond this limit with EFBIG. It leaves room for other types of the same text (text/html), which
+// are dropped
+#define KITTY_CLIPBOARD_MAX ((size_t)1 << 20)
 
 // What a notification (OSC 9, OSC 777) keeps of its title and body
 #define NOTIFICATION_MAX ((size_t)4096)
@@ -221,7 +239,9 @@ static bool on_color_scheme(GhosttyTerminal t, void *userdata, GhosttyColorSchem
   return true;
 }
 
-// Without an answer to DA, programs that probe for it (vim, tmux) wait for a timeout
+// Without an answer to DA, programs that probe for it (vim, tmux) wait for a timeout. Clipboard
+// access (52) is listed because clipboard writes are taken (on_clipboard_write), as Ghostty lists
+// it unless clipboard-write = deny; programs looking for it treat OSC 52 as unsupported otherwise
 static bool on_device_attributes(GhosttyTerminal t, void *userdata, GhosttyDeviceAttributes *out) {
   (void)t;
   (void)userdata;
@@ -229,7 +249,8 @@ static bool on_device_attributes(GhosttyTerminal t, void *userdata, GhosttyDevic
   out->primary.features[0] = GHOSTTY_DA_FEATURE_COLUMNS_132;
   out->primary.features[1] = GHOSTTY_DA_FEATURE_SELECTIVE_ERASE;
   out->primary.features[2] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
-  out->primary.num_features = 3;
+  out->primary.features[3] = GHOSTTY_DA_FEATURE_CLIPBOARD;
+  out->primary.num_features = 4;
   out->secondary.device_type = 1;
   out->secondary.firmware_version = 1;
   out->secondary.rom_cartridge = 0;
@@ -366,6 +387,12 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
                        (const void *)on_notification);
   size_t lines = SCROLLBACK_LINES;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
+  size_t bytes = SCROLLBACK_BYTES;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &DEFAULT_FOREGROUND);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &DEFAULT_BACKGROUND);
+  size_t kitty_clipboard = KITTY_CLIPBOARD_MAX;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES, &kitty_clipboard);
   // Grapheme clustering (mode 2027) by default, as in Ghostty (grapheme-width-method = unicode):
   // emoji sequences (ZWJ, skin tones, flags) take one or two cells instead of one per codepoint.
   // Programs that count widths per codepoint (wcwidth) then disagree on such sequences; they can
