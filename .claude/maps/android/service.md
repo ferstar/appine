@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start's stop waits for a switch, the service's end cancels it, exit restarts by importing, kill reports go to the open console)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel at the end, exit restarting by importing, kill reports to the open console, then status notifications last)
 
 ## Responsibilities
 
@@ -20,7 +20,7 @@ outlives an Activity:
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories, too-long holds of the BKL) and turns them into tab messages, notifications and
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
-  clipboard writes);
+  program statuses, clipboard writes);
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
   mirror).
@@ -36,7 +36,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - `TerminalService` — a same-process service; `onBind` returns a `LocalBinder` whose `service` is
   the service itself.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
-  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onSettingsChanged`,
+  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onTabStatus` (a
+  tab's progress or program status changed), `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
   register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
   (Settings included).
@@ -49,9 +50,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
   restore), `current` (written only by `MainActivity`; setting it takes the tab's notification and
-  bell throttle away), `nextSessionId` (counting up from the clock, never wrapped),
-  `bellNotified` (when each tab's bell last notified); `sessionEvents` (title changed, bell,
-  clipboard write, notification, finished).
+  bell throttle away and, with the terminal Activity listening, marks the tab's statuses seen),
+  `nextSessionId` (counting up from the clock, never wrapped), `bellNotified` (when each tab's bell
+  last notified), `statusNotified` (the program status a tab's notification shows, while it shows
+  one); `sessionEvents` (title changed, bell, clipboard write, notification, progress or status
+  changed, finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
@@ -219,7 +222,13 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - A bell in the tab in front (`inFront`: it is `current` and `MainActivity` is a listener, so not
   another tab and not Settings in front) goes to the listeners' `onBell`; elsewhere it becomes the
   tab's notification, at most once a second per tab and alerting only once. An OSC 9 or OSC 777
-  notification becomes the tab's notification unless the tab is in front. A clipboard write sets
+  notification becomes the tab's notification unless the tab is in front. A change of a tab's
+  progress or program status goes to the listeners' `onTabStatus`; a program status that is
+  blocked, done or failed (`notifyStatus`) becomes the tab's notification, once per status (the
+  same record again posts nothing), unless the tab is in front, where done and error count as seen
+  at once (`VtSession.statusSeen`). A status that goes without the user (the program was killed or
+  stopped waiting) takes its notification away, unless a bell or a program's notification has
+  replaced it since. A clipboard write sets
   the clipboard from any tab (labelled Appine), or clears it; before Android 13, which shows copies
   itself, a toast says a program copied text.
 
@@ -258,8 +267,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   guest listens on that pair again), with remap text when the ports differ; the notification id is
   `1000 + guest port`.
 - Tab notifications (`notifyTab`, on the `terminal` channel): one per tab (id `200000 + tab id mod
-  100000`), replaced by the tab's next one: titled with OSC 777's title, else the program's title
-  (`sh` when none), with the body (or "The terminal bell rang") and "Tab N" as subtext. Tapping
+  100000`), replaced by the tab's next one: titled with OSC 777's title or a status record's
+  title, else the program's title (`sh` when none), with the body, "The terminal bell rang", or
+  for a status what it says (`VtSession.describe`: "Waiting for your approval", "Waiting for your
+  answer", "Waiting for credentials", "Waiting for you", "Done", "Failed") and its message after a
+  colon, and "Tab N" as subtext. Tapping
   one opens the activity on that tab (`EXTRA_TAB` with the session id); showing the tab or closing
   it takes it away.
 - Channels: `sessions` (low), `network`, `problems`, `terminal`; kill reports take ids from 100000,

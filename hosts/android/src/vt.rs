@@ -50,11 +50,18 @@ struct RawEffects {
     title_len: usize,
     body: *const u8,
     body_len: usize,
+    progress_state: i32,
+    progress: i32,
+    statuses: *const u8,
+    statuses_len: usize,
 }
 
 /// vt.c's `APPINE_CLIPBOARD_TEXT` and `APPINE_CLIPBOARD_CLEAR`.
 const CLIPBOARD_TEXT: i32 = 1;
 const CLIPBOARD_CLEAR: i32 = 2;
+
+/// vt.c's `STATUS_HEADER_BYTES`: the fixed part of a queued program status report.
+const STATUS_HEADER_BYTES: usize = 7;
 
 // vt.c
 unsafe extern "C" {
@@ -130,7 +137,8 @@ impl Term {
         unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 
-    /// The bells, clipboard write and notification programs sent since the last call.
+    /// The bells, clipboard write, notification and progress and status reports programs sent
+    /// since the last call.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -142,15 +150,22 @@ impl Term {
             title_len: 0,
             body: std::ptr::null(),
             body_len: 0,
+            progress_state: -1,
+            progress: -1,
+            statuses: std::ptr::null(),
+            statuses_len: 0,
         };
         unsafe { appine_vt_take_effects(self.0, &mut raw) };
-        let text = |p: *const u8, len: usize| {
+        /// The `len` bytes vt.c returned at `p`, which it keeps until the next feed.
+        fn bytes<'a>(p: *const u8, len: usize) -> &'a [u8] {
             if p.is_null() || len == 0 {
-                return String::new();
+                return &[];
             }
-            // SAFETY: vt.c keeps len bytes at p until the next feed, which needs the lock
-            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
-        };
+            // SAFETY: vt.c keeps len bytes at p until the next feed, which needs the lock the
+            // caller holds while it reads them
+            unsafe { std::slice::from_raw_parts(p, len) }
+        }
+        let text = |p: *const u8, len: usize| String::from_utf8_lossy(bytes(p, len)).into_owned();
         Effects {
             bell: raw.bells > 0,
             clipboard: match raw.clipboard {
@@ -161,6 +176,8 @@ impl Term {
             notification: raw
                 .notified
                 .then(|| (text(raw.title, raw.title_len), text(raw.body, raw.body_len))),
+            progress: (raw.progress_state >= 0).then_some((raw.progress_state, raw.progress)),
+            statuses: StatusReport::decode(bytes(raw.statuses, raw.statuses_len)),
         }
     }
 
@@ -184,17 +201,66 @@ impl Drop for Term {
 }
 
 /// What programs asked of the app in one read of the console: the bell (any number of BELs
-/// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body).
+/// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
+/// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none) and the
+/// program status reports (OSC 7501), in order.
 struct Effects {
     bell: bool,
     clipboard: Option<Option<String>>,
     notification: Option<(String, String)>,
+    progress: Option<(i32, i32)>,
+    statuses: Vec<StatusReport>,
+}
+
+/// A program status report (OSC 7501), as vt.c queues it: libghostty-vt's state and kind, the
+/// percentage (-1 for none), and the record's id, title and message.
+struct StatusReport {
+    state: i32,
+    kind: i32,
+    progress: i32,
+    id: String,
+    title: String,
+    message: String,
+}
+
+impl StatusReport {
+    /// The reports vt.c queued (`STATUS_HEADER_BYTES` in vt.c has the layout).
+    fn decode(mut bytes: &[u8]) -> Vec<StatusReport> {
+        let mut reports = Vec::new();
+        while bytes.len() >= STATUS_HEADER_BYTES {
+            let id = usize::from(bytes[3]);
+            let title = usize::from(bytes[4]);
+            let message = usize::from(u16::from_le_bytes([bytes[5], bytes[6]]));
+            let end = STATUS_HEADER_BYTES + id + title + message;
+            let Some(text) = bytes.get(STATUS_HEADER_BYTES..end) else {
+                break;
+            };
+            let string = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            reports.push(StatusReport {
+                state: i32::from(bytes[0]),
+                kind: i32::from(bytes[1]),
+                progress: i32::from(bytes[2] as i8),
+                id: string(&text[..id]),
+                title: string(&text[id..id + title]),
+                message: string(&text[id + title..]),
+            });
+            bytes = &bytes[end..];
+        }
+        reports
+    }
 }
 
 impl Effects {
-    /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`); false
-    /// when a call threw. The strings are local references, deleted after each call: the pump
-    /// stays in native code for the tab's whole life, so they would otherwise pile up.
+    /// Whether a program reported its progress or status, which lasts while its process group
+    /// keeps the foreground ([`pump`]).
+    fn reported(&self) -> bool {
+        self.progress.is_some() || !self.statuses.is_empty()
+    }
+
+    /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
+    /// `onProgress`, `onStatus` for each status report); false when a call threw. The strings are
+    /// local references, deleted after each call: the pump stays in native code for the tab's
+    /// whole life, so they would otherwise pile up.
     fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
         if self.bell && env.call_method(session, "onBell", "()V", &[]).is_err() {
             return false;
@@ -221,6 +287,40 @@ impl Effects {
             let called = env.call_method(session, "onNotification", sig, &args);
             let _ = env.delete_local_ref(title);
             let _ = env.delete_local_ref(body);
+            if called.is_err() {
+                return false;
+            }
+        }
+        if let Some((state, percent)) = self.progress {
+            let args = [JValue::Int(state), JValue::Int(percent)];
+            if env
+                .call_method(session, "onProgress", "(II)V", &args)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        for report in self.statuses {
+            let (Ok(id), Ok(title), Ok(message)) = (
+                env.new_string(report.id),
+                env.new_string(report.title),
+                env.new_string(report.message),
+            ) else {
+                return false;
+            };
+            let sig = "(IIILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V";
+            let args = [
+                JValue::Int(report.state),
+                JValue::Int(report.kind),
+                JValue::Int(report.progress),
+                JValue::Object(&id),
+                JValue::Object(&title),
+                JValue::Object(&message),
+            ];
+            let called = env.call_method(session, "onStatus", sig, &args);
+            let _ = env.delete_local_ref(id);
+            let _ = env.delete_local_ref(title);
+            let _ = env.delete_local_ref(message);
             if called.is_err() {
                 return false;
             }
@@ -325,8 +425,17 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
-/// `session.onTitle()` when a program set the title, and `onBell`, `onClipboard` and
-/// `onNotification` for what programs asked of the app ([`Effects`]).
+/// `session.onTitle()` when a program set the title, `onBell`, `onClipboard`, `onNotification`,
+/// `onProgress` and `onStatus` for what programs asked of the app ([`Effects`]), and
+/// `onForeground()` once the process group that was in the foreground when progress or a status
+/// was last reported no longer is.
+///
+/// That stands in for shell integration, which Appine does not install: the program status
+/// specification drops a program's `working` and `blocked` records when the shell's next prompt
+/// starts (OSC 133) or the program exits. Without it, a program that exits without clearing them
+/// (killed, or interrupted with Ctrl-C) would leave its tab working forever. The group is the one
+/// in the foreground after the read that carried the report, so a report from a command that has
+/// already exited by then lasts until the next command takes the foreground.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     mut env: JNIEnv<'l>,
@@ -337,6 +446,9 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
     guarded!("VtNative.pump", (), {
         let Some(tab) = tab(handle) else { return };
         let mut buf = vec![0u8; 64 * 1024];
+        // The foreground process group when progress or a status was last reported, while that
+        // report lasts
+        let mut reporter = None;
         loop {
             // Looked up again for every read, so the kernel is not kept once the service stops it
             let Some(m) = tab.machine() else { break };
@@ -354,12 +466,25 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
             if !replies.is_empty() && !tab.write(&m, &replies) {
                 break;
             }
+            let mut gave_back = false;
+            if effects.reported() {
+                reporter = m.console_foreground(tab.console).ok();
+            } else if let Some(group) = reporter
+                && m.console_foreground(tab.console).ok() != Some(group)
+            {
+                reporter = None;
+                gave_back = true;
+            }
             // Not kept across the calls into Java either
             drop(m);
             let output = !tab.dirty.swap(true, Ordering::AcqRel);
             if (output && env.call_method(&session, "onOutput", "()V", &[]).is_err())
                 || (titled && env.call_method(&session, "onTitle", "()V", &[]).is_err())
                 || !effects.deliver(&mut env, &session)
+                || (gave_back
+                    && env
+                        .call_method(&session, "onForeground", "()V", &[])
+                        .is_err())
             {
                 let _ = env.exception_clear();
                 break;

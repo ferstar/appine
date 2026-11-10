@@ -21,7 +21,10 @@ internal object VtNative {
     /**
      * Blocks, moving console output into the terminal until the session ends or the console is
      * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
-     * [frame], and `session.onTitle()` when a program set the title.
+     * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
+     * `onClipboard`, `onNotification`, `onProgress` and `onStatus` for what programs asked of the
+     * app, and `onForeground()` once the process group in the foreground when progress or a status
+     * was last reported has given the terminal back.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
 

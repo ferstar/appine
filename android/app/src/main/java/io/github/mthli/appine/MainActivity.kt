@@ -48,6 +48,9 @@ import kotlin.concurrent.thread
 class MainActivity : Activity(), TerminalService.Listener {
 
     private lateinit var screen: VtView
+
+    /** The current tab's progress (OSC 9;4), along the top of the terminal. */
+    private lateinit var progressLine: ProgressLine
     private lateinit var tabBar: TabBarView
     private lateinit var status: TextView
     private lateinit var keys: ExtraKeysView
@@ -160,12 +163,14 @@ class MainActivity : Activity(), TerminalService.Listener {
             gravity = Gravity.CENTER
             setText(R.string.starting)
         }
+        progressLine = ProgressLine(this)
         tabBar = TabBarView(this, Bar())
         keys = ExtraKeysView(this, Keys())
         val body = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(screen)
             addView(status)
+            addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ProgressLine.HEIGHT_DP), Gravity.TOP))
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -278,6 +283,12 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The program in the tab shown rang the bell (the service sends only those). */
     override fun onBell() = screen.bell()
 
+    /** A tab's progress or program status changed: its marks in the bar, the progress line. */
+    override fun onTabStatus() {
+        tabBar.refreshStatus()
+        progressLine.show(current?.progress, jump = false)
+    }
+
     /** Settings changed while this activity is visible too (split screen). */
     override fun onSettingsChanged() {
         screen.setFillWide(TerminalService.fillWide(this))
@@ -296,6 +307,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onRestarting() {
         current = null
+        progressLine.show(null, jump = true)
         screen.attach(null)
         screen.visibility = View.INVISIBLE
         status.visibility = View.VISIBLE
@@ -329,6 +341,7 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     private fun show(session: VtSession) {
         current = session
+        progressLine.show(session.progress, jump = true)
         service?.current = session
         // Starts the shell once the view knows the grid (Host.onGrid)
         screen.attach(session)

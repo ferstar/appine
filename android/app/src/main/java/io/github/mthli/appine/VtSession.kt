@@ -1,5 +1,6 @@
 package io.github.mthli.appine
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import java.io.IOException
@@ -39,8 +40,26 @@ internal class VtSession(
         /** A program asked for a notification (OSC 9 body, OSC 777 title and body). */
         fun onNotification(session: VtSession, title: String, body: String)
 
+        /** The tab's [progress] (OSC 9;4) or [status] (OSC 7501) changed. */
+        fun onStatusChanged(session: VtSession)
+
         fun onFinished(session: VtSession)
     }
+
+    /**
+     * A progress report (OSC 9;4): [state] is one of the `PROGRESS_` constants (not
+     * [PROGRESS_REMOVE]), [percent] 0–100, or -1 when the program gave none.
+     */
+    data class Progress(val state: Int, val percent: Int)
+
+    /**
+     * A program status record (OSC 7501): what a program says about itself ([id] empty) or one of
+     * its parts. [state] is one of the `STATUS_` constants, [kind] what a blocked program needs
+     * (the `KIND_` constants), [percent] 0–100 or -1; [title] and [message] are the program's text
+     * for people, without text direction controls, so that shown outside the terminal (a
+     * notification) it cannot pass for text from somewhere else.
+     */
+    data class Status(val id: String, val state: Int, val kind: Int, val percent: Int, val title: String, val message: String)
 
     /**
      * The kernel console, -1 before the shell starts; kept after the console is closed, when the
@@ -95,6 +114,32 @@ internal class VtSession(
 
     /** True until the shell has exited (also before it starts). */
     val isRunning: Boolean get() = exit == null
+
+    /**
+     * The last progress report (OSC 9;4); null when there is none, it was removed, none came for
+     * [PROGRESS_TIMEOUT_MS] (as Ghostty drops it, against programs that never remove it), the
+     * program gave the terminal back ([onForeground]) or the shell exited.
+     */
+    var progress: Progress? = null
+        private set
+
+    /**
+     * The program status record most in need of the user (OSC 7501), null when there is none:
+     * blocked first, then error, done, working and idle, the most recently updated among equals.
+     */
+    var status: Status? = null
+        private set
+
+    /**
+     * The program status records by id, the least recently updated first: the specification keeps
+     * one per id, at most [MAX_STATUS_RECORDS], dropping the one updated longest ago.
+     */
+    private val records = LinkedHashMap<String, Status>()
+
+    /** Status reports taken on the pump thread and not applied yet ([onStatus]). */
+    private val reports = ArrayList<Status>()
+
+    private val dropProgress = Runnable { setProgress(null) }
 
     /**
      * Plain text of the primary screen and its scrollback for saving the tab; null while the shell
@@ -217,6 +262,96 @@ internal class VtSession(
     }
 
     /**
+     * From vt.rs, on the pump thread: a program reported its progress (OSC 9;4), [state] being
+     * libghostty-vt's `GhosttyTerminalProgressState` and [percent] 0–100 or -1.
+     */
+    @Suppress("unused")
+    fun onProgress(state: Int, percent: Int) {
+        main.post {
+            if (!released && isRunning) setProgress(if (state == PROGRESS_REMOVE) null else Progress(state, percent))
+        }
+    }
+
+    /** Takes a progress report, or its removal, and waits [PROGRESS_TIMEOUT_MS] for the next. */
+    private fun setProgress(p: Progress?) {
+        main.removeCallbacks(dropProgress)
+        if (p != null) main.postDelayed(dropProgress, PROGRESS_TIMEOUT_MS)
+        if (p == progress) return
+        progress = p
+        events.onStatusChanged(this)
+    }
+
+    /**
+     * From vt.rs, on the pump thread: a program status report (OSC 7501), the states and kinds
+     * being libghostty-vt's. The reports of one read are usually applied together, so that a
+     * passing state between two of them notifies no one.
+     */
+    @Suppress("unused")
+    fun onStatus(state: Int, kind: Int, percent: Int, id: String, title: String, message: String) {
+        val report = Status(id, state, kind, percent, withoutDirectionControls(title), withoutDirectionControls(message))
+        val first = synchronized(reports) {
+            reports.add(report)
+            reports.size == 1
+        }
+        if (first) main.post(::applyReports)
+    }
+
+    /**
+     * Applies the waiting reports as the specification says: a report replaces its record, a clear
+     * removes the record and those beneath it (`build` takes `build/test` along; an empty id takes
+     * every record, as after a full reset).
+     */
+    private fun applyReports() {
+        val taken = synchronized(reports) { reports.toList().also { reports.clear() } }
+        if (released || !isRunning) return
+        for (r in taken) {
+            if (r.state == STATUS_CLEAR) {
+                if (r.id.isEmpty()) records.clear() else records.keys.removeAll { it == r.id || it.startsWith(r.id + "/") }
+                continue
+            }
+            records.remove(r.id)
+            records[r.id] = r
+            if (records.size > MAX_STATUS_RECORDS) records.remove(records.keys.first())
+        }
+        updateStatus()
+    }
+
+    /** Sets [status] from the records, telling the service when it changed. */
+    private fun updateStatus() {
+        var top: Status? = null
+        // Oldest first, so the most recently updated wins among equals
+        for (r in records.values) {
+            if (top == null || urgency(r.state) >= urgency(top.state)) top = r
+        }
+        if (top == status) return
+        status = top
+        events.onStatusChanged(this)
+    }
+
+    /**
+     * The user has seen the tab: its done and error records go, which the specification keeps
+     * only until then.
+     */
+    fun statusSeen() {
+        if (records.values.removeAll { it.state == STATUS_DONE || it.state == STATUS_ERROR }) updateStatus()
+    }
+
+    /**
+     * From vt.rs, on the pump thread: the process group in the foreground when progress or a
+     * status was last reported no longer is. What it said about its work goes, as the
+     * specification has a terminal do when the program exits or the shell's next prompt starts:
+     * the progress and the working, blocked and idle records; done and error ones stay until seen.
+     */
+    @Suppress("unused")
+    fun onForeground() {
+        main.post {
+            if (released) return@post
+            setProgress(null)
+            if (records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }) updateStatus()
+        }
+    }
+
+    /**
      * The grid changed: the terminal reflows, the console's foreground group gets SIGWINCH, and a
      * program that asked for in-band size reports (mode 2048) gets one.
      */
@@ -250,7 +385,15 @@ internal class VtSession(
         exit = code
         hangUp()
         writer?.shutdown()
+        main.removeCallbacks(dropProgress)
         if (released) return
+        // Nothing runs any more to work, wait or have finished: an ended tab shows none of it
+        if (progress != null || status != null) {
+            progress = null
+            records.clear()
+            status = null
+            events.onStatusChanged(this)
+        }
         if (tab != 0L) {
             val reason = when {
                 code > 0 -> " (code $code)"
@@ -269,6 +412,7 @@ internal class VtSession(
         released = true
         finishIfRunning()
         writer?.shutdown()
+        main.removeCallbacks(dropProgress)
         // A running pump keeps the terminal until it returns
         if (tab != 0L) VtNative.destroy(tab)
     }
@@ -281,5 +425,70 @@ internal class VtSession(
     /** Closes the console once, so a later close cannot hang up a tab that reused its number. */
     private fun hangUp() {
         if (hungUp.compareAndSet(false, true)) pty.close()
+    }
+
+    companion object {
+        // libghostty-vt's GhosttyTerminalProgressState (OSC 9;4)
+        const val PROGRESS_REMOVE = 0
+        const val PROGRESS_SET = 1
+        const val PROGRESS_ERROR = 2
+        const val PROGRESS_INDETERMINATE = 3
+        const val PROGRESS_PAUSE = 4
+
+        // libghostty-vt's GhosttyProgramStatusState (OSC 7501)
+        const val STATUS_IDLE = 0
+        const val STATUS_WORKING = 1
+        const val STATUS_DONE = 2
+        const val STATUS_BLOCKED = 3
+        const val STATUS_ERROR = 4
+        const val STATUS_CLEAR = 5
+
+        // libghostty-vt's GhosttyProgramStatusKind: what a blocked program needs
+        const val KIND_NONE = 0
+        const val KIND_PERMISSION = 1
+        const val KIND_QUESTION = 2
+        const val KIND_AUTH = 3
+
+        /** How long a progress report lasts without the next one (Ghostty's 15 s). */
+        private const val PROGRESS_TIMEOUT_MS = 15_000L
+
+        /** The most status records a tab keeps (the specification allows 64 to 256). */
+        private const val MAX_STATUS_RECORDS = 64
+
+        /**
+         * What [status] says the program is doing or needs, in a few words for people (a
+         * notification, TalkBack).
+         */
+        fun describe(context: Context, status: Status): String = context.getString(
+            when (status.state) {
+                STATUS_BLOCKED -> when (status.kind) {
+                    KIND_PERMISSION -> R.string.status_permission
+                    KIND_QUESTION -> R.string.status_question
+                    KIND_AUTH -> R.string.status_auth
+                    else -> R.string.status_blocked
+                }
+                STATUS_DONE -> R.string.status_done
+                STATUS_ERROR -> R.string.status_error
+                STATUS_WORKING -> R.string.status_working
+                else -> R.string.status_idle
+            },
+        )
+
+        /** How much a record needs the user: [status] is the one that needs them most. */
+        private fun urgency(state: Int) = when (state) {
+            STATUS_BLOCKED -> 4
+            STATUS_ERROR -> 3
+            STATUS_DONE -> 2
+            STATUS_WORKING -> 1
+            else -> 0
+        }
+
+        /**
+         * [text] without Unicode's text direction controls (embeddings, overrides, isolates and
+         * marks), which could make it read otherwise outside the terminal.
+         */
+        private fun withoutDirectionControls(text: String) = text.filterNot {
+            it in '‪'..'‮' || it in '⁦'..'⁩' || it == '‎' || it == '‏' || it == '؜'
+        }
     }
 }

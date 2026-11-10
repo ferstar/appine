@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.InsetDrawable
 import android.util.TypedValue
 import android.view.Gravity
@@ -486,6 +487,23 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
          * row slides it there after tabs close).
          */
         fun drawIndicator(canvas: Canvas, container: View, label: TextView, paint: Paint, dx: Float = 0f) {
+            val r = indicator
+            if (!indicatorBounds(container, label, dx, r)) return
+            val alpha = paint.alpha
+            paint.alpha = (alpha * label.alpha).roundToInt()
+            canvas.drawRoundRect(r, r.height() / 2, r.height() / 2, paint)
+            paint.alpha = alpha
+        }
+
+        /** [drawIndicator]'s bounds, reused: drawing must not allocate. Main thread only. */
+        private val indicator = RectF()
+
+        /**
+         * Puts where the indicator under [label] lies in [container] ([drawIndicator]) into
+         * [out]; false when [label] is not in [container]. The tab row draws a background tab's
+         * progress there too.
+         */
+        fun indicatorBounds(container: View, label: TextView, dx: Float, out: RectF): Boolean {
             // The label's place in the container: its left and top, not
             // offsetDescendantRectToMyCoords, which subtracts each view's scroll, and a single-line
             // label scrolls its text far sideways to centre it
@@ -495,7 +513,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             while (v !== container) {
                 x += v.left
                 y += v.top
-                v = v.parent as? View ?: return
+                v = v.parent as? View ?: return false
             }
             // In whole pixels, rounded down as TabBarView's dp
             val density = label.resources.displayMetrics.density
@@ -503,10 +521,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             val height = max(1, (INDICATOR_HEIGHT_DP * density).toInt())
             val left = x + (label.width - width) / 2f + dx
             val top = (y + label.baseline + (INDICATOR_GAP_DP * density).toInt()).toFloat()
-            val alpha = paint.alpha
-            paint.alpha = (alpha * label.alpha).roundToInt()
-            canvas.drawRoundRect(left, top, left + width, top + height, height / 2f, height / 2f, paint)
-            paint.alpha = alpha
+            out.set(left, top, left + width, top + height)
+            return true
         }
     }
 }

@@ -139,6 +139,13 @@ pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// The console's foreground process group, for the app to tell when the program that reported
+/// progress or its status gave the terminal back (the android/terminal map). ESRCH when there is
+/// none (the shell has exited).
+pub(crate) fn fg_pgrp(k: &Kernel, id: u32) -> Result<Tid, Errno> {
+    tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)
+}
+
 /// The current directory of the console's foreground process group (for restoring tabs after the
 /// app is killed, the android/service map): the leader's, or any process in the group's once the
 /// leader has exited; the path is relative to that process's root (as its `/proc/<pid>/cwd` is).

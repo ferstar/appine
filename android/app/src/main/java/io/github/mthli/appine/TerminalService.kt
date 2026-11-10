@@ -69,6 +69,9 @@ class TerminalService : Service() {
         /** A program rang the bell in the tab in front ([inFront]). */
         fun onBell() {}
 
+        /** A tab's progress or program status changed ([VtSession.progress], [VtSession.status]). */
+        fun onTabStatus() {}
+
         /**
          * State shown in Settings changed: the download progress of a distro switch ([switching]),
          * the mirror.
@@ -278,6 +281,12 @@ class TerminalService : Service() {
     private val bellNotified = HashMap<VtSession, Long>()
 
     /**
+     * The program status each tab's notification shows ([notifyStatus]), while it shows one: a
+     * bell or a program's own notification replacing it takes the tab out.
+     */
+    private val statusNotified = HashMap<VtSession, VtSession.Status>()
+
+    /**
      * The hold of the kernel lock last notified ([reportStall]): the kernel it was in, its id, and
      * whether it had ended.
      */
@@ -323,12 +332,14 @@ class TerminalService : Service() {
 
     /**
      * The tab the Activity is showing (saving tabs records which one it is); showing a tab takes
-     * away its notification ([notifyTab]).
+     * away its notification ([notifyTab]), and the done and error statuses it was showing have
+     * been seen.
      */
     internal var current: VtSession? = null
         set(value) {
             field = value
             value?.let(::cancelTabNotification)
+            value?.takeIf(::inFront)?.statusSeen()
         }
 
     /**
@@ -348,6 +359,7 @@ class TerminalService : Service() {
             val now = System.currentTimeMillis()
             if (now - (bellNotified[session] ?: 0) < BELL_NOTIFY_MS) return
             bellNotified[session] = now
+            statusNotified.remove(session)
             notifyTab(session, "", getString(R.string.bell_rang), quiet = true)
         }
 
@@ -368,7 +380,14 @@ class TerminalService : Service() {
         }
 
         override fun onNotification(session: VtSession, title: String, body: String) {
-            if (!inFront(session)) notifyTab(session, title, body, quiet = false)
+            if (inFront(session)) return
+            statusNotified.remove(session)
+            notifyTab(session, title, body, quiet = false)
+        }
+
+        override fun onStatusChanged(session: VtSession) {
+            each { it.onTabStatus() }
+            notifyStatus(session)
         }
 
         override fun onFinished(session: VtSession) {
@@ -790,7 +809,8 @@ class TerminalService : Service() {
     private fun inFront(session: VtSession) = session === current && listeners.any { it is MainActivity }
 
     /**
-     * A program in [session], not the tab in front, asked for attention (a bell, OSC 9, OSC 777):
+     * A program in [session], not the tab in front, asked for attention (a bell, OSC 9, OSC 777,
+     * a program status, [notifyStatus]):
      * one notification per tab, replaced by the tab's next one and taken away when the tab is
      * shown, opening that tab. It is titled [title], or else the tab's title; a [quiet] one (the
      * bell) alerts only when the tab's notification is not showing already.
@@ -816,8 +836,37 @@ class TerminalService : Service() {
         getSystemService(NotificationManager::class.java).notify(id, notification)
     }
 
+    /**
+     * Tells the user when [session]'s program status (OSC 7501) needs them or has news: blocked
+     * (waiting for an approval, an answer or credentials), done or failed, as the tab's
+     * notification ([notifyTab]) titled with the record's title, or the tab's. Each status
+     * notifies once: the same record again posts nothing, while one that changes posts anew. A
+     * status that goes without the user (the program was killed, or stopped waiting) takes its
+     * notification away, unless something else has replaced it. In the tab in front nothing is
+     * posted, and done and error count as seen at once.
+     */
+    private fun notifyStatus(session: VtSession) {
+        val status = session.status?.takeIf {
+            it.state == VtSession.STATUS_BLOCKED || it.state == VtSession.STATUS_DONE || it.state == VtSession.STATUS_ERROR
+        }
+        if (status == null) {
+            if (statusNotified.remove(session) != null) cancelTabNotification(session)
+            return
+        }
+        if (inFront(session)) {
+            session.statusSeen()
+            return
+        }
+        if (statusNotified[session] == status) return
+        statusNotified[session] = status
+        val what = VtSession.describe(this, status)
+        val text = if (status.message.isEmpty()) what else getString(R.string.status_message, what, status.message)
+        notifyTab(session, status.title, text, quiet = false)
+    }
+
     private fun cancelTabNotification(session: VtSession) {
         bellNotified.remove(session)
+        statusNotified.remove(session)
         getSystemService(NotificationManager::class.java)
             .cancel(TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT)
     }

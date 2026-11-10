@@ -103,6 +103,17 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // What a notification (OSC 9, OSC 777) keeps of its title and body
 #define NOTIFICATION_MAX ((size_t)4096)
 
+// The terminfo entry programs run under (ConsolePty sets TERM to it), the answer to XTGETTCAP's
+// TN. Unset, libghostty-vt leaves that query unanswered; the other capabilities it answers from
+// Ghostty's own entry either way
+static const char TERMINFO_NAME[] = "xterm-256color";
+
+// A program status report (OSC 7501) as appine_vt_take_effects queues it for vt.rs, which reads the
+// same layout: u8 state (GhosttyProgramStatusState), u8 kind (GhosttyProgramStatusKind), i8 progress
+// (0-100, -1 for none), u8 id length, u8 title length, u16 message length, then the id, title and
+// message bytes. The specification's limits (id 128, title 192, message 2048 bytes) fit the fields
+#define STATUS_HEADER_BYTES 7
+
 typedef struct {
   uint8_t *ptr;
   size_t len;
@@ -161,6 +172,13 @@ typedef struct {
   size_t title_len;
   const uint8_t *body;
   size_t body_len;
+  // The last progress report (OSC 9;4): its GhosttyTerminalProgressState, -1 for none, and its
+  // percentage, -1 when it has none
+  int32_t progress_state;
+  int32_t progress;
+  // Every program status report (OSC 7501), in order, as STATUS_HEADER_BYTES describes
+  const uint8_t *statuses;
+  size_t statuses_len;
 } AppineVtEffects;
 
 typedef struct AppineVt {
@@ -190,13 +208,17 @@ typedef struct AppineVt {
   // A program set the title (OSC 0/2) since appine_vt_take_title_changed
   bool title_changed;
   // Effects for the app since appine_vt_take_effects: bells rung (BEL), the last clipboard write
-  // (OSC 52: text, or a request to clear), the last notification (OSC 9, OSC 777)
+  // (OSC 52: text, or a request to clear), the last notification (OSC 9, OSC 777), the last
+  // progress report (OSC 9;4; progress_state -1 for none) and the program status reports (OSC 7501)
   uint32_t bells;
   int clipboard;
   Buf clip;
   bool notified;
   Buf note_title;
   Buf note_body;
+  int32_t progress_state;
+  int32_t progress;
+  Buf statuses;
   // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -330,6 +352,45 @@ static void on_notification(GhosttyTerminal t, void *userdata,
   }
 }
 
+// OSC 9;4: only the last report of a read matters, as each replaces the one before. A full reset
+// reports a removal
+static void on_progress(GhosttyTerminal t, void *userdata, const GhosttyTerminalProgressReport *r) {
+  (void)t;
+  AppineVt *vt = userdata;
+  if (r->size < offsetof(GhosttyTerminalProgressReport, progress) + sizeof(r->progress)) return;
+  vt->progress_state = (int32_t)r->state;
+  vt->progress = r->progress;
+}
+
+static size_t at_most(size_t len, size_t max) {
+  return len < max ? len : max;
+}
+
+// OSC 7501: every report is queued, since each replaces the record of its id only; the app keeps
+// the records (VtSession). A full reset reports a clear of every record
+static void on_program_status(GhosttyTerminal t, void *userdata,
+                              const GhosttyTerminalProgramStatus *s) {
+  (void)t;
+  AppineVt *vt = userdata;
+  if (s->size < offsetof(GhosttyTerminalProgramStatus, message) + sizeof(s->message)) return;
+  size_t id = at_most(s->id.len, UINT8_MAX);
+  size_t title = at_most(s->title.len, UINT8_MAX);
+  size_t message = at_most(s->message.len, UINT16_MAX);
+  if (!buf_reserve(&vt->statuses, STATUS_HEADER_BYTES + id + title + message)) return;
+  uint8_t *p = vt->statuses.ptr + vt->statuses.len;
+  p[0] = (uint8_t)s->state;
+  p[1] = (uint8_t)s->kind;
+  p[2] = (uint8_t)s->progress;
+  p[3] = (uint8_t)id;
+  p[4] = (uint8_t)title;
+  put_u16(p + 5, (uint16_t)message);
+  p += STATUS_HEADER_BYTES;
+  if (id > 0) memcpy(p, s->id.ptr, id);
+  if (title > 0) memcpy(p + id, s->title.ptr, title);
+  if (message > 0) memcpy(p + id + title, s->message.ptr, message);
+  vt->statuses.len += STATUS_HEADER_BYTES + id + title + message;
+}
+
 // A hold began: capture the screen now, which is the frame the program wants to keep showing
 static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   AppineVt *vt = userdata;
@@ -368,6 +429,7 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
   vt->mouse_x = -1;
   vt->mouse_y = -1;
+  vt->progress_state = -1;
 
   // The value itself is the userdata (since 1.4; it was read through *(void **)value before)
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_USERDATA, vt);
@@ -385,6 +447,12 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
                        (const void *)on_clipboard_write);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
                        (const void *)on_notification);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, (const void *)on_progress);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
+                       (const void *)on_program_status);
+  GhosttyString terminfo = {.ptr = (const uint8_t *)TERMINFO_NAME,
+                            .len = sizeof(TERMINFO_NAME) - 1};
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo);
   size_t lines = SCROLLBACK_LINES;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines);
   size_t bytes = SCROLLBACK_BYTES;
@@ -432,6 +500,7 @@ void appine_vt_free(AppineVt *vt) {
   free(vt->clip.ptr);
   free(vt->note_title.ptr);
   free(vt->note_body.ptr);
+  free(vt->statuses.ptr);
   free(vt->grapheme);
   free(vt);
 }
@@ -1104,8 +1173,8 @@ bool appine_vt_take_title_changed(AppineVt *vt) {
   return changed;
 }
 
-// The bells, clipboard write and notification since the last call (vt.rs's `Effects`); the
-// text stays valid until the next feed
+// The bells, clipboard write, notification, progress and status reports since the last call
+// (vt.rs's `Effects`); the text stays valid until the next feed
 void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->bells = vt->bells;
   out->clipboard = vt->clipboard;
@@ -1116,9 +1185,15 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->title_len = vt->notified ? vt->note_title.len : 0;
   out->body = vt->note_body.ptr;
   out->body_len = vt->notified ? vt->note_body.len : 0;
+  out->progress_state = vt->progress_state;
+  out->progress = vt->progress;
+  out->statuses = vt->statuses.ptr;
+  out->statuses_len = vt->statuses.len;
   vt->bells = 0;
   vt->clipboard = APPINE_CLIPBOARD_NONE;
   vt->notified = false;
+  vt->progress_state = -1;
+  vt->statuses.len = 0;
 }
 
 // The title set by the program (OSC 0/2), empty when none; valid until the next text call

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, unwired libghostty-vt options, then scrollback limits, default colours, DA1 and OSC 5522's limit last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, scrollback limits, default colours, DA1 and OSC 5522's limit, then progress reports, program status and TN last)
 
 ## Responsibilities
 
@@ -14,10 +14,11 @@
 - `MainActivity`: the screen's layout and status text, the current session and its successor,
   closing tabs, keyboard shortcuts, font zoom, insets and the IME, links, with the tab bar
   (`TabBarView`) and the extra keys (`ExtraKeysView`);
-- the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads),
-  `VtView` (drawing with the bundled JetBrains Mono, input, selection, gestures), `VtKeys`,
-  `VtGlyphs`, `VtNative`, and the emulator shim and JNI in the native library (`vt.c`, `vt.rs`)
-  around Ghostty's libghostty-vt;
+- the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
+  what its programs report about their progress and status), `VtView` (drawing with the bundled
+  JetBrains Mono, input, selection, gestures), `ProgressLine` (the current tab's progress over the
+  terminal), `VtKeys`, `VtGlyphs`, `VtNative`, and the emulator shim and JNI in the native library
+  (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
 - `LicensesActivity`: the notices generated at build time;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
@@ -28,27 +29,28 @@
 
 Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSession.kt`,
 `VtView.kt`, `VtGlyphs.kt`, `VtKeys.kt`, `VtNative.kt`, `ConsolePty.kt`, `TabBarView.kt`,
-`ExtraKeysView.kt`, `LicensesActivity.kt`, `android/app/src/main/res/`,
+`ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `android/app/src/main/res/`,
 `android/app/src/main/assets/fonts/`, `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
 
-Outside the module: session ownership, saving, kill reports and where bells, notifications and
-clipboard writes go (`android/service`); the host console in the kernel (`kernel/tty`); the
+Outside the module: session ownership, saving, kill reports and where bells, notifications,
+program statuses and clipboard writes go (`android/service`); the host console in the kernel (`kernel/tty`); the
 notices task, the JNI crate, `guarded!` and the build, including compiling libghostty-vt with Zig
 (`android/native`).
 
 ## Key types
 
 - `MainActivity` — a `TerminalService.Listener` built in code: a black column of `TabBarView`, a
-  frame with the `VtView` and a status line, and `ExtraKeysView`; adapters `Host : VtView.Host`,
+  frame with the `VtView`, a status line and the `ProgressLine` along its top, and `ExtraKeysView`; adapters `Host : VtView.Host`,
   `Bar : TabBarView.Target` and `Keys : ExtraKeysView.Target`; the current session and its index,
   from which its successor is taken; a tab requested by a notification (`EXTRA_TAB`); the IME
   animation callback `keysFollowIme`.
 - `TabBarView` — the tab bar (a scrolling row of numbered tabs, with `×`, `+` and `⋮` over its
   end): shows the sessions and the current one it is given (`render`) and sends taps on tabs and
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
-  `newTab`, `menu`, `notice`); `Tab` (one per session: its number in the row, which slides, rolls
-  to a new number and fades out when closed); `TabNumber` (the number, a `TextView` drawing its
-  digits itself so they can roll).
+  `newTab`, `menu`, `notice`); it draws the other tabs' progress and status marks and redraws them
+  on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
+  number and fades out when closed); `TabNumber` (the number, a `TextView` drawing its digits
+  itself so they can roll).
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
@@ -58,8 +60,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   over SYM) fixed over its end. It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
   false while the symbols are shown) and the page shown, exposes them with `modifiersUsed`, and
   sends keys, text and notices (a modifier locked) to a `Target`; `Press` handles the touch on one
-  key. Its companion's `FADE_DP`, `indicatorPaint` and `drawIndicator` (the indicator under a
-  label) serve the tab row too.
+  key. Its companion's `FADE_DP`, `indicatorPaint`, `drawIndicator` (the indicator under a label)
+  and `indicatorBounds` (where it lies, where the tab row also draws a tab's progress) serve the tab
+  row too.
 - `ConsolePty` — `start` (open a console, spawn `login.sh` through `sh -c` with the tab's login
   and cwd and a fixed environment, `TERM=xterm-256color` among it), `waitFor`, `close`; `console`
   is −1 until started and keeps its number after `close` (`VtSession.consoleOpen` tells whether it
@@ -74,9 +77,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   notification's intent), its `ConsolePty`, the terminal handle (0 until the shell starts, never
   reset), the view showing it (`view`, read on the pump thread), pending restored text and
   messages, its login and the account an `auto` login resolved to (`resolvedLogin`, written by the
-  service), the last transcript, a `vt-pump` thread, a `vt-waiter` thread and its own
-  single-thread `vt-writer` executor; `Events` (title changed, bell, clipboard write,
-  notification, finished) go to the service on the main thread.
+  service), the last transcript, the last progress report (`progress`, a `Progress`), the program
+  status records by id (`Status`, least recently updated first, at most 64) and the one most in
+  need of the user (`status`), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
+  `vt-writer` executor; `Events` (title changed, bell, clipboard write, notification, progress or
+  status changed, finished) go to the service on the main thread. Its companion holds
+  libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
   (codepoint, colours, attributes, grapheme clusters per cell, each row's selected columns), a
   backing bitmap of the grid, the modes, scroll position and selection bounds of the last frame,
@@ -84,6 +90,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   handles and the floating menu, the cursor's blink timer and the bell's last vibration. `Host`
   (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift` and
   `modifiersUsed`, and `onLink` (opens a link in another app).
+- `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
+  report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
+  rectangle (`draw`, a fill or a sweep) and gives a report's fraction (`fractionOf`).
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
@@ -91,26 +100,29 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - `VtNative` — 21 `@JvmStatic external` functions on the native library.
 - In `vt.rs`: `Tab` (the kernel's handle, console number, the terminal under a mutex, a `dirty`
   flag) in a table `TABS` keyed by handles from 1, never reused; `Term` (owns the `AppineVt`,
-  freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into `Effects`.
+  freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into `Effects` (with
+  the `StatusReport`s decoded from vt.c's queue).
 - In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and
   cell pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link
   and transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
   selection drag, the last reported mouse cell, and the effects since they were last taken: bells,
-  the last clipboard write, the last notification; `AppineVtEffects` is how they are handed out).
+  the last clipboard write, the last notification, the last progress report and every program
+  status report, queued in a byte layout vt.rs reads; `AppineVtEffects` is how they are handed
+  out).
 
 ## Public entry points
 
 - Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
   most configuration changes itself, the dark mode and density included), started with
   `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
-  `onMachineReady`, `onSessionsChanged`, `onBell`, `onSettingsChanged`, `onNotice`,
-  `onRestarting`, `onExitAll`.
+  `onMachineReady`, `onSessionsChanged`, `onBell`, `onTabStatus`, `onSettingsChanged`,
+  `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
 - `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `resize`, `key`, `paste`, `mouse`,
   `focus`, `scroll`, `selectWord`, `selectGrab`, `selectTo`, `selectAll`, `selectClear`, `copy`,
   `link`, `message`, `transcript`, `destroy`; `pump` runs on `vt-pump` and calls
-  `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard` and `onNotification` back; the rest
-  run on the main thread.
+  `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
+  `onStatus` and `onForeground` back; the rest run on the main thread.
 
 ## Data flow / lifecycle
 
@@ -155,6 +167,15 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   label with its top 4 dp below the baseline, in whole pixels rounded down; the row draws it over
   its tabs. Labels are sized in dp (numbers 12 in the default weight, buttons 14) so the system
   font scale leaves them as they are (dialogs, menus and toasts follow it).
+- The other tabs, while their shell runs, show what their programs report (`VtSession.progress`
+  and `status`; the current tab has the terminal's progress line instead): progress in the
+  indicator's place, its track the progress colour at 30% opacity, filled from the left to the
+  percentage or with a quarter of it sweeping across and back, in the progress line's colours (a
+  progress report; else a working status, or a blocked one with a percentage, in the primary
+  colour); and a dot of 2 dp radius 1 dp right of the number's ink, centred on the top of its
+  digits, for a status: blocked in the primary colour, failed in the error colour, done in the muted
+  one. The row draws them over its tabs, following a sliding tab and fading with its number, and
+  redraws every frame while a sweep is drawn.
 - Closing tabs is animated (150–300 ms a step, under the system's animator duration scale): a
   closed tab shrinks and fades out where it was; the tabs after it slide into the places left,
   still showing their old numbers, then roll to the new ones (300 ms, like SwiftUI's numeric
@@ -169,7 +190,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Tapping a tab shows it; a long press shows its title in a toast: the program's title (`sh` when
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier, a link that cannot be opened), cancelling the previous one.
-  TalkBack reads "Tab N: title" and the `×`, `+` and `⋮` buttons by name (`⋮` as "More options").
+  TalkBack reads "Tab N: title", followed for a running program that reported something by what
+  it reported in parentheses ("Waiting for your approval", "Done", "Failed", "Paused", "Working",
+  with the percentage when there is one), and the `×`, `+` and `⋮` buttons by name (`⋮` as "More
+  options").
 - `×` and the menu's "Close other tabs" and "Close all tabs" close at once when no shell they
   close is running, else after a confirmation dialog ("Close this tab?" for one tab, else "Close N
   tabs?"); several tabs are closed with the current one last, so no other tab is shown (and its
@@ -243,8 +267,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
   the cursor follows the foreground as in Ghostty; grapheme clustering, mode 2027, on by default as
   in Ghostty; Kitty graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is
-  advertised and programs that probe fall back to text); restored text and queued messages are
-  printed into it; then the writer, the pump and the waiter start.
+  advertised and programs that probe fall back to text; the terminfo name `xterm-256color`, the
+  `TERM` the console's login gets, which XTGETTCAP's `TN` reports); restored text and queued
+  messages are printed into it; then the writer, the pump and the waiter start.
 - If opening the console or spawning fails, the reason is printed, the console is closed and the
   tab counts as ended (127), with no "Process completed" line and no writer. If the terminal cannot
   be made (the kernel is gone, libghostty-vt fails, a panic), the tab ends (127) without a word,
@@ -264,17 +289,34 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   denied, other types unsupported; those replies reach only OSC 5522 programs), or a request to
   clear (an OSC 5522 write of more than 1 MiB in all its representations fails with EFBIG inside
   libghostty-vt, which buffers a write whole before handing it over); a notification (OSC 9's
-  body, OSC 777's title and body, up to 4 KiB each; only the last of a read). Clipboard reads have
+  body, OSC 777's title and body, up to 4 KiB each; only the last of a read); a progress report
+  (OSC 9;4, only the last of a read); program status reports (OSC 7501, every one in order, which
+  libghostty-vt has already checked against the specification and whose title and message it has
+  decoded; with the callback set it also answers the protocol's `?` query). Clipboard reads have
   no callback: OSC 52 `?` goes unanswered, OSC 5522 reads are refused, and Kitty paste events are
   never sent, as with `clipboard-read = deny`. What the app prints itself (`VtNative.print`) asks
   nothing: its replies and effects are dropped. Where they go is the service's choice
   (android/service): the bell of the tab in front vibrates through `VtView.bell`, other bells (at
   most once a second) and notifications from tabs not in front become the tab's notification, and
   clipboard writes always reach the clipboard.
+- Progress and status (`VtSession`, main thread): a progress report replaces the last one (a
+  removal clears it) and lasts 15 s without another, as in Ghostty. Status reports of a read are
+  applied together, as the specification keeps them: one record per id, a report replacing its
+  record whole, a clear removing the record and those beneath it (`build` takes `build/test`; an
+  empty id, as after a full reset, takes all), at most 64 records, the one updated longest ago
+  dropped; text direction controls are removed from titles and messages. `status` is the record
+  most in need of the user: blocked, then error, done, working, idle, the most recently updated
+  among equals. A change of either (by value) is reported to the service (`onStatusChanged`).
+- The pump stands in for shell integration's prompt mark: after a read that carried a progress or
+  status report it notes the console's foreground process group (`Machine::console_foreground`),
+  and on a later read where another group (or none) has the foreground it calls `onForeground`,
+  which drops the progress and the working, blocked and idle records, keeping done and error ones
+  until seen. Seeing the tab (`statusSeen`, from the service) drops done and error records; the
+  shell's end drops everything.
 - The waiter waits for the shell (−9, "signal 9", once the kernel is gone), gives the pump up to
   0.5 s to take the last output, then on the main thread closes the console (once), stops the
-  writer and, unless the tab was released, prints "[Process completed (code N | signal N) - press
-  Enter]" and reports the end.
+  writer and, unless the tab was released, drops the tab's progress and status records, prints
+  "[Process completed (code N | signal N) - press Enter]" and reports the end.
 - `release` (the tab closed, or its kernel going away) hangs up the console once, stops the writer
   (writes already queued still run) and destroys the terminal handle; a running pump keeps the
   terminal until it returns.
@@ -335,6 +377,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   move show it again for a whole period.
 - The bell of the tab shown vibrates once through `performHapticFeedback(REJECT)` (a double
   click, subject to the system's touch feedback setting), at most once per 100 ms.
+- The current tab's progress report is drawn by `ProgressLine`, 2 dp high over the top of the
+  terminal's first row, as Ghostty draws it: filled from the left to the percentage in the primary
+  colour, the error colour for an error, the muted colour while paused (all of it for a pause
+  without a percentage); without a percentage, or indeterminate, a quarter of its width sweeps
+  across and back (1.2 s each way, ease-in-out, timed by the clock) over a track at 30% opacity,
+  redrawn every frame. It fades in and out in 150 ms and slides to a new percentage in 200 ms;
+  showing another tab puts that tab's progress there at once. It takes no touches and is hidden
+  from accessibility.
 
 #### Input
 
@@ -472,7 +522,7 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - `TerminalService` (creates and holds the `VtSession`s: `setRestored`, `showMessage`,
   `transcriptText`, `title`, `isRunning`, `console`, `login` and `resolvedLogin`, `id`,
-  `release`; `current`, `focus`, `sessions`, listener callbacks, the notification intent with
+  `status`, `statusSeen`, `describe`, `release`; `current`, `focus`, `sessions`, listener callbacks, the notification intent with
   `EXTRA_TAB`); `SettingsActivity` (licenses).
 
 ### Outbound
@@ -484,8 +534,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
-  encoding, selection, plain-text formatting, title and width), linked into `libappine.so`
-  (`android/native`); `Machine::read_console`, `write_console` and `resize_console` and the
+  encoding, selection, plain-text formatting, title and width, progress and program status
+  reports), linked into `libappine.so` (`android/native`); `Machine::read_console`,
+  `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly; the system
   clipboard; the app the system picks for a link (a browser, or a viewer or the Files app for a
   guest file through `Documents.fileLink`, android/documents); JetBrains Mono 2.304 (variable,
@@ -621,7 +672,18 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Without a DA reply, programs that probe for it (vim, tmux) wait for a timeout, so `vt.c` answers
   DA1 (132 columns, selective erase, ANSI colour, and clipboard access, 52, which Ghostty lists
   whenever clipboard writes are allowed and programs check before using OSC 52), DA2 (VT220), DA3
-  and XTVERSION ("appine") and reports a dark colour scheme.
+  and XTVERSION ("appine") and reports a dark colour scheme. XTGETTCAP answers `TN` with the name
+  vt.c sets, and every other capability from libghostty-vt's built-in table of Ghostty's own entry,
+  not from `xterm-256color`'s.
+- A progress or status report from a command that exits at once (a `printf` at the prompt) is
+  usually dropped as soon as it shows: the read after it finds the shell back in the foreground. A
+  report made after the reporting group has already given the terminal back is kept until the next
+  command takes the foreground. A program in the background reporting is tracked against whatever
+  group was in the foreground then.
+- The status records live on the main thread only; the pump hands reports over through a locked
+  list drained by one post, so the reports of one read are usually applied together and a passing
+  state between two of them notifies no one. A full reset arrives as a clear of every record and a
+  removal of the progress, before libghostty-vt's reset callback (unset here).
 - Without default foreground and background colours libghostty-vt treats them as unset: OSC 10
   and 11 queries go unanswered, reverse video (DECSCNM) swaps nothing, and a colour set with OSC 10
   or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
@@ -654,16 +716,14 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   compressed (below).
 - **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
   (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
-- **libghostty-vt features not wired**: no callbacks for OSC 9;4 progress, OSC 7501 program
-  status (a program reporting itself idle, working, done, blocked or in error, so a tab cannot
-  show that its CLI waits for an answer), OSC 7 working directories or OSC 133 prompts (the last
-  two also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and nushell but
-  not ash, and Appine installs none); no search; no scrollback compression
+- **libghostty-vt features not wired**: no callbacks for OSC 7 working directories or OSC 133
+  prompts (both also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and
+  nushell but not ash, and Appine installs none; the progress and status records go by the
+  foreground process group instead of the prompt mark); no search; no scrollback compression
   (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
   libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
   continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
-  which vt.c leaves off; no terminfo name is set, so XTGETTCAP `TN` goes unanswered; ENQ, the
-  title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
+  which vt.c leaves off; ENQ, the title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
   clipboard reads are refused where Ghostty's default (`clipboard-read = ask`) asks, and wiring
   them would turn the IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into
   Kitty paste events for programs using mode 5522.
@@ -697,6 +757,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   tabs" with one other tab name it rather than ask "Close this tab?"?
 - Should showing another tab send focus-out and focus-in (mode 1004) to the two tabs?
 - Should invisible cells keep their decorations (as now) or hide them as Ghostty's renderer does?
+- Should a background tab's progress take another colour than the primary one? Nearly full, it
+  looks like the current tab's indicator, told apart only by the numbers' colours.
+- Should a status notification name the record's `app` when it has no title, as a key for grouping
+  (the specification says it is not a label), rather than the tab's title?
 
 ## To verify
 
@@ -722,6 +786,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   macOS build of libghostty-vt 1.4.0 fed 30,000 lines, not from Android or 16 KB-page devices);
   the OSC 5522 limit was likewise tried only there. The default colours, DA1 and reverse video
   were also tried in the app on a Pixel 4a API 34 emulator.
+- Progress and status from real programs (cargo, systemd, AI coding CLIs): tried only with
+  `printf` sequences on a Pixel 4a API 34 emulator (the progress line in each state, background
+  tabs' marks, notifications, a kill from another tab, seeing a tab, the 15 s timeout, Chinese
+  strings, TalkBack descriptions read through uiautomator, not heard).
 - What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
   `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
   also after a full reset and on the alternate screen, was checked on a macOS build of

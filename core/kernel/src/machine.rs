@@ -464,6 +464,15 @@ impl Machine {
         .unwrap_or(Err(Errno::EIO))
     }
 
+    /// The process group in the foreground of console `id` (the app clears what a program reported
+    /// about its progress once another group takes the terminal; the android/terminal map). ESRCH
+    /// if there is none, as after the shell has exited.
+    pub fn console_foreground(&self, id: u32) -> Result<i32, Errno> {
+        let k = self.shared.lock();
+        crate::bug::host_call("Machine::console_foreground", || terminal::fg_pgrp(&k, id))
+            .unwrap_or(Err(Errno::EIO))
+    }
+
     /// The current directory of console `id`'s foreground process group (when the app restores
     /// tabs after being killed, the new shell starts here; the android/service map). ESRCH if the
     /// shell has already exited.
