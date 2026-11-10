@@ -62,6 +62,10 @@ struct RawEffects {
     statuses_len: usize,
     clipboard_reads: u32,
     clipboard_read_kind: u8,
+    command_finished: bool,
+    command_has_exit: bool,
+    command_exit: i32,
+    command_ms: u64,
 }
 
 /// vt.c's `APPINE_CLIPBOARD_TEXT` and `APPINE_CLIPBOARD_CLEAR`.
@@ -226,7 +230,8 @@ impl Term {
     }
 
     /// The bells, clipboard write, notification, progress and status reports and clipboard reads
-    /// programs sent since the last call.
+    /// programs sent, and the last command the shell's prompt marks saw finish, since the last
+    /// call.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -244,6 +249,10 @@ impl Term {
             statuses_len: 0,
             clipboard_reads: 0,
             clipboard_read_kind: 0,
+            command_finished: false,
+            command_has_exit: false,
+            command_exit: 0,
+            command_ms: 0,
         };
         unsafe { appine_vt_take_effects(self.0, &mut raw) };
         /// The `len` bytes vt.c returned at `p`, which it keeps until the next feed.
@@ -270,6 +279,10 @@ impl Term {
             statuses: StatusReport::decode(bytes(raw.statuses, raw.statuses_len)),
             clipboard_reads: (raw.clipboard_reads > 0)
                 .then_some((raw.clipboard_reads, raw.clipboard_read_kind)),
+            command: raw.command_finished.then_some((
+                raw.command_has_exit.then_some(raw.command_exit),
+                raw.command_ms,
+            )),
         }
     }
 
@@ -295,8 +308,10 @@ impl Drop for Term {
 /// What programs asked of the app in one read of the console: the bell (any number of BELs
 /// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
 /// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none), the
-/// program status reports (OSC 7501), in order, and clipboard reads (OSC 52 "?": how many, and the
-/// clipboard the last named, `c`, `p` or `s`), which the app answers once the user agrees.
+/// program status reports (OSC 7501), in order, clipboard reads (OSC 52 "?": how many, and the
+/// clipboard the last named, `c`, `p` or `s`), which the app answers once the user agrees, and the
+/// last command the shell's prompt marks (OSC 133) saw finish (its exit code when the shell
+/// reported one, and how long it ran in milliseconds).
 struct Effects {
     bell: bool,
     clipboard: Option<Option<String>>,
@@ -304,6 +319,7 @@ struct Effects {
     progress: Option<(i32, i32)>,
     statuses: Vec<StatusReport>,
     clipboard_reads: Option<(u32, u8)>,
+    command: Option<(Option<i32>, u64)>,
 }
 
 /// A program status report (OSC 7501), as vt.c queues it: libghostty-vt's state and kind, the
@@ -352,8 +368,8 @@ impl Effects {
     }
 
     /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
-    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`); false when a call
-    /// threw. The strings are
+    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`, `onCommandFinished`);
+    /// false when a call threw. The strings are
     /// local references, deleted after each call: the pump stays in native code for the tab's
     /// whole life, so they would otherwise pile up.
     fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
@@ -424,6 +440,19 @@ impl Effects {
             let args = [JValue::Int(i32::from(kind)), JValue::Int(count as i32)];
             if env
                 .call_method(session, "onClipboardRead", "(II)V", &args)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        if let Some((exit, ms)) = self.command {
+            let args = [
+                JValue::Bool(u8::from(exit.is_some())),
+                JValue::Int(exit.unwrap_or(0)),
+                JValue::Long(i64::try_from(ms).unwrap_or(i64::MAX)),
+            ];
+            if env
+                .call_method(session, "onCommandFinished", "(ZIJ)V", &args)
                 .is_err()
             {
                 return false;
@@ -621,14 +650,15 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
 /// `session.onTitle()` when a program set the title, `onBell`, `onClipboard`, `onNotification`,
-/// `onProgress`, `onStatus` and `onClipboardRead` for what programs asked of the app
-/// ([`Effects`]), and
+/// `onProgress`, `onStatus`, `onClipboardRead` and `onCommandFinished` for what programs asked of
+/// the app and what the shell's prompt marks told ([`Effects`]), and
 /// `onForeground()` once the process group that was in the foreground when progress or a status
 /// was last reported no longer is.
 ///
-/// That stands in for shell integration, which Appine does not install: the program status
-/// specification drops a program's `working` and `blocked` records when the shell's next prompt
-/// starts (OSC 133) or the program exits. Without it, a program that exits without clearing them
+/// That stands in for the shell's next prompt (OSC 133), which only some shells mark (the guest's
+/// login shells, bash and busybox ash, android/setup): the program status specification drops a
+/// program's `working` and `blocked` records when the next prompt starts or the program exits.
+/// Without it, a program that exits without clearing them
 /// (killed, or interrupted with Ctrl-C) would leave its tab working forever. The group is the one
 /// in the foreground after the read that carried the report, so a report from a command that has
 /// already exited by then lasts until the next command takes the foreground.
@@ -921,7 +951,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_paste<'l>(
 
 /// Encodes a mouse event at pixel (`x`, `y`) of the grid; empty when the program does not take
 /// it, null when encoding failed. `action`: 0 press, 1 release, 2 motion; `button`: 0 none,
-/// 1 left, 2 right, 3 middle, 4 and 5 the wheel.
+/// 1 left, 2 right, 3 middle, 4 and 5 the wheel up and down, 6 and 7 left and right.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouse<'l>(

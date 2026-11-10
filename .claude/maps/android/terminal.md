@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/terminal.md` for the paired decision history.
 >
-> Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
->
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: menus and keys, resizes, scrollback, colours, replies, progress, status, selection, search, cells, images, shell integration, snapshots, clipboard reads, clearing last)
+> Verified: 2026-11-10 (full mapping: 5 research concerns; 19 claims checked by 3 independent verifiers — 16 confirmed and 3 partial, corrected below; a bug and debts recorded)
 
 ## Responsibilities
 
@@ -19,8 +17,9 @@
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
   what its programs report about their progress and status, whether its shell waits at its prompt
   and in which directory, its terminal's snapshots and coming back from one, clipboard reads
-  waiting for an answer, clearing and resetting), `VtView` (drawing with the bundled
-  JetBrains Mono, the images programs show, input, selection, search marks, gestures),
+  waiting for an answer, the commands its shell's prompt marks show finishing, clearing and
+  resetting), `VtView` (drawing with the bundled JetBrains Mono, the images programs show, input,
+  selection, search marks, gestures and scrolling by pixels),
   `ProgressLine` (the current tab's progress over the terminal), `VtKeys`, `VtGlyphs`,
   `VtNative`, and the emulator shim and JNI in
   the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt, with the `vt-compress`
@@ -97,21 +96,23 @@ compiling libghostty-vt with Zig (`android/native`).
   64) and the one most in need of the user (`status`), the clipboard reads waiting for an answer
   (the clipboard each named), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
   `vt-writer` executor; `Events` (title changed, bell, clipboard write, notification, clipboard
-  read, progress or status changed, finished) go
+  read, progress or status changed, a command finished, the shell finished) go
   to the service on the main thread; `busy` (closing it would end something: the shell runs, has
   started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
   kernel). Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
   (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
-  selected columns), a backing bitmap of the grid, the modes (the alternate screen's readable as
-  `altScreen`), scroll position and selection
-  bounds and shape of the last frame, whether a search runs and its count as last reported, the
+  selected columns) and a backing bitmap, both one row taller than the grid (the frame's overscan
+  row after the viewport), the modes (the alternate screen's readable as `altScreen`), scroll
+  position and selection bounds and shape of the last frame, `scrollPx` (how many pixels, less
+  than a row, the grid is drawn above its place while the viewport scrolls) with the drag's
+  sub-pixel remainder, whether a search runs and its count as last reported, the
   last frame's image placements (`Placement`, a pool reused across frames) and the bitmaps of the
   images they show by id with the generation each holds (`Picture`), the animation's redraw, the
-  IME connection, gestures (with the taps in a row) and their drag states, the fling's
-  `OverScroller`, selection handles and the floating menu, the cursor's blink timer and the bell's
-  last vibration. `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`,
+  IME connection, gestures (with the taps in a row) and their drag states, the `OverScroller` of
+  flings and of settling on a whole row (`settling`), selection handles and the floating menu,
+  the cursor's blink timer and the bell's last vibration. `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`,
   `alt`, `shift` and `modifiersUsed`, `onLink` (opens a link in another app) and `onSearchCount`.
 - `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
   report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
@@ -126,16 +127,20 @@ compiling libghostty-vt with Zig (`android/native`).
   mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
   tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
   `AppineVt`, freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into
-  `Effects` (with the `StatusReport`s decoded from vt.c's queue, and the clipboard reads); the
+  `Effects` (with the `StatusReport`s decoded from vt.c's queue, the clipboard reads, and the last
+  command finished: its exit code when reported and how long it ran); the
   compression schedule `COMPRESS` (a `Due` per tab: when to look at it next and when it was
   scheduled), served by the `vt-compress` thread (`compressor`).
 - In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and cell
   pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link and
   transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
-  selection drag, the last reported mouse cell, the effects since they were last taken: bells, the
+  selection drag and whether it is a word (`anchor_words`, so a drag extends by words), the last
+  reported mouse cell, the effects since they were last taken: bells, the
   last clipboard write, the last notification, the last progress report and every program status
-  report, queued in a byte layout vt.rs reads, and the clipboard reads (OSC 52) with the clipboard
-  the last named; `AppineVtEffects` is how they are handed out; the OSC string the output is in (its
+  report, queued in a byte layout vt.rs reads, the clipboard reads (OSC 52) with the clipboard
+  the last named, and the last command finished; `AppineVtEffects` is how they are handed out; the
+  timing of the command running (`command_start`) and whether the cursor was at the prompt after
+  the last feed (`was_at_prompt`); the OSC string the output is in (its
   first 32 bytes and its length), to find those reads; the search: a `GhosttySearch` while one runs,
   scratch for the viewport's matches, and each viewport cell's search mark for this frame and as
   last sent; the cell of a command's output a long press found, tracked for the menu's Select
@@ -143,8 +148,9 @@ compiling libghostty-vt with Zig (`android/native`).
   restored compressed pages since the last pass; whether the last transcript is still the screen's
   text, and whether the last snapshot is (or none can be taken until the terminal changes); and the
   render state's image list as last read, in drawing order (`Placement`), with its placements
-  generation). Process-wide: the PNG decoder installed into libghostty-vt's sys interface with the
-  first terminal.
+  generation). Process-wide, installed into libghostty-vt's sys interface with the first terminal
+  (`install_sys`): the PNG decoder and the log callback (`on_log`), which with
+  `on_unknown_sequence` shares a limit of 20 lines a second across all tabs (`log_allowed`).
 
 ## Public entry points
 
@@ -161,7 +167,8 @@ compiling libghostty-vt with Zig (`android/native`).
   `selectOutput`, `selectClear`, `copy`, `link`, `search`, `searchSelect`, `searchEnd`, `clear`,
   `reset`, `message`, `transcript`, `snapshot`, `version`, `compressAll`, `destroy`; `pump` runs on
   `vt-pump` and calls `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`,
-  `onProgress`, `onStatus`, `onClipboardRead` and `onForeground` back; `snapshot` and
+  `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished` and `onForeground` back;
+  `snapshot` and
   `compressAll` run on the service's worker, `version` wherever `Tabs` needs it, the rest on the
   main thread.
 
@@ -179,7 +186,13 @@ compiling libghostty-vt with Zig (`android/native`).
   tab if it still exists, the service's `focus` (the restored current tab) if it still exists, the
   last tab; with no
   sessions a new one opens. A failed start hides the terminal and shows "Cannot start: …";
-  `onRestarting` detaches and shows "Restarting…".
+  `onRestarting` detaches and shows "Restarting…". `onServiceConnected` calls `onMachineReady` on
+  every bind (each `onStart`) when the kernel runs or failed to start (while it starts, the
+  progress, and `onMachineReady` later from the service), so coming back to the activity (from
+  Settings, a link's app, the background) shows the current tab again, which closes the search
+  bar. A new activity instance has no current tab of its own: it falls back to `EXTRA_TAB` (read
+  again from its intent), then the service's `focus` (set only by a restore), then the last tab,
+  never the service's `current`.
 - Showing a tab sets it as the service's `current` (which takes its notification away), attaches
   it to the view (`VtView.attach`) and renders the bar; `onRestarting` and `onDestroy` detach it,
   so sessions never keep a destroyed Activity's view.
@@ -196,7 +209,8 @@ compiling libghostty-vt with Zig (`android/native`).
   "Find", disabled with no current tab, "Clear screen", disabled without a current tab whose
   terminal exists or while it shows the alternate screen, "Reset terminal", disabled without such a
   tab, "Close other tabs", disabled when there is no other, "Close all tabs", disabled with no tabs,
-  and Settings; see Clearing and resetting) over its end, every tab and button a 32 dp square with
+  and Settings; see Clearing and resetting; Find is enabled for a current tab whose terminal does
+  not exist yet, where searching does nothing) over its end, every tab and button a 32 dp square with
   its label centred. The tabs pass under the buttons, which hide them, and an end padding as wide as
   the buttons lets the last tab scroll out from under them; while more tabs lie beyond, the row
   fades out over 32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's
@@ -236,9 +250,12 @@ compiling libghostty-vt with Zig (`android/native`).
   it set none), with "(ended)" once the shell ended. The activity shows one toast at a time (a
   tab's title, a locked modifier, a link that cannot be opened), cancelling the previous one.
   TalkBack reads "Tab N: title", followed for a running program that reported something by what
-  it reported in parentheses ("Waiting for your approval", "Done", "Failed", "Paused", "Working",
-  with the percentage when there is one), and the `×`, `+` and `⋮` buttons by name (`⋮` as "More
-  options").
+  it reported in parentheses (`VtSession.describe`'s words: "Waiting for your approval", "Waiting
+  for your answer", "Waiting for credentials", "Waiting for you", "Done", "Failed", "Working", or
+  "Paused" for a paused progress, with the percentage when there is one; an idle status alone says
+  nothing; for the
+  current tab too, though only the other tabs draw marks), and the `×`, `+` and `⋮` buttons by
+  name (`⋮` as "More options").
 - `×` and the menu's "Close other tabs" and "Close all tabs" close at once when none of the tabs
   they close is busy (its shell has ended, has not started, as in a restored tab never shown, or
   waits at its prompt as the prompt marks tell, see Shell integration), else after a confirmation
@@ -248,7 +265,10 @@ compiling libghostty-vt with Zig (`android/native`).
   shell started) on the way, and closing all ends like closing the last tab. Ctrl+Shift+W closes
   the current tab without asking, even while its shell runs, and in an ended tab any input with a
   line break (Enter) closes it.
-- Its dialogs (close, notices, the paste confirmation) and its menu (⋮, a `PopupMenu` placed like a
+- The close dialog's button closes only the tabs still open, and dismissing it or the clipboard
+  question gives the terminal the focus.
+- Its dialogs (close, notices, the clipboard question, the paste confirmation) and its menu (⋮, a
+  `PopupMenu` placed like a
   toolbar's overflow menu) are Material 3 in the theme's dark colours, from the wallpaper on
   Android 12 and later (`DynamicColors`). The tab bar, the extra keys and what lies under the
   system bars are black like the terminal; their labels, buttons and the status text take the
@@ -280,11 +300,12 @@ compiling libghostty-vt with Zig (`android/native`).
 - No match is selected until a step: `↑`, Enter or the keyboard's Search key selects the next match
   above (towards older output; the first step selects the newest), `↓` or Shift+Enter the one
   below, going round at either end, and the viewport scrolls to it unless it is shown (the scroll
-  bar shows only when it scrolled). The count reads "selected/total", the selected one counted
+  bar shows only when it scrolled; a step stops a fling and puts the grid on a whole row). The count reads "selected/total", the selected one counted
   from the newest, 0 before a step; it grows as a long scrollback is searched over several frames.
 - `×`, Esc in the text, or Back (after Back has hidden the keyboard) closes the bar: the search
   ends and its marks go, the tab bar comes back, the terminal takes the focus and the viewport
-  stays where the search left it. Showing another tab (Ctrl+Tab while searching) or a restart
+  stays where the search left it. Showing a tab (another one, Ctrl+Tab while searching, or the
+  same one again when the activity comes back, see Binding and choosing a tab) or a restart
   closes it too, as a search belongs to the tab it was opened in.
 - Matches are drawn as Ghostty draws them: black text on yellow, the selected match on orange, the
   second cell of a wide character with its first. Tapping the terminal while the bar is open gives
@@ -296,23 +317,33 @@ compiling libghostty-vt with Zig (`android/native`).
 - The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks
   the prompt, the typed command and the output's start; busybox ash the prompt, and the command
   ending with its line). libghostty-vt keeps the marks in the rows and cells it writes (prompt,
-  input, output) and the cursor's place among them; the app sets no OSC 133 callback and reads
-  only that state, through vt.c's shell integration functions. A shell without the marks (zsh,
-  fish, dash, a nested non-login shell, a remote one over ssh) leaves every cell output: it is
-  never at a prompt, there is nothing to jump to and no output to select.
+  input, output) and the cursor's place among them, which closing, jumping and Select output read
+  through vt.c's shell integration functions. A shell without the marks (zsh,
+  fish, dash, a nested non-login shell, a remote one over ssh that sends none) leaves every cell
+  output: it is never at a prompt, there is nothing to jump to and no output to select, and no
+  command is timed.
+- Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
+  starts at the output's mark (bash's PS0, `C`) or, as busybox ash marks none, when a feed ends
+  with the cursor no longer at the prompt where the one before left it there (the line feed that
+  ends the typed input, but also output of a background job at the prompt); it finishes at the
+  command end (`D` with the exit code) the next prompt sends, and a primary prompt's start
+  without one forgets it. A command end with nothing timed (a prompt drawn again after a resize,
+  Ctrl-C at the prompt) reports nothing. The pump hands the last finished command of a read to
+  `VtSession.onCommandFinished`, and the service notifies for one that ran at least 10 s in a tab
+  not in front (android/service).
 - At the prompt (`VtNative.atPrompt`, libghostty-vt's cursor-at-prompt: the cursor in a prompt or
   the input after it, on the primary screen): `VtSession.busy` is false and closing asks nothing.
   A command typed and entered ends the input at its line feed, so a running command, even a silent
   one, counts as busy until the next prompt; jobs left in the background do not.
 - Jumping (`VtView.jumpToPrompt`, `VtNative.jumpPrompt`): libghostty-vt scrolls the viewport so the
   prompt the given number of prompts above or below its top starts it, as far as there are
-  prompts (a jump past the newest returns to the bottom); a fling stops, and the next frame shows
-  the scroll bar if the viewport moved.
+  prompts (a jump past the newest returns to the bottom); a fling stops, the grid goes back to a
+  whole row (`scrollPx` 0), and the next frame shows the scroll bar if the viewport moved.
 - Output (`VtNative.outputAt`, `selectOutput`): a cell is in a command's output when libghostty-vt
   can derive an output selection from it (the cell is output, after a prompt, or above the first
   prompt); vt.c then tracks the cell, and selecting it later takes the whole output as it is then
-  (a command still running may have added to it), trailing blanks left out, anchored for drags
-  like a word.
+  (a command still running may have added to it), trailing blanks left out, anchored by cells (no
+  drag of the view uses that anchor: a handle anchors anew).
 
 ### Extra keys
 
@@ -364,8 +395,14 @@ compiling libghostty-vt with Zig (`android/native`).
   restoring), else a new one (`VtNative.create`), both with the same options
   (scrollback limited to 10,000 lines or 10 MiB, whichever is reached first: the lines up to about
   120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
-  the cursor follows the foreground as in Ghostty; grapheme clustering, mode 2027, on by default as
-  in Ghostty; Kitty graphics on, with 32 MiB of decoded images per screen (Ghostty's default is
+  the cursor follows the foreground as in Ghostty; a blinking block cursor by default, as in
+  Ghostty without `cursor-style-blink` (libghostty-vt's own default is steady; DECSCUSR's default,
+  DECSTR and RIS bring the blinking back, and DECSCUSR or mode 12 stop it); grapheme clustering,
+  mode 2027, on by default as
+  in Ghostty; the render state asks for one overscan row below the viewport; the OSC 133 callback
+  (command timing) and unimplemented OSC and APC strings reported with 16 bytes kept, of which
+  only an OSC's leading number or an APC's first letter is logged (a malformed string may start
+  with the program's data); Kitty graphics on, with 32 MiB of decoded images per screen (Ghostty's default is
   320 MB) and only data sent in the escape sequences (the file, temporary file and shared memory
   media, which would name the host's files and objects, answer `EINVAL: unsupported medium`, so
   programs fall back to sending the data); the Glyph Protocol off, so it is not advertised and
@@ -401,7 +438,9 @@ compiling libghostty-vt with Zig (`android/native`).
   decoded; with the callback set it also answers the protocol's `?` query); clipboard reads
   (OSC 52 with `?` for data: an OSC string of `52;`, the clipboards named (`c`, `p`, `q`, `s`,
   `0`–`7`, maybe none) and `;?`, ended and not cancelled, however the reads split it), counted
-  with the clipboard the last named (`p` or `s`, else `c`). libghostty-vt's clipboard-read
+  with the first clipboard the last one named (`p` or `s`, else `c`), which every read of the
+  batch is answered for; the last command the prompt marks saw finish (Shell integration).
+  libghostty-vt's clipboard-read
   callback is left unset: it must answer before returning, under the tab's lock, which rules out
   asking the user; so OSC 5522 reads are refused and Kitty paste events never sent. What the app
   prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. Where they go
@@ -427,9 +466,11 @@ compiling libghostty-vt with Zig (`android/native`).
   dropped; text direction controls are removed from titles and messages. `status` is the record
   most in need of the user: blocked, then error, done, working, idle, the most recently updated
   among equals. A change of either (by value) is reported to the service (`onStatusChanged`).
-- The pump stands in for shell integration's prompt mark: after a read that carried a progress or
-  status report it notes the console's foreground process group (`Machine::console_foreground`),
-  and on a later read where another group (or none) has the foreground it calls `onForeground`,
+- The pump stands in for shell integration's prompt mark, which only some shells send: after a
+  read that carried a progress or status report it notes the console's foreground process group
+  (`Machine::console_foreground`; a failed lookup notes none, and that report then waits for its
+  timeout, being seen or the shell's end), and on a later read where another group (or none) has
+  the foreground it calls `onForeground`,
   which drops the progress and the working, blocked and idle records, keeping done and error ones
   until seen. Seeing the tab (`statusSeen`, from the service) drops done and error records; the
   shell's end drops everything.
@@ -515,10 +556,13 @@ compiling libghostty-vt with Zig (`android/native`).
   reset (RIS) of both screens, the scrollback, modes, the palette, the title and images, keeping
   the app's options and the colours set with OSC 10, 11 and 12; the selection and a
   synchronized-output hold end, a shell that was at its prompt gets a form feed (^L) to draw it
-  on the empty screen, and the tab bar hears that the title went.
-- Both write their sequences as the app's own (`write_own`, as kill reports do): after a CAN when
-  the parser is inside a sequence a program left unfinished, keeping the console's replies as they
-  were.
+  on the empty screen, and the tab bar hears that the title went. Unlike a program's RIS, it
+  reports no removal of the progress and no clear of the status records (libghostty-vt reports
+  them only from the stream), so the tab keeps them (the progress still lapses 15 s after its last
+  report).
+- Clearing writes its sequences as the app's own (`write_own`, as kill reports do): after a CAN
+  when the parser is inside a sequence a program left unfinished, keeping the console's replies
+  as they were; resetting calls libghostty-vt's reset directly.
 
 #### Frames and drawing
 
@@ -533,6 +577,12 @@ compiling libghostty-vt with Zig (`android/native`).
   (12-byte row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
   `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets a header flag, and
   the view draws again on the next animation frame to go on.
+- Overscan: while the viewport is scrolled back the render state captures the row after it too,
+  the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
+  iterator, which is right while nothing above the viewport is asked for), with the same cells,
+  dirty flag and selection columns as the others but no search marks (they come once it is in the
+  viewport). The view then draws the grid up to a row higher (`scrollPx`, Gestures and selection),
+  so as much of that row shows at the bottom as is hidden of the first.
 - Images (the Kitty graphics protocol): libghostty-vt stores what programs send (PNG decoded at
   once with Wuffs, which libghostty-vt.a links, into straight-alpha RGBA; larger than the storage
   refused) and its render state lists what to draw: per placement the image, a source rectangle,
@@ -552,8 +602,8 @@ compiling libghostty-vt with Zig (`android/native`).
   row ask for a full frame.
 - A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
   full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
-  rows, cursor and colours come from the capture while the header's modes, selection and scroll
-  position are read live.
+  rows, cursor and colours come from the capture, and so does the overscan byte, while the
+  header's modes, selection and scroll position are read live.
 - The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
   reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
   shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
@@ -565,15 +615,18 @@ compiling libghostty-vt with Zig (`android/native`).
   rows, the viewport's first row in it and the rows it shows) and the search's count (matches so
   far, the selected one's place from the newest); each row carries its selected columns (a
   rectangle's columns on each of its rows) and each cell its search mark (attributes bits 14 and
-  15). `VtView` reads neither the header's dirty byte nor the focus-events flag, and reports the
-  count to the activity when it changes.
+  15). `VtView` reads the dirty byte only to tell whether late image pixels need a full frame and
+  the focus-events flag not at all, and reports the count to the activity when it changes.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
   the advance of "水" (the system's CJK fallback, one em, so 1.2 with JetBrains Mono; a font's own
   ideograph when it has one), at least 1, or 1 with the setting off.
-- `onDraw` fills the view (the margin past the last whole cell included) with the default
-  background, then each dirty row is repainted into the bitmap under a clip: default background,
+- `onDraw` fills the view with the default background, applies the frame, draws the bitmap
+  clipped to the grid's whole cells (the margin below keeps the background) and shifted up by
+  `scrollPx`, then the cursor and the composing text translated by it, then the handles (whose
+  places subtract it). Applying a frame repaints each row it brings into the bitmap under a
+  clip: default background,
   the images below the backgrounds (showing through cells of the default background), runs of
   other backgrounds (a search match's colour over a cell's own), the images below the text, the
   selection's translucent highlight, text (black in a search match), then the images above the
@@ -594,8 +647,8 @@ compiling libghostty-vt with Zig (`android/native`).
   left at the right edge) and the theme's text selection handles are drawn over the bitmap each
   draw.
 - The cursor blinks (shown and hidden every 500 ms, as Android's text fields) while the frame
-  header says the program asked for blinking (DECSCUSR, mode 12; libghostty-vt's default is off)
-  and the view has the focus in a focused window; otherwise no timer runs. Input and a cursor
+  header says it blinks (by default, see Start and end; a program stops it with DECSCUSR or mode
+  12) and the view has the focus in a focused window; otherwise no timer runs. Input and a cursor
   move show it again for a whole period.
 - The bell of the tab shown vibrates once through `performHapticFeedback(REJECT)` (a double
   click, subject to the system's touch feedback setting), at most once per 100 ms.
@@ -605,8 +658,8 @@ compiling libghostty-vt with Zig (`android/native`).
   without a percentage); without a percentage, or indeterminate, a quarter of its width sweeps
   across and back (1.2 s each way, ease-in-out, timed by the clock) over a track at 30% opacity,
   redrawn every frame. It fades in and out in 150 ms and slides to a new percentage in 200 ms;
-  showing another tab puts that tab's progress there at once. It takes no touches and is hidden
-  from accessibility.
+  showing another tab puts that tab's progress there at once (a tab without one still lets the
+  old one fade out). It takes no touches and is hidden from accessibility.
 
 #### Input
 
@@ -630,16 +683,16 @@ compiling libghostty-vt with Zig (`android/native`).
   dedicated copy and paste keys copy and paste; copying without a selection does nothing, and the
   release still reaches the program.
 - Typed and pasted input ends a selection; all input that encodes to bytes (focus events and hover
-  motion included) first scrolls the viewport back to the bottom and, but for a fling's own wheel
-  events and arrow keys, stops a fling, then goes through the host to the tab's `vt-writer` thread
-  (`Native.write`).
+  motion included) first scrolls the viewport back to the bottom (the grid on a whole row) and,
+  but for scrolling's own wheel events and arrow keys, stops a fling or settling, then goes through
+  the host to the tab's `vt-writer` thread (`Native.write`).
 - IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
   paste, which covers the IME's clipboard); finishing a composition types it; the editor action is
   Enter; composing text is only drawn at the cursor; the editable is kept empty so Backspace with
   nothing composed arrives as `deleteSurroundingText` and becomes as many DELs (text after the
   cursor is ignored). `requestCursorUpdates` is answered with the cursor and composing text's
-  position (`CursorAnchorInfo`), again whenever the cursor or composing text moves while the IME
-  monitors it.
+  position (`CursorAnchorInfo`, less `scrollPx`), again whenever the cursor or composing text
+  moves while the IME monitors it (not when only `scrollPx` changes).
 - Paste (`VtNative.paste`, through `ghostty_terminal_paste`): bracketed with mode 2004, else line
   breaks become carriage returns; unsafe control bytes become spaces. Text that could run commands
   (line breaks without bracketed paste, or the bracketed terminator) is refused, and the view asks
@@ -652,7 +705,8 @@ compiling libghostty-vt with Zig (`android/native`).
 - A tap ends a selection or its menu; otherwise, when the program does not track the mouse and the
   tap is on a link, it opens the link instead of the IME; otherwise it opens the IME and, when the
   program tracks the mouse, also sends a left click (press and release at the tap's pixel position,
-  in the program's format). A tap that stopped a fling does nothing else. Taps act at once:
+  in the program's format). A tap that stopped a fling does nothing else (one during settling on
+  a whole row is no fling stop and acts). Taps act at once:
   `VtView` counts taps in a row itself (each press within the system's double-tap timeout of the
   last lift, the two lifts within its double-tap slop), so without mouse tracking the second tap
   selects the word under it and the third the line (with the menu), and with it every tap is a
@@ -673,15 +727,34 @@ compiling libghostty-vt with Zig (`android/native`).
   directory in the Files app, a file in the app the system picks. A link from another host, outside
   the home while the whole system is not shown, or to nothing in the store gets a toast instead, as
   does a link no app takes.
-- A vertical drag, or a mouse wheel or touchpad scroll (3 rows per scroll event), scrolls by whole
-  rows: wheel events when the program tracks the mouse, arrow keys on the alternate screen with
-  alternate scroll (1007, on by default), else the viewport.
-- A fling goes on scrolling that way, slowing down as a ScrollView does (Android's fling physics
-  in pixels, taken as whole rows like a drag): the viewport until it reaches either end, wheel
-  events and arrow keys for at most a screen of rows. It stops when the way to scroll changes
-  (mouse tracking, the alternate screen, alternate scroll), when the tab has no terminal, at a
-  touch, at any other input to the program (not the wheel), when the window loses focus and when
-  another tab is shown.
+- A vertical drag, or a mouse wheel or touchpad scroll (3 rows per scroll event, whatever its
+  size), scrolls: wheel events when the program tracks the mouse and arrow keys on the alternate
+  screen with alternate scroll (1007, on by default), by whole rows; else the viewport, which a
+  drag moves by pixels (`scrollPixels`): within a row by drawing the grid up to a row higher
+  (`scrollPx`, with the overscan row after the viewport showing below), across rows by scrolling
+  libghostty-vt's viewport, as far as either end (by the last frame's scroll total and length,
+  with the rows moved since), where the grid rests on a whole row. A wheel moves it by whole rows
+  and keeps the pixels.
+- With mouse tracking a mouse's or touchpad's sideways scroll goes to the program as wheel buttons
+  6 (left) and 7 (right), one per scroll event, as Ghostty sends them; without it nothing scrolls
+  sideways.
+- A fling goes on scrolling that way, slowing down as a ScrollView does (Android's fling physics,
+  in pixels for the viewport and taken as whole rows otherwise): the viewport until it cannot
+  move, wheel events and arrow keys for at most a screen of rows. It stops when the way to scroll
+  changes (mouse tracking, the alternate screen, alternate scroll), when the tab has no terminal,
+  at a touch, at any other input to the program (not scrolling's own), when the window loses
+  focus and when another tab is shown.
+- The viewport comes to rest on the nearest whole row (`settle`, 150 ms through the same
+  scroller) when a fling stops between rows, when a touch ends there without a fling (a touch
+  that interrupts settling settles again when it lifts), and when the window loses focus (unless
+  the program asked for focus events, whose report, like any input, returns the viewport to the
+  bottom); prompt jumps, search steps, a selection's keyboard adjustment (Shift with the arrows,
+  Page Up or Down, Home or End), its autoscroll and input returning to the bottom put the grid on
+  a whole row at once, and so do a regrid,
+  attaching a tab and a frame without the overscan row or with scrolling going another way.
+  Touches are taken to cells with the shift (`cellY`; a touch on the part of the overscan row
+  shown counts as the last row), and the handles, the menu's place and a drag's offset subtract
+  it.
 - The viewport scrolling (a drag, wheel, fling, a selection's autoscroll, input returning it to the
   bottom) shows the theme's scroll bar at the right edge, faded out after a moment as a
   ScrollView's; output alone does not show it, and with no scrollback (the alternate screen) it is
@@ -689,7 +762,11 @@ compiling libghostty-vt with Zig (`android/native`).
 - A long press (ignored during a pinch, with a long-press haptic) selects the word under it
   (`ghostty_terminal_select_word`, installed as the terminal's selection), notes whether the cell is
   in a command's output (Shell integration) and keeps the word as the anchor: moving on extends the
-  selection from the far side of the word to the cell under the finger. On blank cells it selects
+  selection by whole words, as Ghostty's double-click drag does (`ghostty_terminal_select_word_between`
+  from the anchor's first cell towards the finger's cell and back, joining the two words), so over
+  blanks and punctuation it stays on the last word reached; when the anchor's word has gone it
+  extends to the cell instead (Ghostty would leave the selection as it was). A double tap's word
+  is a word anchor too, though no drag follows a tap. On blank cells it selects
   nothing and shows a menu with Paste (with a clipboard), Select all and, on a link, Open link. When
   the program tracks the mouse, the long press selects the same way, but what it becomes waits for
   the finger: lifted, it keeps the word (or the point menu); moved on past the touch slop, the
@@ -705,13 +782,15 @@ compiling libghostty-vt with Zig (`android/native`).
   included (except in SGR-Pixels format).
 - The two handles (start below the first cell, end below the last, when in the viewport; a
   rectangle's top left and bottom right corners) drag the selection's ends; the other end is the
-  anchor, kept as tracked grid references so output does not move it, and a rectangle stays one
+  anchor, kept as tracked grid references so output does not move it, a handle drag extends by
+  cells, and a rectangle stays one
   with the anchor and the finger's cell at opposite corners. A handle that would stick out of the view at the left edge (start) or right edge
   (end) is drawn with the other handle's drawable, on the other side of the same point, so both
   stay on the screen, and the handles' areas (with an 8 dp margin) are excluded from the system's
   back gesture while they are shown, so a drag from the edge moves the handle. The finger keeps
   its offset from the dragged cell; held above or below the grid (a handle or a long-press word
-  drag), the viewport scrolls one row every 50 ms and the selection follows.
+  drag), the viewport scrolls one row every 50 ms (the grid on a whole row) and the selection
+  follows.
 - A floating action mode (`TYPE_FLOATING`) appears once the next frame is drawn after a selection
   drag or long-press word ends, a double-tap word or Select all (at once, pinned at the press point,
   after a long press on blanks or a mouse-mode long press that selected nothing), and offers Open
@@ -750,7 +829,8 @@ compiling libghostty-vt with Zig (`android/native`).
   then full texts); a full text is monospace, selectable and sized so 74 columns fit (at most
   13 sp), scrolling sideways when it does not.
 - The page (`page.xml`): a `MaterialToolbar` (title, back arrow) in an `AppBarLayout` that lifts
-  while the content below it is scrolled, over a `NestedScrollView`; edge to edge (wallpaper
+  while the content below it is scrolled, over a `FrameLayout` with the app bar's scrolling
+  behaviour, into which the activity puts a `NestedScrollView` it makes; edge to edge (wallpaper
   colours from Android 12 on through `DynamicColors`), with the bar padded under the status bar
   and the scroll view clear of the navigation bar. The toolbar shows the entry's title over its
   full text; the back arrow and back both return to the list, then close.
@@ -778,11 +858,13 @@ compiling libghostty-vt with Zig (`android/native`).
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state and its full reset, writes that stop at OSC strings'
-  ends, render state, key and mouse encoders, paste, focus encoding, selection with word, line and
-  output derivation and keyboard adjustment, search, plain-text formatting, title and width,
-  progress and program status reports, semantic prompts (cursor at a prompt, scrolling by
-  prompts), scrollback compression, snapshots with continuation tracking, Kitty graphics with
-  their render-state image list and animation), and the Wuffs PNG decoder it carries, linked into
+  ends, render state with one overscan row, key and mouse encoders, paste, focus encoding,
+  selection with word (and word-between), line and output derivation and keyboard adjustment,
+  search, plain-text formatting, title and width, progress and program status reports, semantic
+  prompts (cursor at a prompt, scrolling by prompts, the OSC 133 callback), unimplemented OSC and
+  APC strings, its log, scrollback compression, snapshots with continuation tracking, Kitty
+  graphics with their render-state image list and animation), and the Wuffs PNG decoder it
+  carries, linked into
   `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
   pixels); `Machine::read_console`,
   `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
@@ -885,12 +967,19 @@ compiling libghostty-vt with Zig (`android/native`).
 - With IME shown, a hardware Esc press is taken by the IME (Gboard hides itself), so a program
   using the Kitty protocol's release events sees only the release.
 - The scroll bar is `View`'s own (`computeVerticalScrollRange`, `Offset` and `Extent` return the
-  last frame's rows), shown with `awakenScrollBars` wherever `VtView` moves the viewport. A view
+  last frame's rows in pixels, the offset with `scrollPx`, so it follows pixel scrolling), shown
+  with `awakenScrollBars` wherever `VtView` moves the viewport. A view
   built in code has no scroll bar until it is given a thumb (`verticalScrollbarThumbDrawable`, the
   theme's `scrollbarThumbVertical`) and fading is turned on explicitly; `View` also flashes it
   each time the window becomes visible again.
-- A fling runs in `computeScroll`, before each draw takes its frame, so its end checks (top row,
-  bottom) see the frame of the step before: it stops one frame after reaching an end.
+- A fling runs in `computeScroll`, before each draw takes its frame, so the viewport's ends are
+  those of the frame before, kept up by `scrollPixels` with the rows it moved: `VtNative.scroll`
+  is relative, and output that changes the scroll total meanwhile can make the two disagree until
+  the next frame. A viewport fling ends at the first step that cannot move.
+- `scrollPx` is nonzero only while scrolling moves the viewport and there is a row after it; a
+  frame without the overscan row puts it back to 0, which keeps the view from showing the
+  mirror's stale extra row. Mouse positions sent to programs ignore it, which is safe because
+  mouse tracking (another way to scroll) puts it to 0.
 - `VtView` turns off the default focus highlight: focused outside touch mode (after hardware or
   injected keys) the system would cover the whole view with a translucent grey.
 - Without a terminal (`tab` 0) `onDraw` draws the bitmap as it was last painted.
@@ -911,9 +1000,13 @@ compiling libghostty-vt with Zig (`android/native`).
   they pile up in its frame.
 - `AppineVtEffects` (vt.c) and `RawEffects` (vt.rs) are one layout and change together, as the
   frame format does (vt.c's comments name vt.rs's `Effects` for it).
-- A restored terminal is a new one (the decoder makes it): the userdata, callbacks and every
-  option vt.c sets (limits, colours, media, grapheme clustering, the Glyph Protocol, continuation
-  tracking) are not in a snapshot and are set on it as on a new terminal, after `settle`.
+- A restored terminal is a new one (the decoder makes it): the userdata and callbacks are not in a
+  snapshot, nor are the Kitty storage limit (a decoder option), the media, the Glyph Protocol,
+  the continuation limit (the unfinished sequence's bytes are), the terminfo name and the
+  clipboard-write and unknown-sequence limits;
+  the snapshot carries the scrollback limits, default colours, default modes (2027's) and cursor
+  defaults (older snapshots a steady cursor). vt.c sets every option on it as on a new terminal,
+  after `settle`, so the app's values win.
 - Snapshots are recorded with the version that wrote them: the Ghostty source's directory name
   (from build.rs) and libghostty-vt's own version string, which stays `0.1.0-dev` across Ghostty
   releases. One from another version is not decoded, since the format carries no compatibility
@@ -965,8 +1058,17 @@ compiling libghostty-vt with Zig (`android/native`).
   group was in the foreground then.
 - The status records live on the main thread only; the pump hands reports over through a locked
   list drained by one post, so the reports of one read are usually applied together and a passing
-  state between two of them notifies no one. A full reset arrives as a clear of every record and a
-  removal of the progress, before libghostty-vt's reset callback (unset here).
+  state between two of them notifies no one. A program's full reset (RIS) arrives as a clear of
+  every record and a removal of the progress, before libghostty-vt's reset callback (unset here);
+  the app's Reset terminal sends neither (Clearing and resetting).
+- Command timing's at-prompt state (`was_at_prompt`) changes only in `appine_vt_feed`, which the
+  app's own printed text also goes through; clearing, resetting, messages and resizes leave it.
+  For busybox ash, which marks no output start, output of a background job while the shell waits
+  at its prompt starts the timing, so the next command's time is counted from then; bash's output
+  mark replaces such a start. libghostty-vt is built ReleaseFast, so its log emits info and
+  above, of which `on_log` passes warnings and errors; the log is installed when the first
+  terminal is wrapped, after it was created or restored, so what that first decode and settle
+  would log goes nowhere.
 - Without default foreground and background colours libghostty-vt treats them as unset: OSC 10
   and 11 queries go unanswered, reverse video (DECSCNM) swaps nothing, and a colour set with OSC 10
   or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
@@ -1038,29 +1140,30 @@ compiling libghostty-vt with Zig (`android/native`).
 - **Shell integration is partial**: only bash and busybox ash get prompt marks (not zsh, fish or
   nested non-login shells); ash's mark the typed command as ending with its line, so the rows of a
   command longer than the screen's width after the first count as output (ash breaks such lines
-  itself), and a PS1 set after the profile (ash's `~/.profile`) has none; the progress and status
-  records still go by the foreground process group rather than the next prompt; and a tap on the
+  itself), ash marks no output start, so a background job's output at its prompt starts the next
+  command's timing early, and a PS1 set after the profile (ash's `~/.profile`) has none; the
+  progress and status records still go by the foreground process group rather than the next
+  prompt, though the OSC 133 callback is now set (for command timing only); and a tap on the
   input line does not move the cursor there (Ghostty's prompt click, `cl=` in the prompt mark: the
   C API has no helper for it, so vt.c would count the arrow presses from the cells' semantic
   content).
-- **libghostty-vt features not wired**: no callbacks for OSC 7 working directories (the profile
-  sends none; new tabs take the kernel's foreground directory) or OSC 133 prompt events (the marks
-  are read from the terminal's state instead); ENQ, the title report (CSI 21 t), XTCHECKSUM and
-  window resizing (CSI 8 t) are left unanswered; OSC 5522 clipboard reads are refused and Kitty
+- **libghostty-vt features not wired**: no callback for OSC 7 working directories (the profile
+  sends none; new tabs take the kernel's foreground directory); ENQ, the title report (CSI 21 t),
+  XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
+  (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and
+  `vt-window-resize-allowed` false); OSC 5522 clipboard reads are refused and Kitty
   paste events never sent, since only the read callback, which cannot wait for the user, serves
   them (wiring it would also need the IME's multi-line commits, pasted as
   `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, marked `GHOSTTY_PASTE_SOURCE_TEXT`, or they would become paste
   events).
 - **More of libghostty-vt left unused**:
-  - selection: `select_word_between` (a word drag that extends by words) and the selection
-    gesture state machine (click counts to cell, word, line or output selection), for which
-    `VtView` has its own taps and long presses;
-  - input: a mouse's or touchpad's horizontal scrolling (`AXIS_HSCROLL`, the wheel buttons 6 and 7
-    for programs tracking the mouse) is not read;
-  - drawing: overscan (rows captured beyond the viewport, to scroll by pixels; drags and flings
-    move whole rows); the default palette and cursor style/blink options (the 256 colours are
-    libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
-    pointer shape for a mouse; `row_iterator_next_dirty` and the two-phase render update
+  - selection: the selection gesture state machine (click counts to cell, word, line or output
+    selection, with line and output drags), for which `VtView` has its own taps and long presses
+    (no drag follows a double or triple tap);
+  - drawing: the default palette and cursor style options (the 256 colours are libghostty-vt's
+    built-in ones, the built-in block is Ghostty's `cursor-style` default, and the colour scheme
+    reply is fixed to dark); overscan above the viewport (only the row below is asked for); the
+    OSC 22 pointer shape for a mouse; `row_iterator_next_dirty` and the two-phase render update
     (`begin_update` under the lock, `end_update` after), so `frame` holds the tab's lock while
     it encodes every row; `frame` reads each cell with four to six
     `ghostty_render_state_row_cells_get` calls and a `ghostty_cell_get`, where
@@ -1070,11 +1173,11 @@ compiling libghostty-vt with Zig (`android/native`).
     all matches (`GHOSTTY_SEARCH_DATA_MATCHES`, which could mark them along the scroll bar); the
     colour utilities (`palette_generate`, the 256 colours from the first 16, and contrast and
     luminance for a minimum contrast), of use only with themes;
-  - the rest: no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
-    colours and OSC 8 links; the memory usage and the VT processing-error flag are never read;
-    the library's log and unknown-sequence callbacks are unset, so its warnings never reach
-    logcat; KAM (mode 2) is ignored: Ghostty's own surface drops keys while it is set, but the key
-    encoder does not, and neither does vt.c;
+  - the rest: no RIS callback; transcripts are plain text, though the formatter can emit VT or
+    HTML with colours and OSC 8 links; the memory usage and the VT processing-error flag are never
+    read; the OSC 133 event's command line and error text are not used (the profile sends no
+    command line); KAM (mode 2) is ignored, as Ghostty ignores it by default (`vt-kam-allowed =
+    false`; the key encoder never drops keys);
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
     the terminal's visibility, so mode 2033 reports every tab as visible, background ones too;
     Kitty's drag and drop (OSC 72) has a callback only in the Zig API; OSC 66 text sizing, OSC 99
@@ -1082,8 +1185,17 @@ compiling libghostty-vt with Zig (`android/native`).
     itself.
 - **Images take memory twice for the tab shown, and are never trimmed**: each screen of each tab
   keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and the view holds a bitmap of
-  every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both, and a
-  restored tab has its text only (placeholder cells come back blank).
+  every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both. A tab
+  restored from its snapshot gets its images back (libghostty-vt's snapshot encoder writes them
+  when built with Kitty graphics, though a comment in its `snapshot/terminal.zig` says otherwise);
+  one restored from its plain transcript has text only.
+- **A new terminal activity loses the tab being viewed**: it shows the tab its intent's
+  `EXTRA_TAB` names (a recreated activity keeps the intent a notification once created it with),
+  else the
+  service's `focus`, which only a restore after a kill sets and nothing updates, else the last tab,
+  never the service's `current`. So when the activity is created again while the service lives
+  (Back on Android 11 finishes the root activity; a locale or font scale change recreates it, as
+  `configChanges` leaves them out), another tab than the one the user was on comes to the front.
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels, `VtView`'s touch and double-tap slops,
   fling velocity and handle margin): `MainActivity` handles `density` itself and builds its views
@@ -1107,6 +1219,12 @@ compiling libghostty-vt with Zig (`android/native`).
 - Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
   empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
   every time)?
+- Should the menu's Reset terminal also drop the tab's progress and status records, as a program's
+  RIS does?
+- Should a mouse wheel or touchpad scrolling the viewport go by pixels and by the event's size
+  (high-resolution wheels, touchpads) rather than 3 rows a scroll event?
+- Should a clipboard question left open when the activity is destroyed be answered then? Until
+  the tab's queued reads are answered it asks for no later read.
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
   while it has the keyboard, rather than on the terminal?
@@ -1126,7 +1244,15 @@ compiling libghostty-vt with Zig (`android/native`).
 - The terminal on real devices and 16 KB-page devices, and with CJK IMEs' composing text and
   floating candidate windows (`CursorAnchorInfo`); tried only on a 4 KB-page API 34 emulator with
   Gboard in English. Flings and the scroll bar were tried there with adb swipes only (viewport and
-  alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger.
+  alternate-scroll arrows; wheel events to a mouse-tracking program not tried), not with a finger;
+  pixel scrolling with `input motionevent` (a held drag shifted by part of a row, the overscan row
+  shown below, settling on release) and a fling settling on a whole row. Sideways scrolling was
+  not tried on a device (API 34's `input` has no scroll command); only its encoding (buttons 6 and
+  7 in SGR) on a macOS build of vt.c. The long-press word drag and the blinking default cursor
+  were tried on the emulator.
+- Command timing on a macOS build of vt.c fed ash's and bash's marks, and in the app on that
+  emulator with busybox ash and bash 5.3 (android/service has the notifications); the log lines
+  (an unknown OSC and CSI) were seen in logcat there.
 - The bell's vibration on real devices and with haptics turned off; the copy toast Android 12
   and earlier get for a program's clipboard write (only tried on API 34, where the system shows
   its own); how tab notifications look and alert outside an API 34 emulator (there Android

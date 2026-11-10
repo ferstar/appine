@@ -13,6 +13,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.icu.text.MeasureFormat
+import android.icu.util.Measure
+import android.icu.util.MeasureUnit
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -405,6 +408,31 @@ class TerminalService : Service() {
         override fun onStatusChanged(session: VtSession) {
             each { it.onTabStatus() }
             notifyStatus(session)
+        }
+
+        /**
+         * A command that ran at least [COMMAND_NOTIFY_MS] finished in a tab not in front, as
+         * Ghostty's notify-on-command-finish = unfocused tells (it defaults to never, but a phone
+         * shows one tab at a time, and none while the app is away): the tab's notification says
+         * whether it succeeded, how long it took and the exit code it failed with.
+         */
+        override fun onCommandFinished(session: VtSession, exitCode: Int?, millis: Long) {
+            if (millis < COMMAND_NOTIFY_MS || inFront(session)) return
+            statusNotified.remove(session)
+            val title = getString(
+                when (exitCode) {
+                    null -> R.string.command_finished
+                    0 -> R.string.command_succeeded
+                    else -> R.string.command_failed
+                },
+            )
+            val took = duration(millis)
+            val text = if (exitCode == null || exitCode == 0) {
+                getString(R.string.command_took, took)
+            } else {
+                getString(R.string.command_took_code, took, exitCode)
+            }
+            notifyTab(session, title, text, quiet = false)
         }
 
         override fun onFinished(session: VtSession) {
@@ -827,7 +855,7 @@ class TerminalService : Service() {
 
     /**
      * A program in [session], not the tab in front, asked for attention (a bell, OSC 9, OSC 777,
-     * a program status, [notifyStatus]):
+     * a program status, [notifyStatus]), or a command there finished:
      * one notification per tab, replaced by the tab's next one and taken away when the tab is
      * shown, opening that tab. It is titled [title], or else the tab's title; a [quiet] one (the
      * bell) alerts only when the tab's notification is not showing already.
@@ -879,6 +907,21 @@ class TerminalService : Service() {
         val what = VtSession.describe(this, status)
         val text = if (status.message.isEmpty()) what else getString(R.string.status_message, what, status.message)
         notifyTab(session, status.title, text, quiet = false)
+    }
+
+    /**
+     * How long a command took ([millis]) in the app's language: hours and minutes, minutes and
+     * seconds, or seconds, leaving out a second part of 0.
+     */
+    private fun duration(millis: Long): String {
+        val s = millis / 1000
+        val parts = when {
+            s >= 3600 -> listOf(Measure(s / 3600, MeasureUnit.HOUR), Measure(s % 3600 / 60, MeasureUnit.MINUTE))
+            s >= 60 -> listOf(Measure(s / 60, MeasureUnit.MINUTE), Measure(s % 60, MeasureUnit.SECOND))
+            else -> listOf(Measure(s, MeasureUnit.SECOND))
+        }.filterIndexed { i, m -> i == 0 || m.number.toLong() != 0L }
+        return MeasureFormat.getInstance(resources.configuration.locales[0], MeasureFormat.FormatWidth.SHORT)
+            .formatMeasures(*parts.toTypedArray())
     }
 
     private fun cancelTabNotification(session: VtSession) {
@@ -1550,6 +1593,12 @@ class TerminalService : Service() {
         private const val TAB_NOTIFICATION_COUNT = 100_000
         /** A tab's bell posts at most one notification per this long. */
         private const val BELL_NOTIFY_MS = 1_000L
+        /**
+         * A command that ran at least this long notifies when it finishes in a tab not in front
+         * (Ghostty's notify-on-command-finish-after is 5 s; a phone's shorter commands, a few
+         * package installs, are more often watched to the end).
+         */
+        private const val COMMAND_NOTIFY_MS = 10_000L
         private const val NOTIFICATION_ID = 1
         /** Listen notifications are numbered by port: 1000 + port, below [KILL_NOTIFICATION_BASE]. */
         private const val LISTEN_NOTIFICATION_BASE = 1000

@@ -32,7 +32,8 @@ internal object VtNative {
      * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
      * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
      * `onClipboard`, `onNotification`, `onProgress`, `onStatus` and `onClipboardRead` for what
-     * programs asked of the app, and `onForeground()` once the process group in the foreground when
+     * programs asked of the app, `onCommandFinished` when the shell's prompt marks saw a command
+     * finish, and `onForeground()` once the process group in the foreground when
      * progress or a status was last reported has given the terminal back.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
@@ -83,7 +84,7 @@ internal object VtNative {
     /**
      * Encodes a mouse event at pixel ([x], [y]) of the grid in the program's tracking mode and
      * format: [action] 0 press, 1 release, 2 motion; [button] 0 none, 1 left, 2 right, 3 middle,
-     * 4 and 5 the wheel; [mods] as for [key]; [pressed] whether a button is held after this event.
+     * 4 and 5 the wheel up and down, 6 and 7 left and right; [mods] as for [key]; [pressed] whether a button is held after this event.
      * Empty when the program does not take it (motion is sent once per cell, and only as its
      * tracking mode asks), null when it fails.
      */
@@ -121,8 +122,9 @@ internal object VtNative {
     @JvmStatic external fun selectGrab(tab: Long, end: Boolean): Boolean
 
     /**
-     * Extends the selection from its anchor to viewport cell ([x], [y]); a rectangle stays one,
-     * with the anchor and the cell at opposite corners.
+     * Extends the selection from its anchor to viewport cell ([x], [y]): by whole words when the
+     * anchor is a word [selectWord] selected, else to the cell; a rectangle stays one, with the
+     * anchor and the cell at opposite corners.
      */
     @JvmStatic external fun selectTo(tab: Long, x: Int, y: Int): Boolean
 

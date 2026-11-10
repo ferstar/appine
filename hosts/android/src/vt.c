@@ -41,7 +41,9 @@
 //     u32 search_selected  the selected match's place counted from the newest (1 for the
 //                          newest), 0 when none is selected
 //     u16 image_count      number of image placements that follow
-//     u16 reserved
+//     u8  overscan         rows captured below the viewport: 1 while it is scrolled back (there
+//                          is a row after it), else 0
+//     u8  reserved
 //     u32 animation_ms     when to draw again for the next frame of an animated image, 0 when
 //                          none plays
 //   image_count image placements (Kitty graphics), in drawing order, 56 bytes each:
@@ -59,7 +61,10 @@
 //     u32 image_width, u32 image_height
 //                          the image's size
 //   row_count rows:
-//     u16 y, u16 cell_count, u32 extra_count
+//     u16 y                the row in the viewport; y == rows is the overscan row after it,
+//                          which the view shows in part while it draws the grid shifted up by
+//                          part of a row (scrolling by pixels)
+//     u16 cell_count, u32 extra_count
 //     u16 selection_from, u16 selection_to
 //                          the row's selected columns (inclusive), 0xffff for both when none
 //     cell_count cells of 16 bytes:
@@ -74,11 +79,13 @@
 //     extra_count u32 codepoints: the further codepoints of the row's cells, in cell order
 //
 // A row is sent when its cells changed or when its search marks did (a new needle, another
-// selected match, a match found), so the view's mirror always carries the marks. The view paints
+// selected match, a match found), so the view's mirror always carries the marks; the overscan row
+// carries none (its matches are marked once it is in the viewport). The view paints
 // images into its rows, so every row is sent whenever the placements change and some are or were
 // on the screen.
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -171,6 +178,16 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 
 // The shortest wait between two frames of an animated image (about 120 Hz)
 #define ANIMATION_MIN_MS 8
+
+// libghostty-vt's warnings and errors, and the sequences it does not implement, go to stderr (which
+// the app sends to logcat): at most this many lines a second across all tabs, so a program
+// repeating one cannot flood the log
+#define LOG_PER_SECOND 20
+
+// How much of an unimplemented OSC or APC string libghostty-vt keeps for on_unknown_sequence,
+// which logs only an OSC's number or an APC's protocol letter, never its data. Within the buffer
+// libghostty-vt already has for OSC strings, so they cost no allocation (an APC's always does)
+#define UNKNOWN_MAX ((size_t)16)
 
 // The terminfo entry programs run under (ConsolePty sets TERM to it), the answer to XTGETTCAP's
 // TN. Unset, libghostty-vt leaves that query unanswered; the other capabilities it answers from
@@ -287,6 +304,12 @@ typedef struct {
   // Clipboard reads (OSC 52 "?"): how many, and the clipboard the last one named ('c', 'p' or 's')
   uint32_t clipboard_reads;
   uint8_t clipboard_read_kind;
+  // The last command the shell's prompt marks (OSC 133) saw finish (on_semantic_prompt): whether
+  // one did, whether the shell reported its exit code, the code, and how long it ran
+  bool command_finished;
+  bool command_has_exit;
+  int32_t command_exit;
+  uint64_t command_ms;
 } AppineVtEffects;
 
 // One image placement of a frame (see the format above), with what puts it in drawing order and
@@ -352,6 +375,15 @@ typedef struct AppineVt {
   // Clipboard reads (OSC 52 "?") since appine_vt_take_effects, and the clipboard of the last
   uint32_t clipboard_reads;
   uint8_t clipboard_read_kind;
+  // Commands as the prompt marks tell (on_semantic_prompt): when the one running started (0 for
+  // none), whether the cursor was at the prompt after the last feed, and the last one finished
+  // since appine_vt_take_effects
+  int64_t command_start;
+  bool was_at_prompt;
+  bool command_finished;
+  bool command_has_exit;
+  int32_t command_exit;
+  uint64_t command_ms;
   // The OSC string the output is in (appine_vt_feed): its first OSC_HEAD bytes, and its length so
   // far (which may be larger)
   bool osc_open;
@@ -361,6 +393,8 @@ typedef struct AppineVt {
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
   GhosttyTrackedGridRef anchor_end;
+  // The anchor is a word (appine_vt_select_word), so a drag extends the selection by words
+  bool anchor_words;
   // A cell in a command's output that a long press found (appine_vt_output_at), for the menu's
   // Select output; tracked, so output does not move it. NULL when none
   GhosttyTrackedGridRef output_at;
@@ -560,6 +594,38 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
   vt->statuses.len += STATUS_HEADER_BYTES + id + title + message;
 }
 
+// OSC 133: a command starts when the shell marks its output's start (bash's PS0) or, as busybox ash
+// marks none (its input ends at the line feed), when the cursor leaves the prompt
+// (appine_vt_feed), which output of a background job at the prompt does too; it finishes at the
+// command end the next prompt reports, with the exit code (both shells send it). Only a command
+// that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the prompt) reports
+// a command end too, with none running
+static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
+                               const GhosttyTerminalSemanticPrompt *e) {
+  (void)t;
+  AppineVt *vt = userdata;
+  switch (e->kind) {
+    case GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START:
+      // The mark is the command's start, whatever left the prompt before it
+      vt->command_start = now_ns();
+      break;
+    case GHOSTTY_SEMANTIC_PROMPT_COMMAND_END:
+      if (vt->command_start == 0) break;
+      vt->command_finished = true;
+      vt->command_has_exit = e->has_exit_code;
+      vt->command_exit = e->has_exit_code ? e->exit_code : 0;
+      vt->command_ms = (uint64_t)(now_ns() - vt->command_start) / 1000000;
+      vt->command_start = 0;
+      break;
+    case GHOSTTY_SEMANTIC_PROMPT_PROMPT_START:
+      // A new prompt without a command end: what ran is not known to have finished
+      if (e->prompt_kind == GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) vt->command_start = 0;
+      break;
+    default:
+      break;
+  }
+}
+
 // A hold began: capture the screen now, which is the frame the program wants to keep showing
 static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   AppineVt *vt = userdata;
@@ -625,12 +691,71 @@ done:
   return ok;
 }
 
-// The PNG decoder is process-wide (libghostty-vt's sys interface); installed with the first
-// terminal
-static pthread_once_t png_once = PTHREAD_ONCE_INIT;
+// ---- Logging ----
 
-static void install_png(void) {
+// Whether another line may be logged in this second (LOG_PER_SECOND across all threads; a line
+// racing the second's turn may slip through)
+static bool log_allowed(void) {
+  static _Atomic int64_t second;
+  static _Atomic uint32_t lines;
+  int64_t now = now_ns() / 1000000000LL;
+  int64_t seen = atomic_load_explicit(&second, memory_order_relaxed);
+  if (seen != now && atomic_compare_exchange_strong_explicit(&second, &seen, now,
+                                                             memory_order_relaxed,
+                                                             memory_order_relaxed)) {
+    atomic_store_explicit(&lines, 0, memory_order_relaxed);
+  }
+  return atomic_fetch_add_explicit(&lines, 1, memory_order_relaxed) < LOG_PER_SECOND;
+}
+
+// libghostty-vt's own log, on any thread: warnings (an unimplemented CSI or ESC sequence or mode,
+// a malformed OSC 52) and errors. The info messages a release build also emits are routine
+static void on_log(void *userdata, GhosttySysLogLevel level, const uint8_t *scope, size_t scope_len,
+                   const uint8_t *message, size_t message_len) {
+  (void)userdata;
+  if (level > GHOSTTY_SYS_LOG_LEVEL_WARNING || !log_allowed()) return;
+  fprintf(stderr, "vt: %s(%.*s): %.*s\n", level == GHOSTTY_SYS_LOG_LEVEL_ERROR ? "error" : "warning",
+          (int)scope_len, scope_len > 0 ? (const char *)scope : "", (int)message_len,
+          message_len > 0 ? (const char *)message : "");
+}
+
+// An OSC or APC string libghostty-vt does not implement (it logs the CSI and ESC ones itself),
+// named by an OSC's leading number or an APC's first letter (its protocol) and nothing else: the
+// data may be anything the program sent, a file or a password among it, and a malformed string
+// (an OSC not starting with a number) may start with it
+static void on_unknown_sequence(GhosttyTerminal t, void *userdata,
+                                const GhosttyTerminalUnknownSequence *seq) {
+  (void)t;
+  (void)userdata;
+  char name[UNKNOWN_MAX + 1];
+  size_t len = 0;
+  const char *kind;
+  if (seq->tag == GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_OSC) {
+    kind = "OSC";
+    GhosttyString s = seq->value.osc.content;
+    while (len < s.len && len < UNKNOWN_MAX && s.ptr[len] >= '0' && s.ptr[len] <= '9') {
+      name[len] = (char)s.ptr[len];
+      len++;
+    }
+  } else if (seq->tag == GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC) {
+    kind = "APC";
+    GhosttyString s = seq->value.apc.content;
+    uint8_t c = s.len > 0 ? s.ptr[0] : 0;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) name[len++] = (char)c;
+  } else {
+    return;
+  }
+  name[len] = 0;
+  if (log_allowed()) fprintf(stderr, "vt: unsupported %s %s\n", kind, len > 0 ? name : "(unnamed)");
+}
+
+// libghostty-vt's sys interface is process-wide: the PNG decoder and the log are installed with
+// the first terminal
+static pthread_once_t sys_once = PTHREAD_ONCE_INIT;
+
+static void install_sys(void) {
   ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)decode_png);
+  ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, (const void *)on_log);
 }
 
 // ---- Lifecycle ----
@@ -702,7 +827,8 @@ static void settle(GhosttyTerminal term) {
   ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
   if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE) append(&seq, "\x1b[?1049l");
   append(&seq, "\x1b[!p");
-  append(&seq, "\x1b[?5;9;12;1000;1001;1002;1003;1004;1005;1006;1015;1016;2004;2026;2031;2048;5522l");
+  // (1001, highlight tracking, is not implemented: resetting it would only log a warning)
+  append(&seq, "\x1b[?5;9;1000;1002;1003;1004;1005;1006;1015;1016;2004;2026;2031;2048;5522l");
   append(&seq, "\x1b[?1007h\x1b[<99u\x1b]8;;\x1b\\\x1b]0;\x1b\\");
   if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
   seq.len = 0;
@@ -748,7 +874,10 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
     appine_vt_free(vt);
     return NULL;
   }
-  pthread_once(&png_once, install_png);
+  pthread_once(&sys_once, install_sys);
+  // The row after the viewport too, which the view needs to draw the grid shifted by part of a row
+  GhosttyRenderStateOverscan overscan = {.above = 0, .below = 1};
+  ghostty_render_state_set(vt->state, GHOSTTY_RENDER_STATE_OPTION_OVERSCAN, &overscan);
   // Cell sizes are only known to libghostty-vt through resize (size reports, images)
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
   vt->mouse_x = -1;
@@ -774,6 +903,12 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, (const void *)on_progress);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
                        (const void *)on_program_status);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
+                       (const void *)on_semantic_prompt);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE,
+                       (const void *)on_unknown_sequence);
+  size_t unknown = UNKNOWN_MAX;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES, &unknown);
   GhosttyString terminfo = {.ptr = (const uint8_t *)TERMINFO_NAME,
                             .len = sizeof(TERMINFO_NAME) - 1};
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &terminfo);
@@ -792,6 +927,11 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
   GhosttyTerminalModeConfig graphemes = {.mode = GHOSTTY_MODE_GRAPHEME_CLUSTER, .value = true};
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &graphemes);
+  // A blinking block by default, as in Ghostty without cursor-style-blink (libghostty-vt's default
+  // is steady): DECSCUSR's default (CSI 0 q), DECSTR and RIS bring the blinking back, and programs
+  // can still stop it with DECSCUSR or mode 12. Applied at once unless a program chose a style
+  bool blink = true;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
   // Kitty graphics, drawn by the view from the frames' placements; a full reset keeps the limit
   // and the media (the alternate screen takes the primary's)
   uint64_t kitty_limit = KITTY_STORAGE;
@@ -857,6 +997,7 @@ static void changed(AppineVt *vt) {
 }
 
 static void osc_ended(AppineVt *vt);
+bool appine_vt_at_prompt(AppineVt *vt);
 
 // Feeds console output to the terminal. It stops at the ends of OSC strings to find clipboard reads
 // (OSC 52 with "?" for data), which libghostty-vt answers only from a callback that must answer at
@@ -895,6 +1036,10 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
       vt->osc_len = 0;
     }
   }
+  // A command's start for a shell that does not mark it (on_semantic_prompt): the input ended
+  bool at_prompt = appine_vt_at_prompt(vt);
+  if (vt->was_at_prompt && !at_prompt && vt->command_start == 0) vt->command_start = now_ns();
+  vt->was_at_prompt = at_prompt;
   changed(vt);
 }
 
@@ -1224,6 +1369,9 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   put_u32(h + 52, search_selected);
   size_t images = vt->placed_len < UINT16_MAX ? vt->placed_len : UINT16_MAX;
   put_u16(h + 56, (uint16_t)images);
+  GhosttyRenderStateOverscan captured = {0};
+  ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_OVERSCAN, &captured);
+  h[58] = captured.below > 0;
   put_u32(h + 60, animation_ms);
   vt->frame.len = HEADER_BYTES;
 
@@ -1659,7 +1807,8 @@ int appine_vt_paste(AppineVt *vt, const uint8_t *data, size_t len, bool allow_un
 // Encodes a mouse event at pixel (x, y) of the grid for the program, in its tracking mode and
 // format; returns the length, 0 when the program does not take it (no tracking, or a motion it
 // did not ask for), -1 when it does not fit. action 0 press, 1 release, 2 motion; button 0 none
-// (motion with no button held), 1 left, 2 right, 3 middle, 4 and 5 the wheel.
+// (motion with no button held), 1 left, 2 right, 3 middle, 4 and 5 the wheel up and down, 6 and 7
+// left and right.
 ptrdiff_t appine_vt_mouse(AppineVt *vt, int action, int button, uint16_t mods, float x, float y,
                           bool pressed, char *out, size_t cap) {
   // The cell as the encoder takes it (clamped to the grid); SGR-Pixels reports every pixel
@@ -1744,6 +1893,7 @@ static void drop_anchor(AppineVt *vt) {
   if (vt->anchor_end) ghostty_tracked_grid_ref_free(vt->anchor_end);
   vt->anchor_start = NULL;
   vt->anchor_end = NULL;
+  vt->anchor_words = false;
 }
 
 // Tracks the cells at the screen coordinates (start, end) as the anchor
@@ -1791,16 +1941,21 @@ static bool select_anchored(AppineVt *vt, const GhosttySelection *derived) {
          set_selection(vt, a, b, false);
 }
 
-// Selects the word at viewport cell (x, y) and anchors later drags to it; false when there is no
-// word there (blank cells), with any earlier selection cleared.
+// Selects the word at viewport cell (x, y) and anchors later drags to it, which then extend the
+// selection by words (appine_vt_select_to); false when there is no word there (blank cells), with
+// any earlier selection cleared.
 bool appine_vt_select_word(AppineVt *vt, uint16_t x, uint16_t y) {
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
   drop_anchor(vt);
   GhosttyTerminalSelectWordOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
   GhosttySelection word = GHOSTTY_INIT_SIZED(GhosttySelection);
-  return viewport_ref(vt, x, y, &options.ref) &&
-         ghostty_terminal_select_word(vt->term, &options, &word) == GHOSTTY_SUCCESS &&
-         select_anchored(vt, &word);
+  if (!viewport_ref(vt, x, y, &options.ref) ||
+      ghostty_terminal_select_word(vt->term, &options, &word) != GHOSTTY_SUCCESS ||
+      !select_anchored(vt, &word)) {
+    return false;
+  }
+  vt->anchor_words = true;
+  return true;
 }
 
 // Selects the line at viewport cell (x, y), as Ghostty's triple click does: the whole soft-wrapped
@@ -1841,9 +1996,22 @@ static bool rectangular(AppineVt *vt) {
          sel.rectangle;
 }
 
+// The nearest word to `from` towards `to` (inclusive), as Ghostty's word drag looks for it
+static bool word_between(AppineVt *vt, GhosttyGridRef from, GhosttyGridRef to,
+                         GhosttySelection *out) {
+  GhosttyTerminalSelectWordBetweenOptions options =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordBetweenOptions);
+  options.start = from;
+  options.end = to;
+  *out = GHOSTTY_INIT_SIZED(GhosttySelection);
+  return ghostty_terminal_select_word_between(vt->term, &options, out) == GHOSTTY_SUCCESS;
+}
+
 // Extends the selection from the anchor to viewport cell (x, y): the anchor stays selected
-// whole, and the selection runs from its far side to the cell; a rectangle stays one, with the
-// anchor and the cell at opposite corners. False without an anchor.
+// whole, and the selection runs from its far side to the cell, or with a word as the anchor to
+// the end of the nearest word between the cell and the anchor, as Ghostty's double-click drag
+// does (passing over blanks and punctuation, it stays on the last word reached); a rectangle stays
+// one, with the anchor and the cell at opposite corners. False without an anchor.
 bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   if (vt->anchor_start == NULL || vt->anchor_end == NULL) return false;
   GhosttyGridRef start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
@@ -1860,6 +2028,16 @@ bool appine_vt_select_to(AppineVt *vt, uint16_t x, uint16_t y) {
   probe.start = start;
   probe.end = cell;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
+  GhosttySelection anchored, reached;
+  // The anchor's first cell stands for the press, as it lies in the word pressed; when the word
+  // has gone (cleared from the screen), the drag goes by cells
+  if (vt->anchor_words && !rectangle && word_between(vt, start, cell, &anchored) &&
+      word_between(vt, cell, start, &reached)) {
+    if (order == GHOSTTY_SELECTION_ORDER_REVERSE) {
+      return set_selection(vt, reached.start, anchored.end, false);
+    }
+    return set_selection(vt, anchored.start, reached.end, false);
+  }
   if (order == GHOSTTY_SELECTION_ORDER_REVERSE) return set_selection(vt, end, cell, rectangle);
   probe.start = end;
   ghostty_terminal_selection_order(vt->term, &probe, &order);
@@ -2263,9 +2441,9 @@ bool appine_vt_take_title_changed(AppineVt *vt) {
   return changed;
 }
 
-// The bells, clipboard write, notification, progress and status reports and clipboard reads since
-// the last call
-// (vt.rs's `Effects`); the text stays valid until the next feed
+// The bells, clipboard write, notification, progress and status reports, clipboard reads and the
+// last command finished since the last call (vt.rs's `Effects`); the text stays valid until the
+// next feed
 void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->bells = vt->bells;
   out->clipboard = vt->clipboard;
@@ -2282,6 +2460,11 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->statuses_len = vt->statuses.len;
   out->clipboard_reads = vt->clipboard_reads;
   out->clipboard_read_kind = vt->clipboard_read_kind;
+  out->command_finished = vt->command_finished;
+  out->command_has_exit = vt->command_has_exit;
+  out->command_exit = vt->command_exit;
+  out->command_ms = vt->command_ms;
+  vt->command_finished = false;
   vt->clipboard_reads = 0;
   vt->bells = 0;
   vt->clipboard = APPINE_CLIPBOARD_NONE;

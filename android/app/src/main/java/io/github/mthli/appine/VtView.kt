@@ -39,6 +39,7 @@ import android.widget.OverScroller
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
 import androidx.core.graphics.withScale
+import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.nio.ByteBuffer
@@ -282,15 +283,31 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var scaleRemainder = 1f
 
     /**
-     * A fling: pixels scrolled over time, taken in rows as a drag's are, the way scrolling went when
-     * it started ([scrollWay]) and with wheel events at [flingX], [flingY]; [flingLast] is the
-     * position taken so far.
+     * Pixels the grid is drawn above its place, from 0 to less than a row: the viewport scrolls
+     * by pixels, hiding part of its first row and showing as much of the row after it (the frame's
+     * overscan row). Only while scrolling moves the viewport ([WAY_VIEWPORT]) and it is not at the
+     * bottom; scrolling comes to rest on a whole row ([settle]). Touches are taken to cells with
+     * it ([cellY]).
+     */
+    private var scrollPx = 0
+
+    /** What a drag scrolled the viewport by beyond whole pixels. */
+    private var pixelRemainder = 0f
+
+    /**
+     * A fling: pixels scrolled over time, the viewport's as a drag's are and in rows otherwise,
+     * the way scrolling went when it started ([scrollWay]) and with wheel events at [flingX],
+     * [flingY]; [flingLast] is the position taken so far. It also brings the viewport to rest on a
+     * whole row ([settling]).
      */
     private val scroller = OverScroller(context)
     private var flingWay = WAY_VIEWPORT
     private var flingX = 0f
     private var flingY = 0f
     private var flingLast = 0
+
+    /** The scroller only brings the viewport to a whole row ([settle]), which a touch does not count as a fling. */
+    private var settling = false
 
     /** The touch under way stopped a fling, so its tap does nothing else. */
     private var stoppedFling = false
@@ -328,6 +345,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private val autoscrollTick = object : Runnable {
         override fun run() {
             if (autoscroll == 0 || tab == 0L) return
+            // By whole rows, the grid in its place
+            scrollPx = 0
             VtNative.scroll(tab, autoscroll)
             VtNative.selectTo(tab, autoscrollX, if (autoscroll < 0) 0 else rows - 1)
             awakenScrollBars()
@@ -409,6 +428,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         autoscroll = 0
         removeCallbacks(autoscrollTick)
         scroller.forceFinished(true)
+        scrollPx = 0
         selected = false
         scrollTotal = 0
         scrollOffset = 0
@@ -457,6 +477,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     fun searchStep(older: Boolean) {
         if (tab == 0L || !searching || !VtNative.searchSelect(tab, older)) return
         scroller.forceFinished(true)
+        scrollPx = 0
         stepFrom = scrollOffset
         invalidate()
     }
@@ -479,6 +500,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     fun jumpToPrompt(delta: Int): Boolean {
         if (tab == 0L || altScreen) return false
         scroller.forceFinished(true)
+        scrollPx = 0
         stepFrom = scrollOffset
         VtNative.jumpPrompt(tab, delta)
         invalidate()
@@ -526,23 +548,29 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = regrid()
 
+    /**
+     * Fits the grid to the view. The mirror and the bitmap hold one row more than the grid, the
+     * frame's overscan row after the viewport, which shows in part while the grid is drawn
+     * shifted up by [scrollPx].
+     */
     private fun regrid() {
         if (width == 0 || height == 0) return
         val c = max(1, width / cellWidth)
         val r = max(1, height / cellHeight)
         val bw = c * cellWidth
-        val bh = r * cellHeight
+        val bh = (r + 1) * cellHeight
         if (c == cols && r == rows && bitmap?.width == bw && bitmap?.height == bh) return
         cols = c
         rows = r
-        val n = c * r
+        scrollPx = 0
+        val n = c * (r + 1)
         cp = IntArray(n)
         fg = IntArray(n)
         bg = IntArray(n)
         attrs = IntArray(n)
         clusters = arrayOfNulls(n)
-        selFrom = IntArray(r) { -1 }
-        selTo = IntArray(r) { -1 }
+        selFrom = IntArray(r + 1) { -1 }
+        selTo = IntArray(r + 1) { -1 }
         bitmap?.recycle()
         bitmap = createBitmap(bw, bh).also { canvas = Canvas(it) }
         full = true
@@ -588,9 +616,16 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             VtNative.frame(tab, f)?.let(::apply)
             stats(SystemClock.elapsedRealtimeNanos() - start)
         }
-        c.drawBitmap(bmp, 0f, 0f, null)
-        drawCursor(c)
-        drawPreedit(c)
+        // The grid, shifted up by part of a row while the viewport scrolls; the margin below the
+        // last whole row keeps the background
+        val s = scrollPx.toFloat()
+        c.withClip(0, 0, cols * cellWidth, rows * cellHeight) {
+            c.drawBitmap(bmp, 0f, -s, null)
+        }
+        c.withTranslation(0f, -s) {
+            drawCursor(c)
+            drawPreedit(c)
+        }
         drawHandles(c)
         if (menuPending) {
             menuPending = false
@@ -638,6 +673,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollTotal = b.getInt(36)
         scrollOffset = b.getInt(40)
         scrollLen = b.getInt(44)
+        // Without a row after the viewport (at the bottom), or once scrolling no longer moves it
+        // (mouse tracking, the alternate screen), the grid is in its place
+        if (b.get(58).toInt() == 0 || scrollWay() != WAY_VIEWPORT) scrollPx = 0
         if (stepFrom >= 0) {
             if (scrollOffset != stepFrom) awakenScrollBars()
             stepFrom = -1
@@ -679,7 +717,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             val to = coordinate(b, pos + 10)
             pos += ROW_HEADER_BYTES
             var e = pos + n * 16
-            if (y < rows) {
+            // Up to the overscan row after the viewport (y == rows)
+            if (y <= rows) {
                 selFrom[y] = if (to >= 0) from else -1
                 selTo[y] = to
                 val base = y * cols
@@ -815,13 +854,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
-    // The scroll bar, which View draws after onDraw from the frame just taken; it shows only with a
-    // scrollback, so never on the alternate screen
-    override fun computeVerticalScrollRange() = scrollTotal
+    // The scroll bar, which View draws after onDraw from the frame just taken, in pixels so it
+    // follows [scrollPx]; it shows only with a scrollback, so never on the alternate screen
+    override fun computeVerticalScrollRange() = scrollTotal * cellHeight
 
-    override fun computeVerticalScrollOffset() = scrollOffset
+    override fun computeVerticalScrollOffset() = scrollOffset * cellHeight + scrollPx
 
-    override fun computeVerticalScrollExtent() = scrollLen
+    override fun computeVerticalScrollExtent() = scrollLen * cellHeight
 
     // ---- Painting ----
 
@@ -1202,6 +1241,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 true
             }
             adjustment != null && VtNative.selectAdjust(tab, adjustment) -> {
+                // It may have scrolled the viewport by rows to show the end, which rests on a row
+                scroller.forceFinished(true)
+                scrollPx = 0
                 // The menu follows the selection once the next frame is drawn
                 awakenScrollBars()
                 invalidate()
@@ -1243,6 +1285,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         restartBlink()
         if (!atBottom && tab != 0L) {
             VtNative.scroll(tab, 0)
+            scrollPx = 0
             awakenScrollBars()
             invalidate()
         }
@@ -1251,8 +1294,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
-        // A fling not drawn to its end would jump there when the window draws again
-        if (!hasWindowFocus) scroller.forceFinished(true)
+        // A fling not drawn to its end would jump there when the window draws again; a viewport it
+        // leaves between rows comes to rest on the nearest (a short scroll that may end unseen)
+        if (!hasWindowFocus) {
+            scroller.forceFinished(true)
+            if (scrollPx != 0) settle()
+        }
         // Focus events (mode 1004): editors reload changed files when they regain focus
         if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
         updateBlink()
@@ -1351,7 +1398,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         getLocationOnScreen(location)
         val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
         val x = (cursorX * cellWidth).toFloat() + paints[0].measureText(preedit)
-        val top = (cursorY * cellHeight).toFloat()
+        val top = (cursorY * cellHeight - scrollPx).toFloat()
         val info = CursorAnchorInfo.Builder()
             .setMatrix(matrix)
             .setSelectionRange(preedit.length, preedit.length)
@@ -1411,7 +1458,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             else -> -1 to -1
         }
         dragOffsetX = if (cx < 0) 0f else (cx + 0.5f) * cellWidth - x
-        dragOffsetY = if (cy < 0) 0f else (cy + 0.5f) * cellHeight - y
+        dragOffsetY = if (cy < 0) 0f else (cy + 0.5f) * cellHeight - scrollPx - y
         dragCellX = -1
         dragCellY = -1
         parent?.requestDisallowInterceptTouchEvent(true)
@@ -1432,7 +1479,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             if (edge != 0) postDelayed(autoscrollTick, AUTOSCROLL_MS)
         }
         autoscrollX = cx
-        val cy = floor(py / cellHeight).toInt().coerceIn(0, rows - 1)
+        val cy = cellY(py)
         if (cx == dragCellX && cy == dragCellY) return
         dragCellX = cx
         dragCellY = cy
@@ -1539,7 +1586,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     }
                     val l = if (first == last) selFrom[first] * cellWidth else 0
                     val r = if (first == last) (selTo[last] + 1) * cellWidth else cols * cellWidth
-                    outRect.set(l, first * cellHeight, r, (last + 1) * cellHeight)
+                    outRect.set(l, first * cellHeight - scrollPx, r, (last + 1) * cellHeight - scrollPx)
                 }
             },
             ActionMode.TYPE_FLOATING,
@@ -1595,7 +1642,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             d = other
             l = left(other, !start)
         }
-        val top = (y + 1) * cellHeight
+        val top = (y + 1) * cellHeight - scrollPx
         return d to Rect(l, top, l + d.intrinsicWidth, top + d.intrinsicHeight)
     }
 
@@ -1621,11 +1668,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Gestures ----
 
+    /**
+     * A touch, then: a viewport left between rows comes to rest on the nearest whole row once the
+     * gesture ends without a fling, which settles it when it stops.
+     */
     @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        // A touch stops a fling
+        val handled = touch(event)
+        val action = event.actionMasked
+        if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && scrollPx != 0 && scroller.isFinished) {
+            settle()
+        }
+        return handled
+    }
+
+    private fun touch(event: MotionEvent): Boolean {
+        // A touch stops a fling; settling to a whole row is no fling, so its tap still acts
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-            stoppedFling = !scroller.isFinished
+            stoppedFling = !scroller.isFinished && !settling
             scroller.forceFinished(true)
         }
         // A mouse's buttons and drags go to a program tracking it as they are, from the press on
@@ -1765,6 +1825,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
                 if (tab == 0L) return false
+                // The viewport follows the finger by pixels; wheel events and arrow keys go by rows
+                if (scrollWay() == WAY_VIEWPORT) {
+                    pixelRemainder += distanceY
+                    val px = pixelRemainder.toInt()
+                    pixelRemainder -= px
+                    if (px != 0) scrollPixels(px)
+                    return true
+                }
                 scrollRemainder += distanceY
                 val n = (scrollRemainder / cellHeight).toInt()
                 if (n != 0) {
@@ -1824,18 +1892,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     )
 
     /**
-     * A mouse wheel (or touchpad scroll) scrolls like a drag; a mouse moving with no button held
-     * goes to a program tracking all motion (mode 1003).
+     * A mouse wheel (or touchpad scroll) scrolls like a drag, and its sideways scrolling goes to a
+     * program tracking the mouse as wheel buttons 6 and 7 (left and right), one a notch, as in
+     * Ghostty (nothing else scrolls sideways); a mouse moving with no button held goes to a
+     * program tracking all motion (mode 1003).
      */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) {
             when (event.actionMasked) {
                 MotionEvent.ACTION_SCROLL -> {
                     val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
-                    if (v != 0f) {
-                        scrollBy(if (v > 0) -WHEEL_ROWS else WHEEL_ROWS, event.x, event.y)
-                        return true
+                    val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+                    if (v != 0f) scrollBy(if (v > 0) -WHEEL_ROWS else WHEEL_ROWS, event.x, event.y)
+                    val sideways = h != 0f && mouseTracking
+                    if (sideways) {
+                        val button = if (h > 0) MOUSE_WHEEL_RIGHT else MOUSE_WHEEL_LEFT
+                        send(VtNative.mouse(tab, MOUSE_PRESS, button, 0, event.x, event.y, false), scrolling = true)
                     }
+                    if (v != 0f || sideways) return true
                 }
                 MotionEvent.ACTION_HOVER_MOVE -> if (mouseTracking) {
                     send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_NONE, VtKeys.mods(event.metaState), event.x, event.y, false))
@@ -1889,12 +1963,32 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 val arrow = VtKeys.of(if (n > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
                 repeat(abs(n)) { send(VtNative.key(tab, arrow, 0, 0, VtKeys.ACTION_PRESS, null, 0), scrolling = true) }
             }
-            else -> {
-                VtNative.scroll(tab, n)
-                awakenScrollBars()
-                invalidate()
-            }
+            else -> scrollPixels(n * cellHeight)
         }
+    }
+
+    /**
+     * Scrolls the viewport by [dy] pixels (positive: towards the newest output): within a row by
+     * the [scrollPx], across rows by the terminal's viewport, as far as either end, where the grid
+     * rests on a whole row (at the bottom there is no row after the viewport to show). The ends
+     * are those of the last frame, kept up with the rows moved since; false when it could not
+     * move at all.
+     */
+    private fun scrollPixels(dy: Int): Boolean {
+        val last = max(0, scrollTotal - scrollLen)
+        val to = (scrollOffset.toLong() * cellHeight + scrollPx + dy).coerceIn(0L, last.toLong() * cellHeight)
+        val top = (to / cellHeight).toInt()
+        val s = (to % cellHeight).toInt()
+        if (top == scrollOffset && s == scrollPx) return false
+        if (top != scrollOffset) {
+            VtNative.scroll(tab, top - scrollOffset)
+            scrollOffset = top
+            atBottom = top == last
+        }
+        scrollPx = s
+        awakenScrollBars()
+        invalidate()
+        return true
     }
 
     /**
@@ -1909,31 +2003,54 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * Goes on scrolling after a drag at [velocity] pixels a second (positive: towards the newest
-     * output), slowing down as a ScrollView does ([computeScroll] takes the rows): the viewport up
-     * to either end, wheel events and arrow keys for at most a screen of rows.
+     * output), slowing down as a ScrollView does ([computeScroll] takes the pixels, or rows): the
+     * viewport up to either end, wheel events and arrow keys for at most a screen of rows.
      */
     private fun fling(x: Float, y: Float, velocity: Int) {
         flingWay = scrollWay()
         flingX = x
         flingY = y
         flingLast = 0
+        settling = false
         val reach = (if (flingWay == WAY_VIEWPORT) scrollTotal else rows) * cellHeight
         scroller.fling(0, 0, 0, velocity, 0, 0, -reach, reach)
         postInvalidateOnAnimation()
     }
 
     /**
-     * A fling's next rows, before each frame while it lasts. It stops when the way to scroll
-     * changes (a program turning mouse tracking on, the alternate screen) or the viewport reaches
-     * the end it moves to, as of the last frame.
+     * Brings a viewport left between rows to the nearest whole row, scrolling there in
+     * [SETTLE_MS] as the scroller's fling does.
+     */
+    private fun settle() {
+        val to = if (scrollPx < cellHeight / 2) -scrollPx else cellHeight - scrollPx
+        flingWay = WAY_VIEWPORT
+        flingLast = 0
+        settling = true
+        scroller.startScroll(0, 0, 0, to, SETTLE_MS)
+        postInvalidateOnAnimation()
+    }
+
+    /**
+     * A fling's next pixels or rows, before each frame while it lasts, and its settling to a whole
+     * row once it stops in the viewport between two. It stops when the way to scroll changes (a
+     * program turning mouse tracking on, the alternate screen) or the viewport reaches the end it
+     * moves to.
      */
     override fun computeScroll() {
         if (!scroller.computeScrollOffset()) return
         val delta = scroller.currY - flingLast
         flingLast = scroller.currY
-        val end = flingWay == WAY_VIEWPORT && (if (delta < 0) scrollOffset == 0 else delta > 0 && atBottom)
-        if (tab == 0L || scrollWay() != flingWay || end) {
+        if (tab == 0L || scrollWay() != flingWay) {
             scroller.forceFinished(true)
+            return
+        }
+        if (flingWay == WAY_VIEWPORT) {
+            if (delta != 0 && !scrollPixels(delta)) scroller.forceFinished(true)
+            if (scroller.isFinished) {
+                if (scrollPx != 0) settle()
+            } else {
+                postInvalidateOnAnimation()
+            }
             return
         }
         scrollRemainder += delta
@@ -1947,7 +2064,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
 
-    private fun cellY(y: Float) = floor(y / cellHeight).toInt().coerceIn(0, rows - 1)
+    /** The row of the viewport at [y], counting the [scrollPx] (the overscan row's part as the last row). */
+    private fun cellY(y: Float) = floor((y + scrollPx) / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
         /** Shift with these keys moves a selection's end ([VtNative.selectAdjust]), as in Ghostty. */
@@ -2025,9 +2143,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val MOUSE_MIDDLE = 3
         const val MOUSE_WHEEL_UP = 4
         const val MOUSE_WHEEL_DOWN = 5
+        const val MOUSE_WHEEL_LEFT = 6
+        const val MOUSE_WHEEL_RIGHT = 7
 
         /** Rows per mouse wheel notch. */
         const val WHEEL_ROWS = 3
+
+        /** How long the viewport takes to come to rest on a whole row after scrolling stops between two. */
+        const val SETTLE_MS = 150
 
         /** A blinking cursor's half period, as Android's text fields. */
         const val BLINK_MS = 500L

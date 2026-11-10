@@ -42,7 +42,7 @@
     <string name="tab_ended">%1$s（已结束）</string>
     <string name="tab_description">标签页 %1$d：%2$s</string>
     <string name="tab_number">标签页 %1$d</string>
-    <string name="channel_terminal">程序的响铃和通知</string>
+    <string name="channel_terminal">响铃、程序的通知和命令结束</string>
     <string name="bell_rang">终端响铃了</string>
     <string name="program_copied">程序把文本复制到了剪贴板</string>
     <string name="tab_description_status">标签页 %1$d：%2$s（%3$s）</string>
@@ -57,6 +57,11 @@
     <string name="status_error">出错了</string>
     <string name="status_paused">已暂停</string>
     <string name="status_message">%1$s：%2$s</string>
+    <string name="command_succeeded">命令已完成</string>
+    <string name="command_failed">命令失败</string>
+    <string name="command_finished">命令已结束</string>
+    <string name="command_took">用时 %1$s。</string>
+    <string name="command_took_code">用时 %1$s，退出码 %2$d。</string>
     <string name="modifier_locked">%1$s 已锁定</string>
     <string name="menu_settings">设置</string>
     <string name="settings">设置</string>

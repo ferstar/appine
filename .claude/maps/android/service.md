@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exiting, kill reports to the open console, status notifications, scrollback trimming, snapshots, clipboard reads last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exiting, kill reports to the open console, status notifications, scrollback trimming, snapshots, clipboard reads, finished commands last)
 
 ## Responsibilities
 
@@ -20,7 +20,8 @@ outlives an Activity:
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories, too-long holds of the BKL) and turns them into tab messages, notifications and
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
-  program statuses, clipboard writes and reads);
+  program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
+  finish;
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
   mirror).
@@ -55,7 +56,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `nextSessionId` (counting up from the clock, never wrapped), `bellNotified` (when each tab's bell
   last notified), `statusNotified` (the program status a tab's notification shows, while it shows
   one); `sessionEvents` (title changed, bell, clipboard write, notification, clipboard read,
-  progress or status changed, finished).
+  progress or status changed, a command finished, the shell finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
@@ -71,7 +72,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
   transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
 - Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, bell notifications at
-  most once a second per tab.
+  most once a second per tab, commands notifying from 10 s.
 
 ## Public entry points
 
@@ -246,6 +247,12 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
   Android lets an app read the clipboard only while it has the focus, and the program would
   otherwise wait for a timeout.
+- A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
+  terminal, android/terminal) after at least 10 s, in a tab not in front (another tab shown, or
+  the terminal Activity not listening), becomes the tab's notification, as Ghostty's
+  `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold 5 s);
+  shorter ones and those in the tab in front post nothing. Like a program's notification it
+  replaces a status notification (`statusNotified` forgets the tab).
 
 ### Reports and notifications
 
@@ -286,10 +293,14 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   title, else the program's title (`sh` when none), with the body, "The terminal bell rang", or
   for a status what it says (`VtSession.describe`: "Waiting for your approval", "Waiting for your
   answer", "Waiting for credentials", "Waiting for you", "Done", "Failed") and its message after a
-  colon, and "Tab N" as subtext. Tapping
+  colon, and "Tab N" as subtext. A finished command's is titled "Command succeeded" (exit code
+  0), "Command failed" (another code) or "Command finished" (none reported), with "Took <time>."
+  or, after a failure, "Took <time> and exited with code N." (the time in ICU's short units in the
+  app's language: hours and minutes, minutes and seconds, or seconds). Tapping
   one opens the activity on that tab (`EXTRA_TAB` with the session id); showing the tab or closing
   it takes it away.
-- Channels: `sessions` (low), `network`, `problems`, `terminal`; kill reports take ids from 100000,
+- Channels: `sessions` (low), `network`, `problems`, `terminal` (named "Bells, notifications from
+  programs and finished commands"); kill reports take ids from 100000,
   counting up from a clock-seeded start and wrapping after 100000.
 
 ## Dependencies (inbound / outbound)
@@ -351,3 +362,6 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 - Whether tapping "copy report" after the service stopped recreates the service (and starts a
   kernel) through its `getService` pending intent.
+- Finished-command notifications were tried only on a Pixel 4a API 34 emulator (busybox ash and
+  bash 5.3 from another tab, ash with the app in the background, English and Simplified Chinese),
+  not on real devices or with long durations in hours.

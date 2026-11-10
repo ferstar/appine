@@ -51,6 +51,12 @@ internal class VtSession(
         /** The tab's [progress] (OSC 9;4) or [status] (OSC 7501) changed. */
         fun onStatusChanged(session: VtSession)
 
+        /**
+         * The shell's prompt marks (OSC 133) saw a command finish after [millis] milliseconds, with
+         * [exitCode] when the shell reported one.
+         */
+        fun onCommandFinished(session: VtSession, exitCode: Int?, millis: Long)
+
         fun onFinished(session: VtSession)
     }
 
@@ -460,6 +466,16 @@ internal class VtSession(
             setProgress(null)
             if (records.values.removeAll { it.state != STATUS_DONE && it.state != STATUS_ERROR }) updateStatus()
         }
+    }
+
+    /**
+     * From vt.rs, on the pump thread: the shell's prompt marks (OSC 133) saw a command finish after
+     * [millis] milliseconds, with exit code [exit] when [hasExit]: from the line feed that ended
+     * its input (or the output's mark) to the next prompt's command end.
+     */
+    @Suppress("unused")
+    fun onCommandFinished(hasExit: Boolean, exit: Int, millis: Long) {
+        main.post { if (!released) events.onCommandFinished(this, exit.takeIf { hasExit }, millis) }
     }
 
     /**
