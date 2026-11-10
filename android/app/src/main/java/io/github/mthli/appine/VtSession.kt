@@ -3,6 +3,8 @@ package io.github.mthli.appine
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
+import android.util.Log
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -14,10 +16,10 @@ import kotlin.concurrent.thread
  * A terminal tab (the android/terminal map), owned by [TerminalService]: a login shell on a kernel
  * console ([ConsolePty]) and its libghostty-vt terminal. The terminal lives in the native library
  * and takes the console's output on a pump thread whether or not a [VtView] shows it ([view]); the
- * shell starts when a view first knows the grid ([start]), and until then restored text and
- * messages wait. Input goes out on the tab's own writer thread, so a program that stops reading
- * blocks only its tab. Calls are on the main thread, except [console], which saving reads on the
- * service's worker.
+ * shell starts when a view first knows the grid ([start]), and until then a restored tab's saved
+ * terminal and messages wait. Input goes out on the tab's own writer thread, so a program that
+ * stops reading blocks only its tab. Calls are on the main thread, except [console],
+ * [resolvedLogin], [takeSnapshot] and [savedSnapshot], which saving uses on the service's worker.
  */
 internal class VtSession(
     /** Names the tab in a notification's intent (from the service, never reused in a run). */
@@ -39,6 +41,12 @@ internal class VtSession(
 
         /** A program asked for a notification (OSC 9 body, OSC 777 title and body). */
         fun onNotification(session: VtSession, title: String, body: String)
+
+        /**
+         * A program asked to read the clipboard (OSC 52); the answer goes through
+         * [answerClipboardRead], which also answers the reads that come meanwhile.
+         */
+        fun onClipboardRead(session: VtSession)
 
         /** The tab's [progress] (OSC 9;4) or [status] (OSC 7501) changed. */
         fun onStatusChanged(session: VtSession)
@@ -81,6 +89,13 @@ internal class VtSession(
     @Volatile
     var resolvedLogin: String? = null
 
+    /**
+     * The file of the terminal's last saved snapshot (`Tabs`), kept while the terminal does not
+     * change ([takeSnapshot] gives nothing new); only the service's worker thread uses it.
+     */
+    @Volatile
+    var savedSnapshot: String? = null
+
     /** The terminal ([VtNative]), 0 until [start] created it. */
     @Volatile
     var tab = 0L
@@ -97,7 +112,14 @@ internal class VtSession(
     private val hungUp = AtomicBoolean()
     private var writer: ExecutorService? = null
 
-    /** Restored text and messages to show before the shell's output. */
+    /**
+     * A restored tab's terminal as it was saved: its snapshot (read when the shell starts), else
+     * its transcript (a terminal byte stream). Both are dropped once the terminal exists.
+     */
+    private var restoredSnapshot: (() -> ByteArray?)? = null
+    private var restoredText: ByteArray? = null
+
+    /** A restored tab's notice and messages to show before the shell's output. */
     private var pending: ByteArray? = null
 
     // The grid the terminal and the console have
@@ -157,6 +179,12 @@ internal class VtSession(
     /** Status reports taken on the pump thread and not applied yet ([onStatus]). */
     private val reports = ArrayList<Status>()
 
+    /**
+     * Clipboard reads (OSC 52) waiting for the user's answer: the clipboard each named, `c`, `p`
+     * or `s`, which the answer names too.
+     */
+    private val clipboardReads = ArrayList<Char>()
+
     private val dropProgress = Runnable { setProgress(null) }
 
     /**
@@ -176,9 +204,25 @@ internal class VtSession(
             return lastTranscript.orEmpty()
         }
 
-    /** A restored tab: [text] (a terminal byte stream) is shown before the shell's output. */
-    fun setRestored(text: ByteArray) {
-        pending = text
+    /**
+     * A snapshot of the whole terminal for saving the tab ([VtNative.snapshot]), on the service's
+     * worker: null when nothing changed since the last one ([savedSnapshot] is still the
+     * terminal's) or the shell has not started, empty when none can be taken.
+     */
+    fun takeSnapshot(): ByteArray? {
+        val t = tab
+        return if (t == 0L) null else VtNative.snapshot(t)
+    }
+
+    /**
+     * A restored tab: its terminal comes back from the [snapshot] the loader reads when the shell
+     * starts, or, without one that decodes, shows [text] (a terminal byte stream, the transcript);
+     * then the [notice] and the shell's output follow.
+     */
+    fun setRestored(text: ByteArray, snapshot: (() -> ByteArray?)?, notice: ByteArray) {
+        restoredText = text
+        restoredSnapshot = snapshot
+        pending = notice
     }
 
     /**
@@ -211,7 +255,7 @@ internal class VtSession(
             e.message ?: e.toString()
         }
         val t = try {
-            VtNative.create(machine, pty.console, cols, rows, cellWidth, cellHeight)
+            createTerminal(cols, rows, cellWidth, cellHeight)
         } catch (e: IOException) {
             0L
         }
@@ -250,6 +294,25 @@ internal class VtSession(
         view?.onStarted()
     }
 
+    /**
+     * The tab's terminal: a restored tab's from its snapshot when that decodes, else a new one,
+     * which shows a restored tab's transcript. Throws when the kernel is gone.
+     */
+    private fun createTerminal(cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): Long {
+        val snapshot = restoredSnapshot?.invoke()
+        val text = restoredText
+        restoredSnapshot = null
+        restoredText = null
+        if (snapshot != null) {
+            val t = VtNative.restore(machine, pty.console, snapshot, cols, rows, cellWidth, cellHeight)
+            if (t != 0L) return t
+            Log.w("appine", "cannot restore a tab's snapshot; showing its transcript")
+        }
+        val t = VtNative.create(machine, pty.console, cols, rows, cellWidth, cellHeight)
+        if (t != 0L && text != null) VtNative.print(t, text)
+        return t
+    }
+
     /** From vt.rs, on the pump thread: the screen changed since the last frame. */
     @Suppress("unused")
     fun onOutput() {
@@ -278,6 +341,35 @@ internal class VtSession(
     @Suppress("unused")
     fun onNotification(title: String, body: String) {
         main.post { if (!released) events.onNotification(this, title, body) }
+    }
+
+    /**
+     * From vt.rs, on the pump thread: programs asked to read the clipboard (OSC 52 "?") [count]
+     * times, the last naming clipboard [kind] (`c`, `p` or `s`). They wait for the answer: the
+     * service has the user asked, or answers with an empty clipboard ([answerClipboardRead]).
+     */
+    @Suppress("unused")
+    fun onClipboardRead(kind: Int, count: Int) {
+        main.post {
+            if (released) return@post
+            val first = clipboardReads.isEmpty()
+            repeat(count) { clipboardReads.add(kind.toChar()) }
+            if (first) events.onClipboardRead(this)
+        }
+    }
+
+    /**
+     * Answers the clipboard reads that wait with [text], or, denied, with an empty clipboard
+     * (as libghostty-vt answers a read it refuses), so programs do not wait for a timeout. The
+     * answer names the clipboard asked for, ends with ST and carries the text in base64, as
+     * Ghostty's does.
+     */
+    fun answerClipboardRead(text: String?) {
+        if (clipboardReads.isEmpty()) return
+        val data = Base64.encodeToString(text.orEmpty().toByteArray(), Base64.NO_WRAP)
+        val answer = clipboardReads.joinToString("") { "\u001b]52;$it;$data\u001b\\" }
+        clipboardReads.clear()
+        write(answer.toByteArray())
     }
 
     /**
@@ -399,6 +491,32 @@ internal class VtSession(
         }
     }
 
+    /**
+     * Clears the screen and the scrollback as Ghostty's clear_screen does (⋮); a shell at its prompt
+     * gets a form feed (^L) to draw the prompt again on the empty screen. Nothing on the alternate
+     * screen.
+     */
+    fun clear() {
+        if (tab == 0L) return
+        when (VtNative.clear(tab)) {
+            -1 -> return
+            1 -> write(FORM_FEED)
+        }
+        view?.invalidate()
+    }
+
+    /**
+     * Resets the terminal as Ghostty's reset does (⋮); a shell at its prompt gets a form feed (^L)
+     * to draw the prompt again on the empty screen.
+     */
+    fun reset() {
+        if (tab == 0L) return
+        if (VtNative.reset(tab)) write(FORM_FEED)
+        view?.invalidate()
+        // The title a program set is gone
+        events.onTitleChanged(this)
+    }
+
     private fun exited(code: Int) {
         if (exit != null) return
         exit = code
@@ -467,6 +585,9 @@ internal class VtSession(
         const val KIND_PERMISSION = 1
         const val KIND_QUESTION = 2
         const val KIND_AUTH = 3
+
+        /** Ctrl+L, which shells take as a request to draw their prompt again. */
+        private val FORM_FEED = byteArrayOf(0x0c)
 
         /** How long a progress report lasts without the next one (Ghostty's 15 s). */
         private const val PROGRESS_TIMEOUT_MS = 15_000L

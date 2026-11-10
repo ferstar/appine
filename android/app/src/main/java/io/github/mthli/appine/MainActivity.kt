@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
@@ -26,6 +27,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -88,6 +90,12 @@ class MainActivity : Activity(), TerminalService.Listener {
      * kept untyped for older versions); null otherwise. See [onBackPressed].
      */
     private var closeSearchOnBack: Any? = null
+
+    /**
+     * The question whether a program may read the clipboard ([onClipboardRead]) while it is open,
+     * which answers the reads that come meanwhile too.
+     */
+    private var clipboardQuestion: AlertDialog? = null
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -303,6 +311,37 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The program in the tab shown rang the bell (the service sends only those). */
     override fun onBell() = screen.bell()
 
+    /**
+     * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
+     * it holds shown, as Ghostty's clipboard-read = ask does; nothing to read (an empty clipboard,
+     * or no text) is answered at once. Denying, or leaving the question unanswered, gives the
+     * program an empty clipboard.
+     */
+    override fun onClipboardRead() {
+        val session = current ?: return
+        if (clipboardQuestion != null) return
+        val clip = getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }
+        val text = clip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+        if (text.isEmpty()) {
+            session.answerClipboardRead("")
+            return
+        }
+        val preview = if (text.length > CLIPBOARD_PREVIEW) text.take(CLIPBOARD_PREVIEW) + "…" else text
+        var allowed = false
+        clipboardQuestion = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.clipboard_read_title)
+            .setMessage(getString(R.string.clipboard_read, preview))
+            .setPositiveButton(R.string.allow) { _, _ -> allowed = true }
+            .setNegativeButton(R.string.deny, null)
+            .setOnDismissListener {
+                clipboardQuestion = null
+                session.answerClipboardRead(if (allowed) text else null)
+                // The terminal takes the keyboard again
+                screen.requestFocus()
+            }
+            .show()
+    }
+
     /** A tab's progress or program status changed: its marks in the bar, the progress line. */
     override fun onTabStatus() {
         tabBar.refreshStatus()
@@ -391,8 +430,10 @@ class MainActivity : Activity(), TerminalService.Listener {
     // ---- The menu and closing tabs ----
 
     /**
-     * `⋮`: finding text in the current tab (none: disabled), closing the other tabs (none other:
-     * disabled) or all of them, and Settings.
+     * `⋮`: finding text in the current tab (none: disabled), clearing its screen (also disabled on
+     * the alternate screen, where Ghostty's clear_screen does nothing) or resetting its terminal
+     * (disabled before its shell starts), closing the other tabs (none other: disabled) or all of
+     * them, and Settings.
      */
     private fun showMenu(anchor: View) {
         val sessions = service?.sessions.orEmpty().toList()
@@ -400,6 +441,16 @@ class MainActivity : Activity(), TerminalService.Listener {
         PopupMenu(this, anchor, Gravity.END, 0, R.style.Widget_Appine_MorePopup).apply {
             menu.add(R.string.find).apply { isEnabled = current != null }.setOnMenuItemClickListener {
                 openSearch()
+                true
+            }
+            val terminal = current?.takeIf { it.tab != 0L }
+            menu.add(R.string.clear_screen).apply { isEnabled = terminal != null && !screen.altScreen }
+                .setOnMenuItemClickListener {
+                    terminal?.clear()
+                    true
+                }
+            menu.add(R.string.reset_terminal).apply { isEnabled = terminal != null }.setOnMenuItemClickListener {
+                terminal?.reset()
                 true
             }
             menu.add(R.string.close_other_tabs).apply { isEnabled = others.isNotEmpty() }.setOnMenuItemClickListener {
@@ -705,5 +756,11 @@ class MainActivity : Activity(), TerminalService.Listener {
         /** A [VtSession.id]: the tab to show (a tab's notification, from the service). */
         const val EXTRA_TAB = "tab"
         private const val PREF_FONT_SIZE = "font_size"
+
+        /**
+         * Characters of the clipboard shown when asking whether a program may read it, as many as
+         * of a paste (VtView).
+         */
+        private const val CLIPBOARD_PREVIEW = 300
     }
 }

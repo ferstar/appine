@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exit restarting by importing, kill reports to the open console, status notifications, then scrollback trimming last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exiting, kill reports to the open console, status notifications, scrollback trimming, snapshots, clipboard reads last)
 
 ## Responsibilities
 
@@ -20,7 +20,7 @@ outlives an Activity:
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
   directories, too-long holds of the BKL) and turns them into tab messages, notifications and
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
-  program statuses, clipboard writes);
+  program statuses, clipboard writes and reads);
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
   mirror).
@@ -36,7 +36,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - `TerminalService` — a same-process service; `onBind` returns a `LocalBinder` whose `service` is
   the service itself.
 - `Listener` — UI callbacks with no-op defaults, always on the main thread: `onProgress`,
-  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onTabStatus` (a
+  `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onClipboardRead`
+  (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
   tab's progress or program status changed), `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
   register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
@@ -44,7 +45,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - `worker` — a single-thread executor (`appine-worker`) for the calls that take a kernel handle
   and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
   the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
-  ordered with them: saving tabs, resolving an `auto` login, changed directories,
+  ordered with them: saving tabs (their terminals' snapshots included), resolving an `auto` login, changed directories,
   `Rootfs.setMirror`, and a replacement's mirror join and store reset.
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
@@ -53,8 +54,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   bell throttle away and, with the terminal Activity listening, marks the tab's statuses seen),
   `nextSessionId` (counting up from the clock, never wrapped), `bellNotified` (when each tab's bell
   last notified), `statusNotified` (the program status a tab's notification shows, while it shows
-  one); `sessionEvents` (title changed, bell, clipboard write, notification, progress or status
-  changed, finished).
+  one); `sessionEvents` (title changed, bell, clipboard write, notification, clipboard read,
+  progress or status changed, finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
@@ -63,9 +64,12 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
   the active one, `downloader` the one whose thread has not ended yet.
 - `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
-  `index.json`, transcripts named by content (`t-<128-bit SHA-256 prefix>.txt`; earlier versions
-  wrote `t<i>.txt`, still read); `Tab(login, cwd, transcript)`, `Saved(tabs, current, time)`,
-  `Killed(pid, saved)`; transcripts capped at 256 K chars.
+  `index.json` (recording the libghostty-vt version, `VtNative.version`, its snapshots were written
+  with), transcripts named by content (`t-<128-bit SHA-256 prefix>.txt`; earlier versions wrote
+  `t<i>.txt`, still read), terminal snapshots named by content and deflated
+  (`s-<128-bit SHA-256 prefix of the snapshot>.snap`); `Tab(login, cwd, transcript, snapshot)`
+  (the snapshot's file name, null for none), `Saved(tabs, current, time)`, `Killed(pid, saved)`;
+  transcripts capped at 256 K chars, snapshots read back at most 16 MiB.
 - Constants: poll 2 s, trim delay 60 s, periodic save 60 s, save-soon 2 s, bell notifications at
   most once a second per tab.
 
@@ -195,16 +199,19 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - Saving (`saveTabs`, while a kernel runs): for running tabs only, the login setting and the
   transcript (plain text, last 256 K chars; `VtSession.transcriptText`) on the main thread, and on
   the worker the foreground group's cwd (`consoleCwd` of the tab's console, when it has one; null
-  once the shell has ended), with an `auto` login saved as the account it resolves to
+  once the shell has ended) and, for a tab whose shell started, its terminal's snapshot
+  (`VtSession.takeSnapshot`: written with `Tabs.writeSnapshot` when it changed since the last save,
+  else the file saved last, `VtSession.savedSnapshot`; none when none can be taken), with an `auto`
+  login saved as the account it resolves to
   (`Rootfs.loginAccount`, kept in `VtSession.resolvedLogin` from the tab's first save) so a
-  restored tab logs in as the same user. Restored tabs not shown yet keep their saved transcript
-  and cwd; the saved current tab is an index among the running tabs (0 when none is current).
-- `Tabs.save` writes temp-then-rename; a transcript's name is its content digest, so unchanged ones
-  are not rewritten; the index (with the time) is skipped when its tabs and current tab hash the
+  restored tab logs in as the same user. Restored tabs not shown yet keep their saved transcript,
+  snapshot and cwd; the saved current tab is an index among the running tabs (0 when none is current).
+- `Tabs.save` writes temp-then-rename, as `writeSnapshot` did before it; a transcript's or
+  snapshot's name is its content digest, so unchanged ones are not rewritten; the index (with the time) is skipped when its tabs and current tab hash the
   same as the last one this process wrote, so the saved time is that of the last save that found a
-  change or was its process's first; transcripts no index names any more (and their leftover
-  temporary files) are deleted only after the index step (a kill at any point leaves a consistent
-  set). A
+  change or was its process's first; transcripts and snapshots no index names any more (and their
+  leftover temporary files) are deleted only after the index step (a kill at any point leaves a
+  consistent set). A
   `name` key in an index from versions that could rename tabs is ignored. Triggers: every 60 s, 2 s
   after a tab opens, closes or its shell ends, when the last listener leaves, on memory trim.
 - The `running` marker, holding the process's pid, is written after each successful start and
@@ -214,8 +221,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   from an earlier version is empty (pid 0).
 - Restore, at the first successful start without a pending replacement (a failed start or a
   replacement keeps `restore` for the next one): each saved tab reopens with its saved login
-  setting and cwd, preceded by its old transcript and a yellow `[appine]` notice saying why the run
-  ended and when the tabs were saved; the saved current tab becomes `focus`. Seven reasons are told
+  setting and cwd, below its terminal as saved (its snapshot, read and inflated when the tab is
+  first shown, when the index's version is this build's and it decodes; else its transcript) and a
+  yellow `[appine]` notice saying why the run ended and when the tabs were saved; the saved current tab becomes `focus`. Seven reasons are told
   apart: low memory, too many resources in the background, force-stopped (user requested or
   stopped), the app updated (from Android 14), a crash (Java or native) and an ANR of Appine;
   anything else, no record or no pid gives "Android stopped the app".
@@ -233,7 +241,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   stopped waiting) takes its notification away, unless a bell or a program's notification has
   replaced it since. A clipboard write sets
   the clipboard from any tab (labelled Appine), or clears it; before Android 13, which shows copies
-  itself, a toast says a program copied text.
+  itself, a toast says a program copied text. A clipboard read (OSC 52) from the tab in front goes
+  to the listeners' `onClipboardRead`, where the terminal Activity asks the user; from any other
+  tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
+  Android lets an app read the clipboard only while it has the focus, and the program would
+  otherwise wait for a timeout.
 
 ### Reports and notifications
 
@@ -291,7 +303,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 ### Outbound
 
 - `Native` (start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls, `bklStall`,
-  routes, `consoleCwd`); `VtNative.compressAll`; `Rootfs` (readiness, importing, prepare,
+  routes, `consoleCwd`); `VtNative.compressAll`, and `VtNative.version` through `Tabs`; `Rootfs` (readiness, importing, prepare,
   download, mirrors, ensure-files, profile, access lock, store, reset, failed services, rules
   refresh, login accounts); `Tabs`;
   `VtSession` and `ConsolePty`; `Documents` (`rootsChanged`, `dirsChanged`).

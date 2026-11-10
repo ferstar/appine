@@ -215,8 +215,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // Modes and the selection, as of the last frame (vt.c's header flags)
     private var mouseTracking = false
-    private var altScreen = false
     private var altScroll = false
+
+    /** The alternate screen is shown (a full-screen program), as of the last frame. */
+    var altScreen = false
+        private set
 
     /** Whether the terminal has a selection; also set at once by the view's own changes. */
     private var selected = false
@@ -1180,9 +1183,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         return m
     }
 
-    /** Copy and paste keys: Ctrl+Shift+C and V (held, or from the extra keys) and the dedicated keys. */
+    /**
+     * Copy and paste keys: Ctrl+Shift+C and V (held, or from the extra keys) and the dedicated
+     * keys; and with a selection, Shift with an arrow, Page Up or Down, Home or End moves its end
+     * ([ADJUSTMENTS]), as Ghostty's adjust_selection keys do (without one, they reach the program).
+     */
     private fun shortcut(event: KeyEvent): Boolean {
         val both = event.isCtrlPressed && event.isShiftPressed
+        val shiftOnly = event.isShiftPressed && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed
+        val adjustment = if (selected && shiftOnly) ADJUSTMENTS[event.keyCode] else null
         return when {
             event.keyCode == KeyEvent.KEYCODE_PASTE || both && event.keyCode == KeyEvent.KEYCODE_V -> {
                 pasteClipboard()
@@ -1190,6 +1199,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
             event.keyCode == KeyEvent.KEYCODE_COPY || both && event.keyCode == KeyEvent.KEYCODE_C -> {
                 if (selected) copySelection()
+                true
+            }
+            adjustment != null && VtNative.selectAdjust(tab, adjustment) -> {
+                // The menu follows the selection once the next frame is drawn
+                awakenScrollBars()
+                invalidate()
                 true
             }
             else -> false
@@ -1935,6 +1950,18 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun cellY(y: Float) = floor(y / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
+        /** Shift with these keys moves a selection's end ([VtNative.selectAdjust]), as in Ghostty. */
+        val ADJUSTMENTS = mapOf(
+            KeyEvent.KEYCODE_DPAD_LEFT to VtNative.ADJUST_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT to VtNative.ADJUST_RIGHT,
+            KeyEvent.KEYCODE_DPAD_UP to VtNative.ADJUST_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN to VtNative.ADJUST_DOWN,
+            KeyEvent.KEYCODE_PAGE_UP to VtNative.ADJUST_PAGE_UP,
+            KeyEvent.KEYCODE_PAGE_DOWN to VtNative.ADJUST_PAGE_DOWN,
+            KeyEvent.KEYCODE_MOVE_HOME to VtNative.ADJUST_HOME,
+            KeyEvent.KEYCODE_MOVE_END to VtNative.ADJUST_END,
+        )
+
         // Cell attributes (vt.c)
         const val BOLD = 1
         const val ITALIC = 2

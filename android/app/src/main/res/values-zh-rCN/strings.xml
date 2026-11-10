@@ -32,6 +32,8 @@
     <string name="shortcuts_tabs">标签页</string>
     <string name="shortcuts_terminal">终端</string>
     <string name="find">查找</string>
+    <string name="clear_screen">清屏</string>
+    <string name="reset_terminal">重置终端</string>
     <string name="find_previous">上一个匹配</string>
     <string name="find_next">下一个匹配</string>
     <string name="find_close">关闭查找</string>
@@ -140,6 +142,10 @@
     </plurals>
     <string name="paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
     <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
+    <string name="clipboard_read_title">要让程序读取剪贴板吗？</string>
+    <string name="clipboard_read">此标签页中的程序请求读取剪贴板中的内容：\n\n%1$s</string>
+    <string name="allow">允许</string>
+    <string name="deny">拒绝</string>
     <string name="open_link">打开链接</string>
     <string name="select_rectangle">矩形选择</string>
     <string name="select_lines">按行选择</string>

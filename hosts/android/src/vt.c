@@ -160,6 +160,10 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // What a notification (OSC 9, OSC 777) keeps of its title and body
 #define NOTIFICATION_MAX ((size_t)4096)
 
+// How much of an OSC string's start appine_vt_feed keeps to find clipboard reads (OSC 52 with "?"
+// for data: "52;", the clipboards, ";?"), which fit with all eight clipboards named
+#define OSC_HEAD 32
+
 // The memory each screen's Kitty images may take, decoded; beyond it libghostty-vt deletes the
 // oldest images no placement shows, and refuses an image that does not fit at all. About three
 // images the size of a phone's screen; Ghostty's default is 320 MB, libghostty-vt's 10 MB
@@ -182,6 +186,23 @@ static const char TERMINFO_NAME[] = "xterm-256color";
 // The text buffer (AppineVt.text) a finished compression pass leaves allocated: a transcript or a
 // large copy grows it to their size, and it is not needed again until the next one
 #define TEXT_KEEP ((size_t)64 * 1024)
+
+// The most of an unfinished sequence libghostty-vt keeps to replay (continuation tracking): a
+// snapshot of a terminal whose parser is inside a sequence needs it, or encoding fails until the
+// parser is back at ground. Programs send long strings in chunks (a Kitty image's are 4 KiB), so
+// only a save that falls inside a longer one finds none
+#define CONTINUATION_MAX ((size_t)64 * 1024)
+
+// The largest snapshot kept for a tab (appine_vt_snapshot): a full scrollback of coloured output
+// takes about 1.5 MB, so beyond this it is mostly Kitty images' pixels, and the tab comes back from
+// its plain transcript instead
+#define SNAPSHOT_MAX ((size_t)16 << 20)
+
+// The state of a tab's snapshot (AppineVt.snapshot): the terminal changed since the last one, the
+// last one is still the terminal's, or none could be taken of the terminal as it is
+#define SNAPSHOT_STALE 0
+#define SNAPSHOT_TAKEN 1
+#define SNAPSHOT_NONE 2
 
 // A program status report (OSC 7501) as appine_vt_take_effects queues it for vt.rs, which reads the
 // same layout: u8 state (GhosttyProgramStatusState), u8 kind (GhosttyProgramStatusKind), i8 progress
@@ -263,6 +284,9 @@ typedef struct {
   // Every program status report (OSC 7501), in order, as STATUS_HEADER_BYTES describes
   const uint8_t *statuses;
   size_t statuses_len;
+  // Clipboard reads (OSC 52 "?"): how many, and the clipboard the last one named ('c', 'p' or 's')
+  uint32_t clipboard_reads;
+  uint8_t clipboard_read_kind;
 } AppineVtEffects;
 
 // One image placement of a frame (see the format above), with what puts it in drawing order and
@@ -325,6 +349,14 @@ typedef struct AppineVt {
   int32_t progress_state;
   int32_t progress;
   Buf statuses;
+  // Clipboard reads (OSC 52 "?") since appine_vt_take_effects, and the clipboard of the last
+  uint32_t clipboard_reads;
+  uint8_t clipboard_read_kind;
+  // The OSC string the output is in (appine_vt_feed): its first OSC_HEAD bytes, and its length so
+  // far (which may be larger)
+  bool osc_open;
+  uint8_t osc_head[OSC_HEAD];
+  size_t osc_len;
   // The fixed end of a selection being dragged (appine_vt_select_to): the word first selected,
   // or the end opposite the handle being dragged; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -357,8 +389,10 @@ typedef struct AppineVt {
   bool compress_scheduled;
   uint64_t compress_seen;
   bool compress_touched;
-  // The last transcript is still the screen's text: no output, message or resize came since
+  // The last transcript is still the screen's text, and the state of the last snapshot
+  // (SNAPSHOT_*): both go stale with output, a message, a resize, clearing or a reset (changed)
   bool transcribed;
+  int snapshot;
   // Kitty graphics: the render state's image list, read into placed (in drawing order) whenever
   // its placements generation changes, and that generation as last read
   GhosttyRenderStateImageIterator images;
@@ -449,8 +483,9 @@ static bool is_text(GhosttyString mime) {
 
 // A program writes the clipboard (OSC 52, OSC 1337, OSC 5522; Ghostty's default
 // clipboard-write = allow). Android has one clipboard, so every location goes there; only text is
-// taken, up to CLIPBOARD_MAX. Reads (OSC 52 "?") have no callback and so go unanswered, as with
-// Ghostty's clipboard-read = deny
+// taken, up to CLIPBOARD_MAX. Reads have no callback: libghostty-vt asks for the answer to one
+// within the callback, while the app asks the user first, so OSC 52 reads are found and answered
+// apart (appine_vt_feed), and OSC 5522 reads are refused
 static void on_clipboard_write(GhosttyTerminal t, void *userdata, const GhosttyClipboardWrite *w) {
   (void)t;
   AppineVt *vt = userdata;
@@ -602,15 +637,107 @@ static void install_png(void) {
 
 void appine_vt_free(AppineVt *vt);
 
+static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32_t cell_width,
+                      uint32_t cell_height);
+static void settle(GhosttyTerminal term);
+
+// A new terminal of cols × rows cells, each cell_width × cell_height pixels
 AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint32_t cell_height) {
+  GhosttyTerminal term = NULL;
+  if (ghostty_terminal_new(NULL, &term, cols, rows) != GHOSTTY_SUCCESS) return NULL;
+  return wrap(term, cols, rows, cell_width, cell_height);
+}
+
+// The terminal a snapshot (appine_vt_snapshot) holds, on a grid of cols × rows cells: its screens,
+// scrollback (compressed as it is restored), images, colours and title, without what the programs
+// that ran in it had set up for themselves (settle). NULL when the snapshot cannot be decoded,
+// which a snapshot from another version of libghostty-vt may well be: the format carries no
+// compatibility guarantee yet.
+AppineVt *appine_vt_restore(const uint8_t *data, size_t len, uint16_t cols, uint16_t rows,
+                            uint32_t cell_width, uint32_t cell_height) {
+  GhosttySnapshotDecoder decoder = NULL;
+  if (ghostty_snapshot_decoder_new_buf(NULL, &decoder, data, len) != GHOSTTY_SUCCESS) return NULL;
+  bool compress = true;
+  // The snapshot does not carry the limit of the terminal that wrote it
+  uint64_t kitty_limit = KITTY_STORAGE;
+  GhosttyTerminal term = NULL;
+  bool ok = ghostty_snapshot_decoder_set(decoder, GHOSTTY_SNAPSHOT_DECODER_OPT_COMPRESS_HISTORY,
+                                         &compress) == GHOSTTY_SUCCESS &&
+            ghostty_snapshot_decoder_set(decoder,
+                                         GHOSTTY_SNAPSHOT_DECODER_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+                                         &kitty_limit) == GHOSTTY_SUCCESS &&
+            ghostty_snapshot_decoder_decode(decoder, &term) == GHOSTTY_SUCCESS;
+  ghostty_snapshot_decoder_free(decoder);
+  if (!ok) return NULL;
+  settle(term);
+  return wrap(term, cols, rows, cell_width, cell_height);
+}
+
+static void append(Buf *b, const char *s) {
+  size_t len = strlen(s);
+  if (!buf_reserve(b, len)) return;
+  memcpy(b->ptr + b->len, s, len);
+  b->len += len;
+}
+
+// A restored terminal's programs are gone, and a new shell starts below what they left: what they
+// set up for themselves is undone first, before any callback is installed, so it reports nothing
+// and its replies go nowhere. A sequence they were in the middle of is cancelled, a full-screen
+// program's screen is left for the primary one, and a soft reset (DECSTR) brings back the cursor,
+// margins, attributes, cursor and keypad modes and the palette; the modes it leaves alone are
+// reset by name (reverse video, mouse tracking, focus events, bracketed paste, synchronized
+// output, colour scheme and size reports, Kitty paste events; alternate scroll is set, its
+// default), as are the Kitty keyboard flags, an open hyperlink and the title. The cursor then
+// starts a line of its own with what follows marked as output, not as the input of a prompt the
+// snapshot was taken at (a resize at a prompt clears it for the shell to redraw), and nothing is
+// left below it.
+static void settle(GhosttyTerminal term) {
+  Buf seq = {0};
+  bool ground = true;
+  if (ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) == GHOSTTY_SUCCESS &&
+      !ground) {
+    append(&seq, "\x18");
+  }
+  GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+  ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+  if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE) append(&seq, "\x1b[?1049l");
+  append(&seq, "\x1b[!p");
+  append(&seq, "\x1b[?5;9;12;1000;1001;1002;1003;1004;1005;1006;1015;1016;2004;2026;2031;2048;5522l");
+  append(&seq, "\x1b[?1007h\x1b[<99u\x1b]8;;\x1b\\\x1b]0;\x1b\\");
+  if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
+  seq.len = 0;
+  // Output first: a line feed in a prompt's input marks the next row as the prompt's
+  // continuation, and at the start of a row this unmarks it (OSC 133;C)
+  append(&seq, "\x1b]133;C\x1b\\");
+  if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
+  seq.len = 0;
+  uint16_t x = 0;
+  ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_CURSOR_X, &x);
+  if (x > 0) append(&seq, "\r\n");
+  append(&seq, "\x1b[J");
+  if (seq.ptr != NULL) ghostty_terminal_vt_write(term, seq.ptr, seq.len);
+  free(seq.ptr);
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  GhosttyTerminalScrollViewport bottom = {.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM};
+  ghostty_terminal_scroll_viewport(term, bottom);
+}
+
+// Makes an AppineVt around a terminal, new or restored (freed with it on failure), on a grid of
+// cols × rows cells, and sets what libghostty-vt asks the app through and the options a snapshot
+// does not carry
+static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32_t cell_width,
+                      uint32_t cell_height) {
   AppineVt *vt = calloc(1, sizeof(*vt));
-  if (vt == NULL) return NULL;
+  if (vt == NULL) {
+    ghostty_terminal_free(term);
+    return NULL;
+  }
+  vt->term = term;
   vt->cols = cols;
   vt->height = rows;
   vt->cell_width = cell_width;
   vt->cell_height = cell_height;
-  if (ghostty_terminal_new(NULL, &vt->term, cols, rows) != GHOSTTY_SUCCESS ||
-      ghostty_render_state_new(NULL, &vt->state) != GHOSTTY_SUCCESS ||
+  if (ghostty_render_state_new(NULL, &vt->state) != GHOSTTY_SUCCESS ||
       ghostty_render_state_row_iterator_new(NULL, &vt->rows) != GHOSTTY_SUCCESS ||
       ghostty_render_state_row_cells_new(NULL, &vt->cells) != GHOSTTY_SUCCESS ||
       ghostty_key_encoder_new(NULL, &vt->encoder) != GHOSTTY_SUCCESS ||
@@ -681,6 +808,9 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   // would send glyphs that never appear instead of falling back to text
   bool glyphs = false;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyphs);
+  // A snapshot can then be taken while output stops inside a sequence (CONTINUATION_MAX)
+  size_t continuation = CONTINUATION_MAX;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES, &continuation);
   return vt;
 }
 
@@ -720,9 +850,71 @@ void appine_vt_free(AppineVt *vt) {
 
 // ---- Output from the console ----
 
-void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
-  ghostty_terminal_vt_write(vt->term, data, len);
+// The terminal changed what a transcript or a snapshot of it holds
+static void changed(AppineVt *vt) {
   vt->transcribed = false;
+  vt->snapshot = SNAPSHOT_STALE;
+}
+
+static void osc_ended(AppineVt *vt);
+
+// Feeds console output to the terminal. It stops at the ends of OSC strings to find clipboard reads
+// (OSC 52 with "?" for data), which libghostty-vt answers only from a callback that must answer at
+// once and so without asking the user, as Ghostty's clipboard-read = ask does: they are counted
+// for the app (appine_vt_take_effects), which asks and answers itself, as Ghostty's own app does.
+void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
+  uint32_t want = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+  size_t off = 0;
+  while (off < len) {
+    GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
+    GhosttyResult r = ghostty_terminal_vt_write_until(vt->term, data + off, len - off, want, &stop);
+    if (r != GHOSTTY_SUCCESS && r != GHOSTTY_NO_VALUE) {
+      ghostty_terminal_vt_write(vt->term, data + off, len - off);
+      vt->osc_open = false;
+      break;
+    }
+    bool ended = r == GHOSTTY_SUCCESS && (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END);
+    size_t n = r == GHOSTTY_SUCCESS ? stop.consumed : len - off;
+    if (vt->osc_open) {
+      // The string's content: what was consumed but the byte that ended it
+      size_t content = ended ? n - 1 : n;
+      if (vt->osc_len < OSC_HEAD) {
+        size_t keep = OSC_HEAD - vt->osc_len < content ? OSC_HEAD - vt->osc_len : content;
+        memcpy(vt->osc_head + vt->osc_len, data + off, keep);
+      }
+      vt->osc_len += content;
+    }
+    off += n;
+    if (ended) {
+      // A cancelled string (CAN, SUB) does not run
+      if (vt->osc_open && stop.end != GHOSTTY_TERMINAL_STRING_END_CANCELLED) osc_ended(vt);
+      vt->osc_open = false;
+    }
+    if (r == GHOSTTY_SUCCESS && (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_START)) {
+      vt->osc_open = true;
+      vt->osc_len = 0;
+    }
+  }
+  changed(vt);
+}
+
+// An OSC string ended: a clipboard read (OSC 52 ; clipboards ; ?) is counted, with the clipboard it
+// names first ('c' for the standard one, also when it names none; 'p' primary, 's' selection), which
+// the answer names as Ghostty's does
+static void osc_ended(AppineVt *vt) {
+  const uint8_t *s = vt->osc_head;
+  size_t n = vt->osc_len;
+  if (n > OSC_HEAD || n < 5 || memcmp(s, "52;", 3) != 0) return;
+  size_t i = 3;
+  for (; i < n && s[i] != ';'; i++) {
+    bool clipboard = s[i] == 'c' || s[i] == 'p' || s[i] == 'q' || s[i] == 's' ||
+                     (s[i] >= '0' && s[i] <= '7');
+    if (!clipboard) return;
+  }
+  if (i + 2 != n || s[i] != ';' || s[i + 1] != '?') return;
+  uint8_t first = i > 3 ? s[3] : 'c';
+  vt->clipboard_read_kind = first == 'p' || first == 's' ? first : 'c';
+  vt->clipboard_reads++;
 }
 
 // The answers collected since the last call; valid until the next feed
@@ -747,7 +939,7 @@ void appine_vt_resize(AppineVt *vt, uint16_t cols, uint16_t rows, uint32_t cell_
                   ghostty_search_get(vt->search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &selected) ==
                       GHOSTTY_SUCCESS;
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
-  vt->transcribed = false;
+  changed(vt);
   if (reselect) search_reselect(vt, selected);
 }
 
@@ -1751,6 +1943,45 @@ void appine_vt_select_clear(AppineVt *vt) {
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
 }
 
+// Moves the selection's end as Ghostty's adjust_selection does (GhosttySelectionAdjust: to the
+// next or previous non-blank cell, a row or a page up or down, the screen's start or end) and
+// scrolls the viewport to show it, as Ghostty does; false without a selection.
+bool appine_vt_select_adjust(AppineVt *vt, int adjustment) {
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+  drop_anchor(vt);
+  // Moving by pages and to the ends reads beyond the viewport
+  vt->compress_touched = true;
+  if (ghostty_terminal_selection_adjust(vt->term, &sel, (GhosttySelectionAdjust)adjustment) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+  // From the selection as installed: references taken before are stale
+  GhosttySelection now = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPointCoordinate end;
+  GhosttyTerminalScrollbar bar = {0};
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &now) != GHOSTTY_SUCCESS ||
+      !screen_point(vt, &now.end, &end) ||
+      ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &bar) != GHOSTTY_SUCCESS) {
+    return true;
+  }
+  // Screen rows are the scroll bar's rows: the end at the viewport's top when above it, at its
+  // bottom when below
+  GhosttyTerminalScrollViewport s = {.tag = GHOSTTY_SCROLL_VIEWPORT_ROW};
+  if (end.y < bar.offset) {
+    s.value.row = (size_t)end.y;
+  } else if (end.y >= bar.offset + bar.len) {
+    s.value.row = (size_t)(end.y - bar.len + 1);
+  } else {
+    return true;
+  }
+  ghostty_terminal_scroll_viewport(vt->term, s);
+  return true;
+}
+
 // The selection as plain text, soft-wrapped lines joined and trailing blanks trimmed (as
 // Ghostty copies); NULL with len 0 when there is no selection or it is empty. Valid until the
 // next call.
@@ -1952,6 +2183,77 @@ void appine_vt_search_end(AppineVt *vt) {
   vt->search = NULL;
 }
 
+// ---- Clearing and resetting ----
+
+static bool is_alternate(AppineVt *vt);
+
+// Writes the app's own sequences into the terminal as if the console had sent them, after a CAN
+// when the parser is inside a sequence a program left unfinished (which would take them for its
+// payload); they ask for no answer, so the console's replies stay as they were
+static void write_own(AppineVt *vt, const Buf *seq) {
+  bool ground = true;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) == GHOSTTY_SUCCESS &&
+      !ground) {
+    static const uint8_t can = 0x18;
+    ghostty_terminal_vt_write(vt->term, &can, 1);
+    vt->osc_open = false;
+  }
+  size_t replies = vt->replies.len;
+  if (seq->ptr != NULL) ghostty_terminal_vt_write(vt->term, seq->ptr, seq->len);
+  vt->replies.len = replies;
+  changed(vt);
+}
+
+// Clears the screen and the scrollback as Ghostty's clear_screen does: at the shell's prompt the
+// whole screen, for the shell to draw the prompt again (the caller sends it a form feed, ^L, as
+// Ghostty does); elsewhere the rows above the cursor's, which moves to the top with what follows
+// it, and the screen's images. Returns 1 when cleared at the prompt, 0 when cleared elsewhere, and
+// -1 on the alternate screen, where nothing is done: a full-screen program would go on drawing on a
+// screen it no longer knows.
+int appine_vt_clear(AppineVt *vt) {
+  if (is_alternate(vt)) return -1;
+  appine_vt_select_clear(vt);
+  bool prompt = appine_vt_at_prompt(vt);
+  Buf seq = {0};
+  if (prompt) {
+    // At a prompt, erasing the display (ED 2) moves the screen into the scrollback, as for a
+    // shell's ^L, so the scrollback goes after it
+    append(&seq, "\x1b[2J\x1b[3J");
+  } else {
+    uint16_t x = 0;
+    uint16_t y = 0;
+    ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_CURSOR_X, &x);
+    ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &y);
+    append(&seq, "\x1b[3J");
+    if (y > 0) {
+      // Deleting lines from the top moves the cursor's row up to it with the rows below
+      char rows[64];
+      snprintf(rows, sizeof(rows), "\x1b[H\x1b[%uM\x1b[1;%uH", (unsigned)y, (unsigned)x + 1);
+      append(&seq, rows);
+    }
+    // Every placement on the screen, and the images no other one shows
+    append(&seq, "\x1b_Ga=d,d=A,q=2\x1b\\");
+  }
+  write_own(vt, &seq);
+  free(seq.ptr);
+  appine_vt_scroll(vt, 0);
+  return prompt ? 1 : 0;
+}
+
+// Resets the terminal as Ghostty's reset does (a full reset, RIS): both screens, the scrollback,
+// modes, colours programs set (but OSC 10, 11 and 12's), the title and images; the app's own
+// settings (default colours, limits, grapheme clustering) stay. Returns whether the shell was at
+// its prompt, which the caller then sends a form feed (^L) to draw it again on the empty screen.
+bool appine_vt_reset(AppineVt *vt) {
+  bool prompt = appine_vt_at_prompt(vt);
+  appine_vt_select_clear(vt);
+  ghostty_terminal_reset(vt->term);
+  // A synchronized output hold ends with the modes
+  vt->held = false;
+  changed(vt);
+  return prompt;
+}
+
 // ---- Title, effects, messages, transcript ----
 
 // Whether a program set the title since the last call
@@ -1961,7 +2263,8 @@ bool appine_vt_take_title_changed(AppineVt *vt) {
   return changed;
 }
 
-// The bells, clipboard write, notification, progress and status reports since the last call
+// The bells, clipboard write, notification, progress and status reports and clipboard reads since
+// the last call
 // (vt.rs's `Effects`); the text stays valid until the next feed
 void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->bells = vt->bells;
@@ -1977,6 +2280,9 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->progress = vt->progress;
   out->statuses = vt->statuses.ptr;
   out->statuses_len = vt->statuses.len;
+  out->clipboard_reads = vt->clipboard_reads;
+  out->clipboard_read_kind = vt->clipboard_read_kind;
+  vt->clipboard_reads = 0;
   vt->bells = 0;
   vt->clipboard = APPINE_CLIPBOARD_NONE;
   vt->notified = false;
@@ -2030,15 +2336,6 @@ static size_t utf8_width(const uint8_t *s, size_t len) {
 // where nothing is written.
 bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
   if (is_alternate(vt)) return false;
-  // The program may have died inside a sequence (an OSC, DCS or APC string): CAN returns the
-  // parser to ground first, so the line feeds that make the report's room are not ignored or
-  // taken as the string's payload
-  bool ground = true;
-  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) == GHOSTTY_SUCCESS &&
-      !ground) {
-    static const uint8_t can = 0x18;
-    ghostty_terminal_vt_write(vt->term, &can, 1);
-  }
   size_t width = utf8_width(text, len);
   size_t rows = (width + vt->cols - 1) / vt->cols;
   if (rows > (size_t)vt->height - 1) rows = (size_t)vt->height - 1;
@@ -2058,11 +2355,9 @@ bool appine_vt_message(AppineVt *vt, const uint8_t *text, size_t len) {
     seq.len += len;
     memcpy(seq.ptr + seq.len, tail, (size_t)tail_len);
     seq.len += (size_t)tail_len;
-    size_t replies = vt->replies.len;
-    ghostty_terminal_vt_write(vt->term, seq.ptr, seq.len);
-    vt->transcribed = false;
-    // Nothing above asks for an answer; keep the console's replies as they were
-    vt->replies.len = replies;
+    // The program may have died inside a sequence (an OSC, DCS or APC string): the CAN before it
+    // keeps the line feeds that make the report's room from being ignored or taken as payload
+    write_own(vt, &seq);
   }
   free(seq.ptr);
   return ok;
@@ -2101,6 +2396,50 @@ const uint8_t *appine_vt_transcript(AppineVt *vt, size_t *len) {
   const uint8_t *text = keep_text(vt, data, data_len, len);
   vt->transcribed = text != NULL;
   return text;
+}
+
+// A snapshot of the whole terminal for saving the tab, which appine_vt_restore brings back: 1 with
+// its bytes in *out (freed with appine_vt_free_snapshot), 0 when nothing changed since the last
+// one (the caller keeps that), -1 when there is none of the terminal as it is: libghostty-vt
+// failed (output stopped inside a sequence longer than CONTINUATION_MAX), or the snapshot is
+// larger than SNAPSHOT_MAX. Not taken again until the terminal changes.
+int appine_vt_snapshot(AppineVt *vt, uint8_t **out, size_t *len) {
+  *out = NULL;
+  *len = 0;
+  if (vt->snapshot == SNAPSHOT_TAKEN) return 0;
+  if (vt->snapshot == SNAPSHOT_NONE) return -1;
+  // Encoding reads every page
+  vt->compress_touched = true;
+  uint8_t *data = NULL;
+  size_t data_len = 0;
+  vt->snapshot = SNAPSHOT_NONE;
+  if (ghostty_snapshot_encode_alloc(vt->term, NULL, &data, &data_len) != GHOSTTY_SUCCESS) {
+    return -1;
+  }
+  if (data_len > SNAPSHOT_MAX) {
+    ghostty_free(NULL, data, data_len);
+    return -1;
+  }
+  vt->snapshot = SNAPSHOT_TAKEN;
+  *out = data;
+  *len = data_len;
+  return 1;
+}
+
+void appine_vt_free_snapshot(uint8_t *data, size_t len) {
+  ghostty_free(NULL, data, len);
+}
+
+// libghostty-vt's version, which the tabs' saved snapshots are recorded with: another version may
+// not read them
+const uint8_t *appine_vt_version(size_t *len) {
+  GhosttyString version = {0};
+  if (ghostty_build_info(GHOSTTY_BUILD_INFO_VERSION_STRING, &version) != GHOSTTY_SUCCESS) {
+    *len = 0;
+    return NULL;
+  }
+  *len = version.len;
+  return version.ptr;
 }
 
 // ---- Scrollback compression ----

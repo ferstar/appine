@@ -15,11 +15,12 @@
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
 //! the terminal's replies back) until the session ends; the main thread takes frames and the
 //! pixels of the images they place, resizes, scrolls, encodes keys, mouse and focus events and
-//! pastes, selects, searches and copies, and reads the title and transcript; the `vt-compress`
-//! thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not thread-safe, so
-//! every call into vt.c holds the tab's lock; the frame buffer it returns is only written by
-//! `frame`, which only the main thread calls, so the main thread may read it after the lock is
-//! released.
+//! pastes, selects, searches and copies, and reads the title and transcript; the service's worker
+//! takes snapshots for saving tabs and compresses every tab's scrollback when memory is trimmed;
+//! the `vt-compress` thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not
+//! thread-safe, so every call into vt.c holds the tab's lock; the frame buffer it returns is only
+//! written by `frame`, which only the main thread calls, so the main thread may read it after the
+//! lock is released.
 //!
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
@@ -59,6 +60,8 @@ struct RawEffects {
     progress: i32,
     statuses: *const u8,
     statuses_len: usize,
+    clipboard_reads: u32,
+    clipboard_read_kind: u8,
 }
 
 /// vt.c's `APPINE_CLIPBOARD_TEXT` and `APPINE_CLIPBOARD_CLEAR`.
@@ -86,6 +89,14 @@ const COMPRESS_MAX_WAIT: Duration = Duration::from_secs(5);
 // vt.c
 unsafe extern "C" {
     fn appine_vt_new(cols: u16, rows: u16, cell_width: u32, cell_height: u32) -> *mut AppineVt;
+    fn appine_vt_restore(
+        data: *const u8,
+        len: usize,
+        cols: u16,
+        rows: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> *mut AppineVt;
     fn appine_vt_free(vt: *mut AppineVt);
     fn appine_vt_feed(vt: *mut AppineVt, data: *const u8, len: usize);
     fn appine_vt_take_replies(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -134,6 +145,7 @@ unsafe extern "C" {
     fn appine_vt_select_line(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_grab(vt: *mut AppineVt, end: bool) -> bool;
     fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
+    fn appine_vt_select_adjust(vt: *mut AppineVt, adjustment: i32) -> bool;
     fn appine_vt_select_rectangle(vt: *mut AppineVt, on: bool) -> bool;
     fn appine_vt_select_all(vt: *mut AppineVt) -> bool;
     fn appine_vt_output_at(vt: *mut AppineVt, x: u16, y: u16) -> bool;
@@ -144,11 +156,16 @@ unsafe extern "C" {
     fn appine_vt_search(vt: *mut AppineVt, needle: *const u8, len: usize) -> bool;
     fn appine_vt_search_select(vt: *mut AppineVt, older: bool) -> bool;
     fn appine_vt_search_end(vt: *mut AppineVt);
+    fn appine_vt_clear(vt: *mut AppineVt) -> i32;
+    fn appine_vt_reset(vt: *mut AppineVt) -> bool;
     fn appine_vt_take_title_changed(vt: *mut AppineVt) -> bool;
     fn appine_vt_take_effects(vt: *mut AppineVt, out: *mut RawEffects);
     fn appine_vt_title(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_message(vt: *mut AppineVt, text: *const u8, len: usize) -> bool;
     fn appine_vt_transcript(vt: *mut AppineVt, len: *mut usize) -> *const u8;
+    fn appine_vt_snapshot(vt: *mut AppineVt, out: *mut *mut u8, len: *mut usize) -> i32;
+    fn appine_vt_free_snapshot(data: *mut u8, len: usize);
+    fn appine_vt_version(len: *mut usize) -> *const u8;
     fn appine_vt_compress_wanted(vt: *mut AppineVt) -> bool;
     fn appine_vt_compress_step(vt: *mut AppineVt, may_wait: bool) -> i32;
     fn appine_vt_compress_all(vt: *mut AppineVt);
@@ -208,8 +225,8 @@ impl Term {
         unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
     }
 
-    /// The bells, clipboard write, notification and progress and status reports programs sent
-    /// since the last call.
+    /// The bells, clipboard write, notification, progress and status reports and clipboard reads
+    /// programs sent since the last call.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -225,6 +242,8 @@ impl Term {
             progress: -1,
             statuses: std::ptr::null(),
             statuses_len: 0,
+            clipboard_reads: 0,
+            clipboard_read_kind: 0,
         };
         unsafe { appine_vt_take_effects(self.0, &mut raw) };
         /// The `len` bytes vt.c returned at `p`, which it keeps until the next feed.
@@ -249,6 +268,8 @@ impl Term {
                 .then(|| (text(raw.title, raw.title_len), text(raw.body, raw.body_len))),
             progress: (raw.progress_state >= 0).then_some((raw.progress_state, raw.progress)),
             statuses: StatusReport::decode(bytes(raw.statuses, raw.statuses_len)),
+            clipboard_reads: (raw.clipboard_reads > 0)
+                .then_some((raw.clipboard_reads, raw.clipboard_read_kind)),
         }
     }
 
@@ -273,14 +294,16 @@ impl Drop for Term {
 
 /// What programs asked of the app in one read of the console: the bell (any number of BELs
 /// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
-/// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none) and the
-/// program status reports (OSC 7501), in order.
+/// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none), the
+/// program status reports (OSC 7501), in order, and clipboard reads (OSC 52 "?": how many, and the
+/// clipboard the last named, `c`, `p` or `s`), which the app answers once the user agrees.
 struct Effects {
     bell: bool,
     clipboard: Option<Option<String>>,
     notification: Option<(String, String)>,
     progress: Option<(i32, i32)>,
     statuses: Vec<StatusReport>,
+    clipboard_reads: Option<(u32, u8)>,
 }
 
 /// A program status report (OSC 7501), as vt.c queues it: libghostty-vt's state and kind, the
@@ -329,7 +352,8 @@ impl Effects {
     }
 
     /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
-    /// `onProgress`, `onStatus` for each status report); false when a call threw. The strings are
+    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`); false when a call
+    /// threw. The strings are
     /// local references, deleted after each call: the pump stays in native code for the tab's
     /// whole life, so they would otherwise pile up.
     fn deliver(self, env: &mut JNIEnv<'_>, session: &JObject<'_>) -> bool {
@@ -393,6 +417,15 @@ impl Effects {
             let _ = env.delete_local_ref(title);
             let _ = env.delete_local_ref(message);
             if called.is_err() {
+                return false;
+            }
+        }
+        if let Some((count, kind)) = self.clipboard_reads {
+            let args = [JValue::Int(i32::from(kind)), JValue::Int(count as i32)];
+            if env
+                .call_method(session, "onClipboardRead", "(II)V", &args)
+                .is_err()
+            {
                 return false;
             }
         }
@@ -509,19 +542,59 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_create<'l>(
             throw(&mut env, "cannot create a terminal");
             return 0;
         }
-        let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
-        let tab = Tab {
-            id,
-            machine: handle,
-            console: console as u32,
-            term: Mutex::new(Term(raw)),
-            dirty: AtomicBool::new(false),
-        };
-        TABS.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, Arc::new(tab));
-        id
+        register(handle, console, raw)
     })
+}
+
+/// Creates the terminal of an open console from a tab's saved `snapshot` ([`snapshot`]), settled
+/// for a new shell (vt.c's `appine_vt_restore`); returns the tab handle, 0 when the snapshot
+/// cannot be decoded.
+///
+/// [`snapshot`]: Java_io_github_mthli_appine_VtNative_snapshot
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_restore<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    console: jint,
+    snapshot: JByteArray<'l>,
+    cols: jint,
+    rows: jint,
+    cell_width: jint,
+    cell_height: jint,
+) -> jlong {
+    guarded!("VtNative.restore", 0, {
+        if machine(handle).is_none() {
+            throw(&mut env, "the machine is stopped");
+            return 0;
+        }
+        let Ok(data) = env.convert_byte_array(&snapshot) else {
+            return 0;
+        };
+        let (cols, rows, cw, ch) = size(cols, rows, cell_width, cell_height);
+        let raw = unsafe { appine_vt_restore(data.as_ptr(), data.len(), cols, rows, cw, ch) };
+        if raw.is_null() {
+            return 0;
+        }
+        register(handle, console, raw)
+    })
+}
+
+/// Registers a new terminal of kernel `machine`'s `console` in [`TABS`]; returns its handle.
+fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> jlong {
+    let id = NEXT_TAB.fetch_add(1, Ordering::Relaxed);
+    let tab = Tab {
+        id,
+        machine,
+        console: console as u32,
+        term: Mutex::new(Term(raw)),
+        dirty: AtomicBool::new(false),
+    };
+    TABS.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(id, Arc::new(tab));
+    id
 }
 
 /// Shows bytes from the app itself (not the program) as if the console had printed them; replies
@@ -548,7 +621,8 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
 /// `session.onTitle()` when a program set the title, `onBell`, `onClipboard`, `onNotification`,
-/// `onProgress` and `onStatus` for what programs asked of the app ([`Effects`]), and
+/// `onProgress`, `onStatus` and `onClipboardRead` for what programs asked of the app
+/// ([`Effects`]), and
 /// `onForeground()` once the process group that was in the foreground when progress or a status
 /// was last reported no longer is.
 ///
@@ -1014,6 +1088,21 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectTo<'l>(
     })
 }
 
+/// Moves the selection's end by `adjustment` (libghostty-vt's `GhosttySelectionAdjust`) and
+/// scrolls the viewport to show it; false without a selection.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectAdjust<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    adjustment: jint,
+) -> jboolean {
+    guarded!("VtNative.selectAdjust", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_select_adjust(tab.term().0, adjustment) })
+            as jboolean
+    })
+}
+
 /// A viewport coordinate from Kotlin, clamped to the grid's range (vt.c clamps to the grid).
 fn cell(v: jint) -> u16 {
     v.clamp(0, 0xffff) as u16
@@ -1181,6 +1270,33 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_searchEnd<'l>(
     })
 }
 
+/// Clears the screen and the scrollback as Ghostty's clear_screen does: 1 when it cleared at the
+/// shell's prompt (the caller sends the shell a form feed to draw it again), 0 when it cleared
+/// elsewhere, -1 on the alternate screen or without the tab, where nothing changes.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_clear<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jint {
+    guarded!("VtNative.clear", -1, {
+        tab(handle).map_or(-1, |tab| unsafe { appine_vt_clear(tab.term().0) })
+    })
+}
+
+/// Resets the terminal (a full reset, RIS); true when the shell was at its prompt (the caller
+/// sends it a form feed to draw it again).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_reset<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jboolean {
+    guarded!("VtNative.reset", 0, {
+        tab(handle).is_some_and(|tab| unsafe { appine_vt_reset(tab.term().0) }) as jboolean
+    })
+}
+
 /// Shows a yellow line of app notice above the cursor's line; false on the alternate screen.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_VtNative_message<'l>(
@@ -1214,6 +1330,59 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_transcript<'l>(
         let mut len = 0;
         let p = unsafe { appine_vt_transcript(term.0, &mut len) };
         term.text(&mut env, p, len)
+    })
+}
+
+/// A snapshot of the whole terminal for saving the tab, which [`restore`] brings back; null when
+/// nothing changed since the last one (whose bytes the caller keeps) or the tab is gone, empty
+/// when none can be taken of the terminal as it is (vt.c's `appine_vt_snapshot`).
+///
+/// [`restore`]: Java_io_github_mthli_appine_VtNative_restore
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_snapshot<'l>(
+    mut env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jbyteArray {
+    guarded!("VtNative.snapshot", std::ptr::null_mut(), {
+        let Some(tab) = tab(handle) else {
+            return std::ptr::null_mut();
+        };
+        let mut data = std::ptr::null_mut();
+        let mut len = 0;
+        let taken = unsafe { appine_vt_snapshot(tab.term().0, &mut data, &mut len) };
+        match taken {
+            0 => std::ptr::null_mut(),
+            1 => {
+                // SAFETY: vt.c returned len bytes at data, ours until freed below
+                let array = bytes_array(&mut env, unsafe { std::slice::from_raw_parts(data, len) });
+                unsafe { appine_vt_free_snapshot(data, len) };
+                array
+            }
+            _ => bytes_array(&mut env, &[]),
+        }
+    })
+}
+
+/// The version saved snapshots are recorded with: the Ghostty source libghostty-vt was built from
+/// (its directory's name, from build.rs) and libghostty-vt's own version string. A snapshot from
+/// another version is not decoded: the format carries no compatibility guarantee yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_version<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+) -> jstring {
+    guarded!("VtNative.version", std::ptr::null_mut(), {
+        let mut len = 0;
+        let p = unsafe { appine_vt_version(&mut len) };
+        let lib = if p.is_null() {
+            String::new()
+        } else {
+            // SAFETY: vt.c returns len bytes of libghostty-vt's static version string
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned()
+        };
+        env.new_string(format!("{}/{lib}", env!("APPINE_GHOSTTY")))
+            .map_or(std::ptr::null_mut(), JString::into_raw)
     })
 }
 

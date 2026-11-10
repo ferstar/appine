@@ -69,6 +69,13 @@ class TerminalService : Service() {
         /** A program rang the bell in the tab in front ([inFront]). */
         fun onBell() {}
 
+        /**
+         * A program in the tab in front ([inFront], so the current one) asks to read the clipboard
+         * (OSC 52): the listener asks the user and answers through
+         * [VtSession.answerClipboardRead].
+         */
+        fun onClipboardRead() {}
+
         /** A tab's progress or program status changed ([VtSession.progress], [VtSession.status]). */
         fun onTabStatus() {}
 
@@ -383,6 +390,16 @@ class TerminalService : Service() {
             if (inFront(session)) return
             statusNotified.remove(session)
             notifyTab(session, title, body, quiet = false)
+        }
+
+        /**
+         * Programs read the clipboard as Ghostty lets them by default (clipboard-read = ask): the
+         * user is asked, in the tab in front only. A tab elsewhere gets an empty clipboard at once:
+         * Android lets an app read the clipboard only while it has the focus, and the program
+         * would otherwise wait for a timeout.
+         */
+        override fun onClipboardRead(session: VtSession) {
+            if (inFront(session)) each { it.onClipboardRead() } else session.answerClipboardRead(null)
         }
 
         override fun onStatusChanged(session: VtSession) {
@@ -880,8 +897,9 @@ class TerminalService : Service() {
 
     /**
      * Restores the tabs from when the app was last killed (the android/service map): each starts a
-     * new shell, logged in as the original account and starting in the original directory, showing
-     * the original transcript and a line of notice first. Processes are not restored.
+     * new shell, logged in as the original account and starting in the original directory, below
+     * its terminal as it was (from its snapshot, else its transcript) and a line of notice.
+     * Processes are not restored.
      */
     private fun restoreTabs(saved: Tabs.Saved) {
         val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(saved.time))
@@ -890,7 +908,13 @@ class TerminalService : Service() {
         for (tab in saved.tabs) {
             val session = createSession(tab.login, tab.cwd)
             val body = tab.transcript.trimEnd().replace("\r\n", "\n").replace("\n", "\r\n")
-            session.setRestored(((if (body.isEmpty()) "" else body + "\r\n") + notice).toByteArray())
+            // Read when the tab is first shown, so tabs never shown cost no memory
+            val snapshot = tab.snapshot?.let { name -> { Tabs.readSnapshot(this, name) } }
+            session.setRestored(
+                (if (body.isEmpty()) "" else body + "\r\n").toByteArray(),
+                snapshot,
+                notice.toByteArray(),
+            )
             unshown[session] = tab
         }
         focus = sessions.getOrNull(saved.current) ?: sessions.lastOrNull()
@@ -899,26 +923,31 @@ class TerminalService : Service() {
     /**
      * Saves the tabs ([Tabs]): transcripts are taken on the main thread (the emulator changes them
      * on the main thread); the foreground process's current directory needs the BKL, so it is taken
-     * on [worker] together with writing the files. Tabs that have ended are not saved.
+     * on [worker] together with the terminals' snapshots and writing the files. Tabs that have
+     * ended are not saved.
      */
     private fun saveTabs() {
         val m = machine
         if (m == 0L) return
         main.removeCallbacks(saveSoon)
         val live = sessions.filter { it.isRunning }
-        val snapshot = live.map { s ->
+        val taken = live.map { s ->
             val text = s.transcriptText
             // A restored tab not shown yet: its shell has not started, so save the original copy
             val old = if (text == null) unshown[s] else null.also { unshown.remove(s) }
-            // The directory is filled in on the worker
-            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty())
+            // The directory and the snapshot are filled in on the worker
+            s to Tabs.Tab(s.login, old?.cwd, text ?: old?.transcript.orEmpty(), old?.snapshot)
         }
         val index = live.indexOf(current).coerceAtLeast(0)
         runCatching {
             worker.execute {
-                val tabs = snapshot.map { (session, tab) ->
+                val tabs = taken.map { (session, tab) ->
                     val console = session.console
-                    val withCwd = if (console >= 0) tab.copy(cwd = Native.consoleCwd(m, console)) else tab
+                    val withCwd = if (console >= 0) {
+                        tab.copy(cwd = Native.consoleCwd(m, console), snapshot = snapshotOf(session))
+                    } else {
+                        tab
+                    }
                     // An "auto" tab is saved as the account it logged in as: the setting would be
                     // resolved again at restore and might name another user by then
                     if (tab.login != ConsolePty.LOGIN_AUTO) return@map withCwd
@@ -929,6 +958,17 @@ class TerminalService : Service() {
                 Tabs.save(this, tabs, index)
             }
         }
+    }
+
+    /**
+     * The file of [session]'s terminal snapshot for saving it (on [worker]): written anew when the
+     * terminal changed since the last save, else the last one; null when none can be taken.
+     */
+    private fun snapshotOf(session: VtSession): String? {
+        val snapshot = session.takeSnapshot() ?: return session.savedSnapshot
+        val name = if (snapshot.isEmpty()) null else Tabs.writeSnapshot(this, snapshot)
+        session.savedSnapshot = name
+        return name
     }
 
     /**

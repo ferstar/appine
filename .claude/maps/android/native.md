@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment, then vt.c's Wuffs header and libjnigraphics last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment, vt.c's Wuffs header, libjnigraphics, then the Ghostty source's name for vt.rs last)
 
 ## Responsibilities
 
@@ -141,7 +141,10 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   single-file header in the source's Zig packages (`zig-pkg/<hash>/release/c`, the hash read from
   Ghostty's `pkg/wuffs/build.zig.zon`; vt.c decodes PNG images with the Wuffs in the archive), and
   links `libghostty-vt.a` statically into `libappine.so` (with uucode, simdutf, Highway, Wuffs and
-  Zig's compiler_rt); `vt.rs` also links the system's libjnigraphics. Ghostty's build
+  Zig's compiler_rt); `vt.rs` also links the system's libjnigraphics. The source directory's name
+  (`ghostty-1.4.0`) goes to the crate as `APPINE_GHOSTTY`, part of the version vt.rs records the
+  tabs' saved snapshots with (libghostty-vt's own version string does not follow Ghostty's
+  releases). Ghostty's build
   finds the NDK through `ANDROID_NDK_HOME`, and Ghostty 1.4.0 requires Zig 0.17.0 (its
   `minimum_zig_version`; neither `build.rs` nor `fetch-ghostty` checks the version). Every Android
   build, CI's included, therefore needs Zig and the fetched source.

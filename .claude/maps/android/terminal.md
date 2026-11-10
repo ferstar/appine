@@ -5,19 +5,21 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback, colours, DA1, OSC 5522, progress, status, TN, selection, search, compression, cell reads, Kitty graphics, shell integration last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: menus and keys, resizes, scrollback, colours, replies, progress, status, selection, search, cells, images, shell integration, snapshots, clipboard reads, clearing last)
 
 ## Responsibilities
 
 `android/terminal` is the terminal screen and the pieces that render the service's sessions:
 
 - `MainActivity`: the screen's layout and status text, the current session and its successor,
-  closing tabs, keyboard shortcuts, font zoom, insets and the IME, links, with the tab bar
+  closing tabs, keyboard shortcuts, font zoom, insets and the IME, links, the question whether a
+  program may read the clipboard, with the tab bar
   (`TabBarView`), the search bar in its place while searching (`SearchBarView`) and the extra keys
   (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
   what its programs report about their progress and status, whether its shell waits at its prompt
-  and in which directory), `VtView` (drawing with the bundled
+  and in which directory, its terminal's snapshots and coming back from one, clipboard reads
+  waiting for an answer, clearing and resetting), `VtView` (drawing with the bundled
   JetBrains Mono, the images programs show, input, selection, search marks, gestures),
   `ProgressLine` (the current tab's progress over the terminal), `VtKeys`, `VtGlyphs`,
   `VtNative`, and the emulator shim and JNI in
@@ -36,10 +38,10 @@ Root: `android/app/src/main/java/io/github/mthli/appine/MainActivity.kt`, `VtSes
 `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`,
 `android/app/src/main/res/`, `android/app/src/main/assets/fonts/`, `hosts/android/src/vt.c` and `hosts/android/src/vt.rs`.
 
-Outside the module: session ownership, saving, kill reports and where bells, notifications,
-program statuses and clipboard writes go (`android/service`); the host console in the kernel (`kernel/tty`); the
-notices task, the JNI crate, `guarded!` and the build, including compiling libghostty-vt with Zig
-(`android/native`).
+Outside the module: session ownership, saving, kill reports and where bells, notifications, program
+statuses, clipboard writes and clipboard reads go (`android/service`); the host console in the
+kernel (`kernel/tty`); the notices task, the JNI crate, `guarded!` and the build, including
+compiling libghostty-vt with Zig (`android/native`).
 
 ## Key types
 
@@ -49,7 +51,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `Bar : TabBarView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
   current session and its index, from which its successor is taken; a tab requested by a
   notification (`EXTRA_TAB`); the IME animation callback `keysFollowIme`; Back's callback while
-  the search bar is open (`closeSearchOnBack`, Android 16 and later).
+  the search bar is open (`closeSearchOnBack`, Android 16 and later); the open question whether a
+  program may read the clipboard (`clipboardQuestion`).
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
@@ -85,20 +88,24 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - `VtSession` — a tab owned by the service: its `id` (from the service, naming the tab in a
   notification's intent), its `ConsolePty`, the terminal handle (0 until the shell starts, never
-  reset), the view showing it (`view`, read on the pump thread), pending restored text and
-  messages, its login and the account an `auto` login resolved to (`resolvedLogin`, written by the
-  service), the last transcript (whole, also returned while the screen is unchanged), the last
-  progress report (`progress`, a `Progress`), the program status records by id (`Status`, least
-  recently updated first, at most 64) and the one most in need of the user (`status`), a
-  `vt-pump` thread, a `vt-waiter` thread and its own single-thread `vt-writer` executor; `Events`
-  (title changed, bell, clipboard write, notification, progress or status changed, finished) go
+  reset), the view showing it (`view`, read on the pump thread), a restored tab's snapshot (a
+  loader the service gives) and transcript, the pending notice and messages, its login and the
+  account an `auto` login resolved to (`resolvedLogin`, written by the service), the file of its
+  last saved snapshot (`savedSnapshot`, used by the service's worker only), the last transcript
+  (whole, also returned while the screen is unchanged), the last progress report (`progress`, a
+  `Progress`), the program status records by id (`Status`, least recently updated first, at most
+  64) and the one most in need of the user (`status`), the clipboard reads waiting for an answer
+  (the clipboard each named), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
+  `vt-writer` executor; `Events` (title changed, bell, clipboard write, notification, clipboard
+  read, progress or status changed, finished) go
   to the service on the main thread; `busy` (closing it would end something: the shell runs, has
   started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
   kernel). Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtView` — the view: the attached `VtSession`, cell metrics, four paints, a mirror of the screen
   (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
-  selected columns), a backing bitmap of the grid, the modes, scroll position and selection
+  selected columns), a backing bitmap of the grid, the modes (the alternate screen's readable as
+  `altScreen`), scroll position and selection
   bounds and shape of the last frame, whether a search runs and its count as last reported, the
   last frame's image placements (`Placement`, a pool reused across frames) and the bitmaps of the
   images they show by id with the generation each holds (`Picture`), the animation's redraw, the
@@ -113,43 +120,49 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 32 `@JvmStatic external` functions on the native library.
+- `VtNative` — 38 `@JvmStatic external` functions on the native library, and libghostty-vt's
+  selection adjustments (`ADJUST_*`).
 - In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
   mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
   tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
   `AppineVt`, freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into
-  `Effects` (with the `StatusReport`s decoded from vt.c's queue); the compression schedule
-  `COMPRESS` (a `Due` per tab: when to look at it next and when it was scheduled), served by the
-  `vt-compress` thread (`compressor`).
-- In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and
-  cell pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link
-  and transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
-  selection drag, the last reported mouse cell, the effects since they were last taken: bells,
-  the last clipboard write, the last notification, the last progress report and every program
-  status report, queued in a byte layout vt.rs reads; `AppineVtEffects` is how they are handed
-  out; the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
-  each viewport cell's search mark for this frame and as last sent; the cell of a command's output
-  a long press found, tracked for the menu's Select output; the compression state: a pass
-  scheduled, the activity token last seen, a read that restored compressed pages since the last
-  pass; whether the last transcript is still the screen's text; and the render state's image list
-  as last read, in drawing order (`Placement`), with its placements generation). Process-wide: the
-  PNG decoder installed into libghostty-vt's sys interface with the first terminal.
+  `Effects` (with the `StatusReport`s decoded from vt.c's queue, and the clipboard reads); the
+  compression schedule `COMPRESS` (a `Due` per tab: when to look at it next and when it was
+  scheduled), served by the `vt-compress` thread (`compressor`).
+- In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and cell
+  pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link and
+  transcript, the title-changed flag, the synchronized-output hold, the tracked anchor of a
+  selection drag, the last reported mouse cell, the effects since they were last taken: bells, the
+  last clipboard write, the last notification, the last progress report and every program status
+  report, queued in a byte layout vt.rs reads, and the clipboard reads (OSC 52) with the clipboard
+  the last named; `AppineVtEffects` is how they are handed out; the OSC string the output is in (its
+  first 32 bytes and its length), to find those reads; the search: a `GhosttySearch` while one runs,
+  scratch for the viewport's matches, and each viewport cell's search mark for this frame and as
+  last sent; the cell of a command's output a long press found, tracked for the menu's Select
+  output; the compression state: a pass scheduled, the activity token last seen, a read that
+  restored compressed pages since the last pass; whether the last transcript is still the screen's
+  text, and whether the last snapshot is (or none can be taken until the terminal changes); and the
+  render state's image list as last read, in drawing order (`Placement`), with its placements
+  generation). Process-wide: the PNG decoder installed into libghostty-vt's sys interface with the
+  first terminal.
 
 ## Public entry points
 
 - Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
   most configuration changes itself, the dark mode and density included), started with
   `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
-  `onMachineReady`, `onSessionsChanged`, `onBell`, `onTabStatus`, `onSettingsChanged`,
+  `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
+  `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
-- `VtNative`: `create`, `print`, `pump`, `title`, `atPrompt`, `frame`, `image`, `resize`, `key`,
-  `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`, `selectWord`, `selectLine`, `selectGrab`,
-  `selectTo`, `selectRectangle`, `selectAll`, `outputAt`, `selectOutput`, `selectClear`, `copy`,
-  `link`, `search`, `searchSelect`,
-  `searchEnd`, `message`, `transcript`, `compressAll`, `destroy`; `pump` runs on `vt-pump` and calls
-  `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
-  `onStatus` and `onForeground` back; `compressAll` runs on the service's worker, the rest on the
+- `VtNative`: `create`, `restore`, `print`, `pump`, `title`, `atPrompt`, `frame`, `image`,
+  `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`, `selectWord`, `selectLine`,
+  `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`, `selectAll`, `outputAt`,
+  `selectOutput`, `selectClear`, `copy`, `link`, `search`, `searchSelect`, `searchEnd`, `clear`,
+  `reset`, `message`, `transcript`, `snapshot`, `version`, `compressAll`, `destroy`; `pump` runs on
+  `vt-pump` and calls `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`,
+  `onProgress`, `onStatus`, `onClipboardRead` and `onForeground` back; `snapshot` and
+  `compressAll` run on the service's worker, `version` wherever `Tabs` needs it, the rest on the
   main thread.
 
 ## Data flow / lifecycle
@@ -176,16 +189,18 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 ### The tab bar
 
-- One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes
-  the current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
-  current tab's directory: its console's foreground group's, read from the kernel on the main
-  thread as a spawn is; the home directory without a current tab or once its shell ended) and
-  `⋮` (a menu: "Find", disabled with no current tab, "Close other tabs", disabled when there is no
-  other, "Close all tabs", disabled with no tabs, and Settings) over its end, every tab and button
-  a 32 dp square with its label centred. The tabs pass under the buttons, which hide them, and an end padding as wide as the
-  buttons lets the last tab scroll out from under them; while more tabs lie beyond, the row fades
-  out over 32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's right
-  fading edge; the left edge does not fade).
+- One 32 dp row in any window: a scrolling row of tabs across its whole width, with `×` (closes the
+  current tab; hidden while there is none), `+` (opens a session while the kernel runs, in the
+  current tab's directory: its console's foreground group's, read from the kernel on the main thread
+  as a spawn is; the home directory without a current tab or once its shell ended) and `⋮` (a menu:
+  "Find", disabled with no current tab, "Clear screen", disabled without a current tab whose
+  terminal exists or while it shows the alternate screen, "Reset terminal", disabled without such a
+  tab, "Close other tabs", disabled when there is no other, "Close all tabs", disabled with no tabs,
+  and Settings; see Clearing and resetting) over its end, every tab and button a 32 dp square with
+  its label centred. The tabs pass under the buttons, which hide them, and an end padding as wide as
+  the buttons lets the last tab scroll out from under them; while more tabs lie beyond, the row
+  fades out over 32 dp ending 12 dp inside `×`, in the blank before its glyph (the scroll view's
+  right fading edge; the left edge does not fade).
 - A tab shows its number (from 1, by position): the current one in the primary colour above the
   indicator, the others muted, an ended one faded (38% opacity, its indicator too). The current
   tab is scrolled into view after each change, clear of the fade, or to the row's end when less
@@ -344,7 +359,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 
 - A `VtSession` starts its shell the first time a view showing it knows the grid (`VtView.attach`
   and every regrid call `Host.onGrid`, which starts the current tab once): `ConsolePty.start`
-  opens a console of the grid's size and spawns the login; `VtNative.create` makes the terminal
+  opens a console of the grid's size and spawns the login; then the terminal is made: a restored
+  tab's from its saved snapshot when it has one that decodes (`VtNative.restore`, see Snapshots and
+  restoring), else a new one (`VtNative.create`), both with the same options
   (scrollback limited to 10,000 lines or 10 MiB, whichever is reached first: the lines up to about
   120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
   the cursor follows the foreground as in Ghostty; grapheme clustering, mode 2027, on by default as
@@ -353,15 +370,19 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   media, which would name the host's files and objects, answer `EINVAL: unsupported medium`, so
   programs fall back to sending the data); the Glyph Protocol off, so it is not advertised and
   programs that probe fall back to text; the terminfo name `xterm-256color`, the
-  `TERM` the console's login gets, which XTGETTCAP's `TN` reports); restored text and queued
-  messages are printed into it; then the writer, the pump and the waiter start.
+  `TERM` the console's login gets, which XTGETTCAP's `TN` reports; continuation tracking of up to
+  64 KiB, so a snapshot can be taken while output stops inside a sequence); a restored tab whose
+  snapshot did not come back has its transcript printed into the new terminal, then the restore
+  notice and queued messages are; then the writer, the pump and the waiter start.
 - If opening the console or spawning fails, the reason is printed, the console is closed and the
   tab counts as ended (127), with no "Process completed" line and no writer. If the terminal cannot
   be made (the kernel is gone, libghostty-vt fails, a panic), the tab ends (127) without a word,
   and later messages for it are refused.
-- Restored text replaces whatever was pending; a message shown before the terminal exists is
-  queued as a plain yellow line, not inserted as below.
-- The pump reads the console into a 64 KB buffer, feeds the terminal under the tab's lock, writes
+- A restore replaces whatever was pending with its notice; a message shown before the terminal
+  exists is queued after it as a plain yellow line, not inserted as below.
+- The pump reads the console into a 64 KB buffer, feeds the terminal under the tab's lock (in parts
+  that end at the start or end of an OSC string, `ghostty_terminal_vt_write_until`, where vt.c
+  keeps the string's first 32 bytes to find clipboard reads; no slower than one write), writes
   the terminal's replies (DA, DSR, XTVERSION, size reports, pastes' bytes) back to the console
   before reading again, calls `VtSession.onOutput` only when it sets `dirty` (so a burst asks for
   one frame, and nothing is asked while no view takes frames) and `onTitle` after OSC 0/2. It runs
@@ -377,13 +398,27 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   body, OSC 777's title and body, up to 4 KiB each; only the last of a read); a progress report
   (OSC 9;4, only the last of a read); program status reports (OSC 7501, every one in order, which
   libghostty-vt has already checked against the specification and whose title and message it has
-  decoded; with the callback set it also answers the protocol's `?` query). Clipboard reads have
-  no callback: OSC 52 `?` goes unanswered, OSC 5522 reads are refused, and Kitty paste events are
-  never sent, as with `clipboard-read = deny`. What the app prints itself (`VtNative.print`) asks
-  nothing: its replies and effects are dropped. Where they go is the service's choice
-  (android/service): the bell of the tab in front vibrates through `VtView.bell`, other bells (at
-  most once a second) and notifications from tabs not in front become the tab's notification, and
-  clipboard writes always reach the clipboard.
+  decoded; with the callback set it also answers the protocol's `?` query); clipboard reads
+  (OSC 52 with `?` for data: an OSC string of `52;`, the clipboards named (`c`, `p`, `q`, `s`,
+  `0`–`7`, maybe none) and `;?`, ended and not cancelled, however the reads split it), counted
+  with the clipboard the last named (`p` or `s`, else `c`). libghostty-vt's clipboard-read
+  callback is left unset: it must answer before returning, under the tab's lock, which rules out
+  asking the user; so OSC 5522 reads are refused and Kitty paste events never sent. What the app
+  prints itself (`VtNative.print`) asks nothing: its replies and effects are dropped. Where they go
+  is the service's choice (android/service): the bell of the tab in front vibrates through
+  `VtView.bell`, other bells (at most once a second) and notifications from tabs not in front
+  become the tab's notification, clipboard writes always reach the clipboard, and clipboard reads
+  are asked about in the tab in front and answered empty elsewhere.
+- Clipboard reads, as Ghostty's default `clipboard-read = ask`: the session queues them (the
+  clipboard each named) and tells the service once for the reads that come before an answer;
+  `MainActivity` reads the clipboard's first item as text and, when there is some, asks ("Let the
+  program read the clipboard?", up to 300 characters shown, Allow and Deny), one question at a
+  time, whose answer covers every read queued meanwhile; an empty clipboard, or one without text,
+  is answered at once. `VtSession.answerClipboardRead` writes one answer per read through the
+  tab's writer, in Ghostty's form `ESC ] 52 ; <clipboard> ; <base64> ESC \` (ST, whatever ended
+  the request): the text when allowed, nothing (an empty clipboard, as libghostty-vt answers a
+  read it refuses, so the program does not wait for a timeout) when denied, dismissed or asked
+  from a tab not in front.
 - Progress and status (`VtSession`, main thread): a progress report replaces the last one (a
   removal clears it) and lasts 15 s without another, as in Ghostty. Status reports of a read are
   applied together, as the specification keeps them: one record per id, a report replacing its
@@ -407,8 +442,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   terminal until it returns.
 - Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
   wraps joined, trailing blanks trimmed); on the alternate screen, when nothing changed the screen
-  since the last transcript (no output, message or resize), or when formatting fails, it returns
-  the last transcript taken on the primary one ("" when none was).
+  since the last transcript (no output, message, resize, clearing or reset), or when formatting
+  fails, it returns the last transcript taken on the primary one ("" when none was). The service
+  also takes the terminal's snapshot (Snapshots and restoring).
 - Kill reports go through `VtNative.message` (a yellow line inserted above the cursor line: a CAN
   first when the parser is not at ground (`VT_GROUND`, which includes the UTF-8 decoder), so a
   program that died inside an OSC, DCS or APC string does not swallow it; then as many line feeds
@@ -436,7 +472,53 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   at once, idle or not, one tab's lock at a time.
 - Saving does not format a transcript again while nothing changed the screen, since formatting
   restores every compressed page; a tab whose text changed is formatted at each save and
-  compressed again afterwards.
+  compressed again afterwards. A snapshot, which reads every page, marks the terminal touched too.
+
+#### Snapshots and restoring
+
+- A snapshot (`VtSession.takeSnapshot`, `VtNative.snapshot`, on the service's worker) is
+  libghostty-vt's binary record of the whole terminal: both screens, the scrollback, images,
+  colours, modes, the title and the unfinished sequence the parser is in. One is encoded only
+  after the terminal changed since the last (output, a message, a resize, clearing or resetting;
+  null otherwise, and the service keeps the last file); none can be taken (empty) when encoding
+  fails, output having stopped inside a sequence longer than the 64 KiB tracked, or the snapshot
+  is larger than 16 MiB (mostly images), and none is tried again until the terminal changes. A full
+  scrollback of coloured output takes about 1.5 MB, encoded in about 1 ms and decoded in about
+  3 ms on a Mac; the service stores it deflated (android/service).
+- Restoring (`VtNative.restore`) decodes a snapshot into a new terminal, compressing its
+  scrollback as it comes and keeping its images within the 32 MiB per screen. Before any callback
+  is installed (nothing is reported, replies go nowhere), vt.c undoes what the programs that ran
+  in it set up for themselves: an unfinished sequence is cancelled (CAN), the alternate screen
+  left for the primary one, a soft reset (DECSTR) brings back the cursor, margins, attributes,
+  cursor and keypad modes, the palette and the cursor style, reverse video, mouse tracking and its
+  formats, focus events, bracketed paste, synchronized output, colour scheme and in-band size
+  reports and Kitty paste events are reset, alternate scroll set, the Kitty keyboard flags popped,
+  an open hyperlink closed and the title cleared; what follows is marked as output (OSC 133;C), so
+  the prompt the snapshot was taken at is not cleared by a resize as a live one is, the cursor
+  starts a line of its own when it is not at its start, and the rest of the screen below it is
+  erased; the selection goes and the viewport returns to the bottom. The terminal then gets the
+  options a new one gets and is resized to the grid. A snapshot that does not decode leaves the
+  tab to its transcript (logged).
+
+#### Clearing and resetting
+
+- ⋮'s Clear screen (`VtSession.clear`, `VtNative.clear`) is Ghostty's clear_screen, and does
+  nothing on the alternate screen (the item is disabled there): the selection goes and the
+  scrollback is erased (ED 3). At the shell's prompt (prompt marks) the whole screen goes too (ED 2,
+  which libghostty-vt turns into a move into the scrollback when the last non-blank row is a
+  prompt, hence the ED 3 after it) and the shell gets a form feed (^L) to draw its prompt again;
+  elsewhere (a command running, or a shell without marks) the rows above the cursor's are deleted
+  from the top (DL), so the cursor's row moves up to it with the rows below, and the screen's
+  Kitty placements are deleted with the images no other one shows. The viewport returns to the
+  bottom.
+- Reset terminal (`VtSession.reset`, `VtNative.reset`) is Ghostty's reset: libghostty-vt's full
+  reset (RIS) of both screens, the scrollback, modes, the palette, the title and images, keeping
+  the app's options and the colours set with OSC 10, 11 and 12; the selection and a
+  synchronized-output hold end, a shell that was at its prompt gets a form feed (^L) to draw it
+  on the empty screen, and the tab bar hears that the title went.
+- Both write their sequences as the app's own (`write_own`, as kill reports do): after a CAN when
+  the parser is inside a sequence a program left unfinished, keeping the console's replies as they
+  were.
 
 #### Frames and drawing
 
@@ -647,6 +729,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   takes the selection as plain text with soft wraps joined (not in a rectangle, whose rows are lines
   of their own) and trailing blanks trimmed (as Ghostty copies), puts it on the clipboard and ends
   the selection.
+- With a selection, Shift with an arrow, Page Up or Down, Home or End (a hardware keyboard, or the
+  extra keys' SHIFT with their arrows, HOME and END) moves its end as Ghostty's adjust_selection
+  keys do (`VtNative.selectAdjust`): to the previous or next non-blank cell (going round rows), a
+  row or a page up or down at its column, the screen's top left cell, or the end of its last
+  non-blank row; the anchor of a drag is dropped and the viewport scrolls to show the end (at its
+  top when above, at its bottom when below). Without a selection the keys reach the program.
 - Pinch zoom changes the font by 1 dp beyond a 0.9–1.1 scale band, within 6–32 dp, which regrids
   and resizes the terminal and then the console (SIGWINCH); the activity saves the new size.
 - A resize (`VtSession.resize`, from attaching and every regrid) takes the replies the terminal
@@ -674,10 +762,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 ### Inbound
 
 - `TerminalService` (creates and holds the `VtSession`s: `setRestored`, `showMessage`,
-  `transcriptText`, `title`, `isRunning`, `console`, `login` and `resolvedLogin`, `id`,
-  `status`, `statusSeen`, `describe`, `release`; `current`, `focus`, `sessions`, listener
-  callbacks, the notification intent with `EXTRA_TAB`), and its memory trimming
-  (`VtNative.compressAll`); `SettingsActivity` (licenses).
+  `transcriptText`, `takeSnapshot` and `savedSnapshot`, `title`, `isRunning`, `console`, `login`
+  and `resolvedLogin`, `id`, `status`, `statusSeen`, `describe`, `answerClipboardRead`, `release`;
+  `current`, `focus`, `sessions`, listener callbacks, the notification intent with `EXTRA_TAB`),
+  its memory trimming (`VtNative.compressAll`) and `Tabs` (`VtNative.version`);
+  `SettingsActivity` (licenses).
 
 ### Outbound
 
@@ -688,11 +777,12 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
-- libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
-  encoding, selection with word, line and output derivation, search, plain-text formatting, title
-  and width, progress and program status reports, semantic prompts (cursor at a prompt, scrolling
-  by prompts), scrollback compression, Kitty graphics with their
-  render-state image list and animation), and the Wuffs PNG decoder it carries, linked into
+- libghostty-vt 1.4.0 (the terminal state and its full reset, writes that stop at OSC strings'
+  ends, render state, key and mouse encoders, paste, focus encoding, selection with word, line and
+  output derivation and keyboard adjustment, search, plain-text formatting, title and width,
+  progress and program status reports, semantic prompts (cursor at a prompt, scrolling by
+  prompts), scrollback compression, snapshots with continuation tracking, Kitty graphics with
+  their render-state image list and animation), and the Wuffs PNG decoder it carries, linked into
   `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
   pixels); `Machine::read_console`,
   `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
@@ -726,8 +816,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   keyboard with the modifiers held (the tab shortcuts), nor Ctrl+Shift+↑ and ↓ on the primary screen
   (the prompt jumps, taken even when there are no prompts); the release of the shortcut's key is
   swallowed too, so the Kitty protocol sees no release without a press. Other releases are never
-  matched to presses: Ctrl+Shift+C/V's, or Esc's when the IME took the press, reach the program
-  alone.
+  matched to presses: Ctrl+Shift+C/V's, a Shift+arrow's (or Page Up or Down, Home or End) that
+  moved a selection, or Esc's when the IME took the press, reach the program alone.
 - The tab bar's buttons sit over the row's end, so their group is clickable and black but for the
   left part of `×` the fade reaches into: a hidden (`INVISIBLE`) `×` takes no touches, and
   without the group's a tap there would reach a tab under it. The black is an `InsetDrawable`,
@@ -821,6 +911,24 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   they pile up in its frame.
 - `AppineVtEffects` (vt.c) and `RawEffects` (vt.rs) are one layout and change together, as the
   frame format does (vt.c's comments name vt.rs's `Effects` for it).
+- A restored terminal is a new one (the decoder makes it): the userdata, callbacks and every
+  option vt.c sets (limits, colours, media, grapheme clustering, the Glyph Protocol, continuation
+  tracking) are not in a snapshot and are set on it as on a new terminal, after `settle`.
+- Snapshots are recorded with the version that wrote them: the Ghostty source's directory name
+  (from build.rs) and libghostty-vt's own version string, which stays `0.1.0-dev` across Ghostty
+  releases. One from another version is not decoded, since the format carries no compatibility
+  guarantee yet, and an app update is the commonest way a run ends with tabs to restore; those
+  tabs come back from their transcripts.
+- libghostty-vt's clipboard-read callback must answer before it returns, which happens on the pump
+  thread under the tab's lock: asking the user there would block every frame (the main thread
+  takes the same lock). OSC 52 reads are therefore found by vt.c and answered later through the
+  tab's writer, and OSC 5522 reads, which only the callback can serve, stay refused.
+- vt.c's OSC tracking (`osc_open`) follows only what goes through `appine_vt_feed`. App writes
+  that cancel a program's string with CAN (`write_own`) clear it; any other write into the
+  terminal that could end or start an OSC string must too, or a later string's start is misread.
+- Continuation tracking keeps at most 64 KiB of an unfinished sequence: a snapshot taken while
+  output stops inside a longer one (an OSC 52 write, a large Kitty transmission) fails, and that
+  save leaves the tab without a snapshot until the terminal changes.
 - libghostty-vt is not thread-safe: every call into `vt.c` holds the tab's lock (recovered when
   poisoned); the frame buffer is written only by `frame`, which only the main thread calls, so the
   main thread reads it after the lock is released. vt.c's text buffer is shared by title, copy,
@@ -937,17 +1045,16 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   content).
 - **libghostty-vt features not wired**: no callbacks for OSC 7 working directories (the profile
   sends none; new tabs take the kernel's foreground directory) or OSC 133 prompt events (the marks
-  are read from the terminal's state instead); tabs are restored from plain text, not
-  libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
-  continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
-  which vt.c leaves off; ENQ, the title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered;
-  clipboard reads are refused where Ghostty's default (`clipboard-read = ask`) asks, and wiring
-  them would turn the IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into
-  Kitty paste events for programs using mode 5522.
+  are read from the terminal's state instead); ENQ, the title report (CSI 21 t), XTCHECKSUM and
+  window resizing (CSI 8 t) are left unanswered; OSC 5522 clipboard reads are refused and Kitty
+  paste events never sent, since only the read callback, which cannot wait for the user, serves
+  them (wiring it would also need the IME's multi-line commits, pasted as
+  `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, marked `GHOSTTY_PASTE_SOURCE_TEXT`, or they would become paste
+  events).
 - **More of libghostty-vt left unused**:
-  - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`
-    (keys extending a selection), and the selection gesture state machine (click counts to cell,
-    word, line or output selection), for which `VtView` has its own taps and long presses;
+  - selection: `select_word_between` (a word drag that extends by words) and the selection
+    gesture state machine (click counts to cell, word, line or output selection), for which
+    `VtView` has its own taps and long presses;
   - input: a mouse's or touchpad's horizontal scrolling (`AXIS_HSCROLL`, the wheel buttons 6 and 7
     for programs tracking the mouse) is not read;
   - drawing: overscan (rows captured beyond the viewport, to scroll by pixels; drags and flings
@@ -963,14 +1070,16 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
     all matches (`GHOSTTY_SEARCH_DATA_MATCHES`, which could mark them along the scroll bar); the
     colour utilities (`palette_generate`, the 256 colours from the first 16, and contrast and
     luminance for a minimum contrast), of use only with themes;
-  - the rest: no action to reset the terminal or clear the scrollback (`ghostty_terminal_reset`)
-    and no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
+  - the rest: no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
     colours and OSC 8 links; the memory usage and the VT processing-error flag are never read;
     the library's log and unknown-sequence callbacks are unset, so its warnings never reach
     logcat; KAM (mode 2) is ignored: Ghostty's own surface drops keys while it is set, but the key
     encoder does not, and neither does vt.c;
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
-    the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
+    the terminal's visibility, so mode 2033 reports every tab as visible, background ones too;
+    Kitty's drag and drop (OSC 72) has a callback only in the Zig API; OSC 66 text sizing, OSC 99
+    Kitty notifications and hierarchical contexts are parsed but not acted on by libghostty-vt
+    itself.
 - **Images take memory twice for the tab shown, and are never trimmed**: each screen of each tab
   keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and the view holds a bitmap of
   every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both, and a
@@ -995,6 +1104,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   GPLv3; its zsh and fish scripts' licences were not checked), and should a background tab's
   progress and status be dropped at the next prompt mark rather than when the foreground group
   changes?
+- Should a clipboard read from a tab not in front wait until the tab is shown rather than get an
+  empty clipboard, and should the question offer to remember the answer for the tab (Ghostty asks
+  every time)?
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
   while it has the keyboard, rather than on the terminal?
@@ -1053,3 +1165,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   about 2.5 ms a frame, at most 12 ms), and on a macOS build of vt.c (queries, refused media,
   PNG with alpha, oversized and corrupt PNG, deletion, scrolling, full reset); not on real devices,
   16 KB-page devices, or with the 32 MiB storage filled.
+- Snapshot restoring was tried only on a Pixel 4a API 34 emulator (a force-stop and an update
+  reinstall, with coloured output, mouse tracking, bracketed paste and a title left on), and the
+  encoding, settling and round trip on a macOS build of vt.c; not with images in a snapshot,
+  bash's marks, a program on the alternate screen at saving, a library version change or 16 KB-page
+  devices. Clipboard reads (Allow and Deny, a shell reading raw input), Clear screen and Reset
+  terminal at busybox ash's prompt, and Shift+arrows on a selection (adb key combinations) were
+  tried there too; not with real hardware keyboards, bash, or a read from a tab not in front.

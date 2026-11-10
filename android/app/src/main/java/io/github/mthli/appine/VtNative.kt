@@ -16,6 +16,14 @@ internal object VtNative {
     /** Creates the terminal of an open [console] of [machine]; returns the tab handle. */
     @JvmStatic external fun create(machine: Long, console: Int, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): Long
 
+    /**
+     * Creates the terminal of an open [console] of [machine] from a tab's saved [snapshot]
+     * (screens, scrollback, images, colours), settled for a new shell: what the programs that ran
+     * in it set up for themselves (modes, the alternate screen, the title) is undone and the cursor
+     * starts a line of its own. Returns the tab handle, 0 when the snapshot cannot be decoded.
+     */
+    @JvmStatic external fun restore(machine: Long, console: Int, snapshot: ByteArray, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): Long
+
     /** Shows bytes from the app as if the console had printed them. */
     @JvmStatic external fun print(tab: Long, data: ByteArray)
 
@@ -23,9 +31,9 @@ internal object VtNative {
      * Blocks, moving console output into the terminal until the session ends or the console is
      * closed; calls `session.onOutput()` (on this thread) when the screen changed after the last
      * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
-     * `onClipboard`, `onNotification`, `onProgress` and `onStatus` for what programs asked of the
-     * app, and `onForeground()` once the process group in the foreground when progress or a status
-     * was last reported has given the terminal back.
+     * `onClipboard`, `onNotification`, `onProgress`, `onStatus` and `onClipboardRead` for what
+     * programs asked of the app, and `onForeground()` once the process group in the foreground when
+     * progress or a status was last reported has given the terminal back.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
 
@@ -119,6 +127,13 @@ internal object VtNative {
     @JvmStatic external fun selectTo(tab: Long, x: Int, y: Int): Boolean
 
     /**
+     * Moves the selection's end as Ghostty's adjust_selection does ([adjustment] is one of the
+     * `ADJUST_` constants: to the next or previous non-blank cell, a row or a page up or down, the
+     * screen's start or end) and scrolls the viewport to show it; false without a selection.
+     */
+    @JvmStatic external fun selectAdjust(tab: Long, adjustment: Int): Boolean
+
+    /**
      * Makes the selection a rectangle ([on]) with its first and last cells at opposite corners, or
      * linear again from its top left to its bottom right corner; false when there is none.
      */
@@ -170,6 +185,20 @@ internal object VtNative {
     @JvmStatic external fun searchEnd(tab: Long)
 
     /**
+     * Clears the screen and the scrollback as Ghostty's clear_screen does: at the shell's prompt
+     * the whole screen (returns 1: send the shell a form feed to draw its prompt again), elsewhere
+     * the rows above the cursor's, which moves to the top, and the screen's images (returns 0).
+     * Returns -1 on the alternate screen, where nothing changes.
+     */
+    @JvmStatic external fun clear(tab: Long): Int
+
+    /**
+     * Resets the terminal (a full reset, RIS: screens, scrollback, modes, title, images); true when
+     * the shell was at its prompt, which then gets a form feed to draw it again.
+     */
+    @JvmStatic external fun reset(tab: Long): Boolean
+
+    /**
      * Shows a yellow line of app notice above the cursor's line (a kill report); false on the
      * alternate screen, where nothing is written.
      */
@@ -184,6 +213,20 @@ internal object VtNative {
     @JvmStatic external fun transcript(tab: Long): String?
 
     /**
+     * A snapshot of the whole terminal for saving the tab, which [restore] brings back; null when
+     * nothing changed since the last one (the caller keeps that) or the tab is gone, empty when
+     * none can be taken of the terminal as it is (output stopped inside a long sequence, or the
+     * snapshot is larger than 16 MiB, mostly images). Any thread.
+     */
+    @JvmStatic external fun snapshot(tab: Long): ByteArray?
+
+    /**
+     * The version the snapshots are recorded with (the Ghostty source and libghostty-vt's own
+     * version): one from another version is not restored.
+     */
+    @JvmStatic external fun version(): String?
+
+    /**
      * Compresses every tab's cold scrollback at once (memory trimming); otherwise a tab's is
      * compressed once its terminal has been idle for a moment.
      */
@@ -191,4 +234,14 @@ internal object VtNative {
 
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)
+
+    // libghostty-vt's GhosttySelectionAdjust ([selectAdjust])
+    const val ADJUST_LEFT = 0
+    const val ADJUST_RIGHT = 1
+    const val ADJUST_UP = 2
+    const val ADJUST_DOWN = 3
+    const val ADJUST_HOME = 4
+    const val ADJUST_END = 5
+    const val ADJUST_PAGE_UP = 6
+    const val ADJUST_PAGE_DOWN = 7
 }

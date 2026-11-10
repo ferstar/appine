@@ -36,6 +36,12 @@ fn main() {
         "cargo:rerun-if-changed={}",
         src.join("build.zig.zon").display()
     );
+    // The source's name (ghostty-<version>) is part of the version the tabs' saved snapshots are
+    // recorded with (vt.rs): libghostty-vt's own version string does not follow Ghostty's releases
+    println!(
+        "cargo:rustc-env=APPINE_GHOSTTY={}",
+        src.file_name().unwrap_or_default().to_string_lossy()
+    );
 
     let target = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
         Ok("aarch64") => "aarch64-linux-android",

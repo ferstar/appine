@@ -6,6 +6,7 @@ import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -442,8 +443,9 @@ class MachineTest {
      * Saved tabs (the android/service map): while the marker is still there (killed) they read back
      * unchanged with the pid of the run that left it, also a second time (killed again before the
      * kernel came up); a later save replaces them and leaves only the transcripts its index names;
-     * an earlier version's empty marker still counts as killed, with no pid; after a normal exit
-     * (clear) nothing is read.
+     * a snapshot reads back as written while an index names it, not when the index was written with
+     * another libghostty-vt, and goes with the next save that does not name it; an earlier version's
+     * empty marker still counts as killed, with no pid; after a normal exit (clear) nothing is read.
      */
     @Test
     fun tabsComeBackOnlyAfterAKill() {
@@ -465,6 +467,16 @@ class MachineTest {
         assertEquals(listOf("line 3"), Tabs.takeKilled(context)?.saved?.tabs?.map { it.transcript })
         val transcripts = File(context.filesDir, "tabs").list()!!.filter { it.endsWith(".txt") }
         assertEquals(transcripts.toString(), 1, transcripts.size)
+        val snapshot = ByteArray(100_000) { (it % 7).toByte() }
+        val name = Tabs.writeSnapshot(context, snapshot)!!
+        Tabs.save(context, listOf(tabs[0].copy(snapshot = name)), 0)
+        assertEquals(name, Tabs.takeKilled(context)?.saved?.tabs?.single()?.snapshot)
+        assertArrayEquals(snapshot, Tabs.readSnapshot(context, name))
+        val index = File(context.filesDir, "tabs/index.json")
+        index.writeText(index.readText().replace("\"vt\":", "\"vt\":\"other\",\"was\":"))
+        assertEquals(null, Tabs.takeKilled(context)?.saved?.tabs?.single()?.snapshot)
+        Tabs.save(context, listOf(tabs[0]), 0)
+        assertFalse(File(context.filesDir, "tabs/$name").exists())
         File(context.filesDir, "tabs/running").writeText("")
         assertEquals(0, Tabs.takeKilled(context)?.pid)
         Tabs.clear(context)
