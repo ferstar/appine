@@ -28,7 +28,7 @@ import kotlin.concurrent.thread
 /**
  * Settings: distro, package mirror, reset rootfs, execution tier (debug builds only; the
  * android/setup map), login account (likewise), keep running with the screen off (the
- * android/service map), CJK characters filling two cells (the android/terminal map), open source
+ * android/service map), CJK characters filling two cells (the android/vtview map), open source
  * licenses (design doc §13.4). All the state is in [TerminalService]; this only displays and
  * forwards it, and while the kernel is not running (starting, replacing the store) everything can
  * be viewed but not changed. When replacing the store or a restart begins, it goes back to the

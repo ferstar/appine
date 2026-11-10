@@ -4,7 +4,7 @@ import android.graphics.Bitmap
 import java.nio.ByteBuffer
 
 /**
- * The JNI side of the libghostty-vt terminal (`hosts/android/src/vt.rs`, the android/terminal map):
+ * The JNI side of the libghostty-vt terminal (`hosts/android/src/vt.rs`, the android/vt map):
  * a terminal per [VtSession], fed from its kernel console inside the native library.
  */
 internal object VtNative {

@@ -141,7 +141,7 @@ pub(crate) fn feed(k: &Kernel, id: u32, data: &[u8]) -> Result<(), Errno> {
 }
 
 /// The console's foreground process group, for the app to tell when the program that reported
-/// progress or its status gave the terminal back (the android/terminal map). ESRCH when there is
+/// progress or its status gave the terminal back (the android/vt map). ESRCH when there is
 /// none (the shell has exited).
 pub(crate) fn fg_pgrp(k: &Kernel, id: u32) -> Result<Tid, Errno> {
     tty_of(k, id)?.borrow().fg.ok_or(Errno::ESRCH)
@@ -180,7 +180,7 @@ pub(crate) fn fg_cwd(k: &Kernel, id: u32) -> Result<Vec<u8>, Errno> {
 
 /// Whether the console's line discipline reads whole lines without echoing them (ICANON on, ECHO
 /// off), as programs set it while reading a password: the app then draws the cursor as a lock, as
-/// Ghostty does by the same rule (the android/terminal map).
+/// Ghostty does by the same rule (the android/vtview map).
 pub(crate) fn password_input(k: &Kernel, id: u32) -> Result<bool, Errno> {
     let lflag = tty_of(k, id)?.borrow().termios.lflag;
     Ok(lflag & (ICANON | ECHO) == ICANON)

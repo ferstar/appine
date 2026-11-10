@@ -14,7 +14,7 @@ outlives an Activity:
 
 - the kernel handle (`machine`), starting, booting (inittab), shutting down, rebooting and
   replacing the kernel and its store;
-- all terminal sessions (`VtSession`s, `android/terminal`), and restoring tabs after the process
+- all terminal sessions (`VtSession`s, `android/vt`), and restoring tabs after the process
   was killed (`Tabs`);
 - the ongoing notification and its actions, the wake lock, memory trimming;
 - a 2 s poll that fetches kernel events (listens, kills, power requests, process count, changed
@@ -28,8 +28,9 @@ outlives an Activity:
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Tabs.kt`.
 
-Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); rendering,
-the tab bar, sessions' internals and the console adapter (`android/terminal`); the Files app
+Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
+and its tab bar (`android/terminal`); rendering (`android/vtview`); sessions' internals and the
+console adapter (`android/vt`); the Files app
 provider (`android/documents`); JNI and the kernel API (`android/native`, `kernel/process`).
 
 ## Key types
@@ -187,7 +188,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 - The last listener leaving saves tabs at once and starts a 60 s timer that trims memory
   (on the worker: `Native.trimMemory`, the kernel's rebuildable caches, then
-  `VtNative.compressAll`, every tab's cold scrollback at once, android/terminal); a returning
+  `VtNative.compressAll`, every tab's cold scrollback at once, android/vt); a returning
   listener cancels it. `onTrimMemory` at `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and
   saves immediately. Tabs also compress their own scrollback within seconds of their output, so
   the trim mostly finds what the last few seconds left.
@@ -252,12 +253,12 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
   Android lets an app read the clipboard only while it has the focus, and the program would
   otherwise wait for a timeout.
-- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/terminal),
+- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vt),
   ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
   (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
   back.
 - A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
-  terminal, android/terminal) after at least 10 s, in a tab not in front (another tab shown, or
+  terminal, android/vt) after at least 10 s, in a tab not in front (another tab shown, or
   the terminal Activity not listening), becomes the tab's notification, as Ghostty's
   `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold 5 s);
   shorter ones and those in the tab in front post nothing. Like a program's notification it

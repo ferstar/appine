@@ -14,7 +14,7 @@
 6. Processes, threads and scheduling, moved to the [kernel/process map](../../.claude/maps/kernel/process.md)
 7. Signals and ABI, moved to the [kernel/signal map](../../.claude/maps/kernel/signal.md)
 8. File system, moved to the [kernel/store](../../.claude/maps/kernel/store.md), [kernel/vfs](../../.claude/maps/kernel/vfs.md) and [kernel/procfs](../../.claude/maps/kernel/procfs.md) maps
-9. TTY and terminal, moved to the [kernel/tty map](../../.claude/maps/kernel/tty.md); the terminal UI is in the [android/terminal map](../../.claude/maps/android/terminal.md)
+9. TTY and terminal, moved to the [kernel/tty map](../../.claude/maps/kernel/tty.md); the terminal UI is in the [android/terminal](../../.claude/maps/android/terminal.md), [android/vt](../../.claude/maps/android/vt.md) and [android/vtview](../../.claude/maps/android/vtview.md) maps
 10. Networking, moved to the [kernel/net](../../.claude/maps/kernel/net.md), [kernel/netns](../../.claude/maps/kernel/netns.md), [kernel/unix](../../.claude/maps/kernel/unix.md) and [kernel/poll](../../.claude/maps/kernel/poll.md) maps
 11. Users, permissions and Android integration, moved to the [kernel/cred](../../.claude/maps/kernel/cred.md), [android/service](../../.claude/maps/android/service.md), [android/setup](../../.claude/maps/android/setup.md), [android/documents](../../.claude/maps/android/documents.md), [android/terminal](../../.claude/maps/android/terminal.md) and [android/native](../../.claude/maps/android/native.md) maps
 12. [Threat model](12-threat-model.md)

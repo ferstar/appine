@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
- * A terminal tab (the android/terminal map), owned by [TerminalService]: a login shell on a kernel
+ * A terminal tab (the android/vt map), owned by [TerminalService]: a login shell on a kernel
  * console ([ConsolePty]) and its libghostty-vt terminal. The terminal lives in the native library
  * and takes the console's output on a pump thread whether or not a [VtView] shows it ([view]); the
  * shell starts when a view first knows the grid ([start]), and until then a restored tab's saved

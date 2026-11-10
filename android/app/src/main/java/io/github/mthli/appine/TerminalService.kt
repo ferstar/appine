@@ -1404,7 +1404,7 @@ class TerminalService : Service() {
 
     /**
      * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
-     * on by default, the android/terminal map); [MainActivity] reads it whenever it starts.
+     * on by default, the android/vtview map); [MainActivity] reads it whenever it starts.
      */
     val fillWide: Boolean get() = fillWide(this)
 

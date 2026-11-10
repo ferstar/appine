@@ -259,7 +259,7 @@ internal object Rootfs {
      * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
      * language environment variables, and gives bash and busybox ash a coloured prompt with shell
      * integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
-     * android/terminal map). Which directory the shell starts in is decided by the assets'
+     * android/vt map). Which directory the shell starts in is decided by the assets'
      * `login.sh` (restored tabs start in their original directory, the android/service map, new
      * tabs in the current tab's, the android/terminal map).
      */

@@ -314,7 +314,7 @@ class MachineTest {
     }
 
     /**
-     * The profile gives the login shell (busybox ash) its shell integration (the android/terminal
+     * The profile gives the login shell (busybox ash) its shell integration (the android/vt
      * map): each prompt reports the last command's status (OSC 133 D) and starts the prompt (A,
      * whose cursor taps move with the arrows), the typed command starts after it and ends with its
      * line (I), and continuation lines are secondary prompts.

@@ -465,7 +465,7 @@ impl Machine {
     }
 
     /// The process group in the foreground of console `id` (the app clears what a program reported
-    /// about its progress once another group takes the terminal; the android/terminal map). ESRCH
+    /// about its progress once another group takes the terminal; the android/vt map). ESRCH
     /// if there is none, as after the shell has exited.
     pub fn console_foreground(&self, id: u32) -> Result<i32, Errno> {
         let k = self.shared.lock();
@@ -483,7 +483,7 @@ impl Machine {
     }
 
     /// Whether console `id` reads lines without echoing them (ICANON on, ECHO off), as programs
-    /// set it to read a password; the app draws the cursor as a lock then (the android/terminal
+    /// set it to read a password; the app draws the cursor as a lock then (the android/vtview
     /// map).
     pub fn console_password_input(&self, id: u32) -> Result<bool, Errno> {
         let k = self.shared.lock();

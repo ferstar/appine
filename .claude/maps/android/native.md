@@ -30,7 +30,8 @@ the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app
 
 Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
 what the app does with them (the other `android/*` modules), including the libghostty-vt
-terminal's emulator shim, its JNI functions, sessions and views (`android/terminal`).
+terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its view
+(`android/vtview`).
 
 ## Key types
 
@@ -161,7 +162,7 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
   since AAPT would unpack `.gz`) and the newest `doas.apk` (both by `byVersion`; `rootfsAsset`
   fails with "run scripts/fetch-rootfs first" when either is missing), generated `notices/`, and
-  the terminal font (`fonts/`, `android/terminal`); `BuildConfig.ALPINE_BRANCH` carries the
+  the terminal font (`fonts/`, `android/vtview`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
 - SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
   native libraries (`useLegacyPackaging = false`) so 16 KB-aligned `LOAD` segments (NDK 29's
@@ -248,7 +249,7 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 - `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; `vt.rs`
   (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` and `LicensesActivity`
   through the assets and `BuildConfig`; CI's `android.yml` (`assembleDebug lintDebug`, clippy
-  through cargo-ndk); the terminal (`android/terminal`) through the libghostty-vt build.
+  through cargo-ndk); the terminal (`android/vt`) through the libghostty-vt build.
 
 ### Outbound
 

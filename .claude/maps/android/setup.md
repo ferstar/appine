@@ -41,7 +41,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   licenses (`android/terminal`'s `page.xml`, `list_item.xml`, `list_header.xml`); rows in groups
   under headings: System (distro, mirror, login account, reset), Android (keep-awake, system
   documents), Terminal (CJK characters filling two cells, the cursor's shape and whether it
-  blinks, `android/terminal`), Debugging (tier, debug builds only) and About (licenses).
+  blinks, `android/vtview`), Debugging (tier, debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 - `profile.sh` — copied verbatim, comments included, into the guest as
   `/etc/profile.d/appine.sh`; `Rootfs` keeps the texts of the versions without prompt marks
@@ -99,7 +99,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ### Prompt marks
 
-- For the terminal's shell integration (android/terminal) the profile has login shells mark their
+- For the terminal's shell integration (android/vt) the profile has login shells mark their
   prompts with OSC 133:
   - bash: a `__appine_prompt` function put first in `PROMPT_COMMAND` (once) prints, before each
     prompt, the last command's end with its status (D) and the prompt's start on a fresh line (A,
@@ -199,7 +199,7 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
   the version they have; and the motd is written only at import, so it is never updated.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
-  rows on a resize; android/terminal): bash and busybox ash do.
+  rows on a resize; android/vt): bash and busybox ash do.
 
 ## Confirmed bugs / technical debt
 
