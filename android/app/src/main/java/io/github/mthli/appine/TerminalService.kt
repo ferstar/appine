@@ -170,6 +170,12 @@ class TerminalService : Service() {
     private var exiting = false
 
     /**
+     * [onDestroy] has run: threads that outlive the service (a download, mirror probes) must not
+     * post the ongoing notification again, which would then have no service behind it.
+     */
+    private var destroyed = false
+
+    /**
      * An entry of [Native.bklStall]: one kernel operation has held the kernel lock longer than the
      * kernel's watchdog allows, and every guest program, and this service's other calls into the
      * kernel, wait for it. A new one posts a notification with "Copy report" ([bugReport]); once
@@ -427,11 +433,16 @@ class TerminalService : Service() {
             ended = endedText(exit?.reason)
             if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifyCrash(exit)
         }
-        // First run: import the Alpine in the APK (other distros are switched to in Settings); an
-        // import or switch the app was killed in is started again with the same distro, its
-        // download reused when it is still in the cache
-        start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
+        startOrImport()
     }
+
+    /**
+     * Starts the kernel, importing first when no store is ready: on the first run the Alpine in
+     * the APK (other distros are switched to in Settings); after an import or switch that the app
+     * was killed in, or that failed, the same distro again, its download reused when it is still
+     * in the cache.
+     */
+    private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
     private fun createChannel() {
         val channel = NotificationChannel(
@@ -567,6 +578,7 @@ class TerminalService : Service() {
     }
 
     private fun updateNotification() {
+        if (destroyed) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
     }
 
@@ -736,10 +748,13 @@ class TerminalService : Service() {
     /**
      * The start failed and no UI is left to show it: stop rather than keep a foreground service
      * and its notification with nothing running (without a kernel there is no poll to end it).
-     * Opening the app again tries again.
+     * Opening the app again tries again. A distro switch still downloading keeps the service (its
+     * progress and cancel action are in the notification) until it ends one way or the other.
      */
     private fun stopIfFailed() {
-        if (machine == 0L && startError != null && !starting && !transitioning && !exiting && listeners.isEmpty()) {
+        if (machine == 0L && startError != null && !starting && !transitioning && !exiting &&
+            switching == null && listeners.isEmpty()
+        ) {
             stopSelf()
         }
     }
@@ -926,7 +941,10 @@ class TerminalService : Service() {
             }
             else -> getString(R.string.killed_bug, comm, pid)
         }
-        val session = sessions.firstOrNull { it.console == console && console >= 0 }
+        // An ended tab keeps its console's number, which the kernel may have given to a newer tab's
+        // console since: the tab whose console is open has it, else the newest one that had it
+        val session = sessions.firstOrNull { it.console == console && it.consoleOpen }
+            ?: sessions.lastOrNull { it.console == console && console >= 0 }
         val shown = session?.showMessage("[appine] $text") == true
         // Enough only when that tab is the one in front of the user
         if (shown && inFront(session) && !bug) return
@@ -1080,6 +1098,8 @@ class TerminalService : Service() {
                         Log.w(TAG, "cannot download ${distro.label}", it)
                         tell(getString(R.string.download_failed, distro.label, it.message ?: it.toString()))
                     }
+                    // The old system stays: after a failed start, nothing is left to keep running
+                    stopIfFailed()
                 }
                 settingsChanged()
             }
@@ -1092,6 +1112,7 @@ class TerminalService : Service() {
         sw.cancelled = true
         switching = null
         settingsChanged()
+        stopIfFailed()
     }
 
     /**
@@ -1309,9 +1330,10 @@ class TerminalService : Service() {
                 // Normal exit: do not restore the tabs next time. Tabs of a killed run that have not
                 // been restored yet (the start never succeeded) are kept for the next start
                 if (restore == null) Tabs.clear(this)
-                // The user opened the app again during the shutdown: start again, otherwise the UI
-                // stays at "Starting…" forever
-                if (listeners.isNotEmpty()) start(null) else stopSelf()
+                // The user opened the app again during the shutdown: start again (importing again
+                // when an import the exit came during failed), otherwise the UI stays at
+                // "Starting…" forever
+                if (listeners.isNotEmpty()) startOrImport() else stopSelf()
             }
         }
     }
@@ -1361,6 +1383,10 @@ class TerminalService : Service() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        // A download still under way has nothing left to replace
+        switching?.cancelled = true
+        switching = null
         main.removeCallbacks(trimWhenHidden)
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)

@@ -42,8 +42,14 @@ internal class VtSession(
         fun onFinished(session: VtSession)
     }
 
-    /** The kernel console, -1 before the shell starts. */
+    /**
+     * The kernel console, -1 before the shell starts; kept after the console is closed, when the
+     * kernel may give the number to another tab's console ([consoleOpen]).
+     */
     val console: Int get() = pty.console
+
+    /** The console is open: started and not closed yet. */
+    val consoleOpen: Boolean get() = pty.console >= 0 && !hungUp.get()
 
     /** The login account setting the tab was opened with ([ConsolePty.login]). */
     val login: String get() = pty.login

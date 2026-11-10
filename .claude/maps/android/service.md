@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/service.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start's stop waits for a switch, the service's end cancels it, exit restarts by importing, kill reports go to the open console)
 
 ## Responsibilities
 
@@ -101,8 +103,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - On failure: a failed import of a downloaded distro (not Alpine, store not ready) falls back to
   Alpine with a notice; with a `pendingReplace` the store is replaced; any other failure sets
   `startError`, updates the wake lock and notification ("Cannot start: …"), reports it to the
-  listeners, and stops the service as soon as no UI is left (there is no kernel, so no poll would
-  end it; opening the app tries again).
+  listeners, and stops the service as soon as no UI is left and no distro switch is downloading
+  (there is no kernel, so no poll would end it; opening the app tries again).
+- Which start: when no store is ready (`startOrImport`, at creation and when an exit finishes with
+  a UI back) the distro the last import was started for is imported first, otherwise the store
+  starts as it is.
 - Boot (`appine-boot` thread): run the osclock script without a console (failures only logged),
   `Native.boot` (blocks until inittab's boot entries finish), then notify OpenRC services that
   failed to start, if the kernel is still the same.
@@ -127,8 +132,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   it stops there and the start or restart finishes the exit once its kernel is up or has failed;
   otherwise `finishExit`: `Native.shutdown` on the worker (inittab shutdown, 30 s; `Native.stop`
   for a kernel that was never booted), then clear `exiting`, release the wake lock and clear saved
-  tabs unless tabs of a killed run are still waiting to be restored; start the kernel again if a
-  listener came back meanwhile, else `stopSelf`.
+  tabs unless tabs of a killed run are still waiting to be restored; start the kernel again
+  (importing when no store is ready, as after a failed import the exit came during) if a listener
+  came back meanwhile, else `stopSelf`.
 - `detach`: unregister the network callback, clear `machine` (before sessions end, so the UI does
   not treat it as the last tab closing), update the wake lock, cancel the poll and saves, release
   (hang up and free) every session and take its notification away, clear `sessions` and
@@ -141,14 +147,18 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   kernel runs or the start failed): download on an `appine-download` thread (progress in Settings
   and the notification, both cancellable; a failure other than a cancel shows a notice); when it
   finishes, `replace` if a kernel runs or the start failed, else record it in `pendingReplace`
-  while a start or restart is under way (in any other state it is dropped). `replace`: reset the login setting, `transitioning`,
+  while a start or restart is under way (in any other state it is dropped). After a failed start
+  the switch keeps the service running without a UI; its failure or cancel then stops it as a
+  failed start does. `replace`: reset the login setting, `transitioning`,
   `detach`, then on the worker `Native.stop` (kill all, no inittab shutdown), join the mirror
   thread and delete the store, then `start(distro)` — also after "exit all" meanwhile, so the
   chosen distro is imported (and then stopped) rather than the next start importing Alpine.
-- `onDestroy` removes the pending callbacks, clears saved tabs unless tabs of a killed run are
-  still waiting to be restored, unregisters the network callback, releases the sessions, shuts a
-  remaining kernel down on the worker (best effort), shuts the worker down and releases the wake
-  lock.
+- `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
+  which threads outliving it, the download's and the mirror probes', would otherwise post again),
+  cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
+  unless tabs of a killed run are still waiting to be restored, unregisters the network callback,
+  releases the sessions, shuts a remaining kernel down on the worker (best effort), shuts the
+  worker down and releases the wake lock.
 
 ### Wake lock and notification
 
@@ -217,8 +227,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 - Kill reports (one tab-separated line each: console, pid, command, `bug` or `oom`, and three
   fields: for a bug the kernel's report line, its log records and the unimplemented paths, for an
-  OOM kill the limit): written as `[appine] …` into the first tab whose console matches, when the
-  process had one (`VtSession.showMessage`, queued until a tab's terminal exists), in yellow above the cursor line
+  OOM kill the limit): written as `[appine] …` into the tab whose console with that number is open,
+  else the newest tab that had it (ended tabs keep their number, which the kernel hands to the next
+  console), when the process had one (`VtSession.showMessage`, queued until a tab's terminal exists), in yellow above the cursor line
   (skipped on the alternate screen); a notification "<command> was killed" follows unless the
   message was shown in the tab in front (another tab or Settings in front does not count), and
   always for an Appine bug. OOM kills say whether the app's limit or a cgroup's `memory.max` (in
@@ -289,28 +300,18 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path
   that ends `starting` or `transitioning` must check `exiting` (a replacement does so through the
   start it ends with), or the service stops with a kernel still running (or never stops).
+- Threads that outlive the service (a download, mirror probes) post to the main thread after
+  `onDestroy`: they reach notification 1 only through `updateNotification`, which does nothing once
+  destroyed, so a new way of posting it must go through that too.
 - The marker is rewritten at a start before the first save replaces the old run's index, so a kill
   in between restores the old tabs again; tabs of a killed run kept through a replacement are
   restored into the new distro, where their directories may not exist.
 
 ## Confirmed bugs / technical debt
 
-- **A switch or reset after a failed start can crash the app.** Settings allows it then
-  (`canSwitch`), but `stopIfFailed` stops the service once no UI is left without regard to the
-  download, and `onDestroy` shuts the worker down without cancelling the switch; when the download
-  finishes, `replace` runs on the destroyed service and its unguarded `worker.execute` throws
-  `RejectedExecutionException` on the main thread. A failed restart during a download gets there
-  too.
-- **The ongoing notification can outlive the service.** The download thread's progress and
-  completion posts and the mirror threads (after an import, `autoMirror`) call `settingsChanged`
-  with no check that the service was destroyed, and `finishExit` does not wait for them, so after
-  `onDestroy` they can post notification 1 again (a plain `notify`, with no service behind it).
-- **A kill report can go to an ended tab** that kept a console number the kernel has since given
-  to a live tab: the routing takes the first tab with that number (android/terminal).
-- **An exit during a failed import does not resume it.** When "exit all" comes during a start
-  that imports (or a replacement) and a UI returns before it ends, `finishExit` starts the kernel
-  again with `start(null)`, which never imports; with no store the start fails ("Cannot start")
-  until the user resets or switches in Settings or the next launch imports.
+- **A kill report of a shell can reach a new tab:** when a tab's shell itself is killed and a tab
+  opened within the next poll (2 s) gets the freed console number, the report goes to the new tab,
+  whose console is open, rather than the ended one.
 
 ## Open questions
 

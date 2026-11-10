@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/terminal.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open)
 
 ## Responsibilities
 
@@ -60,7 +62,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   label) serve the tab row too.
 - `ConsolePty` — `start` (open a console, spawn `login.sh` through `sh -c` with the tab's login
   and cwd and a fixed environment, `TERM=xterm-256color` among it), `waitFor`, `close`; `console`
-  is −1 until started and keeps its number after `close`.
+  is −1 until started and keeps its number after `close` (`VtSession.consoleOpen` tells whether it
+  is still open, for the routing of kill reports in android/service).
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
   `assets/notices/index.tsv` (one `list_item.xml` row per line with three fields), full text view;
   an `OnBackPressedCallback`, enabled while a full text is shown, returns to the list.
@@ -661,10 +664,6 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - **A resize's in-band size report** (mode 2048) waits in the replies until the pump's next read
   or a paste takes it, so a program waiting only for that report after a resize stalls until it
   writes something else.
-- **A kill report can go to an ended tab.** `ConsolePty` keeps its console number after closing
-  it, ended tabs stay in the service's list until closed, and the kernel hands the freed number to
-  the next console, so the service's routing by number (android/service) can write the report
-  into an older ended tab with the same number instead of the live one.
 - **`VtKeys` maps `KEYCODE_MENU`**, which Android counts as a system key, so it never reaches the
   encoder.
 - **The tab bar's `⋮` has no content description**, so TalkBack reads only the character, unlike
