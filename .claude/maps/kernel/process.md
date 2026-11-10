@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record and failed host spawns last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record, failed host spawns and stale fast-path deadlines last)
 
 ## Responsibilities
 
@@ -462,8 +462,10 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - Fast futex: under the futex lock the value is compared and the waiter enqueued; it sleeps on its
   event; dequeued means woken, still queued after waking hands over to the BKL path, and a relative
   timeout's end time is handed over in `fast_sleep` (as for a relative `nanosleep` or
-  `clock_nanosleep`, whose remaining time it also gives). Wakes are signalled through the deferred
-  list and flushed at once.
+  `clock_nanosleep`, whose remaining time it also gives), which the run loop clears once the BKL
+  path has dispatched that same call, so a deadline its handler never took (the call skipped or
+  renumbered by seccomp or a tracer, or failing first) is dropped. Wakes are signalled through
+  the deferred list and flushed at once.
 
 ### Waiting and waking
 
@@ -825,12 +827,10 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - **Doomed images:** `Machine::spawn` ignores `Image::doomed` and starts the program at pc 0 and
   sp 0 instead of failing the spawn; execve reports its ptrace exec event (and a successful syscall
   exit) for a doomed image, where Linux fails the exec before the event.
-- **A stale fast-path deadline can end a later sleep early:** a relative fast-path wait woken
-  before it finished leaves its deadline in `fast_sleep` for the BKL path, and only the sleep and
-  futex handlers take it; when the call never reaches its handler (a seccomp filter another thread
-  installed with `TSYNC`, or its tracer, skips or renumbers it) or the futex handler's re-read of
-  the timeout fails, it stays, and the thread's next relative sleep or futex wait handled on the
-  BKL path uses that old deadline.
+- **An interrupted no-BKL futex wait reads its timeout again:** handed to the BKL path, the futex
+  handler re-reads the timeout before anything else, so a wait whose timeout memory another thread
+  unmapped meanwhile fails with `EFAULT`, where Linux's restart keeps the deadline and a handler
+  sees `EINTR` (only the later waits are compared, in `edge-cases`).
 - **POSIX timers on a CPU clock of a thread or process that is gone** never fire, yet keep the
   timer thread ticking every 10 ms while their owner lives, report their whole interval as time
   left, and follow a new task that reuses the number.

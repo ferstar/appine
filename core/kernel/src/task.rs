@@ -793,7 +793,14 @@ fn handle(cx: &mut Cx<'_>, cpu: &mut Cpu, exit: Exit) -> Flow {
             invalidate_code(cx, &[ivau]);
             return handle(cx, cpu, exit);
         }
-        Exit::Svc { .. } => return syscall::dispatch(cx, cpu),
+        Exit::Svc { .. } => {
+            let flow = syscall::dispatch(cx, cpu);
+            // A deadline the no-BKL path handed over (TaskState::fast_sleep) is for this call's
+            // handler only: one it never took (the call skipped or renumbered by seccomp or a
+            // tracer, or failing first) must not end the thread's next timed wait early
+            cx.t.fast_sleep = None;
+            return flow;
+        }
         Exit::Kick => return signal::deliver(cx, cpu, false),
         Exit::Undefined { insn } => {
             crate::debug::log(format_args!(

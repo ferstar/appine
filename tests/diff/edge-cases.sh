@@ -4,7 +4,8 @@
 # lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS), timeouts
 # too long for Linux to represent saturating, select ignoring hangups and errors its sets do not
 # take (waiting without spinning), reporting fds it cannot poll (O_PATH) in every set and
-# clamping nfds to the fd table
+# clamping nfds to the fd table, and a timed wait cut short by a signal leaving nothing that
+# shortens the thread's next timed wait
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -528,3 +529,73 @@ int main(void)
 C
 gcc -O2 -o sel sel.c
 ./sel
+
+# A thread's timed futex wait, interrupted by a signal after another thread unmapped its timeout,
+# fails (Linux's restart path keeps the deadline and returns EINTR to the handler; Appine reads
+# the timeout again: EFAULT, not compared); its next timed wait must still wait its whole timeout.
+# Appine's no-BKL wait handed its deadline to the BKL path, which kept it when the call ended
+# before taking it, and a later wait on a shared word (always on the BKL path) ended at it
+cat > stale.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+#define FUTEX_WAIT 0
+#define FUTEX_WAIT_PRIVATE 128
+
+static int *shared;
+static struct timespec *first;
+
+static double now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static void on_usr1(int sig)
+{
+    (void)sig;
+}
+
+static void *sleeper(void *arg)
+{
+    (void)arg;
+    int word = 0;
+    syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, first, NULL, 0);
+    struct timespec three = {3, 0};
+    double t = now();
+    long r = syscall(SYS_futex, shared, FUTEX_WAIT, 0, &three, NULL, 0);
+    printf("next 3 s wait: %ld %s after %s\n", r, r < 0 ? strerror(errno) : "",
+           now() - t >= 2.5 ? "its whole timeout" : "less than its timeout");
+    return NULL;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sigaction(SIGUSR1, &sa, NULL);
+    shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    first = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    first->tv_sec = 2;
+    pthread_t t;
+    pthread_create(&t, NULL, sleeper, NULL);
+    usleep(300000);
+    munmap(first, 4096);
+    pthread_kill(t, SIGUSR1);
+    pthread_join(t, NULL);
+    return 0;
+}
+C
+gcc -O2 -o stale stale.c
+./stale
