@@ -16,7 +16,9 @@
 //!   kept for the host ([`crate::Machine::stall`]), and the app shows it in a notification with
 //!   the bug report;
 //! - when the hold ends: a KERN_ERR record in the kernel log naming the process and how long the
-//!   hold lasted (taking the BKL for it), also kept for the host.
+//!   hold lasted, also kept for the host. Writing the record takes the BKL, so a short-lived
+//!   thread writes it: the next holder may keep the BKL just as long, and the watchdog must go on
+//!   looking meanwhile.
 //!
 //! Durations count from the first look that saw the hold, so they are right to within one look
 //! (2 s by default). Nothing is ended: a hold cannot be interrupted, and one that ends leaves the
@@ -93,7 +95,7 @@ struct Seen {
 }
 
 /// The watchdog's thread, until `stop` is set.
-fn watch(shared: &Shared, stop: &AtomicBool, threshold: Duration) {
+fn watch(shared: &Arc<Shared>, stop: &AtomicBool, threshold: Duration) {
     let look = threshold / 5;
     let mut seen: Option<Seen> = None;
     loop {
@@ -157,8 +159,9 @@ fn report(shared: &Shared, s: &HoldSample, held: Duration) -> (u64, String) {
     (id, name)
 }
 
-/// The reported hold has ended after `held`: records it in the kernel log, taking the BKL.
-fn ended(shared: &Shared, id: u64, s: &HoldSample, host: &str, held: Duration) {
+/// The reported hold has ended after `held`: tells stderr and the host at once, and starts a
+/// thread that records it in the kernel log once it gets the BKL.
+fn ended(shared: &Arc<Shared>, id: u64, s: &HoldSample, host: &str, held: Duration) {
     let secs = held.as_secs();
     let line = match holder(s) {
         Some(guest) => format!(
@@ -167,19 +170,25 @@ fn ended(shared: &Shared, id: u64, s: &HoldSample, host: &str, held: Duration) {
         ),
         None => format!("appine: host thread {host} held the BKL for {secs} s"),
     };
-    let k = shared.lock();
-    let logged = crate::bug::catch(|| {
-        crate::klog::printk(&k.klog, crate::klog::level::ERR, format_args!("{line}"));
-    });
-    drop(k);
-    if logged.is_none() {
-        crate::bug::report(format_args!("kernel panic in the BKL watchdog"));
-    }
     eprintln!("{line}");
     set(shared, id, |stall| {
         stall.secs = secs;
-        stall.ended = Some(line);
+        stall.ended = Some(line.clone());
     });
+    // When the thread cannot start, only the kernel log goes without the record
+    let shared = shared.clone();
+    let _ = std::thread::Builder::new()
+        .name("bkl-watchdog-log".into())
+        .spawn(move || {
+            let k = shared.lock();
+            let logged = crate::bug::catch(|| {
+                crate::klog::printk(&k.klog, crate::klog::level::ERR, format_args!("{line}"));
+            });
+            drop(k);
+            if logged.is_none() {
+                crate::bug::report(format_args!("kernel panic in the BKL watchdog"));
+            }
+        });
 }
 
 /// The guest thread holding the BKL, as `pid 120 (git), thread 121`; None when the holder runs

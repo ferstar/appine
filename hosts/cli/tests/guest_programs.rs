@@ -494,6 +494,49 @@ fn bkl_watchdog_reports_long_holds() {
 }
 
 #[test]
+fn bkl_watchdog_reports_a_hold_right_after_another() {
+    // A second hold starts as soon as the first one ends, while the watchdog's record of the first
+    // waits for the BKL: the watchdog goes on looking and reports the second hold too, and both
+    // records reach the kernel log, in order
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Some(program) = build_c_guest("stall") else {
+        return;
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+        .env("APPINE_TEST_HOOKS", "1")
+        .env("APPINE_BKL_WATCHDOG", "1")
+        .arg(&program)
+        .arg("twice")
+        .output()
+        .expect("failed to run appine-run");
+    let (out, err) = (stdout(&out), stderr(&out));
+    assert!(out.ends_with("all ok\n"), "{out}{err}");
+    let reports: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains(" has held the BKL for "))
+        .collect();
+    assert_eq!(reports.len(), 2, "{err}");
+    let thread = |l: &str| {
+        l.split_once(", thread ")
+            .unwrap()
+            .1
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(thread(reports[0]), thread(reports[1]), "{err}");
+    let records: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains(" held the BKL for "))
+        .collect();
+    assert_eq!(records.len(), 2, "{out}");
+    assert_eq!(thread(records[0]), thread(reports[0]), "{out}{err}");
+}
+
+#[test]
 fn bkl_stall_reaches_the_host() {
     // Machine::stall answers without the BKL while a hold goes on, then carries its kernel log
     // record once it ended

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record last)
 
 ## Responsibilities
 
@@ -604,10 +604,12 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   comm), thread, what it entered for and its pc, or else the host thread, plus the holder's host
   thread name and activity (running, in host syscall n, or its scheduler state); the same line
   becomes the latest `Stall` (ids count from 1 per kernel; seconds updated at each look).
-- When a later look sees the lock free or another hold: a KERN_ERR kernel log record naming the
-  holder and the total seconds (taking the BKL to write it, and so waiting behind the next holder;
-  a panic there is only reported), the same line on stderr, and the `Stall` updated with it.
-  Durations count from the first look, so they are right to within one look. Nothing is ended.
+- When a later look sees the lock free or another hold: at once a line naming the holder and the
+  total seconds on stderr and in the `Stall`, and the same line as a KERN_ERR kernel log record,
+  which a short-lived thread (`bkl-watchdog-log`) writes once it gets the BKL, so the watchdog
+  goes on looking, and reports the next hold, while that holder keeps it (a panic writing it is
+  only reported; when the thread cannot start the record is lost). Durations count from the first
+  look, so they are right to within one look. Nothing is ended.
 - `Machine::stall` returns the latest `Stall` without the BKL; the watchdog is stopped and joined
   last in `Machine`'s drop.
 
@@ -833,9 +835,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - **POSIX timers on a CPU clock of a thread or process that is gone** never fire, yet keep the
   timer thread ticking every 10 ms while their owner lives, report their whole interval as time
   left, and follow a new task that reuses the number.
-- **The BKL watchdog stops looking while it reports a stall's end:** writing the kernel log record
-  takes the BKL, so it waits behind the next holder, and a next hold that never ends is never
-  reported.
 - **`sched_setattr` changes the policy before the nice check**, so a refused nice value can leave
   the policy (and reset-on-fork) changed.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
