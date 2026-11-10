@@ -435,6 +435,10 @@ class TerminalService : Service() {
             notifyTab(session, title, text, quiet = false)
         }
 
+        override fun onTmuxDetached(session: VtSession) {
+            session.showMessage("[appine] " + getString(R.string.tmux_control_detached))
+        }
+
         override fun onFinished(session: VtSession) {
             // The notification counts running tabs, and an ended tab is no longer saved
             sessionsChanged()
@@ -833,6 +837,7 @@ class TerminalService : Service() {
     internal fun createSession(account: String = login, cwd: String? = null): VtSession {
         val pty = ConsolePty(machine, ConsolePty.script(this), account, cwd)
         val session = VtSession(nextSessionId++, pty, machine, sessionEvents)
+        session.setCursor(cursorStyle, cursorBlink)
         sessions.add(session)
         sessionsChanged()
         return session
@@ -1409,6 +1414,47 @@ class TerminalService : Service() {
     }
 
     /**
+     * The cursor's default shape, as Ghostty's cursor-style (a choice in Settings): a block by
+     * default ([VtNative.CURSOR_BLOCK]), a bar or an underline. Every tab takes it at once, unless
+     * a program chose its own cursor (DECSCUSR), which the program's reset brings back to it.
+     */
+    val cursorStyle: Int
+        get() = when (getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_CURSOR_STYLE, null)) {
+            CURSOR_BAR -> VtNative.CURSOR_BAR
+            CURSOR_UNDERLINE -> VtNative.CURSOR_UNDERLINE
+            else -> VtNative.CURSOR_BLOCK
+        }
+
+    fun setCursorStyle(style: Int) {
+        val name = when (style) {
+            VtNative.CURSOR_BAR -> CURSOR_BAR
+            VtNative.CURSOR_UNDERLINE -> CURSOR_UNDERLINE
+            else -> CURSOR_BLOCK
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putString(KEY_CURSOR_STYLE, name) }
+        cursorChanged()
+    }
+
+    /**
+     * Whether the cursor blinks by default, as Ghostty's cursor-style-blink (a switch in Settings,
+     * on by default); programs may still choose otherwise.
+     */
+    val cursorBlink: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_CURSOR_BLINK, true)
+
+    fun setCursorBlink(on: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_CURSOR_BLINK, on) }
+        cursorChanged()
+    }
+
+    /** Gives every tab, restored ones not shown yet included, the cursor settings. */
+    private fun cursorChanged() {
+        val style = cursorStyle
+        val blink = cursorBlink
+        sessions.forEach { it.setCursor(style, blink) }
+        settingsChanged()
+    }
+
+    /**
      * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
      * takes it from Settings, effective at the next kernel start; a release build always runs Tier
      * 1, ignoring a value recorded by an earlier debug install.
@@ -1616,6 +1662,13 @@ class TerminalService : Service() {
         private const val KEY_LOGIN = "login"
         private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
         private const val KEY_FILL_WIDE = "fill_wide"
+        private const val KEY_CURSOR_STYLE = "cursor_style"
+        private const val KEY_CURSOR_BLINK = "cursor_blink"
+
+        // The cursor shapes as recorded, Ghostty's cursor-style values
+        private const val CURSOR_BLOCK = "block"
+        private const val CURSOR_BAR = "bar"
+        private const val CURSOR_UNDERLINE = "underline"
 
         /**
          * The login account in Settings (see the instance's [login]); the DocumentsProvider needs

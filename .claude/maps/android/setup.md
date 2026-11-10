@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; the profile's prompt marks and replaced versions last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; the profile's prompt marks and replaced versions; the cursor settings last)
 
 ## Responsibilities
 
@@ -35,12 +35,13 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 - `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe), `Download`
   (urls, sha256, size), `Cancelled`, `Account`, `access` (a `ReentrantReadWriteLock`).
 - Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`, read
-  by debug builds only; `login`, `keep_awake`, `system_documents`, `fill_wide`).
+  by debug builds only; `login`, `keep_awake`, `system_documents`, `fill_wide`, `cursor_style` (a
+  Ghostty `cursor-style` name: `block`, the default, `bar` or `underline`), `cursor_blink`).
 - `SettingsActivity` — an `AppCompatActivity` on the Material 3 page that it shares with the
   licenses (`android/terminal`'s `page.xml`, `list_item.xml`, `list_header.xml`); rows in groups
   under headings: System (distro, mirror, login account, reset), Android (keep-awake, system
-  documents), Terminal (CJK characters filling two cells, `android/terminal`), Debugging (tier,
-  debug builds only) and About (licenses).
+  documents), Terminal (CJK characters filling two cells, the cursor's shape and whether it
+  blinks, `android/terminal`), Debugging (tier, debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
 - `profile.sh` — copied verbatim, comments included, into the guest as
   `/etc/profile.d/appine.sh`; `Rootfs` keeps the texts of the versions without prompt marks
@@ -155,6 +156,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   turns the distro row into "cancel".
 - The tier row exists only in a debug build (`BuildConfig.DEBUG`); a release build has no way to
   choose and always runs Tier 1.
+- The terminal's rows are usable at any time: the cursor shape is a choice of Block, Bar and
+  Underline (the summary names the current one), blinking a toggle (on by default); the service
+  gives every tab the new values at once (android/service).
 - Display: a row is a title over its value or description; a toggle row adds a `MaterialSwitch`
   that only shows the state (tapping the row toggles, and accessibility services see the row as a
   switch), whose first state jumps into place instead of sliding; a disabled row is drawn at 38%

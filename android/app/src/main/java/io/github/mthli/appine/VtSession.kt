@@ -57,6 +57,12 @@ internal class VtSession(
          */
         fun onCommandFinished(session: VtSession, exitCode: Int?, millis: Long)
 
+        /**
+         * tmux's control mode (tmux -CC), which the terminal cannot show and detached as it
+         * started, ended; its session goes on without the tab.
+         */
+        fun onTmuxDetached(session: VtSession)
+
         fun onFinished(session: VtSession)
     }
 
@@ -127,6 +133,13 @@ internal class VtSession(
 
     /** A restored tab's notice and messages to show before the shell's output. */
     private var pending: ByteArray? = null
+
+    /**
+     * The cursor's default shape ([VtNative.CURSOR_BLOCK], [VtNative.CURSOR_BAR] or
+     * [VtNative.CURSOR_UNDERLINE]) and blinking, from Settings ([setCursor]).
+     */
+    private var cursorStyle = VtNative.CURSOR_BLOCK
+    private var cursorBlink = true
 
     // The grid the terminal and the console have
     private var cols = 0
@@ -221,6 +234,19 @@ internal class VtSession(
     }
 
     /**
+     * The cursor's default [style] and whether it [blink]s, the settings' (the service gives them
+     * to every tab): shown at once unless a program chose its own cursor, and given to the terminal
+     * when it is made, a restored one included.
+     */
+    fun setCursor(style: Int, blink: Boolean) {
+        cursorStyle = style
+        cursorBlink = blink
+        if (tab == 0L) return
+        VtNative.setCursor(tab, style, blink)
+        view?.invalidate()
+    }
+
+    /**
      * A restored tab: its terminal comes back from the [snapshot] the loader reads when the shell
      * starts, or, without one that decodes, shows [text] (a terminal byte stream, the transcript);
      * then the [notice] and the shell's output follow.
@@ -272,6 +298,7 @@ internal class VtSession(
             return
         }
         tab = t
+        VtNative.setCursor(t, cursorStyle, cursorBlink)
         this.cols = cols
         this.rows = rows
         this.cellWidth = cellWidth
@@ -476,6 +503,15 @@ internal class VtSession(
     @Suppress("unused")
     fun onCommandFinished(hasExit: Boolean, exit: Int, millis: Long) {
         main.post { if (!released) events.onCommandFinished(this, exit.takeIf { hasExit }, millis) }
+    }
+
+    /**
+     * From vt.rs, on the pump thread: tmux's control mode ended, which vt.c detached with an empty
+     * line as it started (the tab would show nothing of it).
+     */
+    @Suppress("unused")
+    fun onTmuxDetached() {
+        main.post { if (!released) events.onTmuxDetached(this) }
     }
 
     /**

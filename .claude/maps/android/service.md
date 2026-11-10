@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: a failed start waiting for a switch, its cancel, exiting, kill reports to the open console, status notifications, scrollback trimming, snapshots, clipboard reads, finished commands last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: a failed start waiting for a switch or its cancel, exiting, kill reports, status and command notifications, scrollback trimming, snapshots, clipboard reads, cursor settings, tmux -CC last)
 
 ## Responsibilities
 
@@ -23,8 +23,8 @@ outlives an Activity:
   program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
   finish;
 - the settings state that the activities only display and forward (tier in debug builds,
-  keep-awake, login account, system documents, CJK characters filling two cells, distro switch,
-  mirror).
+  keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
+  shape and blinking, distro switch, mirror).
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Tabs.kt`.
 
@@ -56,7 +56,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `nextSessionId` (counting up from the clock, never wrapped), `bellNotified` (when each tab's bell
   last notified), `statusNotified` (the program status a tab's notification shows, while it shows
   one); `sessionEvents` (title changed, bell, clipboard write, notification, clipboard read,
-  progress or status changed, a command finished, the shell finished).
+  progress or status changed, a command finished, tmux's control mode detached, the shell
+  finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
@@ -81,8 +82,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier` (ignored in a release
   build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`, `setMirror`/`autoMirror`,
-  `setLogin`, `setSystemDocuments`, `setFillWide`, `takeNotice`; state read by them: `machine`,
-  `startError`, `progress`, `switching`, `sessions`, `focus`, the settings.
+  `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
+  `takeNotice`; state read by them: `machine`, `startError`, `progress`, `switching`, `sessions`,
+  `focus`, the settings.
 - Static settings read without the service: `login()` and `showSystemDocuments()` by `Documents`,
   `fillWide()` by `MainActivity` (in `onStart` and `onSettingsChanged`).
 
@@ -192,8 +194,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Sessions, saving and restore
 
-- `createSession` builds a `ConsolePty` and a `VtSession` with the next id; the shell starts when a
-  view first knows its size. A title change only calls the listeners' `onSessionsChanged`; a
+- `createSession` builds a `ConsolePty` and a `VtSession` with the next id and gives it the
+  cursor settings (`VtSession.setCursor`: the shape, a `GhosttyCursorStyle`, recorded as Ghostty's
+  `cursor-style` name, and blinking); changing either in Settings gives every tab, restored ones
+  not shown yet included, the new values at once. The shell starts when a view first knows its
+  size. A title change only calls the listeners' `onSessionsChanged`; a
   shell's end, and opening or closing a tab, go through `sessionsChanged` (the notification's
   count, the listeners, a save 2 s later while a kernel runs). `removeSession` releases the session
   and takes its notification away, as `detach` and `onDestroy` do for every tab.
@@ -247,6 +252,10 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
   Android lets an app read the clipboard only while it has the focus, and the program would
   otherwise wait for a timeout.
+- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/terminal),
+  ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
+  (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
+  back.
 - A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
   terminal, android/terminal) after at least 10 s, in a tab not in front (another tab shown, or
   the terminal Activity not listening), becomes the tab's notification, as Ghostty's

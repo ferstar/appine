@@ -57,6 +57,8 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
     private lateinit var keepAwake: Row
     private lateinit var systemDocuments: Row
     private lateinit var fillWide: Row
+    private lateinit var cursorStyle: Row
+    private lateinit var cursorBlink: Row
     private lateinit var licenses: Row
 
     private val connection = object : ServiceConnection {
@@ -95,6 +97,8 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             service?.let { it.setSystemDocuments(!it.systemDocuments) }
         }
         fillWide = Row(R.string.settings_fill_wide, toggle = true) { service?.let { it.setFillWide(!it.fillWide) } }
+        cursorStyle = Row(R.string.settings_cursor_style) { onCursorStyle() }
+        cursorBlink = Row(R.string.settings_cursor_blink, toggle = true) { service?.let { it.setCursorBlink(!it.cursorBlink) } }
         // AGPL sections 0 and 5's "Appropriate Legal Notices": copyright, no warranty, the license,
         // and where to read the full text
         licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
@@ -103,7 +107,7 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         // The guest system; the Android side (power, the Files app); the terminal's look
         group(R.string.settings_group_system, distro, mirror, account, reset)
         group(R.string.settings_group_android, keepAwake, systemDocuments)
-        group(R.string.settings_group_terminal, fillWide)
+        group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink)
         tier?.let { group(R.string.settings_group_debug, it) }
         group(R.string.settings_group_about, licenses)
 
@@ -257,6 +261,8 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
         systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
+        cursorStyle.set(getString(CURSOR_LABELS[CURSOR_STYLES.indexOf(s.cursorStyle).coerceAtLeast(0)]), true)
+        cursorBlink.set(getString(if (s.cursorBlink) R.string.cursor_blink_on else R.string.cursor_blink_off), true, s.cursorBlink)
     }
 
     private fun loginSummary(login: String): String = when (login) {
@@ -366,6 +372,20 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             .show()
     }
 
+    /** Chooses the cursor's default shape: a block, a bar or an underline. */
+    private fun onCursorStyle() {
+        val s = service ?: return
+        val labels = CURSOR_LABELS.map { getString(it) }.toTypedArray()
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.settings_cursor_style)
+            .setSingleChoiceItems(labels, CURSOR_STYLES.indexOf(s.cursorStyle)) { dialog, i ->
+                dialog.dismiss()
+                s.setCursorStyle(CURSOR_STYLES[i])
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
     private fun onTier() {
         val s = service ?: return
         val tiers = intArrayOf(1, 0)
@@ -389,5 +409,9 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
     companion object {
         /** Material 3's opacity for disabled content. */
         private const val DISABLED_ALPHA = 0.38f
+
+        /** The cursor shapes offered, in order, and their names. */
+        private val CURSOR_STYLES = intArrayOf(VtNative.CURSOR_BLOCK, VtNative.CURSOR_BAR, VtNative.CURSOR_UNDERLINE)
+        private val CURSOR_LABELS = intArrayOf(R.string.cursor_block, R.string.cursor_bar, R.string.cursor_underline)
     }
 }

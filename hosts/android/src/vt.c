@@ -179,6 +179,14 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // "133;A;redraw=last;cl=line;aid=" and the shell's pid)
 #define OSC_HEAD 64
 
+// tmux's control mode (tmux -CC) wraps everything it prints in a DCS string with this header, for
+// terminals that turn it into windows and tabs (iTerm2's). libghostty-vt built for apps leaves
+// tmux control mode out with Oniguruma, so it swallows the string as an unknown DCS: the tab would
+// show nothing until tmux left control mode, while keys reached tmux as commands. appine_vt_feed
+// keeps the first DCS_HEAD bytes of a DCS string to find it
+#define TMUX_CONTROL "1000p"
+#define DCS_HEAD 5
+
 // How a tap on the input typed at the shell's prompt moves its cursor there
 // (appine_vt_prompt_click), as the last prompt's start (OSC 133;A) declared: not at all; with left
 // and right arrows within the input's line (cl=line, and cl=m, v and w, which Ghostty treats as
@@ -331,6 +339,8 @@ typedef struct {
   bool command_has_exit;
   int32_t command_exit;
   uint64_t command_ms;
+  // tmux's control mode, which the app detached (tmux_started), ended
+  bool tmux_detached;
 } AppineVtEffects;
 
 // One image placement of a frame (see the format above), with what puts it in drawing order and
@@ -410,6 +420,14 @@ typedef struct AppineVt {
   bool osc_open;
   uint8_t osc_head[OSC_HEAD];
   size_t osc_len;
+  // The DCS string the output is in (appine_vt_feed): its first DCS_HEAD bytes and its length so
+  // far; whether it is tmux's control mode, which the app detached (tmux_started), and whether one
+  // ended since appine_vt_take_effects
+  bool dcs_open;
+  uint8_t dcs_head[DCS_HEAD];
+  size_t dcs_len;
+  bool tmux_control;
+  bool tmux_detached;
   // How a tap on the shell's input moves its cursor (PROMPT_CLICK_*), as the primary screen's last
   // prompt start declared it (osc_ended); a full reset forgets it, as libghostty-vt's screen does
   uint8_t prompt_click;
@@ -417,11 +435,14 @@ typedef struct AppineVt {
   // the handle, or a whole output selected; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
   GhosttyTrackedGridRef anchor_end;
-  // A press that selected a word or a line and the drag after it (appine_vt_gesture_*):
-  // libghostty-vt's selection gesture, which tracks the pressed cell, and its reusable events
+  // A press that selected a word or a line and the drag after it (appine_vt_gesture_*), or a
+  // mouse's clicks and drags (appine_vt_mouse_*): libghostty-vt's selection gesture, which tracks
+  // the pressed cell, and its reusable events (a mouse's presses are timed, a finger's not)
   GhosttySelectionGesture gesture;
   GhosttySelectionGestureEvent gesture_press;
   GhosttySelectionGestureEvent gesture_drag;
+  GhosttySelectionGestureEvent mouse_press;
+  GhosttySelectionGestureEvent mouse_release;
   // A cell in a command's output that a long press found (appine_vt_output_at), for the menu's
   // Select output; tracked, so output does not move it. NULL when none
   GhosttyTrackedGridRef output_at;
@@ -838,6 +859,16 @@ AppineVt *appine_vt_restore(const uint8_t *data, size_t len, uint16_t cols, uint
   return wrap(term, cols, rows, cell_width, cell_height);
 }
 
+// The cursor's defaults, the user's setting (Ghostty's cursor-style and cursor-style-blink): its
+// shape (GhosttyCursorStyle: bar, block or underline) and whether it blinks. Shown at once unless a
+// program chose a cursor of its own (DECSCUSR), and what DECSCUSR's default (CSI 0 q), DECSTR and a
+// full reset bring back; a full reset keeps the setting.
+void appine_vt_set_cursor(AppineVt *vt, int style, bool blink) {
+  GhosttyCursorStyle shape = (GhosttyCursorStyle)style;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_STYLE, &shape);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
+}
+
 static void append(Buf *b, const char *s) {
   size_t len = strlen(s);
   if (!buf_reserve(b, len)) return;
@@ -918,6 +949,12 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
           GHOSTTY_SUCCESS ||
       ghostty_selection_gesture_event_new(NULL, &vt->gesture_drag,
                                           GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_new(NULL, &vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_new(NULL, &vt->mouse_release,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE) !=
           GHOSTTY_SUCCESS) {
     appine_vt_free(vt);
     return NULL;
@@ -977,8 +1014,9 @@ static AppineVt *wrap(GhosttyTerminal term, uint16_t cols, uint16_t rows, uint32
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &graphemes);
   // A blinking block by default, as in Ghostty without cursor-style-blink (libghostty-vt's default
-  // is steady): DECSCUSR's default (CSI 0 q), DECSTR and RIS bring the blinking back, and programs
-  // can still stop it with DECSCUSR or mode 12. Applied at once unless a program chose a style
+  // is steady), until the app sets the user's (appine_vt_set_cursor): DECSCUSR's default
+  // (CSI 0 q), DECSTR and RIS bring the blinking back, and programs can still stop it with DECSCUSR
+  // or mode 12. Applied at once unless a program chose a style
   bool blink = true;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &blink);
   // Kitty graphics, drawn by the view from the frames' placements; a full reset keeps the limit
@@ -1015,6 +1053,8 @@ void appine_vt_free(AppineVt *vt) {
   if (vt->gesture) ghostty_selection_gesture_free(vt->gesture, vt->term);
   if (vt->gesture_press) ghostty_selection_gesture_event_free(vt->gesture_press);
   if (vt->gesture_drag) ghostty_selection_gesture_event_free(vt->gesture_drag);
+  if (vt->mouse_press) ghostty_selection_gesture_event_free(vt->mouse_press);
+  if (vt->mouse_release) ghostty_selection_gesture_event_free(vt->mouse_release);
   if (vt->images) ghostty_render_state_image_iterator_free(vt->images);
   free(vt->placed);
   free(vt->matches);
@@ -1054,12 +1094,16 @@ static void osc_ended(AppineVt *vt);
 static bool is_alternate(AppineVt *vt);
 bool appine_vt_at_prompt(AppineVt *vt);
 
+static void tmux_started(AppineVt *vt);
+
 // Feeds console output to the terminal. It stops at the ends of OSC strings to find clipboard reads
 // (OSC 52 with "?" for data), which libghostty-vt answers only from a callback that must answer at
 // once and so without asking the user, as Ghostty's clipboard-read = ask does: they are counted
 // for the app (appine_vt_take_effects), which asks and answers itself, as Ghostty's own app does.
+// It also stops at the starts and ends of DCS strings to find tmux's control mode (TMUX_CONTROL).
 void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
-  uint32_t want = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+  uint32_t want = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END |
+                  GHOSTTY_TERMINAL_BOUNDARY_DCS_START | GHOSTTY_TERMINAL_BOUNDARY_DCS_END;
   size_t off = 0;
   while (off < len) {
     GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
@@ -1067,9 +1111,13 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
     if (r != GHOSTTY_SUCCESS && r != GHOSTTY_NO_VALUE) {
       ghostty_terminal_vt_write(vt->term, data + off, len - off);
       vt->osc_open = false;
+      vt->dcs_open = false;
+      vt->tmux_control = false;
       break;
     }
-    bool ended = r == GHOSTTY_SUCCESS && (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END);
+    uint32_t reached = r == GHOSTTY_SUCCESS ? stop.reached : 0;
+    bool ended = reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
+    bool dcs_ended = reached & GHOSTTY_TERMINAL_BOUNDARY_DCS_END;
     size_t n = r == GHOSTTY_SUCCESS ? stop.consumed : len - off;
     if (vt->osc_open) {
       // The string's content: what was consumed but the byte that ended it
@@ -1080,15 +1128,44 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
       }
       vt->osc_len += content;
     }
+    if (vt->dcs_open) {
+      // Its header (parameters, intermediates, final byte) comes first
+      size_t content = dcs_ended ? n - 1 : n;
+      size_t had = vt->dcs_len;
+      if (had < DCS_HEAD) {
+        size_t keep = DCS_HEAD - had < content ? DCS_HEAD - had : content;
+        memcpy(vt->dcs_head + had, data + off, keep);
+      }
+      vt->dcs_len += content;
+      if (had < DCS_HEAD && vt->dcs_len >= DCS_HEAD &&
+          memcmp(vt->dcs_head, TMUX_CONTROL, DCS_HEAD) == 0) {
+        tmux_started(vt);
+      }
+    }
     off += n;
     if (ended) {
       // A cancelled string (CAN, SUB) does not run
       if (vt->osc_open && stop.end != GHOSTTY_TERMINAL_STRING_END_CANCELLED) osc_ended(vt);
       vt->osc_open = false;
     }
-    if (r == GHOSTTY_SUCCESS && (stop.reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_START)) {
+    if (dcs_ended) {
+      // tmux ends it with ST once detached (libghostty-vt reports ST_ESC at its ESC; past the
+      // header, 0x9C is payload); a string cancelled (CAN, SUB) or cut short ended otherwise, as
+      // the OSC strings above do not run then
+      if (vt->tmux_control && (stop.end == GHOSTTY_TERMINAL_STRING_END_ST_ESC ||
+                               stop.end == GHOSTTY_TERMINAL_STRING_END_ST_C1)) {
+        vt->tmux_detached = true;
+      }
+      vt->tmux_control = false;
+      vt->dcs_open = false;
+    }
+    if (reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_START) {
       vt->osc_open = true;
       vt->osc_len = 0;
+    }
+    if (reached & GHOSTTY_TERMINAL_BOUNDARY_DCS_START) {
+      vt->dcs_open = true;
+      vt->dcs_len = 0;
     }
   }
   // A command's start for a shell that does not mark it (on_semantic_prompt): the input ended
@@ -1096,6 +1173,16 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
   if (vt->was_at_prompt && !at_prompt && vt->command_start == 0) vt->command_start = now_ns();
   vt->was_at_prompt = at_prompt;
   changed(vt);
+}
+
+// tmux started its control mode, which the terminal cannot show: an empty line detaches it at
+// once, as the user's Enter would, leaving its session running (tmux attach brings it back in the
+// tab), and the string's end tells the app to say so (tmux_detached). The line goes out with the
+// replies the pump writes before reading again
+static void tmux_started(AppineVt *vt) {
+  vt->tmux_control = true;
+  if (!buf_reserve(&vt->replies, 1)) return;
+  vt->replies.ptr[vt->replies.len++] = '\r';
 }
 
 static void prompt_started(AppineVt *vt, const uint8_t *options, size_t len);
@@ -2105,12 +2192,11 @@ bool appine_vt_gesture_press(AppineVt *vt, int behavior, uint16_t x, uint16_t y,
   return false;
 }
 
-// Drags the gesture on to viewport cell (x, y), at pixel (px, py) from the grid's corner: the
-// selection runs by whole words or lines from the pressed cell's to the cell's (passing over
-// blanks and punctuation, a word drag stays on the last word reached; a line drag takes in blank
-// lines too). False, leaving the selection as it was, without a gesture, or when there is nothing
-// to select towards the cell or the pressed cell has gone (its screen changed).
-bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py) {
+// Applies a drag of the gesture to viewport cell (x, y), at pixel (px, py) from the grid's corner,
+// making the selection a rectangle when asked (a cell drag's only); the selection it makes goes to
+// sel, not yet installed. GHOSTTY_NO_VALUE when it makes none.
+static GhosttyResult gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py,
+                                  bool rectangle, GhosttySelection *sel) {
   GhosttySelectionGestureGeometry geometry = {
       .columns = vt->cols,
       .cell_width = vt->cell_width,
@@ -2119,25 +2205,191 @@ bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, dou
   };
   GhosttySurfacePosition at = {.x = px, .y = py};
   GhosttyGridRef ref;
+  if (!viewport_ref(vt, x, y, &ref) ||
+      ghostty_selection_gesture_event_set(vt->gesture_drag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                          &ref) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                          &at) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
+                                          &geometry) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event_set(vt->gesture_drag,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_RECTANGLE,
+                                          &rectangle) != GHOSTTY_SUCCESS) {
+    return GHOSTTY_INVALID_VALUE;
+  }
+  return ghostty_selection_gesture_event(vt->gesture, vt->term, vt->gesture_drag, sel);
+}
+
+// Drags the gesture on to viewport cell (x, y), at pixel (px, py) from the grid's corner: the
+// selection runs by whole words or lines from the pressed cell's to the cell's (passing over
+// blanks and punctuation, a word drag stays on the last word reached; a line drag takes in blank
+// lines too). False, leaving the selection as it was, without a gesture, or when there is nothing
+// to select towards the cell or the pressed cell has gone (its screen changed).
+bool appine_vt_gesture_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py) {
   GhosttySelection sel = {0};
-  return viewport_ref(vt, x, y, &ref) &&
-         ghostty_selection_gesture_event_set(vt->gesture_drag,
-                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
-                                             &ref) == GHOSTTY_SUCCESS &&
-         ghostty_selection_gesture_event_set(vt->gesture_drag,
-                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
-                                             &at) == GHOSTTY_SUCCESS &&
-         ghostty_selection_gesture_event_set(vt->gesture_drag,
-                                             GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY,
-                                             &geometry) == GHOSTTY_SUCCESS &&
-         ghostty_selection_gesture_event(vt->gesture, vt->term, vt->gesture_drag, &sel) ==
-             GHOSTTY_SUCCESS &&
+  return gesture_drag(vt, x, y, px, py, false, &sel) == GHOSTTY_SUCCESS &&
          ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS;
 }
 
 // Ends the gesture (the finger lifted), keeping its selection and releasing the pressed cell's
 // tracking.
 void appine_vt_gesture_end(AppineVt *vt) { ghostty_selection_gesture_reset(vt->gesture, vt->term); }
+
+// A mouse's (or touchpad's) left button selects as Ghostty's does, through the same gesture, its
+// presses timed so that libghostty-vt counts the clicks: a first click clears the selection and a
+// drag from it selects by cells, a cell counting once the drag passes its point 60% of the way
+// across (libghostty-vt's threshold; a rectangle while the view says so), a second click selects
+// the word and a third the line (the command's output when asked), each dragging on by its unit. A
+// release ends the drag but keeps the count, so the next press nearby within the interval is the
+// next click; anything else that starts a gesture (a finger's) or clears the selection resets it.
+
+// Presses the left button at viewport cell (x, y), at pixel (px, py) from the grid's corner, at
+// time_ns on a monotonic clock, a press within interval_ns of the last and a cell's width of it
+// counting as its next click. Installs the click's selection (none after a first click, which
+// clears it; a second or third on blanks leaves the selection as it was) and returns the click
+// count (1 to 3), or 0 when the press could not be applied (the gesture is then reset).
+int appine_vt_mouse_press(AppineVt *vt, uint16_t x, uint16_t y, double px, double py,
+                          uint64_t time_ns, uint64_t interval_ns, bool output) {
+  drop_anchor(vt);
+  drop_output(vt);
+  GhosttySelectionGestureBehaviors behaviors = {
+      .single_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_CELL,
+      .double_click = GHOSTTY_SELECTION_GESTURE_BEHAVIOR_WORD,
+      .triple_click = output ? GHOSTTY_SELECTION_GESTURE_BEHAVIOR_OUTPUT
+                             : GHOSTTY_SELECTION_GESTURE_BEHAVIOR_LINE,
+  };
+  double distance = vt->cell_width;
+  GhosttySurfacePosition at = {.x = px, .y = py};
+  GhosttyGridRef ref;
+  GhosttySelection sel = {0};
+  uint8_t count = 0;
+  GhosttyResult r = GHOSTTY_INVALID_VALUE;
+  if (viewport_ref(vt, x, y, &ref) &&
+      ghostty_selection_gesture_event_set(vt->mouse_press, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                          &ref) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION,
+                                          &at) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_BEHAVIORS,
+                                          &behaviors) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS,
+                                          &time_ns) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS,
+                                          &interval_ns) == GHOSTTY_SUCCESS &&
+      ghostty_selection_gesture_event_set(vt->mouse_press,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE,
+                                          &distance) == GHOSTTY_SUCCESS) {
+    r = ghostty_selection_gesture_event(vt->gesture, vt->term, vt->mouse_press, &sel);
+  }
+  if ((r != GHOSTTY_SUCCESS && r != GHOSTTY_NO_VALUE) ||
+      ghostty_selection_gesture_get(vt->gesture, vt->term,
+                                    GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT,
+                                    &count) != GHOSTTY_SUCCESS ||
+      count == 0) {
+    appine_vt_select_clear(vt);
+    return 0;
+  }
+  if (r == GHOSTTY_SUCCESS) {
+    // An output's bounds are looked for beyond the viewport
+    if (output && count == 3) vt->compress_touched = true;
+    ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel);
+  } else if (count == 1) {
+    ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  }
+  return count;
+}
+
+// Drags the held left button on to viewport cell (x, y), at pixel (px, py) from the grid's corner
+// (outside the grid, the edge cell under it): the selection becomes the one the press's unit makes
+// from the pressed cell (a cell drag a rectangle when asked), or none (a cell drag not yet past
+// its threshold), as Ghostty installs it. Returns 1 with a selection, 0 without, and -1, changing
+// nothing, when no press is under way (none was made, the gesture was reset, or the pressed cell's
+// screen has gone).
+int appine_vt_mouse_drag(AppineVt *vt, uint16_t x, uint16_t y, double px, double py,
+                         bool rectangle) {
+  uint8_t count = 0;
+  GhosttyGridRef anchor = {0};
+  if (ghostty_selection_gesture_get(vt->gesture, vt->term,
+                                    GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT,
+                                    &count) != GHOSTTY_SUCCESS ||
+      count == 0 ||
+      ghostty_selection_gesture_get(vt->gesture, vt->term, GHOSTTY_SELECTION_GESTURE_DATA_ANCHOR,
+                                    &anchor) != GHOSTTY_SUCCESS) {
+    return -1;
+  }
+  drop_anchor(vt);
+  drop_output(vt);
+  GhosttySelection sel = {0};
+  GhosttyResult r = gesture_drag(vt, x, y, px, py, rectangle, &sel);
+  if (r == GHOSTTY_SUCCESS &&
+      ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &sel) == GHOSTTY_SUCCESS) {
+    return 1;
+  }
+  if (r == GHOSTTY_NO_VALUE) {
+    ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+    return 0;
+  }
+  return -1;
+}
+
+// Releases the left button at viewport cell (x, y), or outside the grid (x or y negative or past
+// it, which counts as having moved away). Returns the click count, negated when the press moved
+// from its cell or its drag selected (no click then), or 0 without a press under way.
+int appine_vt_mouse_release(AppineVt *vt, int x, int y) {
+  GhosttyGridRef ref;
+  bool inside = x >= 0 && y >= 0 && x < vt->cols && y < vt->height &&
+                viewport_ref(vt, (uint16_t)x, (uint16_t)y, &ref);
+  uint8_t count = 0;
+  bool dragged = true;
+  if (ghostty_selection_gesture_event_set(vt->mouse_release,
+                                          GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                          inside ? &ref : NULL) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_event(vt->gesture, vt->term, vt->mouse_release, NULL) ==
+          GHOSTTY_INVALID_VALUE ||
+      ghostty_selection_gesture_get(vt->gesture, vt->term,
+                                    GHOSTTY_SELECTION_GESTURE_DATA_CLICK_COUNT,
+                                    &count) != GHOSTTY_SUCCESS ||
+      ghostty_selection_gesture_get(vt->gesture, vt->term, GHOSTTY_SELECTION_GESTURE_DATA_DRAGGED,
+                                    &dragged) != GHOSTTY_SUCCESS) {
+    return 0;
+  }
+  return dragged ? -(int)count : (int)count;
+}
+
+// A right-click at viewport cell (x, y), as Ghostty's for its context menu: a selection holding
+// the cell stays; otherwise the word there is selected (on a written space, the run of spaces),
+// and on empty cells the selection stays as it was. True when there is a selection afterwards.
+bool appine_vt_select_context(AppineVt *vt, uint16_t x, uint16_t y) {
+  GhosttySelection sel = {0};
+  bool has = ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_SELECTION, &sel) ==
+             GHOSTTY_SUCCESS;
+  if (x >= vt->cols) x = vt->cols - 1;
+  if (y >= vt->height) y = vt->height - 1;
+  GhosttyPoint p = {.tag = GHOSTTY_POINT_TAG_VIEWPORT, .value.coordinate = {.x = x, .y = y}};
+  bool inside = false;
+  if (has && ghostty_terminal_selection_contains(vt->term, &sel, p, &inside) == GHOSTTY_SUCCESS &&
+      inside) {
+    return true;
+  }
+  GhosttyTerminalSelectWordOptions word = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+  GhosttySelection selected = {0};
+  if (!viewport_ref(vt, x, y, &word.ref) ||
+      ghostty_terminal_select_word(vt->term, &word, &selected) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_SELECTION, &selected) !=
+          GHOSTTY_SUCCESS) {
+    return has;
+  }
+  // Only now: untracking may change the page list the references above point into
+  drop_anchor(vt);
+  drop_output(vt);
+  ghostty_selection_gesture_reset(vt->gesture, vt->term);
+  return true;
+}
 
 // Starts dragging a selection handle: the other end becomes the anchor. end is the handle of the
 // selection's last cell, else its first. False when there is no selection.
@@ -2770,6 +3022,8 @@ static void write_own(AppineVt *vt, const Buf *seq) {
     static const uint8_t can = 0x18;
     ghostty_terminal_vt_write(vt->term, &can, 1);
     vt->osc_open = false;
+    vt->dcs_open = false;
+    vt->tmux_control = false;
   }
   size_t replies = vt->replies.len;
   if (seq->ptr != NULL) ghostty_terminal_vt_write(vt->term, seq->ptr, seq->len);
@@ -2838,9 +3092,9 @@ bool appine_vt_take_title_changed(AppineVt *vt) {
   return changed;
 }
 
-// The bells, clipboard write, notification, progress and status reports, clipboard reads and the
-// last command finished since the last call (vt.rs's `Effects`); the text stays valid until the
-// next feed
+// The bells, clipboard write, notification, progress and status reports, clipboard reads, the
+// last command finished and a detached tmux control mode since the last call (vt.rs's `Effects`);
+// the text stays valid until the next feed
 void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->bells = vt->bells;
   out->clipboard = vt->clipboard;
@@ -2861,6 +3115,8 @@ void appine_vt_take_effects(AppineVt *vt, AppineVtEffects *out) {
   out->command_has_exit = vt->command_has_exit;
   out->command_exit = vt->command_exit;
   out->command_ms = vt->command_ms;
+  out->tmux_detached = vt->tmux_detached;
+  vt->tmux_detached = false;
   vt->command_finished = false;
   vt->clipboard_reads = 0;
   vt->bells = 0;

@@ -14,6 +14,7 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.os.Build
 import android.os.SystemClock
 import android.text.InputType
 import android.util.Log
@@ -76,6 +77,10 @@ import kotlin.math.roundToInt
  * press or a double tap selects a word and a triple tap a line, and dragging on after a long press
  * extends the selection, as do its two handles; a floating menu copies, pastes, selects all and
  * turns the selection into a rectangle and back.
+ * A mouse or touchpad selects as in a desktop terminal (Ghostty's): dragging selects by cells (a
+ * rectangle with Ctrl+Alt), a double click a word and a triple click a line, Shift+click extends
+ * the selection, Ctrl+click opens a link and a right-click brings up the menu; with Shift it does
+ * so while the program tracks the mouse too.
  * The selection is the terminal's, so it stays on its text through output and scrolling.
  *
  * A search ([search], from the activity's search bar) marks its matches in yellow, the selected
@@ -244,13 +249,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * The mouse pointer: the shape the program asked for (OSC 22, a `GhosttyMouseShape`; an
-     * I-beam by default), the cell a hovering mouse is over (-1 for none) and whether that is a
-     * link, which a click opens and the pointer shows with a hand, as in Ghostty; and the
-     * `PointerIcon` type set on the view (-1 for none yet).
+     * I-beam by default), the cell a hovering mouse is over (-1 for none), whether that is a link
+     * and whether Ctrl (or Meta) is held, with which a click opens it and the pointer shows a
+     * hand, as in Ghostty on Linux; and the `PointerIcon` type set on the view (-1 for none yet).
      */
     private var pointerShape = POINTER_TEXT
     private var hoverCell = -1
     private var hoverLink = false
+    private var hoverCtrl = false
     private var pointerSet = -1
 
     // Modes and the selection, as of the last frame (vt.c's header flags)
@@ -391,6 +397,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var mouseButton = 0
 
     /**
+     * The button of a mouse (or touchpad) held down to select, as in a desktop terminal (without
+     * mouse tracking, or with Shift), or 0: the left one drags the selection ([DRAG_POINTER]), the
+     * right one brought up the menu, the middle one does nothing.
+     */
+    private var pointerButton = 0
+
+    /** When the last left press to select came (uptime), after which Shift+press extends. */
+    private var lastPointerPress = 0L
+
+    /** The left button's drag makes a rectangle: Ctrl+Alt held, as in Ghostty on Linux. */
+    private var pointerRectangle = false
+
+    /** The selection was made with a mouse, so no handles show, as in Android's text fields. */
+    private var pointerSelection = false
+
+    /**
      * The last tap's lift and how many taps came in a row before it (each within the double-tap
      * timeout and slop of the one before), to tell a double and a triple tap.
      */
@@ -488,7 +510,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         endSearch()
         session?.let { if (it.view === this) it.view = null }
         menu?.finish()
-        if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS) VtNative.gestureEnd(tab)
+        if (drag == DRAG_WORD || drag == DRAG_TAPS || drag == DRAG_PRESS || drag == DRAG_POINTER) {
+            VtNative.gestureEnd(tab)
+        }
         drag = DRAG_NONE
         autoscroll = 0
         removeCallbacks(autoscrollTick)
@@ -886,12 +910,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
 
     /**
-     * Shows a mouse over the view the pointer for its place: a hand over a link a click opens
+     * Shows a mouse over the view the pointer for its place: a hand over a link a Ctrl+click opens
      * (without mouse tracking), else the shape the program asked for (OSC 22) as the closest of
      * Android's system pointers. Set on the view, so it changes at once, the mouse still or not.
      */
     private fun updatePointer() {
-        val type = if (hoverLink && !mouseTracking) PointerIcon.TYPE_HAND else pointerType(pointerShape)
+        val type = if (hoverLink && hoverCtrl && !mouseTracking) PointerIcon.TYPE_HAND else pointerType(pointerShape)
         if (type == pointerSet) return
         pointerSet = type
         pointerIcon = PointerIcon.getSystemIcon(context, type)
@@ -1262,8 +1286,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     /**
-     * Blinks the cursor every [BLINK_MS] (as Android's text fields do) while the program asks for
-     * a blinking one (DECSCUSR, mode 12) and the view has the keyboard focus in a focused window;
+     * Blinks the cursor every [BLINK_MS] (as Android's text fields do) while the frame says it
+     * blinks (the setting, unless the program chose otherwise with DECSCUSR or mode 12) and the
+     * view has the keyboard focus in a focused window;
      * otherwise no timer runs and the cursor stays shown (hollow without the focus).
      */
     private fun updateBlink() {
@@ -1337,11 +1362,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Input ----
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean =
-        key(event) || super.onKeyDown(keyCode, event)
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        hoverModifiers(event)
+        return key(event) || super.onKeyDown(keyCode, event)
+    }
 
     /** Releases matter only to programs using the Kitty keyboard protocol's event types. */
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        hoverModifiers(event)
         val key = VtKeys.of(keyCode)
         if (tab == 0L || systemKey(event) || key == 0) return super.onKeyUp(keyCode, event)
         val bytes = VtNative.key(tab, key, VtKeys.mods(event.metaState), 0, VtKeys.ACTION_RELEASE, null, event.getUnicodeChar(0))
@@ -1692,7 +1720,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         autoscrollX = cx
         val cy = cellY(py)
-        if (cx == dragCellX && cy == dragCellY) return
+        // A mouse's cell drag starts within its cell, once past libghostty-vt's threshold in it
+        if (drag != DRAG_POINTER && cx == dragCellX && cy == dragCellY) return
         dragCellX = cx
         dragCellY = cy
         extendTo(cx, cy, px, py + scrollPx)
@@ -1700,10 +1729,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /**
      * Extends the selection to viewport cell ([cx], [cy]), at pixel ([px], [py]) from the grid's
-     * corner: by words or lines from a gesture's press ([VtNative.gestureDrag]), by cells from a
-     * handle's anchor ([VtNative.selectTo]).
+     * corner: by words or lines from a gesture's press ([VtNative.gestureDrag]), by a mouse's
+     * click's unit from its press ([VtNative.mouseDrag], which may also leave none), by cells from
+     * a handle's anchor ([VtNative.selectTo]).
      */
     private fun extendTo(cx: Int, cy: Int, px: Float, py: Float) {
+        if (drag == DRAG_POINTER) {
+            val dragged = VtNative.mouseDrag(tab, cx, cy, px, py, pointerRectangle)
+            if (dragged >= 0) {
+                selected = dragged == 1
+                invalidate()
+            }
+            return
+        }
         val extended = if (drag == DRAG_WORD || drag == DRAG_TAPS) {
             VtNative.gestureDrag(tab, cx, cy, px, py)
         } else {
@@ -1827,7 +1865,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     private fun drawHandles(c: Canvas) {
         val excluded = mutableListOf<Rect>()
-        if (selected) {
+        if (selected && !pointerSelection) {
             for (start in booleanArrayOf(true, false)) {
                 val (d, b) = handle(start) ?: continue
                 d.bounds = b
@@ -1873,9 +1911,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         return d to Rect(l, top, l + d.intrinsicWidth, top + d.intrinsicHeight)
     }
 
-    /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE. */
+    /** The handle under a touch, with some slop: DRAG_START, DRAG_END or DRAG_NONE (none shown). */
     private fun handleAt(x: Float, y: Float): Int {
-        if (!selected) return DRAG_NONE
+        if (!selected || pointerSelection) return DRAG_NONE
         for (start in booleanArrayOf(false, true)) {
             val b = handle(start)?.second ?: continue
             b.inset(-handleSlop, -handleSlop)
@@ -1915,15 +1953,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             stoppedFling = !scroller.isFinished && !settling
             scroller.forceFinished(true)
         }
-        // A mouse's buttons and drags go to a program tracking it as they are, from the press on
-        val press = event.actionMasked == MotionEvent.ACTION_DOWN && mouseTracking && drag == DRAG_NONE
-        if (tab != 0L && event.isFromSource(InputDevice.SOURCE_MOUSE) && (press || mouseButton != 0)) {
+        // A mouse's buttons and drags go to a program tracking it as they are, from the press on,
+        // unless Shift is held (Ghostty's mouse-shift-capture = false)
+        val down = event.actionMasked == MotionEvent.ACTION_DOWN && drag == DRAG_NONE
+        val mouse = tab != 0L && event.isFromSource(InputDevice.SOURCE_MOUSE) && !touchpadGesture(event)
+        if (mouse && (down && mouseTracking && !event.held(KeyEvent.META_SHIFT_ON) || mouseButton != 0)) {
             mouseButtons(event)
+            return true
+        }
+        // Otherwise they select, as in a desktop terminal
+        if (mouse && (down || pointerButton != 0)) {
+            pointer(event)
             return true
         }
         // A handle drag owns the whole gesture
         if (event.actionMasked == MotionEvent.ACTION_DOWN && tab != 0L) {
             val handle = handleAt(event.x, event.y)
+            // A finger brings the handles back
+            pointerSelection = false
             if (handle != DRAG_NONE && VtNative.selectGrab(tab, handle == DRAG_END)) {
                 startDrag(handle, event.x, event.y)
                 return true
@@ -1997,6 +2044,118 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 mouseButton = 0
             }
         }
+    }
+
+    /**
+     * A touchpad's swipe or pinch, which Android may deliver as touches from the mouse source
+     * (Android 14 and later classify them): not a press of a button.
+     */
+    private fun touchpadGesture(e: MotionEvent) = Build.VERSION.SDK_INT >= 34 &&
+        (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || e.classification == MotionEvent.CLASSIFICATION_PINCH)
+
+    /**
+     * A mouse (or touchpad) button pressed, dragged and released to select, as Ghostty does on
+     * Linux, the first button pressed owning the rest: the left one (a touchpad's tap) clicks
+     * through libghostty-vt's selection gesture, which counts the clicks (within the double-tap
+     * timeout and a cell's width): a first click clears the selection and dragging from it
+     * selects by cells (a rectangle while Ctrl+Alt is held), a second selects the word and a third
+     * the line (the command's output with Ctrl), each dragging on by its unit and scrolling past
+     * the grid's edges; Shift+press after the timeout extends the selection from the last press
+     * instead. A click that did not drag opens the link under it with Ctrl, else moves the shell's
+     * cursor there (at its prompt) and opens the keyboard, as a tap does. The right button selects
+     * the word under it unless the selection holds it and brings up the menu there. No menu comes
+     * up otherwise, and the selection shows no handles.
+     */
+    private fun pointer(e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                requestFocus()
+                pointerButton = when {
+                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
+                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
+                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
+                }
+                if (pointerButton == MOUSE_MIDDLE) return
+                menu?.finish()
+                menuLink = null
+                menuOutput = false
+                pointerSelection = true
+                if (pointerButton == MOUSE_LEFT) pointerPress(e) else contextMenu(e)
+            }
+            MotionEvent.ACTION_MOVE -> if (pointerButton == MOUSE_LEFT && drag == DRAG_POINTER) {
+                pointerRectangle = rectangleHeld(e)
+                dragTo(e.x, e.y)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (pointerButton == MOUSE_LEFT) pointerRelease(e)
+                pointerButton = 0
+            }
+        }
+    }
+
+    private fun pointerPress(e: MotionEvent) {
+        val interval = ViewConfiguration.getDoubleTapTimeout().toLong()
+        pointerRectangle = rectangleHeld(e)
+        startDrag(DRAG_POINTER, e.x, e.y)
+        val cx = cellX(e.x)
+        val cy = cellY(e.y)
+        val py = e.y + scrollPx
+        // Shift+press extends the selection from the last press, unless it may be its next click
+        if (e.held(KeyEvent.META_SHIFT_ON) && selected && e.eventTime - lastPointerPress > interval) {
+            val extended = VtNative.mouseDrag(tab, cx, cy, e.x, py, pointerRectangle)
+            if (extended >= 0) {
+                selected = extended == 1
+                invalidate()
+                return
+            }
+        }
+        lastPointerPress = e.eventTime
+        val ctrl = e.held(CTRL_OR_META)
+        val clicks = VtNative.mousePress(tab, cx, cy, e.x, py, e.eventTime * 1_000_000, interval * 1_000_000, ctrl)
+        // The button still owns the rest of its stream, which then does nothing
+        if (clicks == 0) drag = DRAG_NONE
+        // The next frame tells whether a word or line was there
+        selected = clicks >= 2
+        invalidate()
+    }
+
+    private fun pointerRelease(e: MotionEvent) {
+        val dragging = drag == DRAG_POINTER
+        drag = DRAG_NONE
+        autoscroll = 0
+        removeCallbacks(autoscrollTick)
+        if (!dragging) return
+        val inside = e.x >= 0 && e.y >= 0 && e.x < cols * cellWidth && e.y < rows * cellHeight
+        val clicks = VtNative.mouseRelease(tab, if (inside) cellX(e.x) else -1, if (inside) cellY(e.y) else -1)
+        // A click that did not drag: Ctrl opens a link, else as a tap
+        if (clicks != 1 || e.actionMasked != MotionEvent.ACTION_UP) return
+        val link = if (e.held(CTRL_OR_META)) linkAt(e.x, e.y) else null
+        if (link != null) {
+            host.onLink(link)
+            return
+        }
+        send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
+        context.getSystemService(InputMethodManager::class.java).showSoftInput(this, 0)
+    }
+
+    /** Ctrl (or Meta) and Alt held: Ghostty's rectangle selection on Linux. */
+    private fun rectangleHeld(e: MotionEvent) = e.held(CTRL_OR_META) && e.held(KeyEvent.META_ALT_ON)
+
+    /** Any of the [meta] modifiers is held during the event. */
+    private fun MotionEvent.held(meta: Int) = metaState and meta != 0
+
+    /**
+     * A right-click: as Ghostty's before its context menu, the word under it is selected unless
+     * the selection holds it, and the menu comes up there once the frame has the selection.
+     */
+    private fun contextMenu(e: MotionEvent) {
+        selected = VtNative.selectContext(tab, cellX(e.x), cellY(e.y))
+        menuLink = linkAt(e.x, e.y)
+        menuOutput = VtNative.outputAt(tab, cellX(e.x), cellY(e.y))
+        menuX = e.x
+        menuY = e.y
+        menuPending = true
+        invalidate()
     }
 
     /**
@@ -2176,12 +2335,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     )
 
     /**
-     * A mouse wheel (or touchpad scroll) scrolls like a drag, and its sideways scrolling goes to a
-     * program tracking the mouse as wheel buttons 6 and 7 (left and right), one a notch, as in
-     * Ghostty (nothing else scrolls sideways); a mouse moving with no button held goes to a
-     * program tracking all motion (mode 1003).
-     */
-    /**
      * The pointer [updatePointer] set, also when the system resolves it again after it was set
      * while the mouse rests (a program's OSC 22): that event comes from no mouse, and the view's
      * own resolution returns the pointer for mouse events only, which would leave the default
@@ -2192,6 +2345,12 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         return if (resolved != null || event.isFromSource(InputDevice.SOURCE_STYLUS)) resolved else pointerIcon
     }
 
+    /**
+     * A mouse wheel (or touchpad scroll) scrolls like a drag, and its sideways scrolling goes to a
+     * program tracking the mouse as wheel buttons 6 and 7 (left and right), one a notch, as in
+     * Ghostty (nothing else scrolls sideways); a mouse moving with no button held goes to a
+     * program tracking all motion (mode 1003).
+     */
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
         if (tab != 0L && event.isFromSource(InputDevice.SOURCE_CLASS_POINTER)) {
             when (event.actionMasked) {
@@ -2207,7 +2366,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     if (v != 0f || sideways) return true
                 }
                 MotionEvent.ACTION_HOVER_MOVE -> {
-                    hoverAt(event.x, event.y)
+                    hoverAt(event.x, event.y, event.held(CTRL_OR_META))
                     if (mouseTracking) {
                         send(VtNative.mouse(tab, MOUSE_MOTION, MOUSE_NONE, VtKeys.mods(event.metaState), event.x, event.y, false))
                         return true
@@ -2224,14 +2383,25 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     /**
-     * A mouse hovers at ([x], [y]): on coming to another cell, whether it is over a link is looked
-     * up again, for the pointer.
+     * A mouse hovers at ([x], [y]) with [ctrl] (or Meta) held or not: on coming to another cell,
+     * whether it is over a link is looked up again, for the pointer.
      */
-    private fun hoverAt(x: Float, y: Float) {
+    private fun hoverAt(x: Float, y: Float, ctrl: Boolean) {
         val cell = cellY(y) * cols + cellX(x)
-        if (cell == hoverCell) return
-        hoverCell = cell
-        hoverLink = linkAt(x, y) != null
+        if (cell == hoverCell && ctrl == hoverCtrl) return
+        if (cell != hoverCell) {
+            hoverCell = cell
+            hoverLink = linkAt(x, y) != null
+        }
+        hoverCtrl = ctrl
+        updatePointer()
+    }
+
+    /** Ctrl (or Meta) pressed or let go while a mouse hovers: a link under it shows a hand or not. */
+    private fun hoverModifiers(event: KeyEvent) {
+        val ctrl = event.isCtrlPressed || event.isMetaPressed
+        if (hoverCell < 0 || ctrl == hoverCtrl) return
+        hoverCtrl = ctrl
         updatePointer()
     }
 
@@ -2398,7 +2568,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val UNDERLINE_DOTTED = 4
         const val UNDERLINE_DASHED = 5
 
-        // GhosttyRenderStateCursorVisualStyle
+        // GhosttyCursorStyle (and vt.c's lock)
         const val CURSOR_BAR = 0
         const val CURSOR_UNDERLINE = 2
         const val CURSOR_HOLLOW = 3
@@ -2449,7 +2619,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val FLAG_RECTANGLE = 1 shl 5
         const val FLAG_SEARCH_PENDING = 1 shl 6
 
-        // An image placement's layer (GhosttyRenderStateImageLayer)
+        // An image placement's layer (GhosttyImageLayer)
         const val LAYER_BELOW_BACKGROUND = 0
         const val LAYER_BELOW_TEXT = 1
         const val LAYER_ABOVE_TEXT = 2
@@ -2505,6 +2675,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val DRAG_PRESS = 4
         const val DRAG_MOUSE = 5
         const val DRAG_TAPS = 6
+        const val DRAG_POINTER = 7
+
+        /** Ctrl or Meta (Super): Ghostty's ctrlOrSuper, the link and output modifier on Linux. */
+        const val CTRL_OR_META = KeyEvent.META_CTRL_ON or KeyEvent.META_META_ON
         const val AUTOSCROLL_MS = 50L
 
         const val MENU_COPY = 1

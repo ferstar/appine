@@ -65,6 +65,7 @@ struct RawEffects {
     command_has_exit: bool,
     command_exit: i32,
     command_ms: u64,
+    tmux_detached: bool,
 }
 
 /// vt.c's `APPINE_CLIPBOARD_TEXT` and `APPINE_CLIPBOARD_CLEAR`.
@@ -100,6 +101,7 @@ unsafe extern "C" {
         cell_width: u32,
         cell_height: u32,
     ) -> *mut AppineVt;
+    fn appine_vt_set_cursor(vt: *mut AppineVt, style: i32, blink: bool);
     fn appine_vt_free(vt: *mut AppineVt);
     fn appine_vt_feed(vt: *mut AppineVt, data: *const u8, len: usize);
     fn appine_vt_take_replies(vt: *mut AppineVt, len: *mut usize) -> *const u8;
@@ -155,6 +157,26 @@ unsafe extern "C" {
     ) -> bool;
     fn appine_vt_gesture_drag(vt: *mut AppineVt, x: u16, y: u16, px: f64, py: f64) -> bool;
     fn appine_vt_gesture_end(vt: *mut AppineVt);
+    fn appine_vt_mouse_press(
+        vt: *mut AppineVt,
+        x: u16,
+        y: u16,
+        px: f64,
+        py: f64,
+        time_ns: u64,
+        interval_ns: u64,
+        output: bool,
+    ) -> i32;
+    fn appine_vt_mouse_drag(
+        vt: *mut AppineVt,
+        x: u16,
+        y: u16,
+        px: f64,
+        py: f64,
+        rectangle: bool,
+    ) -> i32;
+    fn appine_vt_mouse_release(vt: *mut AppineVt, x: i32, y: i32) -> i32;
+    fn appine_vt_select_context(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_grab(vt: *mut AppineVt, end: bool) -> bool;
     fn appine_vt_select_to(vt: *mut AppineVt, x: u16, y: u16) -> bool;
     fn appine_vt_select_adjust(vt: *mut AppineVt, adjustment: i32) -> bool;
@@ -240,8 +262,8 @@ impl Term {
     }
 
     /// The bells, clipboard write, notification, progress and status reports and clipboard reads
-    /// programs sent, and the last command the shell's prompt marks saw finish, since the last
-    /// call.
+    /// programs sent, the last command the shell's prompt marks saw finish, and whether tmux's
+    /// control mode, which vt.c detached, ended, since the last call.
     fn take_effects(&mut self) -> Effects {
         let mut raw = RawEffects {
             bells: 0,
@@ -263,6 +285,7 @@ impl Term {
             command_has_exit: false,
             command_exit: 0,
             command_ms: 0,
+            tmux_detached: false,
         };
         unsafe { appine_vt_take_effects(self.0, &mut raw) };
         /// The `len` bytes vt.c returned at `p`, which it keeps until the next feed.
@@ -293,6 +316,7 @@ impl Term {
                 raw.command_has_exit.then_some(raw.command_exit),
                 raw.command_ms,
             )),
+            tmux_detached: raw.tmux_detached,
         }
     }
 
@@ -319,9 +343,10 @@ impl Drop for Term {
 /// counts once), a clipboard write (`Some(None)` clears it), a notification (title, body), the
 /// last progress report (OSC 9;4: libghostty-vt's state and the percentage, -1 for none), the
 /// program status reports (OSC 7501), in order, clipboard reads (OSC 52 "?": how many, and the
-/// clipboard the last named, `c`, `p` or `s`), which the app answers once the user agrees, and the
+/// clipboard the last named, `c`, `p` or `s`), which the app answers once the user agrees, the
 /// last command the shell's prompt marks (OSC 133) saw finish (its exit code when the shell
-/// reported one, and how long it ran in milliseconds).
+/// reported one, and how long it ran in milliseconds), and the end of tmux's control mode, which
+/// vt.c detached as it started.
 struct Effects {
     bell: bool,
     clipboard: Option<Option<String>>,
@@ -330,6 +355,7 @@ struct Effects {
     statuses: Vec<StatusReport>,
     clipboard_reads: Option<(u32, u8)>,
     command: Option<(Option<i32>, u64)>,
+    tmux_detached: bool,
 }
 
 /// A program status report (OSC 7501), as vt.c queues it: libghostty-vt's state and kind, the
@@ -378,7 +404,8 @@ impl Effects {
     }
 
     /// Hands them to the tab's `VtSession` (`onBell`, `onClipboard`, `onNotification`,
-    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`, `onCommandFinished`);
+    /// `onProgress`, `onStatus` for each status report, `onClipboardRead`, `onCommandFinished`,
+    /// `onTmuxDetached`);
     /// false when a call threw. The strings are
     /// local references, deleted after each call: the pump stays in native code for the tab's
     /// whole life, so they would otherwise pile up.
@@ -467,6 +494,13 @@ impl Effects {
             {
                 return false;
             }
+        }
+        if self.tmux_detached
+            && env
+                .call_method(session, "onTmuxDetached", "()V", &[])
+                .is_err()
+        {
+            return false;
         }
         true
     }
@@ -636,6 +670,23 @@ fn register(machine: jlong, console: jint, raw: *mut AppineVt) -> jlong {
     id
 }
 
+/// Sets the cursor's default shape (`style`, libghostty-vt's `GhosttyCursorStyle`) and whether it
+/// blinks, the user's setting; shown at once unless a program chose its own cursor.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_setCursor<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    style: jint,
+    blink: jboolean,
+) {
+    guarded!("VtNative.setCursor", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_set_cursor(tab.term().0, style, blink != 0) };
+        }
+    })
+}
+
 /// Shows bytes from the app itself (not the program) as if the console had printed them; replies
 /// are dropped.
 #[unsafe(no_mangle)]
@@ -660,8 +711,8 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 /// Moves the console's output into the terminal until the session ends or the console is closed;
 /// calls `session.onOutput()` whenever the screen changed after the last frame was taken,
 /// `session.onTitle()` when a program set the title, `onBell`, `onClipboard`, `onNotification`,
-/// `onProgress`, `onStatus`, `onClipboardRead` and `onCommandFinished` for what programs asked of
-/// the app and what the shell's prompt marks told ([`Effects`]), and
+/// `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished` and `onTmuxDetached` for what
+/// programs asked of the app and what the shell's prompt marks told ([`Effects`]), and
 /// `onForeground()` once the process group that was in the foreground when progress or a status
 /// was last reported no longer is.
 ///
@@ -1144,6 +1195,99 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_gestureEnd<'l>(
         if let Some(tab) = tab(handle) {
             unsafe { appine_vt_gesture_end(tab.term().0) };
         }
+    })
+}
+
+/// A mouse's left button pressed at viewport cell (`x`, `y`), pixel (`px`, `py`), at `time_ns`:
+/// a timed press of the selection gesture, which counts the clicks (`interval_ns` apart at most).
+/// Returns the click count, 0 when it failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_mousePress<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    px: jfloat,
+    py: jfloat,
+    time_ns: jlong,
+    interval_ns: jlong,
+    output: jboolean,
+) -> jint {
+    guarded!("VtNative.mousePress", 0, {
+        tab(handle).map_or(0, |tab| unsafe {
+            appine_vt_mouse_press(
+                tab.term().0,
+                cell(x),
+                cell(y),
+                px.into(),
+                py.into(),
+                time_ns.max(0) as u64,
+                interval_ns.max(0) as u64,
+                output != 0,
+            )
+        })
+    })
+}
+
+/// The held left button dragged on to viewport cell (`x`, `y`), pixel (`px`, `py`): 1 with a
+/// selection, 0 without, -1 when no press is under way.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouseDrag<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    px: jfloat,
+    py: jfloat,
+    rectangle: jboolean,
+) -> jint {
+    guarded!("VtNative.mouseDrag", -1, {
+        tab(handle).map_or(-1, |tab| unsafe {
+            appine_vt_mouse_drag(
+                tab.term().0,
+                cell(x),
+                cell(y),
+                px.into(),
+                py.into(),
+                rectangle != 0,
+            )
+        })
+    })
+}
+
+/// The left button released at viewport cell (`x`, `y`) (out of the grid: moved away): the click
+/// count, negated after a drag, 0 without a press.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_mouseRelease<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jint {
+    guarded!("VtNative.mouseRelease", 0, {
+        tab(handle).map_or(0, |tab| unsafe {
+            appine_vt_mouse_release(tab.term().0, x, y)
+        })
+    })
+}
+
+/// A right-click at viewport cell (`x`, `y`): keeps a selection holding it, else selects the word
+/// there; true when there is a selection afterwards.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_selectContext<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) -> jboolean {
+    guarded!("VtNative.selectContext", 0, {
+        tab(handle)
+            .is_some_and(|tab| unsafe { appine_vt_select_context(tab.term().0, cell(x), cell(y)) })
+            as jboolean
     })
 }
 

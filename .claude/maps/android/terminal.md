@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/terminal.md` for the paired decision history.
 >
-> Verified: 2026-11-10 (full mapping: 5 research concerns; 19 claims checked by 3 independent verifiers — 16 confirmed and 3 partial, corrected below; a bug and debts recorded)
->
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: gesture word and line drags, scroll-bar search marks, libghostty-vt 1.0.0 and its unused API, taps moving the shell's cursor, mouse pointers, then the lock cursor with the IME's password mode last)
+> Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 
 ## Responsibilities
 
@@ -20,8 +18,9 @@
   what its programs report about their progress and status, whether its shell waits at its prompt
   and in which directory, its terminal's snapshots and coming back from one, clipboard reads
   waiting for an answer, the commands its shell's prompt marks show finishing, clearing and
-  resetting), `VtView` (drawing with the bundled JetBrains Mono, the images programs show, input,
-  selection, search marks, gestures and scrolling by pixels),
+  resetting, the cursor's default from Settings, tmux's control mode ending), `VtView` (drawing
+  with the bundled JetBrains Mono, the images programs show, input, selection by touch and by
+  mouse, search marks, gestures and scrolling by pixels),
   `ProgressLine` (the current tab's progress over the terminal), `VtKeys`, `VtGlyphs`,
   `VtNative`, and the emulator shim and JNI in
   the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt, with the `vt-compress`
@@ -97,8 +96,9 @@ compiling libghostty-vt with Zig (`android/native`).
   `Progress`), the program status records by id (`Status`, least recently updated first, at most
   64) and the one most in need of the user (`status`), the clipboard reads waiting for an answer
   (the clipboard each named), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
-  `vt-writer` executor; `Events` (title changed, bell, clipboard write, notification, clipboard
-  read, progress or status changed, a command finished, the shell finished) go
+  `vt-writer` executor, the cursor's default shape and blinking (`setCursor`, from the service);
+  `Events` (title changed, bell, clipboard write, notification, clipboard read, progress or status
+  changed, a command finished, tmux's control mode detached, the shell finished) go
   to the service on the main thread; `busy` (closing it would end something: the shell runs, has
   started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
   kernel). Its companion holds
@@ -114,9 +114,11 @@ compiling libghostty-vt with Zig (`android/native`).
   belong to), the
   last frame's image placements (`Placement`, a pool reused across frames) and the bitmaps of the
   images they show by id with the generation each holds (`Picture`), the animation's redraw, the
-  IME connection, the mouse pointer (the program's shape, the cell hovered and whether it is a
-  link, the system pointer set), gestures (with the taps in a row) and their drag states, the
-  `OverScroller` of
+  IME connection, the mouse pointer (the program's shape, the cell hovered, whether it is a link
+  and whether Ctrl or Meta is held, the system pointer set), gestures (with the taps in a row) and
+  their drag states, a mouse's selecting (the button held, `pointerButton`; when its last left
+  press came; whether its drag makes a rectangle; whether the selection came from a mouse,
+  `pointerSelection`, which hides the handles), the `OverScroller` of
   flings and of settling on a whole row (`settling`), selection handles and the floating menu,
   the cursor's blink timer, the check whether a password is still read while the cursor is a lock
   (`passwordCheck`) and whether the IME was told a password is typed (`imePassword`), and the
@@ -129,30 +131,36 @@ compiling libghostty-vt with Zig (`android/native`).
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 42 `@JvmStatic external` functions on the native library, and libghostty-vt's
-  selection gesture behaviours (`GESTURE_WORD`, `GESTURE_LINE`) and selection adjustments
-  (`ADJUST_*`).
+- `VtNative` — 47 `@JvmStatic external` functions on the native library, and libghostty-vt's
+  cursor styles (`CURSOR_BAR`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`), selection gesture behaviours
+  (`GESTURE_WORD`, `GESTURE_LINE`) and selection adjustments (`ADJUST_*`), passed to vt.c as raw
+  values, so they must match libghostty-vt's headers.
 - In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
   mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
   tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
   `AppineVt`, freed on drop); `RawEffects`, laid out as vt.c's `AppineVtEffects`, turned into
-  `Effects` (with the `StatusReport`s decoded from vt.c's queue, the clipboard reads, and the last
-  command finished: its exit code when reported and how long it ran); the
+  `Effects` (with the `StatusReport`s decoded from vt.c's queue, the clipboard reads, the last
+  command finished: its exit code when reported and how long it ran, and whether tmux's control
+  mode, which vt.c detached, ended); the
   compression schedule `COMPRESS` (a `Due` per tab: when to look at it next and when it was
   scheduled), served by the `vt-compress` thread (`compressor`).
 - In `vt.c`: `AppineVt` (the terminal, its render state, key and mouse encoders, the grid and cell
   pixel sizes, reply, frame and scratch buffers, one text buffer shared by title, copy, link and
   transcript, the title-changed flag, the synchronized-output hold, whether the console reads a
   password (`password_input`, the cursor then a lock), the tracked anchor of a
-  handle's drag, libghostty-vt's selection gesture with its reusable press and drag events (the
-  word and line selections of presses and the drags after them), the last
+  handle's drag, libghostty-vt's selection gesture, shared by touch and mouse, with its reusable
+  events (an untimed press and a drag for a finger's word and line selections, a timed press and
+  a release for a mouse's clicks, which share the drag), the last
   reported mouse cell, the effects since they were last taken: bells, the
   last clipboard write, the last notification, the last progress report and every program status
   report, queued in a byte layout vt.rs reads, the clipboard reads (OSC 52) with the clipboard
-  the last named, and the last command finished; `AppineVtEffects` is how they are handed out; the
+  the last named, the last command finished, and the end of tmux's control mode it detached
+  (`tmux_detached`); `AppineVtEffects` is how they are handed out; the
   timing of the command running (`command_start`) and whether the cursor was at the prompt after
   the last feed (`was_at_prompt`); the OSC string the output is in (its
-  first 64 bytes and its length), to find those reads and prompt starts; how a tap on the shell's
+  first 64 bytes and its length), to find those reads and prompt starts, and the DCS string it is
+  in (its first 5 bytes, its header, and its length) with whether that is tmux's control mode
+  (`tmux_control`); how a tap on the shell's
   input moves its cursor, as the primary screen's last prompt start (OSC 133;A) declared it
   (`prompt_click`: not at all, arrows, or a mouse press with the row counted from the screen's top
   or the prompt's); the search: a `GhosttySearch` while one runs,
@@ -176,15 +184,17 @@ compiling libghostty-vt with Zig (`android/native`).
   `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
-- `VtNative`: `create`, `restore`, `print`, `pump`, `title`, `atPrompt`, `frame`, `image`,
-  `passwordInput`,
+- `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `frame`,
+  `image`, `passwordInput`,
   `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`, `gesturePress`,
-  `gestureDrag`, `gestureEnd`, `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`,
+  `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`, `selectContext`,
+  `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`,
   `selectAll`, `outputAt`, `selectOutput`, `selectClear`, `copy`, `link`, `promptClick`, `search`,
   `searchSelect`, `searchRows`, `searchEnd`, `clear`,
   `reset`, `message`, `transcript`, `snapshot`, `version`, `compressAll`, `destroy`; `pump` runs on
   `vt-pump` and calls `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`,
-  `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished` and `onForeground` back;
+  `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and
+  `onForeground` back;
   `snapshot` and
   `compressAll` run on the service's worker, `version` wherever `Tabs` needs it, the rest on the
   main thread.
@@ -335,8 +345,9 @@ compiling libghostty-vt with Zig (`android/native`).
   shrink (rows left the scrollback at its limit, or it was cleared) and at most every 500 ms while
   frames bring changes, since rows that leave the scrollback move every match's row. vt.c reads all
   the matches (newest first) and looks up only each page's first row, adding a match's row within
-  its page, which reads no compressed page. Tapping the terminal while the bar is open gives
-  the keyboard back to the terminal and leaves the bar and its marks; the extra keys always go to
+  its page, which reads no compressed page. Tapping the terminal (or pressing a mouse on it)
+  while the bar is open gives the keyboard back to the terminal and leaves the bar and its marks;
+  the extra keys always go to
   the terminal, the bar's text focused or not.
 
 ### Shell integration
@@ -345,7 +356,9 @@ compiling libghostty-vt with Zig (`android/native`).
   the prompt, the typed command and the output's start; busybox ash the prompt, and the command
   ending with its line). libghostty-vt keeps the marks in the rows and cells it writes (prompt,
   input, output) and the cursor's place among them, which closing, jumping, Select output and taps
-  on the input read through vt.c's shell integration functions. A shell without the marks (zsh,
+  on the input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click
+  selects a command's output through libghostty-vt's selection gesture, and a right-click looks
+  for one for the menu's Select output. A shell without the marks (zsh,
   fish, dash, a nested non-login shell, a remote one over ssh that sends none) leaves every cell
   output: it is never at a prompt, there is nothing to jump to and no output to select, and no
   command is timed.
@@ -376,8 +389,11 @@ compiling libghostty-vt with Zig (`android/native`).
   from the OSC string (the C API does not expose the value libghostty-vt keeps) and holds until
   another declares a way or a full reset: Kitty's `click_events=1` or `2` (fish's) first, else
   `cl=` (`line`, or `m`, `v` and `w`, which Ghostty treats as line too; the profile sends
-  `cl=line` from bash and ash); a value it does not know counts as none. A tap without mouse
-  tracking, not on a link, with the cursor at the prompt and the tapped row not above the prompt's
+  `cl=line` from bash and ash); an option with a value it does not know is ignored like a missing
+  one, so the way the last prompt declared stays, and only OSC strings of at most 64 bytes, not
+  cancelled, are read. A tap without mouse tracking that is not on a link, or a mouse's left click
+  (without tracking, or with Shift) that did not drag and is no Ctrl+click on a link, with the
+  cursor at the prompt and the tapped row not above the prompt's
   first one (found going up from the cursor, at most 64 rows) moves the cursor there: with `cl`,
   left or right arrows (in the cursor key mode's form), one for each input cell between the cursor
   and the tapped cell over the soft-wrapped rows of the cursor's line (rows after it must continue
@@ -386,7 +402,7 @@ compiling libghostty-vt with Zig (`android/native`).
   character takes one arrow and its second half stands for it; with `click_events`, a left button
   press in SGR without a release, its row counted from the screen's top (`1`) or from the
   prompt's first row (`2`). The bytes go out as typing does and the keyboard comes up as for any
-  tap; a tap that is no prompt's sends nothing.
+  tap, or such a click; a tap that is no prompt's sends nothing.
 
 ### Extra keys
 
@@ -438,9 +454,12 @@ compiling libghostty-vt with Zig (`android/native`).
   restoring), else a new one (`VtNative.create`), both with the same options
   (scrollback limited to 10,000 lines or 10 MiB, whichever is reached first: the lines up to about
   120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
-  the cursor follows the foreground as in Ghostty; a blinking block cursor by default, as in
-  Ghostty without `cursor-style-blink` (libghostty-vt's own default is steady; DECSCUSR's default,
-  DECSTR and RIS bring the blinking back, and DECSCUSR or mode 12 stop it); grapheme clustering,
+  the cursor follows the foreground as in Ghostty; the cursor's default shape and blinking from
+  Settings (a blinking block unless changed, as Ghostty's `cursor-style` and `cursor-style-blink`
+  default): `wrap` itself only turns blinking on over libghostty-vt's steady block, and the session
+  gives the terminal the setting right after making it (`VtNative.setCursor`), before the pending
+  text; DECSCUSR 0, DECSTR and RIS bring the setting back, DECSCUSR or mode 12 override it, see
+  Frames and drawing; grapheme clustering,
   mode 2027, on by default as
   in Ghostty; the render state asks for one overscan row below the viewport; the OSC 133 callback
   (command timing) and unimplemented OSC and APC strings reported with 16 bytes kept, of which
@@ -463,10 +482,11 @@ compiling libghostty-vt with Zig (`android/native`).
 - The pump reads the console into a 64 KB buffer, asks the kernel whether the console now reads a
   password (`Machine::console_password_input`: lines without echo, which programs set before
   printing their prompt) and notes it in vt.c, feeds the terminal under the tab's lock (in parts
-  that end at the start or end of an OSC string, `ghostty_terminal_vt_write_until`, where vt.c
-  keeps the string's first 64 bytes to find clipboard reads and prompt starts; no slower than one
-  write), writes
-  the terminal's replies (DA, DSR, XTVERSION, size reports, pastes' bytes) back to the console
+  that end at the start or end of an OSC or DCS string, `ghostty_terminal_vt_write_until`, where
+  vt.c keeps an OSC's first 64 bytes to find clipboard reads and prompt starts and a DCS's first 5,
+  its header, to find tmux's control mode; no slower than one write), writes
+  the terminal's replies (DA, DSR, XTVERSION, size reports, pastes' bytes, the line that detaches
+  tmux's control mode) back to the console
   before reading again, calls `VtSession.onOutput` only when it sets `dirty` (so a burst asks for
   one frame, and nothing is asked while no view takes frames) and `onTitle` after OSC 0/2. It runs
   whether or not a view shows the tab, and ends when the kernel is gone, the console reads end or
@@ -485,7 +505,8 @@ compiling libghostty-vt with Zig (`android/native`).
   (OSC 52 with `?` for data: an OSC string of `52;`, the clipboards named (`c`, `p`, `q`, `s`,
   `0`–`7`, maybe none) and `;?`, ended and not cancelled, however the reads split it), counted
   with the first clipboard the last one named (`p` or `s`, else `c`), which every read of the
-  batch is answered for; the last command the prompt marks saw finish (Shell integration).
+  batch is answered for; the last command the prompt marks saw finish (Shell integration); the end
+  of tmux's control mode, which vt.c detached (below), delivered last (`onTmuxDetached`).
   libghostty-vt's clipboard-read
   callback is left unset: it must answer before returning, under the tab's lock, which rules out
   asking the user; so OSC 5522 reads are refused and Kitty paste events never sent. What the app
@@ -504,6 +525,17 @@ compiling libghostty-vt with Zig (`android/native`).
   the request): the text when allowed, nothing (an empty clipboard, as libghostty-vt answers a
   read it refuses, so the program does not wait for a timeout) when denied, dismissed or asked
   from a tab not in front.
+- tmux's control mode (`tmux -CC`), which libghostty-vt built for apps does not parse (Confirmed
+  bugs / technical debt), would leave the tab showing nothing while keys reach tmux as commands.
+  vt.c finds a DCS whose header is literally `1000p`, however the reads split it, and, as Enter
+  would, puts a carriage return among the replies the pump writes before reading again: tmux takes
+  the empty line as a detach, leaving its session running, and ends the string with ST. That end
+  is reported (only an ESC ending it, which libghostty-vt reports at ST's first byte; 0x9C is
+  payload once the header is complete, and a string a program cancels with CAN or SUB, or the app's
+  own CAN cuts, reports nothing), and the service shows a yellow `[appine]` line in the tab saying
+  so and that `tmux attach` brings the session back (android/service; nothing on the alternate
+  screen). Other DCS strings (DECRQSS, XTGETTCAP, tmux passthrough) only cost two extra stops each. Nothing
+  retries when tmux does not detach.
 - Progress and status (`VtSession`, main thread): a progress report replaces the last one (a
   removal clears it) and lasts 15 s without another, as in Ghostty. Status reports of a read are
   applied together, as the specification keeps them: one record per id, a report replacing its
@@ -543,8 +575,9 @@ compiling libghostty-vt with Zig (`android/native`).
 - libghostty-vt compresses the primary screen's cold pages (wholly in the scrollback and outside
   the viewport; the alternate screen keeps no scrollback) to about a fifth of their 400 KiB, and
   restores a page when something reads it: drawing a viewport scrolled back over it, the formatter
-  (transcripts, copies), select all (which reads the oldest and newest pages) and a tapped link's
-  line; searching restores nothing. The scrollback limits count pages uncompressed, so the same
+  (transcripts, copies), select all (which reads the oldest and newest pages), a mouse's
+  Ctrl+triple-click that selected a command's output and a tapped link's line; searching restores
+  nothing. The scrollback limits count pages uncompressed, so the same
   history is kept in less memory.
 - A pass is scheduled when a call into vt.c left work for one, which vt.c tells as the
   `TermGuard` is released: libghostty-vt's activity token changed (rows moving into the
@@ -665,8 +698,9 @@ compiling libghostty-vt with Zig (`android/native`).
   far, the selected one's place from the newest) and the mouse pointer's shape the program asked
   for (OSC 22, byte 59); each row carries its selected columns (a
   rectangle's columns on each of its rows) and each cell its search mark (attributes bits 14 and
-  15). `VtView` reads the dirty byte only to tell whether late image pixels need a full frame and
-  the focus-events flag not at all, and reports the count to the activity when it changes.
+  15). `VtView` reads the dirty byte only to tell whether late image pixels need a full frame and,
+  while searching, whether to take the matches' rows again, the focus-events flag not at all, and
+  reports the count to the activity when it changes.
 - Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
   adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
   centred; the light line width is the font's underline thickness. The wide scale is two cells over
@@ -708,9 +742,18 @@ compiling libghostty-vt with Zig (`android/native`).
   While the lock shows, the IME is told a password is typed (Input), as Ghostty turns macOS's
   secure input on at password prompts.
 - The cursor blinks (shown and hidden every 500 ms, as Android's text fields) while the frame
-  header says it blinks (by default, see Start and end; a program stops it with DECSCUSR or mode
+  header says it blinks (the setting, on by default; a program changes it with DECSCUSR or mode
   12) and the view has the focus in a focused window; otherwise no timer runs. Input and a cursor
   move show it again for a whole period.
+- The cursor setting (Settings' shape, block, bar or underline, and blinking; android/service
+  gives it to every tab, restored ones not shown yet included, as `VtSession.setCursor`) is
+  libghostty-vt's default cursor: a change shows at once unless a program chose its own cursor
+  (DECSCUSR with a nonzero style), and is kept for DECSCUSR 0, DECSTR, a program's RIS and the
+  app's Reset terminal, which bring it back; while the cursor follows its defaults, a change also
+  overrides a program's mode 12. No full frame is needed: every frame's header carries the shape
+  and blinking. A restored tab shows the current setting whatever its snapshot recorded (`settle`'s
+  DECSTR, then the session's setting). The lock ignores it while it shows. Changing it does not
+  make the last snapshot stale.
 - The bell of the tab shown vibrates once through `performHapticFeedback(REJECT)` (a double
   click, subject to the system's touch feedback setting), at most once per 100 ms.
 - The current tab's progress report is drawn by `ProgressLine`, 2 dp high over the top of the
@@ -724,12 +767,15 @@ compiling libghostty-vt with Zig (`android/native`).
 
 #### Input
 
-- Keys: mapped keys go through `VtNative.key`, which encodes them in the terminal's current modes
-  (cursor and keypad modes, Kitty keyboard protocol, including releases from `onKeyUp` and lone
-  modifiers, which are sent only when the encoder emits something). An unmapped key that types a
-  character goes as text without Ctrl or Alt, and to the encoder as an unidentified key with that
-  text with them; one that types nothing goes to the system. System keys (Back, Home, volume,
-  media) go to the system, except the menu key, a hardware keyboard's context menu key, which goes
+- Keys: mapped keys go through `VtNative.key`, which encodes them in the terminal's current modes,
+  copied into the encoder before each key (`set_from_terminal`: cursor and keypad modes, the
+  keypad with NumLock (1035) and Alt's ESC prefix (1036), both on by default, the backarrow key
+  (67), modifyOtherKeys and the Kitty keyboard protocol, including releases from `onKeyUp` and
+  lone modifiers, which are sent only when the encoder emits something). An unmapped key that
+  types a character goes as text without Ctrl or Alt, and to the encoder as an unidentified key
+  with that text with them; one that types nothing goes to the system. System keys (Back, Home,
+  volume, media) go to the system, except the menu key, a hardware keyboard's context menu key,
+  which goes
   to the encoder (`CSI 29 ~` in the legacy encoding). A key the encoder cannot encode is
   swallowed and leaves the modifiers on.
 - CTRL, ALT and SHIFT on the extra keys (SHIFT only with the first page shown) apply to the next
@@ -756,9 +802,10 @@ compiling libghostty-vt with Zig (`android/native`).
   moves while the IME monitors it (not when only `scrollPx` changes).
 - The editor is text without suggestions (`TYPE_TEXT_FLAG_NO_SUGGESTIONS`), and a password
   (`TYPE_TEXT_VARIATION_PASSWORD` with `IME_FLAG_NO_PERSONALIZED_LEARNING`) while the frames give
-  the cursor as a lock: when that changes, and when another tab is attached during one, the view
-  restarts the input (posted, outside drawing) and the IME takes a new connection of the other
-  kind. Gboard then shows its password layout (a number row, no toolbar or suggestions) and is
+  the cursor as a lock: when a frame changes that, the view posts an input restart (outside
+  drawing); attaching another tab during one turns it off and restarts the input at once; the IME
+  then takes a new connection of the other kind. Gboard then shows its password layout (a number
+  row, no toolbar or suggestions) and is
   asked to learn nothing typed; restarting the input ends a composition, which password layouts
   do not make.
 - Paste (`VtNative.paste`, through `ghostty_terminal_paste`): bracketed with mode 2004, else line
@@ -770,7 +817,8 @@ compiling libghostty-vt with Zig (`android/native`).
 
 #### Gestures and selection
 
-- A tap ends a selection or its menu; otherwise, when the program does not track the mouse and the
+- A finger's (or a stylus's) tap ends a selection or its menu; a mouse's or touchpad's press takes
+  the pointer paths below. Otherwise, when the program does not track the mouse and the
   tap is on a link, it opens the link instead of the IME; otherwise it opens the IME and, when the
   program tracks the mouse, also sends a left click (press and release at the tap's pixel position,
   in the program's format), or else moves the shell's cursor when it is on the input at the prompt
@@ -794,10 +842,12 @@ compiling libghostty-vt with Zig (`android/native`).
   (`selectWordBetween` both ways for words), so over blanks and punctuation a word drag stays on the
   last word reached, while a line drag takes in blank rows too (libghostty-vt 1.0's fix; before,
   the selection stayed as it was); any drag once the pressed cell's screen has changed (the
-  alternate screen) leaves the selection as it was. The view counts the taps itself, since a finger press may become a
-  scroll, so each press goes to the gesture untimed (a first click in libghostty-vt's count) with
-  the behaviour the view asks for as a first click's. Lifting ends the gesture (its tracking goes,
-  the selection stays); so does clearing the selection or attaching another tab during a drag.
+  alternate screen) leaves the selection as it was. The view counts a finger's taps itself, since
+  a finger press may become a scroll, so each finger press goes to the gesture untimed (a first
+  click in libghostty-vt's count) with the behaviour the view asks for as a first click's; a
+  mouse's left presses go to the same gesture timed (below). Lifting a finger ends the gesture
+  (its tracking goes, the selection stays); so does clearing the selection, a right-click selecting
+  a word, or attaching another tab during a drag, a mouse's included.
 - A link is a cell's OSC 8 hyperlink, else an `http://` or `https://` URL written in the text
   (`VtNative.link`): vt.c joins the cell's soft-wrapped line (up to 64 rows above and below), takes
   the run's first scheme at or before the cell and runs on over ASCII URL characters (letters,
@@ -851,23 +901,60 @@ compiling libghostty-vt with Zig (`android/native`).
   the finger: lifted, it keeps the word (or the point menu); moved on past the touch slop, the
   selection and the output found are dropped and the program gets a left-button drag instead (press
   at the long-pressed point, motion while moving, release where the finger lifts).
-- A mouse or touchpad (not a finger) pressed while the program tracks the mouse goes to it as it
-  is: the first button pressed (left, right or middle; a touchpad tap is left) with modifiers,
-  motion while it is held and its release, bypassing the gestures (it clears a selection and takes
-  focus without opening the IME); without tracking a mouse acts like a finger. Hover (no button)
-  is sent as motion while the program tracks the mouse. Which of these the program gets is the
+- A mouse or touchpad (not a finger) pressed while the program tracks the mouse, Shift not held at
+  the press, goes to it as it is: the first button pressed (left, right or middle; a touchpad tap
+  is left) with modifiers, motion while it is held and its release, bypassing the gestures (it
+  clears a selection and takes focus without opening the IME). Without tracking, or with Shift held
+  (always: the C API does not expose a program's XTSHIFTESCAPE, so this is Ghostty's
+  `mouse-shift-capture = never`, not its default), it selects as in a desktop terminal (below). A
+  touchpad's two-finger swipe or pinch (classified from Android 14 on) takes the finger gestures
+  instead; earlier, and for other multi-finger swipes, delivered as mouse touches it would select.
+  Hover (no button) is sent as motion while the program tracks the mouse. Which of these the
+  program gets is the
   encoder's choice by its mode (1000 none of the motion, 1002 motion with a button held, 1003
   all), and vt.c skips motion within the cell of the last event it encoded, press or release
   included (except in SGR-Pixels format).
+- Selecting with a mouse (`pointer`, as Ghostty does on Linux; the first button pressed owns the
+  rest of its stream, and every press takes the focus):
+  - The left button (a touchpad's tap) goes to libghostty-vt's selection gesture with its press
+    timed (`VtNative.mousePress`, `mouseDrag`, `mouseRelease`), so libghostty-vt counts the clicks:
+    a press within the double-tap timeout of the last press and a cell's width of the series' first
+    is the next click, up to three. A first click clears the selection, and dragging from it
+    selects by cells, a cell counting once the drag passes its point 60% of the way across
+    (libghostty-vt's threshold), a rectangle while Ctrl (or Meta) and Alt are held (checked at each
+    move); a second click selects the word and a third the line (with Ctrl or Meta, the command's
+    output, Shell integration), each dragging on by its unit; a second or third on empty cells
+    leaves the selection as it was. Held past the grid's edges, the drag scrolls as below.
+  - Shift+press, with a selection and later than the double-tap timeout after the last left press,
+    extends the selection from that press by its unit instead (Ghostty's), when the gesture still
+    has it; otherwise it is a plain press.
+  - A release keeps the click count for the next press; only a first click that did not drag (it
+    stayed in its cell and selected nothing) acts: with Ctrl or Meta on a link it opens the link,
+    otherwise it moves the shell's cursor there at the prompt (Shell integration) and brings the
+    keyboard up, as a tap does. A press that stopped a fling still acts.
+  - The right button, as Ghostty's before its context menu: a selection holding the cell stays,
+    otherwise the word there is selected (on a written space the run of spaces; on empty cells the
+    selection stays as it was), and the menu
+    comes up pinned at the click once the frame has the selection, with Open link for a link under
+    it (no Ctrl needed) and Select output in a command's output.
+  - The middle button only takes the focus.
+  - No menu comes up after the left button, and a selection made or right-clicked with a mouse
+    shows no handles (`pointerSelection`) until the next press that reaches the touch path (a
+    finger, a stylus, a touchpad's swipe or pinch), which itself cannot grab one; Ctrl+Shift+C or
+    the right-click menu copies it.
+  - Unlike Ghostty, a double click on a URL or a right-click on a link selects the word, not the
+    link, and Ctrl or Meta count with other modifiers held too.
 - The mouse pointer over the terminal (`updatePointer`) is the shape the program asked for with
   OSC 22 (an I-beam by default, as in Ghostty; libghostty-vt's names are CSS's cursors), shown as
   the closest of Android's system pointers (progress as waiting, move as all-scroll, not-allowed as
-  no-drop, edge resizes by their axis), or a hand over a link while the program does not track the
-  mouse (a click opens it then), looked up again whenever a hovering mouse reaches another cell.
-  It is set on the view, so a program changing it while the mouse rests shows at once; Ghostty's
-  pointers for its Shift and Ctrl+Alt mouse selections have no counterpart, as the view has
-  neither.
-- The two handles (start below the first cell, end below the last, when in the viewport; a
+  no-drop, edge resizes by their axis), or a hand over a link while Ctrl or Meta is held and the
+  program does not track the mouse (a Ctrl+click opens it then), looked up again when a hovering
+  mouse reaches another cell or a hardware Ctrl or Meta that reaches the view is pressed or let go
+  (the extra keys' CTRL counts for neither). It is set on the view, so a program changing it while
+  the mouse rests shows at once; Ghostty's I-beam and crosshair for its Shift override and
+  Ctrl+Alt rectangle have no counterpart.
+- The two handles (shown for a selection not made with a mouse; start below the first cell, end
+  below the last, when in the viewport; a
   rectangle's top left and bottom right corners) drag the selection's ends; the other end is the
   anchor, kept as tracked grid references so output does not move it, a handle drag extends by
   cells, and a rectangle stays one
@@ -876,21 +963,25 @@ compiling libghostty-vt with Zig (`android/native`).
   stay on the screen, and the handles' areas (with an 8 dp margin) are excluded from the system's
   back gesture while they are shown, so a drag from the edge moves the handle. The finger keeps
   its offset from the dragged cell; held above or below the grid (a handle's drag or a gesture's:
-  a long press's, a double or triple tap's), the viewport scrolls one row every 50 ms (the grid on
+  a long press's, a double or triple tap's, a mouse's left-button drag), the viewport scrolls one
+  row every 50 ms (the grid on
   a whole row) and the selection follows (a gesture's to the edge row's word or line, by the
   view's own timer, not libghostty-vt's autoscroll tick).
 - A floating action mode (`TYPE_FLOATING`) appears once the next frame is drawn after a selection
-  drag, a long press's word or a double or triple tap's press ends (the finger lifted), or Select
-  all (at once, pinned at the press point,
-  after a long press on blanks or a mouse-mode long press that selected nothing), and offers Open
-  link (when the long press that began the selection was on a link, also in mouse mode), Copy (with
-  a selection), Paste (with a clipboard), Select output (when that long press was in a command's
-  output), Select all (scrollback included), and with a selection Rectangle, or Lines for a
+  drag, a long press's word or a double or triple tap's press ends (the finger lifted), Select
+  all, or a right-click (pinned at the click), and at once, pinned at the press point, after a long
+  press on blanks or a mouse-mode long press that selected nothing; never after a mouse's left
+  button. It offers Open link (when the long press that began the selection, or the right-click,
+  was on a link, also in
+  mouse mode), Copy (with a selection), Paste (with a clipboard), Select output (when that long
+  press or right-click was in a command's output), Select all (scrollback included), and with a
+  selection Rectangle, or Lines for a
   rectangle, with the system's own labels but Open link's, Select output's and the last two, placed
   over the selected rows and moved with them on every draw; a frame without a selection closes it.
   Open link ends the selection and opens the link. Select output selects the whole output (Shell
   integration) and the menu comes back for it, without the item, which a double or triple tap,
-  Select all, clearing or a mouse-mode drag also drop; when the output has left the scrollback the
+  Select all, clearing, a mouse-mode drag or a mouse press to select also drop; when the output has
+  left the scrollback the
   menu comes back without the item and the selection as it was. Rectangle makes the selection's
   first and last cells opposite corners of a rectangle; Lines makes it linear again from the
   rectangle's top left to its bottom right corner; the menu comes back with the other item. Copy
@@ -948,10 +1039,13 @@ compiling libghostty-vt with Zig (`android/native`).
   and the page layouts, `MainActivity`'s dialogs and menus, `VtView`'s paste confirmation);
   androidx.core's insets and animation compat.
 - libghostty-vt 1.0.0, Ghostty's terminal library released apart from the app (the terminal
-  state and its full reset, writes that stop at OSC strings'
-  ends, render state with one overscan row, key and mouse encoders, paste, focus encoding,
-  selection gestures (word and line presses and drags), output derivation and keyboard
-  adjustment, search with the list of all its matches, plain-text formatting, title and width,
+  state and its full reset, the default cursor's shape and blinking, writes that stop at OSC and
+  DCS strings' starts and ends, render state with one overscan row, key and mouse encoders, paste,
+  focus encoding, selection gestures (a finger's untimed word and line presses and drags; a
+  mouse's timed clicks with their count, cell, word, line and output behaviours, rectangle drags,
+  releases, dragged flag and anchor), word selection and selection containment (right-click),
+  output derivation and keyboard adjustment, search with the list of all its matches, plain-text
+  formatting, title and width,
   progress and program status reports, semantic
   prompts (cursor at a prompt, scrolling by prompts, the OSC 133 callback, rows' and cells' marks
   read through grid references), the full reset callback, unimplemented OSC and
@@ -974,9 +1068,15 @@ compiling libghostty-vt with Zig (`android/native`).
   colour string parsing and the X11 colour names; iterating Kitty placements directly (the render
   state's image list is what is drawn); decoding a snapshot in steps and exporting its unfinished
   sequence (a snapshot is decoded at once and settled); the composing flag of key events (the
-  IME's composing text is drawn by `VtView` and never goes through the key encoder); setting the
-  title or directory by hand. Defaults that suit it stay unset: resizing pulls rows back from the
-  scrollback (right for a console that keeps no screen of its own), APC strings' size limits,
+  IME's composing text is drawn by `VtView` and never goes through the key encoder) and the
+  encoder's macOS Option-as-Alt setting, the one option `set_from_terminal` does not copy, which
+  only a macOS build reads; the standalone encoders the terminal's own handling replaces
+  (`paste_encode`, `paste_is_safe`, `size_report_encode`, `mode_report_encode`,
+  `color_scheme_report_encode`); the hollow block cursor style, which the setting does not offer
+  (the view draws a block hollow without the focus); setting the title or directory by hand.
+  Defaults that suit it stay
+  unset: resizing pulls rows back from the scrollback (right for a console that keeps no screen
+  of its own), APC strings' size limits,
   and the platform's secure random source (getrandom). OSC 7 (and OSC 9 or 1337 directories) is
   left unwired too: Ghostty takes a directory only from the local host, and for a local shell the
   kernel's foreground directory, which new tabs use, says as much without the shell's help.
@@ -1004,8 +1104,9 @@ compiling libghostty-vt with Zig (`android/native`).
   reading blocks only its tab.
 - Console numbers are freed at close and reused lowest-first by the kernel, and a close carries no
   generation, so closing a stale number closes whichever console now has it.
-- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab or Ctrl+Shift+Tab typed on a hardware
-  keyboard with the modifiers held (the tab shortcuts), nor Ctrl+Shift+↑ and ↓ on the primary screen
+- Programs never receive Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Shift+F, Ctrl+Tab or Ctrl+Shift+Tab
+  typed on a hardware keyboard with Ctrl held but neither Alt nor Meta (the tab shortcuts), nor
+  Ctrl+Shift+↑ and ↓ on the primary screen
   (the prompt jumps, taken even when there are no prompts); the release of the shortcut's key is
   swallowed too, so the Kitty protocol sees no release without a press. Other releases are never
   matched to presses: Ctrl+Shift+C/V's, a Shift+arrow's (or Page Up or Down, Home or End) that
@@ -1120,8 +1221,9 @@ compiling libghostty-vt with Zig (`android/native`).
   the continuation limit (the unfinished sequence's bytes are), the terminfo name and the
   clipboard-write and unknown-sequence limits;
   the snapshot carries the scrollback limits, default colours, default modes (2027's) and cursor
-  defaults (older snapshots a steady cursor). vt.c sets every option on it as on a new terminal,
-  after `settle`, so the app's values win.
+  defaults and whether the cursor follows them (older snapshots a steady cursor). vt.c sets every
+  option on it as on a new terminal, after `settle` (whose DECSTR makes the cursor follow its
+  defaults again), and the session then sets the user's cursor, so the app's values win.
 - Snapshots are recorded with the libghostty-vt version that wrote them (`1.0.0`; the copy in
   Ghostty 1.4.0 recorded `ghostty-1.4.0/0.1.0-dev`). One from another version is not decoded,
   since the snapshot format is versioned apart from the library and outside its ABI promise, and
@@ -1131,9 +1233,30 @@ compiling libghostty-vt with Zig (`android/native`).
   thread under the tab's lock: asking the user there would block every frame (the main thread
   takes the same lock). OSC 52 reads are therefore found by vt.c and answered later through the
   tab's writer, and OSC 5522 reads, which only the callback can serve, stay refused.
-- vt.c's OSC tracking (`osc_open`) follows only what goes through `appine_vt_feed`. App writes
-  that cancel a program's string with CAN (`write_own`) clear it; any other write into the
-  terminal that could end or start an OSC string must too, or a later string's start is misread.
+- vt.c's OSC and DCS tracking (`osc_open`, `dcs_open` and `tmux_control`) follows only what goes
+  through `appine_vt_feed`. App writes that cancel a program's string with CAN (`write_own`) clear
+  it (a tmux control string so cut is never reported as detached); any other write into the
+  terminal that could end or start such a string must too, or a later string's start is misread.
+  Text the app prints (`VtNative.print`) goes through the tracking, but its replies are dropped,
+  so it cannot detach tmux.
+- The tmux detach rests on tmux taking a lone carriage return in control mode as an empty line,
+  which detaches it (tmux 3.5a and 3.7c do); the reply goes out once per string. Should a program
+  ever start and end such a string within one read, the carriage return still reaches whatever
+  reads the console next (an empty line at a shell's prompt).
+- The selection gesture is one per terminal, shared by touch and mouse: a mouse's click count
+  survives its releases, but vt.c's own clearing (`appine_vt_select_clear`: the view's
+  `clearSelection`, typing, Clear screen, Reset terminal), a finger's word or line press and the
+  finger lifting from its drag, a right-click that selects a word, a failed mouse press and
+  attaching another tab during a drag reset it; selecting all, a rectangle, an output or a
+  handle's grab do not, so a later Shift+press after the timeout replaces those with an extension
+  from the last left press. A cell press yields no selection (vt.c clears it on a first click, and
+  a cell drag not yet past its threshold leaves none, neither resetting the gesture), and a repeat
+  keeps the first click's cell, so a release on another cell counts as a drag.
+- A cursor shape set while a full-screen program shows the alternate screen reaches only that
+  screen: libghostty-vt keeps the shape per screen, and leaving the alternate screen with mode 1049
+  restores no shape (its saved cursor carries none), so the primary keeps the old one until the
+  next DECSCUSR 0, DECSTR, RIS or setting change; leaving with mode 47 or 1047 copies the whole
+  cursor, shape included, back (from libghostty-vt's source, not tried).
 - Continuation tracking keeps at most 64 KiB of an unfinished sequence: a snapshot taken while
   output stops inside a longer one (an OSC 52 write, a large Kitty transmission) fails, and that
   save leaves the tab without a snapshot until the terminal changes.
@@ -1238,8 +1361,9 @@ compiling libghostty-vt with Zig (`android/native`).
   place again (the steps scroll nothing but the last); a resize that changed which matches exist
   could select another one.
 - The C API's `select_line` defaults to ignoring prompt marks (`semantic_prompt_boundary` off);
-  the selection gesture's line is Ghostty's own, with them on, so a triple tap stops at a prompt
-  mark. vt.c no longer calls `select_line`; a direct call would need the option set.
+  the selection gesture's line is Ghostty's own, with them on, so a triple tap or triple click
+  stops at a prompt mark. vt.c no longer calls `select_line`; a direct call would need the option
+  set.
 - With prompt marks, every resize while the cursor is at a prompt (the keyboard showing or hiding
   is one) clears the prompt's rows, from its first row down, for the shell to redraw them on
   SIGWINCH (bash's marks ask for the last row only, `redraw=last`, as readline redraws). busybox
@@ -1280,14 +1404,13 @@ compiling libghostty-vt with Zig (`android/native`).
   `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, marked `GHOSTTY_PASTE_SOURCE_TEXT`, or they would become paste
   events).
 - **More of libghostty-vt left unused**:
-  - selection: of the selection gesture, its own click counting (the view counts taps, and gives
-    every press untimed), cell and output behaviours, autoscroll ticks (the view scrolls on its own
-    timer), deep presses, a press's rectangle flag (Ghostty's Alt-drag rectangle; the view makes
-    rectangles only from the menu) and its word-boundary characters (the gesture's defaults, which
-    are Ghostty's);
-  - drawing: the default palette and cursor style options (the 256 colours are libghostty-vt's
-    built-in ones, the built-in block is Ghostty's `cursor-style` default, and the colour scheme
-    reply is fixed to dark); overscan above the viewport (only the row below is asked for);
+  - selection: of the selection gesture, its click counting for a finger (the view counts taps
+    and gives finger presses untimed; a mouse's are timed), autoscroll ticks with their viewport
+    option and autoscroll data (the view scrolls on its own timer), deep presses, its behaviour
+    data and its word-boundary characters (the gesture's defaults, which are Ghostty's);
+  - drawing: the default palette option (the 256 colours are libghostty-vt's built-in ones, and
+    the colour scheme reply is fixed to dark); overscan above the viewport (only the row below is
+    asked for);
     `row_iterator_next_dirty`; `frame` holds the tab's lock
     while it encodes every row, about 95% of its time (on an M2 Pro, vt.c on a macOS build fed a
     line of coloured output a frame: 63 of 67 µs at 45 × 60 cells, 69 of 74 µs at 80 × 40, 265 of
@@ -1311,10 +1434,10 @@ compiling libghostty-vt with Zig (`android/native`).
     itself for the lock);
     Kitty's drag and drop (OSC 72) has a callback only in the Zig API; OSC 66 text sizing, OSC 99
     Kitty notifications and hierarchical contexts are parsed but not acted on by libghostty-vt
-    itself; tmux control mode is not even parsed: libghostty-vt built for apps leaves Oniguruma
-    out, which turns tmux control mode off with it, so `ESC P 1000 p` is ignored as an unknown DCS
-    and everything `tmux -CC` prints until it leaves control mode is swallowed (the tab looks hung
-    while keys still reach tmux as commands).
+    itself; tmux control mode is not parsed: libghostty-vt built for apps leaves Oniguruma out,
+    which turns tmux control mode off with it, so `ESC P 1000 p` would be swallowed as an unknown
+    DCS; vt.c detaches tmux as it starts instead (Start and end), so `tmux -CC` gets no windows or
+    tabs as iTerm2 gives it.
 - **Images take memory twice for the tab shown, and are never trimmed**: each screen of each tab
   keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and the view holds a bitmap of
   every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both. A tab
@@ -1360,6 +1483,13 @@ compiling libghostty-vt with Zig (`android/native`).
 - Should typing in the search bar select the newest match at once, as Chrome's find bar does,
   rather than wait for a step, as Ghostty does? And should the extra keys act on the search text
   while it has the keyboard, rather than on the terminal?
+
+- Should a mouse's middle button paste the clipboard (Ghostty's `middle-click-action`; Android has
+  no primary selection), and should a left-button selection copy on release (Ghostty's
+  `copy-on-select`) or bring up the menu?
+- Should a double click on a URL, or a right-click on a link, select the whole link, as Ghostty
+  does, and should the extra keys' CTRL make Ctrl+click and the hand pointer work?
+- Should a cursor shape changed while a full-screen program shows reach the primary screen too?
 
 ## To verify
 
@@ -1456,6 +1586,22 @@ compiling libghostty-vt with Zig (`android/native`).
   mouse rested, a hand over URLs, hover motion still reported under mode 1003; and the frame's
   shape byte, a full reset keeping it and a restored snapshot resetting it on a macOS build of
   vt.c. Not with real mice, touchpads, ChromeOS, DeX or desktop windowing, or every shape.
+- Mouse selection was tried on a Pixel 4a API 34 emulator with a virtual mouse made by the
+  system's `uinput` command, with Ctrl, Alt and Shift keys on the same device (cell drags, double
+  and triple clicks, a Ctrl+Alt rectangle, Shift+click extending, right-clicks inside and outside a
+  selection and on blanks with Copy and Paste from the menu, the hand pointer only with Ctrl, a
+  plain click not opening a URL and Ctrl+click opening Chrome, a mouse-tracking `cat -v` getting
+  the plain drag and Shift+drag selecting), and vt.c's functions on a macOS build (clicks, timing,
+  distance, thresholds, rectangles, extending, releases outside, right-click words, output with
+  Ctrl); not with real mice or touchpads (their swipe and pinch classification), styluses, Android
+  11–13, DeX, ChromeOS or desktop windowing, nor a mouse drag's autoscroll on a device.
+- The cursor setting was tried there through Settings (Bar and steady, then back), with a program's
+  DECSCUSR 2 and 0, and on a macOS build of vt.c (a full reset and the app's Reset terminal keeping
+  it); not in Chinese, with a full-screen program showing, or on real devices.
+- tmux -CC was tried in the app with Alpine's tmux 3.7c (detached at once, the notice, `tmux ls`
+  and a normal `tmux attach`), with tmux 3.5a (Debian) and 3.7c (Alpine) in containers, and on a
+  macOS build of vt.c fed tmux's recorded bytes (one byte a read, other DCS strings, a program's
+  and the app's CAN); not with other tmux versions or on real devices.
 - Snapshot restoring was tried only on a Pixel 4a API 34 emulator (a force-stop and an update
   reinstall, with coloured output, mouse tracking, bracketed paste and a title left on), and the
   encoding, settling and round trip on a macOS build of vt.c; not with images in a snapshot,

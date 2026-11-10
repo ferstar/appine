@@ -24,6 +24,13 @@ internal object VtNative {
      */
     @JvmStatic external fun restore(machine: Long, console: Int, snapshot: ByteArray, cols: Int, rows: Int, cellWidth: Int, cellHeight: Int): Long
 
+    /**
+     * Sets the cursor's default shape ([CURSOR_BLOCK], [CURSOR_BAR] or [CURSOR_UNDERLINE]) and
+     * whether it [blink]s, the user's setting: shown at once unless a program chose its own cursor
+     * (DECSCUSR), and what its reset and a full reset bring back.
+     */
+    @JvmStatic external fun setCursor(tab: Long, style: Int, blink: Boolean)
+
     /** Shows bytes from the app as if the console had printed them. */
     @JvmStatic external fun print(tab: Long, data: ByteArray)
 
@@ -33,8 +40,9 @@ internal object VtNative {
      * [frame], `session.onTitle()` when a program set the title, the session's `onBell`,
      * `onClipboard`, `onNotification`, `onProgress`, `onStatus` and `onClipboardRead` for what
      * programs asked of the app, `onCommandFinished` when the shell's prompt marks saw a command
-     * finish, and `onForeground()` once the process group in the foreground when
-     * progress or a status was last reported has given the terminal back.
+     * finish, `onTmuxDetached()` when tmux's control mode, which vt.c detached, ended, and
+     * `onForeground()` once the process group in the foreground when progress or a status was last
+     * reported has given the terminal back.
      */
     @JvmStatic external fun pump(tab: Long, session: VtSession)
 
@@ -127,6 +135,47 @@ internal object VtNative {
 
     /** Ends the gesture (the finger lifted), keeping its selection. */
     @JvmStatic external fun gestureEnd(tab: Long)
+
+    /**
+     * A mouse's left button pressed at viewport cell ([x], [y]), pixel ([px], [py]) from the grid's
+     * corner, at [timeNs] (uptime), as Ghostty's selection clicks: a press within [intervalNs] of
+     * the last and a cell's width of the first is its next click. A first click clears the
+     * selection, a second selects the word, a third the line (the command's output with
+     * [output]). Returns the click count (1 to 3), 0 when it failed.
+     */
+    @JvmStatic external fun mousePress(
+        tab: Long,
+        x: Int,
+        y: Int,
+        px: Float,
+        py: Float,
+        timeNs: Long,
+        intervalNs: Long,
+        output: Boolean,
+    ): Int
+
+    /**
+     * The held left button dragged on to viewport cell ([x], [y]), pixel ([px], [py]): the
+     * selection runs from the pressed cell by the click's unit (cells, each once the drag passes
+     * its point 60% of the way across, a [rectangle] when asked; words; lines). Also extends the
+     * selection from the last press after it was released (Shift+press). Returns 1 with a
+     * selection, 0 without, -1 when no press is under way (nothing changed).
+     */
+    @JvmStatic external fun mouseDrag(tab: Long, x: Int, y: Int, px: Float, py: Float, rectangle: Boolean): Int
+
+    /**
+     * The left button released at viewport cell ([x], [y]) (out of the grid: moved away). Returns
+     * the click count, negated when the press moved from its cell or its drag selected, 0 without
+     * a press under way.
+     */
+    @JvmStatic external fun mouseRelease(tab: Long, x: Int, y: Int): Int
+
+    /**
+     * A right-click at viewport cell ([x], [y]), as Ghostty's before its context menu: a selection
+     * holding the cell stays, else the word there is selected (on empty cells the selection stays
+     * as it was). True when there is a selection afterwards.
+     */
+    @JvmStatic external fun selectContext(tab: Long, x: Int, y: Int): Boolean
 
     /**
      * Starts dragging the handle of the selection's last cell ([end]) or first cell: the other end
@@ -264,6 +313,11 @@ internal object VtNative {
 
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)
+
+    // libghostty-vt's GhosttyCursorStyle ([setCursor])
+    const val CURSOR_BAR = 0
+    const val CURSOR_BLOCK = 1
+    const val CURSOR_UNDERLINE = 2
 
     // libghostty-vt's GhosttySelectionGestureBehavior ([gesturePress])
     const val GESTURE_WORD = 1
