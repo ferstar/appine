@@ -1,5 +1,6 @@
 package io.github.mthli.appine
 
+import android.graphics.Bitmap
 import java.nio.ByteBuffer
 
 /**
@@ -36,6 +37,14 @@ internal object VtNative {
      * `hosts/android/src/vt.c`); valid until the next call. Main thread only.
      */
     @JvmStatic external fun frame(tab: Long, full: Boolean): ByteBuffer?
+
+    /**
+     * Copies the pixels of the Kitty image [id] at [generation], as a [frame] named it, into
+     * [bitmap] (mutable, `ARGB_8888`, the image's size). False when the image is no longer that
+     * generation or size (a later frame names the new one), its pixels have not all arrived, or the
+     * bitmap does not fit.
+     */
+    @JvmStatic external fun image(tab: Long, id: Int, generation: Long, bitmap: Bitmap): Boolean
 
     /**
      * Resizes the terminal, then the console (SIGWINCH); returns the terminal's replies for the

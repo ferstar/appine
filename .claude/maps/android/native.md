@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment corrected)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `parse_route`'s comment, then vt.c's Wuffs header and libjnigraphics last)
 
 ## Responsibilities
 
@@ -137,8 +137,11 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   `APPINE_GHOSTTY_SRC`), panics on any architecture but aarch64, and runs `$ZIG` (or `zig` on
   `PATH`) `build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast
   -Dtarget=aarch64-linux-android` into `OUT_DIR` with the six proxy variables removed; it then
-  compiles `src/vt.c` (C11, extra warnings) with `cc` and links `libghostty-vt.a` statically into
-  `libappine.so` (with uucode, simdutf, Highway, Wuffs and Zig's compiler_rt). Ghostty's build
+  compiles `src/vt.c` (C11, extra warnings) with `cc`, against the installed headers and Wuffs's
+  single-file header in the source's Zig packages (`zig-pkg/<hash>/release/c`, the hash read from
+  Ghostty's `pkg/wuffs/build.zig.zon`; vt.c decodes PNG images with the Wuffs in the archive), and
+  links `libghostty-vt.a` statically into `libappine.so` (with uucode, simdutf, Highway, Wuffs and
+  Zig's compiler_rt); `vt.rs` also links the system's libjnigraphics. Ghostty's build
   finds the NDK through `ANDROID_NDK_HOME`, and Ghostty 1.4.0 requires Zig 0.17.0 (its
   `minimum_zig_version`; neither `build.rs` nor `fetch-ghostty` checks the version). Every Android
   build, CI's included, therefore needs Zig and the fetched source.
@@ -245,8 +248,9 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
 ### Outbound
 
 - `appine_kernel` (`Machine`, `MachineOptions`, routes, store and browse functions), `jni` 0.21,
-  `libc`, Android `liblog`; cargo-ndk and NDK 29; AGP, Gradle; `androidx.core`, Material Components
-  and androidx.test from Google's Maven repository and Maven Central.
+  `libc`, Android `liblog` and `libjnigraphics`; cargo-ndk and NDK 29; AGP, Gradle;
+  `androidx.core`, Material Components and androidx.test from Google's Maven repository and Maven
+  Central.
 - Zig 0.17.0, the Ghostty 1.4.0 source release and its Zig packages, the `cc` crate;
   `scripts/fetch-rootfs`'s output in `target/rootfs`.
 - `scripts/release-sources`: git, `cargo vendor`, `scripts/fetch-ghostty` and `fetch-rootfs`,
@@ -267,6 +271,11 @@ terminal's emulator shim, its JNI functions, sessions and views (`android/termin
   lazy Zig packages are fetched only for the options the configure phase sees. `build.rs` reruns
   only when `vt.c`, the source's `build.zig.zon`, `APPINE_GHOSTTY_SRC` or `ZIG` change, not for
   other Ghostty files or `ANDROID_NDK_HOME`.
+- vt.c's Wuffs header is found through Ghostty's internals: the dependency named `wuffs` in
+  `pkg/wuffs/build.zig.zon`, Zig's `zig-pkg/<hash>` layout and the file `wuffs-v0.4.c`. A Ghostty
+  upgrade that changes any of them fails the build ("no Wuffs …" or no hash) until `build.rs`
+  follows; the package is there whenever libghostty-vt builds, since it links Wuffs for Kitty
+  graphics.
 - Zig 0.17 unpacks every package already in its global cache into `zig-pkg/`, needed or not; only
   an empty cache shows what a build uses.
 - The K2 compiler reports unused variables and never-read assignments only with its extra

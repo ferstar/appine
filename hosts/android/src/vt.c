@@ -11,7 +11,7 @@
 // Frame format (little-endian), written by appine_vt_frame and read by VtView.kt; the two change
 // together:
 //
-//   header, 56 bytes:
+//   header, 64 bytes:
 //     u16 cols, u16 rows
 //     u8  dirty            0 nothing changed, 1 some rows, 2 every row
 //     u8  cursor_visible   1 when visible and inside the viewport
@@ -40,6 +40,24 @@
 //     u32 search_total     the search's matches on the active screen so far, 0 without a search
 //     u32 search_selected  the selected match's place counted from the newest (1 for the
 //                          newest), 0 when none is selected
+//     u16 image_count      number of image placements that follow
+//     u16 reserved
+//     u32 animation_ms     when to draw again for the next frame of an animated image, 0 when
+//                          none plays
+//   image_count image placements (Kitty graphics), in drawing order, 56 bytes each:
+//     u32 image_id         the image to draw, whose pixels appine_vt_image gives
+//     u8  layer            0 below the cell backgrounds, 1 below the text, 2 above it
+//                          (GhosttyRenderStateImageLayer)
+//     u8  reserved[3]
+//     u64 generation       the image's pixels: a new value whenever they change
+//     i32 x, i32 y         the destination's top left corner in pixels from the grid's, which
+//                          can be left of or above it
+//     u32 width, u32 height
+//                          the destination's size in pixels, which can reach past the grid
+//     u32 source_x, u32 source_y, u32 source_width, u32 source_height
+//                          the part of the image drawn there, in image pixels
+//     u32 image_width, u32 image_height
+//                          the image's size
 //   row_count rows:
 //     u16 y, u16 cell_count, u32 extra_count
 //     u16 selection_from, u16 selection_to
@@ -56,8 +74,11 @@
 //     extra_count u32 codepoints: the further codepoints of the row's cells, in cell order
 //
 // A row is sent when its cells changed or when its search marks did (a new needle, another
-// selected match, a match found), so the view's mirror always carries the marks.
+// selected match, a match found), so the view's mirror always carries the marks. The view paints
+// images into its rows, so every row is sent whenever the placements change and some are or were
+// on the screen.
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -68,7 +89,22 @@
 
 #include <ghostty/vt.h>
 
-#define HEADER_BYTES 56
+// Wuffs, which libghostty-vt links for Kitty graphics, also decodes the PNG images programs send
+// (decode_png): the decoder Ghostty itself uses, memory-safe by construction, for data any program
+// can print. Only its declarations are compiled here; the definitions are in libghostty-vt.a. The
+// modules are those PNG needs of the ones Ghostty compiles (pkg/wuffs/build.zig); build.rs finds
+// the header in the source's Zig packages
+#define WUFFS_CONFIG__MODULES
+#define WUFFS_CONFIG__MODULE__BASE
+#define WUFFS_CONFIG__MODULE__ADLER32
+#define WUFFS_CONFIG__MODULE__CRC32
+#define WUFFS_CONFIG__MODULE__DEFLATE
+#define WUFFS_CONFIG__MODULE__PNG
+#define WUFFS_CONFIG__MODULE__ZLIB
+#include "wuffs-v0.4.c"
+
+#define HEADER_BYTES 64
+#define IMAGE_BYTES 56
 #define ROW_HEADER_BYTES 12
 #define CELL_BYTES 16
 
@@ -124,6 +160,14 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // What a notification (OSC 9, OSC 777) keeps of its title and body
 #define NOTIFICATION_MAX ((size_t)4096)
 
+// The memory each screen's Kitty images may take, decoded; beyond it libghostty-vt deletes the
+// oldest images no placement shows, and refuses an image that does not fit at all. About three
+// images the size of a phone's screen; Ghostty's default is 320 MB, libghostty-vt's 10 MB
+#define KITTY_STORAGE ((uint64_t)32 << 20)
+
+// The shortest wait between two frames of an animated image (about 120 Hz)
+#define ANIMATION_MIN_MS 8
+
 // The terminfo entry programs run under (ConsolePty sets TERM to it), the answer to XTGETTCAP's
 // TN. Unset, libghostty-vt leaves that query unanswered; the other capabilities it answers from
 // Ghostty's own entry either way
@@ -174,8 +218,17 @@ static void put_u32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)(v >> 24);
 }
 
+static void put_u64(uint8_t *p, uint64_t v) {
+  put_u32(p, (uint32_t)v);
+  put_u32(p + 4, (uint32_t)(v >> 32));
+}
+
 static uint32_t clamp_u32(uint64_t v) {
   return v > UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+}
+
+static int32_t clamp_i32(int64_t v) {
+  return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : (int32_t)v;
 }
 
 static uint32_t argb(GhosttyColorRgb c) {
@@ -211,6 +264,27 @@ typedef struct {
   const uint8_t *statuses;
   size_t statuses_len;
 } AppineVtEffects;
+
+// One image placement of a frame (see the format above), with what puts it in drawing order and
+// joins the rows of a virtual placement (images_changed)
+typedef struct {
+  uint32_t id;
+  uint8_t layer;
+  int32_t z;
+  uint8_t kind;
+  uint32_t placement_id;
+  uint64_t generation;
+  int32_t x;
+  int32_t y;
+  uint32_t width;
+  uint32_t height;
+  uint32_t source_x;
+  uint32_t source_y;
+  uint32_t source_width;
+  uint32_t source_height;
+  uint32_t image_width;
+  uint32_t image_height;
+} Placement;
 
 typedef struct AppineVt {
   GhosttyTerminal term;
@@ -282,6 +356,13 @@ typedef struct AppineVt {
   bool compress_touched;
   // The last transcript is still the screen's text: no output, message or resize came since
   bool transcribed;
+  // Kitty graphics: the render state's image list, read into placed (in drawing order) whenever
+  // its placements generation changes, and that generation as last read
+  GhosttyRenderStateImageIterator images;
+  Placement *placed;
+  size_t placed_len;
+  size_t placed_cap;
+  uint64_t images_generation;
 } AppineVt;
 
 // ---- Effects (called inside ghostty_terminal_vt_write, under vt.rs's lock) ----
@@ -453,6 +534,67 @@ static void on_render_hold(GhosttyTerminal t, void *userdata, bool held) {
   }
 }
 
+// ---- PNG images (Kitty graphics) ----
+
+// Decodes a PNG image a program sent into RGBA (straight alpha) allocated from allocator, as
+// libghostty-vt's sys interface asks (GhosttySysDecodePngFn): with Wuffs, as Ghostty does
+// (pkg/wuffs/src/png.zig). Called inside ghostty_terminal_vt_write; an image larger than a
+// screen's whole storage is refused before its pixels are allocated
+static bool decode_png(void *userdata, const GhosttyAllocator *allocator, const uint8_t *data,
+                       size_t data_len, GhosttySysImage *out) {
+  (void)userdata;
+  wuffs_png__decoder *decoder = wuffs_png__decoder__alloc();
+  if (decoder == NULL) return false;
+  bool ok = false;
+  uint8_t *pixels = NULL;
+  size_t size = 0;
+  uint8_t *work = NULL;
+  wuffs_base__io_buffer source = wuffs_base__ptr_u8__reader((uint8_t *)data, data_len, true);
+  wuffs_base__image_config config;
+  wuffs_base__status status =
+      wuffs_png__decoder__decode_image_config(decoder, &config, &source);
+  if (!wuffs_base__status__is_ok(&status)) goto done;
+  uint32_t width = wuffs_base__pixel_config__width(&config.pixcfg);
+  uint32_t height = wuffs_base__pixel_config__height(&config.pixcfg);
+  if (width == 0 || height == 0 || (uint64_t)width * height > KITTY_STORAGE / 4) goto done;
+  wuffs_base__pixel_config__set(&config.pixcfg, WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL,
+                                WUFFS_BASE__PIXEL_SUBSAMPLING__NONE, width, height);
+  size = (size_t)width * height * 4;
+  pixels = ghostty_alloc(allocator, size);
+  if (pixels == NULL) goto done;
+  uint64_t work_len = wuffs_png__decoder__workbuf_len(decoder).max_incl;
+  if (work_len > SIZE_MAX) goto done;
+  // malloc(0) may give NULL, which Wuffs takes for a missing buffer
+  work = malloc(work_len > 0 ? (size_t)work_len : 1);
+  if (work == NULL) goto done;
+  wuffs_base__pixel_buffer buffer;
+  status = wuffs_base__pixel_buffer__set_from_slice(&buffer, &config.pixcfg,
+                                                     wuffs_base__make_slice_u8(pixels, size));
+  if (!wuffs_base__status__is_ok(&status)) goto done;
+  status = wuffs_png__decoder__decode_frame(decoder, &buffer, &source, WUFFS_BASE__PIXEL_BLEND__SRC,
+                                            wuffs_base__make_slice_u8(work, (size_t)work_len),
+                                            NULL);
+  if (!wuffs_base__status__is_ok(&status)) goto done;
+  out->width = width;
+  out->height = height;
+  out->data = pixels;
+  out->data_len = size;
+  ok = true;
+done:
+  if (!ok && pixels != NULL) ghostty_free(allocator, pixels, size);
+  free(work);
+  free(decoder);
+  return ok;
+}
+
+// The PNG decoder is process-wide (libghostty-vt's sys interface); installed with the first
+// terminal
+static pthread_once_t png_once = PTHREAD_ONCE_INIT;
+
+static void install_png(void) {
+  ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)decode_png);
+}
+
 // ---- Lifecycle ----
 
 void appine_vt_free(AppineVt *vt);
@@ -471,10 +613,12 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
       ghostty_key_encoder_new(NULL, &vt->encoder) != GHOSTTY_SUCCESS ||
       ghostty_key_event_new(NULL, &vt->event) != GHOSTTY_SUCCESS ||
       ghostty_mouse_encoder_new(NULL, &vt->mouse) != GHOSTTY_SUCCESS ||
-      ghostty_mouse_event_new(NULL, &vt->mouse_event) != GHOSTTY_SUCCESS) {
+      ghostty_mouse_event_new(NULL, &vt->mouse_event) != GHOSTTY_SUCCESS ||
+      ghostty_render_state_image_iterator_new(NULL, &vt->images) != GHOSTTY_SUCCESS) {
     appine_vt_free(vt);
     return NULL;
   }
+  pthread_once(&png_once, install_png);
   // Cell sizes are only known to libghostty-vt through resize (size reports, images)
   ghostty_terminal_resize(vt->term, cols, rows, cell_width, cell_height);
   vt->mouse_x = -1;
@@ -518,13 +662,20 @@ AppineVt *appine_vt_new(uint16_t cols, uint16_t rows, uint32_t cell_width, uint3
   GhosttyTerminalModeConfig graphemes = {.mode = GHOSTTY_MODE_GRAPHEME_CLUSTER, .value = true};
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE_DEFAULT, &graphemes);
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &graphemes);
-  // Images and registered glyphs are never drawn (frames carry cells only), so neither protocol is
-  // advertised: libghostty-vt's 10 MB default would answer a Kitty graphics query with OK and
-  // a Glyph Protocol query with support, and programs such as yazi or chafa would send images that
-  // never appear instead of falling back to text. A limit of 0 turns the Kitty protocol off
-  // entirely (queries unanswered, as in a terminal without it); a full reset keeps the limit
-  uint64_t kitty_limit = 0;
+  // Kitty graphics, drawn by the view from the frames' placements; a full reset keeps the limit
+  // and the media (the alternate screen takes the primary's)
+  uint64_t kitty_limit = KITTY_STORAGE;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &kitty_limit);
+  // Images sent in the escape sequences only (libghostty-vt's default, set so that it stays so):
+  // the file, temporary file and shared memory media name files and objects of the app's host,
+  // not of the guest whose program sends them. Programs then fall back to sending the data
+  bool host_media = false;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE, &host_media);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &host_media);
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, NULL);
+  // Registered glyphs are never drawn (the C API gives no access to them), so the Glyph Protocol
+  // is not advertised: libghostty-vt answers its query with support by default, and programs
+  // would send glyphs that never appear instead of falling back to text
   bool glyphs = false;
   ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL, &glyphs);
   return vt;
@@ -537,6 +688,8 @@ void appine_vt_free(AppineVt *vt) {
   drop_anchor(vt);
   // Before the terminal, so it releases what it tracks there
   if (vt->search) ghostty_search_free(vt->search);
+  if (vt->images) ghostty_render_state_image_iterator_free(vt->images);
+  free(vt->placed);
   free(vt->matches);
   free(vt->marks);
   free(vt->marks_sent);
@@ -748,6 +901,8 @@ static void put_viewport(AppineVt *vt, uint8_t *p, const GhosttyGridRef *ref) {
 
 static bool search_catch_up(AppineVt *vt);
 static bool mark_matches(AppineVt *vt);
+static uint32_t tick_animations(AppineVt *vt);
+static bool images_changed(AppineVt *vt);
 
 // Captures the screen and writes a frame with the rows that changed since the last frame (all of
 // them when full is set); the result is valid until the next call. NULL when out of memory.
@@ -758,9 +913,13 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
     ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &sync);
     vt->held = false;
   }
+  // The animation frames due now go into the update that follows
+  uint32_t animation_ms = vt->held ? 0 : tick_animations(vt);
   if (!vt->held && ghostty_render_state_update(vt->state, vt->term) != GHOSTTY_SUCCESS) {
     return NULL;
   }
+  // The view paints images into its rows, so every row is repainted when they change
+  if (images_changed(vt)) full = true;
   bool search_pending = vt->search != NULL && !search_catch_up(vt);
   // Without memory for the marks, rows go without them
   bool marked = mark_matches(vt);
@@ -837,7 +996,31 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   put_u32(h + 44, clamp_u32(scrollbar.len));
   put_u32(h + 48, search_total);
   put_u32(h + 52, search_selected);
+  size_t images = vt->placed_len < UINT16_MAX ? vt->placed_len : UINT16_MAX;
+  put_u16(h + 56, (uint16_t)images);
+  put_u32(h + 60, animation_ms);
   vt->frame.len = HEADER_BYTES;
+
+  if (!buf_reserve(&vt->frame, images * IMAGE_BYTES)) return NULL;
+  for (size_t i = 0; i < images; i++) {
+    const Placement *p = &vt->placed[i];
+    uint8_t *o = vt->frame.ptr + vt->frame.len;
+    memset(o, 0, IMAGE_BYTES);
+    put_u32(o, p->id);
+    o[4] = p->layer;
+    put_u64(o + 8, p->generation);
+    put_u32(o + 16, (uint32_t)p->x);
+    put_u32(o + 20, (uint32_t)p->y);
+    put_u32(o + 24, p->width);
+    put_u32(o + 28, p->height);
+    put_u32(o + 32, p->source_x);
+    put_u32(o + 36, p->source_y);
+    put_u32(o + 40, p->source_width);
+    put_u32(o + 44, p->source_height);
+    put_u32(o + 48, p->image_width);
+    put_u32(o + 52, p->image_height);
+    vt->frame.len += IMAGE_BYTES;
+  }
 
   uint16_t count = 0;
   if (ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &vt->rows) ==
@@ -865,6 +1048,241 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
   ghostty_render_state_clean(vt->state);
   *len = vt->frame.len;
   return vt->frame.ptr;
+}
+
+// Shows the frames of animated Kitty images that are due now (libghostty-vt keeps no timer of its
+// own); the milliseconds until the next one is due, 0 when nothing plays. A program starting an
+// animation writes to the terminal, which brings a frame that starts the ticking
+static uint32_t tick_animations(AppineVt *vt) {
+  GhosttyKittyGraphics graphics = NULL;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics) !=
+          GHOSTTY_SUCCESS ||
+      graphics == NULL) {
+    return 0;
+  }
+  uint64_t now = (uint64_t)now_ns() / 1000000;
+  uint64_t next = 0;
+  if (ghostty_kitty_graphics_animation_tick(graphics, now, &next) != GHOSTTY_SUCCESS) return 0;
+  uint64_t delay = next > now ? next - now : 0;
+  return clamp_u32(delay < ANIMATION_MIN_MS ? ANIMATION_MIN_MS : delay);
+}
+
+static int compare(int64_t a, int64_t b) {
+  return a < b ? -1 : a > b;
+}
+
+// Drawing order, as Ghostty's: by layer, then z-index, then image; within an image by placement,
+// then top to bottom, so that the rows of a virtual placement follow each other
+static int placement_order(const void *a, const void *b) {
+  const Placement *p = a;
+  const Placement *q = b;
+  int c = compare(p->layer, q->layer);
+  if (c == 0) c = compare(p->z, q->z);
+  if (c == 0) c = compare(p->id, q->id);
+  if (c == 0) c = compare(p->placement_id, q->placement_id);
+  if (c == 0) c = compare(p->x, q->x);
+  if (c == 0) c = compare(p->y, q->y);
+  return c;
+}
+
+// Joins the rows of a virtual placement, one placement per row of placeholder cells, back into
+// one rectangle wherever they meet: libghostty-vt gives each row's source in whole image pixels,
+// so rows drawn on their own scale by different amounts and leave seams (an 8-pixel tall image
+// over three rows gets the source rows 0-3, 3-6 and 5-8 for 2⅔ each), while one rectangle scales
+// evenly. Rows meet when they are of the same placement, columns and source columns, one starts
+// where the other ends on the screen, and their sources meet within the rounding. Returns the
+// placements left.
+static size_t join_rows(Placement *placed, size_t len) {
+  size_t out = 0;
+  for (size_t i = 0; i < len; i++) {
+    const Placement *next = &placed[i];
+    Placement *last = out > 0 ? &placed[out - 1] : NULL;
+    if (last != NULL && last->kind == GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL &&
+        next->kind == last->kind && next->layer == last->layer && next->z == last->z &&
+        next->id == last->id && next->generation == last->generation &&
+        next->placement_id == last->placement_id && next->x == last->x &&
+        next->width == last->width && next->source_x == last->source_x &&
+        next->source_width == last->source_width &&
+        (int64_t)last->y + last->height == next->y) {
+      int64_t end = (int64_t)last->source_y + last->source_height;
+      if (next->source_y >= end - 1 && next->source_y <= end + 1) {
+        last->height += next->height;
+        last->source_height = next->source_y + next->source_height - last->source_y;
+        continue;
+      }
+    }
+    placed[out++] = *next;
+  }
+  return out;
+}
+
+// Reads the render state's images into vt->placed, in drawing order with virtual placements' rows
+// joined, when its placements generation changed since the last read (they moved, came, went, or
+// an image's pixels changed). Placements of another protocol than Kitty's, or of an image the
+// storage no longer has (a held frame's), are left out; without memory the list ends early. True
+// when placements changed while some were or are on the screen, so every row has to be painted
+// again.
+static bool images_changed(AppineVt *vt) {
+  uint64_t generation = 0;
+  ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION,
+                           &generation);
+  if (generation == vt->images_generation) return false;
+  vt->images_generation = generation;
+  bool had = vt->placed_len > 0;
+  vt->placed_len = 0;
+  GhosttyKittyGraphics graphics = NULL;
+  if (ghostty_render_state_get(vt->state, GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR,
+                               &vt->images) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics) !=
+          GHOSTTY_SUCCESS ||
+      graphics == NULL) {
+    return had;
+  }
+  static const GhosttyRenderStateImageData keys[] = {
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL,      GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION, GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_Z,             GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,  GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y, GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,  GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,      GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH,
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+      // Kitty's own, which fail for another protocol's placements
+      GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID, GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND,
+  };
+  while (ghostty_render_state_image_iterator_next(vt->images)) {
+    GhosttyImageProtocol protocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+    GhosttyRenderStateImageLayer layer = GHOSTTY_RENDER_STATE_IMAGE_LAYER_ABOVE_TEXT;
+    GhosttyRenderStateKittyPlacementKind kind = GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED;
+    Placement p = {0};
+    int32_t col = 0;
+    int32_t row = 0;
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    void *values[] = {
+        &protocol,      &p.id,           &p.generation, &layer,    &p.z,
+        &col,           &row,            &offset_x,     &offset_y, &p.width,
+        &p.height,      &p.source_x,     &p.source_y,   &p.source_width,
+        &p.source_height, &p.placement_id, &kind,
+    };
+    if (ghostty_render_state_image_get_multi(vt->images, sizeof(keys) / sizeof(keys[0]), keys,
+                                             values, NULL) != GHOSTTY_SUCCESS ||
+        protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY) {
+      continue;
+    }
+    p.kind = (uint8_t)kind;
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, p.id);
+    if (image == NULL ||
+        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &p.image_width) !=
+            GHOSTTY_SUCCESS ||
+        ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
+                                         &p.image_height) != GHOSTTY_SUCCESS ||
+        p.image_width == 0 || p.image_height == 0 || p.width == 0 || p.height == 0) {
+      continue;
+    }
+    p.layer = (uint8_t)layer;
+    p.x = clamp_i32((int64_t)col * vt->cell_width + offset_x);
+    p.y = clamp_i32((int64_t)row * vt->cell_height + offset_y);
+    if (vt->placed_len == vt->placed_cap) {
+      size_t cap = vt->placed_cap ? vt->placed_cap * 2 : 16;
+      Placement *grown = realloc(vt->placed, cap * sizeof(*grown));
+      if (grown == NULL) break;
+      vt->placed = grown;
+      vt->placed_cap = cap;
+    }
+    vt->placed[vt->placed_len++] = p;
+  }
+  qsort(vt->placed, vt->placed_len, sizeof(*vt->placed), placement_order);
+  vt->placed_len = join_rows(vt->placed, vt->placed_len);
+  return had || vt->placed_len > 0;
+}
+
+// Writes the pixels of Kitty image id into out (width × height RGBA with premultiplied alpha, rows
+// stride bytes apart, as an Android bitmap holds them). False when the image is gone, its pixels
+// have not all arrived, or it is not of this generation and size any more: the frame that named
+// it is stale, and the next one names its new generation.
+bool appine_vt_image(AppineVt *vt, uint32_t id, uint64_t generation, uint8_t *out, uint32_t width,
+                     uint32_t height, size_t stride) {
+  GhosttyKittyGraphics graphics = NULL;
+  if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics) !=
+          GHOSTTY_SUCCESS ||
+      graphics == NULL) {
+    return false;
+  }
+  GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, id);
+  uint64_t current = 0;
+  uint32_t w = 0;
+  uint32_t h = 0;
+  GhosttyKittyImageFormat format = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+  const uint8_t *pixels = NULL;
+  size_t len = 0;
+  if (image == NULL ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_GENERATION, &current) !=
+          GHOSTTY_SUCCESS ||
+      current != generation ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &w) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &h) !=
+          GHOSTTY_SUCCESS ||
+      w != width || h != height || stride < (size_t)width * 4 ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &pixels) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &len) !=
+          GHOSTTY_SUCCESS ||
+      pixels == NULL) {
+    return false;
+  }
+  size_t bpp;
+  switch (format) {
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGB:
+      bpp = 3;
+      break;
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGBA:
+      bpp = 4;
+      break;
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA:
+      bpp = 2;
+      break;
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY:
+      bpp = 1;
+      break;
+    default:
+      return false;
+  }
+  if (len < (size_t)width * height * bpp) return false;
+  for (uint32_t y = 0; y < height; y++) {
+    const uint8_t *s = pixels + (size_t)y * width * bpp;
+    uint8_t *d = out + (size_t)y * stride;
+    for (uint32_t x = 0; x < width; x++, s += bpp, d += 4) {
+      uint8_t r, g, b, a;
+      switch (bpp) {
+        case 3:
+          r = s[0], g = s[1], b = s[2], a = 0xff;
+          break;
+        case 4:
+          r = s[0], g = s[1], b = s[2], a = s[3];
+          break;
+        case 2:
+          r = g = b = s[0], a = s[1];
+          break;
+        default:
+          r = g = b = s[0], a = 0xff;
+          break;
+      }
+      if (a != 0xff) {
+        r = (uint8_t)((r * a + 127) / 255);
+        g = (uint8_t)((g * a + 127) / 255);
+        b = (uint8_t)((b * a + 127) / 255);
+      }
+      d[0] = r;
+      d[1] = g;
+      d[2] = b;
+      d[3] = a;
+    }
+  }
+  return true;
 }
 
 // Catches the search up with the terminal: feeds it what changed and works through what it has,

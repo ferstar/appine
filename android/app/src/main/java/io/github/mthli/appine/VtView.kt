@@ -63,7 +63,9 @@ import kotlin.math.roundToInt
  * is chosen so their advance is exactly one cell), every other glyph is centred in its one or two
  * cells, enlarged evenly to fill two cells when it is wide (the setting, for CJK fallback glyphs
  * narrower than two cells) or shrunk evenly when it is wider, never stretched. Box drawing, block
- * elements and the Powerline triangles are drawn as shapes ([VtGlyphs]).
+ * elements and the Powerline triangles are drawn as shapes ([VtGlyphs]). Images programs show
+ * (the Kitty graphics protocol) are painted into the rows they reach, below the backgrounds, below
+ * the text or above it as the frame places them; their pixels are copied once per change.
  *
  * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
  * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
@@ -108,6 +110,24 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
          */
         fun onSearchCount(total: Int, selected: Int)
     }
+
+    /** Where a frame draws an image, or part of it (vt.c's image placements). */
+    private class Placement {
+        var id = 0
+        var layer = 0
+        var generation = 0L
+        var imageWidth = 0
+        var imageHeight = 0
+
+        /** In the grid's pixels; it can reach past the grid. */
+        val dst = Rect()
+
+        /** In the image's pixels. */
+        val src = Rect()
+    }
+
+    /** An image's bitmap and the [generation] of its pixels it holds, -1 when copying them failed. */
+    private class Picture(val bitmap: Bitmap, var generation: Long)
 
     /** The tab shown, null for none. */
     var session: VtSession? = null
@@ -224,6 +244,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Each row's selected columns (inclusive), -1 when none. */
     private var selFrom = IntArray(0)
     private var selTo = IntArray(0)
+
+    /**
+     * Kitty images: the last frame's placements in drawing order (the first [imageCount], from a
+     * pool kept across frames), painted into the rows they reach, and the bitmaps of the images
+     * they show by id, dropped once no placement shows them.
+     */
+    private val placements = ArrayList<Placement>()
+    private var imageCount = 0
+    private val pictures = HashMap<Int, Picture>()
+    private val imagePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+    /** Draws again for the next frame of an animated image. */
+    private val animationTick = Runnable { invalidate() }
 
     private var bitmap: Bitmap? = null
     private var canvas: Canvas? = null
@@ -370,6 +403,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollTotal = 0
         scrollOffset = 0
         scrollLen = 0
+        dropImages()
         session = s
         s?.view = this
         if (s != null && cols > 0) {
@@ -379,6 +413,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         full = true
         invalidate()
+    }
+
+    /** Forgets the images of the tab shown, which another tab's image ids do not name. */
+    private fun dropImages() {
+        removeCallbacks(animationTick)
+        imageCount = 0
+        for (p in pictures.values) p.bitmap.recycle()
+        pictures.clear()
     }
 
     /** The session's shell started: take the whole screen. */
@@ -597,9 +639,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             full = true
             postInvalidateOnAnimation()
         }
+        val images = b.getShort(56).toInt() and 0xffff
+        takeImages(b, HEADER_BYTES, images, b.get(4).toInt() == DIRTY_FULL)
+        removeCallbacks(animationTick)
+        val animationMs = b.getInt(60)
+        if (animationMs > 0) postDelayed(animationTick, animationMs.toLong())
         frameRows += count
         val target = canvas ?: return
-        var pos = HEADER_BYTES
+        var pos = HEADER_BYTES + images * IMAGE_BYTES
         repeat(count) {
             val y = b.getShort(pos).toInt() and 0xffff
             val n = b.getShort(pos + 2).toInt() and 0xffff
@@ -650,6 +697,82 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun coordinate(b: ByteBuffer, at: Int): Int =
         (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
 
+    /**
+     * Takes the frame's [count] image placements at [at] and copies the pixels of the images they
+     * show that are not held at their generation yet; bitmaps no placement shows are dropped. New
+     * pixels come with a frame that repaints every row ([repaintsAll]) since the placements
+     * changed; when they come later (an earlier frame could not get them), the whole screen is
+     * asked for again so that the rows they reach show them.
+     */
+    private fun takeImages(b: ByteBuffer, at: Int, count: Int, repaintsAll: Boolean) {
+        while (placements.size < count) placements.add(Placement())
+        imageCount = count
+        var arrived = false
+        for (k in 0 until count) {
+            val o = at + k * IMAGE_BYTES
+            val p = placements[k]
+            p.id = b.getInt(o)
+            p.layer = b.get(o + 4).toInt()
+            p.generation = b.getLong(o + 8)
+            rect(p.dst, b.getInt(o + 16), b.getInt(o + 20), b.getInt(o + 24), b.getInt(o + 28))
+            rect(p.src, b.getInt(o + 32), b.getInt(o + 36), b.getInt(o + 40), b.getInt(o + 44))
+            p.imageWidth = b.getInt(o + 48)
+            p.imageHeight = b.getInt(o + 52)
+            val held = pictures[p.id]
+            if (held != null && held.generation == p.generation) continue
+            if (copyImage(p, held)) arrived = true
+        }
+        val it = pictures.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (!shown(e.key)) {
+                e.value.bitmap.recycle()
+                it.remove()
+            }
+        }
+        if (arrived && !repaintsAll) {
+            full = true
+            postInvalidateOnAnimation()
+        }
+    }
+
+    /**
+     * Sets [r] to [w] × [h] pixels at ([x], [y]), the sizes read as unsigned (vt.c's u32) and the
+     * far edges kept within an Int.
+     */
+    private fun rect(r: Rect, x: Int, y: Int, w: Int, h: Int) {
+        val right = min(x + (w.toLong() and 0xffffffffL), Int.MAX_VALUE.toLong())
+        val bottom = min(y + (h.toLong() and 0xffffffffL), Int.MAX_VALUE.toLong())
+        r.set(x, y, right.toInt(), bottom.toInt())
+    }
+
+    /**
+     * Copies the pixels of [p]'s image at its generation into its bitmap, reusing the one [held]
+     * for an older generation when the size is the same; false when they cannot be had now (a
+     * later frame names a newer generation), or the bitmap cannot be made.
+     */
+    private fun copyImage(p: Placement, held: Picture?): Boolean {
+        if (p.imageWidth <= 0 || p.imageHeight <= 0) return false
+        val reuse = held?.bitmap?.takeIf { it.width == p.imageWidth && it.height == p.imageHeight }
+        val bitmap = reuse ?: try {
+            createBitmap(p.imageWidth, p.imageHeight)
+        } catch (_: OutOfMemoryError) {
+            return false
+        } catch (_: IllegalArgumentException) {
+            return false
+        }
+        if (held != null && held.bitmap !== bitmap) held.bitmap.recycle()
+        val copied = VtNative.image(tab, p.id, p.generation, bitmap)
+        pictures[p.id] = Picture(bitmap, if (copied) p.generation else -1L)
+        return copied
+    }
+
+    /** Whether one of the last frame's placements shows image [id]. */
+    private fun shown(id: Int): Boolean {
+        for (k in 0 until imageCount) if (placements[k].id == id) return true
+        return false
+    }
+
     private fun stats(nanos: Long) {
         frames++
         frameNanos += nanos
@@ -684,6 +807,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         c.withClip(0, top, cols * cellWidth, top + cellHeight) {
             fill.color = defaultBg
             c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
+            // Images below the backgrounds show through cells of the default one
+            drawImages(c, LAYER_BELOW_BACKGROUND, top)
             var x = 0
             while (x < cols) {
                 val color = bgOf(base + x)
@@ -695,6 +820,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
                 x = end
             }
+            drawImages(c, LAYER_BELOW_TEXT, top)
             val from = selFrom[y]
             if (from >= 0) {
                 // The highlight covers a wide character whose first cell ends the selection
@@ -752,6 +878,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 x += span
             }
             flush()
+            drawImages(c, LAYER_ABOVE_TEXT, top)
+        }
+    }
+
+    /**
+     * The images of [layer] that reach into the row at [top], to which the canvas is clipped, in
+     * the frame's order; images whose pixels are not held at the placement's generation are left
+     * out.
+     */
+    private fun drawImages(c: Canvas, layer: Int, top: Int) {
+        for (k in 0 until imageCount) {
+            val p = placements[k]
+            if (p.layer != layer || p.dst.bottom <= top || p.dst.top >= top + cellHeight) continue
+            val picture = pictures[p.id] ?: continue
+            if (picture.generation != p.generation) continue
+            c.drawBitmap(picture.bitmap, p.src, p.dst, imagePaint)
         }
     }
 
@@ -790,6 +932,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     private fun drawGlyph(c: Canvas, i: Int, x: Int, span: Int, top: Int, color: Int, paint: Paint) {
         val code = cp[i]
+        // With or without the diacritics that say which part of the image the cell shows
+        if (code == KITTY_PLACEHOLDER) return
         val cluster = clusters[i]
         val left = x * cellWidth
         val w = span * cellWidth
@@ -1776,14 +1920,27 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         const val CURSOR_HOLLOW = 3
 
         // The frame format (vt.c)
-        const val HEADER_BYTES = 56
+        const val HEADER_BYTES = 64
+        const val IMAGE_BYTES = 56
         const val ROW_HEADER_BYTES = 12
+        const val DIRTY_FULL = 2
         const val FLAG_MOUSE = 1
         const val FLAG_ALT_SCREEN = 1 shl 1
         const val FLAG_ALT_SCROLL = 1 shl 2
         const val FLAG_SELECTION = 1 shl 4
         const val FLAG_RECTANGLE = 1 shl 5
         const val FLAG_SEARCH_PENDING = 1 shl 6
+
+        // An image placement's layer (GhosttyRenderStateImageLayer)
+        const val LAYER_BELOW_BACKGROUND = 0
+        const val LAYER_BELOW_TEXT = 1
+        const val LAYER_ABOVE_TEXT = 2
+
+        /**
+         * The Kitty graphics placeholder (U+10EEEE): its cells show part of an image, which the
+         * frame places, and are drawn blank, as Ghostty draws them.
+         */
+        const val KITTY_PLACEHOLDER = 0x10EEEE
 
         // A cell's search mark (attrs bits 14 and 15)
         const val MARK_NONE = 0

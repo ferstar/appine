@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback limits, colours, DA1, OSC 5522, progress, status, TN, selection, search, then scrollback compression last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: console state, ⋮'s label, menu key, resize replies, scrollback size, colours, DA1, OSC 5522, progress, status, TN, selection, search, compression, cell reads, Kitty graphics last)
 
 ## Responsibilities
 
@@ -17,8 +17,9 @@
   (`ExtraKeysView`);
 - the terminal: `VtSession` (a tab: its shell, the terminal, pump, waiter and writer threads,
   what its programs report about their progress and status), `VtView` (drawing with the bundled
-  JetBrains Mono, input, selection, search marks, gestures), `ProgressLine` (the current tab's
-  progress over the terminal), `VtKeys`, `VtGlyphs`, `VtNative`, and the emulator shim and JNI in
+  JetBrains Mono, the images programs show, input, selection, search marks, gestures),
+  `ProgressLine` (the current tab's progress over the terminal), `VtKeys`, `VtGlyphs`,
+  `VtNative`, and the emulator shim and JNI in
   the native library (`vt.c`, `vt.rs`) around Ghostty's libghostty-vt, with the `vt-compress`
   thread that compresses idle tabs' scrollback;
 - `ConsolePty`: the tab's kernel console (`/dev/pts/N`) and login shell;
@@ -96,6 +97,8 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   (codepoint, colours, attributes with search marks, grapheme clusters per cell, each row's
   selected columns), a backing bitmap of the grid, the modes, scroll position and selection
   bounds and shape of the last frame, whether a search runs and its count as last reported, the
+  last frame's image placements (`Placement`, a pool reused across frames) and the bitmaps of the
+  images they show by id with the generation each holds (`Picture`), the animation's redraw, the
   IME connection, gestures (with the taps in a row) and their drag states, the fling's
   `OverScroller`, selection handles and the floating menu, the cursor's blink timer and the bell's
   last vibration. `Host` (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`,
@@ -107,7 +110,7 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
-- `VtNative` — 27 `@JvmStatic external` functions on the native library.
+- `VtNative` — 28 `@JvmStatic external` functions on the native library.
 - In `vt.rs`: `Tab` (its own handle, the kernel's handle, console number, the terminal under a
   mutex, a `dirty` flag) in a table `TABS` keyed by handles from 1, never reused; `TermGuard` (a
   tab's locked terminal, which schedules a compression pass when it is released); `Term` (owns the
@@ -124,7 +127,9 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   out; the search: a `GhosttySearch` while one runs, scratch for the viewport's matches, and
   each viewport cell's search mark for this frame and as last sent; the compression state: a pass
   scheduled, the activity token last seen, a read that restored compressed pages since the last
-  pass; and whether the last transcript is still the screen's text).
+  pass; whether the last transcript is still the screen's text; and the render state's image list
+  as last read, in drawing order (`Placement`), with its placements generation). Process-wide: the
+  PNG decoder installed into libghostty-vt's sys interface with the first terminal.
 
 ## Public entry points
 
@@ -134,10 +139,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onTabStatus`, `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`.
 - `LicensesActivity`, opened from Settings.
-- `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `resize`, `key`, `paste`, `mouse`,
-  `focus`, `scroll`, `selectWord`, `selectLine`, `selectGrab`, `selectTo`, `selectRectangle`,
-  `selectAll`, `selectClear`, `copy`, `link`, `search`, `searchSelect`, `searchEnd`, `message`,
-  `transcript`, `compressAll`, `destroy`; `pump` runs on `vt-pump` and calls
+- `VtNative`: `create`, `print`, `pump`, `title`, `frame`, `image`, `resize`, `key`, `paste`,
+  `mouse`, `focus`, `scroll`, `selectWord`, `selectLine`, `selectGrab`, `selectTo`,
+  `selectRectangle`, `selectAll`, `selectClear`, `copy`, `link`, `search`, `searchSelect`,
+  `searchEnd`, `message`, `transcript`, `compressAll`, `destroy`; `pump` runs on `vt-pump` and calls
   `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
   `onStatus` and `onForeground` back; `compressAll` runs on the service's worker, the rest on the
   main thread.
@@ -309,8 +314,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   (scrollback limited to 10,000 lines or 10 MiB, whichever is reached first: the lines up to about
   120 columns, the bytes beyond; default colours white on black and no default cursor colour, so
   the cursor follows the foreground as in Ghostty; grapheme clustering, mode 2027, on by default as
-  in Ghostty; Kitty graphics, with a storage limit of 0, and the Glyph Protocol off, so neither is
-  advertised and programs that probe fall back to text; the terminfo name `xterm-256color`, the
+  in Ghostty; Kitty graphics on, with 32 MiB of decoded images per screen (Ghostty's default is
+  320 MB) and only data sent in the escape sequences (the file, temporary file and shared memory
+  media, which would name the host's files and objects, answer `EINVAL: unsupported medium`, so
+  programs fall back to sending the data); the Glyph Protocol off, so it is not advertised and
+  programs that probe fall back to text; the terminfo name `xterm-256color`, the
   `TERM` the console's login gets, which XTGETTCAP's `TN` reports); restored text and queued
   messages are printed into it; then the writer, the pump and the waiter start.
 - If opening the console or spawning fails, the reason is printed, the console is closed and the
@@ -399,14 +407,33 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 #### Frames and drawing
 
 - `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
-  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, updates the render
-  state (unless a synchronized-output hold is active), catches a running search up with the
-  terminal for at most 4 ms and marks its matches in the viewport, and writes a 56-byte header
-  plus the dirty rows and the rows whose search marks changed since the last frame (all rows when
-  the view asks for a full frame) in the format documented in `vt.c` (12-byte row headers, 16-byte
-  cells, a grapheme's extra codepoints after its row); the direct `ByteBuffer` is valid until the
-  next `frame`. A search not yet caught up sets a header flag, and the view draws again on the
-  next animation frame to go on.
+  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, shows the animation
+  frames due (unless a synchronized-output hold is active), updates the render state (likewise),
+  reads the image placements again when their generation changed, catches a running search up
+  with the terminal for at most 4 ms and marks its matches in the viewport, and writes a 64-byte
+  header, the image placements (56 bytes each) and the dirty rows and the rows whose search marks
+  changed since the last frame (all rows when the view asks for a full frame, or when the
+  placements changed while some were or are on the screen) in the format documented in `vt.c`
+  (12-byte row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
+  `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets a header flag, and
+  the view draws again on the next animation frame to go on.
+- Images (the Kitty graphics protocol): libghostty-vt stores what programs send (PNG decoded at
+  once with Wuffs, which libghostty-vt.a links, into straight-alpha RGBA; larger than the storage
+  refused) and its render state lists what to draw: per placement the image, a source rectangle,
+  a destination in pixels from the grid's corner (which may start above or left of it), a layer
+  (below the backgrounds, below the text, above it) and a z-index. `frame` sorts them as Ghostty
+  does (layer, z-index, image), then by placement and position, and joins the rows of a virtual
+  placement (one per row of placeholder cells) back into one rectangle where they meet, since
+  each row's source comes in whole image pixels and rows scaled apart leave seams. Every frame
+  carries the whole list, and the header the milliseconds to the next animation frame (at least
+  8, 0 when none plays), for which the view draws again.
+- The view keeps a bitmap per image shown, by id with the generation of its pixels: a placement
+  of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
+  locking, premultiplied as `ARGB_8888` holds them; gray and RGB images widened), reusing the
+  bitmap when the size is the same; a copy fails when the terminal has moved on to another
+  generation, and the next frame names that. Bitmaps no placement shows are recycled, and
+  attaching another tab drops them all. Pixels that arrive in a frame that does not repaint every
+  row ask for a full frame.
 - A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
   full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
   rows, cursor and colours come from the capture while the header's modes, selection and scroll
@@ -431,12 +458,16 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   ideograph when it has one), at least 1, or 1 with the setting off.
 - `onDraw` fills the view (the margin past the last whole cell included) with the default
   background, then each dirty row is repainted into the bitmap under a clip: default background,
-  runs of other backgrounds (a search match's colour over a cell's own), the selection's
-  translucent highlight, then text (black in a search match). Plain ASCII runs of
+  the images below the backgrounds (showing through cells of the default background), runs of
+  other backgrounds (a search match's colour over a cell's own), the images below the text, the
+  selection's translucent highlight, text (black in a search match), then the images above the
+  text; images are scaled from their source to their destination with bilinear filtering, as
+  Ghostty samples them, and only the part in the row is drawn. Plain ASCII runs of
   one paint, colour and decoration go out in one draw call; other glyphs are centred in their one
   or two cells, a wide cell's glyph enlarged evenly by the wide scale about the cell's vertical
   middle, and any glyph still wider than its cells shrunk evenly to fit (never stretched); single
-  codepoints `VtGlyphs` covers are shapes across their one or two cells; four paints
+  codepoints `VtGlyphs` covers are shapes across their one or two cells; Kitty placeholder cells
+  (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
   (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
   double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
   invisible hides the glyph but not its decorations; blink is ignored. Every 120 frames the view
@@ -620,8 +651,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   androidx.core's insets and animation compat.
 - libghostty-vt 1.4.0 (the terminal state, render state, key and mouse encoders, paste, focus
   encoding, selection with word and line derivation, search, plain-text formatting, title and
-  width, progress and program status reports, scrollback compression), linked into
-  `libappine.so` (`android/native`); `Machine::read_console`,
+  width, progress and program status reports, scrollback compression, Kitty graphics with their
+  render-state image list and animation), and the Wuffs PNG decoder it carries, linked into
+  `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
+  pixels); `Machine::read_console`,
   `write_console`, `resize_console` and `console_foreground` (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly; the system
   clipboard; the app the system picks for a link (a browser, or a viewer or the Files app for a
@@ -790,11 +823,25 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   or 11 alone does not reach the render state. With them, an OSC 12 query without a cursor colour
   answers the foreground. A full reset (RIS) resets the palette but keeps colours set with OSC 10,
   11 and 12, as Ghostty does.
-- libghostty-vt as a library turns Kitty graphics on with a 10 MB store and the Glyph Protocol on,
-  answering `OK` and `fmt=glyf` to their queries, though frames carry no images and the C API
-  gives no access to registered glyphs; vt.c turns both off at create. A full reset keeps the
-  storage limit (the alternate screen takes the primary's) and the Glyph Protocol setting, so they
-  stay off.
+- libghostty-vt as a library turns the Glyph Protocol on, answering `fmt=glyf` to its query,
+  though the C API gives no access to registered glyphs; vt.c turns it off at create. A full reset
+  keeps that setting, the Kitty storage limit and the allowed media (the alternate screen takes
+  the primary's), so they stay as set. Its Kitty media default is data in the escape sequences
+  only; vt.c sets it again so a library change cannot open the file media, whose paths would be
+  the app's own files rather than the guest's.
+- As built for an app (`-Demit-lib-vt`), libghostty-vt has no PNG decoder unless one is installed
+  (`ghostty_sys_set`, process-wide), though libghostty-vt.a contains Wuffs: vt.c's decoder calls
+  Wuffs's C functions in the archive, compiling against the header from Ghostty's Zig packages.
+  Without it, PNG images (`f=100`, what most programs send) fail with `EINVAL`.
+- The render state's source rectangles are whole image pixels, so a virtual placement's rows,
+  drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
+  so); vt.c joins rows that meet. Rows only partly in the viewport keep the rounding at their top.
+- Erasing below the cursor (ED 0, what busybox's `clear` sends) leaves images in place, as in
+  Ghostty and kitty; ED 2 and 3 delete the visible ones (and the scrollback's).
+- The view paints images into its row bitmap, so a changed placement list must repaint every row:
+  vt.c makes such a frame a full one, and the view asks for one when pixels arrive late. An image
+  read for a frame during a synchronized-output hold may be gone or replaced by then; its copy
+  fails (by generation) and the frame after the hold names the new one.
 - With grapheme clustering on, programs that count widths per codepoint (`wcwidth`) disagree on
   emoji sequences; they can turn mode 2027 off.
 - libghostty-vt's C terminal starts with a scrollback byte limit of 10,000 bytes (the default of
@@ -848,7 +895,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
     libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
     pointer shape for a mouse; `row_iterator_next_dirty` and the two-phase render update
     (`begin_update` under the lock, `end_update` after), so `frame` holds the tab's lock while
-    it encodes every row;
+    it encodes every row; `frame` reads each cell with four to six
+    `ghostty_render_state_row_cells_get` calls and a `ghostty_cell_get`, where
+    `ghostty_render_state_row_cells_get_multi` takes several keys in one call (it stops at the
+    first key that fails, so the colours, which may have no value, would go last, and the
+    grapheme buffer still needs its length first); the gain is unmeasured;
   - the rest: no action to reset the terminal or clear the scrollback (`ghostty_terminal_reset`)
     and no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
     colours and OSC 8 links; the memory usage and the VT processing-error flag are never read;
@@ -857,6 +908,10 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
     encoder does not, and neither does vt.c;
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
     the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
+- **Images take memory twice for the tab shown, and are never trimmed**: each screen of each tab
+  keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and the view holds a bitmap of
+  every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both, and a
+  restored tab has its text only (placeholder cells come back blank).
 - **A display size change while the terminal is open** keeps the sizes its views were built with
   (tab bar, extra keys, the terminal's font in pixels, `VtView`'s touch and double-tap slops,
   fling velocity and handle margin): `MainActivity` handles `density` itself and builds its views
@@ -917,7 +972,11 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
   `onBackPressed`: the Android 16 callback is untried. How long searching a full scrollback takes
   was measured only on a macOS build of libghostty-vt 1.4.0 (10,000 lines of 80 columns: about
   10 ms over three frames for 38,544 matches, then 0.5 ms a frame), not on a device.
-- What programs that probe for Kitty graphics or the Glyph Protocol (yazi, chafa, timg,
-  `kitten icat`) fall back to in the app; that both queries go unanswered with vt.c's options,
-  also after a full reset and on the alternate screen, was checked on a macOS build of
-  libghostty-vt 1.4.0, not on a device.
+- Kitty graphics with real programs beyond chafa (`chafa -f kitty`; its own detection picked
+  symbols): yazi, timg, `kitten icat`, tmux passthrough with placeholders, and how programs that
+  probe for the Glyph Protocol fall back. Tried on a Pixel 4a API 34 emulator with chafa and
+  `printf` sequences (fixed placements above and below text, placeholders, a two-frame animation,
+  scrolling back, a tab switch, the alternate screen, a 1080 × 1400 PNG: scrolling over it took
+  about 2.5 ms a frame, at most 12 ms), and on a macOS build of vt.c (queries, refused media,
+  PNG with alpha, oversized and corrupt PNG, deletion, scrolling, full reset); not on real devices,
+  16 KB-page devices, or with the 32 MiB storage filled.

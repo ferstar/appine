@@ -13,12 +13,13 @@
 //! switch, and the next kernel would then start without the boot cleanup.
 //!
 //! Threads: Kotlin's pump thread runs [`pump`]'s loop (read the console, feed the terminal, write
-//! the terminal's replies back) until the session ends; the main thread takes frames, resizes,
-//! scrolls, encodes keys, mouse and focus events and pastes, selects, searches and copies, and
-//! reads the title and transcript; the `vt-compress` thread compresses idle tabs' scrollback
-//! ([`compressor`]). The terminal is not thread-safe, so every call into vt.c holds the tab's lock;
-//! the frame buffer it returns is only written by `frame`, which only the main thread calls, so the
-//! main thread may read it after the lock is released.
+//! the terminal's replies back) until the session ends; the main thread takes frames and the
+//! pixels of the images they place, resizes, scrolls, encodes keys, mouse and focus events and
+//! pastes, selects, searches and copies, and reads the title and transcript; the `vt-compress`
+//! thread compresses idle tabs' scrollback ([`compressor`]). The terminal is not thread-safe, so
+//! every call into vt.c holds the tab's lock; the frame buffer it returns is only written by
+//! `frame`, which only the main thread calls, so the main thread may read it after the lock is
+//! released.
 //!
 //! [`pump`]: Java_io_github_mthli_appine_VtNative_pump
 
@@ -91,6 +92,15 @@ unsafe extern "C" {
     fn appine_vt_resize(vt: *mut AppineVt, cols: u16, rows: u16, cell_width: u32, cell_height: u32);
     fn appine_vt_scroll(vt: *mut AppineVt, delta: i32);
     fn appine_vt_frame(vt: *mut AppineVt, full: bool, len: *mut usize) -> *const u8;
+    fn appine_vt_image(
+        vt: *mut AppineVt,
+        id: u32,
+        generation: u64,
+        out: *mut u8,
+        width: u32,
+        height: u32,
+        stride: usize,
+    ) -> bool;
     #[allow(clippy::too_many_arguments)]
     fn appine_vt_key(
         vt: *mut AppineVt,
@@ -138,6 +148,36 @@ unsafe extern "C" {
     fn appine_vt_compress_wanted(vt: *mut AppineVt) -> bool;
     fn appine_vt_compress_step(vt: *mut AppineVt, may_wait: bool) -> i32;
     fn appine_vt_compress_all(vt: *mut AppineVt);
+}
+
+/// `AndroidBitmapInfo` (`<android/bitmap.h>`).
+#[repr(C)]
+struct BitmapInfo {
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: i32,
+    flags: u32,
+}
+
+/// `ANDROID_BITMAP_FORMAT_RGBA_8888`, a `Bitmap.Config.ARGB_8888` bitmap's pixels: R, G, B, A
+/// bytes, premultiplied.
+const BITMAP_RGBA_8888: i32 = 1;
+
+// The NDK's bitmap access (libjnigraphics, a system library on every version)
+#[link(name = "jnigraphics")]
+unsafe extern "C" {
+    fn AndroidBitmap_getInfo(
+        env: *mut jni::sys::JNIEnv,
+        bitmap: jobject,
+        info: *mut BitmapInfo,
+    ) -> i32;
+    fn AndroidBitmap_lockPixels(
+        env: *mut jni::sys::JNIEnv,
+        bitmap: jobject,
+        pixels: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn AndroidBitmap_unlockPixels(env: *mut jni::sys::JNIEnv, bitmap: jobject) -> i32;
 }
 
 /// Owns one vt.c terminal.
@@ -613,6 +653,60 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_frame<'l>(
             Ok(b) => b.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
+    })
+}
+
+/// Copies the pixels of the Kitty image `id` at `generation`, as a frame named it, into `bitmap`
+/// (mutable, `ARGB_8888`, the image's size); false when the image is no longer that generation or
+/// size (a later frame names the new one), its pixels have not all arrived, or the bitmap does not
+/// fit.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_image<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+    id: jint,
+    generation: jlong,
+    bitmap: JObject<'l>,
+) -> jboolean {
+    guarded!("VtNative.image", 0, {
+        let Some(tab) = tab(handle) else {
+            return 0;
+        };
+        let raw = env.get_raw();
+        let bitmap = bitmap.as_raw();
+        let mut info = BitmapInfo {
+            width: 0,
+            height: 0,
+            stride: 0,
+            format: 0,
+            flags: 0,
+        };
+        // SAFETY: a live JNIEnv of this thread and a Bitmap reference Kotlin passed
+        if unsafe { AndroidBitmap_getInfo(raw, bitmap, &mut info) } != 0
+            || info.format != BITMAP_RGBA_8888
+        {
+            return 0;
+        }
+        let mut pixels = std::ptr::null_mut();
+        // SAFETY: as above; the pixels stay put until they are unlocked below
+        if unsafe { AndroidBitmap_lockPixels(raw, bitmap, &mut pixels) } != 0 || pixels.is_null() {
+            return 0;
+        }
+        let copied = unsafe {
+            appine_vt_image(
+                tab.term().0,
+                id as u32,
+                generation as u64,
+                pixels.cast(),
+                info.width,
+                info.height,
+                info.stride as usize,
+            )
+        };
+        // SAFETY: locked above; unlocking also tells the bitmap its pixels changed
+        unsafe { AndroidBitmap_unlockPixels(raw, bitmap) };
+        copied as jboolean
     })
 }
 

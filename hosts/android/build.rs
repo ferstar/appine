@@ -1,5 +1,6 @@
 //! Builds libghostty-vt (static, with Zig) and vt.c, the terminal emulator of the app's tabs
-//! (src/vt.rs). For a host other than Android (where the crate is empty) it does nothing.
+//! (src/vt.rs), which also uses the Wuffs that libghostty-vt links. For a host other than Android
+//! (where the crate is empty) it does nothing.
 //!
 //! The Ghostty source comes from scripts/fetch-ghostty (target/ghostty/ghostty-<version>, or
 //! APPINE_GHOSTTY_SRC), which also fetched the Zig packages, so this build needs no network. The
@@ -7,7 +8,8 @@
 //! which the Gradle task sets.
 
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GHOSTTY: &str = "ghostty-1.4.0";
@@ -71,6 +73,7 @@ fn main() {
     cc::Build::new()
         .file("src/vt.c")
         .include(prefix.join("include"))
+        .include(wuffs(&src))
         .std("c11")
         .warnings(true)
         .extra_warnings(true)
@@ -81,4 +84,26 @@ fn main() {
         prefix.join("lib").display()
     );
     println!("cargo:rustc-link-lib=static=ghostty-vt");
+}
+
+/// The directory of Wuffs's single-file C library among the source's Zig packages. libghostty-vt
+/// links Wuffs for Kitty graphics, and vt.c decodes PNG images with it, so it compiles against
+/// those declarations; the package is the one Ghostty's `pkg/wuffs/build.zig.zon` names by hash.
+fn wuffs(src: &Path) -> PathBuf {
+    let zon = src.join("pkg/wuffs/build.zig.zon");
+    let text =
+        fs::read_to_string(&zon).unwrap_or_else(|e| panic!("cannot read {}: {e}", zon.display()));
+    let hash = text
+        .split_once(".wuffs = .{")
+        .and_then(|(_, dependency)| dependency.split_once(".hash = \""))
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(hash, _)| hash)
+        .unwrap_or_else(|| panic!("no Wuffs package hash in {}", zon.display()));
+    let dir = src.join("zig-pkg").join(hash).join("release/c");
+    assert!(
+        dir.join("wuffs-v0.4.c").is_file(),
+        "no Wuffs at {}: run scripts/fetch-ghostty",
+        dir.display()
+    );
+    dir
 }
