@@ -785,6 +785,55 @@ fn self_modifying_code() {
 }
 
 #[test]
+fn readv_on_host_stdin_returns_what_has_arrived() {
+    // tests/guest/stdinreadv.c: with stdin a host pipe, a readv whose first iovec the input just
+    // fills returns those bytes instead of waiting to fill the second, so a program can answer
+    // before the host sends more (it used to wait for more input, and here the host waits for the
+    // answer first, so it never came); input spread over both iovecs comes in one readv. A run
+    // is given 20 s per answer
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let Some(program) = build_c_guest("stdinreadv") else {
+        return;
+    };
+    for tier in TIERS {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_appine-run"))
+            .args(["--tier", tier, "--no-pty"])
+            .arg(&program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to run appine-run");
+        let (lines, answers) = mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let _ = lines.send(line.unwrap());
+            }
+        });
+        let mut stdin = child.stdin.take().unwrap();
+        let mut answer = |what: &str| match answers.recv_timeout(Duration::from_secs(20)) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = child.kill();
+                panic!("tier {tier}: no answer after {what} within 20 s");
+            }
+        };
+        stdin.write_all(b"12345678").unwrap();
+        assert_eq!(answer("8 bytes"), "got 8: 12345678|", "tier {tier}");
+        stdin.write_all(b"ABCDEFGHIJ").unwrap();
+        assert_eq!(answer("10 bytes"), "got 10: ABCDEFGH|IJ", "tier {tier}");
+        drop(stdin);
+        assert_eq!(answer("the end of input"), "got 0: |", "tier {tier}");
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "tier {tier}: {}", stderr(&out));
+    }
+}
+
+#[test]
 fn missing_program_exits_127() {
     let out = Command::new(env!("CARGO_BIN_EXE_appine-run"))
         .arg("/nonexistent/program")

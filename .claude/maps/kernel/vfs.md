@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 36 claims checked by 3 independent verifiers — 26 confirmed and 10 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: the mount table, mount syscalls and mount namespaces split out to kernel/mount, then write opens on read-only instances, splice out of a pipe and tmpfs recounts)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: the mount table, mount syscalls and mount namespaces split out to kernel/mount, then write opens on read-only instances, splice out of a pipe, tmpfs recounts and vectored I/O on host stdio)
 
 ## Responsibilities
 
@@ -550,9 +550,12 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   in order; writes in 64 KiB pieces across iovec boundaries until one is short; sockets through
   `kernel/net`), so a pipe readv returns what was there instead of waiting again and small pipe
   writes stay atomic; `/dev/fuse` does the same in pieces of up to 8 MiB, since a FUSE message is
-  read and written whole (read and write of it, and of FUSE files, are not cut at 64 KiB either). Everything else goes iovec by iovec and stops at an incomplete one, as Linux
+  read and written whole (read and write of it, and of FUSE files, are not cut at 64 KiB either).
+  Host stdio fds that are not regular files on the host (pipes, terminals, sockets) take the pipe
+  path too; a host regular file goes iovec by iovec, so it is read whole. Everything else goes
+  iovec by iovec and stops at an incomplete one, as Linux
   does for files with only `read`/`write` (eventfd writes, timerfd, signalfd, inotify, `/dev/kmsg`
-  reads), and so do host stdio fds. A total of 0 returns 0 after the offset and mode checks without reaching the file.
+  reads). A total of 0 returns 0 after the offset and mode checks without reaching the file.
 - Copying to and from the guest buffer grows a grows-down mapping below it first (`kernel/mm`),
   except vmsplice's write side, which reads guest memory directly. A
   read whose buffer faults partway returns the bytes copied before the faulting page (`EFAULT` when
@@ -1113,8 +1116,7 @@ filesystem (`kernel/ipc`), the BKL, the no-BKL fast path and the namespace mecha
   of cgroup2 nodes are refused (`EACCES` by path, `EBADF` by fd), where Linux's kernfs lets a
   privileged caller chown them, which systemd's cgroup delegation does; readlink of
   `/proc/<pid>/cwd` for a removed cwd is `ENOENT` (Linux shows the path with ` (deleted)`; getcwd's
-  `ENOENT` is right); readv on host stdio goes iovec by iovec, so after filling the first one it
-  can block waiting for more input, where Linux returns what was ready.
+  `ENOENT` is right).
 - **Error order in I/O calls:** a zero-length `read` or `pread` returns 0 without checking that
   the file is readable (`EBADF`, `O_PATH` included, or `EINVAL` for an epoll fd), seekable for
   pread (`ESPIPE`) or a directory (`EISDIR`); pread and pwrite look up the fd before refusing a

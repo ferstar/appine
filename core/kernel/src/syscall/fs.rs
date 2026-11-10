@@ -2957,8 +2957,9 @@ impl Drop for Splicing {
     }
 }
 
-/// readv, writev and their positional variants. Pipes, terminals and sockets (and eventfd reads)
-/// do one read or write over all the iovecs, as Linux's `read_iter` and `write_iter` see them
+/// readv, writev and their positional variants. Pipes, terminals and sockets (and eventfd reads,
+/// and host stdio that is not a regular file on the host) do one read or write over all the
+/// iovecs, as Linux's `read_iter` and `write_iter` see them
 /// ([`stream_vectored`]); everything else handles each iovec in order and stops at an incomplete
 /// one, which is also what Linux does for files with only `read` or `write` (eventfd writes,
 /// timerfd, signalfd, inotify, `/dev/kmsg` reads). With `offset` None the file position is used
@@ -3035,8 +3036,11 @@ pub(super) fn vectored(
 /// readv and writev on files whose Linux operations are `read_iter`/`write_iter` and that have no
 /// positions: one read or write over all the iovecs, so a datagram is one message, a pipe or
 /// terminal read returns what was ready instead of waiting again once an iovec is full, a pipe
-/// write up to `PIPE_BUF` stays atomic, and an eventfd value read may span iovecs. None for the
-/// other files, which go iovec by iovec.
+/// write up to `PIPE_BUF` stays atomic, and an eventfd value read may span iovecs. Host stdio that
+/// is a pipe, terminal or socket on the host goes the same way (musl's stdio reads with a readv
+/// into the caller's buffer and its own, and waiting for the second once the first was filled
+/// blocks a program whose peer waits for its answer). None for the other files, which go iovec by
+/// iovec: a host regular file is read whole, as Linux reads regular files.
 fn stream_vectored(
     cx: &mut Cx<'_>,
     file: &FileRef,
@@ -3061,8 +3065,20 @@ fn stream_vectored(
         // iov_iter): libfuse writes a reply's header and data as separate iovecs
         IoPath::FuseDev if write => write_gathered(cx, file, vecs, FUSE_CHUNK),
         IoPath::FuseDev => read_scattered(cx, file, vecs, FUSE_CHUNK),
+        IoPath::Host(fd) if !host_regular(fd) => {
+            if write {
+                write_gathered(cx, file, vecs, IO_CHUNK)
+            } else {
+                read_scattered(cx, file, vecs, IO_CHUNK)
+            }
+        }
         _ => return None,
     })
+}
+
+/// Whether host fd `fd` (host stdio) is a regular file on the host.
+fn host_regular(fd: i32) -> bool {
+    appine_hal::fstat(fd).is_ok_and(|st| st.st_mode & mode::S_IFMT == mode::S_IFREG)
 }
 
 /// readv on a pipe, terminal, eventfd or `/dev/fuse`: one read of up to `step` bytes, scattered
