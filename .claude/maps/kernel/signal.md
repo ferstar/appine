@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: sending; frames, siginfo; ptrace, TRACEME credentials; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS, stubs; watchdog; host vDSO; coalesced siginfo last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: sending; frames, siginfo; ptrace credentials; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS, stubs; watchdog; host vDSO; `errno.rs` and `debug.rs` last)
 
 ## Responsibilities
 
@@ -19,11 +19,14 @@ user-visible ABI contract:
 - ptrace (tracer and tracee sides) and `process_vm_readv/writev`;
 - core dumps;
 - the kernel log (`/dev/kmsg`, `syslog(2)`, `/proc/kmsg`);
-- the kernel-version contract, the `ENOSYS` policy for unimplemented syscalls, counting the paths
-  the kernel layer does not implement, and refusing guest clock changes.
+- the kernel-version contract, Linux's errno numbers, the `ENOSYS` policy for unimplemented
+  syscalls, counting the paths the kernel layer does not implement, and refusing guest clock
+  changes;
+- the local debug log and syscall trace on the host's stderr (`APPINE_LOG`, `APPINE_STRACE`).
 
 Root: `core/kernel/src/signal.rs`, `syscall/sig.rs`, `vdso.rs`, `ptrace.rs`, `syscall/ptrace.rs`,
-`coredump.rs`, `klog.rs`, signalfd (in `fd.rs`/`syscall/sig.rs`), and in `syscall/misc.rs`:
+`coredump.rs`, `klog.rs`, `errno.rs`, `debug.rs`, signalfd (in `fd.rs`/`syscall/sig.rs`), and in
+`syscall/misc.rs`:
 `uname`, `syslog`, `adjtimex`, clock setting, `restart_syscall`; the dispatcher's restart and
 unimplemented-syscall handling in `syscall/mod.rs`; `stub.rs`, which counts unimplemented paths
 (the default arms calling it stay with their modules); the fault-to-signal branch of the run loop
@@ -60,6 +63,11 @@ procfs.
   missing name's path, a device without a driver); `stub::Stubs` — the kernel's table of them
   (`Kernel::stubs`, in a cell so procfs views can record): count and first caller's comm per path,
   in first-hit order.
+- `Errno` (`errno.rs`) — Linux's errno numbers as the guest sees them, independent of the host
+  (host calls' raw errnos are wrapped as they are, the hosts being Linux and Android on arm64);
+  also the restart codes `ERESTARTSYS`, `ERESTARTNOINTR`, `ERESTARTNOHAND` and
+  `ERESTART_RESTARTBLOCK` (512 to 516) and the internal `FUSE_RETRY` (600, never returned to the
+  guest). `to_syscall_return` gives `-errno`.
 
 ## Public entry points
 
@@ -80,6 +88,8 @@ procfs.
   dispatcher's default arm, `settimeofday`, `clock_settime`, `adjtimex`, `clock_adjtime`.
 - **Unimplemented paths**: `stub::hit` and `stub::ioctl` from default arms, `stub::record` from
   procfs views; `stub::top` for kernel-bug kill reports.
+- **Debug log**: `debug::log` (core dumps, signal frames, seccomp, the vDSO choice, task exits,
+  first stub hits); `trace_start`/`trace_syscall` in the dispatcher and `tracing` for the fast path.
 
 ## Data flow / lifecycle
 
@@ -374,6 +384,19 @@ procfs.
   first-hit order (`prctl option 0x59616d61: 2 calls, first by gdb`; option tags of 0x10000 and
   above in hex), and a line counting the rest. Nothing reaches the guest: the kernel log has no
   such lines.
+
+### Debug log and syscall trace
+
+- `APPINE_LOG` and `APPINE_STRACE` are on when set, not empty and not `0`, each read once per
+  host process at its first use.
+- `debug::log` writes `appine: <line>` to the host's stderr (logcat on Android); nothing reaches
+  the guest.
+- With `APPINE_STRACE`, the dispatcher prints each syscall it handled as it returns: the seconds
+  since the first traced syscall, `[tid]`, the number, the six arguments in hex (pid arguments
+  already translated to global pids), `=` the result in hex or `-errno`, and the milliseconds it
+  took in angle brackets. The fast path is off while tracing (`syscall::fast`), so every syscall
+  goes through the dispatcher; `exit`, `exit_group`, `rt_sigreturn` and a successful `execve`
+  return before the print and show nothing.
 
 ## Dependencies (inbound / outbound)
 

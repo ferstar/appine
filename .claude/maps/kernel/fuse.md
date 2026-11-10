@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed; key bits last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: INIT flags, forced flushes, serialized appends, creates racing; mappings read on demand; forgetting nodes; lazy unmounts; releases while borrowed; key bits; mounts in kernel/mount last)
 
 ## Responsibilities
 
@@ -124,7 +124,7 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
   given. statfs reports `FUSE_SUPER_MAGIC`; `/proc/filesystems` lists `nodev fuse`.
 - Aborting (6.1's `fuse_abort_conn`): the last attached device file closing, or `Vfs::collect`
   finding no attached or detached mount of the instance (umount, a dying mount namespace, or the
-  last open file, cwd or root in a lazily unmounted one going, `kernel/vfs`), which also forgets
+  last open file, cwd or root in a lazily unmounted one going, `kernel/mount`), which also forgets
   the instance's nodes. Requests not yet answered end with ECONNABORTED, new ones are
   ENOTCONN, the daemon's reads ENODEV and writes ENOENT, poll `POLLERR`.
 
@@ -328,8 +328,9 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 
 ### Inbound
 
-- `kernel/vfs`: the walk (`fuse_child`, `fuse_permission`, kind, readlink, parents), mount(2)
-  (`fuse_mount`), collection, opening `/dev/fuse`, and every file syscall's FUSE branch (open,
+- `kernel/mount`: mount(2) (`fuse_mount`) and collection.
+- `kernel/vfs`: the walk (`fuse_child`, `fuse_permission`, kind, readlink, parents), opening
+  `/dev/fuse`, and every file syscall's FUSE branch (open,
   I/O routes, splice, readv/writev, getdents, lseek, stat, statfs, access, chdir, close paths,
   fsync, attribute and namespace syscalls, xattrs, copy_file_range).
 - `kernel/process`: the dispatcher's retry loop (`new_syscall`, `serve`), execve (`open_fuse`,
@@ -342,8 +343,9 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 
 - `kernel/process`: the wait API (`wait_object`, wake objects), `interrupted`, `killed`,
   `stopping`.
-- `kernel/vfs`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`),
-  `resolve_parent`, inotify hooks, `open_mask`, `encode_stat`, `executing`, `check_fsize`.
+- `kernel/mount`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`).
+- `kernel/vfs`: `resolve_parent`, inotify hooks, `open_mask`, `encode_stat`, `executing`,
+  `check_fsize`.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
   `capable_wrt`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.

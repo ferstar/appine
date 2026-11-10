@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 5 research concerns; 21 claims checked by 3 independent verifiers — 14 confirmed and 7 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay; change notifications; per-thread credentials; vfork freezing; mount options last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: /proc/net, /proc/<tid>, /sys/block; mm and oom fields; fd access; cgroups; /proc/sys; locks; FUSE, overlay; change notifications; thread credentials; vfork freezing; mount options, kernel/mount last)
 
 ## Responsibilities
 
@@ -202,7 +202,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   it reaches the program itself even after a rename (an overlay program through its overlay node)
   and a deleted program through the host file recorded at execve (`OpenExe`), which a removed
   overlay program only runs from: opening it is `ENOENT`.
-- `mounts`/`mountinfo` come from the VFS mount table for the process's namespace and root (an exited
+- `mounts`/`mountinfo` come from the mount table (`kernel/mount`) for the process's namespace and
+  root (an exited
   thread has none: `EINVAL` at open, as `mounts_open_common`), each mount's type as `Vfs::type_of`
   gives it (`fuse.<subtype>` for a FUSE mount with a subtype); mountinfo's optional fields are
   `shared:N`, `master:N` and `unbindable` (no `propagate_from`), and its superblock options start
@@ -247,7 +248,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   namespace (the reader's or writer's: the limits of `kernel/process`'s namespace counts,
   `INT_MAX` by default in a new one, 0 to `INT_MAX`); everything else kernel-wide
   (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`,
-  `mount-max` (1 to `INT_MAX`; the mount limit of kernel/vfs),
+  `mount-max` (1 to `INT_MAX`; the mount limit of kernel/mount),
   `pipe-max-size`, `core_pattern`, `core_uses_pid`, `protected_symlinks`/`hardlinks`, `printk*`,
   `panic`; `dmesg_restrict`, `unprivileged_bpf_disabled` and seccomp
   `actions_logged` need `CAP_SYS_ADMIN` in the initial namespace, `mmap_min_addr`
@@ -413,8 +414,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
-  `loadavg`, the VFS (`mounts_from`, `reach`, `path_of`, devpts options, the loop devices'
-  `Loops`, `proc_locks` and `fd_locks`), the OOM killer (`proc_score`), unimplemented-path counting
+  `loadavg`, the VFS (`reach`, `path_of`, the loop devices' `Loops`, `proc_locks` and
+  `fd_locks`), the mount table (`mounts_from`, devpts options; `kernel/mount`), the OOM killer
+  (`proc_score`), unimplemented-path counting
   (`stub::record`).
 - Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
   `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine

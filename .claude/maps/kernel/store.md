@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 7 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: boot cleanup keeps its own numbers from the reaper; browse writes refuse the root directory as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects; host writers last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: boot cleanup numbers; browse writes refusing the root as `top`; memfd owners; no links to unlinked inodes; host block counts; shared objects; host writers; boot mounts in kernel/mount last)
 
 ## Responsibilities
 
@@ -26,7 +26,8 @@ Root: `core/kernel/src/vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs`, and the 
 `core/kernel/src/lib.rs` (`import_rootfs`, `sync_store`, `browse`, `browse_changing`,
 `write_file`, `read_file`).
 
-Outside the module: path resolution, mounts, the no-BKL resolver and file syscalls (`kernel/vfs`),
+Outside the module: path resolution, the no-BKL resolver and file syscalls (`kernel/vfs`), mounts
+(`kernel/mount`),
 synthetic filesystems (`kernel/procfs`), the BKL and fast path (`kernel/process`), the Android
 provider and rootfs installation UI (`android`).
 
@@ -278,8 +279,9 @@ provider and rootfs installation UI (`android`).
 
 ### Inbound
 
-- `kernel/vfs` (path walks, file syscalls, tmpfs mounts, the no-BKL resolver, `Vfs::open` with the
-  volatile list), `kernel/process` (`syscall::fast`), the machine (waker, timer `commit_due`,
+- `kernel/vfs` (path walks, file syscalls, tmpfs instances, the no-BKL resolver), `kernel/mount`
+  (`Vfs::open`'s boot with the volatile list), `kernel/process` (`syscall::fast`), the machine
+  (waker, timer `commit_due`,
   `sync`, `trim_memory`, teardown, the store registry, `take_changed_dirs`), inotify (`host_change`),
   host wrappers in `lib.rs` (JNI and `appine-run`).
 

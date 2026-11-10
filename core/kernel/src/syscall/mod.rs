@@ -1,4 +1,5 @@
-//! Syscall dispatch (the kernel/signal map).
+//! Syscall dispatch (the kernel/process map; restarts and unimplemented syscalls: the kernel/signal
+//! map).
 //!
 //! Numbers and argument layouts follow aarch64 Linux (asm-generic). Unimplemented syscalls always
 //! return `-ENOSYS`, never crash, and record a local debug log line. Handlers run holding the BKL;

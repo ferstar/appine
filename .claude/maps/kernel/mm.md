@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/mm.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `uaccess.rs` registered here, mount flags read from kernel/mount last)
 
 ## Responsibilities
 
@@ -763,7 +765,8 @@ signals may still be delivered).
   stubs (`clocks`, `svc_bytes`), the host's vvar, and its identity as a trusted translation source.
 - `kernel/fuse` through `Fill::source` (the open file a `Fill` keeps open; reading is the
   caller's).
-- vfs (file kinds, mount flags, seals, store objects for re-reads and `Refill`s), credentials
+- vfs (file kinds, seals, store objects for re-reads and `Refill`s), mount flags (`kernel/mount`),
+  credentials
   (`CAP_IPC_LOCK`, `CAP_SYS_RAWIO`), rlimits; SysV IPC (`reap_shm` after munmap, mremap and
   `MAP_FIXED` mmap, so a removed segment goes with its last attachment).
 - OOM killer: `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`),

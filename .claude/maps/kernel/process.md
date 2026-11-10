@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/process.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount last)
 
 ## Responsibilities
 
@@ -19,6 +21,10 @@
 - the timer thread (interval and POSIX timers, CPU-time limits, periodic checks);
 - the built-in virtual init (PID 1) and inittab boot/shutdown, and the host-facing `Machine`;
 - scheduling parameters applied to host threads;
+- kernel-layer bugs: a panic or host fault ends only the guest process that hit it, with a kill
+  report for the app, and test hooks plant such bugs;
+- the other process-wide calls in `syscall/misc.rs` (clocks and CPU times, resource use and
+  limits, host and domain names, reboot, sysinfo, getcpu, getrandom);
 - the namespace mechanism (clone/unshare/setns, user and pid ID translation, time offsets, nsfs,
   namespace counts).
 
@@ -26,12 +32,14 @@ Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, 
 `wake` module), `cell.rs`, `syscall/proc.rs`, `syscall/fast.rs`, `futex.rs`, `loader.rs`,
 `machine.rs` (timer thread, boot/shutdown, host-facing calls), `watchdog.rs`, `itimer.rs`,
 `syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `pidns.rs`, `nsproxy.rs`,
-`syscall/ns.rs`, and `UserNs` in `cred.rs`. The futex, robust-list, sleep and interval-timer
-handlers sit in `syscall/misc.rs`, and the dispatcher in `syscall/mod.rs`, `bug.rs` and `debug.rs`
-are filed here by this module's decisions though the registry does not list them.
+`syscall/ns.rs`, `UserNs` in `cred.rs`, `bug.rs`, the dispatcher in `syscall/mod.rs` (its restart
+and unimplemented-syscall handling are `kernel/signal`'s), and `syscall/misc.rs` except the
+handlers `kernel/signal` lists there (uname, syslog, adjtimex, clock setting, restart_syscall). Of
+the rest of `syscall/misc.rs`, membarrier is described in `kernel/mm`, umask in `kernel/vfs`, and
+the capability and seccomp prctls in `kernel/cred`.
 
 Outside the module: address spaces and fork copy-on-write (`kernel/mm`), CPU state and translation
-(`engine`), signals and ptrace, credentials beyond user namespaces, mount trees (`kernel/vfs`),
+(`engine`), signals and ptrace, credentials beyond user namespaces, mount trees (`kernel/mount`),
 network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`), the OOM policy.
 
 ## Key types
@@ -118,7 +126,12 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   `nanosleep`/`clock_nanosleep`, `setitimer`/`getitimer`, `timer_*`, `getpriority`/`setpriority`,
   `ioprio_*`, `sched_*`, `unshare`, `setns`, namespace ioctls (`NS_GET_*`), `setsid`/`setpgid`/
   `getpgid`/`getsid`, `pidfd_open`, `pidfd_getfd`, `kcmp`, `prctl` (`PR_SET/GET_PDEATHSIG`,
-  `PR_SET/GET_CHILD_SUBREAPER`), `kill` to pid 1 (power requests).
+  `PR_SET/GET_CHILD_SUBREAPER`), `kill` to pid 1 (power requests), `clock_gettime`/`clock_getres`/
+  `gettimeofday`, `times`, `getrusage`, `prlimit`, `reboot`, `personality`, `sethostname`/
+  `setdomainname`, `getcpu`, `sysinfo`, `getrandom`, and the test syscall 0xa991 (debug and
+  `test-hooks` builds).
+- **Kernel bugs**: `bug::catch`, `host_call`, `kill`/`kill_process`, `record_kill` (also the OOM
+  killer's), `report`, `install_panic_hook`, `trap`/`trap_finish`; `Machine::take_kills`.
 - **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
   `signal_later`/`flush_signals`, `Shared::fast_changed`, `loader::prepare`/`load_prepared`,
@@ -222,6 +235,38 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   `rt_sigreturn` and a successful `execve` return before the sweeps and `Mm::sync`.
 - A guest page fault on a FUSE mapping's page not yet read reads it with the BKL released before
   re-executing (`kernel/mm`'s fault order).
+
+### Kernel bugs and kill reports
+
+- Containment (`bug::contain`) is on with `APPINE_ON_BUG=kill`, off with `abort`, and otherwise on
+  in release builds and off in debug builds. `catch` runs kernel code under `catch_unwind`; with
+  containment off a panic aborts the host process (`appine: internal error, aborting`).
+- Where a panic is caught and what it ends: every entry of a guest thread into the kernel, thread
+  start and each step of thread exit end that thread's process; each step of process finish is
+  only reported and the next step goes on; the timer thread's handling of one process's timers
+  ends that process, while a panic in the memory-limit check or signal-driven I/O turns that
+  feature off; `host_call` around `Machine` methods and the library's other public functions makes
+  the call return an error (a console's call also hangs up that console). Taking the BKL after a
+  caught panic ignores its poison flag (`Shared::lock`). An engine host fault (`Exit::HostFault`)
+  ends the process the same way.
+- `kill` (a thread's own bug) and `kill_process` (the timer thread's) write one report line to
+  stderr (pid, comm, the thread and its last guest pc for `kill`, what failed, and the panic's
+  message and location) and to the kernel log at `KERN_ERR`, one record per line, record a kill
+  report, and end the whole thread group with `SIGSEGV` (no core dump). The panic hook
+  (`install_panic_hook`, once per host process, chained to the previous hook) keeps each thread's
+  latest panic message (up to 1000 bytes) and location for that report.
+- Kill reports (`Kernel::kills`, at most 32, the oldest dropped) carry the pid, comm, the console
+  number when the process's controlling terminal is one of the app's consoles, and the reason:
+  `Bug` (the report, the 10 kernel log records before it plus itself, and the most-reached
+  unimplemented paths from `stub::top`) or `OutOfMemory` (from the OOM killer, `kernel/mm`). The
+  host takes them with `Machine::take_kills` (`android/service`).
+- Test hooks exist only in debug builds and with the `test-hooks` feature, and answer `ENOSYS`
+  unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 12 panics at once, points a page
+  at an inaccessible host page so the engine faults on the host, or plants a panic that fires once
+  (`trap`) at the thread's exit, the next thread start, the next timer handling, the next host
+  call, a step of process finish, right after releasing the BKL, the next no-BKL syscall or a futex
+  wait; it can also act as if the host's wall clock jumped, or hold the BKL for `addr`
+  milliseconds for the watchdog's tests. Any other `what` is `EINVAL`.
 
 ### Exit and reaping
 
@@ -622,6 +667,16 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - The guest's `tpidr_el0` is a field of the CPU state; the host `TPIDR_EL0` is never changed, so
   ART's signal chain always sees bionic's value.
 
+### Other calls in `syscall/misc.rs`
+
+- `sethostname`/`setdomainname` change the caller's UTS namespace: `CAP_SYS_ADMIN` over its owner
+  (`EPERM`), then a negative length or one over 64 is `EINVAL`, then the name is copied in.
+- `getcpu` reports the lowest CPU in the thread's affinity mask (not where its host thread runs)
+  and node 0, skipping null pointers.
+- `getrandom`: flags other than `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE`, or `RANDOM`
+  with `INSECURE`, are `EINVAL`; the bytes come from the host (`fill_random`) 64 KiB at a time,
+  never blocking, and a fault in a later piece returns the bytes of the pieces before it.
+
 ### Namespaces
 
 - All eight types exist. UTS, IPC, net, cgroup and time live in the task's `NsProxy`; the mount
@@ -638,7 +693,7 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   then applies: fd table and fs copies (`EMFILE` above `nr_open`), credentials, mount namespace,
   pid-for-children, the semaphore exit for `CLONE_SYSVSEM`/`CLONE_NEWIPC`, and a new `NsProxy`
   (time, cgroup, net, UTS, IPC); a new mount namespace copies the whole mount tree
-  (`kernel/vfs`), a new cgroup namespace is rooted at the creator's cgroup.
+  (`kernel/mount`), a new cgroup namespace is rooted at the creator's cgroup.
 - Pid namespaces nest to level 32 and user namespaces to 33 (`ENOSPC` beyond); a new pid
   namespace's owner must descend from its parent's owner (`EPERM`). Time namespaces follow the
   Linux 6.2 rule: a new one becomes time-for-children; non-`CLONE_VM` children enter it at fork;
@@ -689,8 +744,9 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 
 - Syscall dispatch (`syscall/mod.rs`), `Machine` and the hosts (CLI, Android JNI: boot, shutdown,
   power, spawn, stall), signals and ptrace (group exit, delivery, exit hooks), procfs, every
-  blocking syscall (via the wait API), `kernel/mm` (kicks through `TaskSync`, `quiesce`), mount
-  (nsfs binds, procfs/mqueue mounts, `fast_changed`), the terminal bridge (`block_for`).
+  blocking syscall (via the wait API), `kernel/mm` (kicks through `TaskSync`, `quiesce`),
+  `kernel/mount` (nsfs binds, procfs/mqueue mounts, `fast_changed`), the terminal bridge
+  (`block_for`).
 
 ### Outbound
 
@@ -699,7 +755,8 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - `kernel/mm`: `fork`, `quiesce`, users, `futex_key`, `translate`, `cow_break`/`fault_in`, layout
   and mapping calls used by the loader, `vdso_syscalls`, `defer_unmaps`/`release_unmapped`/
   `spare::refill`, `Mm::sync`.
-- vfs (resolution, mount flags, store, `copy_ns`, the metadata cache's `Cached`), `kernel/fuse`
+- vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags, `copy_ns`),
+  `kernel/fuse`
   (serving retries, prefault, sweeps, the exit flush, FUSE programs), credentials, cgroups
   (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/vfs`), the OOM
   killer (`kernel/mm`), loadavg, the store's deferred commits, signals (`send_to_group`,

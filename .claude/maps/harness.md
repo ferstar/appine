@@ -4,6 +4,8 @@
 > See `.claude/decisions/harness.md` for the paired decision history.
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process last)
 
 ## Responsibilities
 
@@ -29,7 +31,7 @@ Root: `hosts/cli/`, `tests/guest/`, `tests/bench/`, `tests/diff/`, `tests/survey
 
 Outside the module: the instruction-level lockstep tests (`engine`); unit tests inside each crate;
 the kernel's `run`, boot and console bridge (`kernel/process`, `kernel/tty`); the kernel's bug
-reports and test hooks (`bug.rs`, which no module claims); Android instrumentation tests
+reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tests
 (`android/native`); rootfs downloads (`android/setup`).
 
 ## Key types

@@ -1,4 +1,4 @@
-//! Linux errno (the guest ABI's numbers, independent of the host).
+//! Linux errno (the guest ABI's numbers, independent of the host; the kernel/signal map).
 
 use std::fmt;
 

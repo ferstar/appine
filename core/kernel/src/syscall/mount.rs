@@ -1,4 +1,5 @@
-//! mount(2), umount2(2), pivot_root(2) (the kernel/vfs map).
+//! mount(2), umount2(2), pivot_root(2) (the kernel/mount map; tmpfs and overlay options and the
+//! overlay node sweep: the kernel/vfs map).
 //!
 //! Synthetic filesystems (procfs, sysfs, devpts, cgroup2) can be mounted on any directory;
 //! directories and files both in the store and in synthetic filesystems can be bind-mounted

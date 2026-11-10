@@ -1,4 +1,4 @@
-//! Guest pointer types (design doc §12 item 2).
+//! Guest pointer types (the kernel/mm map, design doc §12 item 2).
 //!
 //! Addresses in syscall arguments are plain `u64`s or the types here and can be accessed only
 //! through [`Mm`](crate::mm::Mm); the kernel layer never dereferences them as host pointers. There

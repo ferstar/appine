@@ -1,4 +1,5 @@
-//! Miscellaneous syscalls: futex, time, resource limits and so on.
+//! Miscellaneous syscalls: futex, time, resource limits and so on (the kernel/process map; uname,
+//! syslog, adjtimex, clock setting and restart_syscall: the kernel/signal map).
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
