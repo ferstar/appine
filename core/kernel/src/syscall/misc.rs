@@ -89,9 +89,14 @@ pub(super) fn futex(
 ) -> SysResult {
     let cmd = op & FUTEX_CMD_MASK;
     let private = op & FUTEX_PRIVATE_FLAG != 0;
+    // A wait the no-BKL path (syscall::fast) began and a signal cut short hands over the deadline
+    // it computed: its timeout was read and checked then, and is not read again, as Linux's
+    // restart never reads it again (the memory may be gone by now)
+    let early = cx.t.fast_sleep.take();
     // sys_futex reads and checks the timeout of the commands that take one before do_futex
     // allows FUTEX_CLOCK_REALTIME only for the absolute waits (ENOSYS)
     if timeout != 0
+        && early.is_none()
         && matches!(
             cmd,
             FUTEX_WAIT | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI
@@ -113,16 +118,14 @@ pub(super) fn futex(
             if bitset == 0 {
                 return Err(Errno::EINVAL);
             }
-            // FUTEX_WAIT's timeout is relative (CLOCK_MONOTONIC), WAIT_BITSET's is absolute. If
-            // the no-BKL path (syscall::fast) has already slept for a while, use the deadline it
-            // computed
-            let early = cx.t.fast_sleep.take();
-            let deadline = match timeout {
-                0 => None,
-                addr => {
+            // FUTEX_WAIT's timeout is relative (CLOCK_MONOTONIC), WAIT_BITSET's is absolute
+            let deadline = match (timeout, early) {
+                (0, _) => None,
+                (_, Some(early)) => Some(early),
+                (addr, None) => {
                     let t = read_timespec(cx, addr)?;
                     Some(if cmd == FUTEX_WAIT {
-                        early.unwrap_or_else(|| Expiry::after(t))
+                        Expiry::after(t)
                     } else {
                         let clock = if op & FUTEX_CLOCK_REALTIME != 0 {
                             CLOCK_REALTIME
@@ -525,10 +528,14 @@ fn futex_key(cx: &Cx<'_>, uaddr: u64, private: bool) -> Result<Key, Errno> {
     cx.mm().futex_key(uaddr, private).ok_or(Errno::EFAULT)
 }
 
+/// nanosleep(2). A sleep the no-BKL path began hands over its deadline ([`futex`]'s `early`), and
+/// its time is not read again.
 pub(super) fn nanosleep(cx: &mut Cx<'_>, req: u64, rem: u64) -> SysResult {
-    let early = cx.t.fast_sleep.take();
-    let t = read_timespec(cx, req)?;
-    sleep_rest(cx, early.unwrap_or_else(|| Expiry::after(t)), rem)
+    let deadline = match cx.t.fast_sleep.take() {
+        Some(early) => early,
+        None => Expiry::after(read_timespec(cx, req)?),
+    };
+    sleep_rest(cx, deadline, rem)
 }
 
 pub(super) fn clock_nanosleep(
@@ -544,6 +551,14 @@ pub(super) fn clock_nanosleep(
         CLOCK_THREAD_CPUTIME_ID | 4..=6 => return Err(Errno::EOPNOTSUPP),
         c if c < 0 && c & 4 != 0 => return Err(Errno::EINVAL),
         _ => {}
+    }
+    // A sleep the no-BKL path began hands over its deadline (as for nanosleep), relative or
+    // absolute, and its time is not read again
+    if let Some(early) = early {
+        if flags & TIMER_ABSTIME == 0 {
+            return sleep_rest(cx, early, rem);
+        }
+        return sleep_until(cx, early).map_or(Err(Errno::ERESTARTNOHAND), |()| Ok(0));
     }
     let t = read_timespec(cx, req)?;
     // Process CPU clocks: CPU time converted to approximate wall time (checked every 10 ms)
@@ -565,11 +580,7 @@ pub(super) fn clock_nanosleep(
     // sleeps, CLOCK_REALTIME's moves to the monotonic base (Expiry::new)
     if flags & TIMER_ABSTIME == 0 {
         appine_hal::clock_gettime(clock).map_err(Errno)?;
-        let deadline = match early {
-            Some(d) => d,
-            None => Expiry::new(clock, t, false)?,
-        };
-        return sleep_rest(cx, deadline, rem);
+        return sleep_rest(cx, Expiry::new(clock, t, false)?, rem);
     }
     // An absolute time: re-executing with the same arguments simply continues the sleep
     match sleep_until(cx, expiry_in_ns(cx, clock, t)?) {

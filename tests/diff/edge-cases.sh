@@ -4,8 +4,9 @@
 # lock exits, EPOLLEXCLUSIVE argument checks, jumping to an unaligned address (SIGBUS), timeouts
 # too long for Linux to represent saturating, select ignoring hangups and errors its sets do not
 # take (waiting without spinning), reporting fds it cannot poll (O_PATH) in every set and
-# clamping nfds to the fd table, and a timed wait cut short by a signal leaving nothing that
-# shortens the thread's next timed wait
+# clamping nfds to the fd table, timed waits that a signal interrupts after their time was
+# unmapped ending with EINTR, and a timed wait refused after a signal woke it leaving nothing
+# that shortens the thread's next timed wait
 set -e
 mkdir -p /tmp/diff-edges
 cd /tmp/diff-edges
@@ -530,11 +531,13 @@ C
 gcc -O2 -o sel sel.c
 ./sel
 
-# A thread's timed futex wait, interrupted by a signal after another thread unmapped its timeout,
-# fails (Linux's restart path keeps the deadline and returns EINTR to the handler; Appine reads
-# the timeout again: EFAULT, not compared); its next timed wait must still wait its whole timeout.
-# Appine's no-BKL wait handed its deadline to the BKL path, which kept it when the call ended
-# before taking it, and a later wait on a shared word (always on the BKL path) ended at it
+# Timed waits (futex relative and absolute, nanosleep, clock_nanosleep relative and absolute),
+# each interrupted by a signal after another thread unmapped its time argument, end with EINTR:
+# Linux's restart keeps the deadline and never reads the time again. Appine's no-BKL waits hand
+# their deadline to the BKL path, which read the time again (EFAULT). Then a thread whose timed
+# futex wait a seccomp filter (installed with TSYNC while it waited) refuses once a signal wakes
+# it must still wait the whole timeout of its next timed wait, on a shared word (always the BKL
+# path): the handed-over deadline used to outlive the refused call and end that wait early
 cat > stale.c <<'C'
 #define _GNU_SOURCE
 #include <errno.h>
@@ -543,15 +546,31 @@ cat > stale.c <<'C'
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define FUTEX_WAIT 0
-#define FUTEX_WAIT_PRIVATE 128
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_PRIVATE 128
 
+struct sock_filter {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned int k;
+};
+struct sock_fprog {
+    unsigned short len;
+    struct sock_filter *filter;
+};
+
+static const char *names[] = {"futex wait", "futex wait bitset (absolute)", "nanosleep",
+                              "clock_nanosleep", "clock_nanosleep (absolute)"};
+static int kind;
+static struct timespec *ts;
 static int *shared;
-static struct timespec *first;
 
 static double now(void)
 {
@@ -565,15 +584,45 @@ static void on_usr1(int sig)
     (void)sig;
 }
 
-static void *sleeper(void *arg)
+static void *waiter(void *arg)
 {
     (void)arg;
     int word = 0;
-    syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, first, NULL, 0);
+    long r = 0;
+    switch (kind) {
+    case 0:
+        r = syscall(SYS_futex, &word, FUTEX_WAIT | FUTEX_PRIVATE, 0, ts, NULL, 0);
+        break;
+    case 1:
+        r = syscall(SYS_futex, &word, FUTEX_WAIT_BITSET | FUTEX_PRIVATE, 0, ts, NULL, ~0u);
+        break;
+    case 2:
+        r = syscall(SYS_nanosleep, ts, NULL);
+        break;
+    case 3:
+        r = syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, ts, NULL);
+        break;
+    case 4:
+        r = syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, TIMER_ABSTIME, ts, NULL);
+        break;
+    }
+    printf("%s with its time unmapped: %ld %s\n", names[kind], r, r < 0 ? strerror(errno) : "");
+    return NULL;
+}
+
+// Waits on 12345, which the filter refuses once the signal sends it back through the kernel,
+// then waits 3 s on a shared word
+static void *refused(void *arg)
+{
+    (void)arg;
+    int word = 12345;
+    struct timespec two = {2, 0};
+    syscall(SYS_futex, &word, FUTEX_WAIT | FUTEX_PRIVATE, 12345, &two, NULL, 0);
     struct timespec three = {3, 0};
     double t = now();
     long r = syscall(SYS_futex, shared, FUTEX_WAIT, 0, &three, NULL, 0);
-    printf("next 3 s wait: %ld %s after %s\n", r, r < 0 ? strerror(errno) : "",
+    printf("next 3 s wait after the refused one: %ld %s after %s\n", r,
+           r < 0 ? strerror(errno) : "",
            now() - t >= 2.5 ? "its whole timeout" : "less than its timeout");
     return NULL;
 }
@@ -585,15 +634,43 @@ int main(void)
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_usr1;
     sigaction(SIGUSR1, &sa, NULL);
+    for (kind = 0; kind < 5; kind++) {
+        ts = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (kind == 1 || kind == 4)
+            clock_gettime(CLOCK_MONOTONIC, ts);
+        ts->tv_sec += 2;
+        pthread_t t;
+        pthread_create(&t, NULL, waiter, NULL);
+        usleep(300000);
+        munmap(ts, 4096);
+        pthread_kill(t, SIGUSR1);
+        pthread_join(t, NULL);
+    }
+
     shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    first = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    first->tv_sec = 2;
-    pthread_t t;
-    pthread_create(&t, NULL, sleeper, NULL);
-    usleep(300000);
-    munmap(first, 4096);
-    pthread_kill(t, SIGUSR1);
-    pthread_join(t, NULL);
+    pid_t child = fork();
+    if (child == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, refused, NULL);
+        usleep(300000);
+        // futex with 12345 as its value: EPERM; anything else is allowed
+        struct sock_filter code[] = {
+            {0x20, 0, 0, 0},                 // ld nr
+            {0x15, 0, 3, SYS_futex},         // jeq futex
+            {0x20, 0, 0, 32},                // ld args[2]
+            {0x15, 0, 1, 12345},             // jeq 12345
+            {0x06, 0, 0, 0x00050000u | EPERM}, // ret errno
+            {0x06, 0, 0, 0x7fff0000u},       // ret allow
+        };
+        struct sock_fprog prog = {6, code};
+        prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        if (syscall(SYS_seccomp, 1, 1, &prog) != 0)
+            printf("seccomp: %s\n", strerror(errno));
+        pthread_kill(t, SIGUSR1);
+        pthread_join(t, NULL);
+        _exit(0);
+    }
+    waitpid(child, NULL, 0);
     return 0;
 }
 C

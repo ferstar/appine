@@ -369,10 +369,10 @@ fn futex(
     match waiting.leave() {
         Some(_) => Some(Ok(0)),
         // Most likely a signal arrived: the BKL path re-checks the value, enqueues again and
-        // handles the signal. A relative timeout goes on waiting until the deadline computed here
-        // ([`TaskState::fast_sleep`])
+        // handles the signal, waiting until the deadline computed here without reading the
+        // timeout again ([`TaskState::fast_sleep`])
         None if woke => {
-            if cmd == FUTEX_WAIT && deadline.is_some() {
+            if deadline.is_some() {
                 task.state.borrow_mut().fast_sleep = deadline;
             }
             None
@@ -383,7 +383,7 @@ fn futex(
 
 fn nanosleep(task: &Task, cpu: &Cpu, req: u64) -> Option<SysResult> {
     let deadline = Expiry::after(read_timespec(cpu, req)?);
-    sleep_until(task, deadline, true)
+    sleep_until(task, deadline)
 }
 
 /// The wall clock, the monotonic clock and the since-boot clock of `misc::clock_nanosleep`.
@@ -402,25 +402,23 @@ fn clock_nanosleep(
     }
     let t = read_timespec(cpu, req)?;
     if flags & TIMER_ABSTIME == 0 {
-        return sleep_until(task, Expiry::new(clock, t, false).ok()?, true);
+        return sleep_until(task, Expiry::new(clock, t, false).ok()?);
     }
-    // An absolute time: the BKL path converts the same arguments again, which simply goes on
-    // sleeping
     let t = super::misc::to_host_clock(offset, t);
     let deadline = Expiry::new(clock, t, true).ok()?;
-    sleep_until(task, deadline, false)
+    sleep_until(task, deadline)
 }
 
-/// Sleeps until `deadline`. When woken (most likely by a signal) the BKL path goes on sleeping;
-/// with `relative` the deadline is recorded in [`TaskState::fast_sleep`]: the BKL path does not
-/// recompute it from now, and also uses it for the time remaining when interrupted by a signal.
-fn sleep_until(task: &Task, deadline: Expiry, relative: bool) -> Option<SysResult> {
+/// Sleeps until `deadline`. When woken (most likely by a signal) the BKL path goes on sleeping,
+/// with the deadline recorded in [`TaskState::fast_sleep`]: it takes that instead of reading the
+/// time again, so a relative sleep does not start over from now, the time remaining when a
+/// signal interrupts comes from it, and memory unmapped meanwhile is never read (Linux's restart
+/// keeps the deadline too).
+fn sleep_until(task: &Task, deadline: Expiry) -> Option<SysResult> {
     if !sleep(task, Some(deadline)) {
         return Some(Ok(0));
     }
-    if relative {
-        task.state.borrow_mut().fast_sleep = Some(deadline);
-    }
+    task.state.borrow_mut().fast_sleep = Some(deadline);
     None
 }
 

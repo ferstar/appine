@@ -229,10 +229,10 @@ pub(crate) struct TaskState {
     pub vfork_done: Option<(Rc<Cell<bool>>, Arc<Event>)>,
     /// What remains of a nanosleep or timed futex wait interrupted by a signal (`restart_syscall`).
     pub restart: Option<crate::syscall::Restart>,
-    /// The original deadline of a no-BKL nanosleep or relative-timeout futex wait (`syscall::fast`)
-    /// that was woken before sleeping long enough and handed over to the locked path. The locked
-    /// path goes on sleeping until it, and when interrupted by a signal also computes what remains
-    /// from it.
+    /// The deadline of a no-BKL sleep or timed futex wait (`syscall::fast`) that was woken before
+    /// it passed and handed over to the locked path, which goes on waiting until it without
+    /// reading the time argument again, and computes what remains from it when a signal
+    /// interrupts. Cleared once the locked path has dispatched that call.
     pub fast_sleep: Option<crate::itimer::Expiry>,
 }
 
