@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 5 research concerns; 25 claims checked by 3 independent verifiers — 19 confirmed and 6 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, then the scrollback's byte limit last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: whether a console is open, the ⋮ button's description, the menu key and resize replies, the scrollback's byte limit, then unwired libghostty-vt options and colours last)
 
 ## Responsibilities
 
@@ -647,29 +647,44 @@ notices task, the JNI crate, `guarded!` and the build, including compiling libgh
 - **The terminal lacks** triple-tap (line) and rectangular selection. libghostty-vt has both
   (`ghostty_terminal_select_line`, a selection's `rectangle` flag).
 - **libghostty-vt features not wired**: no callbacks for OSC 9;4 progress, OSC 7501 program
-  status, OSC 7 working directories or OSC 133 prompts (the last two also need shell integration,
-  which Ghostty ships for bash, zsh, fish, elvish and nushell but not ash, and Appine installs
-  none); no search; no scrollback compression (`TerminalService.trimMemory` trims only the
-  kernel); tabs are restored from plain text, not libghostty-vt snapshots; no terminfo name is
-  set, so XTGETTCAP `TN` goes unanswered; ENQ, the title report (CSI 21 t), XTCHECKSUM and window
-  resizing (CSI 8 t) are left unanswered; OSC 5522 transactions are buffered up to the library's
-  64 MiB default.
+  status (a program reporting itself idle, working, done, blocked or in error, so a tab cannot
+  show that its CLI waits for an answer), OSC 7 working directories or OSC 133 prompts (the last
+  two also need shell integration, which Ghostty ships for bash, zsh, fish, elvish and nushell but
+  not ash, and Appine installs none); no search; no scrollback compression
+  (`TerminalService.trimMemory` trims only the kernel); tabs are restored from plain text, not
+  libghostty-vt snapshots, and a snapshot keeps a sequence the output stopped inside only with
+  continuation tracking (`CONTINUATION_MAX_BYTES`, off by default and needed before that output),
+  which vt.c leaves off; no terminfo name is set, so XTGETTCAP `TN` goes unanswered; ENQ, the
+  title report (CSI 21 t), XTCHECKSUM and window resizing (CSI 8 t) are left unanswered; DA1
+  leaves out 52 (clipboard access), which Ghostty adds whenever clipboard writes are allowed, as
+  they are here, so programs that look for it take OSC 52 as unsupported; clipboard reads are
+  refused where Ghostty's default (`clipboard-read = ask`) asks, and wiring them would turn the
+  IME's multi-line commits, pasted as `GHOSTTY_PASTE_SOURCE_CLIPBOARD`, into Kitty paste events
+  for programs using mode 5522; an OSC 5522
+  write is buffered up to the library's 64 MiB default (the protocol's minimum) before vt.c denies
+  anything over 256 KiB, so one write can make a tab hold 64 MiB.
+- **No default colours are given to libghostty-vt**: vt.c sets no foreground, background or
+  cursor colour (`GHOSTTY_TERMINAL_OPT_COLOR_*`), so the render state keeps its built-in white on
+  black and the terminal treats all three as unset: OSC 10, 11 and 12 queries go unanswered
+  (programs asking for the background to pick a light or dark theme get no reply), reverse video
+  (DECSCNM, mode 5, which visual bells flash) changes nothing, and a foreground or background a
+  program sets with OSC 10 or 11 shows only once the other is set too.
 - **More of libghostty-vt left unused**:
   - selection: `select_word_between` (a word drag that extends by words), `selection_adjust`,
     `select_output` (needs OSC 133), and the selection gesture state machine (click counts to
     cell, word, line or output selection), for which `VtView` has its own taps and long presses;
   - drawing: overscan (rows captured beyond the viewport, to scroll by pixels; drags and flings
-    move whole rows); the default palette, colour and cursor style/blink options (the 256 colours
-    are libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
+    move whole rows); the default palette and cursor style/blink options (the 256 colours are
+    libghostty-vt's built-in ones, and the colour scheme reply is fixed to dark); the OSC 22
     pointer shape for a mouse; `row_iterator_next_dirty` and the two-phase render update
     (`begin_update` under the lock, `end_update` after), so `frame` holds the tab's lock while
     it encodes every row;
   - the rest: no action to reset the terminal or clear the scrollback (`ghostty_terminal_reset`)
     and no RIS callback; transcripts are plain text, though the formatter can emit VT or HTML with
-    colours and OSC 8 links; the memory usage is never read; the library's log and
-    unknown-sequence callbacks are unset, so its warnings never reach logcat; KAM (mode 2) is
-    ignored: Ghostty's own surface drops keys while it is set, but the key encoder does not, and
-    neither does vt.c;
+    colours and OSC 8 links; the memory usage and the VT processing-error flag are never read;
+    the library's log and unknown-sequence callbacks are unset, so its warnings never reach
+    logcat; KAM (mode 2) is ignored: Ghostty's own surface drops keys while it is set, but the key
+    encoder does not, and neither does vt.c;
   - out of reach: the C API has no setter for the password-input flag (Ghostty's lock cursor) or
     the terminal's visibility, so mode 2033 reports every tab as visible, background ones too.
 - **A display size change while the terminal is open** keeps the sizes its views were built with
