@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process last)
+> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process, then difftest's run lock and tool check last)
 
 ## Responsibilities
 
@@ -48,7 +48,8 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
 - difftest's per-case directives, matched on any line: `# docker-run-options:`,
   `# appine-options:` and `# difftest-files:`; outputs `target/difftest/<case>.{native,appine,
   appine.err}`, failure copies `failed/<time>-t<tier>-<case>.*`, timings
-  `durations-t<tier>.txt` (`<case> <seconds>`), the run lock `.lock/pid`, lane claims
+  `durations-t<tier>.txt` (`<case> <seconds>`), the run lock `.lock` (a symbolic link naming the
+  run's pid), lane claims
   `.slot-<n>`, lane stores `<store>-w<n>` (marked `.cloned`); the image `appine-difftest`,
   labelled with the exported directory list.
 - Suite tarballs: `target/starnix-tests/starnix-tests-<commit12>.tar` and
@@ -141,9 +142,12 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
 
 ### Differential tests
 
-- One run at a time: a run creates `target/difftest/.lock` (a directory holding its pid) before
-  touching the store, waits while another live run holds it, takes over one left by a killed run,
-  and removes it on exit; its lanes run under it.
+- One run at a time: a run creates `target/difftest/.lock`, a symbolic link naming its pid made in
+  one step, before touching the store; it waits while the run it names is alive (`ps -p`, which
+  also finds another user's process), takes over a lock whose run is gone (or an earlier version's
+  lock directory, with or without its pid file) by moving it aside first, so that of two waiters
+  finding the same dead run the one that moved away the other's new lock puts it back, and
+  removes it on exit; its lanes run under it.
 - On aarch64 Linux `appine-run` runs inside a container (`APPINE_IMAGE`, default
   `debian:trixie-slim`, the caller's uid, seccomp unconfined, the repository at its own path) for
   the store import, the tool check, the export and the cases, while the store's package and suite
@@ -155,8 +159,8 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
 - A store (`target/difftest/store`, inside the work tree, since both containers mount only the
   repository) is imported once and gets 22 packages (fuse3, fuse-overlayfs, sshfs, rclone and
   openssh-sftp-server among them, for the `fuse` and `fuse-tools` cases, whose native side needs
-  `--device /dev/fuse`); a tool check on every top-level run (`command -v` of 17 commands, and
-  util-linux's `nsenter` and `dmesg`) aborts if one is missing.
+  `--device /dev/fuse`); a tool check on every top-level run (`command -v` of each of 17 commands,
+  and util-linux's `nsenter` and `dmesg`) aborts if one is missing.
 - Each suite tarball (`starnix`, `gvisor`; the last one in `ls` order) is installed into the store
   at `/usr/lib/<suite>-tests` when its `VERSION` differs from the store's.
 - The store's top-level directories `bin etc home lib media mnt opt run sbin srv tmp usr var`
@@ -373,13 +377,8 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   terminals, so the host keeps ISIG (^C reaches the program as `SIGINT` through `appine-run`, ^Z
   stops `appine-run` itself), line-buffers input and echoes it while the guest echoes into the
   pipe; the size stays 24×80.
-- **A difftest lock without its pid file is never taken over**: a run killed between creating the
-  lock directory and writing its pid leaves later runs waiting forever ("pid unknown"). Two
-  waiters that see the same dead holder can both remove the lock and run together, and a live
-  holder of another user looks dead to `kill -0`.
-- **difftest's tool check tests only `python3`**: it passes all 17 names to one `command -v`, and
-  busybox ash describes only the first operand, so a store missing any other tool passes the check
-  (only the util-linux checks still bite).
+- **Three waiters can still run together:** when one moves aside a lock another waiter has just
+  made and a third makes its own before it is put back, the moved one's run goes on without it.
 - **Stale comments:** `ci.yml`'s header still says `full.yml` runs the performance probe, and
   `scripts/survey`'s header says every script under `tests/survey/` runs without names.
 

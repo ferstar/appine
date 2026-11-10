@@ -84,25 +84,36 @@ shift $((OPTIND - 1))
 out=target/difftest
 mkdir -p "$out"
 # One run at a time: runs share the per-case outputs, the lane claims and the lane clones (which -r
-# deletes), so a second run waits for the first. The lock is a directory holding the owner's pid;
+# deletes), so a second run waits for the first. The lock is a symbolic link naming the owner's
+# pid, made in one step (earlier versions left a directory holding a pid file, also understood);
 # one left by a run that was killed is taken over. The lanes (-G) run under their parent's lock
 if [ -z "$group" ]; then
     lock=$out/.lock
+    owner() { readlink "$1" 2>/dev/null || cat "$1/pid" 2>/dev/null || true; }
     waited=0
-    while ! mkdir "$lock" 2>/dev/null; do
-        holder=$(cat "$lock/pid" 2>/dev/null || true)
-        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-            rm -rf "$lock"
+    # (ln -s would make the link inside an earlier version's lock directory, and succeed)
+    while { [ ! -L "$lock" ] && [ -d "$lock" ]; } || ! ln -s "$$" "$lock" 2>/dev/null; do
+        holder=$(owner "$lock")
+        # ps, unlike kill -0, also finds another user's live process
+        if [ -z "$holder" ] || ! ps -p "$holder" >/dev/null 2>&1; then
+            # Taken over by moving it aside first: of several waiters that found the same dead
+            # holder, one that moved away the lock another has just made puts it back
+            if mv "$lock" "$lock.$$" 2>/dev/null; then
+                moved=$(owner "$lock.$$")
+                if [ -n "$moved" ] && [ "$moved" != "$holder" ]; then
+                    ln -s "$moved" "$lock" 2>/dev/null || true
+                fi
+                rm -rf "$lock.$$"
+            fi
             continue
         fi
         if [ "$waited" = 0 ]; then
-            echo "difftest: waiting for the run holding $lock (pid ${holder:-unknown})" >&2
+            echo "difftest: waiting for the run holding $lock (pid $holder)" >&2
             waited=1
         fi
         sleep 2
     done
-    echo $$ >"$lock/pid"
-    trap 'rm -rf "$lock"' EXIT
+    trap 'rm -f "$lock"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 fi
@@ -149,8 +160,9 @@ fi
 # Checking only that the directory exists is not enough: a store whose install failed midway, or
 # whose cache was only partly restored, makes every test case fail
 if ! appine --tier 1 --rootfs "$store" --env "$env_path" -- \
-    /bin/sh -c "command -v python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap iptables nft fusermount3 fuse-overlayfs sshfs rclone &&
-        nsenter --version | grep -q util-linux && dmesg --version | grep -q util-linux" >/dev/null 2>&1; then
+    /bin/sh -c "for tool in python3 gcc lua5.4 sqlite3 go node java strace gdb uv bwrap iptables nft fusermount3 fuse-overlayfs sshfs rclone; do
+            command -v \"\$tool\" || exit 1
+        done && nsenter --version | grep -q util-linux && dmesg --version | grep -q util-linux" >/dev/null 2>&1; then
     echo "difftest: $store lacks some of: $packages" >&2
     echo "difftest: install them with apk add, or delete $store to create it again" >&2
     exit 1
