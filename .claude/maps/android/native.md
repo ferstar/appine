@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: `parse_route`'s comment, libjnigraphics, then the libghostty-vt 1.0.0 release's fetch, offline build, notices and released sources last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: the Gradle tasks' shared `CargoTask` and `newestFetched`, the version catalog, Gradle 9.9.1)
 
 ## Responsibilities
 
@@ -45,8 +45,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   `(name, throws env, fallback, body)` for the functions Kotlin declares `@Throws`.
 - Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`), `RootfsAssetTask` (one
   `rootfsAsset` shared by all variants), `NoticesTask` (one per variant,
-  `generateNotices<Variant>`); helpers `byVersion` (compares file names by their runs of digits,
-  then by how many runs) and `alpineBranch` (from the tarball's name, `edge` without one).
+  `generateNotices<Variant>`), the first and last on `CargoTask` (the workspace and which cargo
+  to run); helpers `byVersion` (compares file names by their runs of digits, then by how many
+  runs), `newestFetched` (the newest file in `target/rootfs` whose name matches) and
+  `alpineBranch` (from the tarball's name, `edge` without one).
 - `MachineTest` — the only instrumentation test class.
 
 ## Public entry points
@@ -154,9 +156,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   a tarball whose sha256 matches, else downloads it (`curl --retry 3` to a `.part` file, checked,
   renamed), and unpacks each into `<name>.part` and moves its directory into place whole, only
   when that directory is missing. It runs no Zig and needs no proxy handling.
-- Toolchain: AGP 9.4.1 with its built-in Kotlin, Gradle 9.8.2, Java 17, NDK 29.0.14206865; plugins
-  and dependencies from `google()` and `mavenCentral()` (project repositories fail the build); no
-  version catalog. Android libraries: `androidx.core` 1.19.1 and Material Components 1.14.0 (which
+- Toolchain: AGP 9.4.1 with its built-in Kotlin, Gradle 9.9.1, Java 17, NDK 29.0.14206865; plugins
+  and dependencies from `google()` and `mavenCentral()` (project repositories fail the build). The
+  version catalog (`android/gradle/libs.versions.toml`) holds the libraries' versions, and AGP's
+  is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,

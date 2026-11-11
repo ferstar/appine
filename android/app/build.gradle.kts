@@ -21,18 +21,19 @@ val byVersion: Comparator<File> = Comparator { a, b ->
     x.zip(y).map { (p, q) -> p.compareTo(q) }.firstOrNull { it != 0 } ?: x.size.compareTo(y.size)
 }
 
-/** Alpine minirootfs: the tarball `scripts/fetch-rootfs` downloaded and verified. */
-val rootfsTarball: File? = repoRoot.dir("target/rootfs").asFile
-    .listFiles { f -> f.name.matches(Regex("alpine-minirootfs-.*-aarch64\\.tar\\.gz")) }
+/** The newest of the files `scripts/fetch-rootfs` downloaded and verified whose name matches. */
+fun newestFetched(name: Regex): File? = repoRoot.dir("target/rootfs").asFile
+    .listFiles { f -> f.name.matches(name) }
     ?.maxWithOrNull(byVersion)
 
+/** Alpine minirootfs tarball. */
+val rootfsTarball: File? = newestFetched(Regex("""alpine-minirootfs-.*-aarch64\.tar\.gz"""))
+
 /**
- * The doas package bundled with the app (downloaded by `scripts/fetch-rootfs`), installed offline
- * when a regular user first becomes the login account.
+ * The doas package bundled with the app, installed offline when a regular user first becomes the
+ * login account.
  */
-val doasPackage: File? = repoRoot.dir("target/rootfs").asFile
-    .listFiles { f -> f.name.matches(Regex("doas-.*\\.apk")) }
-    ?.maxWithOrNull(byVersion)
+val doasPackage: File? = newestFetched(Regex("""doas-.*\.apk"""))
 
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
@@ -42,6 +43,7 @@ val alpineBranch: String = rootfsTarball
 
 android {
     namespace = "io.github.mthli.appine"
+
     compileSdk = 37
     ndkVersion = "29.0.14206865"
 
@@ -50,7 +52,7 @@ android {
         minSdk = 30
         targetSdk = 37
         versionCode = 1
-        versionName = "0.0.0"
+        versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "ALPINE_BRANCH", "\"$alpineBranch\"")
     }
@@ -79,11 +81,11 @@ android {
     }
 
     lint {
-        // A lint warning fails lint (CI runs lintDebug), as `-D warnings` fails clippy
+        // A lint warning fails lint (CI runs lintDebug), as `-D warnings` fails clippy.
         warningsAsErrors = true
         // These follow what is published or dated outside the repository (newer libraries, AGP or
         // SDK levels, Play's target SDK deadlines, the Play SDK Index), so as errors they would fail
-        // an unchanged tree; they stay in the report
+        // an unchanged tree; they stay in the report.
         informational += listOf(
             "GradleDependency",
             "AndroidGradlePluginVersion",
@@ -96,8 +98,60 @@ android {
 
 kotlin {
     compilerOptions {
-        // A compiler warning fails the build, main and test sources alike
+        // A compiler warning fails the build, main and test sources alike.
         allWarningsAsErrors = true
+    }
+}
+
+dependencies {
+    implementation(libs.androidx.core)
+    implementation(libs.material)
+    androidTestImplementation(libs.androidx.runner)
+    androidTestImplementation(libs.androidx.junit)
+}
+
+val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
+    rootfsTarball?.let { tarball.set(it) }
+    doasPackage?.let { doas.set(it) }
+    outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        val suffix = variant.name.replaceFirstChar(Char::uppercase)
+        val buildRust = tasks.register<CargoNdkTask>("buildRust$suffix") {
+            workspace.set(repoRoot)
+            ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
+            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
+            outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
+        }
+        variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
+        variant.sources.assets?.addGeneratedSourceDirectory(rootfsAsset, RootfsAssetTask::outputDir)
+        val notices = tasks.register<NoticesTask>("generateNotices$suffix") {
+            license.set(repoRoot.file("LICENSE"))
+            texts.set(layout.projectDirectory.dir("../licenses"))
+            rootfsTarball?.let { tarball.set(it) }
+            doasPackage?.let { doas.set(it) }
+            cargoLock.set(repoRoot.file("Cargo.lock"))
+            workspace.set(repoRoot)
+            // Modules in the dependency graph (not in-project modules), resolving only the graph without downloading.
+            androidLibraries.set(
+                variant.runtimeConfiguration.incoming.resolutionResult.rootComponent.map { top ->
+                    val seen = mutableSetOf<ResolvedComponentResult>()
+                    val modules = sortedSetOf<String>()
+                    val queue = ArrayDeque(listOf(top))
+                    while (queue.isNotEmpty()) {
+                        val c = queue.removeFirst()
+                        if (!seen.add(c)) continue
+                        (c.id as? ModuleComponentIdentifier)?.let { modules.add("${it.group}:${it.module}:${it.version}") }
+                        c.dependencies.filterIsInstance<ResolvedDependencyResult>().forEach { queue.add(it.selected) }
+                    }
+                    modules.toList()
+                },
+            )
+            outputDir.set(layout.buildDirectory.dir("generated/notices/${variant.name}/assets"))
+        }
+        variant.sources.assets?.addGeneratedSourceDirectory(notices, NoticesTask::outputDir)
     }
 }
 
@@ -108,10 +162,7 @@ kotlin {
  * process (effective only when `APPINE_TEST_HOOKS=1` is set); it also turns on `borrow-check`,
  * which checks that no kernel object is borrowed when the BKL is released.
  */
-abstract class CargoNdkTask : DefaultTask() {
-    @get:Internal
-    abstract val workspace: DirectoryProperty
-
+abstract class CargoNdkTask : CargoTask() {
     @get:Input
     abstract val ndkDirectory: Property<String>
 
@@ -121,9 +172,6 @@ abstract class CargoNdkTask : DefaultTask() {
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
-    @get:Inject
-    abstract val exec: ExecOperations
-
     init {
         // cargo does its own incremental builds
         outputs.upToDateWhen { false }
@@ -132,11 +180,9 @@ abstract class CargoNdkTask : DefaultTask() {
     @TaskAction
     fun build() {
         val root = workspace.get().asFile
-        val cargo = File(System.getProperty("user.home"), ".cargo/bin/cargo")
-            .takeIf { it.canExecute() }?.path ?: "cargo"
         exec.exec {
             workingDir = root
-            executable = cargo
+            executable = cargo()
             args(
                 "ndk", "-t", "arm64-v8a", "--platform", "30",
                 "-o", outputDir.get().asFile.path,
@@ -145,7 +191,7 @@ abstract class CargoNdkTask : DefaultTask() {
             if (features.get().isNotEmpty()) args("--features", features.get().joinToString(","))
             // Set both: with only one set, when the other one in the environment points at another
             // NDK (GitHub's runners preset ANDROID_NDK_ROOT), cargo-ndk warns, and which one it
-            // uses depends on its order of precedence
+            // uses depends on its order of precedence.
             environment("ANDROID_NDK_HOME", ndkDirectory.get())
             environment("ANDROID_NDK_ROOT", ndkDirectory.get())
             environment("CARGO_TARGET_DIR", File(root, "target/android").path)
@@ -196,7 +242,7 @@ abstract class RootfsAssetTask : DefaultTask() {
  * The build fails when a newly added Android library is not in one of the groups recognised below:
  * first confirm its license is compatible with AGPL-3.0, then add it.
  */
-abstract class NoticesTask : DefaultTask() {
+abstract class NoticesTask : CargoTask() {
     @get:InputFile
     abstract val license: RegularFileProperty
 
@@ -218,14 +264,8 @@ abstract class NoticesTask : DefaultTask() {
     @get:Input
     abstract val androidLibraries: ListProperty<String>
 
-    @get:Internal
-    abstract val workspace: DirectoryProperty
-
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
-
-    @get:Inject
-    abstract val exec: ExecOperations
 
     @TaskAction
     fun generate() {
@@ -418,12 +458,10 @@ abstract class NoticesTask : DefaultTask() {
     @Suppress("UNCHECKED_CAST")
     private fun crates(): List<Map<String, Any?>> {
         val ws = workspace.get().asFile
-        val cargo = File(System.getProperty("user.home"), ".cargo/bin/cargo")
-            .takeIf { it.canExecute() }?.path ?: "cargo"
         val json = ByteArrayOutputStream()
         exec.exec {
             workingDir = ws
-            executable = cargo
+            executable = cargo()
             args(
                 "metadata", "--format-version", "1", "--locked", "--all-features",
                 "--filter-platform", "aarch64-linux-android", "--manifest-path", File(ws, "Cargo.toml").path,
@@ -542,56 +580,16 @@ abstract class NoticesTask : DefaultTask() {
     }
 }
 
-val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
-    rootfsTarball?.let { tarball.set(it) }
-    doasPackage?.let { doas.set(it) }
-    outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
-}
 
-androidComponents {
-    onVariants { variant ->
-        val buildRust = tasks.register<CargoNdkTask>("buildRust${variant.name.replaceFirstChar(Char::uppercase)}") {
-            workspace.set(repoRoot)
-            ndkDirectory.set(androidComponents.sdkComponents.ndkDirectory.map { it.asFile.path })
-            features.set(if (variant.buildType == "debug") listOf("test-hooks", "borrow-check") else emptyList())
-            outputDir.set(layout.buildDirectory.dir("generated/rust/${variant.name}/jniLibs"))
-        }
-        variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
-        variant.sources.assets?.addGeneratedSourceDirectory(rootfsAsset, RootfsAssetTask::outputDir)
-        val notices = tasks.register<NoticesTask>("generateNotices${variant.name.replaceFirstChar(Char::uppercase)}") {
-            license.set(repoRoot.file("LICENSE"))
-            texts.set(layout.projectDirectory.dir("../licenses"))
-            rootfsTarball?.let { tarball.set(it) }
-            doasPackage?.let { doas.set(it) }
-            cargoLock.set(repoRoot.file("Cargo.lock"))
-            workspace.set(repoRoot)
-            // Modules in the dependency graph (not in-project modules), resolving only the graph
-            // without downloading
-            androidLibraries.set(
-                variant.runtimeConfiguration.incoming.resolutionResult.rootComponent.map { top ->
-                    val seen = mutableSetOf<ResolvedComponentResult>()
-                    val modules = sortedSetOf<String>()
-                    val queue = ArrayDeque(listOf(top))
-                    while (queue.isNotEmpty()) {
-                        val c = queue.removeFirst()
-                        if (!seen.add(c)) continue
-                        (c.id as? ModuleComponentIdentifier)?.let { modules.add("${it.group}:${it.module}:${it.version}") }
-                        c.dependencies.filterIsInstance<ResolvedDependencyResult>().forEach { queue.add(it.selected) }
-                    }
-                    modules.toList()
-                },
-            )
-            outputDir.set(layout.buildDirectory.dir("generated/notices/${variant.name}/assets"))
-        }
-        variant.sources.assets?.addGeneratedSourceDirectory(notices, NoticesTask::outputDir)
-    }
-}
+/** A task that runs cargo in the Cargo workspace. */
+abstract class CargoTask : DefaultTask() {
+    @get:Internal
+    abstract val workspace: DirectoryProperty
 
-dependencies {
-    implementation("androidx.core:core:1.19.1")
-    // Material 3 for Settings and the license pages (brings AppCompat, which their activities
-    // extend, and androidx.activity for enableEdgeToEdge)
-    implementation("com.google.android.material:material:1.14.0")
-    androidTestImplementation("androidx.test:runner:1.7.0")
-    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    @get:Inject
+    abstract val exec: ExecOperations
+
+    /** The cargo under `~/.cargo/bin` when there is one, else the one in `PATH`. */
+    protected fun cargo(): String = File(System.getProperty("user.home"), ".cargo/bin/cargo")
+        .takeIf { it.canExecute() }?.path ?: "cargo"
 }

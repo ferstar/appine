@@ -1,3 +1,5 @@
+@file:Suppress("UnstableApiUsage")
+
 pluginManagement {
     repositories {
         google()
@@ -15,5 +17,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "appine"
-
 include(":app")
