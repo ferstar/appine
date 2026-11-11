@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -36,11 +36,11 @@
 ## Active (full detail)
 
 ### D1: Synthetic files are generated from kernel state when opened, like seq_file
-- **What**: Nothing is stored; opening a procfs, sysfs or cgroup file generates its whole content, later reads use that snapshot, and a read from offset 0 generates it again.
+- **What**: Nothing is stored; opening a procfs, sysfs or cgroup file generates its whole content (`syscall` at its first read instead, D40), later reads use that snapshot, and a read from offset 0 generates it again.
 - **Why**: Linux's seq_file gives the same effect for a file read in one go, and generating from live kernel structures keeps every file consistent with the kernel layer without bookkeeping.
 - **Tradeoffs**: Large files are generated in full per open; of the files that change, only mounts, mountinfo and four cgroup2 files notify pollers (D38).
 - **Watch out**: Regeneration uses the opener's credentials (D25) but the current reader's namespaces.
-- **Source**: design review 2026-10-24 (§8.2); f6a82cc, affb1e2
+- **Source**: design review 2026-10-24 (§8.2); f6a82cc, affb1e2; f1212d8 (`syscall`)
 
 ### D4: The root cgroup looks like a docker container's root
 - **What**: `/proc/<pid>/cgroup` paths are relative to the reader's cgroup-namespace root, the root offers cpuset, cpu, memory and pids, and only `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable there; `memory.max`/`memory.current` at the root are the OOM killer's limit and measurement.
@@ -60,8 +60,8 @@
 - **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
 - **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
 - **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, `/proc/<tid>`'s ptrace-gated files failing with `ESRCH`, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, a `cgroup.subtree_control` panic on a multi-byte token, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8)
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -148,11 +148,18 @@
 - **Source**: affb1e2
 
 ### D39: Per-thread entries show the thread's credentials, and the reader is the reading thread
-- **What**: status ids and the owners of per-process entries come from the thread under `task/<tid>` or the main thread (`Kernel::cred_of`, kernel/cred D1), the reader's credentials are the reading thread's, `may_read`'s access checks go by the target thread, and socket owners in `/proc/net` use the holding thread's fsuid.
+- **What**: status ids and the owners of per-process entries come from the thread under `task/<tid>` or the main thread (`Kernel::cred_of`, kernel/cred D1), the reader's credentials are the reading thread's, `may_read`'s access checks use the directory pid's (the main thread's) credentials except `syscall`'s (D40), and socket owners in `/proc/net` use the holding thread's fsuid.
 - **Why**: `/proc/<pid>/task/<tid>` showed and was owned by the process's credentials, and the reader's credentials were the process's, which per-thread credentials made wrong.
 - **Tradeoffs**: None known.
-- **Watch out**: None known.
-- **Source**: 1be1142
+- **Watch out**: With per-thread credentials a thread's owners and the main thread's access checks can disagree, recorded as a bug in the map.
+- **Source**: 1be1142; f1212d8 (access checks corrected)
+
+### D40: `/proc/<pid>/syscall` follows `proc_pid_syscall`, generated at its first read
+- **What**: `Entry::Syscall` (mode 0400) in the process and thread directories generates nothing at open and builds its content at the first read, so `/proc/self/syscall` shows the read itself, printing `running` for a live thread in state R other than the reader, the number with x0 to x5, sp and pc for one in the kernel (kernel/process D55), a negative number with sp and pc outside a syscall, `-1 0x0 0x0` for an exited main thread and `ESRCH` once another thread has gone, after a ptrace access check of that thread with the reader's own credentials (`may_read_as`, `EPERM`), as lock_trace does.
+- **Why**: The hang dump (harness D39) needs Linux's file, which Appine lacked.
+- **Tradeoffs**: With no Yama, any reader passing the ptrace check reads another process's file where Linux's ptrace_scope 1 limits it to ancestors, and the record is a snapshot whose registers can be a moment old.
+- **Watch out**: Only `syscall` checks the target thread itself; the other per-thread checks use the main thread's credentials (D39).
+- **Source**: f1212d8
 
 ## Superseded
 
@@ -161,3 +168,4 @@
 - ~~Recorded sysctls change nothing, and debug.exception-trace starts at x86's 1 (D16 in part, 42d2ffe)~~ → replaced by **D16** in 7b7f73b (2026-11-08); drop_caches acts since 3957a03 (2026-11-09, no SUPERSEDES declared)
 - ~~Synthetic files that change do not notify pollers, mountinfo and `cgroup.events` included (D1's and D4's tradeoffs, §8.2, rounds 58, 163)~~ → narrowed by **D38** in affb1e2 (2026-11-09, no SUPERSEDES declared): mounts, mountinfo and four cgroup2 files report
 - ~~`memory.current` counts shared pages once per process (D5's tradeoff, round 164)~~ → replaced by **D5** in 1d3d559 (2026-11-10, no SUPERSEDES declared)
+- ~~`may_read`'s access checks go by the target thread (D39 in part, 1be1142)~~ → corrected in f1212d8 (2026-11-11): they use the main thread's credentials (a bug in the map), and only **D40**'s `syscall` checks the thread

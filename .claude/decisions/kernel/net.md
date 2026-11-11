@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -64,12 +64,12 @@
 - **Watch out**: Register the record before releasing the BKL so the peer cannot accept first.
 - **Source**: round 180 (`180-original-dst`)
 
-### D9: Internet and netlink sockets are one kernel/net module
-- **What**: kernel/net covers `net.rs`, `syscall/net.rs`, raw ICMP, the routing table, the port map, traffic counters and `SO_ORIGINAL_DST`, with host socket wrappers in hal and the namespace hooks described from kernel/netns's side.
-- **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits.
-- **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them an error after part of a `MSG_WAITALL` read being lost, non-resumable netlink dumps, unvalidated rtnetlink requests, notifications for rtnetlink change requests only, netlink destination addresses that are ignored, one echo id per raw ICMP socket, raw ICMP sockets that cannot be bound to another address or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2)
+### D9: kernel/net covers internet sockets and the socket syscalls; netlink sockets are kernel/netlink
+- **What**: kernel/net covers `net.rs` and `syscall/net.rs` except their netlink sections, `netlink_*` functions and `Socket::Netlink` arms, raw ICMP, the routing table (`route.rs`, with the route and rule messages and `ip route get` that netlink sends), the port map, traffic counters, `/proc/net`'s socket, protocol and route files, the DNS stub and `SO_ORIGINAL_DST`, with host socket wrappers in hal, the namespace hooks described from kernel/netns's side and netlink sockets in kernel/netlink.
+- **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits, and by 2026-11-11 more than half the map postdated its verification and its full refresh reached 48.8 KB, near one Read, with netlink a subsystem of its own.
+- **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources, socket dispatch, the changing ioctls and route messages read two maps, and decisions on netlink sockets made before the split keep their kernel/net tags here (D3, D24, D26 and the netlink halves of D19 and D23, listed in kernel/netlink's preamble).
+- **Watch out**: Changing socket ioctls must run between kernel/netlink's `rtnl_watched` and `rtnl_notify` (a map invariant), and bugs open in the map include an error after part of a `MSG_WAITALL` read being lost, option passthrough with host semantics, `SO_ATTACH_FILTER` on TCP refused by newer hosts, `MSG_TRUNC` writing zeros on TCP, one echo id per raw ICMP socket, raw ICMP sockets that cannot be rebound or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split)
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -190,6 +190,14 @@
 - **Watch out**: Each change request with a listener rebuilds the namespace's link, address and route messages twice (quadratic for batches over thousands of addresses, with host getifaddrs and route reads in the boot namespace), and a dump encoding that varies between calls would notify spuriously.
 - **Source**: 7a13dd2
 
+### D27: `SO_GET_FILTER` asks the host with a count of instructions
+- **What**: An inet socket's `SO_GET_FILTER` goes to `hal::net::get_filter` (hal D20) with min(optlen, 4096) instructions and answers as Linux's `sk_get_filter`: 0 asks only for the count, fewer than the program holds is `EINVAL`, otherwise the instructions are copied out and optlen becomes the program's count; setsockopt's filter check shares the `SO_ATTACH_FILTER` and `BPF_MAXINSNS` constants.
+- **Why**: The option went to the host with the guest's optlen (at most 256) as a byte count, but Linux reads it as instructions and copies 8 bytes for each, so a guest that attached a filter could write past Appine's heap and abort `appine-run`, ending every guest process.
+- **Tradeoffs**: Netlink and AF_UNIX sockets still accept filters without effect and answer as before (netlink `ENOPROTOOPT`, where Linux reports no filter), one host call copies at most 32 KiB, and hosts that refuse the attach are left to the `SO_ATTACH_FILTER` bug.
+- **Watch out**: Another passed-through option whose optlen is not a byte count would overflow the same way.
+- **Source**: c65da9d (recorded in 0c1b416)
+
 ## Superseded
 
 - ~~DNS stub queries are resolved synchronously in the sending thread (rounds 06, 07)~~ → replaced by **D5** in fe4bb2b (2026-11-05)
+- ~~Internet and netlink sockets are one kernel/net module (D9, c3df5d3)~~ → replaced by **D9** and kernel/netlink **D1** in 0c1b416 (2026-11-11)

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -49,11 +49,11 @@
 - **Source**: rounds 195 (`195-kill-reports`), 205 (`205-copy-bug-report`), 207 (`207-report-kernel-log`); 99b4216
 
 ### D7: The service is a module of its own, split from the app by responsibility
-- **What**: android/service holds `TerminalService.kt` and `Tabs.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
+- **What**: android/service holds `TerminalService.kt`, `Notifications.kt`, `Settings.kt` and `Tabs.kt`; the app is split into service, setup, documents, terminal and native modules by responsibility, in the maps only.
 - **Why**: §11.2's lifecycle table had to leave the retired design doc, and the user asked for the app to be split.
-- **Tradeoffs**: The code stays in one Gradle module, so cross-module statics remain (the login setting, the store lock).
+- **Tradeoffs**: The code stays in one Gradle module, so cross-module statics remain (`Settings`, the store lock).
 - **Watch out**: A shell's kill report can reach a tab opened within the next poll that took the freed console number (open in the map); the switch-after-failed-start crash, notifications posted after `onDestroy` and reports sent to ended tabs, recorded by the full refresh d9e1f0c, were fixed in 6560af6 (D8, D9, D16).
-- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6)
+- **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23)
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
 - **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
@@ -77,11 +77,11 @@
 - **Source**: 62a8c07
 
 ### D11: Display settings the terminal needs before binding live in the service's `settings` file
-- **What**: `fill_wide` (default on) is kept in the `settings` preferences, changed through the service's `setFillWide`, which notifies listeners via `settingsChanged`, and read by `MainActivity` through a static `fillWide(context)`.
+- **What**: `fill_wide` (default on) is kept in the `settings` preferences, changed through the service's `setFillWide`, which writes it through `Settings` and notifies listeners via `settingsChanged`, and read by `MainActivity` through `Settings.fillWide` (D23, android/terminal D52).
 - **Why**: Settings rows display and forward state the service keeps, and the terminal's activity needs the value before it binds the service.
-- **Tradeoffs**: It is one more cross-module static setting, like `login()` and `showSystemDocuments()`, and the service keeps a display preference it never uses itself.
+- **Tradeoffs**: It is one more setting read across modules through `Settings`, like the login and the whole-system root (android/documents D11), and the service keeps a display preference it never uses itself.
 - **Watch out**: `MainActivity` is not a listener while stopped (Settings covers it), so it must keep rereading the value in `onStart`.
-- **Source**: 0478dd5
+- **Source**: 0478dd5; 0553229 (read through `Settings`)
 
 ### D12: `TerminalService` reads in the order a service runs
 - **What**: TerminalService runs `onCreate` and what it calls, `onStartCommand` and `onBind`, listeners, sessions, poll reports in poll order, memory trimming, settings in the settings screen's order, then the exit and stop paths ending with `onDestroy`; `Listener`'s callbacks and their implementations are in firing order, and `Tabs` runs `takeKilled` and `load`, `markRunning`, `save` and `clear`.
@@ -160,9 +160,17 @@
 - **Watch out**: A session not started yet only stores the values until its terminal exists.
 - **Source**: 77d7f36
 
+### D23: Notifications and settings live in classes of their own; the service keeps the decisions
+- **What**: `Notifications(service)` owns the channels, every notification id but the ongoing one (1), the stall, crash, boot-failure, listen and kill notifications with the bug report and its "copy report" action (the service hands it the intent), and each tab's notification with the bell throttle, status de-duplication and stall state, while the service still decides what is told (the tab in front, a kill shown in its tab); `Settings` is an object over the `settings` preferences with getters, plain setters and `clearLogin`, whose values the service's getters delegate to and its setters write before acting; saving tabs and switching distros stay in the service, coupled to its start and worker.
+- **Why**: TerminalService mixed the kernel's lifecycle, sessions and saving with notification building (channels, ids, "copy report", per-tab de-duplication) and the preferences' keys and defaults, and exported static settings only because the preferences lived there.
+- **Tradeoffs**: A notification change can need both files (the decision in the service, the text in Notifications), and settings have two entry points: `Settings` for reading anywhere and the service for changes with effects.
+- **Watch out**: Notification ids are split between the service (the ongoing 1) and Notifications' companion, so a new id must be checked against both, and writing a setting through `Settings` instead of the service skips its effects (wake lock, Files roots, cursor to every tab, restart).
+- **Source**: 0553229
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
 - ~~A tab's name among D5's saved fields, saved again after each rename (2af55e2, 89ad551)~~ → dropped from **D5** in 7c35183 (2026-11-05), with renaming gone from the terminal
 - ~~The trim releases only the kernel's caches (D4, round 37)~~ → replaced by **D4** in 3f45ad0 (2026-11-10)
 - ~~Restored tabs show their old scrollback as plain text, losing colours (D5's tradeoff, round 194)~~ → replaced by **D5** in 600700b (2026-11-10, no SUPERSEDES declared)
+- ~~Settings read across modules through the static `TerminalService.fillWide(context)`, `login()` and `showSystemDocuments()` (D11, 0478dd5)~~ → replaced by **D23** in 0553229 (2026-11-12)

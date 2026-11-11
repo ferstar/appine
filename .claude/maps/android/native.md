@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: the Gradle tasks' shared `CargoTask` and `newestFetched`, the version catalog, Gradle 9.9.1)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the release's versionName, 1.0.0)
 
 ## Responsibilities
 
@@ -174,7 +174,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   included) treats compiler warnings as errors, and lint treats its warnings as errors, except
   `GradleDependency`, `AndroidGradlePluginVersion`, `OldTargetApi`, `ExpiringTargetSdkVersion` and
   `OutdatedLibrary`, which follow data outside the repository and are informational.
-- Release: signed with the debug key, not minified, versionCode 1 and versionName 0.0.0.
+- Release: signed with the debug key, not minified, versionCode 1 and versionName 1.0.0.
 
 ### Notices
 
@@ -294,8 +294,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ## Confirmed bugs / technical debt
 
-- The release build is signed with the debug key, not minified and versioned 1 / 0.0.0; the Alpine
-  tarball's checksum is checked only in `scripts/fetch-rootfs`.
+- The release build is signed with the debug key and not minified; the Alpine tarball's checksum
+  is checked only in `scripts/fetch-rootfs`.
 - Local references are never deleted in lib.rs's loops that build or read arrays (`string_array`,
   `takeListens`, `takeKills`, `strings`; harmless with ART's large table on every supported
   version); a failed string conversion with no pending exception makes void calls return silently

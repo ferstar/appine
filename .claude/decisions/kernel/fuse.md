@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/fuse"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384)
+> Last distilled: 2026-11-12 (HEAD = 0553229)
 >
 > The VFS side of FUSE (the `Node::Fuse` kind, `/dev/fuse` as a file kind, key bits and the sweep's view of mounts) is kernel/vfs's D47 and D51; FUSE becoming a module of its own is knowledge-loop D7.
 
@@ -18,11 +18,11 @@
 
 ### D2: Mapped pages are read on demand, and unused nodes are forgotten by a sweep between syscalls
 
-- **What**: mmap of a FUSE file makes a `Fill` (kernel/mm D40) that reads pages through the mapped file's handle as they are touched, before read and write syscalls for their buffers (`prefault`) and in full with `MAP_POPULATE` (shared mappings of `FOPEN_DIRECT_IO` files are `ENODEV`); nodes count lookups and connections count open handles per node, and above 16384 nodes or on `drop_caches` 2 or 3 a sweep at a syscall's end keeps every node that tasks' roots and cwds, fds (`O_PATH` too), running programs, mounts, inotify watches, open handles and requests in flight use, with their directories, and forgets the oldest leaves (down to 12288, or all with `drop_caches`) through `FUSE_FORGET` or `FUSE_BATCH_FORGET` interleaved with requests as 6.1 does.
-- **Why**: Without forgetting, the node cache and the daemon's node table grew with every name looked up until unmount, and a mapping read its whole range at once.
-- **Tradeoffs**: An unlinked file is not forgotten when it stops being used (Linux forgets it at once), each sweep scans every task and fd table, and the mapped file stays open while mapped, so `FUSE_RELEASE` comes after munmap as on Linux.
-- **Watch out**: Any new place keeping a `Node::Fuse` across syscalls must join `in_use`, or its node can be forgotten and answer `ENOTCONN`; an `O_PATH` fd in flight over `SCM_RIGHTS` is not seen; and above the limit with everything in use, every new entry makes the next syscall's end rescan.
-- **Source**: 3957a03
+- **What**: mmap of a FUSE file makes a `Fill` (kernel/mm D40) that reads pages through the mapped file's handle as they are touched, before read and write syscalls for their buffers (`prefault`) and in full with `MAP_POPULATE` (shared mappings of `FOPEN_DIRECT_IO` files are `ENODEV`); nodes count lookups and connections count open handles per node, and above 16384 nodes or on `drop_caches` 2 or 3 a sweep at a syscall's end keeps every node that tasks' roots and cwds, fds (`O_PATH` too), running programs, mounts, inotify watches, open handles and requests in flight use, with their directories, and forgets the oldest leaves (down to 12288, or all with `drop_caches`) through `FUSE_FORGET` or `FUSE_BATCH_FORGET` interleaved with requests as 6.1 does; nodes `drop_caches` finds kept only by a `RELEASE` or `RELEASEDIR` in flight lose their names and wait in `Conn::doomed`, and the sweep after that release's answer forgets those nothing keeps any more that are leaves.
+- **Why**: Without forgetting, the node cache and the daemon's node table grew with every name looked up until unmount, a mapping read its whole range at once, and a closed file's node kept at `drop_caches` only by its release was forgotten late or never, where Linux evicts it once the release lets go.
+- **Tradeoffs**: An unlinked file is not forgotten when it stops being used (Linux forgets it at once), each sweep scans every task and fd table, and the mapped file stays open while mapped, so `FUSE_RELEASE` comes after munmap as on Linux; a doomed node with children waits for them, and a path lookup before its release is answered asks the daemon again, as on Linux once the dentry is gone.
+- **Watch out**: Any new place keeping a `Node::Fuse` across syscalls must join `in_use`, or its node can be forgotten (after `drop_caches` too, through `doomed`) and answer `ENOTCONN`; an `O_PATH` fd in flight over `SCM_RIGHTS` is not seen; and above the limit with everything in use, every new entry makes the next syscall's end rescan.
+- **Source**: 3957a03, dbfce1d
 
 ### D3: A lazily unmounted connection aborts when the VFS collects its last mount
 
@@ -43,3 +43,4 @@
 ## Superseded
 
 - ~~Mappings are copied whole into memfds, so mmap reads the whole mapped range at once, and nodes are never forgotten (D1's tradeoffs, c008749)~~ → replaced by **D2** in 3957a03 (2026-11-09, no SUPERSEDES declared)
+- ~~`drop_caches` leaves nodes kept only by requests in flight to a later sweep (D2 in part, 3957a03)~~ → replaced by **D2** in dbfce1d (2026-11-11)

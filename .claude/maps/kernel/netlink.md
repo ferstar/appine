@@ -1,7 +1,7 @@
 # kernel/netlink Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/netlink.md` for the paired decision history (not yet created; decisions from before the split are D3, D24, D26 and the netlink halves of D19 and D23 in `.claude/decisions/kernel/net.md`).
+> See `.claude/decisions/kernel/netlink.md` for the paired decision history; decisions from before the split are D3, D24, D26 and the netlink halves of D19 and D23 in `.claude/decisions/kernel/net.md`.
 >
 > Verified: 2026-11-11 (split out of the kernel/net full mapping of 2026-11-11; the boundary was checked against the source at the split)
 

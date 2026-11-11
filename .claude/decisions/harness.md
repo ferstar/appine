@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
@@ -89,11 +89,11 @@
 - **Source**: 248d79f
 
 ### D24: CI is split into quick checks, the Android build and nightly full tests
-- **What**: ci.yml runs fmt, clippy and cargo test on every push and pull request that touches more than docs, `.claude`, Markdown or `android/`; android.yml runs when `core/`, `hosts/android/`, `android/`, the Cargo files or the rootfs and Ghostty scripts change, or by hand; full.yml runs the network test, extended lockstep, the Starnix and gVisor builds, the differential tests (after building the release `appine-run` in a step of its own) and the clang engine tests nightly at 02:00 China time when develop has a commit from the last 25 hours, on pushes to master and by hand; the quick workflows cancel a run a newer push supersedes, and the performance probe is dropped.
+- **What**: ci.yml runs fmt, clippy and cargo test on every push and pull request that touches more than docs, `.claude`, Markdown or `android/`; android.yml runs when `core/`, `hosts/android/`, `android/`, the Cargo files or the rootfs and Ghostty scripts change, or by hand; full.yml runs the network test, extended lockstep, the Starnix and gVisor builds, the differential tests (`scripts/difftest -R`, D38, after building the release `appine-run` in a step of its own) and the clang engine tests nightly at 02:00 China time when develop has a commit from the last 25 hours, on pushes to master and by hand; the quick workflows cancel a run a newer push supersedes, and the performance probe is dropped.
 - **Why**: Each of the frequent pushes waited 16 minutes (30 or more with the Starnix and gVisor cases) for suites that rarely change their verdict between two pushes.
 - **Tradeoffs**: Regressions only the differential tests catch show up the next morning, so risky changes need a local difftest or a manual full run; the nightly run uses master's copy of full.yml; a rust-cache miss adds the release build to full.yml; Tier 1's overhead on Neoverse N2 is no longer recorded in CI logs.
-- **Watch out**: GitHub runs scheduled and manual workflows only from the default branch, so a change to full.yml takes effect only once master has it (without 48dce39's build step the differential tests never ran from 0202f1e on), the differential tests' first runs on CI's newer native kernel may show differences colima's 6.8 did not, and a new Android build input outside the path filters goes unbuilt until a run that matches.
-- **Source**: 0202f1e, 48dce39
+- **Watch out**: GitHub runs scheduled workflows only from the default branch, so the nightly run picks up a change to full.yml only once master has it (without 48dce39's build step the differential tests never ran from 0202f1e on), while a `workflow_dispatch` started with `--ref <branch>` runs that branch's copy; CI's newer native kernel answers some cases otherwise than colima's 6.8 (D36); and a new Android build input outside the path filters goes unbuilt until a run that matches.
+- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch)
 
 ### D25: Signals to appine-run go through the guest, so shutdown still runs
 - **What**: `appine-run` catches SIGINT, SIGTERM and SIGHUP with `appine_hal::stop_notifier` (hal D14) and hands them to the kernel's run through `RunOptions::stop` (kernel/process D30): the first is sent on to the program, one at least a second later ends every guest process, and the run then ends as usual.
@@ -159,11 +159,11 @@
 - **Source**: f713148
 
 ### D34: FUSE is compared with native through real daemons and one written in the case
-- **What**: difftest installs fuse3, fuse-overlayfs, sshfs, openssh-sftp-server and rclone into its store; `fuse` drives fuse-overlayfs (I/O, namespace and attribute changes, xattrs, programs run from the mount, mappings read on demand, errors and unmount) and a Python daemon of its own that counts lookups not forgotten after `drop_caches`, and `fuse-tools` mounts sshfs against a local sftp-server as root and through fusermount3, and rclone (kernel/fuse D1).
+- **What**: difftest installs fuse3, fuse-overlayfs, sshfs, openssh-sftp-server and rclone into its store; `fuse` drives fuse-overlayfs (I/O, namespace and attribute changes, xattrs, programs run from the mount, mappings read on demand, errors and unmount) and a Python daemon of its own that counts lookups not forgotten after `drop_caches`, which a `settle` helper polls every 0.1 s for up to 5 s until they equal the counts Linux leaves, and `fuse-tools` mounts sshfs against a local sftp-server as root and through fusermount3, and rclone (kernel/fuse D1).
 - **Why**: FUSE behaviour has to match a real kernel with the daemons people use, and forgets need counts no packaged daemon reports.
-- **Tradeoffs**: The store gains five packages, the native side needs `--device /dev/fuse`, the case writes `drop_caches` on the whole docker VM, and interrupts, oversized requests, notifications and a refused INIT are covered only by unit tests or not at all.
-- **Watch out**: Alpine's sshfs and rclone versions change what the cases see, and the native side's forgets must arrive within the 1 s the case sleeps after `drop_caches`.
-- **Source**: c008749, 3957a03
+- **Tradeoffs**: The store gains five packages, the native side needs `--device /dev/fuse`, the case writes `drop_caches` on the whole docker VM, interrupts, oversized requests, notifications and a refused INIT are covered only by unit tests or not at all, and the counts Linux leaves are written into the case, so a change in which nodes Linux keeps needs the case edited.
+- **Watch out**: Alpine's sshfs and rclone versions change what the cases see, and a forget taking more than 5 s on a loaded runner would still fail the group.
+- **Source**: c008749, 3957a03, 8f50f11
 
 ### D35: The console's password-input query is tested on a real console
 - **What**: `console_tells_password_input` in rootfs_programs.rs expects false on a new console, true after `stty -echo`, false in non-canonical mode and with echo back, and `ENOENT` once the console is closed.
@@ -171,6 +171,34 @@
 - **Tradeoffs**: Skipped without the Alpine rootfs tarball, and runs on Tier 0 only.
 - **Watch out**: It relies on busybox's `stty` and `read` in the Alpine rootfs.
 - **Source**: 2b04a43
+
+### D36: Cases compare only what CI's native kernel and the development VM both answer
+- **What**: Where CI's native side (kernel 7.x, SVE and AArch32 at EL0, 1 MiB `rmem_default` and `rmem_max`, `fs.suid_dumpable` 2, docker's stack limit, overlayfs defaulting to `redirect_dir=on`) answers otherwise than colima's 6.8, cases compare relations (buffer bounds, the dumpable flag against `fs.suid_dumpable`) or name 6.1's options (`redirect_dir=follow`), checks newer kernels answer otherwise move to `tests/guest/linux61.c`, which `rootfs_programs` runs on both tiers (D11), and about 170 suite test instances are skipped under their cause.
+- **Why**: full.yml's differential tests failed every run from 2026-11-09, mostly because CI's native side answered differently, not Appine.
+- **Tradeoffs**: The skipped suite tests compare nothing now (eight of the syslog ones comparable on both sides), and 6.1's answers are checked only in Appine and natively on 6.8, not on CI's kernel.
+- **Watch out**: The runner image can change its kernel or settings again, the namespaces timeout may be a real pid-namespace teardown race, and the one-off CI failures of namespaces and netmap are recorded as known flaky tests in `docs/milestones.md`.
+- **Source**: ba6200f
+
+### D37: CI saves the suite caches by themselves and uploads the differential tests' diagnostics
+- **What**: full.yml restores each suite build's cache before it and saves it as soon as a missed build finishes (actions/cache/restore and save), samples vmstat every 10 s during the differential tests (stopped by a trap however the step ends), and uploads every case's `.appine.err`, the failed cases' outputs and the samples as the `difftest` artifact whatever the result, removing the store in a later step.
+- **Why**: actions/cache saved only when the whole job succeeded, so the Starnix and gVisor builds ran on every failing run, and stalls seen only on CI cost 23–35 minutes a run with nothing kept to show why.
+- **Tradeoffs**: Every run uploads an artifact, and parallel lanes stay off on CI, since four lanes made timing-sensitive cases flaky on the development VM.
+- **Watch out**: A stall that holds no BKL leaves no watchdog report, only vmstat's view of the runner.
+- **Source**: 4b5f458
+
+### D38: `difftest -R` reruns failed groups once and passes those that pass as flaky
+- **What**: `-R` collects the failed groups (from the single-lane loop, the lanes' report lines and lanes that never reported) and reruns each once, alone on the main store after all the others; one that passes prints `flaky <name>`, counted in the summary and not failed, one that fails again prints its second report too, the first failure's outputs stay in `target/difftest/failed/` for full.yml's upload (D37), and full.yml runs `scripts/difftest -R`.
+- **Why**: On CI's one lane a single group failing only sometimes failed the whole 30-minute run, and telling it from a regression meant starting another run by hand.
+- **Tradeoffs**: A regression that fails only some of the time passes CI as flaky, with the `flaky` lines and the uploaded first outputs as its only trace, and each failure costs one more run of its group.
+- **Watch out**: Flaky reports need reading or intermittent Appine bugs go unnoticed (the FUSE forget failure, kernel/fuse D2, was one), and a group whose first failure leaves state in the shared store can fail its retry for that alone.
+- **Source**: 4083007
+
+### D39: The gtest runner dumps a hung test's threads with their syscalls
+- **What**: `tests/diff/gtest/run.sh` (D19) writes each test's name to `/tmp/gtest.cur` with the builtin echo and runs it in the foreground; a background watcher checking every 5 s writes a test seen for 45 s to `hang.out`, one `hang:` line per thread of its process tree (the processes whose command line has `--gtest_filter=<test> ` and their descendants) with pid, tid, name, state and its `syscall` file (kernel/procfs D40), and the main loop prints those lines after the test's line only when it exited 137 and `hang.out` names it.
+- **Why**: CI's hangs left only `exit 137`, and a dump taken while the test still hangs shows which syscall each of its threads waits in.
+- **Tradeoffs**: One sleep and one date every 5 s for the whole run, a test can see one more process in the system, and on the native side Yama makes most `syscall` files unreadable (the watcher is no ancestor), so only Appine's dumps are useful.
+- **Watch out**: A test that kills its process group or every process stops the watcher for the rest of the run, and a dump finishing just after its test ended leaves a stale `hang.out` that only the name check keeps from the next test.
+- **Source**: f1212d8
 
 ## Superseded
 
@@ -182,3 +210,5 @@
 - ~~difftest's lock as a directory holding a pid file, checked with `kill -0` (3c6bf5e)~~ → replaced by **D29** in 300d384 (2026-11-10)
 - ~~`stale.c` reproduces the stale deadline through an unmapped timeout and prints only the later 3 s wait (9593bae)~~ → replaced by **D13** in 27609fe (2026-11-10, no SUPERSEDES declared)
 - ~~CI caches `target/ghostty` and `~/.cache/zig` by fetch-ghostty's hash (D10, b38d29c)~~ → replaced by **D10** in 172be7c (2026-11-11)
+- ~~Manual full.yml runs also use master's copy (D24's watch-out, 0202f1e, 48dce39)~~ → replaced by **D24** in 4083007 (2026-11-11)
+- ~~The native side's forgets must arrive within the 1 s the case sleeps after `drop_caches` (D34's watch-out, 3957a03)~~ → replaced by **D34** in 8f50f11 (2026-11-11)

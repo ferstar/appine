@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: hal"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D7 were seeded by hand from the design doc §3 and
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D7 were seeded by hand from the design doc §3 and
 > the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Active
@@ -132,6 +132,13 @@
 - **Tradeoffs**: The pages copied into them take the app's memory.
 - **Watch out**: None known.
 - **Source**: c008749
+
+### D20: Socket options whose optlen is not a byte count get calls of their own
+- **What**: `net::get_filter(fd, count)` allocates count × 8 bytes, passes count as optlen and returns the program's count with the instructions copied (none when count is 0), while `getsockopt` keeps reading optlen as bytes (kernel/net D27).
+- **Why**: `getsockopt` sized its buffer by optlen read as bytes, which `SO_GET_FILTER`'s count of instructions broke.
+- **Tradeoffs**: One function per such option.
+- **Watch out**: The Android build takes `SO_GET_FILTER` from bionic's libc and is checked only by CI.
+- **Source**: c65da9d
 
 ## Superseded
 

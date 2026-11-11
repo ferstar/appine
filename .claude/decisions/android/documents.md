@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -74,6 +74,13 @@
 - **Tradeoffs**: Transient grants, given for an activity, cannot be listed and last until that activity ends (map debt).
 - **Watch out**: A failing `getOutgoingPersistedUriPermissions` counts as no grants, and revoking the provider's own URIs relies on the framework's documented behaviour, not exercised end to end.
 - **Source**: 3f761df
+
+### D11: The provider reads the login and whole-system root settings through `Settings`
+- **What**: `Documents` calls `Settings.login` and `Settings.systemDocuments` (android/service D23) instead of TerminalService's static functions.
+- **Why**: Those statics moved to `Settings` when notifications and settings left the service.
+- **Tradeoffs**: None beyond one more class the provider names.
+- **Watch out**: None known; the keys and defaults are unchanged.
+- **Source**: 0553229
 
 ## Superseded
 

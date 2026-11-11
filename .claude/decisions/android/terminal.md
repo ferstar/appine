@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -42,18 +42,18 @@
 ## Active (full detail)
 
 ### D4: The terminal screen is a module of its own; the sessions and the view are android/vt's and android/vtview's
-- **What**: android/terminal holds `MainActivity`, `TabBarView`, `SearchBarView`, `ProgressLine`, `ExtraKeysView`, `LicensesActivity` and `res/` (tabs, the tab bar, shortcuts, the search bar, the extra keys, insets and the IME's animation, the progress line, opening links, the clipboard question, the app's strings and themes, the licence screen), while the sessions, consoles and the vt.c/vt.rs shim are android/vt's, the view, glyphs, keys and terminal font android/vtview's, and building libghostty-vt android/native's.
+- **What**: android/terminal holds `MainActivity`, `TabBarView`, `TabNumber`, `SearchBarView`, `ProgressLine`, `ExtraKeysView`, `LicensesActivity`, the shared view helpers in `Ui.kt` and `res/` (tabs, the tab bar, shortcuts, the search bar, the extra keys, insets and the IME's animation, the progress line, opening links, the clipboard question, the app's strings and themes, the licence screen), while the sessions, consoles and the vt.c/vt.rs shim are android/vt's, the view, glyphs, keys and terminal font android/vtview's, and building libghostty-vt android/native's.
 - **Why**: §11.5 of the retired design doc needed a map and the app was split into modules by responsibility, and by 2026-11-11 the terminal map (133 KB) could not be read in one Read while most terminal commits touch only the screen, the sessions or the view.
 - **Tradeoffs**: A feature spanning the screen and the terminal (search, links, the clipboard question, progress) is described in two or three maps that point at each other's sections, and decisions made before the split keep their android/terminal tags here (listed in the android/vt and android/vtview preambles).
 - **Watch out**: The map records no confirmed bugs; its open questions include a nearly full background progress bar looking like the current tab's indicator, clipboard reads from background tabs or left open by a recreation, and whether Ctrl+Shift+W should ask before closing a running shell.
-- **Source**: 12c4afa, d42013d (file list since updated by 394aecf, 6ffb912, b38d29c and d965886; map fully refreshed in d9e1f0c; debts since closed by 22c8ab0, ddbfb9b, 3f45ad0, 600700b and e12f560)
+- **Source**: 12c4afa, d42013d (file list since updated by 394aecf, 6ffb912, b38d29c, d965886 and 4311150; map fully refreshed in d9e1f0c; debts since closed by 22c8ab0, ddbfb9b, 3f45ad0, 600700b and e12f560)
 
 ### D5: Terminal state lives in libghostty-vt inside the native library, drawn by Appine's own view
 - **What**: Each tab has one libghostty-vt 1.0.0 terminal in the native library, fed straight from the kernel console by a pump thread that writes the terminal's replies back and asks for one frame of dirty rows per burst; `VtView` mirrors the frames onto an integer cell grid in JetBrains Mono (glyphs scaled evenly, never stretched, with wide cells filled as in D9; box drawing, blocks and Powerline triangles as shapes; ligatures off), keys go through libghostty-vt's encoder, grapheme clustering (mode 2027) is on and synchronized output holds the screen for at most 1 s.
 - **Why**: The Termux view flattened CJK (horizontal-only scaling to the cell), broke box-drawing lines between rows, showed Powerline symbols as boxes and split emoji sequences; Ghostty's full renderer targets macOS and GTK, while libghostty-vt is a plain C library for the terminal state, released on its own with a stable C ABI since 1.0.
 - **Tradeoffs**: CJK glyphs still come from the system fallback fonts; programs that count widths per codepoint disagree with mode 2027 on emoji sequences; the 1.0 port made a line drag take in blank rows and gave terminals DECIC, DECDC, DECBI and DECFI.
-- **Watch out**: The frame format (vt.c and `VtView`) and the key numbers (`VtKeys`, from libghostty-vt's header, which its stable ABI keeps) must change together with their counterparts, and `void *` get and set values are not type checked, so each upgrade must check every key's documented type.
-- **Source**: 394aecf; 0478dd5; 172be7c
+- **Watch out**: The frame format (vt.c and `VtFrame`, android/vtview D3) and the key numbers (`VtKeys`, from libghostty-vt's header, which its stable ABI keeps) must change together with their counterparts, and `void *` get and set values are not type checked, so each upgrade must check every key's documented type.
+- **Source**: 394aecf; 0478dd5; 172be7c; 49e8b08 (the frame's reader moved to `VtFrame`)
 
 ### D7: Selection, paste, mouse and focus go through libghostty-vt
 - **What**: Under the tab's lock, vt.c keeps the selection as the terminal's own (started by a long press or a double or triple tap through libghostty-vt's selection gesture, D40, extended by drags and handles and autoscrolled beyond the grid), pastes through `ghostty_terminal_paste` (asking with a preview when it returns REJECTED), and encodes mouse clicks and wheel, alternate-scroll arrows (mode 1007) and focus (mode 1004); frame and row headers carry the selection for `VtView`'s highlight and handles, keys add releases and lone modifiers for the Kitty protocol, and the IME turns a lone newline into Enter and a multi-line commit into a paste.
@@ -87,15 +87,15 @@
 - **What**: vt.c writes libghostty-vt's scroll bar state (total, offset, length) into the frame header, which `VtView` returns from `computeVerticalScroll*` for View's own fading scroll bar in the theme's thumb, awakened when the view moves the viewport but not on output; a fling runs an `OverScroller` in `computeScroll` through the same paths as a drag (the viewport to either end, or at most a screen of wheel events or arrow keys), and a touch, other input, focus loss or another tab stops it, the tap that stops one doing nothing else.
 - **Why**: Nothing showed where the viewport was in up to 10,000 lines of scrollback, and a fling ended as soon as the finger lifted.
 - **Tradeoffs**: The tap that stops a fling neither opens the keyboard nor clicks; the bar flashes whenever the window becomes visible and covers the last column while shown; Alpine's busybox less stays on the primary screen, so flinging in it scrolls the scrollback.
-- **Watch out**: The frame format changed on both sides (vt.c and `VtView.apply`) and must keep changing together (D5); flings were tried only with adb swipes on an API 34 emulator, and flings sent as wheel events to a mouse-tracking program are untested.
-- **Source**: c7e849d (the header has grown since)
+- **Watch out**: The frame format changed on both sides (vt.c and `VtFrame`) and must keep changing together (D5); flings were tried only with adb swipes on an API 34 emulator, and flings sent as wheel events to a mouse-tracking program are untested.
+- **Source**: c7e849d (the header has grown since); 49e8b08 (read by `VtFrame`)
 
 ### D32: Kitty graphics are drawn from direct transmissions; the Glyph Protocol stays off
 - **What**: Each screen stores up to 32 MiB of Kitty images sent by direct transmission (file, temporary-file and shared-memory media answer `EINVAL`, since they would name the host's files), PNG is decoded with the Wuffs libghostty-vt.a contains, frames carry a 64-byte image header and 56-byte placements sorted as Ghostty sorts them with a virtual placement's rows joined, and `VtView` keeps one Bitmap per shown image by generation, painting the three layers into each row with bilinear filtering; the Glyph Protocol stays off, and the libghostty-vt features still unwired (OSC 7, the two-phase render update) are listed in the map.
 - **Why**: Programs that show images (chafa, yazi, timg, `kitten icat`) fell back to text though libghostty-vt stores Kitty images and its render state says where to draw them, while registered glyphs cannot be drawn through the C API, so advertising the Glyph Protocol would bring glyphs that never appear.
 - **Tradeoffs**: The shown tab's images take memory twice (the library's and the Bitmaps; the view drops its copies while hidden, android/vtview D2, and background tabs lose theirs only under memory pressure, android/vt D3); any image change repaints every row; placeholder rows partly in the viewport keep the rounding of their first visible source row; chafa's own detection still picks symbols.
-- **Watch out**: Decoding a large PNG holds the tab's lock on the pump thread; the frame format, vt.rs's FFI and `VtView.apply` must change together; tried only on a 4 KB-page API 34 emulator and macOS, not with yazi, timg, `kitten icat`, tmux placeholders, real devices or a full 32 MiB store.
-- **Source**: fcf4c93, c510bee; d89b5fa; 8811c32
+- **Watch out**: Decoding a large PNG holds the tab's lock on the pump thread; the frame format, vt.rs's FFI and `VtFrame` must change together; tried only on a 4 KB-page API 34 emulator and macOS, not with yazi, timg, `kitten icat`, tmux placeholders, real devices or a full 32 MiB store.
+- **Source**: fcf4c93, c510bee; d89b5fa; 8811c32; 49e8b08 (read by `VtFrame`)
 
 ### D36: Bells, OSC 52 clipboard writes and reads, OSC 9/777 notifications and cursor blinking are wired
 - **What**: vt.c records effects during `feed` (a bell count, the last clipboard write as text/plain up to 256 KiB or a clear, the last notification's title and body up to 4 KiB, and OSC 52 reads, found by stopping at OSC boundaries), the pump takes them after each read (`appine_vt_take_effects`) and calls `VtSession.onBell`, `onClipboard`, `onNotification` and the clipboard-read path (routed by android/service D19), a read from the tab in front is asked about in `MainActivity` and answered through the tab's writer in Ghostty's form (empty when denied), `VtView.bell` vibrates with the REJECT haptic at most every 100 ms, the cursor blinks every 500 ms while the terminal's cursor blinks (D47) and the view and window have focus, and `MainActivity` shows the tab a notification names (`EXTRA_TAB`) once bound.
@@ -129,8 +129,8 @@
 - **What**: `SearchBarView` stands in for `TabBarView` (Find in ⋮ or Ctrl+Shift+F; Enter or ↑ for older, Shift+Enter or ↓ for newer, nothing selected until a step; Back, ×, Esc or another tab closing it, the last text kept); vt.c drives one `GhosttySearch` from `appine_vt_frame` for at most 4 ms per frame, marks the viewport's matches in cell attribute bits 14–15 with the count in the header and steps back to the selected match's place after a resize, and `appine_vt_search_rows` gives the matches' rows for 2 dp marks under the scroll bar's thumb, taken again when the count or the selected match changes or every 500 ms while frames change.
 - **Why**: There was no way to find text in the scrollback, though libghostty-vt searches the screen and scrollback and lists every match.
 - **Tradeoffs**: The tab bar is hidden while searching, so tabs switch only with Ctrl+Tab, which ends the search; the extra keys still type into the terminal; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
-- **Watch out**: The frame format changes in vt.c and `VtView.apply` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device.
-- **Source**: ddbfb9b, 48982fe
+- **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device.
+- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`)
 
 ### D42: Idle tabs' scrollback is compressed, and all of it on a memory trim
 - **What**: Releasing vt.rs's `TermGuard` asks vt.c (`appine_vt_compress_wanted`) whether the activity token changed or a read restored pages and then schedules the tab on the `vt-compress` thread, which waits 250 ms per change (at most 5 s from scheduling, `COMPRESS_MAX_WAIT`) and runs incremental steps 1 ms apart under the tab's lock; `appine_vt_transcript` returns NULL while `transcribed`, so `VtSession` keeps its last transcript, and `VtNative.compressAll` runs a full pass on every tab when the service trims (android/service D4).
@@ -194,6 +194,20 @@
 - **Tradeoffs**: A display size change drops open dialogs, the search bar and the extra keys' modifiers and page, as a locale or font scale change already did, and an old pixel size is taken at the density in force at the first launch after the update.
 - **Watch out**: An open clipboard question lost to a recreation leaves that tab's reads unanswered (open in the map), and Back on Android 11 was not tried on a device.
 - **Source**: e12f560
+
+### D51: `TabNumber` has a file of its own, and the screens share their view helpers from `Ui.kt`
+- **What**: `TabNumber.kt` holds the tab number view as an internal top-level class with its roll timing and blur constants, reading `TabBarView.STANDARD`'s easing through its companion, and `Ui.kt` gives `Context` and `View` the extensions `dp`, `themeColor`, `themeDrawable` and `touchFeedback`, replacing the private copies.
+- **Why**: `TabBarView.kt` held a second view class, and `dp`, `themeColor` and `touchFeedback` were copied into `MainActivity`, `LicensesActivity`, `TabBarView`, `SearchBarView` and `ExtraKeysView` (VtView had its own `themeDrawable`).
+- **Tradeoffs**: The helpers are package-wide names rather than private members, and a View's `dp` reads the density from resources on each call rather than from a cached field.
+- **Watch out**: A member named `dp` or `themeColor` in one of these classes would silently shadow the shared extension.
+- **Source**: 4311150
+
+### D52: `MainActivity` reads the wide-cell setting through `Settings`
+- **What**: `onStart` and `onSettingsChanged` call `Settings.fillWide` (android/service D11 and D23) for `VtView.setFillWide` (D9).
+- **Why**: The static `TerminalService.fillWide` moved to `Settings`.
+- **Tradeoffs**: None beyond one more class the activity names.
+- **Watch out**: None known; it is still read before the service is bound.
+- **Source**: 0553229
 
 ## Superseded
 

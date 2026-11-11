@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/signal"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D11 were seeded by hand from the retired design
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D11 were seeded by hand from the retired design
 > doc §7 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -189,6 +189,13 @@
 - **Tradeoffs**: None known.
 - **Watch out**: A guest relying on threads sharing one set of credentials for signal permission sees per-thread results, as on Linux.
 - **Source**: 1be1142
+
+### D27: Delivery after a syscall forgets it, as Linux's `forget_syscall`
+- **What**: `deliver`, after the restart rewind of a syscall's return, calls `KernelEntry::forget_syscall` (kernel/process D55) with the possibly rewound pc, so a thread stopped by `SIGSTOP` in a syscall shows -1 with its sp and the restart pc in `/proc/<pid>/syscall` (kernel/procfs D40).
+- **Why**: Linux's do_signal forgets the syscall before taking a signal, while Appine showed the syscall the thread had been in.
+- **Tradeoffs**: Every BKL-path syscall pays the record's stores once more, and the difference shows only while the thread waits inside `deliver` (stops, and ptrace stops after this point).
+- **Watch out**: A ptrace stop placed later in `deliver` shows -1 where Linux might still show the syscall.
+- **Source**: f1212d8
 
 ## Superseded
 

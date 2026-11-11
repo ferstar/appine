@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -39,8 +39,8 @@
 - **What**: android/native holds `hosts/android` (except the vt.c/vt.rs terminal shim), `Native.kt`, the Gradle files, the manifest, the debug and instrumentation-test sources, `android/licenses` and the `fetch-ghostty` and `release-sources` scripts.
 - **Why**: JNI, Gradle and the manifest had no map (§11 only touched on them), and `scripts/release-sources` fit neither harness nor android/setup, since it packages the sources the APK release must ship.
 - **Tradeoffs**: `MachineTest` exercises every android module but is filed here; the module grew from the bridge and build to release packaging.
-- **Watch out**: The full refresh d9e1f0c recorded open debts: the release build is signed with the debug key, unminified and versioned 1 / 0.0.0, lib.rs's array loops never delete local references, and the release source bundles have gaps (D4) that matter for AGPL compliance once the APK ships; both risks recorded at the first mapping are fixed (D1, D15).
-- **Source**: 12c4afa, 16ac7a2; d9e1f0c (bug list)
+- **Watch out**: The full refresh d9e1f0c recorded open debts: the release build is signed with the debug key and unminified, lib.rs's array loops never delete local references, and the release source bundles have gaps (D4) that matter for AGPL compliance once the APK ships; both risks recorded at the first mapping are fixed (D1, D15).
+- **Source**: 12c4afa, 16ac7a2; d9e1f0c (bug list); ef7a803 (versionName 1.0.0, unrecorded)
 
 ### D6: libghostty-vt 1.0.0 is built offline with Zig into every Android library and shipped with its notices and sources
 - **What**: `scripts/fetch-ghostty` downloads libghostty-vt-1.0.0.tar.gz and its `-deps` tarball with pinned sha256s and runs no Zig; for Android targets build.rs runs `zig build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast --system <src>-deps` (Zig 0.17.0) with a global cache of its own in the source (`.zig-global-cache`), adds the Wuffs C directory found by pkg/wuffs's `build.zig.zon` hash to vt.c's include path, and links libghostty-vt.a, vt.c and the system's libjnigraphics into libappine.so; the notices list libghostty-vt 1.0.0, uucode (with the Unicode and Hoehrmann licences), simdutf, Highway, Wuffs, translate-c 2.0.0, Zig's compiler_rt and JetBrains Mono from copies in `android/licenses`.
@@ -50,11 +50,11 @@
 - **Source**: 394aecf, b38d29c, 8811c32, 172be7c
 
 ### D7: Material Components is a direct dependency, with its licences allow-listed
-- **What**: `com.google.android.material:material:1.14.0` is declared inline like androidx.core, and NoticesTask's Apache groups gain `com.google.android.material` and `com.google.errorprone:error_prone_annotations`, both POMs checked.
+- **What**: `com.google.android.material:material:1.14.0` is declared in the version catalog (`android/gradle/libs.versions.toml`, D20) like androidx.core, and NoticesTask's Apache groups gain `com.google.android.material` and `com.google.errorprone:error_prone_annotations`, both POMs checked.
 - **Why**: The Material 3 restyle needs Material Components on the classpath, and NoticesTask fails the build for any Android library outside the groups known to be Apache-2.0.
-- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout are used but arrive only through Material, and versions are still bumped by hand.
+- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout are used but arrive only through Material (noted only in the map since the catalog), and versions are still bumped by hand.
 - **Watch out**: A Material upgrade can bring a library outside the known groups, which stops the build until its licence is checked (as intended), and the APK's growth was not measured.
-- **Source**: 55be399
+- **Source**: 55be399; ef7a803 (catalog)
 
 ### D8: Instrumentation tests cover oversized downloads, homeless accounts and repeated reads of saved tabs
 - **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test (its tabs built without names since 7c35183) reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
@@ -140,6 +140,13 @@
 - **Watch out**: The test reads the app's store, so run alone with `am instrument` it needs the app stopped first to free the store lock.
 - **Source**: 6c5f921, 2b04a43
 
+### D20: The app's build script stays one file, configuration first, with a libraries-only version catalog
+- **What**: `android/app/build.gradle.kts` puts its configuration (plugins, inputs, android, kotlin, dependencies, task wiring) before its task classes, finds the rootfs tarball and the doas package through `newestFetched` (D12), and gives `CargoNdkTask` and `NoticesTask` an abstract `CargoTask` base, while `android/gradle/libs.versions.toml` holds the libraries' versions and AGP's stays in `android/build.gradle.kts`.
+- **Why**: The script had grown to about 600 lines with its configuration split around the task classes, and the library versions were written inline.
+- **Tradeoffs**: The script is still long, its task classes stay untestable outside a build, and AGP's version sits apart from the catalog.
+- **Watch out**: A task class in a script must not use the script's top-level members or Gradle cannot instantiate it, so code tasks share goes through a base class like `CargoTask`.
+- **Source**: ef7a803
+
 ## Superseded
 
 - ~~A `vt` cargo feature behind the `appine.vt` Gradle property, debug only and off by default, probed by `VtNative.available` (394aecf)~~ → replaced by **D6** in b38d29c (2026-11-04)
@@ -147,3 +154,4 @@
 - ~~minSdk 29 (D3 in part, round 07)~~ → replaced by **D3** in 0709982 (2026-11-07)
 - ~~The Ghostty 1.4.0 source with the Zig packages fetched by a configure run and proxy variables removed (D6, 394aecf, b38d29c), and released sources bundling the Ghostty release with its zig-pkg bundle (D4, b38d29c)~~ → replaced by **D6** and **D4** in 172be7c (2026-11-11)
 - ~~build.rs passes the Ghostty source directory's name as `APPINE_GHOSTTY` for the snapshot version (600700b)~~ → replaced by android/terminal **D44** in 172be7c (2026-11-11, recorded under android/terminal)
+- ~~Material Components and androidx.core declared inline in build.gradle.kts (D7 in part, 55be399)~~ → replaced by **D7** and **D20** in ef7a803 (2026-11-11)
