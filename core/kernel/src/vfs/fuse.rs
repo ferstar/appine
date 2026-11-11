@@ -482,6 +482,10 @@ pub(crate) struct Conn {
     forget_batch: i32,
     /// Open handles of each node id ([`Handle`]): such nodes are never forgotten.
     opens: HashMap<u64, u32>,
+    /// Node ids `drop_caches` kept only for a release in flight: each is forgotten once the
+    /// daemon has answered it ([`Fuses::evict`]), as Linux evicts the inode then (the release
+    /// holds the last reference to it, its dentry gone, and FUSE keeps no unused inode).
+    doomed: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +573,7 @@ impl Conn {
             forgets: VecDeque::new(),
             forget_batch: 16,
             opens: HashMap::new(),
+            doomed: HashSet::new(),
         }
     }
 
@@ -726,6 +731,29 @@ impl Conn {
             }
         }
         ids
+    }
+
+    /// The node ids of the releases still unanswered that no other request is about.
+    fn releasing_only(&self) -> HashSet<u64> {
+        let mut releasing = HashSet::new();
+        let mut others = HashSet::new();
+        for r in self.requests.values() {
+            let m = &r.message;
+            let opcode = u32::from_le_bytes(m[4..8].try_into().unwrap());
+            let nodeid = u64::from_le_bytes(m[16..24].try_into().unwrap());
+            if matches!(opcode, op::RELEASE | op::RELEASEDIR) {
+                releasing.insert(nodeid);
+            } else {
+                others.insert(nodeid);
+                if matches!(opcode, op::RENAME | op::RENAME2 | op::LINK) && m.len() >= IN_HEADER + 8
+                {
+                    others.insert(u64::from_le_bytes(
+                        m[IN_HEADER..IN_HEADER + 8].try_into().unwrap(),
+                    ));
+                }
+            }
+        }
+        &releasing - &others
     }
 
     /// The error a new request gets before it is queued: ENOTCONN once aborted, ECONNREFUSED
@@ -1225,7 +1253,14 @@ pub(crate) fn dev_write(
         };
     }
     if background {
-        c.requests.remove(&unique);
+        // A release drop_caches waited for: its node goes at the end of this syscall
+        if let Some(r) = c.requests.remove(&unique)
+            && matches!(opcode, op::RELEASE | op::RELEASEDIR)
+            && c.doomed
+                .contains(&u64::from_le_bytes(r.message[16..24].try_into().unwrap()))
+        {
+            SWEEP.store(true, Ordering::Relaxed);
+        }
         if opcode == op::INIT {
             init_reply(&mut c, reply);
             drop(c);
@@ -1475,8 +1510,13 @@ impl Fuses {
         let id = match known {
             Some(id) => {
                 // The lookup counts even when the entry is refused (the inode stays cached on
-                // Linux, to be forgotten later)
+                // Linux, to be forgotten later), and a new name saves a doomed node
                 self.nodes.get_mut(&id).unwrap().nlookup += 1;
+                if let Some(c) = self.conns.get(&dev)
+                    && let Ok(mut c) = c.try_borrow_mut()
+                {
+                    c.doomed.remove(&e.nodeid);
+                }
                 if self.nodes[&id].kind() == mode::S_IFDIR && self.is_within(dir, id) {
                     return Err(Errno::ELOOP);
                 }
@@ -1535,25 +1575,50 @@ impl Fuses {
     /// directories any of these or any remaining node lies in. With `all` (`drop_caches`) every
     /// other node goes; otherwise only when the cache holds more than [`NODES_MAX`], the least
     /// recently entered first, down to 3/4 of it. Entries naming forgotten nodes go too, and so do
-    /// negative entries no longer valid.
+    /// negative entries no longer valid. A node `all` keeps only for a release in flight loses its
+    /// names and is doomed ([`Conn::doomed`]): it goes in the first sweep after nothing keeps it.
     pub fn evict(&mut self, keep: &HashSet<FuseId>, all: bool) -> usize {
         let target = if all { 0 } else { NODES_MAX / 4 * 3 };
-        if self.nodes.len() <= target {
+        let mut doomed = HashSet::new();
+        for c in self.conns.values() {
+            let Ok(mut c) = c.try_borrow_mut() else {
+                return 0;
+            };
+            let dev = c.dev;
+            // A doomed node forgotten some other way leaves the set
+            c.doomed.retain(|nodeid| {
+                let id = self.by_nodeid.get(&(dev, *nodeid)).copied();
+                if let Some(id) = id {
+                    doomed.insert(id);
+                }
+                id.is_some()
+            });
+        }
+        if self.nodes.len() <= target && doomed.is_empty() {
             return 0;
         }
         let mut kept = keep.clone();
+        // What only a release in flight keeps: the file was closed and the daemon has yet to
+        // answer its release
+        let mut releasing = HashSet::new();
         for c in self.conns.values() {
-            let Ok(c) = c.try_borrow() else {
-                return 0;
-            };
+            let c = c.borrow();
             let busy = c.busy_nodeids();
+            let only = c.releasing_only();
             for (&id, n) in &self.nodes {
-                if n.dev == c.dev
-                    && (n.nodeid == ROOT_ID
-                        || c.opens.get(&n.nodeid).is_some_and(|&k| k > 0)
-                        || busy.contains(&n.nodeid))
-                {
+                if n.dev != c.dev {
+                    continue;
+                }
+                let open = c.opens.get(&n.nodeid).is_some_and(|&k| k > 0);
+                if n.nodeid == ROOT_ID || open || busy.contains(&n.nodeid) {
                     kept.insert(id);
+                    if n.nodeid != ROOT_ID
+                        && !open
+                        && only.contains(&n.nodeid)
+                        && !keep.contains(&id)
+                    {
+                        releasing.insert(id);
+                    }
                 }
             }
         }
@@ -1568,14 +1633,17 @@ impl Fuses {
             }
         }
         let mut gone: HashSet<FuseId> = HashSet::new();
+        // Doomed nodes nothing keeps any more go now; one that other nodes lie in waits for them
+        let parents = self.parents();
+        for id in doomed {
+            if !kept.contains(&id) && !parents.contains(&id) {
+                self.forget_node(id);
+                gone.insert(id);
+            }
+        }
         // Leaves first, oldest first; a directory whose last node went is a leaf the next round
         while self.nodes.len() > target {
-            let parents: HashSet<FuseId> = self
-                .nodes
-                .iter()
-                .filter(|(id, n)| n.parent != **id)
-                .map(|(_, n)| n.parent)
-                .collect();
+            let parents = self.parents();
             let mut leaves: Vec<(u64, FuseId)> = self
                 .nodes
                 .iter()
@@ -1588,19 +1656,25 @@ impl Fuses {
             leaves.sort_unstable();
             leaves.truncate(self.nodes.len() - target);
             for (_, id) in leaves {
-                let n = self.nodes.remove(&id).unwrap();
-                if self.by_nodeid.get(&(n.dev, n.nodeid)) == Some(&id) {
-                    self.by_nodeid.remove(&(n.dev, n.nodeid));
-                }
-                if n.nlookup > 0
-                    && let Some(c) = self.conns.get(&n.dev)
-                {
-                    let mut c = c.borrow_mut();
-                    if !c.aborted {
-                        c.forgets.push_back((n.nodeid, n.nlookup));
-                    }
-                }
+                self.forget_node(id);
                 gone.insert(id);
+            }
+        }
+        // Linux has dropped the dentries of what only a release keeps, and evicts the inode when
+        // the release ends (FUSE keeps no unused inode, generic_delete_inode): such a node loses
+        // its names, so a walk looks it up again (which saves it), and is doomed
+        if all {
+            for id in releasing {
+                let Some(n) = self.nodes.get(&id) else {
+                    continue;
+                };
+                let (dev, nodeid, parent) = (n.dev, n.nodeid, n.parent);
+                if let Some(p) = self.nodes.get_mut(&parent) {
+                    p.children.retain(|_, (child, _, _)| *child != Some(id));
+                }
+                if let Some(c) = self.conns.get(&dev) {
+                    c.borrow_mut().doomed.insert(nodeid);
+                }
             }
         }
         for n in self.nodes.values_mut() {
@@ -1615,6 +1689,31 @@ impl Fuses {
             }
         }
         gone.len()
+    }
+
+    /// The nodes other nodes lie in.
+    fn parents(&self) -> HashSet<FuseId> {
+        self.nodes
+            .iter()
+            .filter(|(id, n)| n.parent != **id)
+            .map(|(_, n)| n.parent)
+            .collect()
+    }
+
+    /// Forgets node `id` ([`Fuses::evict`]): it leaves the table, the node-id index and the doomed,
+    /// and its lookups are queued as a forget.
+    fn forget_node(&mut self, id: FuseId) {
+        let n = self.nodes.remove(&id).unwrap();
+        if self.by_nodeid.get(&(n.dev, n.nodeid)) == Some(&id) {
+            self.by_nodeid.remove(&(n.dev, n.nodeid));
+        }
+        if let Some(c) = self.conns.get(&n.dev) {
+            let mut c = c.borrow_mut();
+            c.doomed.remove(&n.nodeid);
+            if n.nlookup > 0 && !c.aborted {
+                c.forgets.push_back((n.nodeid, n.nlookup));
+            }
+        }
     }
 
     /// Whether node `id` is `top` or below it, by following parents up to a root (whose parent
@@ -2593,5 +2692,55 @@ mod tests {
         assert_eq!(&m[..8], &[48, 0, 0, 0, op::FORGET as u8, 0, 0, 0]);
         assert_eq!(&m[16..24], &3u64.to_le_bytes());
         assert_eq!(&m[40..48], &1u64.to_le_bytes());
+    }
+
+    #[test]
+    fn a_node_dropping_caches_kept_for_its_release_goes_when_the_release_ends() {
+        new_syscall();
+        let mut f = Fuses::default();
+        let c = Rc::new(RefCell::new(conn(Options::default())));
+        c.borrow_mut().minor = 37;
+        let root = f.add(c.clone());
+        let entry = |nodeid| Entry {
+            nodeid,
+            attr: Attr {
+                ino: nodeid,
+                mode: mode::S_IFREG,
+                nlink: 1,
+                ..Attr::default()
+            },
+            entry_until: None,
+            attr_until: None,
+        };
+        let a = f.enter(root, b"a", &entry(3)).unwrap();
+        let b = f.enter(root, b"b", &entry(4)).unwrap();
+        // Both closed, their releases not yet answered: dropping caches keeps them but drops
+        // their names
+        let release = |c: &Rc<RefCell<Conn>>, nodeid| {
+            c.borrow_mut()
+                .queue(op::RELEASE, nodeid, None, &[0; 24], (true, false))
+        };
+        let ra = release(&c, 3);
+        release(&c, 4);
+        assert_eq!(f.evict(&HashSet::new(), true), 0);
+        assert!(f.get(a).is_some() && f.get(b).is_some());
+        assert_eq!(f.cached_child(root, b"a"), None);
+        assert_eq!(c.borrow().doomed, HashSet::from([3, 4]));
+        // Looked up again before its release ends, b is saved
+        assert_eq!(f.enter(root, b"b", &entry(4)), Ok(b));
+        assert_eq!(c.borrow().doomed, HashSet::from([3]));
+        // a goes at the first sweep after its release is answered, without dropping caches
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        c.borrow_mut().requests.remove(&ra);
+        assert_eq!(f.evict(&HashSet::new(), false), 1);
+        assert!(f.get(a).is_none() && f.get(b).is_some());
+        assert!(c.borrow().doomed.is_empty());
+        assert_eq!(
+            c.borrow().forgets.iter().copied().collect::<Vec<_>>(),
+            [(3, 1)]
+        );
+        c.borrow_mut().requests.clear();
+        assert_eq!(f.evict(&HashSet::new(), false), 0);
+        assert!(f.get(b).is_some());
     }
 }

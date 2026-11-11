@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-09 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 10 confirmed and 4 partial, all corrected below; the bugs the research and verification found (umount races, parent loops, program copies, interrupts, oversized requests, open ENOSYS, clone ioctl, subtypes, xattr rules, link order, appends, mmap errors) fixed before this line)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: INIT flags, flushes, appends, racing creates; mapped pages on demand; forgetting nodes; lazy unmounts; borrowed releases; key bits; mounts in kernel/mount; read-only instances last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: a node drop_caches keeps for a release in flight is forgotten when the release is answered)
 
 ## Responsibilities
 
@@ -39,8 +39,9 @@ loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
   (waiting, ready, refused), `aborted`, what INIT negotiated (`minor`, accepted `flags`,
   `max_write`, `max_read`), `no` (operations the daemon answered ENOSYS to), the number of attached
   device files, the next `unique` (even, from 2), the queues `pending` and `interrupts` plus
-  `requests` by unique, the `forgets` to send with Linux's `forget_batch`, and `opens`, the open
-  handles of each node id.
+  `requests` by unique, the `forgets` to send with Linux's `forget_batch`, `opens`, the open
+  handles of each node id, and `doomed`, the node ids `drop_caches` kept only for a release in
+  flight.
 - `Req` — the whole message, its state (`Pending` until read, `Sent` until answered, `Done` with
   the reply or error), whether nobody waits for it (`background`: INIT, RELEASE) and whether its
   caller was interrupted.
@@ -212,6 +213,11 @@ loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
   table and the node-id index, the names naming it go with negative entries no longer valid, and
   its `nlookup` is queued as a forget and the readers woken. A node id looked up again is a new
   node.
+- A node `drop_caches` keeps only for a release in flight (its file closed, the daemon not yet
+  answering `FUSE_RELEASE`/`RELEASEDIR`) loses its names and is doomed: the daemon's answer to that
+  release asks for a sweep, which forgets it unless something keeps it again or a lookup found it
+  meanwhile (Linux evicts the inode when the release, holding its last reference, ends; its dentry
+  is gone and FUSE keeps no unused inode).
 
 ### Permission
 
