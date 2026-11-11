@@ -89,14 +89,23 @@ jobs:
 
       # Fuchsia Starnix's syscall tests, which the starnix-* differential cases run (without them those
       # cases only print that they are missing). The Fuchsia commit and googletest version are fixed
-      # in the script, so its hash keys the cache, and a miss rebuilds them (about four minutes)
-      - uses: actions/cache@v6
+      # in the script, so its hash keys the cache, and a miss rebuilds them (about four minutes).
+      # This cache and gVisor's are restored and saved in steps of their own: actions/cache saves
+      # only when the whole job succeeds, so a later failure would leave them never saved
+      - id: starnix-cache
+        uses: actions/cache/restore@v6
         with:
           path: target/starnix-tests
           key: starnix-tests-${{ hashFiles('scripts/build-starnix-tests', 'tests/starnix/compat/**') }}
 
       - name: Build Starnix's syscall tests
         run: scripts/build-starnix-tests
+
+      - if: steps.starnix-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/starnix-tests
+          key: ${{ steps.starnix-cache.outputs.cache-primary-key }}
 
       # gVisor's syscall tests, for the gvisor-* cases: only the programs those cases name are
       # built, so the list is part of the key (abseil and the test library make a miss take about
@@ -105,13 +114,20 @@ jobs:
         id: gvisor
         run: echo "programs=$(scripts/build-gvisor-tests --list | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/cache@v6
+      - id: gvisor-cache
+        uses: actions/cache/restore@v6
         with:
           path: target/gvisor-tests
           key: gvisor-tests-${{ hashFiles('scripts/build-gvisor-tests', 'tests/gvisor/**') }}-${{ steps.gvisor.outputs.programs }}
 
       - name: Build gVisor's syscall tests
         run: scripts/build-gvisor-tests
+
+      - if: steps.gvisor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target/gvisor-tests
+          key: ${{ steps.gvisor-cache.outputs.cache-primary-key }}
 
       # scripts/difftest does not build: it runs target/release/appine-run, which no other step builds
       - name: Build appine-run
@@ -124,13 +140,31 @@ jobs:
       # Android and the Docker container on the native side both allow all groups. rust-cache caches
       # the whole target/ and would restore part of a store left by an earlier run, so the store is
       # created afresh each time and deleted after the run, so that it is not saved into the cache
-      # again
+      # again. vmstat samples the runner every 10 s meanwhile: Appine's side of some cases has
+      # taken tens of times its usual time on some runs only
       - name: Differential tests
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
           rm -rf target/difftest
+          vmstat -t 10 > target/vmstat.log 2>&1 &
+          trap "kill $!" EXIT
           scripts/difftest
-          rm -rf target/difftest
+
+      # Every case's appine-run stderr (internal errors, BKL watchdog reports), the outputs of
+      # failed cases and the vmstat samples, whether the cases passed or not
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: difftest
+          path: |
+            target/difftest/*.appine.err
+            target/difftest/failed/
+            target/vmstat.log
+          if-no-files-found: ignore
+
+      - name: Remove the differential tests' store
+        if: always()
+        run: rm -rf target/difftest target/vmstat.log
 
       # The Android NDK compiles the C engine with clang: run its tests built that way too
       - name: Engine and oracle with clang

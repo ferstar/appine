@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: CI's native side and the cases' handling of what differs only there, and `linux61.c` among the rootfs tests)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: full.yml saves the suite caches on their own and uploads the difftest stderr, failures and vmstat samples)
 
 ## Responsibilities
 
@@ -309,11 +309,13 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   pushes to master and on demand: the network test, a lockstep run of 200,000 iterations,
   `scripts/build-starnix-tests` (its tarball cached by the hash of the script and
   `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the hash of the script,
-  `tests/gvisor` and its program list), a release build of `appine-run`, `scripts/difftest` at
-  Tier 1 with one lane (`ping_group_range` opened, `target/difftest` deleted before and, when it
-  passes, after, so every run imports the store and installs its packages again), and the engine
-  tests built with
-  clang. No workflow sets a timeout, and `full.yml` has no concurrency group.
+  `tests/gvisor` and its program list), both caches restored and saved in steps of their own so
+  that a build is saved even when a later step fails, a release build of `appine-run`,
+  `scripts/difftest` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
+  runner every 10 s, `target/difftest` deleted before and after, so every run imports the store and
+  installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
+  samples uploaded as the `difftest` artifact whatever the result), and the engine tests built
+  with clang. No workflow sets a timeout, and `full.yml` has no concurrency group.
 - Not in CI: LTP, the survey, instrumentation tests (no KVM), Tier 0 difftest, parallel lanes,
   the performance probe (`appine-bench`).
 
