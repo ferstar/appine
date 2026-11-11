@@ -30,7 +30,7 @@ internal object Tabs {
      * The most characters saved per transcript (the last part is kept): a 2000-line transcript
      * usually fits.
      */
-    private const val MAX_TRANSCRIPT = 256 * 1024
+    internal const val MAX_TRANSCRIPT = 256 * 1024
 
     /**
      * The most bytes a snapshot inflates to when read (vt.c keeps none larger than 16 MiB); a file

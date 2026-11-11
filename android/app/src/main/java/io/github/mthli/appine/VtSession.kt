@@ -148,8 +148,8 @@ internal class VtSession(
     private var cellHeight = 0
 
     /**
-     * The last transcript of the primary screen, kept for saves while a full-screen program runs
-     * or nothing changed the screen.
+     * The last transcript of the primary screen (as much as [transcriptText] returns), kept for
+     * saves while a full-screen program runs or nothing changed the screen.
      */
     private var lastTranscript: String? = null
 
@@ -207,15 +207,17 @@ internal class VtSession(
     private val dropProgress = Runnable { setProgress(null) }
 
     /**
-     * Plain text of the primary screen and its scrollback for saving the tab; null while the shell
-     * has not started (a restored tab not shown yet).
+     * Plain text of the primary screen and its scrollback for saving the tab, as much of its end as
+     * saving keeps ([Tabs.MAX_TRANSCRIPT]); null while the shell has not started (a restored tab
+     * not shown yet).
      */
     val transcriptText: String?
         get() {
             if (tab == 0L) return null
             VtNative.transcript(tab)?.let {
-                lastTranscript = it
-                return it
+                // Kept for later saves: the rest of a full scrollback would sit in the heap unused
+                lastTranscript = it.takeLast(Tabs.MAX_TRANSCRIPT)
+                return lastTranscript
             }
             // Unchanged since the last one, which formatting again would only make the scrollback
             // decompress for; or the alternate screen (vim, less): what the tab showed before it,

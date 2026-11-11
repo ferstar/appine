@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/vt.md` for the paired decision history (not yet created; decisions from before the split are D2, D5, D6, D8, D16, D17, D32, D33, D35, D36 and D37 in `.claude/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-11 (targeted verification only since the split: the transcript kept for saves last)
 
 ## Responsibilities
 
@@ -40,7 +42,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   loader the service gives) and transcript, the pending notice and messages, its login and the
   account an `auto` login resolved to (`resolvedLogin`, written by the service), the file of its
   last saved snapshot (`savedSnapshot`, used by the service's worker only), the last transcript
-  (whole, also returned while the screen is unchanged), the last progress report (`progress`, a
+  (its last 256 K characters, also returned while the screen is unchanged), the last progress
+  report (`progress`, a
   `Progress`), the program status records by id (`Status`, least recently updated first, at most
   64) and the one most in need of the user (`status`), the clipboard reads waiting for an answer
   (the clipboard each named), a `vt-pump` thread, a `vt-waiter` thread and its own single-thread
@@ -214,10 +217,11 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   (writes already queued still run) and destroys the terminal handle; a running pump keeps the
   terminal until it returns.
 - Saving: `transcriptText` formats the primary screen with its scrollback as plain text (soft
-  wraps joined, trailing blanks trimmed); on the alternate screen, when nothing changed the screen
-  since the last transcript (no output, message, resize, clearing or reset), or when formatting
-  fails, it returns the last transcript taken on the primary one ("" when none was). The service
-  also takes the terminal's snapshot (Snapshots and restoring).
+  wraps joined, trailing blanks trimmed) and returns its last 256 K characters
+  (`Tabs.MAX_TRANSCRIPT`, all that saving keeps), which it also keeps; on the alternate screen,
+  when nothing changed the screen since the last transcript (no output, message, resize, clearing
+  or reset), or when formatting fails, it returns the last transcript taken on the primary one (""
+  when none was). The service also takes the terminal's snapshot (Snapshots and restoring).
 - Kill reports go through `VtNative.message` (a yellow line inserted above the cursor line: a CAN
   first when the parser is not at ground (`VT_GROUND`, which includes the UTF-8 decoder), so a
   program that died inside an OSC, DCS or APC string does not swallow it; then as many line feeds
@@ -527,9 +531,6 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 
 ## Confirmed bugs / technical debt
 
-- **Each tab keeps its whole last transcript in the Java heap** (`VtSession.lastTranscript`),
-  though saving writes only its last 256 K characters: for a full scrollback of plain text that is
-  several hundred KB, about as much as the compressed scrollback itself.
 - **Shell integration is partial**: only bash and busybox ash get prompt marks (not zsh, fish or
   nested non-login shells); ash's mark the typed command as ending with its line, so the rows of a
   command longer than the screen's width after the first count as output (ash breaks such lines
