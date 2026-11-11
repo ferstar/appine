@@ -1,7 +1,7 @@
 # kernel/mmu Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/mmu.md` for the paired decision history (not yet created; decisions from before the split are D1, D13, D16, D39 and the page-table half of D4 in `.claude/decisions/kernel/mm.md`).
+> See `.claude/decisions/kernel/mmu.md` for the paired decision history (decisions from before the split are D1, D13, D16, D39 and the page-table half of D4 in `.claude/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10; the boundary was checked against the source at the split)
 

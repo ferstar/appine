@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
@@ -87,12 +87,12 @@
 - **Watch out**: Keep the no-watch cost at one emptiness check per event.
 - **Source**: rounds 11 (`11-m8-jvm`), 19 (`19-deferred`), 201 (`201-documents-notify`); d7076fc, affb1e2
 
-### D15: kernel/vfs covers files, fds and filesystem instances; mounts are kernel/mount's
-- **What**: kernel/vfs covers path resolution, the mount-flag checks in file operations, tmpfs and overlay instances, fd tables and file I/O, metadata syscalls, xattrs, pipes and FIFOs, locks and leases, device nodes and loop devices, timerfd, inotify and native AIO, while the mount table, mount syscalls and mount namespaces are kernel/mount's, FUSE connections kernel/fuse's and eventfd kernel/poll's.
-- **Why**: The map, read whole before every VFS change, had reached 1426 lines after its full refresh, and most VFS changes never touch the mount table, propagation or namespaces.
-- **Tradeoffs**: The boundary runs inside `vfs/mod.rs` and `syscall/mount.rs`, mount-flag checks stay here so read-only and remount changes read both maps, overlayfs stays, keeping this the largest map, and mount decisions made before the split keep their kernel/vfs tags in this snapshot (kernel/mount D2).
-- **Watch out**: Bugs confirmed by the 2026-11-10 full refresh stay open in the map, among them `/proc/<pid>/fd` reopens skipping open checks, leases lost across a copy-up, tmpfs undercounting a deleted open file that shrinks, file position races, `IN_EXCL_UNLINK` filtering the wrong events, execve reporting no inotify events and the overlay gaps.
-- **Source**: c5236a1, a536142 (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c, 9b99931 and a36860b)
+### D15: kernel/vfs covers paths, fds, file I/O and tmpfs; mounts, overlayfs, locks, pipes, xattrs, inotify, AIO and loop devices are modules of their own
+- **What**: kernel/vfs covers path resolution, the mount-flag checks in file operations, tmpfs instances, fd tables and file I/O, clones, metadata and namespace syscalls, device nodes and the calls into the overlay, lock, pipe and inotify code, while mounts are kernel/mount's, overlayfs kernel/overlay's, locks and leases kernel/locks's, pipes, FIFOs and splice kernel/pipe's, xattrs kernel/xattr's, inotify kernel/inotify's, native AIO kernel/aio's, loop devices kernel/loop's, timerfd and eventfd kernel/poll's and FUSE connections kernel/fuse's.
+- **Why**: The map, read whole before every VFS change, reached 1426 lines and then 99 KB, past one Read, while each moved part has code of its own and a Linux counterpart that most VFS changes never touch.
+- **Tradeoffs**: tmpfs, readv/writev's per-kind split and copy-to-guest faults stay here; overlay changes, mount-flag checks and splices to files read two maps; boundaries inside `vfs/mod.rs`, `syscall/fs.rs` and `syscall/mount.rs` exist only in the registry's wording; condensing dropped detail from key types and bug entries that the code and commits still hold; decisions made before each split keep their kernel/vfs tags here (listed in kernel/mount D2 and the other new modules' preambles).
+- **Watch out**: Bugs still open in the map include `/proc/<pid>/fd` reopens skipping open checks, tmpfs charges drifting for unlinked open files, writes keeping a setgid bit chown would clear, file position races and the fidelity gaps; one invariant keeps the overlay rules every file operation must follow, described in kernel/overlay's map.
+- **Source**: c5236a1, a536142, cc160c1, 5f327de (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c, 9b99931 and a36860b)
 
 ### D22: Vectored I/O on pipes, terminals, sockets and host stdio streams is one operation
 - **What**: Following Linux's split between `read_iter`/`write_iter` and plain operations (checked against 6.1), sockets go to kernel/net's `rw` (D13 there), pipe, PTY and eventfd reads do one 64 KiB read scattered over the iovecs, pipe and PTY writes go in 64 KiB pieces across iovecs until one is short, `stream_vectored` sends `appine-run`'s host stdio down the same pipe path unless `host_regular` finds a regular file on the host, and positional files and such regular files keep the per-iovec loop.
@@ -229,3 +229,5 @@
 - ~~Copy-up copies data with the BKL held, so large copy-ups stall every process (D40, 4b4af75)~~ → replaced by **D45** in df6ee70 (2026-11-08, no SUPERSEDES declared)
 - ~~Mounts, fds, file syscalls, pipes, locks, devices and inotify are one kernel/vfs module (D15, c5236a1)~~ → replaced by **D15** in d2b1dc3 (2026-11-10)
 - ~~Host stdio fds stay per-iovec (D22's tradeoff, b295644)~~ → replaced by **D22** in a36860b (2026-11-10, no SUPERSEDES declared)
+- ~~kernel/vfs also covers inotify, native AIO, loop devices and timerfd (D15, c5236a1, a536142)~~ → replaced by **D15** in cc160c1 (2026-11-11)
+- ~~kernel/vfs also covers overlayfs, locks and leases, pipes and xattrs, overlayfs having stayed when inotify, AIO and loop devices left (D15; cc160c1)~~ → replaced by **D15** in 5f327de (2026-11-11)

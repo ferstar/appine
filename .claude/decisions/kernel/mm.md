@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mm"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D17 were seeded by hand from the retired design
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D17 were seeded by hand from the retired design
 > doc §5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -55,12 +55,12 @@
 - **Watch out**: `translate` does not break CoW, so kernel code writing through it must break CoW or fault the page in first, as the robust-futex death path now does.
 - **Source**: round 26 (`26-fork-cow`); e4d3386
 
-### D18: Guest memory, with the page table and software TLB, is one kernel/mm module
-- **What**: kernel/mm covers `mm.rs`, `syscall/mem.rs`, `uaccess.rs` (`UserSlice`), the page table in `mmu.c`, the software TLB in `cpu.c` and `internal.h`, the run loop's page-fault branch and the OOM killer in `oom.rs`, so the engine module stops at instruction execution.
-- **Why**: The retired design doc's §5 was the only current-state description of guest memory, much shorter than the code warranted, and had drifted from it in several places.
-- **Tradeoffs**: The module spans the Rust kernel and the C engine, and a full mapping of a module this size cost about 1.3M subagent tokens.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them ignored `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`, past-EOF faults ignoring permissions, approximated Linux VMA boundaries, mlock succeeding on inaccessible ranges, ranges with gaps failing as a whole, stale addresses after mremap moves a SysV segment or the vDSO, `map_pages` dropping entries when a host allocation fails and FUSE short reads taken as whole windows.
-- **Source**: cd53f35 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479)
+### D18: kernel/mm is guest memory above the soft-MMU; the soft-MMU and the OOM killer are modules of their own
+- **What**: kernel/mm covers `mm.rs` (except the soft-MMU's consistency and entry-filling methods and the resident-memory measures), `syscall/mem.rs` (except process_mrelease), `uaccess.rs` (`UserSlice`) and the run loop's page-fault branch, while the page table, software TLB, shootdowns and code groups are kernel/mmu's and the measures, OOM killer and process_mrelease kernel/oom's, so the engine module stops at instruction execution.
+- **Why**: The retired design doc's §5 was the only current-state description of guest memory and had drifted from the code, and by 2026-11-11 the map (69.6 KB) could not be read in one Read while the soft-MMU and the OOM killer sit below and above the VMA code most mm changes do not touch.
+- **Tradeoffs**: Copy-on-write and FUSE mappings stay because they run through mprotect, mremap, madvise and fork; the fault order stays here though its `fault_in` step is kernel/mmu's; boundaries inside `mm.rs` exist only in the registry's wording; decisions made before the split keep their kernel/mm tags here (listed in the kernel/mmu and kernel/oom preambles).
+- **Watch out**: Bugs still open in the map include ignored `MADV_DONTNEED_LOCKED` and `MADV_POPULATE_*`, past-EOF faults ignoring permissions, approximated Linux VMA boundaries, mlock succeeding on inaccessible ranges, ranges with gaps failing as a whole, stale addresses after mremap moves a SysV segment or the vDSO and FUSE short reads taken as whole windows, and a VMA change must still record what kernel/mmu's `sync` acts on.
+- **Source**: cd53f35, 44a21b7 (scope since extended by 3f3db11 and d2b1dc3; bug list since updated by 3f3db11, 1459292, 4e64e74, 400817d, 5d23297, d9e1f0c and 5760479)
 
 ### D22: Linux VMA boundaries are computed over unmerged pieces
 - **What**: `same_vma` decides which adjacent pieces form one Linux VMA (contents source, backing, protection, flags, grows-down and an `anon` identity that fork renews per parent VMA) for maps, mremap's one-VMA rule and `PROT_GROWSDOWN`; mprotect follows `do_mprotect_pkey`; a guard gap below grows-down VMAs and `MMAP_MIN_ADDR` (32768) bound placement; and failed kernel accesses grow stacks.
@@ -201,3 +201,4 @@
 - ~~The kernel grows the stack only at syscall entry and for signal frames (D9 in part, round 22)~~ → replaced by **D22** in e03c0cc (2026-11-07)
 - ~~process_mrelease stays `ENOSYS` until earlyoom and oom_score make it worth doing (b141001 in part)~~ → replaced by **D35** in 39ea702 (2026-11-08)
 - ~~FUSE mappings copy the whole range into a memfd at mmap (c008749)~~ → replaced by **D40** in 3957a03 (2026-11-09)
+- ~~Guest memory, with the page table, software TLB and OOM killer, is one kernel/mm module (D18, cd53f35)~~ → replaced by **D18** in 44a21b7 (2026-11-11)

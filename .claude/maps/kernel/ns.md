@@ -1,7 +1,7 @@
 # kernel/ns Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/ns.md` for the paired decision history (not yet created; decisions from before the split are D12, D13, D28, D40 and the id-map half of D32 in `.claude/decisions/kernel/process.md`).
+> See `.claude/decisions/kernel/ns.md` for the paired decision history (decisions from before the split are D12, D13, D28, D40 and the id-map half of D32 in `.claude/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >

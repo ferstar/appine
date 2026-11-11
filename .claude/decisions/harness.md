@@ -2,12 +2,12 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
 
-> Full text of D1, D3–D6, D8, D10–D12, D14–D17, D20, D21: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/harness.md`
+> Full text of D1, D3–D6, D8, D11, D12, D14–D17, D20, D21: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/harness.md`
 
 - **D1** — Each `tests/diff` case must print byte-identical output (stderr merged, exit code appended) in a docker container built from the store's own files and under `appine-run`, itself in a container so both sides share the network setup; behaviour that changes with the host kernel version is not compared, and scripts normalise addresses, pids and random markers themselves (round 09)
 - **D3** — `-j` lanes (4 on macOS, 1 on Linux hosts and CI) each run on a copy-on-write clone of the store, slowest cases first, and the clones must be rebuilt with `-r` after packages are added to the main store (round 178)
@@ -15,7 +15,6 @@
 - **D5** — `appine-run` enables the kernel's `borrow-check` by default, and difftest, LTP and the survey treat `appine: internal error` on stderr as a failed case, a `BUG` or a counted line, so measurements with the default build include the check (`--no-default-features` removes it) (round 89)
 - **D6** — Integration tests skip without a rootfs tarball or `musl-gcc` unless `APPINE_REQUIRE_ROOTFS=1` / `APPINE_REQUIRE_MUSL=1`, which CI sets so that a missing one fails (rounds 03, 04)
 - **D8** — `tests/crash` checks store durability by dropping writes on a dm-flakey device (or killing the process) against a native control run; it needs root, loop devices and dm-flakey in the VM, so it runs by hand, not in CI (rounds 190, 198)
-- **D10** — CI's Android job installs zig 0.17.0 from ziglang.org checked against a copied sha256, runs `scripts/fetch-ghostty` and caches `target/ghostty` and `~/.cache/zig` by the script's hash (android/native D6), so a ziglang.org download failure fails the job (b38d29c)
 - **D11** — Where Linux 6.1 differs from the native kernel the differential tests run on (unprivileged TIOCSTI), a `tests/guest` program runs on both tiers through `rootfs_programs` and the differential case keeps only what both kernels share (ef5f836)
 - **D12** — difftest counts every requested case without an ok or FAIL line as a failed "no result", fails a group name without a script and starts lanes by the script's absolute path, so a lane printing a malformed report line fails its case (1f93e3d)
 - **D14** — Cases check only what Linux guarantees: they count processes with the shell's own glob (`set -- /proc/[0-9]*`) rather than a pipeline that races, accept independent answers (DNS A and AAAA) in either order, wait up to 5 s for asynchronous effects such as a joined thread's `/proc/<tid>` going, and read a pipe written by several commands until EOF (404a804, fe4bb2b, c11c1db, 093cb96)
@@ -46,6 +45,13 @@
 - **Tradeoffs**: "All tests" span two maps (lockstep is in engine), and the map repeats part of §13.3's overview.
 - **Watch out**: Recorded weaknesses stay open in the map: a forced PTY on a terminal with piped stdout is half set up, and three waiters can still pass difftest's lock together (D29).
 - **Source**: 16ac7a2 (list since updated by 1f93e3d, 1459292 and ce8a9ce; bug list by 5d23297, 7c5e636, dcacfb6, 6d9a9e8, f5c09f7, d9e1f0c, 300d384 and ca8c583)
+
+### D10: CI installs a pinned Zig and caches the libghostty-vt build tree for the Android job
+- **What**: The Android job downloads zig-x86_64-linux-0.17.0 from ziglang.org, checks it against the sha256 copied from ziglang.org/download/index.json, puts it on `PATH`, runs `scripts/fetch-ghostty`, and caches only `target/ghostty` (the unpacked release tarballs with the Zig caches the build keeps inside them) under the key `libghostty-vt-<hash of fetch-ghostty>`.
+- **Why**: The Android native library always builds libghostty-vt, which needs Zig and its source (android/native D6), and since libghostty-vt 1.0.0 the build keeps its Zig caches in `target/ghostty` and must not use `~/.cache/zig`.
+- **Tradeoffs**: No third-party setup action, but ziglang.org asks CI users to prefer mirrors; a new key fetches and builds from scratch on its first run, and the cache holds several hundred MB.
+- **Watch out**: A download failure from ziglang.org fails the job, and actions/cache saves only on a miss, so a key keeps whatever its first run built.
+- **Source**: b38d29c, 172be7c
 
 ### D13: Kernel fixes and features get a differential case that reproduces their calls
 - **What**: Each fix adds a case that reproduces the calls in Python, C or busybox to a differential group (an existing one such as edge-cases, namespaces, pty, fork, nsports, compat2 or mount, since the third map-bug triage one privileged group per batch, compat5 to compat9, and for a new feature a case of its own such as vdso or overlay-inotify) instead of a kernel unit test or the real program (nginx, tmux), checks that it fails with the previous binary (moving a check whose trigger a later fix removes to one that still fails without the earlier fix, as `stale.c` in edge-cases moved to a seccomp filter installed with TSYNC), has C cases define the kernel constants and structures they need, since the image has no Linux headers, runs anything that could hang under `timeout`, and removes the Starnix and gVisor skips the fix makes pass.
@@ -159,6 +165,13 @@
 - **Watch out**: Alpine's sshfs and rclone versions change what the cases see, and the native side's forgets must arrive within the 1 s the case sleeps after `drop_caches`.
 - **Source**: c008749, 3957a03
 
+### D35: The console's password-input query is tested on a real console
+- **What**: `console_tells_password_input` in rootfs_programs.rs expects false on a new console, true after `stty -echo`, false in non-canonical mode and with echo back, and `ENOENT` once the console is closed.
+- **Why**: The termios rule behind the lock cursor (kernel/tty D23) needed a test on a real console rather than a unit test in tty.rs or an Android instrumentation test.
+- **Tradeoffs**: Skipped without the Alpine rootfs tarball, and runs on Tier 0 only.
+- **Watch out**: It relies on busybox's `stty` and `read` in the Alpine rootfs.
+- **Source**: 2b04a43
+
 ## Superseded
 
 - ~~Line-discipline scenarios skipped by group until fixed (24ecd25)~~ → replaced by **D18** in 8dc166b (2026-11-07)
@@ -168,3 +181,4 @@
 - ~~Cases clean up what they leave in the reused lane store's `/tmp` themselves (5d23297, f6a82cc, 84ff4a7)~~ → replaced by **D27** in f5c09f7 (2026-11-09)
 - ~~difftest's lock as a directory holding a pid file, checked with `kill -0` (3c6bf5e)~~ → replaced by **D29** in 300d384 (2026-11-10)
 - ~~`stale.c` reproduces the stale deadline through an unmapped timeout and prints only the later 3 s wait (9593bae)~~ → replaced by **D13** in 27609fe (2026-11-10, no SUPERSEDES declared)
+- ~~CI caches `target/ghostty` and `~/.cache/zig` by fetch-ghostty's hash (D10, b38d29c)~~ → replaced by **D10** in 172be7c (2026-11-11)

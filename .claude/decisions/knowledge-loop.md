@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: knowledge-loop"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe)
+> Last distilled: 2026-11-11 (HEAD = c1a37da)
 
 ## Active
 
@@ -18,7 +18,7 @@
 - **Why**: Five snapshots had Decision blocks committed after their hand seeding and knowledge-loop had none, distilling from commits for the first time raised cases the snapshots had no rule for, and the first distill of every module added cross-module fixes, test-only blocks and refinements of existing entries; the fourth distill (89 blocks from 44 commits) met commits only on explore/hybrid, map-only bug records and recording commits followed by their fixes, and the fifth (130 blocks from 51 commits) edited indexed entries and found 12 stale entries outside the batch.
 - **Tradeoffs**: Scope entries repeat part of `MODULES.md`, one-sentence fields and cluster entries drop details that stay in the source commits, a cross-module fix is spread over several snapshots, implicit and cross-module supersessions rest on judgment rather than SUPERSEDES lines, and the explore/hybrid commits' Decisions are in no snapshot.
 - **Watch out**: Edited hand-seeded entries keep their IDs, which later distills must preserve, and possible merges left separate (android/setup D13 and D5, kernel/netns D10 and D4) may want merging later, as may android/terminal D22 into D18, D14 with D15 and android/setup D15 into D12, and the further pairs c87fd21 left separate; the 2026-11-08 distill gave kernel/vfs, kernel/mm, kernel/process, android/terminal and harness constraint indexes, and the first 2026-11-10 distill (c87fd21) indexed kernel/procfs and a second kernel/process batch, both pinned to 260512d; kernel/process, at 28 full entries after the 27609fe distill, and kernel/signal and kernel/net, at 26 each, are next.
-- **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d, a536142, c87fd21
+- **Source**: 8349911, 4b0adb9, e868881, bfb1e44, 260512d, a536142, c87fd21, 599804a
 
 ### D3: A map's Maintained line is one sentence
 - **What**: A map's Maintained line names in one sentence the areas changed since its full mapping, the latest change last, and says what the full mapping predates; map-module asks for this on every targeted refresh.
@@ -28,11 +28,11 @@
 - **Source**: a75981b (applied to the service map in c2f4912 and to five more maps in 3f3db11)
 
 ### D4: Files with no module are registered when found
-- **What**: A kernel file without a module gets a registry line in the module that owns its behaviour (`syscall/posix_timer.rs`, `syscall/mod.rs`, `bug.rs` and `syscall/misc.rs` outside kernel/signal's handlers in kernel/process, `errno.rs` and `debug.rs` in kernel/signal, native AIO in kernel/vfs, `oom.rs` and `uaccess.rs` in kernel/mm, SysV IPC and message queues in a new kernel/ipc), its module doc comment names that map, and maps written before later splits are repointed at the current owners.
+- **What**: A kernel file without a module gets a registry line in the module that owns its behaviour (`syscall/posix_timer.rs`, `syscall/mod.rs`, `bug.rs` and `syscall/misc.rs` outside kernel/signal's handlers in kernel/process, `errno.rs` and `debug.rs` in kernel/signal, native AIO in kernel/vfs (since kernel/aio), `oom.rs` (since kernel/oom) and `uaccess.rs` in kernel/mm, SysV IPC and message queues in a new kernel/ipc), its module doc comment names that map, and maps written before later splits are repointed at the current owners.
 - **Why**: `MODULES.md` named a `posix_timer.rs` that never existed, about 2300 lines of IPC plus AIO, the OOM killer and the dispatcher's, bug handling's, errno's and debug log's files resolved to no module, so their behaviour and defects were recorded nowhere, and the registry, maps and doc comments named different owners for some.
 - **Tradeoffs**: Message queues and cgroup memory enforcement are spread over several maps, and `syscall/misc.rs`'s owner is a default whose membarrier, umask and capability and seccomp prctls other maps describe.
 - **Watch out**: A new kernel file needs a registry line or no map covers it, and owners split inside one file (`syscall/misc.rs`, `syscall/mod.rs`, `vfs/mod.rs`, `syscall/mount.rs`) exist only in the registry's wording.
-- **Source**: 4140c75, 3f3db11, d2b1dc3
+- **Source**: 4140c75, 3f3db11, d2b1dc3 (owners since moved by cc160c1 and 44a21b7)
 
 ### D5: Survey conclusions without a diff go into one doc that points at the maps
 - **What**: The two Starnix surveys live in one English `docs/starnix.md` whose ranked ideas point at the deviations recorded in the maps, with a "Taken so far" table updated with the fixing commits and no milestones index row, since rounds are frozen.
@@ -48,12 +48,12 @@
 - **Watch out**: New prose, maps and Decision blocks must say Appine, and a distill copying old commit text into `.claude/decisions` can bring the lowercase name back.
 - **Source**: 248d79f
 
-### D7: Subsystems that outgrow the vfs map become modules of their own
-- **What**: FUSE became kernel/fuse with a fully verified map of its own, and the mount table, mount syscalls and mount namespaces became kernel/mount, split out of the vfs map with the facts its full mapping had verified that day; the registry now has 24 modules.
-- **Why**: FUSE is a self-contained subsystem of about 3,500 lines, and the vfs map, read whole before every VFS change, was near its limit and then reached 1426 lines.
-- **Tradeoffs**: More modules to keep in step with kernel/vfs, and boundaries that run inside `vfs/mod.rs` and `syscall/mount.rs`.
-- **Watch out**: The mount decisions made before the split stay in kernel/vfs's snapshot, which kernel/mount's map points to until a kernel/mount distill.
-- **Source**: c008749, d2b1dc3
+### D7: Maps that outgrow one Read are split along subsystems with files of their own
+- **What**: A subsystem with files and a Linux counterpart of its own becomes a module when its map no longer fits one Read (FUSE and mounts out of vfs; then the terminal into terminal, vt and vtview, execve, namespaces and futexes out of process, inotify, AIO, loop devices, overlayfs, locks, pipes and xattrs out of vfs with timerfd joining kernel/poll, and the soft-MMU and the OOM killer out of mm), aiming at about 45 KB per map, and decisions made before a split keep their old tags in the old snapshot, listed by ID in the new map's See line and the new snapshot's preamble, as kernel/mount D2 does.
+- **Why**: FUSE is a self-contained subsystem of about 3,500 lines, the vfs map reached 1426 lines, and by 2026-11-11 the mm, vfs, process and terminal maps had passed one Read; moving pre-split decisions into the new snapshots would not last, since a later distill of the old module mines their tags back.
+- **Tradeoffs**: The registry has grown to 38 modules, boundaries run inside shared files (`vfs/mod.rs`, `syscall/fs.rs`, `syscall/mount.rs`, `syscall/proc.rs`, `syscall/misc.rs`, `syscall/fast.rs`, `mm.rs`, `vt.c`), and a new module's history is spread over its own snapshot and its parent's.
+- **Watch out**: Maps split near the target grow back past one Read (vt and vtview reached 45–49 KB within a day of their split), and the lists of inherited decisions must follow later distills that add or rewrite those entries.
+- **Source**: c008749, d2b1dc3, b320f8e
 
 ## Superseded
 

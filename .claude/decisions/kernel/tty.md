@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -154,6 +154,20 @@
 - **Tradeoffs**: None.
 - **Watch out**: None known.
 - **Source**: 143bb86
+
+### D22: The app reads a console's foreground group while a program's report lasts
+- **What**: `Machine::console_foreground` (`terminal::fg_pgrp`) returns the console's foreground group under the BKL, `ESRCH` when there is none, and a tab's pump calls it only while a progress or status report lasts (android/terminal D39).
+- **Why**: The app must know when the program that reported progress or a status has given the terminal back, and prompt marks, which would tell, come only from shells that send them.
+- **Tradeoffs**: One more BKL acquisition per console read while a report lasts, and the group id is the kernel's own, not translated into any pid namespace.
+- **Watch out**: A tab streaming output while its program reports (an AI CLI at work) contends for the BKL; none was observed.
+- **Source**: 22c8ab0
+
+### D23: The app asks whether a console reads a password by its termios
+- **What**: `terminal::password_input` (ICANON set, ECHO clear), wrapped by `Machine::console_password_input` under the BKL, tells the app when a tab's console reads a password, for the lock cursor and the IME's password mode (android/terminal D48).
+- **Why**: Only the kernel layer knows a console's termios, and Ghostty's rule for its secure-input lock is the same pair of flags.
+- **Tradeoffs**: A BKL acquisition per pump read and every 200 ms while a lock shows, and termios changes raise no event, so the app finds them only when it asks.
+- **Watch out**: Programs that read passwords in non-canonical mode (masking line editors) show no lock.
+- **Source**: 2b04a43
 
 ## Superseded
 

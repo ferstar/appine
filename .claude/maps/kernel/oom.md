@@ -1,7 +1,7 @@
 # kernel/oom Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/oom.md` for the paired decision history (not yet created; decisions from before the split are D26, D29, D32, D35 and D44 in `.claude/decisions/kernel/mm.md`).
+> See `.claude/decisions/kernel/oom.md` for the paired decision history (decisions from before the split are D26, D29, D32, D35 and D44 in `.claude/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 

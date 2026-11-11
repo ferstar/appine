@@ -1,7 +1,7 @@
 # kernel/overlay Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/overlay.md` for the paired decision history (not yet created; decisions from before the split are D39, D40 and D49 in `.claude/decisions/kernel/vfs.md`, and D45 and D46 in `.claude/decisions/kernel/process.md`).
+> See `.claude/decisions/kernel/overlay.md` for the paired decision history (decisions from before the split are D39, D40 and D49 in `.claude/decisions/kernel/vfs.md`, and D45 and D46 in `.claude/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 

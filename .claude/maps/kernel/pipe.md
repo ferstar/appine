@@ -1,7 +1,7 @@
 # kernel/pipe Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/pipe.md` for the paired decision history (not yet created; decisions from before the split are D31 and D54 in `.claude/decisions/kernel/vfs.md`).
+> See `.claude/decisions/kernel/pipe.md` for the paired decision history (decisions from before the split are D31 and D54 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
 

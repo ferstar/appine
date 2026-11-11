@@ -1,7 +1,7 @@
 # kernel/futex Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/futex.md` for the paired decision history (not yet created; decisions from before the split are D26, D44 and the futex halves of D32, D33 and D37 in `.claude/decisions/kernel/process.md`).
+> See `.claude/decisions/kernel/futex.md` for the paired decision history (decisions from before the split are D26, D44 and the futex halves of D32, D33 and D37 in `.claude/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 

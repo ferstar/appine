@@ -1,7 +1,7 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/android/terminal.md` for the paired decision history.
+> See `.claude/decisions/android/terminal.md` for the paired decision history (it still holds the decisions on the tabs' sessions and the terminal view made before they were split out into `android/vt` and `android/vtview`).
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >

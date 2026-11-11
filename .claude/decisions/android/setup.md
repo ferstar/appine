@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -93,9 +93,9 @@
 ### D14: Rootfs and Settings read in the order a start uses them
 - **What**: `Rootfs` runs types and constants, the store, the import, mirror probing and writing, the per-start files, boot, accounts, then downloads and reset; `SettingsActivity` runs lifecycle, row building, listener callbacks, display, then actions in the order of the rows.
 - **Why**: Rootfs interleaved import, mirror, login and download code, unlike the order a start uses them.
-- **Tradeoffs**: `PROFILE` and `OLD_PROFILE` are now apart, each next to its user.
-- **Watch out**: `OLD_PROFILE` is built from `PROFILE` and must stay after it.
-- **Source**: a546fea
+- **Tradeoffs**: The texts earlier profiles are matched against (`UNMARKED_PROFILE`, `OLD_PROFILE`, `REPLACED_PROFILES`) sit apart from the code that writes the profile, each next to its user.
+- **Watch out**: `OLD_PROFILE` is built from `UNMARKED_PROFILE` and must stay after it.
+- **Source**: a546fea; 6c5f921 (the profile moved to an asset)
 
 ### D15: Lint fixes go through androidx compat and KTX helpers
 - **What**: Toggle rows set their accessibility state through `AccessibilityNodeInfoCompat`'s tri-state setter (`setChecked(int)` from API 36, the boolean below), and Rootfs's preference writes use `edit { }`, with `edit(commit = true)` where the import record was committed synchronously.
@@ -132,8 +132,30 @@
 - **Watch out**: Changes that rename nothing in `/etc` (an in-place edit) or fall past the 256-directory limit between polls still wait for the next login (map debt), and changed directories are recorded only from the service's first take.
 - **Source**: d03c9b6
 
+### D20: Login shells mark their prompts from the asset `profile.sh`, and replaced profiles are recognised by text or hash
+- **What**: `assets/profile.sh` gives bash a first `PROMPT_COMMAND` function and marked PS1, PS2 and PS0, and busybox ash a marked PS1 and PS2 (OSC 133 A with `cl=line`, B or I, C, and D with the status), setting PS1 only for bash and ash; `updateProfile` replaces an unchanged earlier profile, matching the two unmarked versions by text (`UNMARKED_PROFILE`, `OLD_PROFILE`) and later asset versions by their sha256 in `REPLACED_PROFILES`.
+- **Why**: The terminal's prompt features (closing at the prompt, jumping, selecting output, command notices and moving the cursor by taps, android/terminal D43 and D48) need marks from the login shells; Ghostty's integration scripts are GPLv3 (bash's) and need injection; and the old bash PS1 showed its escapes under zsh and dash.
+- **Tradeoffs**: zsh, fish, nested non-login shells and an ash PS1 set after the profile get no marks; D is also sent at ash's redraws and bash's empty lines; edited profiles never get the marks; the hash list is opaque without git history.
+- **Watch out**: Changing `profile.sh` without adding the replaced version's sha256 leaves existing stores on the old profile; the bash path was tried only in a Docker container (Ubuntu 26.04, bash 5.3), not on Debian in the app or with prompt tools that rewrite PS1; the `profileMarksPrompts` instrumentation test (android/native D19) matches ash's marks byte for byte.
+- **Source**: 6c5f921, 2b04a43
+
+### D21: Settings' Terminal group chooses the cursor's shape and blinking
+- **What**: The Terminal group gains "Cursor shape" (Block, Bar or Underline in a single-choice dialog, the summary naming the current one) and "Blinking cursor" (a toggle, on by default), both usable at any time and forwarding to the service (android/service D22), with English and Chinese strings.
+- **Why**: The cursor setting needs rows in Settings.
+- **Tradeoffs**: No hollow block (the view already draws a block hollow without the focus), and two more rows.
+- **Watch out**: The Chinese strings were not seen on a device, and the groups' names are still the assistant's choice (D12).
+- **Source**: 77d7f36
+
+### D22: Settings is recreated on a display size change
+- **What**: `SettingsActivity` leaves `density` out of `configChanges`, so a display size change recreates it as a dark-mode change does.
+- **Why**: Settings handled `density` itself, so a display size change left its views at their old sizes, as it did the terminal's (android/terminal D50).
+- **Tradeoffs**: A display size change drops an open Settings dialog.
+- **Watch out**: None beyond the existing recreation path, which rebinds and renders again.
+- **Source**: e12f560
+
 ## Superseded
 
 - ~~The execution tier is chosen in Settings in every build (5c34951, round 190)~~ → replaced by **D10** in 62a8c07 (2026-11-04)
 - ~~`ensureContainersConfig` also chooses vfs in `/etc/containers/storage.conf` (rewriting an active `driver = "overlay"` line) and the native snapshotter in `/etc/docker/daemon.json` (0eb9e19)~~ → replaced by **D18** in 869de68 (2026-11-08)
 - ~~A password set inside a running session keeps NOPASSWD until the next tab logs in (D13's tradeoff, 711b034, and D9's watch-out, 12c4afa)~~ → replaced by **D19** in d03c9b6 (2026-11-09)
+- ~~`OLD_PROFILE` is built from `PROFILE`, the profile kept as a Kotlin string (D14's watch-out, a546fea)~~ → replaced by **D20** in 6c5f921 (2026-11-10)

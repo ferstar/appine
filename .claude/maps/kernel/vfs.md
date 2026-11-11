@@ -1,7 +1,7 @@
 # kernel/vfs Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, overlayfs, locks, pipes and xattrs made before they were split out).
+> See `.claude/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, timerfd, overlayfs, locks, pipes and xattrs made before they were split out).
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 36 claims checked by 3 independent verifiers — 26 confirmed and 10 partial, all corrected below; bugs and debts recorded)
 >

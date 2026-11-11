@@ -1,7 +1,7 @@
 # android/vt Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/android/vt.md` for the paired decision history (not yet created; decisions from before the split are D2, D5, D6, D8, D16, D17, D32, D33, D35, D36 and D37 in `.claude/decisions/android/terminal.md`).
+> See `.claude/decisions/android/vt.md` for the paired decision history (decisions from before the split are D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 in `.claude/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >

@@ -2,9 +2,11 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/poll"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D6 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
+>
+> timerfd decisions made before timerfd moved from kernel/vfs to kernel/poll keep their `kernel/vfs` tags and live in `.claude/decisions/kernel/vfs.md`: D23 and the timerfd halves of D16 and D41.
 
 ## Active
 
@@ -50,12 +52,12 @@
 - **Watch out**: Re-notify when more data arrives on an already-readable file, as Linux does.
 - **Source**: rounds 19 (`19-deferred`), 54 (`54-mqueue-fasync`)
 
-### D7: I/O multiplexing is a module of its own
-- **What**: kernel/poll covers `syscall/poll.rs`: the readiness model, ppoll and pselect6, epoll, eventfd2 and signal-driven I/O.
-- **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions.
-- **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract.
+### D7: I/O multiplexing is a module of its own, with timerfd
+- **What**: kernel/poll covers `syscall/poll.rs` and `syscall/timerfd.rs`: the readiness model, ppoll and pselect6, epoll, eventfd2, timerfd and signal-driven I/O.
+- **Why**: The retired design doc's multiplexing section described EPOLLET, nesting and exclusive wakeups but not the readiness contract, select semantics or signal-driven I/O permissions, and timerfd, which left kernel/vfs with inotify, AIO and loop devices, is an anonymous readiness file like eventfd.
+- **Tradeoffs**: The readiness sources stay in their own modules and are only described here as a contract, and timerfd's clocks and expiries are kernel/process's, so a timerfd change reads both maps.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them exclusive gates that ignore direction and order, epoll results lost on `EFAULT` and pipe `POLLOUT` counting bytes rather than buffers.
-- **Source**: c3df5d3 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4)
+- **Source**: c3df5d3, cc160c1 (bug list since updated by 09188ec, 4e64e74, ce8a9ce, f6a82cc and 5d7b936, and shortened by D4)
 
 ### D8: select waits only for what its sets ask and clamps nfds to Linux's table size
 - **What**: nfds is clamped to an estimate of Linux's fd table size from the highest open fd (64, then 128 · 2^k), bits above it are neither read nor written back, only events in an fd's masks end the wait, and all three masks include `POLLNVAL` as native select does.

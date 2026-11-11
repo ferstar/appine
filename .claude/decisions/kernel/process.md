@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-10 (HEAD = 27609fe). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -61,12 +61,12 @@
 - **Watch out**: The fast path caches the offsets and must be invalidated on namespace entry, and a new way to enter a time namespace must patch the vDSO too.
 - **Source**: round 162 (`162-time-namespaces`); 16364c0
 
-### D14: Processes, threads, scheduling, timers and namespaces are one kernel/process module
-- **What**: kernel/process covers tasks, execve and the ELF loader, syscall dispatch, the BKL with its watchdog and fast path, kernel bugs that end one process and their kill reports, waits and futexes, timers, PID 1 and namespaces, leaving mount trees to kernel/mount, network namespaces to kernel/netns and credentials to kernel/cred.
-- **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source (wake channels, fast-path coverage, timer-thread duties, boot plan, pid-namespace orphans).
-- **Tradeoffs**: The map is large because the module spans many files, and rounds keep § references to the deleted section.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them a non-atomic `unshare`, PI futexes without priority inheritance or requeueing, doomed images started at pc 0 by `Machine::spawn` and CPU-clock POSIX timers outliving their target.
-- **Source**: dd6c288, d2b1dc3 (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52 and D53)
+### D14: kernel/process covers processes, threads, dispatch, the BKL and timers; execve, namespaces and futexes are modules of their own
+- **What**: kernel/process covers tasks, syscall dispatch, the BKL with its watchdog and fast path, kernel bugs that end one process and their kill reports, waits, timers and the timer thread, and PID 1, leaving execve and the ELF loader to kernel/exec, namespaces to kernel/ns, futexes to kernel/futex, mount trees to kernel/mount, network namespaces to kernel/netns and credentials to kernel/cred.
+- **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source, and by 2026-11-11 the map (65.5 KB) could not be read in one Read while execve, namespaces and futexes have files of their own and are mostly changed alone.
+- **Tradeoffs**: The timer thread stays as the hub of every periodic check, clone still creates namespaces and exit still hands on PI locks and robust lists so those changes read two maps, the boundaries inside `syscall/proc.rs`, `syscall/misc.rs` and `syscall/fast.rs` exist only in the registry's wording, and decisions made before the split keep their kernel/process tags here (listed in the kernel/exec, kernel/ns, kernel/futex and kernel/overlay preambles).
+- **Watch out**: Bugs still open in the map include `sched_setattr` changing the policy before the nice check, an exited main thread's CPU clock being gone at once (D54) and wake-up matching during the BKL release running outside `bug::catch`.
+- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54)
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -236,9 +236,17 @@
 - **Watch out**: Code expecting the group in `k.groups` before `task::start` returns would break (none today, since the thread runs only after the BKL is released).
 - **Source**: 143bb86
 
+### D54: CPU-clock timers name their target by serial and are gone with it
+- **What**: `Clock::Process { tgid, serial }` and `Clock::Thread { tid, serial }` carry `Task::serial` from a global counter, so a timer whose thread left the task table or whose process was reaped is gone (disarmed at the timer thread's next look, zeros from timer_gettime, `ESRCH` from timer_settime, still deletable), a zombie process's timers read its stopped clock without firing or ticking, and CPU clock ids are decoded through `Cx::pid_in` (the fast path compares its own-clock ids with `Fast::ns_tid`).
+- **Why**: Timers named their target by number only, so they outlived it (ticking the timer thread every 10 ms) and followed a reused number, and clock ids built inside a pid namespace were decoded as global pids.
+- **Tradeoffs**: An exited main thread's clock is gone at once where Linux keeps the zombie leader's until reap, a timer on the main thread's clock made before a non-leader's execve is gone afterwards, and every task is eight bytes larger.
+- **Watch out**: Code making a `Clock` must take the serial of the same table entry it checked, and a new CPU clock decoder must translate the pid as the three existing ones do.
+- **Source**: 82433e6
+
 ## Superseded
 
 - ~~Deadlines stay plain `Instant`s (D15 in part, 96cd8bd)~~ → replaced by **D19** in 63b9e59 (2026-11-07)
 - ~~PI futexes stay `ENOSYS` (D33's tradeoff, 5d7b936)~~ → replaced by **D44** in edd7f95 (2026-11-09)
 - ~~bug.rs, debug.rs and syscall/mod.rs are filed in kernel/process though the registry does not list them (D18 in part, 0758e3c)~~ → replaced by **D14** in d2b1dc3 (2026-11-10)
 - ~~The futex handler re-reads the timeout of an interrupted wait, and only relative deadlines are handed over (9593bae's tradeoff)~~ → replaced by **D52** in 27609fe (2026-11-10, no SUPERSEDES declared)
+- ~~kernel/process also covers execve and the ELF loader, futexes and namespaces (D14, dd6c288, d2b1dc3)~~ → replaced by **D14** in b320f8e (2026-11-11)

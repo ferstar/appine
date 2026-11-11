@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -27,18 +27,19 @@
 - **Tradeoffs**: The lock is held whenever the kernel runs, even with only an idle shell; vendor background managers (MIUI, ColorOS) are not handled; Play's vitals may count the lock.
 - **Source**: round 191 (`191-keep-awake`)
 
-### D4: Memory is trimmed a minute after the UI disappears
-- **What**: When the last listener leaves, a 60 s timer calls `Machine::trim_memory`; returning cancels it; `RUNNING_LOW` and above (except `UI_HIDDEN`) trim at once.
-- **Why**: Android 14 and later send nothing a foreground-service process can act on; the delay avoids retranslating node or python after a brief look away.
-- **Watch out**: Trimming and stopping share one single-thread executor, so a trim never runs on a released kernel.
-- **Source**: round 37 (`37-trim-memory`)
+### D4: Memory is trimmed a minute after the UI disappears, and background tabs' images only under pressure
+- **What**: When the last listener leaves, a 60 s timer runs `Machine::trim_memory` and then `VtNative.compressAll` (every tab's cold scrollback, android/terminal D42) in one worker task, and returning cancels it; `RUNNING_LOW` and above (except `UI_HIDDEN`) trim at once with `pressure = true`, which first has `VtNative.dropImages` cut the Kitty images of every started tab other than `current` (android/vt D3).
+- **Why**: Android 14 and later send nothing a foreground-service process can act on; the delay avoids retranslating node or python after a brief look away; a tab whose output never pauses escapes idle compression; and losing images is acceptable only when memory is really short and not for the tab the user sees or comes back to.
+- **Tradeoffs**: The full compression holds each tab's lock for its length and waits behind other worker tasks; on Android 14 and later the image cut never runs, so images stay until their tab closes; with the app in the background every tab but the last one shown loses its images.
+- **Watch out**: Trimming and stopping share one single-thread executor, so a trim never runs on a released kernel; a `current` left pointing at a closed tab protects nothing, so every open tab is cut.
+- **Source**: round 37 (`37-trim-memory`); 3f45ad0, c1a37da
 
-### D5: After a kill, tabs come back without their processes
-- **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd and plain-text scrollback (last 256 K, in transcripts named by their content) are saved every minute, when the UI hides, on memory pressure and after tabs open, close or end; on restart each tab gets a new shell in its directory below the old scrollback and a notice, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
-- **Why**: v1 restores only the layout, directories and scrollback, and says so; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash; an "auto" tab resolved again at restore could become another user after accounts changed.
-- **Tradeoffs**: Programs are not restored; colours are lost; tabs never shown since the restore keep their old data; names saved by earlier versions are lost at the next restore; an account added between a tab's opening and its first save (up to a minute) can still be the one recorded.
-- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store.
-- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038
+### D5: After a kill, tabs come back on their saved screens without their processes
+- **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd, plain-text scrollback (last 256 K, in transcripts named by their content) and, when its terminal changed, a deflated libghostty-vt snapshot (`s-*.snap`, named by content, android/terminal D44) are saved on the worker every minute, when the UI hides, on memory pressure and after tabs open, close or end, with `VtNative.version` in the index; on restart each tab gets a new shell in its directory below its restored screen (the snapshot, read at the tab's first show, else the transcript) and a notice, snapshots from another version are dropped, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
+- **Why**: v1 restores the layout, directories and screens but not programs, and says so; plain transcripts lost colours, images and layout; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash; an "auto" tab resolved again at restore could become another user after accounts changed.
+- **Tradeoffs**: Programs are not restored; each save may write both a transcript and a snapshot; a libghostty-vt upgrade sends tabs back to their transcripts once; tabs never shown since the restore keep their old files; names saved by earlier versions are lost at the next restore; an account added between a tab's opening and its first save (up to a minute) can still be the one recorded.
+- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged).
+- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b
 
 ### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
 - **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records, and the unimplemented paths the killed process reached); OpenRC services that failed at boot are notified too.
@@ -104,11 +105,11 @@
 - **Source**: a1f47cc
 
 ### D15: Bug reports name the app Appine; the in-tab tag stays `[appine]`
-- **What**: The copied report's first line is "Appine <version> (<code>, <build type>)", while the "[appine]" tag before restore notices and kill reports stays lowercase, as a source tag like "sudo:".
+- **What**: The copied report's first line is "Appine <version> (<code>, <build type>)", while the "[appine]" tag before restore notices, kill reports and the notice that tmux control mode was detached (android/terminal D49) stays lowercase, as a source tag like "sudo:".
 - **Why**: The report opened with the product name in lowercase.
 - **Tradeoffs**: A notice can read "[appine] ... because Appine crashed", mixing both casings in one line.
 - **Watch out**: Capitalising the tag means changing TerminalService's two `showMessage` calls together with the setup module's "appine:" prefixes (android/setup D16).
-- **Source**: 3f04bf5 (with android/terminal D28)
+- **Source**: 3f04bf5 (with android/terminal D28); 77d7f36 (the tmux notice)
 
 ### D16: A launch without a ready store resumes the import of the recorded distro
 - **What**: Without a ready store `startOrImport`, shared by `onCreate` and the restart that finishes Exit all, calls `start(Rootfs.importing(this))`, the distro the interrupted import recorded (android/setup D17), and the existing fallback to Alpine with `switch_failed` covers a resumed import that cannot download or import.
@@ -132,11 +133,11 @@
 - **Source**: 64a6107 (with kernel/process D38)
 
 ### D19: Bells and OSC 9/777 notifications reach the user per tab; clipboard writes go through the service
-- **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front posts nothing; clipboard writes from any tab set or clear the clipboard, with a toast only before Android 13.
+- **What**: A bell from the tab in front (`current` with the terminal Activity listening) goes to the listeners' `onBell`; otherwise bells, at most one per second per tab, and OSC 9/777 notifications become one notification per tab on a new `terminal` channel (ids from 200000 plus the tab's id), titled by OSC 777's title or the program's title with "Tab N" as subtext, opening that tab and removed when it is shown or closed; OSC 9/777 from the tab in front posts nothing; clipboard writes from any tab set or clear the clipboard, with a toast only before Android 13, and clipboard reads from the tab in front go to the listeners' `onClipboardRead` while reads from other tabs are answered empty.
 - **Why**: Bells and notifications matter most when the user is not looking at the tab, which only the service knows, and the clipboard needs a context that outlives the Activity.
-- **Tradeoffs**: A notification asked for by the tab in front is dropped; the system may bundle tab notifications with the ongoing one, so the first tap expands the bundle; on Android 13 and later, background tabs can overwrite the clipboard with only the system's own confirmation.
+- **Tradeoffs**: A notification asked for by the tab in front is dropped; the system may bundle tab notifications with the ongoing one, so the first tap expands the bundle; on Android 13 and later, background tabs can overwrite the clipboard with only the system's own confirmation, and a background tab reading the clipboard gets nothing.
 - **Watch out**: A bell flood still costs one main-thread post per console read, and the per-second limit is per tab, so many tabs can each notify.
-- **Source**: d89b5fa (with android/terminal D36)
+- **Source**: d89b5fa (with android/terminal D36); 600700b (clipboard reads)
 
 ### D20: The poll hands the guest's changed directories to the NOPASSWD refresh
 - **What**: After `Documents.dirsChanged`, the poll's worker calls `Rootfs.dirsChanged` with the same directories (android/setup D19), ignoring its failures.
@@ -145,7 +146,23 @@
 - **Watch out**: A refresh process counts as a guest process for the service's exit check while it runs.
 - **Source**: d03c9b6
 
+### D21: Program statuses and finished commands notify through the tab's notification
+- **What**: `notifyStatus` posts the tab's notification (D19's) once per status for blocked, done and error, titled by the record's or the tab's title with the status in words and its message, and withdraws it when the status goes without the user unless a bell or OSC 9/777 replaced it (`statusNotified`); `onCommandFinished` posts it for a command of at least 10 s in a tab not in front ("Command succeeded", "Command failed" or "Command finished", the time taken in ICU's short units and a failure's exit code), replacing a status notification; in the tab in front done and error count as seen at once, and listeners hear `onTabStatus`.
+- **Why**: A phone shows one tab at a time, so a program waiting for the user, finishing or failing, or a long command ending in another tab or with the app away, goes unnoticed, and only the service knows which tab the user sees.
+- **Tradeoffs**: Statuses, finished commands, bells and OSC 9/777 share one notification per tab and replace each other; no setting turns command notices off, and their text cannot name the command; the record's app name is never shown.
+- **Watch out**: CLIs that send both OSC 9 and 7501 for one event alert twice, the withdrawal relies on every other path that posts the tab's notification clearing `statusNotified` first, and command notices depend on prompt marks that only the bash and ash login shells send (android/setup D20).
+- **Source**: 22c8ab0, 5256ae2
+
+### D22: The service keeps the cursor settings and gives them to every session
+- **What**: `cursor_style` (Ghostty's names block, bar and underline) and `cursor_blink` live in the `settings` preferences; `setCursorStyle` and `setCursorBlink` save them and call `cursorChanged`, which sets every session's values and tells listeners, and `createSession` gives each new or restored session the current ones (android/terminal D47).
+- **Why**: The cursor setting must reach every tab, background and restored ones included, which a static read by `MainActivity` for the shown view, as for `fill_wide` (D11), would not.
+- **Tradeoffs**: A change sets every tab's terminal under its lock on the main thread.
+- **Watch out**: A session not started yet only stores the values until its terminal exists.
+- **Source**: 77d7f36
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
 - ~~A tab's name among D5's saved fields, saved again after each rename (2af55e2, 89ad551)~~ → dropped from **D5** in 7c35183 (2026-11-05), with renaming gone from the terminal
+- ~~The trim releases only the kernel's caches (D4, round 37)~~ → replaced by **D4** in 3f45ad0 (2026-11-10)
+- ~~Restored tabs show their old scrollback as plain text, losing colours (D5's tradeoff, round 194)~~ → replaced by **D5** in 600700b (2026-11-10, no SUPERSEDES declared)
