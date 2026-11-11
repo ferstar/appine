@@ -126,6 +126,8 @@ pub(crate) enum Entry {
     /// The time namespace offsets for children ([`crate::nsproxy::TimeNs`]), only under
     /// `/proc/<pid>`.
     TimensOffsets,
+    /// The syscall the thread is waiting in ([`crate::task::KernelEntry`]).
+    Syscall,
 }
 
 /// Namespace kinds (the entries in `/proc/<pid>/ns`); every kind can be created by clone or
@@ -228,13 +230,14 @@ impl NsKind {
     }
 }
 
-const ENTRIES: [(&[u8], Entry); 33] = [
+const ENTRIES: [(&[u8], Entry); 34] = [
     (b"auxv", Entry::Auxv),
     (b"stat", Entry::Stat),
     (b"status", Entry::Status),
     (b"statm", Entry::Statm),
     (b"cmdline", Entry::Cmdline),
     (b"comm", Entry::Comm),
+    (b"syscall", Entry::Syscall),
     (b"environ", Entry::Environ),
     (b"limits", Entry::Limits),
     (b"children", Entry::Children),
@@ -873,11 +876,12 @@ const NET_CONF6: &[u8] = b"sys/net/ipv6/conf/";
 /// The entries in `/proc/<pid>/task/<tid>`: the thread's own, and those the same as the
 /// process's (debuggers read a thread's maps and mem; `oom_score_adj` there sets the process's, as
 /// Linux's tid_base_stuff has it).
-const TASK_ENTRIES: [Entry; 29] = [
+const TASK_ENTRIES: [Entry; 30] = [
     Entry::Stat,
     Entry::Status,
     Entry::Statm,
     Entry::Comm,
+    Entry::Syscall,
     Entry::Cmdline,
     Entry::Environ,
     Entry::Limits,
@@ -959,7 +963,8 @@ impl<'a> View<'a> {
     }
 
     /// The thread a pid directory stands for: the thread itself when `pid` is a thread id, so the
-    /// main thread for a process (or any live thread once it has exited).
+    /// main thread for a process, and none once that has exited (procfs then shows it as a
+    /// zombie).
     fn leader(&self, pid: Tid) -> Option<Rc<Task>> {
         let g = self.group(pid)?;
         let threads = g.borrow().threads.clone();
@@ -1667,13 +1672,18 @@ impl View<'_> {
     /// namespaces of thread or process `pid` (Linux's `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`
     /// on the thread, or the main thread).
     fn may_read(&self, pid: Tid) -> bool {
+        self.may_read_as(pid, &self.reader())
+    }
+
+    /// [`View::may_read`] with the credentials `reader`.
+    fn may_read_as(&self, pid: Tid, reader: &Cred) -> bool {
         self.group(pid).is_some_and(|g| {
             let g = g.borrow();
             g.tgid == self.tgid
                 || self
                     .k
                     .cred_of(pid)
-                    .is_some_and(|c| self.reader().may_ptrace(&c, g.dump_scope(), true))
+                    .is_some_and(|c| reader.may_ptrace(&c, g.dump_scope(), true))
         })
     }
 
@@ -1810,7 +1820,7 @@ pub(crate) fn stat(ps: &View<'_>, node: &PseudoNode) -> Result<Stat, Errno> {
         }
         (_, PseudoNode::Static(p)) if recorded(p).is_some() => recorded(p).map_or(0o444, |e| e.1),
         (_, n) if writable(n) => 0o644,
-        (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv)) => 0o400,
+        (_, PseudoNode::Entry(_, _, Entry::Pagemap | Entry::Auxv | Entry::Syscall)) => 0o400,
         (_, PseudoNode::Global(Global::Kmsg)) => 0o400,
         _ => 0o444,
     };
@@ -2610,6 +2620,44 @@ pub(crate) fn content(ps: &View<'_>, mnt: MountId, node: &PseudoNode) -> Result<
                         (fs.root.clone(), fs.mnt_ns.id)
                     };
                     return Ok(mounts(ps, &root, ns, *e == self::Entry::MountInfo));
+                }
+                // Linux's proc_pid_syscall: "running" for a thread running guest code or kernel
+                // code, and for one waiting in the kernel (or the reader itself) the syscall
+                // number with x0 to x5, sp and pc, or a negative number with sp and pc outside a
+                // syscall. An exited main thread (a zombie task on Linux) has no stack left: -1
+                // with zeros; another thread that has gone is released at once (ESRCH). Like
+                // lock_trace, it needs ptrace access to the thread itself, checked when read (open
+                // generates nothing) with the reader's own credentials rather than the opener's
+                self::Entry::Syscall => {
+                    let me = ps.k.cred_of(ps.tid).unwrap_or_else(Cred::root);
+                    let thread = tid.unwrap_or(*pid);
+                    let g = ps.group(*pid).ok_or(Errno::ESRCH)?;
+                    if task.is_none() && thread != g.borrow().tgid {
+                        return Err(Errno::ESRCH);
+                    }
+                    if !ps.may_read_as(thread, &me) {
+                        return Err(Errno::EPERM);
+                    }
+                    let own = thread == ps.tid;
+                    let running = task.is_some()
+                        && !own
+                        && state_of(ps, &g.borrow(), *pid, *tid).0 == 'R';
+                    match task.as_deref().and_then(|t| t.sync.entry.get()) {
+                        _ if running => "running\n".to_owned(),
+                        Some([nr, a0, a1, a2, a3, a4, a5, sp, pc]) => {
+                            // The number is the 32-bit w8, as arm64's syscallno is
+                            let nr = nr as u32 as i32;
+                            if nr < 0 {
+                                format!("{nr} 0x{sp:x} 0x{pc:x}\n")
+                            } else {
+                                format!(
+                                    "{nr} 0x{a0:x} 0x{a1:x} 0x{a2:x} 0x{a3:x} 0x{a4:x} 0x{a5:x} \
+                                     0x{sp:x} 0x{pc:x}\n"
+                                )
+                            }
+                        }
+                        None => "-1 0x0 0x0\n".to_owned(),
+                    }
                 }
                 self::Entry::OomScore => {
                     let g = ps.group(*pid).ok_or(Errno::ESRCH)?;

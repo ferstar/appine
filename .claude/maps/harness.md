@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: difftest's -R retry of failed cases, used by full.yml)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: difftest's -R retry of failed cases, used by full.yml, and the gtest runner's dump of a hung test's threads)
 
 ## Responsibilities
 
@@ -238,7 +238,13 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   its output in a file (a crash or hang, a test ignoring `SIGTERM`, a child keeping the output open
   or a test reading stdin does not take the rest with it), printing `<test> ok|failed|skipped|exit
   <code>`, with core files off, the shell's crash reports filtered out and `/tmp` set back to 1777
-  at the end.
+  at the end. Tests stay in the foreground (a background one would inherit `SIGINT` and `SIGQUIT`
+  ignored); a background watcher checks the current test (named in `/tmp/gtest.cur`) every 5 s,
+  and one running 45 to 50 s gets one `hang:` line per thread of its process tree (found by the
+  `--gtest_filter=<test>` command line): pid, tid, name, state and its
+  `/proc/<pid>/task/<tid>/syscall`. They follow the test's line only when the timeout killed it
+  (exit 137), so a slow test that passes prints the same on both sides; on the native side Yama
+  makes most of those files unreadable, as the watcher is no ancestor.
 - Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
   (it fails on the native side because of docker, the VM or a newer kernel, answers differently

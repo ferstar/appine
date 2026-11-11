@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: registry additions, the watchdog's log record, failed host spawns, fast-path deadline hand-overs, the exec, ns and futex split, then CPU-clock timers last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `TaskSync`'s kernel-entry record for `/proc/<pid>/syscall`)
 
 ## Responsibilities
 
@@ -55,7 +55,10 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   that other threads read, for procfs); thread-private `TaskState` (address space, fd table and
   `FsContext`, each shared or not per clone flags; thread group; alternate stack; `clear_child_tid`;
   vfork completion; restart block; `fast_sleep`).
-- `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mmu` shootdowns).
+- `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mmu` shootdowns),
+  and `KernelEntry`: atomics holding the syscall number (-1 for any other exit), x0 to x5, sp and
+  pc the thread last entered the kernel with, valid until it runs guest code again; procfs reads
+  it for `/proc/<pid>/syscall`.
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie` / `leader_exit`, `exit_signal`, own and
@@ -176,7 +179,8 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 ### Run loop
 
-- Each pass: let the periodic checks resume, mark the thread in guest code, act on generation
+- Each pass: let the periodic checks resume, mark the thread in guest code (also clearing its
+  `KernelEntry`, which every exit records before the fast path runs), act on generation
   changes (a new code space re-attaches the translator, a TLB generation flushes the TLB, a code
   generation invalidates translations), then run: `Cpu::step` while single-stepping, the
   translator when attached and no hardware breakpoints are set, else `Cpu::run`.

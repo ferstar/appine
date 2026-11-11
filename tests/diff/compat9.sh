@@ -9,7 +9,11 @@
 # triage's POSIX timers on the CPU clock of a thread or process that has ended; and getsockopt's
 # SO_GET_FILTER, whose optlen counts classic BPF instructions of 8 bytes (Linux's sk_get_filter):
 # 0 asks for the count, fewer than the program has is EINVAL, and the program comes back whole
-# with optlen its count (a UDP socket, as TCP needs CAP_NET_ADMIN on newer kernels)
+# with optlen its count (a UDP socket, as TCP needs CAP_NET_ADMIN on newer kernels); and
+# /proc/<pid>/syscall (Linux's proc_pid_syscall): the reader's own read, a thread waiting in read,
+# "running" for one running, ESRCH once that thread has gone, -1 with sp and the svc's pc for one
+# stopped by a signal (signal delivery forgets the syscall), -1 with zeros for a zombie, mode 0400,
+# and ptrace access checked when read with the reader's own credentials
 set -e
 cd /tmp
 cat > small.c <<'C'
@@ -358,3 +362,210 @@ C
 gcc -O1 -o getfilter getfilter.c
 ./getfilter
 rm -f getfilter getfilter.c
+
+cat > procsyscall.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int fds[2];
+static char tbuf[16];
+static volatile pid_t reader_tid, spinner_tid;
+static volatile int spin = 1;
+
+/* A line of /proc/.../syscall: the number and the other fields (n counts them all), or the
+   error at open or read */
+struct line {
+    int n;
+    long long nr;
+    unsigned long long v[8];
+    char err[64];
+};
+
+static struct line parse(const char *text)
+{
+    struct line l = {0};
+    if (strcmp(text, "running\n") == 0) {
+        strcpy(l.err, "running");
+        return l;
+    }
+    l.n = sscanf(text, "%lld %llx %llx %llx %llx %llx %llx %llx %llx", &l.nr, &l.v[0], &l.v[1],
+                 &l.v[2], &l.v[3], &l.v[4], &l.v[5], &l.v[6], &l.v[7]);
+    return l;
+}
+
+static struct line get(const char *path)
+{
+    struct line l = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        snprintf(l.err, sizeof l.err, "open: %s", strerror(errno));
+        return l;
+    }
+    char text[256] = {0};
+    ssize_t r = read(fd, text, sizeof text - 1);
+    int e = errno;
+    close(fd);
+    if (r < 0) {
+        snprintf(l.err, sizeof l.err, "read: %s", strerror(e));
+        return l;
+    }
+    return parse(text);
+}
+
+/* Waits until the state in the stat file at path is s */
+static void wait_state(const char *path, char s)
+{
+    for (int i = 0; i < 500; i++) {
+        char b[512] = {0};
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            read(fd, b, sizeof b - 1);
+            close(fd);
+        }
+        char *p = strrchr(b, ')');
+        if (p && p[2] == s)
+            return;
+        usleep(10000);
+    }
+    printf("%s never became %c\n", path, s);
+}
+
+static void *reader(void *a)
+{
+    (void)a;
+    reader_tid = gettid();
+    read(fds[0], tbuf, 7);
+    return 0;
+}
+
+static void *spinner(void *a)
+{
+    (void)a;
+    spinner_tid = gettid();
+    while (spin)
+        ;
+    return 0;
+}
+
+int main(void)
+{
+    char path[64], stat_path[64];
+    struct stat st;
+    stat("/proc/self/syscall", &st);
+    printf("mode %o\n", (unsigned)st.st_mode);
+
+    /* The reader itself is in its read: the descriptor, buffer and count, sp on its stack */
+    int local = 0;
+    int fd = open("/proc/self/syscall", O_RDONLY);
+    char text[256] = {0};
+    ssize_t r = read(fd, text, 200);
+    close(fd);
+    struct line l = parse(text);
+    unsigned long long sp = l.v[6];
+    printf("self: %d, %d fields, nr %lld, fd %d, buffer %d, count %llu, sp near %d\n", r > 0, l.n,
+           l.nr, l.v[0] == (unsigned)fd, l.v[1] == (unsigned long)text, l.v[2],
+           sp < (unsigned long)&local && (unsigned long)&local - sp < 65536);
+
+    /* A thread waiting in read on a pipe, in the process directory's task entry */
+    pipe(fds);
+    pthread_t t;
+    pthread_create(&t, 0, reader, 0);
+    while (!reader_tid)
+        usleep(1000);
+    snprintf(stat_path, sizeof stat_path, "/proc/self/task/%d/stat", reader_tid);
+    wait_state(stat_path, 'S');
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", reader_tid);
+    l = get(path);
+    printf("waiting thread: %d fields, nr %lld, fd %d, buffer %d, count %llu, sp %d, pc %d\n", l.n,
+           l.nr, l.v[0] == (unsigned)fds[0], l.v[1] == (unsigned long)tbuf, l.v[2], l.v[6] != 0,
+           l.v[7] != 0);
+    write(fds[1], "go", 2);
+    pthread_join(t, 0);
+
+    /* A thread running guest code */
+    pthread_create(&t, 0, spinner, 0);
+    while (!spinner_tid)
+        usleep(1000);
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", spinner_tid);
+    l = get(path);
+    printf("spinning thread: %s\n", l.err);
+    int gone = open(path, O_RDONLY);
+    spin = 0;
+    pthread_join(t, 0);
+    /* Once the thread has gone (Linux releases it at once), its open file finds nothing */
+    snprintf(stat_path, sizeof stat_path, "/proc/self/task/%d", spinner_tid);
+    for (int i = 0; i < 500 && access(stat_path, F_OK) == 0; i++)
+        usleep(10000);
+    r = read(gone, text, 200);
+    printf("thread gone: %s\n", r < 0 ? strerror(errno) : "read");
+    close(gone);
+
+    /* A child waiting in read, then stopped by SIGSTOP: signal delivery forgets the syscall
+       (forget_syscall), and the pc goes back to the svc to restart it */
+    int p2[2];
+    pipe(p2);
+    pid_t c = fork();
+    if (c == 0) {
+        char b[4];
+        read(p2[0], b, 3);
+        _exit(0);
+    }
+    snprintf(stat_path, sizeof stat_path, "/proc/%d/stat", c);
+    wait_state(stat_path, 'S');
+    snprintf(path, sizeof path, "/proc/%d/syscall", c);
+    struct line before = get(path);
+    kill(c, SIGSTOP);
+    int status;
+    waitpid(c, &status, WUNTRACED);
+    struct line after = get(path);
+    printf("child waiting: %d fields, nr %lld, count %llu\n", before.n, before.nr, before.v[2]);
+    printf("child stopped: %d fields, nr %lld, same sp %d, pc back %lld\n", after.n, after.nr,
+           after.v[0] == before.v[6], (long long)(before.v[7] - after.v[1]));
+    kill(c, SIGCONT);
+    kill(c, SIGKILL);
+    waitpid(c, &status, 0);
+
+    /* A zombie child has no stack left */
+    c = fork();
+    if (c == 0)
+        _exit(0);
+    snprintf(stat_path, sizeof stat_path, "/proc/%d/stat", c);
+    wait_state(stat_path, 'Z');
+    snprintf(path, sizeof path, "/proc/%d/syscall", c);
+    l = get(path);
+    printf("zombie: %s%d fields, nr %lld, sp %llx, pc %llx\n", l.err, l.n, l.nr, l.v[0], l.v[1]);
+    waitpid(c, &status, 0);
+
+    /* Access is checked when read, with the reader's own credentials: a descriptor root opened
+       on its own syscall file is EPERM to read once the reader is nobody */
+    fd = open("/proc/self/syscall", O_RDONLY);
+    fflush(stdout);
+    c = fork();
+    if (c == 0) {
+        setuid(65534);
+        r = read(fd, text, 200);
+        printf("read as nobody: %s\n", r < 0 ? strerror(errno) : "read");
+        l = get("/proc/1/syscall");
+        printf("open as nobody: %s\n", l.err);
+        fflush(stdout);
+        _exit(0);
+    }
+    waitpid(c, &status, 0);
+    r = read(fd, text, 200);
+    printf("read as root: %s\n", r > 0 ? "read" : strerror(errno));
+    close(fd);
+    return 0;
+}
+C
+gcc -O1 -pthread -o procsyscall procsyscall.c
+./procsyscall
+rm -f procsyscall procsyscall.c

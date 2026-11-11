@@ -34,6 +34,56 @@ pub(crate) struct TaskSync {
     pub in_guest: AtomicBool,
     /// Kicks the thread's Cpu.
     pub kicker: Kicker,
+    /// Why the thread is in the kernel, for `/proc/<pid>/syscall`.
+    pub entry: KernelEntry,
+}
+
+/// What a thread entered the kernel with and has not yet gone back to guest code from, as Linux's
+/// `task_current_syscall` sees it: the syscall number (-1 for a fault, a kick or another
+/// exception), x0 to x5 and sp and pc at the entry. Published with atomics, since the no-BKL path
+/// enters syscalls too, and only while the thread is in the kernel.
+#[derive(Default)]
+pub(crate) struct KernelEntry {
+    inside: AtomicBool,
+    regs: [AtomicU64; 9],
+}
+
+impl KernelEntry {
+    /// The thread enters the kernel with the registers `state`, for a syscall when `svc`.
+    fn enter(&self, state: &CpuState, svc: bool) {
+        let x = &state.x;
+        let nr = if svc { x[8] } else { u64::MAX };
+        let regs = [nr, x[0], x[1], x[2], x[3], x[4], x[5], state.sp, state.pc];
+        for (r, v) in self.regs.iter().zip(regs) {
+            r.store(v, Ordering::Relaxed);
+        }
+        self.inside.store(true, Ordering::Release);
+    }
+
+    /// Linux's `forget_syscall`, which signal delivery does first: the thread is still in the
+    /// kernel but no longer in a syscall, and `state`'s pc is where it goes back to (the svc
+    /// again when the syscall restarts). A thread stopped by a signal shows that.
+    pub fn forget_syscall(&self, state: &CpuState) {
+        self.enter(state, false);
+    }
+
+    /// The thread runs guest code again.
+    fn leave(&self) {
+        if self.inside.load(Ordering::Relaxed) {
+            self.inside.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// The syscall number (`u64::MAX` outside a syscall), x0 to x5, sp and pc the thread entered
+    /// the kernel with, or None while it runs guest code.
+    pub fn get(&self) -> Option<[u64; 9]> {
+        if !self.inside.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(std::array::from_fn(|i| {
+            self.regs[i].load(Ordering::Relaxed)
+        }))
+    }
 }
 
 /// The root directory, current directory and file-creation mask (the part `CLONE_FS` shares),
@@ -285,6 +335,7 @@ impl Task {
             sync: Arc::new(TaskSync {
                 in_guest: AtomicBool::new(false),
                 kicker: cpu.kicker(),
+                entry: KernelEntry::default(),
             }),
             event: Arc::new(event),
             res: RefCell::new(res),
@@ -623,6 +674,7 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         // Mark first, then read the generations, pairing with Mm::sync's "change the generation
         // first, then look at the flags"
         sync.in_guest.store(true, Ordering::SeqCst);
+        sync.entry.leave();
         let now = load(&generations);
         // The address space has left its shared-translation group (crate::mm::CodeGroup): switch
         // to its own translations. Leaving did a shootdown, so this thread will not run the
@@ -687,9 +739,12 @@ fn run(shared: &Arc<Shared>, tid: Tid, cpu: &mut Cpu, reused: bool) {
         // memory it is still marked as running guest code. A kernel-layer bug ends only this
         // process, as on the locked path (crate::bug): the frames unwound through here hold no
         // Rc; it used to unwind all the way to thread_main and terminate the whole app
-        let done = match exit {
-            Exit::Svc { .. } => crate::bug::catch(|| fast.syscall(shared, &task, cpu)),
-            _ => Some(false),
+        let svc = matches!(exit, Exit::Svc { .. });
+        sync.entry.enter(cpu.state(), svc);
+        let done = if svc {
+            crate::bug::catch(|| fast.syscall(shared, &task, cpu))
+        } else {
+            Some(false)
         };
         sync.in_guest.store(false, Ordering::SeqCst);
         match done {

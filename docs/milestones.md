@@ -263,6 +263,8 @@ In `netmap`, Appine's side failed once on CI on 2026-11-10 (the nightly full tes
 
 In `namespaces`, Appine's side failed once on CI on 2026-11-11 (a manual full run, one lane): `unshare -p -f` whose process 1 exits 0.5 s after starting `sh -c "sleep 100 & sleep 100 & wait"` did not end within its 20 s `timeout` (`Terminated`, exit 143 instead of 7). On the development VM the whole group passed 20 of 20 runs (four at a time), the command 40 of 40 runs, and with process 1 exiting 0 to 300 ms after the start 270 of 270 runs (the 120 of them that looked found no `sleep` left behind). Presumably process 1 exited while the inner shell was still forking on the slower runner, and something in the pid namespace's teardown then waited for a process that was not killed; the cause was not investigated.
 
+In `gvisor-process` and `gvisor-fs`, Appine's side of a test was killed by the runner's 60 s timeout (`exit 137`) in two manual full runs on CI on 2026-11-11: `ExecTest.OneEnv` and `ExecTest.InterpreterScriptTrailingWhitespace` in the first, `FcntlLockTest.SetLockDroppedOnClose` in the second. Each forks and execs a child and waits for it; neither run's appine stderr had a BKL watchdog report, so no syscall held the BKL that long, which points to a wait that was never woken. They did not recur on the development VM. Since then the gtest runner follows a test killed by its timeout with each thread of its processes and the syscall it waits in (`hang:` lines, from Appine's `/proc/<pid>/task/<tid>/syscall`), which full.yml uploads with the failed outputs.
+
 
 ## R1 measurements
 

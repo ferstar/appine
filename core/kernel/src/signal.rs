@@ -1082,6 +1082,7 @@ pub(crate) fn deliver(cx: &mut Cx<'_>, cpu: &mut Cpu, syscall: bool) -> Flow {
             st.x[0] = st.orig_x0;
             st.pc -= 4;
         }
+        cx.task.sync.entry.forget_syscall(cpu.state());
     }
     if cx.task.killed.get() {
         return Flow::Exit;

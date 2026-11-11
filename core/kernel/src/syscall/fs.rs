@@ -856,9 +856,14 @@ fn open_pseudo(
         pseudo::open_unwritable(&node, accmode != oflags::O_RDONLY)?;
     }
     // Network sysctls fail only when read (an unset stable_secret is EIO, Linux's
-    // proc_sys_call_handler): open starts with empty contents and the first read regenerates them
+    // proc_sys_call_handler): open starts with empty contents and the first read regenerates them.
+    // So does /proc/<pid>/syscall, which shows the thread as it is when read (/proc/self/syscall
+    // shows the read) and checks ptrace access then
     let mut fresh = true;
     let data = if pseudo::unreadable(&node) {
+        Vec::new()
+    } else if matches!(node, PseudoNode::Entry(_, _, pseudo::Entry::Syscall)) {
+        fresh = false;
         Vec::new()
     } else {
         match pseudo::content(&view, mnt, &node) {

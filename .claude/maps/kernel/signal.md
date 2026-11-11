@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: sending; frames, siginfo; ptrace credentials; zombies, core_pattern; adjtimex; signalfd; exception reports; ENOSYS, stubs; watchdog; host vDSO; `errno.rs` and `debug.rs` last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: delivery forgets the syscall it follows, for `/proc/<pid>/syscall`)
 
 ## Responsibilities
 
@@ -122,7 +122,9 @@ credentials), procfs.
 ### Delivery
 
 - `deliver` runs before every return to guest code. For an interrupted syscall it first rewinds
-  (`x0 = orig_x0`, PC back to the `svc`).
+  (`x0 = orig_x0`, PC back to the `svc`); after a syscall it then forgets it, as Linux's
+  `forget_syscall`, so a thread stopped here shows -1, its sp and the (rewound) pc in
+  `/proc/<pid>/syscall`.
 - Loop: wait while the group is stopped (and while frozen by a cgroup), handle ptrace group-stop
   and trap checks, then dequeue — the thread's own pending before the group's, synchronous signals
   (SEGV, BUS, ILL, TRAP, FPE, SYS) first, then the lowest number — and offer a ptrace
