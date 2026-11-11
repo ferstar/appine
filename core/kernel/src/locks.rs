@@ -1,4 +1,5 @@
-//! fcntl(2) record locks: traditional POSIX locks and OFD locks (open file description locks).
+//! fcntl(2) record locks (the kernel/locks map): traditional POSIX locks and OFD locks (open file
+//! description locks).
 //!
 //! Locks are recorded by inode, and each lock has one owner: a POSIX lock belongs to an fd table
 //! (shared by all threads of one process), and closing any fd in that table that refers to the

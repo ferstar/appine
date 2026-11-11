@@ -170,7 +170,7 @@ loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
 - read, write, readv and writev of the device move one whole message (up to 8 MiB); splice into a
   pipe takes one whole request (the device's own `O_NONBLOCK`, EIO when the pipe lacks room, the
   request then lost as in Linux), and splice from a pipe takes a reply of the length asked, its
-  header's length set to it (`kernel/vfs`).
+  header's length set to it (`kernel/pipe`).
 - poll: always writable, readable while a request or an interrupt for a held request waits,
   `POLLERR` once aborted or unattached.
 - `FUSE_DEV_IOC_CLONE` attaches an unattached device file to the connection of another, both
@@ -411,7 +411,7 @@ loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`),
   start; any error but ENOENT of a lookup ends the syscall even where the walk would tolerate it.
 - **Small fidelity gaps:** fstat asks `FUSE_GETATTR` without the open file's handle; seeking a
   FUSE directory to its end is EINVAL; spliced replies have their header length replaced
-  (`kernel/vfs`).
+  (`kernel/pipe`).
 
 ## Open questions
 

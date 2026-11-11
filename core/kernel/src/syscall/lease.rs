@@ -1,4 +1,4 @@
-//! File leases (`F_SETLEASE`, `F_GETLEASE`).
+//! File leases (`F_SETLEASE`, `F_GETLEASE`; the kernel/locks map).
 //!
 //! A lease hangs off an open file and is registered by inode in
 //! [`Kernel::leases`](crate::kernel::Kernel). When another open file is about to open this inode in

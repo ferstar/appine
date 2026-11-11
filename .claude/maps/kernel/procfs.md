@@ -195,7 +195,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   its own table); `fd/N` links show the
   path stored at open with ` (deleted)` appended when nlink is 0; `fdinfo/N` has `pos`, `flags`
   (octal, with `O_CLOEXEC`), `mnt_id`, `ino`, the `lock:` lines of the locks held through that
-  open file (`kernel/vfs`'s `fd_locks`; only for files or fd tables that have taken locks) and
+  open file (`kernel/locks`'s `fd_locks`; only for files or fd tables that have taken locks) and
   per-kind lines (eventfd count, inotify watches, epoll `tfd:` lines, timerfd clock and times,
   signalfd mask, pidfd pids).
 - `exe` reads as the program's path recorded at execve, with ` (deleted)` once the file's last
@@ -239,7 +239,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   list (`nodev fuse` included, no `fuseblk` or `fusectl`); `cmdline` is `appine`; `cgroups` from the cgroup tree. `mounts` and `net` link into
   `self`. `swaps` is the host's file when the app may read it (as meminfo's swap lines are the
   host's), otherwise Linux's header line alone; `locks` lists every lock and lease
-  (`kernel/vfs`'s `proc_locks`) with pids in the instance's pid namespace.
+  (`kernel/locks`'s `proc_locks`) with pids in the instance's pid namespace.
 - Absent: `partitions`, `devices`, `sys/fs/file-nr`, `protected_regular`/`protected_fifos`,
   Yama.
 - Sysctl scoping: SysV IPC limits and `fs/mqueue/*` per the writer's IPC namespace; `hostname`/
@@ -416,9 +416,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
-  `loadavg`, the VFS (`reach`, `path_of`, `proc_locks` and `fd_locks`), the loop devices'
-  `Loops` (`kernel/loop`), the mount table (`mounts_from`, devpts options; `kernel/mount`), the
-  OOM killer (`proc_score`), unimplemented-path counting (`stub::record`).
+  `loadavg`, the VFS (`reach`, `path_of`), the locks (`proc_locks` and `fd_locks`, `kernel/locks`),
+  the loop devices' `Loops` (`kernel/loop`), the mount table (`mounts_from`, devpts options;
+  `kernel/mount`), the OOM killer (`proc_score`), unimplemented-path counting (`stub::record`).
 - Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
   `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine
   (`guest_hwcap*`, `guest_midr`).

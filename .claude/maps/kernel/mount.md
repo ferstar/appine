@@ -33,8 +33,9 @@ Outside the module:
   - the mount-flag checks in file operations;
   - what unlink and rename do to mount points;
   - `chroot`;
-  - the tmpfs and overlayfs instances and their options, though their option parsing and the
-    overlay node sweep sit in `syscall/mount.rs`.
+  - the tmpfs instances and their options, though their option parsing sits in `syscall/mount.rs`.
+- `kernel/overlay`: overlayfs instances, their options and the overlay node sweep, though the
+  option parsing and the sweep sit in `syscall/mount.rs`.
 - `kernel/fuse`: FUSE connections and their mount options.
 - `kernel/procfs`: the content of procfs, sysfs, devpts and cgroup2, the mountinfo text and the
   `fs.mount-max` sysctl file.
@@ -130,7 +131,7 @@ Outside the module:
   mount, strip `MS_MGC_VAL`, `MS_NOUSER` is `EINVAL`, `may_mount` (`CAP_SYS_ADMIN` in the user
   namespace owning the caller's mount namespace), then remount, bind, propagation, move, new mount.
 - New mounts: proc, devpts, sysfs, cgroup2, tmpfs (options in `kernel/vfs`'s tmpfs), mqueue,
-  overlay (`kernel/vfs`'s overlayfs), `fuse` and `fuse.<subtype>` (`kernel/fuse`); anything else
+  overlay (`kernel/overlay`), `fuse` and `fuse.<subtype>` (`kernel/fuse`); anything else
   `ENODEV`. A missing target is `ENOENT` from the walk before any check; then: no type `EINVAL`,
   unknown type `ENODEV`, the namespace capability checks and `mount_too_revealing` (`EPERM`), a
   point that cannot take a mount (`may_mount_on`: a nameless open file, a `/proc/<pid>/fd` or
@@ -311,8 +312,8 @@ Outside the module:
 
 - `kernel/vfs`:
   - walks and nodes;
-  - new tmpfs, overlay and FUSE instances (`new_tmpfs`, `new_overlay`, `new_fuse`) and tmpfs
-    reconfiguration;
+  - new tmpfs and FUSE instances (`new_tmpfs`, `new_fuse`) and tmpfs reconfiguration;
+- `kernel/overlay`: new overlayfs instances (`new_overlay`);
   - the fd tables that `in_use` and `writers` scan.
 - `kernel/loop`: loop devices' backing files (`Loops::backing_files`).
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.

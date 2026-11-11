@@ -1,5 +1,5 @@
-//! In-process pipes: pipe2's anonymous pipes and the store's named pipes (FIFOs; all opens of one
-//! inode share one pipe object).
+//! In-process pipes (the kernel/pipe map): pipe2's anonymous pipes and the store's named pipes
+//! (FIFOs; all opens of one inode share one pipe object).
 //!
 //! The buffer size defaults to 64 KiB as on Linux and can be changed with `F_SETPIPE_SZ`; writes
 //! of at most `PIPE_BUF` are atomic.

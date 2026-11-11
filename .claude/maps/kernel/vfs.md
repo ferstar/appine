@@ -1,11 +1,11 @@
 # kernel/vfs Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/vfs.md` for the paired decision history.
+> See `.claude/decisions/kernel/vfs.md` for the paired decision history (it still holds the decisions on mounts, inotify, AIO, loop devices, overlayfs, locks, pipes and xattrs made before they were split out).
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 36 claims checked by 3 independent verifiers — 26 confirmed and 10 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: mounts split out to kernel/mount, read-only write opens, splice out of a pipe, tmpfs recounts, host stdio readv, then inotify, AIO, timerfd and loop devices split out and wording condensed last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: read-only write opens, splice out of a pipe, tmpfs recounts, host stdio readv, then mounts, inotify, AIO, timerfd, loop devices, overlayfs, locks, pipes and xattrs split out and wording condensed)
 
 ## Responsibilities
 
@@ -16,29 +16,30 @@ store and the synthetic filesystems):
   search permission, `protected_symlinks`, magic links, openat2's `RESOLVE_*`;
 - mount and superblock flag checks in file operations, and what removing or renaming a mount point
   does;
-- tmpfs instances and their accounting; overlayfs instances, nodes and copy-up;
+- tmpfs instances and their accounting;
 - fd tables and open file descriptions, open flags, `fcntl`, data I/O on regular files (host
-  `pread`/`pwrite` without the BKL), `sendfile`/`copy_file_range`/`splice`;
+  `pread`/`pwrite` without the BKL), `sendfile`/`copy_file_range`;
 - clones sharing the store's objects, and giving a shared file an object of its own before it
   changes;
-- namespace and metadata syscalls and extended attributes;
-- pipes and FIFOs, advisory locks (`flock`, POSIX, OFD) and leases, device nodes and the
-  character devices;
+- namespace and metadata syscalls;
+- device nodes and the character devices;
 - calling the inotify hooks where Linux's fsnotify does, and each open file's `Opened` record.
 
-Root: `core/kernel/src/vfs/mod.rs` (except the mount table), `vfs/dev.rs`, `vfs/overlay.rs`,
-`fd.rs` (its `EventFd` and `TimerFd` are described by `kernel/poll`), `pipe.rs`, `locks.rs`,
-`syscall/fs.rs`, `syscall/xattr.rs`, `syscall/lease.rs`, and in `syscall/mount.rs` the tmpfs and
-overlay options and the overlay node sweep.
+Root: `core/kernel/src/vfs/mod.rs` (except the mount table and the overlay methods), `vfs/dev.rs`,
+`fd.rs` (its `EventFd` and `TimerFd` are described by `kernel/poll`), `syscall/fs.rs` (except its
+overlay functions, `flock`, the fcntl lock commands and the pipe, FIFO and splice code), and in
+`syscall/mount.rs` the tmpfs options.
 
-Outside the module: the mount table, mount syscalls and mount namespaces (`kernel/mount`); store
-semantics (`kernel/store`); FUSE connections, their node cache and the file syscalls on FUSE nodes
-(`kernel/fuse`, dispatched to from here); procfs/sysfs/cgroup2/devpts content (`kernel/procfs`);
-terminals (`kernel/tty`); sockets (`kernel/net`, `kernel/unix`); poll/epoll, eventfd and timerfd
-(`kernel/poll`); inotify instances, watches and event rules (`kernel/inotify`); native AIO
-(`kernel/aio`); loop devices (`kernel/loop`); message queues (`kernel/ipc`); the BKL and the no-BKL
-fast path (`kernel/process`); namespaces (`kernel/ns`); execve (`kernel/exec`); credentials and file
-capabilities (`kernel/cred`).
+Outside the module: the mount table, mount syscalls and mount namespaces (`kernel/mount`); overlayfs
+mounts, lookups, copy-up and its removal and rename (`kernel/overlay`, branched to from here);
+advisory locks and leases (`kernel/locks`); pipes, FIFOs and splice (`kernel/pipe`); extended
+attributes (`kernel/xattr`); store semantics (`kernel/store`); FUSE connections, their node cache
+and the file syscalls on FUSE nodes (`kernel/fuse`, dispatched to from here);
+procfs/sysfs/cgroup2/devpts content (`kernel/procfs`); terminals (`kernel/tty`); sockets
+(`kernel/net`, `kernel/unix`); poll/epoll, eventfd and timerfd (`kernel/poll`); inotify instances,
+watches and event rules (`kernel/inotify`); native AIO (`kernel/aio`); loop devices (`kernel/loop`);
+message queues (`kernel/ipc`); the BKL and the no-BKL fast path (`kernel/process`); namespaces
+(`kernel/ns`); execve (`kernel/exec`); credentials and file capabilities (`kernel/cred`).
 
 ## Key types
 
@@ -55,13 +56,6 @@ capabilities (`kernel/cred`).
   `Index`, `GroupAlloc`), the no-BKL resolver state, the executable cache, the namespaces, the
   overlay and FUSE tables and the mount event counter.
 - `TmpfsParams` / `Tmpfs` — options and usage (pages, inodes), counted lazily with a changed mark.
-- `Overlays` (`vfs/overlay.rs`) — `Instance`s by device number (upper root, the mounter's IDs, the
-  tmpfs instances its layers are in, `Options`) and `OvlNode`s by `OvlId` (Linux's overlay dentry:
-  parent and name, upper inode, lower inodes — every merged lower directory for a directory, the
-  topmost otherwise — `origin`, children looked up), plus orphans stamped with the syscall count
-  and the next sweep threshold. Ids are per kernel, never reused.
-- `overlay::Hold` — an open file's or running program's claim on an overlay node, in one static
-  table for every kernel in the process (a hold in another kernel can only delay a sweep).
 - `Cached` / `Pending` — the fast-path stat resolver without the BKL (reads the store's metadata
   cache under its read lock; 64-component stack), with the store inodes that are mount points.
 - `FdTable` — slots (`FileRef` and `cloexec`), the soft `RLIMIT_NOFILE`, `holds_locks`.
@@ -79,11 +73,7 @@ capabilities (`kernel/cred`).
   an object of its own.
 - `IoPath` — the route of one I/O call, chosen so no borrow of the open file is held during I/O
   (`Local`: regular files through `unlocked_io`, other local files while borrowed).
-- `Pipe` / `PipeEnd` — buffer, capacity, reader and writer counts, `writer_need`, EPOLLET
-  counters, `splicing`; FIFOs by inode in `Kernel::fifos` (weak).
 - `Kernel::unsharing` — inodes being given an object of their own, which other changes wait for.
-- `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, ranges, taker's pid, waiters),
-  `FlockHolder`, `Lease` (with its setter's pid).
 - `Device` — Null, Zero, Full, Random, Kmsg, LoopControl, Loop (`kernel/loop`'s; tty, ptmx, pts
   and `/dev/fuse` are routed before it).
 - `fs::Attrs` — what chmod, chown and utimensat act on: Store, Overlay, Pts, Anon (inode-less
@@ -93,22 +83,18 @@ capabilities (`kernel/cred`).
 
 - **Resolution**: `Vfs::resolve`, `walk`, `walk_resolve(…, follow, flags)`, `resolve_parent`,
   `resolve_parent_with`, `found_path`, `path_of`, `reach`; `Cached::stat` (fast path).
-- **Instances**: `new_tmpfs`, `tmpfs_*`, `new_overlay`, `overlay`, `overlay_stat`,
-  `overlay_readdir`, `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`,
-  `overlay_prefix`, `sweep_overlays`, `new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
+- **Instances**: `new_tmpfs`, `tmpfs_*`, `new_fuse`, `add_fuse_mount`, `fuse`/`fuse_mut`,
   `fuse_child`, `fuse_permission`. The mount table's methods and the mount syscalls are
-  `kernel/mount`'s.
-- **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `pipe2`,
-  `lseek`, `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
-  `copy_file_range`, `splice`/`tee`/`vmsplice`, `ftruncate`, `fallocate`, `memfd_create`; ioctls
+  `kernel/mount`'s, the overlay methods `kernel/overlay`'s.
+- **fds and I/O**: `openat`, `openat2`, `close`, `close_range`, `dup`/`dup3`, `fcntl`, `lseek`,
+  `read`/`write` and the vector and positional forms, `preadv2`/`pwritev2`, `sendfile`,
+  `copy_file_range`, `ftruncate`, `fallocate`, `memfd_create`; ioctls
   `FIOCLEX`/`FIONCLEX`/`FIONBIO`/`FIOASYNC`/`FIONREAD`/`FICLONE`/`FICLONERANGE`, random ioctls,
   and the dispatch of other ioctls by kind.
 - **Metadata**: `newfstatat`/`fstat`/`statx`, `statfs`/`fstatfs`, `fchmod*`, `fchown*`,
   `utimensat`, `truncate`, `faccessat`/`faccessat2`, `umask`, `mkdirat`, `mknodat`, `unlinkat`,
   `renameat2`, `linkat`, `symlinkat`, `readlinkat`, `getdents64`, `getcwd`, `chdir`/`fchdir`,
-  `chroot`, xattr calls.
-- **Locks**: `flock`, fcntl lock commands, `F_SETLEASE`/`F_GETLEASE`; `locks::closed`,
-  `lease::break_leases`; `locks::proc_locks`, `locks::fd_locks` (for `kernel/procfs`).
+  `chroot`.
 - **Devices**: `dev::ensure_dev_nodes` (store `/dev`, at import and every boot), `dev::populate`
   (boot `/dev` tmpfs), `Device::from_rdev`.
 - **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps),
@@ -218,92 +204,6 @@ capabilities (`kernel/cred`).
   boot instances start uncounted and charge nothing until the first recount. The mount's
   filesystem decides what is charged, so changes through an overlay never count against a tmpfs
   its upper layer is in.
-
-### overlayfs
-
-- mount(2) of type `overlay` follows 6.1's `ovl_parse_opt` and `ovl_fill_super`: options split at
-  unescaped commas, empty ones skipped, unknown ones or missing values `EINVAL`, the last of a
-  repeated one wins; `workdir`, `index` and `volatile` without `upperdir` ignored; conflicting
-  `metacopy`, `nfs_export`, `index`, `redirect_dir` and `userxattr` `EINVAL`, the accepted ones
-  changing nothing else. `lowerdir` is split first at unescaped colons (missing, an empty
-  component or over 500 `EINVAL`). Then upper layer and work directory: both or neither, non-empty,
-  upper not on a read-only mount, both on one mount, neither inside the other (`EINVAL`); without
-  an upper layer at least two lower layers (`EINVAL`); each lower layer then resolves, none inside
-  the upper layer or work directory (`ELOOP`). Each layer resolves from the caller's root and cwd,
-  following links, and must be a store directory on a mount of the caller's namespace with no
-  locked mount under it (`EINVAL`, also for synthetic or overlay directories;
-  `clone_private_mount`'s checks). The work directory gets an empty `work` (mode 0, the
-  mounter's; an old one removed) that nothing uses: copy-up builds in place in one store
-  transaction. An instance keeps the tmpfs instances its layers are in from being collected.
-- Without an upper layer it is read-only as a filesystem (`sb_readonly`): `ro` in mountinfo's
-  superblock options (the mount's own flags as given), read-only in `/proc/<pid>/mounts` and
-  statfs; every change is `EROFS` after creation's `EEXIST`, also through a bind remounted
-  read-write, and remounting it read-write is `EROFS`. Superblock options are `lowerdir`,
-  `upperdir`, `workdir` as given, then what differs from 6.1's defaults (`ovl_show_options`;
-  `xino` parsed, never shown), escaped as `seq_show_option` does.
-- Lookup (`ovl_lookup`): the upper inode, then each lower directory merged into the parent; a
-  whiteout (char 0:0) is `ENOENT`; a non-directory ends the search and hides what is below a
-  directory; an opaque directory (`trusted.overlay.opaque` = `y`, or `user.overlay.opaque` with
-  `userxattr`, in any layer) ends it after itself. One directory and name give one node, its
-  inodes refreshed on each lookup. Mounts inside a layer are not seen through the overlay.
-- Node lifetime: a node lasts while its name does. A removed name (unlink, rmdir, a replacing
-  rename) makes it an orphan no lookup finds; once 1024 orphans gather (then twice as many as the
-  last sweep left), the end of a syscall sweeps them (`sweep_overlays`): an orphan goes, with every
-  node below it, unless it or a node below is held (`Hold`), is a process's root or cwd, a mount's
-  root or point (detached ones too), watched by inotify, or was removed after another thread's
-  syscall began — unless that syscall waits only on files it holds (`waits_on_files_only`: I/O,
-  polls, child and signal waits, sleeps, futexes, locks, receives and accepts, fcntl, ioctl,
-  fsync, copy_file_range, IPC, AIO events), as `kernel/process` numbers syscalls. A sweep gives up
-  for the round when a task's resources or the inotify registry are borrowed. An instance and its
-  nodes go in `kernel/mount`'s `collect` once it has no mount.
-- readdir merges the layers' entries sorted by name (even from one layer), the highest layer's
-  entry per name, whiteouts hiding names below, each inode number the one stat shows. Stat is the
-  topmost inode's with the overlay's device number and the inode number of the lower inode a
-  directory, or a file with one link, was copied up from (in memory only); a merged directory
-  reports one link. Reads, readlink, exec, search permission and xattr reads use the topmost
-  inode; the overlay's own attributes (`trusted.overlay.*`, `user.overlay.*` with `userxattr`) are
-  `EOPNOTSUPP` to get or set (`ovl_own_xattr_get`/`_set`) and hidden from listings. statfs reports
-  overlayfs's magic with the store's capacity, even with the upper layer on a tmpfs.
-- Copy-up (`Overlays::upper_of`, `ovl_copy_up`): parents first, then the node as its topmost lower
-  inode is (directory; regular file sharing the lower object, as 6.1 clones with reflink; symlink;
-  special file), with mode (set-id bits too), owner, non-overlay attributes and times, in one store
-  transaction; the parent's times are put back. Sharing marks both inodes held, so a later write
-  open of either first gives it an object of its own; unlike `try_share`, copy-up does not check
-  for writers already holding the lower object. A non-directory then forgets its lower inodes; a
-  copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with
-  `O_TRUNC` or truncated to 0 is copied without data. chmod, chown, utimensat (`Attrs::Overlay`),
-  setxattr, removexattr, truncate and write opens check `EROFS` and permission on what the overlay
-  shows (the last two also `ETXTBSY` for a program run from the lower inode), copy up only then,
-  and change the upper inode. utimensat by fd goes by number, never through the open (possibly
-  lower) object.
-- Creating (`create_dir`, `create_in`): the directory is copied up, a whiteout of the name does not
-  count as existing and is replaced in the same transaction, and a directory made in its place is
-  opaque (`ovl_create_over_whiteout`); this covers open with `O_CREAT` (the new file is the
-  overlay's node, so it locks with later opens), mkdir, mknod, symlink, link (the file copied up
-  and linked there) and AF_UNIX bind (connect finds the upper inode). mknod of a whiteout through
-  an overlay is `EPERM` (`ovl_mknod`).
-- Removing (`unlink_overlay`, `Overlays::remove`; do_unlinkat's and do_rmdir's order, `may_delete`
-  on what the overlay shows, a mount of the caller's namespace on it `EBUSY`, rmdir of a directory
-  not shown empty `ENOTEMPTY`): the upper inode goes with the whiteouts left in a directory, and a
-  whiteout owned by the mounter replaces it when a lower layer has the name.
-- Renaming (`rename_overlay`, `Overlays::rename`; may_rename's checks on what the overlay shows,
-  mount points `EBUSY`, then `ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY` on the merged
-  view): a directory with lower layers (merged or lower only) is `EXDEV` (6.1 without
-  `redirect_dir`; with `RENAME_EXCHANGE` the destination too), so tools fall back to copying;
-  otherwise both sides are copied up and renamed in the upper layer, a whiteout at the new name or
-  left in a replaced directory is removed first, a whiteout is left at the old name when a lower
-  layer has it, and a directory moved into a merged one becomes opaque (with exchange, the other
-  too).
-- Opening goes through `open_store` on the topmost inode; a directory stays an overlay node for
-  getdents, fchdir and `*at` calls, and regular files, devices and FIFOs record the node in
-  `OpenFile::ovl`, so `OpenFile::node`, fchmod-like calls and `/proc/<pid>/fd` give the overlay
-  node; fstat of a regular file shows the node's inode number, of a device the node's stat, of a
-  FIFO its layer inode and attributes. `O_DIRECT` is decided by the mount's filesystem, so overlay
-  files pass it even with the upper layer on a tmpfs. A file opened before its copy-up switches to
-  the upper object on its next read, fstat, lseek or copy out (`follow_copy_up`,
-  `ovl_real_fdget`; a writable one marked `cow` while the upper file is held), keeping the lower
-  object open until close (`OpenFile::ovl_lower`). Locks key on the node (`lock_ino`), leases on
-  the store inode behind it.
 
 ### fd tables and open files
 
@@ -423,29 +323,6 @@ capabilities (`kernel/cred`).
   `RLIMIT_FSIZE` and the largest file size (`EFBIG`), overlap in one file `EINVAL`, negative
   positions `EINVAL`. `sendfile` rejects `O_APPEND` output other than a pipe (`EINVAL`,
   `do_splice_direct`).
-- `splice`, `tee` and `vmsplice` copy through buffers. One side of `splice` must be a pipe; data
-  leaves the pipe only after the write succeeds, and meanwhile every other consumer of that pipe
-  (read, readv, vmsplice, another splice out) waits whatever `O_NONBLOCK` says, as for Linux's pipe
-  lock; writers do not wait. Unknown flags `EINVAL`; a zero length returns 0 first in splice,
-  after the flags in tee, and in vmsplice after the flags, access mode and iovecs (a non-pipe fd
-  is `EBADF` only after that). splice checks access modes (`EBADF`), then its `EINVAL` cases (no
-  pipe, an `O_APPEND` output including FIFOs, kinds that cannot splice), then offsets on a pipe
-  (`ESPIPE`); an offset with an AF_UNIX stream input is ignored for the read and written back
-  advanced, on other unseekable inputs `ESPIPE` only after the wait for room. `/dev/fuse` splices
-  one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
-  room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
-  fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
-  see).
-- When splice waits follows 6.1: between two pipes and for tee, for data (going on at end of file)
-  and then room, unless `SPLICE_F_NONBLOCK` or either end's `O_NONBLOCK`, then moving or copying
-  what is there and fits (splice waits again if a race took it, tee returns 0); from a pipe, for
-  data unless `SPLICE_F_NONBLOCK` or the input's `O_NONBLOCK`, writing as the output's own
-  `O_NONBLOCK` says; into a pipe, for room unless `SPLICE_F_NONBLOCK` or the output's
-  `O_NONBLOCK` (`EPIPE` with `SIGPIPE` without readers), reading at most the room as the input's
-  `O_NONBLOCK` says, except that an AF_UNIX stream socket also stops waiting for the splice flag or
-  the pipe's `O_NONBLOCK` (TCP does not). vmsplice writes when the fd is open for writing (a FIFO
-  opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever the
-  pipe's `O_NONBLOCK`. Room is the free space in whole pages, as Linux counts free page buffers.
 - Writes, truncation and fallocate on tmpfs files go through the instance's accounting.
 - Before a regular file changes (a write through `write_bytes` or the host copy; ftruncate,
   truncate, `O_TRUNC`; fallocate; a shared mapping from a writable descriptor), `prepare_write` or
@@ -548,84 +425,6 @@ capabilities (`kernel/cred`).
 - `protected_symlinks` and `protected_hardlinks` exist (default 1); `protected_regular` and
   `protected_fifos` do not.
 
-### Extended attributes
-
-- Names need a `security.`, `system.`, `trusted.` or `user.` prefix (`EOPNOTSUPP`); bad name
-  lengths `ERANGE`; values over 64 KiB `E2BIG`. Unprivileged `trusted.*` reads `ENODATA`, writes
-  `EPERM` and is hidden from listings. `user.*` is for regular files and directories only
-  (elsewhere reads `ENODATA`, writes `EPERM`), needs read or write permission, and on a sticky
-  directory only its owner may write it (`xattr_permission`); writing `security.*` other than the
-  capability needs `CAP_SYS_ADMIN`.
-- `system.*` holds only `system.posix_acl_access` and `system.posix_acl_default` (any other
-  `EOPNOTSUPP`). Setting or removing follows `posix_acl_xattr_set` and `set_posix_acl`: `EROFS`,
-  then a malformed value `EINVAL` (short header, a length not header plus 8-byte entries, an
-  unknown tag, a named user or group unmapped in the caller's namespace) or `EOPNOTSUPP` (version
-  other than 2), a symlink `EOPNOTSUPP`, a default ACL on a non-directory `EACCES` (removing it
-  succeeds), not owner nor `CAP_FOWNER` `EPERM`, an ACL out of `posix_acl_valid`'s order or with
-  bits beyond rwx `EINVAL`; an empty ACL and removing a missing one succeed;
-  `XATTR_CREATE`/`XATTR_REPLACE` are ignored. An access ACL of only owner, group and other entries
-  is a chmod (setgid dropped as `posix_acl_update_mode` does) and is not stored; others are stored
-  with named IDs as kernel IDs and read in the reader's namespace (unmapped as -1). Reads need
-  nothing; symlinks have none (`EOPNOTSUPP`).
-- `security.capability` (`cap_convert_nscap`, `cap_inode_getsecurity`): writes accept v2/v3 (the
-  magic checked under a mask, so stray flag bits pass) and need `CAP_SETFCAP` over the file in the
-  writer's namespace (owner and group mapped there; removal too); a v2 written with
-  `CAP_SETFCAP` in the initial namespace is stored as is, anything else as a v3 whose rootid is
-  the kernel ID of the writer's namespace root (or the rootid given; `EINVAL` unmapped). Reads: a
-  root mapped to a nonzero ID in the reader's namespace gives a v3 with that rootid, a root owning
-  the reader's namespace (or an ancestor's) a v2, any other `EOVERFLOW`. A non-empty value neither
-  v2 nor v3 is `EINVAL` at write; an empty one is stored unchecked and reads as `EINVAL` (6.1
-  skips the conversion for size 0).
-- Synthetic nodes: get `ENODATA`, set/remove `EOPNOTSUPP` (`EROFS` first on ro), empty list;
-  pipes and sockets `EOPNOTSUPP`.
-
-### Pipes and FIFOs
-
-- Data lives in process memory. `pipe2` accepts `O_CLOEXEC|O_NONBLOCK|O_DIRECT` (`O_DIRECT`
-  ignored: no packet mode, not in `F_GETFL`). Capacity 64 KiB, capped at `pipe-max-size` (1 MiB)
-  without `CAP_SYS_RESOURCE`; `F_SETPIPE_SZ` rounds up to a power of two of at least a page
-  (`EPERM` over the max, `EBUSY` below the buffered bytes).
-- A write wakes readers only when the pipe was empty; a read wakes writers only when it crosses
-  `PIPE_BUF` of free room or meets the room a blocked writer asked for (`writer_need`).
-- FIFO open: one `Pipe` per inode; write-only nonblocking without a reader `ENXIO`; read-only
-  nonblocking succeeds; read-write never waits; blocking one-ended opens wait for a peer present
-  or opened since (`ERESTARTSYS` on a signal); access mode 3 `EINVAL` (`fifo_open`).
-- No readers: `SIGPIPE`+`EPIPE` (or a short count); writes up to `PIPE_BUF` (4096) are atomic,
-  larger ones partial; nonblocking `EAGAIN`. Reads return 0 without writers. `FIONREAD` reports
-  the buffered bytes.
-
-### Locks and leases
-
-- All in-process. Locks key on the store inode (bind mounts share them), on an overlay node with
-  the top bit set, or on a FUSE node's key (top two bits; `OpenFile::lock_ino`), the daemon never
-  asked; leases key on the store inode behind a regular file (FUSE files `EINVAL`). The host
-  `flock` is used only by the store itself. `flock` and fcntl locks are separate tables.
-- `flock`: one entry per open file; relocking converts; `LOCK_NB` `EAGAIN`; released on `LOCK_UN`
-  or when the open file goes.
-- POSIX locks belong to the fd table and go with any close of the file in that table (close,
-  close_range, dup2 replacement, close-on-exec, seccomp addfd); OFD locks belong to the open file;
-  both kinds share one table and conflict. Ranges follow `flock64_to_posix_lock`: a start past
-  `OFFSET_MAX` `EOVERFLOW`, below 0 `EINVAL`; a positive length may end at `OFFSET_MAX`
-  (`EOVERFLOW` past it), 0 means to the end and beyond, a negative one covers the bytes before the
-  start (`EINVAL` below 0). Ranges split and merge; `F_SETLKW` detects deadlocks for POSIX requests
-  only (`EDEADLK`; the chain may pass through OFD waiters, which Linux excludes) and waits on the
-  lock channel. Files without a store inode (anonymous pipes, sockets, PTYs, synthetic files,
-  eventfds) succeed silently and `F_GETLK` reports unlocked; named FIFOs lock normally.
-- Leases (regular files, owner or `CAP_LEASE`): read leases need no writers, write leases no
-  other opens. Opening for write or truncating breaks all leases, opening for read breaks write
-  leases: the file's owner gets `F_SETSIG`'s signal or `SIGIO` (setting a lease makes the setter
-  owner unless one exists, `lease_setup`); a nonblocking open is `EAGAIN`, others wait until the
-  holder downgrades or `lease-break-time` (45 s) forces it. `F_NOTIFY` (dnotify) is `EINVAL`.
-- Listing (6.1's `lock_get_status`): every flock, POSIX and OFD lock and lease, in that order and
-  by inode, as `FLOCK  ADVISORY  `, `POSIX  ADVISORY  `, `OFDLCK ADVISORY  ` or
-  `LEASE  ACTIVE    `/`LEASE  BREAKING  `, the type (a lease being broken shows its target type),
-  the taker's pid (the caller's tgid at flock, F_SETLK or F_SETLEASE; -1 for OFD locks), the device
-  and inode fstat shows through the holding open file (an overlay node's shown inode), and the
-  range with an inclusive end (`EOF` from `OFFSET_MAX`) or `0 EOF`. `/proc/locks` numbers lines by
-  position, leaving out (numbers included) locks whose pid the reader's procfs cannot see; fdinfo
-  numbers from 1 the locks held through that open file, a POSIX lock through the open file of its
-  table's lowest fd on the file.
-
 ### Devices
 
 - `dev::populate` (boot `/dev` tmpfs) and `ensure_dev_nodes` (the store's `/dev`, after creating
@@ -647,15 +446,17 @@ capabilities (`kernel/cred`).
 
 ### Inbound
 
-- The syscall dispatcher, including the overlay sweep at syscall end.
+- The syscall dispatcher.
 - `kernel/process`: fd tables and fs contexts at clone; the fast-path `Cached` resolver.
 - `kernel/ns`: fd-table and fs copies at unshare; `kernel/exec`: execve's fd-table handling and
   mount-flag checks.
-- `kernel/mount`: walks; new tmpfs, overlay and FUSE instances and tmpfs reconfiguration; the fd
-  tables its busy and writer checks scan.
+- `kernel/mount`: walks; new tmpfs and FUSE instances and tmpfs reconfiguration; the fd tables its
+  busy and writer checks scan.
+- `kernel/overlay`: `open_store`, `prepare_write`, the tmpfs instances its layers are in;
+  `kernel/locks`: fd tables, open files, `lock_ino`; `kernel/pipe`: file checks and the read and
+  write paths of a splice's other end; `kernel/xattr`: resolution and mount flags.
 - `kernel/mm`: mmap `PROT_EXEC` on noexec.
-- `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; fd links and fdinfo; sysctls for pipes,
-  leases and `protected_*`.
+- `kernel/procfs`: fd links and fdinfo; sysctls for `protected_*`.
 - `kernel/unix`: AF_UNIX bind creating store nodes.
 - `kernel/poll`: poll/epoll reading open files; eventfd and timerfd reads through the read path.
 - `kernel/inotify`: `host_unshared`, overlay keys, second walks; `kernel/aio` and `kernel/loop`:
@@ -668,12 +469,18 @@ capabilities (`kernel/cred`).
 - `kernel/mount`: the mount table resolution lifts through and climbs out of; mount and
   superblock flags; detaching mount points at unlink and rename; `released` when an open file, cwd
   or root in a detached mount goes.
-- `kernel/store`: lookups, snapshots, objects, namespace changes, detached directories, xattrs,
-  `fs_stats`, the metadata cache reader.
+- `kernel/store`: lookups, snapshots, objects, namespace changes, detached directories, `fs_stats`,
+  the metadata cache reader.
 - `kernel/inotify`: the hooks, `opened`, `renamed`, `deleted`.
+- `kernel/overlay`: overlay nodes in the walk, opening, creation, attribute changes, truncate,
+  readdir, stat and statfs; the sweep at syscall end.
+- `kernel/locks`: fcntl lock commands, `locks::closed` on every close, `break_leases` on opens and
+  truncation.
+- `kernel/pipe`: `pipe2`, FIFO opens, pipe reads and writes, splice, tee and vmsplice, the pipe-size
+  fcntl commands.
 - `kernel/loop`: open, I/O, lseek, fsync and ioctls of loop devices.
 - `kernel/fuse`: everything on FUSE nodes and open FUSE files (the cache the walk reads, open and
-  create, namespace and attribute changes, I/O, flushes, statfs, xattrs, `/dev/fuse`).
+  create, namespace and attribute changes, I/O, flushes, statfs, `/dev/fuse`).
 - `kernel/procfs` (the `Pseudo` views, `pseudo::stat`, writability), `kernel/tty` (controlling
   terminal, ptmx, devpts), `kernel/ipc` (mqueue objects), `kernel/poll` (eventfd and timerfd
   reads), `kernel/unix` (files in flight, for clones).
@@ -692,32 +499,15 @@ capabilities (`kernel/cred`).
 - `Node` values are held without counting (cwds, roots, open files, mounts, inotify watches):
   `kernel/fuse` may forget a FUSE node between syscalls only when its scan finds none, so a new
   long-lived holder of FUSE nodes must join that scan.
-- splice and vmsplice put what they read into the output pipe whole even when a writer took the
-  room while the BKL was released (Linux holds the pipe lock throughout), so a pipe can briefly
-  exceed its capacity.
-- A splice out of a pipe into a file, socket or FUSE file drains what it wrote only after the
-  write, which can release the BKL: code that takes data out of a pipe must first wait while
-  `Pipe::splicing` is set (`wait_splice_done`), or the late drain removes bytes it never wrote.
-  Closing an end does not wait (Linux's close takes the pipe lock too).
 - `mounted()` matches a whole node, so a mount on a file shows through every hard link to it in
   that mount; the process root itself is never lifted (a mount on `/` is not seen by absolute
   lookups).
 - Synthetic directories are searchable by everyone except cgroup directories (their mkdir mode);
   procfs gates per-process data in readlink/follow.
-- An overlay node's store inodes may be in lower layers that must never change, so `Node::ino` is
-  None for it and nothing may turn an overlay file's store inode back into a `Node::Store`: an
-  open file reaches its node through `OpenFile::ovl`, and every change goes through a copy-up
-  (`create_dir`, `Attrs::Overlay`, the overlay's removal and rename); `store_dir` refuses overlay
-  directories (`EXDEV`). A `Node::Store` of an overlay mount and its upper inode is built only
-  inside one call (`create_parent_at`'s result, the tmpfs accounting helpers, `file_stat`,
-  truncate, `may_create`), for mount flags and accounting, and never stored.
-- Overlay nodes live while their names do, and a removed one while anything may use it: every
-  open file naming one must hold it (`OpenFile::hold`, or the kind's node at creation), as
-  `ExeFile` holds a program's, and every other long-lived holder must be in the sweep's scan; a
-  syscall that waits while keeping a node it looked up (an open waiting for a FIFO peer or a lease
-  break) is safe only by staying out of `waits_on_files_only`.
-- Locks and leases are keyed by inode and live in one kernel; other kernels and the host do not
-  see them.
+- Every file operation keeps `kernel/overlay`'s rules for overlay nodes: no `Node::Store` is ever
+  kept for an overlay file's store inode (changes go through a copy-up), every open file naming an
+  overlay node holds it, and a syscall that waits while keeping a looked-up node stays out of
+  `waits_on_files_only`.
 - File operations added here must call `kernel/inotify`'s hooks where Linux's fsnotify does,
   passing an overlay node's key (`key_of`), never the store inode behind it; every open records an
   `Opened`, and every rename that moves open files scans them all, even with no watches.
@@ -747,29 +537,14 @@ capabilities (`kernel/cred`).
   checks the pipe inode's 0600 mode and owner) — no `EROFS`, `O_NOATIME`, `ETXTBSY` or lease
   breaks; its display path is the reopening path (`/proc/self/fd/3`, ` (deleted)` for a memfd), not
   `pipe:[N]`, `/memfd:name` or the host path.
-- **Leases are lost across an overlay copy-up:** a lease taken through an overlay before copy-up
-  sits on the lower inode; the write open or truncate that copies up breaks leases on the upper
-  inode without notifying the holder, and once `follow_copy_up` moves the holder's description,
-  `F_GETLEASE` reports `F_UNLCK` while `F_SETLEASE(F_UNLCK)` fails with `EAGAIN` until close.
-  Linux keys leases on the overlay file's own inode.
 - **tmpfs charges drift for unlinked open files:** writes through a description still open after
   the last unlink are charged and never given back (nothing uncharges at close; recounts skip
   unlinked files), while truncating or punching one uncharges pages already given back, so writes
   can pass the limit until the next recount. Linux charges until eviction at the last close.
 - **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
   exec (6.1), while chown follows 6.2; since 6.2 Linux's writes match its chown.
-- **POSIX ACLs are not enforced:** named users, groups and masks are stored but never consulted,
-  the mode does not take the mask as its group bits, chmod leaves a stored ACL alone, and new
-  files never inherit a default ACL.
 - **File position races:** lseek and `O_APPEND` writes move the position without `pos_busy`, so a
   concurrent unlocked read or write can overwrite it (Linux's lseek takes `f_pos_lock`).
-- **Locks on inode-less files are no-ops:** `flock` and `F_SETLK` on anonymous pipes, sockets and
-  PTYs succeed without locking, though processes sharing an inherited fd can coordinate with them
-  on Linux.
-- **Lock listings differ:** `/proc/locks` goes by kind and inode where Linux lists newest first
-  (lslocks prints another order) and leaves out `F_SETLKW` waiters (Linux's `->` lines); a POSIX
-  lock shows in the fdinfo of its table's lowest fd on the file, not of the open file that took
-  it; locks on FUSE files are left out of both, still using up `/proc/locks` line numbers.
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **atime ignores the guest:** a regular file's atime is its host object's, updated by the host's
@@ -782,12 +557,8 @@ capabilities (`kernel/cred`).
     counted only at a recount;
   - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table;
   - sendfile, copy_file_range and splice into an `O_SYNC`/`O_DSYNC` file do not sync it;
-  - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
-  - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
   - preadv2/pwritev2 refuse `RWF_NOWAIT` and `RWF_APPEND` (6.1 supports both);
   - FIONREAD on a FUSE regular file is `ENOTTY`;
-  - `F_SETPIPE_SZ` is `EPERM` over `pipe-max-size` even when not growing, and checks `EBUSY`
-    against bytes rather than occupied pages;
   - newfstatat refuses `AT_NO_AUTOMOUNT` and the `AT_STATX_*` sync flags;
   - utimensat with one `UTIME_NOW` and one `UTIME_OMIT` passes on write permission (Linux wants
     the owner unless both are `UTIME_NOW`);
@@ -800,17 +571,6 @@ capabilities (`kernel/cred`).
   where 6.1 says `ENODEV`.
 - **writev to a synchronous file syncs per iovec** (slower, same durability), and a sync failing
   on a later iovec returns the earlier total, leaving out bytes already written.
-- **splice's checks differ:** access modes (`EBADF`) come before a pipe given an offset
-  (`ESPIPE`), where 6.1 returns `ESPIPE` first; an offset on an unseekable non-pipe is `ESPIPE`
-  (after waiting for room) instead of `EINVAL`; one with an AF_UNIX stream input is ignored and
-  written back advanced.
-- **splice into a file stops quietly at `RLIMIT_FSIZE`:** it returns the short count without
-  `SIGXFSZ`, which Linux raises on its next write while still returning the count.
-- **Pipe I/O with faulting buffers:** a pipe read, readv or read-side vmsplice whose buffer faults
-  consumes what it took (Linux leaves a short-copied buffer in the pipe); a writev whose later
-  iovec faults still writes what precedes it (Linux commits only whole copied pages; a sub-page
-  writev writes nothing); a write copies 64 KiB at a time, so a fault in the first 64 KiB is
-  `EFAULT` and a later one returns a multiple of 64 KiB (Linux returns the bytes up to the fault).
 - **Scoped openat2 never returns `EAGAIN`:** the walk is atomic under the BKL, so a `..` walked
   while another thread mounts or renames never asks the caller to retry. Safe.
 - **Anonymous pipes and sockets have no owner:** fstat shows root (mapped into the caller's
@@ -821,27 +581,6 @@ capabilities (`kernel/cred`).
 - **Clone fidelity:** FICLONE and FICLONERANGE work on a store that reports ext4's magic (ext4
   says `EOPNOTSUPP`); partial ranges are copied, not shared; `FIDEDUPERANGE` is `EOPNOTSUPP`; a
   whole-file copy_file_range returns more than `MAX_RW_COUNT` in one call.
-- **Overlay gaps**, one per line:
-  - an overlay cannot be a layer (Linux accepts one as a lower layer);
-  - `/proc/<pid>/exe` of a program whose overlay name was removed can be run again but not opened
-    (`ENOENT`; a descriptor of the store inode would change it behind the overlay);
-  - nodes of existing names are never freed while mounted (one per name looked up), and removed
-    ones stay while a path-based syscall begun before their removal runs in another thread;
-  - the no-BKL stat never serves overlay paths;
-  - copy-up shares the lower object without `try_share`'s checks, so writers already holding it
-    in place (a writable description, a writable shared mapping, a Files app writer) keep changing
-    the upper file too (Linux copies the data);
-  - a FIFO opened through an overlay fstats as its layer inode, so after a copy-up fstat and stat
-    disagree;
-  - no `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's inode
-    number changes at the next mount, and a hard link through the overlay shows the upper number;
-  - changes through an overlay whose upper layer is on a tmpfs are not charged to it;
-  - a mapping made from a file opened before its copy-up keeps the lower object;
-  - parents are copied up before a creation's permission check, so a refused creation leaves them
-    copied;
-  - other namespaces' mounts on a removed or renamed overlay name are not detached;
-  - a lower layer's `trusted.overlay.redirect` is not followed, though sysfs shows
-    `redirect_always_follow` as Y (nothing Appine runs writes one).
 
 ## Open questions
 
@@ -850,8 +589,6 @@ capabilities (`kernel/cred`).
 - Is skipping search permission on synthetic directories other than cgroup ones intended (only
   `/proc/<pid>/fd` and `fdinfo` gate access, by the ptrace-read check)?
 - Should `protected_regular`, `protected_fifos` and `O_TMPFILE` be implemented?
-- Is xattr `ENODATA` on every synthetic node intended? Linux's procfs and devpts have no xattr
-  handlers and answer `EOPNOTSUPP`.
 
 ## To verify
 
@@ -859,5 +596,3 @@ capabilities (`kernel/cred`).
   filesystem's, unlike fstat).
 - Whether anything else (such as `mm`'s `shmem_like`, which looks for a `/memfd:` mapping name)
   depends on the display path a `/proc/<pid>/fd` reopen freezes.
-- The 6.1 attribution of splice's `SPLICE_F_NONBLOCK` conversion, per-page pipe copies and
-  `O_NOTIFICATION_PIPE`, seen only on a native 6.8 kernel.

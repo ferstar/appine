@@ -213,10 +213,10 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 
 ### Inbound
 
-- `kernel/vfs` (every permission and ownership check, xattr capability rules, file-cap removal),
-  `kernel/process` (fork/clone copies, setpriority/ioprio `PRIO_USER`, `RLIMIT_NPROC`),
-  `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal` (kill, ptrace access),
-  `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix` (credentials),
+- `kernel/vfs` (every permission and ownership check, file-cap removal), `kernel/xattr` (xattr
+  capability rules), `kernel/process` (fork/clone copies, setpriority/ioprio `PRIO_USER`,
+  `RLIMIT_NPROC`), `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal` (kill, ptrace
+  access), `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix` (credentials),
   `kernel/net`/`kernel/netns` (capability checks), the syscall dispatcher and fast path (seccomp).
 
 ### Outbound

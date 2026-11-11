@@ -1,7 +1,7 @@
-//! Extended attributes: setxattr, getxattr, listxattr, removexattr, and the variants that act on
-//! the symlink itself (`l`) and on an fd (`f`).
+//! Extended attributes (the kernel/xattr map): setxattr, getxattr, listxattr, removexattr, and the
+//! variants that act on the symlink itself (`l`) and on an fd (`f`).
 //!
-//! Extended attributes live in the inode store's database (the kernel/vfs map). Nodes of
+//! Extended attributes live in the inode store's database (the kernel/store map). Nodes of
 //! synthetic filesystems (/proc, /dev/pts) have no extended attributes, and files not in a
 //! filesystem, such as pipes and sockets, do not support them. Permissions are checked as in
 //! Linux's `xattr_permission` and commoncap's hooks ([`permission`]); program file capabilities,

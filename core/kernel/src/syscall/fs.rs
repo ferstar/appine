@@ -1,4 +1,5 @@
-//! File and directory syscalls.
+//! File and directory syscalls (the kernel/vfs map; overlay paths: the kernel/overlay map; flock
+//! and fcntl locks: the kernel/locks map; pipes, FIFOs and splice: the kernel/pipe map).
 //!
 //! Reads and writes have two layers: `read_bytes`/`write_bytes` do one operation on an open file
 //! with a host buffer, and `read_file`/`write_file` copy to and from guest memory. Host fds and

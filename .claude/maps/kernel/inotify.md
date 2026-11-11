@@ -27,7 +27,7 @@ Outside the module: where the hooks are called — the file syscalls, opens and 
 readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`); `/proc/sys/fs/inotify/*` and the
 fdinfo text's place (`kernel/procfs`); the Files app's change list (`kernel/store`) and the
 machine's `store_changed`, which finds each kernel and takes its BKL (`kernel/process`); overlay
-node lifetime and the sweep that keeps watched nodes (`kernel/vfs`).
+node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 
 ## Key types
 

@@ -1,4 +1,4 @@
-//! overlayfs (Linux 6.1's `fs/overlayfs`, the kernel/vfs map): a filesystem that shows several
+//! overlayfs (Linux 6.1's `fs/overlayfs`, the kernel/overlay map): a filesystem that shows several
 //! store directories (layers) merged into one tree. The lower layers are read-only; a name in a
 //! higher layer hides the same name below it, a whiteout (a character device 0:0) hides it
 //! without showing anything, and a directory marked opaque (`trusted.overlay.opaque` = `y`, or

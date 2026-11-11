@@ -23,7 +23,7 @@ lives in `fd.rs`, a `kernel/vfs` file).
 
 Outside the module: the wait mechanism, wake objects, the BKL and the timer thread (`kernel/process`);
 per-kind readiness of sockets (`kernel/net`, `kernel/unix`), terminals (`kernel/tty`), pipes
-(`kernel/vfs`), inotify (`kernel/inotify`), signalfd (`kernel/signal`), message queues
+(`kernel/pipe`), inotify (`kernel/inotify`), signalfd (`kernel/signal`), message queues
 (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl entry points and the read paths
 (`kernel/vfs`); clock bases, `Expiry` and the wall-clock jump count (`itimer`, `kernel/process`);
 signal delivery (`kernel/signal`).

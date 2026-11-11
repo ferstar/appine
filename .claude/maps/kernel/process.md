@@ -207,7 +207,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   sweep can tell which syscalls began before a removal.
 - After the handler: released FUSE files are flushed, the FUSE node cache may be swept
   (`kernel/fuse`'s `sweep`), detached mounts whose last use the syscall let go of are collected
-  and removed overlay nodes swept (`kernel/vfs`), and watched cgroup2 files compared for changes
+  and removed overlay nodes swept (`kernel/overlay`), and watched cgroup2 files compared for changes
   (`cgroup::notify_changes`, also run at thread exit, freezer stops and by the timer thread); then
   results are translated out (invisible pids become 0), edge-triggered readiness is re-armed after
   reads, x0 is set, `Mm::sync` runs, then the exit stop and signal delivery. `exit`, `exit_group`,
@@ -584,8 +584,8 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 - Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
   nodes; a node another thread holds must be found by `kernel/fuse`'s `in_use` scan, an open
   handle or a request in flight.
-- Removed overlay nodes are kept for every syscall in progress that began before the removal,
-  unless its number is in `kernel/vfs`'s `waits_on_files_only`: a syscall that waits with the BKL
+- Removed overlay nodes are kept for every syscall in progress that began before the removal, unless
+  its number is in `kernel/overlay`'s `waits_on_files_only`: a syscall that waits with the BKL
   released while keeping a node it looked up must never be added there.
 
 ## Confirmed bugs / technical debt
