@@ -36,11 +36,11 @@ SKIP="$SKIP:NetlinkRouteTest.NewRouteGatewayOnLink:NetlinkRouteTest.NewRouteLink
 SKIP="$SKIP:$R.RouteMulticastGroupReplace/*:$R.NewRouteWithoutOif/1:$R.NewRouteViaAddress/1"
 # kernel/net D7: the SNMP error counters are always 0
 SKIP="$SKIP:ProcNetSnmp.TcpEstab:ProcNetSnmp.TcpReset:ProcNetSnmp.UdpNoPorts"
-# kernel/net: a host kernel with Linux 5d39580f68e6 (in 6.1.y since June 2026, and in CI's) refuses
-# SO_ATTACH_FILTER on a TCP socket without CAP_NET_ADMIN, which appine-run lacks
-SKIP="$SKIP:AllInetTests/SimpleTcpSocketTest.SetSocketAttachDetachFilter/*"
 # Cannot be compared: runs only on a kernel 7 or newer (CI's), skipping itself on 6.8 and Appine
 SKIP="$SKIP:NetlinkRouteTest.VethAddRefusedPeerNetnsLeavesNothing"
+# Cannot be compared: skips itself on a kernel without Linux 5d39580f68e6 (the dev VM's 6.8), while
+# Appine refuses SO_ATTACH_FILTER on TCP without CAP_NET_ADMIN as 6.1.y does
+SKIP="$SKIP:AllInetTests/SimpleTcpSocketTest.SetSocketAttachFilterWithoutNetAdmin/*"
 sh /tmp/difftest-files/gtest/run.sh gvisor "$SKIP" tcp_socket_test bind_test \
     socket_ip_unbound_test socket_netlink_test socket_netlink_route_test proc_net_test epoll_test \
     poll_test

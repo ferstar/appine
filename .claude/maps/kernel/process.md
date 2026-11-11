@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `TaskSync`'s kernel-entry record for `/proc/<pid>/syscall`)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: test hook 14, a host that refuses TCP socket filters)
 
 ## Responsibilities
 
@@ -116,7 +116,8 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   `personality`, `sethostname`/ `setdomainname`, `getcpu`, `sysinfo`, `getrandom`, and the test
   syscall 0xa991 (debug and `test-hooks` builds).
 - **Kernel bugs**: `bug::catch`, `host_call`, `kill`/`kill_process`, `record_kill` (also the OOM
-  killer's), `report`, `install_panic_hook`, `trap`/`trap_finish`; `Machine::take_kills`.
+  killer's), `report`, `install_panic_hook`, `trap`/`trap_finish`, `host_refuses_tcp_filters`;
+  `Machine::take_kills`.
 - **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
   `signal_later`/`flush_signals`, `Shared::fast_changed`, `kernel::doing`/`done`.
@@ -245,14 +246,15 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   unimplemented paths from `stub::top`) or `OutOfMemory` (from the OOM killer, `kernel/oom`). The
   host takes them with `Machine::take_kills` (`android/service`).
 - Test hooks exist only in debug builds and with the `test-hooks` feature, and answer `ENOSYS`
-  unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 13 panics at once, points a page
+  unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 14 panics at once, points a page
   at an inaccessible host page so the engine faults on the host, or plants a panic that fires once
   (`trap`) at the thread's exit, the next thread start, the next timer handling, the next host
   call, a step of process finish, right after releasing the BKL, the next no-BKL syscall or a futex
   wait; it can also act as if the host's wall clock jumped, hold the BKL for `addr`
-  milliseconds for the watchdog's tests, or make the next host thread for a guest thread fail to
-  be created (`fails`: `task::start` returns `EAGAIN` for a clone or a host spawn). Any other
-  `what` is `EINVAL`.
+  milliseconds for the watchdog's tests, make the next host thread for a guest thread fail to
+  be created (`fails`: `task::start` returns `EAGAIN` for a clone or a host spawn), or, until
+  turned off again (`addr` 0), act as a host that refuses `SO_ATTACH_FILTER` on TCP sockets
+  (`host_refuses_tcp_filters`, read by `kernel/net`). Any other `what` is `EINVAL`.
 
 ### Exit and reaping
 

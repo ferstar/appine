@@ -145,6 +145,11 @@ pub(crate) struct InetSocket {
     pub local_map: Option<(u16, u16)>,
     /// Connected to a mapped low port on the local machine: (guest port, host port).
     pub peer_map: Option<(u16, u16)>,
+    /// A classic BPF program attached with `SO_ATTACH_FILTER` that the host refused (a host with
+    /// Linux 5d39580f68e6 lets only `CAP_NET_ADMIN` attach one to a TCP socket, and the app never
+    /// has it), kept here as the guest gave it so that `SO_GET_FILTER`, `SO_DETACH_FILTER` and
+    /// accepted sockets see it as on Linux. It filters nothing.
+    pub filter: Option<Vec<u8>>,
 }
 
 impl InetSocket {
@@ -189,6 +194,7 @@ impl InetSocket {
             lease: None,
             local_map: None,
             peer_map: None,
+            filter: None,
         }
     }
 }

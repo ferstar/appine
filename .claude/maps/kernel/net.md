@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `SO_GET_FILTER` asked of the host with a count of instructions)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: TCP `SO_ATTACH_FILTER` checked for `CAP_NET_ADMIN` and kept in Appine when the host refuses it)
 
 ## Responsibilities
 
@@ -49,8 +49,9 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `bound`, `any`, `vaddr`, `wide`, `vconn`, `listener`, `self_port`, `v6only`) and the forwarder
   handle `fwd`; `track` (nat state, seen peers, a blocked verdict, the claimed original
   destination, `SO_MARK`); raw ICMP and tap state (`icmp`, `ttl_set`, `guest_recverr`,
-  `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`. Dropping it closes the host
-  fd and removes its namespace UDP port and listener.
+  `udp_tap`, `icmp_err`); port-map `lease`, `local_map`, `peer_map`; `filter` (a TCP socket's
+  classic BPF program the host refused, kept as given). Dropping it closes the host fd and removes
+  its namespace UDP port and listener.
 - `Message` (one recv result), `MsgHdr` (a guest msghdr read in), `Routed` (connect/sendto
   routing result: namespace map, nat, filter verdict, original destinations).
 - `route::Entry` — one route (`host` marks entries whose source the host chooses).
@@ -158,7 +159,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   taken (the slot is only looked for, not reserved); host accept with waits bounded by the
   listener's `SO_RCVTIMEO` (`EAGAIN` on timeout, `ERESTARTSYS` on a signal); the new socket inherits
   protocol, local port map (not the lease), namespace and its address, mark, the claimed original
-  destination and the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`; the peer address is unmapped,
+  destination, the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO` and a filter kept in Appine (the host's
+  own filter is inherited on the host); the peer address is unmapped,
   translated and written back before the fd is installed, so a fault drops the connection and
   leaves no fd.
 - shutdown: inet goes to the host, and `SHUT_RD`/`SHUT_RDWR` set `rd_shut`, also when the host
@@ -214,25 +216,31 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `IP_PKTINFO`, `IP_RECVERR`/`IPV6_RECVERR`, `IPV6_CHECKSUM` recorded only, other `SOL_RAW` names
   `ENOPROTOOPT`); on UDP, `IP_TTL`/`IPV6_UNICAST_HOPS` recorded for the raw ICMP taps and still
   passed to the host, and `IP_RECVERR`/`IPV6_RECVERR` intercepted while a tap watches the socket;
-  `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF` (at least 16 bytes and 1..4096 instructions, else
-  `EINVAL`; the instructions are copied and the pointer rewritten for the host, with no
-  capability check of Appine's own); `SO_MARK` (needs `CAP_NET_RAW` or `CAP_NET_ADMIN` over the
-  namespace owner; stored only, inherited by accepted sockets, fed to nftables, which sees 0
-  outside the sender's namespace); `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux 6.1's `sock_set_timeout`: a
-  short buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a negative time zero (no
-  waiting, `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read back as 0 like Linux's
-  `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way); `IPV6_V6ONLY` in new
-  namespaces (recorded). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR` (pending ICMP errors
-  first), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW` for raw sockets) and recorded
-  `IPV6_V6ONLY` itself, and asks the host for `SO_GET_FILTER` the way Linux's `sk_get_filter`
-  reads it: optlen is a count of 8-byte instructions (passed on capped at `BPF_MAXINSNS`, 4096,
-  which no attached program exceeds), 0 asks only for the count, and optlen comes back as the
-  program's count.
-- Everything else (including `SO_DETACH_FILTER`, `SO_LOCK_FILTER`, `SO_PEERCRED`,
-  `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`, `IP_TRANSPARENT`,
-  `TCP_*`, and `SO_ATTACH_BPF` with its guest fd number) goes to the host and is checked against
-  the app's host credentials. Netlink (`kernel/netlink`) and AF_UNIX sockets keep their options in
-  process (`SockOpts`).
+  `SO_ATTACH_FILTER`/`SO_ATTACH_REUSEPORT_CBPF`, checked in Linux 6.1.y's order (an optlen under
+  4 `EINVAL`; `SO_ATTACH_FILTER` on a TCP socket without `CAP_NET_ADMIN` over the namespace owner
+  `EPERM`, as Linux 5d39580f68e6; an optlen other than 16 `EINVAL`; a host filter locked with
+  `SO_LOCK_FILTER` `EPERM`; 0 or more than 4096 instructions, or no program, `EINVAL`), then the
+  instructions are copied and the pointer rewritten for the host, which checks them; when the host
+  refuses a TCP `SO_ATTACH_FILTER` with `EPERM` (a host with 5d39580f68e6, or test hook 14), the
+  program is checked by attaching it to a scratch host UDP socket and kept in `filter`, filtering
+  nothing; a host attach that succeeds clears `filter`; `SO_DETACH_FILTER` with a kept program
+  clears it (`EPERM` while the host filter is locked); `SO_MARK` (needs `CAP_NET_RAW` or
+  `CAP_NET_ADMIN` over the namespace owner; stored only, inherited by accepted sockets, fed to
+  nftables, which sees 0 outside the sender's namespace); `SO_RCVTIMEO`/`SO_SNDTIMEO` (Linux
+  6.1's `sock_set_timeout`: a short buffer `EINVAL`, microseconds outside `[0, 1000000)` `EDOM`, a
+  negative time zero (no waiting, `EAGAIN` at once), 0 or at least `KTIME_MAX` no timeout, read
+  back as 0 like Linux's `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way);
+  `IPV6_V6ONLY` in new namespaces (recorded). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR`
+  (pending ICMP errors first), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW` for raw sockets) and
+  recorded `IPV6_V6ONLY` itself, and `SO_GET_FILTER` the way Linux's `sk_get_filter` reads it,
+  from a kept program or else by asking the host: optlen is a count of 8-byte instructions (passed
+  to the host capped at `BPF_MAXINSNS`, 4096, which no attached program exceeds), 0 asks only for
+  the count, fewer than the program has is `EINVAL`, and optlen comes back as the program's count.
+- Everything else (including `SO_DETACH_FILTER` without a kept program, `SO_LOCK_FILTER`,
+  `SO_PEERCRED`, `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`,
+  `IP_TRANSPARENT`, `TCP_*`, and `SO_ATTACH_BPF` with its guest fd number) goes to the host and is
+  checked against the app's host credentials. Netlink (`kernel/netlink`) and AF_UNIX sockets keep
+  their options in process (`SockOpts`).
 - ioctls: `FIONREAD`/`SIOCINQ` (stub answers emulated) and `SIOCATMARK` pass
   through; `SIOCGIF*` getters pass through (`SIOCGIFHWADDR`'s family fixed up), setters `EPERM`;
   `SIOCGIFCONF` appends virtual devices; interface ioctls also work on AF_UNIX and netlink sockets
@@ -396,7 +404,7 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `rtnl_watched`/`rtnl_notify` around changing ioctls, `message` and `attr` for route messages);
   `kernel/unix`; credentials (`ns_capable`); the
   kernel's waits (`wait_objects`, `unlocked`), wake objects; signals (`SIGPIPE`); the kernel log;
-  the table of unimplemented paths.
+  the table of unimplemented paths; the test hooks (`kernel/process`, host-refused TCP filters).
 
 ## Invariants and gotchas
 
@@ -418,7 +426,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - `dispatch` of the raw ICMP taps must run with no socket borrowed.
 - Options passed to the host meet the host kernel's rules, which change with the device's kernel:
   a host with Linux 5d39580f68e6 (in 6.1.y since June 2026) refuses `SO_ATTACH_FILTER` on a TCP
-  socket without `CAP_NET_ADMIN`, which the app never has.
+  socket without `CAP_NET_ADMIN`, which the app never has, so such programs live in `filter` and
+  every path that reads, replaces, detaches or inherits a filter must look there before the host.
 
 ## Confirmed bugs / technical debt
 
@@ -429,12 +438,10 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `IP_TRANSPARENT`) are judged by the app's host credentials (a privileged guest gets `EPERM`);
   `SO_BINDTODEVICE` names are resolved against host interfaces; `SO_ATTACH_BPF` passes a guest fd
   number to the host.
-- **`SO_ATTACH_FILTER` on TCP fails on hosts with Linux 5d39580f68e6:** such a host (6.1.y since
-  June 2026, so Android's GKI kernels in time) refuses the filter without `CAP_NET_ADMIN`, so every
-  guest gets `EPERM` where 6.1.y lets a guest with `CAP_NET_ADMIN` over its namespace attach it
-  (and Appine itself checks nothing); dockerd's port allocator attaches a drop-everything filter
-  to each TCP port it publishes with `-p`, so publishing fails there. Appine also takes an optlen
-  above 16 where Linux wants exactly 16.
+- **A TCP filter the host refused filters nothing:** on a host with Linux 5d39580f68e6 the program
+  is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
+  its DNAT rules are in place) still lets connections through and other programs see unfiltered
+  data; a guest filter that the host accepts on an older kernel does filter.
 - **`MSG_TRUNC` on a TCP recv writes zeros into the guest's buffer:** the host discards the data
   and returns its length, and Appine copies that many zero bytes out (`EFAULT` for a NULL
   buffer), where Linux's `tcp_recvmsg` leaves the buffer untouched.
@@ -485,8 +492,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - Should container namespaces reach the DNS stub (for example through the gateway address), and
   should nftables see stub queries?
 - Should AF_PACKET report `EPERM` (Linux without `CAP_NET_RAW`) instead of `EAFNOSUPPORT`?
-- When a host refuses `SO_ATTACH_FILTER` for a guest that may attach it, should the filter be
-  kept in Appine (and a drop-everything one emulated) rather than failing?
 
 ## To verify
 

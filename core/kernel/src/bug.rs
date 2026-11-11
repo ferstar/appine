@@ -35,7 +35,7 @@ use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::sync::OnceLock;
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 use appine_engine::Cpu;
@@ -379,6 +379,22 @@ pub(crate) fn fails(at: Trap, id: Tid) -> bool {
     }
 }
 
+/// Test hook 14 is acting as a host that refuses TCP filters.
+#[cfg(any(debug_assertions, feature = "test-hooks"))]
+static REFUSE_TCP_FILTERS: AtomicBool = AtomicBool::new(false);
+
+/// Whether a test hook makes the host refuse `SO_ATTACH_FILTER` on TCP sockets, as a host with
+/// Linux 5d39580f68e6 does (`syscall::net`). Always false in builds without test hooks.
+#[inline]
+pub(crate) fn host_refuses_tcp_filters() -> bool {
+    #[cfg(any(debug_assertions, feature = "test-hooks"))]
+    {
+        REFUSE_TCP_FILTERS.load(Ordering::Relaxed)
+    }
+    #[cfg(not(any(debug_assertions, feature = "test-hooks")))]
+    false
+}
+
 /// The test hook's syscall number, far outside Linux's numbers. Exists only in debug builds and in
 /// builds with the `test-hooks` feature (the Android debug app), and requires `APPINE_TEST_HOOKS=1`
 /// to be set. End-to-end tests use it to simulate kernel-layer and engine bugs.
@@ -408,7 +424,10 @@ pub(crate) const TEST_SYSCALL: u64 = 0xa991;
 ///     BKL watchdog ([`crate::watchdog`]);
 /// 13. the next host thread created for a guest thread, in any process or for the host's
 ///     `Machine::spawn`, cannot be created ([`Trap::ThreadStart`]): the clone or spawn fails with
-///     EAGAIN.
+///     EAGAIN;
+/// 14. from now on (`addr` 1) or no longer (`addr` 0), act as a host with Linux 5d39580f68e6, which
+///     refuses `SO_ATTACH_FILTER` on TCP sockets to the app ([`host_refuses_tcp_filters`]), since
+///     whether the host refuses depends on its kernel.
 #[cfg(any(debug_assertions, feature = "test-hooks"))]
 pub(crate) fn test_hook(
     cx: &mut Cx<'_>,
@@ -459,6 +478,7 @@ pub(crate) fn test_hook(
         11 => crate::itimer::clock_jumped(cx.kr()),
         12 => std::thread::sleep(std::time::Duration::from_millis(addr)),
         13 => arm(Trap::ThreadStart, HOST),
+        14 => REFUSE_TCP_FILTERS.store(addr != 0, Ordering::SeqCst),
         _ => return Err(Errno::EINVAL),
     }
     Ok(0)

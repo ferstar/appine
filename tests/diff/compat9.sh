@@ -9,7 +9,10 @@
 # triage's POSIX timers on the CPU clock of a thread or process that has ended; and getsockopt's
 # SO_GET_FILTER, whose optlen counts classic BPF instructions of 8 bytes (Linux's sk_get_filter):
 # 0 asks for the count, fewer than the program has is EINVAL, and the program comes back whole
-# with optlen its count (a UDP socket, as TCP needs CAP_NET_ADMIN on newer kernels); and
+# with optlen its count, on a UDP socket and on a TCP one (which needs CAP_NET_ADMIN on kernels
+# with 5d39580f68e6, and which such a host refuses to Appine, so Appine keeps the program): an
+# optlen other than 16 or no program is EINVAL, accepted sockets inherit the listener's program,
+# and a locked one can be neither replaced nor detached; and
 # /proc/<pid>/syscall (Linux's proc_pid_syscall): the reader's own read, a thread waiting in read,
 # "running" for one running, ESRCH once that thread has gone, -1 with sp and the svc's pc for one
 # stopped by a signal (signal delivery forgets the syscall), -1 with zeros for a zombie, mode 0400,
@@ -295,7 +298,9 @@ gcc -O1 -pthread -o deadclock deadclock.c
 rm -f deadclock deadclock.c
 cat > getfilter.c <<'C'
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -303,6 +308,7 @@ cat > getfilter.c <<'C'
 
 #define SO_GET_FILTER 26
 #define SO_DETACH_FILTER 27
+#define SO_LOCK_FILTER 44
 #define LEN 40
 
 struct insn {
@@ -352,10 +358,41 @@ int main(void)
     get(s, "one short", LEN - 1);
     get(s, "exact", LEN);
     get(s, "twice", 2 * LEN);
-    int zero = 0;
+    int zero = 0, one = 1;
     printf("detach: %d\n", setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero));
     get(s, "detached", 2 * LEN);
     close(s);
+
+    /* TCP, which a host with Linux 5d39580f68e6 refuses to the app (Appine keeps the program) */
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    printf("tcp attach: %d\n", setsockopt(t, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof fp));
+    get(t, "tcp count", 0);
+    get(t, "tcp one short", LEN - 1);
+    get(t, "tcp exact", LEN);
+    int r = setsockopt(t, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof fp - 1);
+    printf("tcp optlen 15: %s\n", r ? strerror(errno) : "0");
+    struct fprog none = {LEN, NULL};
+    r = setsockopt(t, SOL_SOCKET, SO_ATTACH_FILTER, &none, sizeof none);
+    printf("tcp no program: %s\n", r ? strerror(errno) : "0");
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    bind(t, (struct sockaddr *)&a, sizeof a);
+    getsockname(t, (struct sockaddr *)&a, &al);
+    listen(t, 1);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    printf("tcp connect: %d\n", connect(c, (struct sockaddr *)&a, sizeof a));
+    int n = accept(t, NULL, NULL);
+    get(n, "tcp accepted", LEN);
+    get(c, "tcp client", LEN);
+    printf("tcp detach: %d\n", setsockopt(n, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero));
+    r = setsockopt(n, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero);
+    printf("tcp detach again: %s\n", r ? strerror(errno) : "0");
+    printf("tcp lock: %d\n", setsockopt(t, SOL_SOCKET, SO_LOCK_FILTER, &one, sizeof one));
+    r = setsockopt(t, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof fp);
+    printf("tcp attach locked: %s\n", r ? strerror(errno) : "0");
+    r = setsockopt(t, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero);
+    printf("tcp detach locked: %s\n", r ? strerror(errno) : "0");
+    get(t, "tcp locked", LEN);
     return 0;
 }
 C

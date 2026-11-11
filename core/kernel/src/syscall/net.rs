@@ -59,6 +59,8 @@ const SO_MARK: i32 = 36;
 const SO_ATTACH_FILTER: i32 = 26;
 /// getsockopt's name for `SO_ATTACH_FILTER`.
 const SO_GET_FILTER: i32 = SO_ATTACH_FILTER;
+const SO_DETACH_FILTER: i32 = 27;
+const SO_LOCK_FILTER: i32 = 44;
 /// The most instructions of a classic BPF program (`BPF_MAXINSNS`).
 const BPF_MAXINSNS: usize = 4096;
 
@@ -646,7 +648,7 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, (timeout, sndtimeo), net, local_map, vaddr, mark) =
+    let (host_fd, family, ty, proto, (timeout, sndtimeo), net, local_map, vaddr, (mark, filter)) =
         match &*sock.borrow() {
             Socket::Inet(s) => (
                 s.fd,
@@ -657,7 +659,7 @@ fn accept_host(
                 s.net.clone(),
                 s.local_map,
                 s.vaddr,
-                s.mark(),
+                (s.mark(), s.filter.clone()),
             ),
             Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
             Socket::Unix(_) => unreachable!("handled by accept4"),
@@ -668,8 +670,10 @@ fn accept_host(
             Ok((new, peer)) => {
                 let mut new = InetSocket::new(new, family, ty);
                 new.proto = proto;
-                // The listener's timeouts carry over (sk_clone_lock copies the whole sock)
+                // The listener's timeouts and the filter kept in Appine carry over (sk_clone_lock
+                // copies the whole sock and shares sk_filter)
                 (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
+                new.filter = filter.clone();
                 new.local_map = local_map;
                 new.net = net.clone();
                 // The accepted connection inherits the listener's SO_MARK (ir_mark in
@@ -1260,6 +1264,7 @@ pub(super) fn setsockopt(
     const SO_RCVBUFFORCE: i32 = 33;
     let (sock, _) = socket_of(cx, fd)?;
     let name = new_timeouts(level, name);
+    let optlen = len;
     let len = (len as usize).min(256);
     let mut v = vec![0u8; len];
     cx.mm().read(UserSlice::new(value, len), &mut v)?;
@@ -1311,31 +1316,88 @@ pub(super) fn setsockopt(
         Some(false) => return Ok(0),
         None => {}
     }
-    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF): the pointer to the
-    // instructions in struct sock_fprog is replaced with one on the host (dockerd installs a
-    // drop-everything filter on -p listening sockets). An instruction count of 0 or above
-    // BPF_MAXINSNS is EINVAL; checking the instructions is left to the host
+    // Classic BPF filters (SO_ATTACH_FILTER, SO_ATTACH_REUSEPORT_CBPF), checked in Linux 6.1.y's
+    // order: an optlen under an int is EINVAL; SO_ATTACH_FILTER on a TCP socket needs
+    // CAP_NET_ADMIN over the socket's network namespace (Linux 5d39580f68e6, EPERM); struct
+    // sock_fprog must be exactly 16 bytes (EINVAL); a locked filter is EPERM; a count of 0 or above
+    // BPF_MAXINSNS, or no program, is EINVAL. The pointer to the instructions is then replaced
+    // with one on the host, which checks them. dockerd attaches a drop-everything filter to each
+    // TCP port it publishes until its DNAT rules are in place, and a host with 5d39580f68e6
+    // refuses TCP filters from the app, which never has CAP_NET_ADMIN: the program is then checked
+    // on a scratch UDP socket and kept in InetSocket::filter, filtering nothing
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
-    let inet_fd = match &*sock.borrow() {
-        Socket::Inet(s) => Some(s.fd),
+    let inet = match &*sock.borrow() {
+        Socket::Inet(s) => Some((
+            s.fd,
+            s.ty == SOCK_STREAM && s.proto == IPPROTO_TCP,
+            net_of(cx, s).owner.clone(),
+        )),
         _ => None,
     };
-    if let Some(host_fd) = inet_fd
+    if let Some((host_fd, tcp, owner)) = inet
         && level == SOL_SOCKET
         && matches!(name, SO_ATTACH_FILTER | SO_ATTACH_REUSEPORT_CBPF)
     {
-        let fprog = v.get(..16).ok_or(Errno::EINVAL)?;
-        let n = usize::from(u16::from_le_bytes([fprog[0], fprog[1]]));
-        if n == 0 || n > BPF_MAXINSNS {
+        let tcp_filter = tcp && name == SO_ATTACH_FILTER;
+        if optlen < 4 {
             return Err(Errno::EINVAL);
         }
-        let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap());
+        if tcp_filter && !cx.cred().ns_capable(&owner, crate::cred::cap::NET_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        if optlen != 16 {
+            return Err(Errno::EINVAL);
+        }
+        if filter_locked(host_fd) {
+            return Err(Errno::EPERM);
+        }
+        let n = usize::from(u16::from_le_bytes([v[0], v[1]]));
+        let ptr = u64::from_le_bytes(v[8..16].try_into().unwrap());
+        if n == 0 || n > BPF_MAXINSNS || ptr == 0 {
+            return Err(Errno::EINVAL);
+        }
         let mut insns = vec![0u8; n * 8];
         cx.mm().read(UserSlice::new(ptr, n * 8), &mut insns)?;
         let mut host = [0u8; 16];
         host[..2].copy_from_slice(&(n as u16).to_le_bytes());
         host[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_le_bytes());
-        appine_hal::net::setsockopt(host_fd, level, name, &host).map_err(Errno)?;
+        let attach = |fd: i32| appine_hal::net::setsockopt(fd, level, name, &host);
+        let res = if tcp_filter && crate::bug::host_refuses_tcp_filters() {
+            Err(Errno::EPERM.0)
+        } else {
+            attach(host_fd)
+        };
+        let kept = match res {
+            Ok(()) => None,
+            Err(e) if e == Errno::EPERM.0 && tcp_filter => {
+                let scratch = appine_hal::net::socket(AF_INET, SOCK_DGRAM, 0).map_err(Errno)?;
+                let checked = attach(scratch);
+                appine_hal::net::close(scratch);
+                checked.map_err(Errno)?;
+                Some(insns)
+            }
+            Err(e) => return Err(Errno(e)),
+        };
+        if name == SO_ATTACH_FILTER
+            && let Socket::Inet(s) = &mut *sock.borrow_mut()
+        {
+            s.filter = kept;
+        }
+        return Ok(0);
+    }
+    // SO_DETACH_FILTER of a program kept in Appine (Linux's sk_detach_filter: EPERM while the
+    // filter is locked); without one the host answers (ENOENT when it has none either)
+    if (level, name) == (SOL_SOCKET, SO_DETACH_FILTER)
+        && let Socket::Inet(s) = &mut *sock.borrow_mut()
+        && s.filter.is_some()
+    {
+        if optlen < 4 {
+            return Err(Errno::EINVAL);
+        }
+        if filter_locked(s.fd) {
+            return Err(Errno::EPERM);
+        }
+        s.filter = None;
         return Ok(0);
     }
     // SO_MARK: only recorded (InetSocket::mark); packets sent by this machine carry it in
@@ -1385,6 +1447,13 @@ fn new_timeouts(level: i32, name: i32) -> i32 {
         (SOL_SOCKET, SO_SNDTIMEO_NEW) => SO_SNDTIMEO,
         _ => name,
     }
+}
+
+/// Whether the host socket's filter is locked (`SO_LOCK_FILTER`, which goes to the host): Linux
+/// then refuses to attach or detach one with EPERM. A host that cannot say counts as unlocked.
+fn filter_locked(host_fd: i32) -> bool {
+    appine_hal::net::getsockopt(host_fd, SOL_SOCKET, SO_LOCK_FILTER, 4)
+        .is_ok_and(|v| v.iter().any(|&b| b != 0))
 }
 
 /// Whether the caller may give a socket in `net` a priority outside 0..=6 (`CAP_NET_RAW` or
@@ -1624,19 +1693,33 @@ pub(super) fn getsockopt(
         return Ok(0);
     }
     // SO_GET_FILTER: Linux's sk_get_filter takes optlen as a count of instructions (8 bytes
-    // each), so the host is asked with the count, never above BPF_MAXINSNS, and optlen comes back
-    // as the program's count; with 0 only the count is asked
-    let inet_fd = match &*sock.borrow() {
-        Socket::Inet(s) => Some(s.fd),
+    // each), and optlen comes back as the program's count; with 0 only the count is asked, and
+    // fewer than the program has is EINVAL. A program kept in Appine (InetSocket::filter) answers
+    // itself; otherwise the host is asked with the count, never above BPF_MAXINSNS
+    let inet = match &*sock.borrow() {
+        Socket::Inet(s) => Some((s.fd, s.filter.clone())),
         _ => None,
     };
     if (level, name) == (SOL_SOCKET, SO_GET_FILTER)
-        && let Some(host_fd) = inet_fd
+        && let Some((host_fd, kept)) = inet
     {
-        let count = room.min(BPF_MAXINSNS) as u32;
-        let (n, insns) = appine_hal::net::get_filter(host_fd, count).map_err(Errno)?;
+        let (n, insns) = match kept {
+            Some(insns) => {
+                let n = insns.len() / 8;
+                match room {
+                    0 => (n, Vec::new()),
+                    r if r < n => return Err(Errno::EINVAL),
+                    _ => (n, insns),
+                }
+            }
+            None => {
+                let count = room.min(BPF_MAXINSNS) as u32;
+                let (n, insns) = appine_hal::net::get_filter(host_fd, count).map_err(Errno)?;
+                (n as usize, insns)
+            }
+        };
         cx.mm().write(UserSlice::new(value, insns.len()), &insns)?;
-        return put(cx, len, n.to_le_bytes()).map(|()| 0);
+        return put(cx, len, (n as u32).to_le_bytes()).map(|()| 0);
     }
     // The ICMP errors the host recorded for raw ICMP sockets and for UDP sockets the aggregation
     // point watches must not be seen by the guest (crate::rawicmp)
