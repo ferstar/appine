@@ -542,7 +542,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
-    /** Forgets the images of the tab shown, which another tab's image ids do not name. */
+    /**
+     * Forgets the images of the tab shown: when another tab is attached, whose image ids do not
+     * name them, or while the window is hidden, as libghostty-vt still holds their pixels, which
+     * the next frame copies again.
+     */
     private fun dropImages() {
         removeCallbacks(animationTick)
         imageCount = 0
@@ -1544,11 +1548,15 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         stopPasswordCheck()
     }
 
-    /** A hidden window asks the kernel nothing; the frame drawn when it shows again resumes it. */
+    /**
+     * A hidden window asks the kernel nothing and keeps no copies of the images' pixels; the frame
+     * drawn when it shows again resumes both (the bitmap still holds the rows painted with them).
+     */
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         if (visibility != VISIBLE) {
             stopPasswordCheck()
+            dropImages()
         } else {
             invalidate()
         }

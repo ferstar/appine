@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/vtview.md` for the paired decision history (not yet created; decisions from before the split are D5, D7, D9, D16, D17, D25, D30, D31, D34, D36 and D37 in `.claude/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-11 (targeted verification only since the split: image bitmaps dropped while the window is hidden last)
 
 ## Responsibilities
 
@@ -90,9 +92,11 @@ opening links (`android/terminal`).
   of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
   locking, premultiplied as `ARGB_8888` holds them; gray and RGB images widened), reusing the
   bitmap when the size is the same; a copy fails when the terminal has moved on to another
-  generation, and the next frame names that. Bitmaps no placement shows are recycled, and
-  attaching another tab drops them all. Pixels that arrive in a frame that does not repaint every
-  row ask for a full frame.
+  generation, and the next frame names that. Bitmaps no placement shows are recycled; attaching
+  another tab drops them all, and so does the window being hidden (the activity stopped), after
+  which the next frame copies them again from libghostty-vt while the backing bitmap still holds
+  the rows painted with them. Pixels that arrive in a frame that does not repaint every row ask
+  for a full frame.
 - A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
   full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
   rows, cursor and colours come from the capture, and so does the overscan byte, while the
@@ -578,12 +582,12 @@ select a command's output and move the cursor by taps:
     in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
     the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
     and luminance), of use only with themes;
-- **Images take memory twice for the tab shown, and are never trimmed**: each screen of each tab
-  keeps up to 32 MiB of decoded Kitty images in libghostty-vt, and the view holds a bitmap of
-  every image placed on the shown tab's screen; memory trimming (`compressAll`) leaves both. A tab
-  restored from its snapshot gets its images back (libghostty-vt's snapshot encoder writes them
-  when built with Kitty graphics, though a comment in its `snapshot/terminal.zig` says otherwise);
-  one restored from its plain transcript has text only.
+- **libghostty-vt's images are never trimmed**: each screen of each tab keeps up to 32 MiB of
+  decoded Kitty images, which memory trimming (`compressAll`) leaves, and while a tab is shown the
+  view holds a second copy of those placed on its screen (dropped while the window is hidden). A
+  tab restored from its snapshot gets its images back (libghostty-vt's snapshot encoder writes
+  them when built with Kitty graphics, though a comment in its `snapshot/terminal.zig` says
+  otherwise); one restored from its plain transcript has text only.
 
 ## Open questions
 
