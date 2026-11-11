@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 7 claims checked by 1 independent verifier — 6 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: `fill_random`, `ClockWatch`; host statistics, `has_private_pages`; DNS waits; handlers' errno; Linux and Android only; `fallocate`, `MADV_REMOVE`, `map_file_over`; host vDSO, timezone; `memfd` last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `get_filter` for `SO_GET_FILTER`, whose optlen counts instructions)
 
 ## Responsibilities
 
@@ -68,7 +68,7 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
   `set_thread_affinity`, `set_thread_nice`, `set_thread_ioprio`, `thread_ioprio`, `clock_gettime`,
   `clock_getres`, `timezone`, `host_vdso` (`HostVdso`), `adjtimex_query`, `RawMode`, `sigwinch_notifier`, `stop_notifier`.
 - Network (`net`): `socket`, `close`, `bind`, `connect`, `listen`, `accept`, `sockname`,
-  `setsockopt`, `getsockopt`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
+  `setsockopt`, `getsockopt`, `get_filter`, `shutdown`, `sendmsg`, `recvmsg`, `interfaces`, `routes`,
   `tx_queue_len`, `source_for`, `sockaddr`, `dns_query`.
 
 ## Data flow / lifecycle
@@ -156,7 +156,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Sockets are created `SOCK_NONBLOCK|SOCK_CLOEXEC` (`accept4` likewise); addresses, options and
   control bytes pass through raw (shared arm64 Linux ABI; `sockaddr` writes the Linux layout);
   `sendmsg` always adds `MSG_NOSIGNAL`; `recvmsg` clamps the address to 128 bytes and returns the
-  full length with `MSG_TRUNC`; `accept` and `sockname` do not clamp, which is safe because only
+  full length with `MSG_TRUNC`; `getsockopt` sizes its buffer by optlen in bytes, so options whose
+  optlen means something else need their own call: `get_filter` sizes `SO_GET_FILTER`'s buffer by
+  its count of 8-byte instructions; `accept` and `sockname` do not clamp, which is safe because only
   `AF_INET`/`AF_INET6` host sockets exist (AF_UNIX and netlink never reach the hal) and Linux caps
   the reported length at 128.
 - `interfaces()` walks `getifaddrs` (one entry per name, index from `if_nametoindex`, flags from
@@ -195,6 +197,9 @@ callbacks and JNI (`android`); the CLI front end (`hosts/cli`).
 - Guest pages are 4K while hosts may use 16K pages: file mappings and residency results are
   translated accordingly.
 - `ioctl` is safe to call but trusts the caller's buffer size.
+- `getsockopt` relies on the host reading optlen as a byte count; an option whose optlen means
+  anything else (`SO_GET_FILTER`'s instruction count) needs a call of its own, or the host writes
+  past the buffer.
 
 ## Confirmed bugs / technical debt
 

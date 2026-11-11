@@ -5,8 +5,11 @@
 # mprotect are Starnix's personality_test's), every execve clears it (arm64's SET_PERSONALITY)
 # and a setuid one the other PER_CLEAR_ON_SETID flags too;
 # a bind mount whose source name was removed shows `//deleted` after its root in mountinfo,
-# whether the source was a directory, a file or one link of a file with another; and the tenth
-# triage's POSIX timers on the CPU clock of a thread or process that has ended
+# whether the source was a directory, a file or one link of a file with another; the tenth
+# triage's POSIX timers on the CPU clock of a thread or process that has ended; and getsockopt's
+# SO_GET_FILTER, whose optlen counts classic BPF instructions of 8 bytes (Linux's sk_get_filter):
+# 0 asks for the count, fewer than the program has is EINVAL, and the program comes back whole
+# with optlen its count (a UDP socket, as TCP needs CAP_NET_ADMIN on newer kernels)
 set -e
 cd /tmp
 cat > small.c <<'C'
@@ -286,3 +289,72 @@ C
 gcc -O1 -pthread -o deadclock deadclock.c
 ./deadclock
 rm -f deadclock deadclock.c
+cat > getfilter.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define SO_GET_FILTER 26
+#define SO_DETACH_FILTER 27
+#define LEN 40
+
+struct insn {
+    unsigned short code;
+    unsigned char jt, jf;
+    unsigned int k;
+};
+struct fprog {
+    unsigned short len;
+    struct insn *filter;
+};
+
+static struct insn prog[LEN];
+
+/* getsockopt(SO_GET_FILTER) with optlen `len` (in instructions) into a buffer twice the program's
+ * size, filled with a marker: optlen afterwards, how many instructions match the program and
+ * whether the first one past them is untouched */
+static void get(int s, const char *what, socklen_t len)
+{
+    struct insn buf[2 * LEN];
+    memset(buf, 0xee, sizeof buf);
+    socklen_t l = len;
+    if (getsockopt(s, SOL_SOCKET, SO_GET_FILTER, buf, &l) < 0) {
+        printf("%s: %s\n", what, strerror(errno));
+        return;
+    }
+    int same = 0;
+    while (same < LEN && memcmp(&buf[same], &prog[same], sizeof *buf) == 0)
+        same++;
+    unsigned char *next = (unsigned char *)&buf[l < 2 * LEN ? l : 2 * LEN - 1];
+    printf("%s: optlen %u, %d instructions match, next untouched %d\n", what, (unsigned)l, same,
+           next[0] == 0xee && next[7] == 0xee);
+}
+
+int main(void)
+{
+    /* 39 loads of a constant, then accept the packet */
+    for (int i = 0; i < LEN - 1; i++)
+        prog[i] = (struct insn){0x00, 0, 0, (unsigned)i};
+    prog[LEN - 1] = (struct insn){0x06, 0, 0, 0xffff};
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    get(s, "no filter, count", 0);
+    get(s, "no filter, room for 10", 10);
+    struct fprog fp = {LEN, prog};
+    printf("attach: %d\n", setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof fp));
+    get(s, "count", 0);
+    get(s, "one short", LEN - 1);
+    get(s, "exact", LEN);
+    get(s, "twice", 2 * LEN);
+    int zero = 0;
+    printf("detach: %d\n", setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &zero, sizeof zero));
+    get(s, "detached", 2 * LEN);
+    close(s);
+    return 0;
+}
+C
+gcc -O1 -o getfilter getfilter.c
+./getfilter
+rm -f getfilter getfilter.c

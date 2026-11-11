@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: netlink sockets split out into kernel/netlink)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: `SO_GET_FILTER` asked of the host with a count of instructions)
 
 ## Responsibilities
 
@@ -201,7 +201,7 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   piece by piece, writing each piece out at its offset until one comes up short; msghdr iovecs are
   read as Linux's `import_iovec` does (a negative length anywhere `EINVAL`, then an iovec reaching
   past 2^48 `EFAULT`, the total cut to `MAX_RW_COUNT`); setsockopt values are cut to 256 bytes and
-  getsockopt asks the host for at most 256.
+  getsockopt asks the host for at most 256 (`SO_GET_FILTER` aside).
 - Host sendmsg/recvmsg run under the BKL (nonblocking); only waits release it. There is no
   BKL-free fast path for sockets.
 
@@ -224,7 +224,10 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `MAX_SCHEDULE_TIMEOUT`; AF_UNIX sockets parse them the same way); `IPV6_V6ONLY` in new
   namespaces (recorded). getsockopt answers `SO_ORIGINAL_DST`, `SO_ERROR` (pending ICMP errors
   first), the timeouts, `SO_MARK`, `SO_TYPE` (`SOCK_RAW` for raw sockets) and recorded
-  `IPV6_V6ONLY` itself.
+  `IPV6_V6ONLY` itself, and asks the host for `SO_GET_FILTER` the way Linux's `sk_get_filter`
+  reads it: optlen is a count of 8-byte instructions (passed on capped at `BPF_MAXINSNS`, 4096,
+  which no attached program exceeds), 0 asks only for the count, and optlen comes back as the
+  program's count.
 - Everything else (including `SO_DETACH_FILTER`, `SO_LOCK_FILTER`, `SO_PEERCRED`,
   `SO_BINDTODEVICE` — resolved against host interface names —, `SO_PRIORITY`, `IP_TRANSPARENT`,
   `TCP_*`, and `SO_ATTACH_BPF` with its guest fd number) goes to the host and is checked against
@@ -419,13 +422,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 
 ## Confirmed bugs / technical debt
 
-- **`getsockopt(SO_GET_FILTER)` lets the host write past Appine's heap buffer:** the option goes
-  to the host with an optlen of `min(guest optlen, 256)` and a host buffer of that many bytes,
-  but Linux reads optlen as a count of instructions and copies 8 bytes for each, so a guest that
-  attached n instructions (which any host without Linux 5d39580f68e6 allows) and asks with the
-  usual optlen of n has 8n bytes written into an n-byte allocation; with a larger optlen it gets
-  only part of the filter, above the length it gets `EINVAL`, and the count query (optlen 0)
-  answers 0.
 - **An error after part of a `MSG_WAITALL` read is lost:** the partial count is returned, but the
   host has already taken the error (a reset, say), so the next read sees end of file where Linux
   reports the error then.

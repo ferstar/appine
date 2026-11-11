@@ -93,6 +93,27 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, len: usize) -> Result<Vec<u8>,
     Ok(buf)
 }
 
+/// getsockopt(`SO_GET_FILTER`): the classic BPF program attached to a socket. Linux's
+/// `sk_get_filter` takes optlen as a count of instructions, 8 bytes each, and answers the
+/// program's count, so the buffer holds `count` instructions (with 0 only the count is asked);
+/// a program longer than `count` is `EINVAL`. Returns the count and the instructions copied.
+pub fn get_filter(fd: i32, count: u32) -> Result<(u32, Vec<u8>), i32> {
+    let mut buf = vec![0u8; count as usize * 8];
+    let mut l = count as libc::socklen_t;
+    check(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_GET_FILTER,
+            buf.as_mut_ptr().cast(),
+            &mut l,
+        )
+    })?;
+    // With a nonzero count the host copied `l` instructions, never more than `count`
+    buf.truncate(l.min(count) as usize * 8);
+    Ok((l, buf))
+}
+
 /// sendmsg(2): an empty `addr` sends to the connected peer. Always adds `MSG_NOSIGNAL`, so a
 /// broken connection returns EPIPE instead of the host receiving SIGPIPE.
 pub fn sendmsg(

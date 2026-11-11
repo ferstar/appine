@@ -56,6 +56,11 @@ const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ERROR: i32 = 4;
 const SO_MARK: i32 = 36;
+const SO_ATTACH_FILTER: i32 = 26;
+/// getsockopt's name for `SO_ATTACH_FILTER`.
+const SO_GET_FILTER: i32 = SO_ATTACH_FILTER;
+/// The most instructions of a classic BPF program (`BPF_MAXINSNS`).
+const BPF_MAXINSNS: usize = 4096;
 
 const MSG_PEEK: u32 = 0x2;
 const MSG_CTRUNC: u32 = 0x8;
@@ -1310,7 +1315,6 @@ pub(super) fn setsockopt(
     // instructions in struct sock_fprog is replaced with one on the host (dockerd installs a
     // drop-everything filter on -p listening sockets). An instruction count of 0 or above
     // BPF_MAXINSNS is EINVAL; checking the instructions is left to the host
-    const SO_ATTACH_FILTER: i32 = 26;
     const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
     let inet_fd = match &*sock.borrow() {
         Socket::Inet(s) => Some(s.fd),
@@ -1322,7 +1326,7 @@ pub(super) fn setsockopt(
     {
         let fprog = v.get(..16).ok_or(Errno::EINVAL)?;
         let n = usize::from(u16::from_le_bytes([fprog[0], fprog[1]]));
-        if n == 0 || n > 4096 {
+        if n == 0 || n > BPF_MAXINSNS {
             return Err(Errno::EINVAL);
         }
         let ptr = u64::from_le_bytes(fprog[8..16].try_into().unwrap());
@@ -1618,6 +1622,21 @@ pub(super) fn getsockopt(
         let out = r?;
         cx.mm().write(UserSlice::new(value, out.len()), &out)?;
         return Ok(0);
+    }
+    // SO_GET_FILTER: Linux's sk_get_filter takes optlen as a count of instructions (8 bytes
+    // each), so the host is asked with the count, never above BPF_MAXINSNS, and optlen comes back
+    // as the program's count; with 0 only the count is asked
+    let inet_fd = match &*sock.borrow() {
+        Socket::Inet(s) => Some(s.fd),
+        _ => None,
+    };
+    if (level, name) == (SOL_SOCKET, SO_GET_FILTER)
+        && let Some(host_fd) = inet_fd
+    {
+        let count = room.min(BPF_MAXINSNS) as u32;
+        let (n, insns) = appine_hal::net::get_filter(host_fd, count).map_err(Errno)?;
+        cx.mm().write(UserSlice::new(value, insns.len()), &insns)?;
+        return put(cx, len, n.to_le_bytes()).map(|()| 0);
     }
     // The ICMP errors the host recorded for raw ICMP sockets and for UDP sockets the aggregation
     // point watches must not be seen by the guest (crate::rawicmp)
