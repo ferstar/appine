@@ -1,6 +1,6 @@
 //! Rust bindings for the Appine engine (implemented in C).
 //!
-//! The engine executes guest instructions and the soft-MMU fast path (the engine and kernel/mm
+//! The engine executes guest instructions and the soft-MMU fast path (the engine and kernel/mmu
 //! maps). The kernel layer drives execution with [`Cpu::run`] and then handles syscalls,
 //! exceptions and other events according to the returned [`Exit`].
 
@@ -255,7 +255,7 @@ impl fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
-/// The software page table of one guest address space (the kernel/mm map).
+/// The software page table of one guest address space (the kernel/mmu map).
 pub struct Mmu {
     raw: NonNull<RawMmu>,
 }

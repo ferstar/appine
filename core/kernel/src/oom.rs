@@ -1,4 +1,4 @@
-//! The guest's own OOM killer (design doc §12 item 4).
+//! The guest's own OOM killer (the kernel/oom map, design doc §12 item 4).
 //!
 //! Android's LMK sees only the app process: under memory pressure it kills the whole app, and all
 //! sessions are lost together. So the app process's anonymous memory gets a limit (by default half

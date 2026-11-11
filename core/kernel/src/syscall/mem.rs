@@ -1,4 +1,4 @@
-//! Memory syscalls.
+//! Memory syscalls (the kernel/mm map; process_mrelease: the kernel/oom map).
 
 use std::os::fd::AsRawFd;
 

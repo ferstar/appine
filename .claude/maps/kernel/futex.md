@@ -110,7 +110,7 @@ copy-on-write (`kernel/mm`); counting unimplemented commands (`kernel/signal`).
 
 - `kernel/process`: `Shared`'s futex lock and queue, wait events, restart blocks, `Expiry`
   deadlines, the task table for PI owners.
-- `kernel/mm`: `futex_key`, `translate`, `cow_break`/`fault_in`.
+- `kernel/mm`: `futex_key`, `translate`, `cow_break`; `kernel/mmu`: `fault_in`.
 - `kernel/ns`: owner tids as their pid namespace sees them; `kernel/signal`: counting
   unimplemented commands (`stub`).
 

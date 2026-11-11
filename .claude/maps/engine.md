@@ -24,7 +24,7 @@ under an interpreter or translator, so the engine never jumps to guest code dire
 - The host fault guard (`guard.c`), which turns a host fault inside engine code into an exit.
 
 Outside the module: the radix page table (`mmu.c`), the TLB entry layout and Tier 0 TLB fill/flush,
-and the mm-side code-group policy belong to `kernel/mm`; the kernel layer decides which tier runs
+and the mm-side code-group policy belong to `kernel/mmu`; the kernel layer decides which tier runs
 and what each exit means to the guest. Build: `core/engine/build.rs` compiles the C files with the
 `cc` crate (`-std=c17`, warnings as errors); non-aarch64 hosts get stubs (no native stubs, no
 Tier 1, only CPUID advertised).
@@ -403,17 +403,17 @@ Tier 1, only CPUID advertised).
 ### Inbound
 
 - The kernel task run loop (`Cpu::run`/`step`, `Dbt::run`, exit handling, `ivau_page`, kicks).
-- `kernel/mm` (`DbtSpace` creation, code groups, `trust`/`share`/`retire_outside`/`set_sources`,
-  `Dbt::invalidate`/`flush`, TLB flushes, `Mmu`), the loader (register set, `AT_HWCAP`), signals
-  and ptrace (FP registers, kicks, hardware debug slots), procfs (`/proc/cpuinfo`, MIDR), the
-  machine (fault guard), the OOM timer (`unmap_written_code`, `written_code_bytes`).
+- `kernel/mmu` (`DbtSpace` creation, code groups, `trust`/`share`/`retire_outside`/`set_sources`,
+  `Dbt::invalidate`/`flush`, TLB flushes, `Mmu`), the loader (register set, `AT_HWCAP`), signals and
+  ptrace (FP registers, kicks, hardware debug slots), procfs (`/proc/cpuinfo`, MIDR), the machine
+  (fault guard), the OOM timer (`kernel/oom`: `unmap_written_code`, `written_code_bytes`).
 - Tests: `core/engine/tests` (interpreter, translator, page table, guard) and `tests/lockstep`
   (random instruction sequences compared between hardware, Tier 0 and Tier 1; the whitelist check
   against `llvm-mc`, which runs only on Linux aarch64 and is skipped without `llvm-mc`).
 
 ### Outbound
 
-- `kernel/mm` structures: the page table (`appine_mmu_translate`, the PTE layout walked by the
+- `kernel/mmu` structures: the page table (`appine_mmu_translate`, the PTE layout walked by the
   refill routine), the TLB entry layout and `tlb_used`.
 - Host: `getauxval`, `mrs midr_el1`/`fpcr`/`cntvct_el0`/`cntvctss_el0`/`cntfrq_el0`, `msr dit`, `mmap`/`mremap`/
   `madvise`, pthreads (locks, once, TLS), `sigaction`/`sigsetjmp`/`siglongjmp`, instruction-cache

@@ -25,13 +25,12 @@ stored:
 Root: `core/kernel/src/pseudo.rs`, `cgroup.rs`, `bpf.rs`, `syscall/bpf.rs`.
 
 Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order, open/read/write
-dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps, pagemap and
-`/proc/<pid>/mem` semantics (`kernel/mm`, `kernel/signal`); id maps, `setgroups`,
-`timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children` and state letters
-(`kernel/process`);
-`/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour
-(`kernel/tty`); network semantics behind `/proc/net` and `net.*` (`kernel/net`); the OOM killer
-(`kernel/mm`); SysV IPC and message queues (`kernel/ipc`).
+dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps and `/proc/<pid>/mem`
+semantics (`kernel/mm`, `kernel/signal`); smaps, pagemap and the Rss figures (`kernel/oom`); id
+maps, `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children` and state
+letters (`kernel/process`); `/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`);
+terminal behaviour (`kernel/tty`); network semantics behind `/proc/net` and `net.*` (`kernel/net`);
+the OOM killer (`kernel/oom`); SysV IPC and message queues (`kernel/ipc`).
 
 ## Key types
 
@@ -168,7 +167,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   and `oom_score_adj` are the process's, and writing the latter sets the process's, as Linux's
   tid_base_stuff). Absent: `oom_adj`, `io`, `wchan`, `sched*`, `personality`,
   `loginuid`/`sessionid`, `attr/`, `stack`, `syscall`, `cpuset`, `mountstats`, `timerslack_ns`.
-- `oom_score` is the OOM killer's badness scaled against the host's RAM plus swap (`kernel/mm`'s
+- `oom_score` is the OOM killer's badness scaled against the host's RAM plus swap (`kernel/oom`'s
   `proc_score`): 0 to 2000, 0 for the built-in init, `oom_score_adj` -1000, a process without
   live threads and a vfork child its parent still waits for.
 - `stat`: all 52 fields; the layout fields (code bounds, start of stack, data bounds, start of
@@ -370,7 +369,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `cgroup.subtree_control` are writable (`EPERM` otherwise). Writing a read-only file is `EINVAL`.
 - Enforced: `pids.max` (fork and thread creation), `memory.max` (the root shows the OOM killer's
   limit and measurement; a child's usage is its members' resident memory with what they share
-  counted once (`kernel/mm`'s `Usage`), checked periodically by the OOM
+  counted once (`kernel/oom`'s `Usage`), checked periodically by the OOM
   killer and immediately when a lower limit is written; `memory.oom.group` widens the kill),
   `cgroup.freeze` (threads stop before returning to guest code, waits return and restart after
   thaw; `cgroup.events` reports frozen once every task has stopped or is a vfork parent waiting

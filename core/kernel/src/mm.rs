@@ -1,5 +1,6 @@
 //! Guest address spaces (the kernel/mm map: `.claude/maps/kernel/mm.md`): a VMA table plus a
-//! soft-MMU page table.
+//! soft-MMU page table. Filling entries, keeping threads consistent and code groups are described
+//! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map.
 //!
 //! Every VMA points at a piece of host memory (an anonymous or a file mapping), and several VMAs
 //! can share one piece (after munmap/mprotect splits them, or shared mappings after fork). Host
@@ -4513,7 +4514,7 @@ impl Mm {
     }
 }
 
-// ---- Consistency and code ----
+// ---- Consistency and code (the kernel/mmu map) ----
 
 /// Ranges invalidated in the last few code generations.
 #[derive(Default)]

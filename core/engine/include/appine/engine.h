@@ -1,5 +1,5 @@
 /*
- * The Appine engine's public interface (design doc §13.1, the engine and kernel/mm maps).
+ * The Appine engine's public interface (design doc §13.1, the engine and kernel/mmu maps).
  *
  * The engine only executes guest instructions and the soft-MMU fast path. On svc, a memory access
  * failure, an undefined instruction or brk, appine_cpu_run() returns an exit reason; the kernel
@@ -219,7 +219,7 @@ uint64_t appine_guest_hwcap2(void);
 /* The MIDR_EL1 the guest reads (0 when the host does not allow reading ID registers) */
 uint64_t appine_guest_midr(void);
 
-/* ---- soft-MMU page table (the kernel/mm map) ---- */
+/* ---- soft-MMU page table (the kernel/mmu map) ---- */
 
 enum {
     APPINE_OK = 0,

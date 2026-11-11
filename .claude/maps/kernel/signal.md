@@ -353,7 +353,7 @@ credentials), procfs.
 - Unimplemented syscalls (including io_uring) return `ENOSYS` from the dispatcher's default arm and
   never crash; each is counted as an unimplemented path (below). The list of
   `ENOSYS` numbers is kept in round 139 (`docs/rounds/139-unimplemented-syscalls.md`), less
-  process_mrelease (448), implemented since (`kernel/mm`).
+  process_mrelease (448), implemented since (`kernel/oom`).
 - `gettimeofday` reports the host kernel's timezone (`sys_tz`; Android sets it to the device's time
   zone), from the host's vDSO and from the syscall alike.
 - The guest cannot change host time: `settimeofday` is `EPERM` without reading its arguments;

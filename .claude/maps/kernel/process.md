@@ -32,7 +32,7 @@ Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, 
 dispatcher in `syscall/mod.rs` (its restart and unimplemented-syscall handling are
 `kernel/signal`'s), and `syscall/misc.rs` except the handlers `kernel/signal` lists there (uname,
 syslog, adjtimex, clock setting, restart_syscall), the futex and robust-list handlers and the
-time-namespace offsets. Of the rest of `syscall/misc.rs`, membarrier is described in `kernel/mm`,
+time-namespace offsets. Of the rest of `syscall/misc.rs`, membarrier is described in `kernel/mmu`,
 umask in `kernel/vfs`, and the capability and seccomp prctls in `kernel/cred`.
 
 Outside the module: execve and the ELF loader (`kernel/exec`), namespaces, unshare, setns and ID
@@ -54,7 +54,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   copy of its address space, fd table and fs that other threads read, for procfs); thread-private
   `TaskState` (address space, fd table and `FsContext`, each shared or not per clone flags; thread
   group; alternate stack; `clear_child_tid`; vfork completion; restart block; `fast_sleep`).
-- `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mm` shootdowns).
+- `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mmu` shootdowns).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
   included), `exiting` / `leader_status` / `zombie` / `leader_exit`, `exit_signal`, own and
@@ -237,7 +237,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 - Kill reports (`Kernel::kills`, at most 32, the oldest dropped) carry the pid, comm, the console
   number when the process's controlling terminal is one of the app's consoles, and the reason:
   `Bug` (the report, the 10 kernel log records before it plus itself, and the most-reached
-  unimplemented paths from `stub::top`) or `OutOfMemory` (from the OOM killer, `kernel/mm`). The
+  unimplemented paths from `stub::top`) or `OutOfMemory` (from the OOM killer, `kernel/oom`). The
   host takes them with `Machine::take_kills` (`android/service`).
 - Test hooks exist only in debug builds and with the `test-hooks` feature, and answer `ENOSYS`
   unless `APPINE_TEST_HOOKS=1`. Syscall 0xa991 with `what` 1 to 13 panics at once, points a page
@@ -532,7 +532,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 - Syscall dispatch (`syscall/mod.rs`), `Machine` and the hosts (CLI, Android JNI: boot, shutdown,
   power, spawn, stall), signals and ptrace (group exit, delivery, exit hooks), procfs, every
-  blocking syscall (via the wait API), `kernel/mm` (kicks through `TaskSync`, `quiesce`),
+  blocking syscall (via the wait API), `kernel/mmu` (kicks through `TaskSync`, `quiesce`),
   `kernel/mount` (`fast_changed`), `kernel/exec` (killing the other threads, the tgid takeover,
   vfork completion, POSIX timers), `kernel/ns` (thread groups, ptrace access for setns), the
   terminal bridge (`block_for`).
@@ -541,15 +541,15 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 - `engine`: `Cpu::new`/`run`/`step`/`reset`/`translate`, `Dbt::attach`/`run`, `Kicker`,
   `guest_hwcap`, the spare CPU list.
-- `kernel/mm`: `fork`, `quiesce`, users, `translate`,
-  `defer_unmaps`/`release_unmapped`/`spare::refill`, `Mm::sync`.
+- `kernel/mm`: `fork`, `translate`, `defer_unmaps`/`release_unmapped`/`spare::refill`;
+  `kernel/mmu`: `quiesce`, users, `Mm::sync`, generations and code spaces in the run loop.
 - `kernel/exec` (execve, `loader::load` for `Machine::spawn`), `kernel/ns` (namespaces at clone,
   pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
   robust lists and PI owners at exit).
 - vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags),
   `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, cgroups
   (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
-  killer (`kernel/mm`), loadavg, the store's deferred commits, signals (`send_to_group`,
+  killer (`kernel/oom`), loadavg, the store's deferred commits, signals (`send_to_group`,
   `send_cpu_timer`, `force_fatal`), the kernel log.
 - `appine_hal`: `poll`, `Event`, thread CPU clocks and system time, host thread
   nice/affinity/ioprio, host thread activity (watchdog reports), host CPUs, `ClockWatch`, random

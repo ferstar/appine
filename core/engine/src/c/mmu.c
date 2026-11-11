@@ -1,5 +1,5 @@
 /*
- * soft-MMU page table (the kernel/mm map): a 4-level radix tree with 512 entries per level,
+ * soft-MMU page table (the kernel/mmu map): a 4-level radix tree with 512 entries per level,
  * covering a 48-bit guest address space. Intermediate entries point to the next level's table;
  * leaf entries are a host page address | permission bits. The tree is walked only on a TLB miss.
  *
