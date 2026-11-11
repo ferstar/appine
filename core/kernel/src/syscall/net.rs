@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::{SysResult, get, put, unix};
 use crate::cell::RefCell;
 use crate::errno::Errno;
-use crate::fd::{FileKind, OpenFile, oflags};
+use crate::fd::{FileKind, FileRef, OpenFile, oflags};
 use crate::kernel::{Cx, request_wake_object, wake};
 use crate::net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, InetSocket, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT,
@@ -624,22 +624,36 @@ pub(super) fn listen(cx: &mut Cx<'_>, fd: i32, backlog: i32) -> SysResult {
 }
 
 pub(super) fn accept4(cx: &mut Cx<'_>, fd: i32, addr: u64, addrlen: u64, flags: u32) -> SysResult {
+    // As Linux's __sys_accept4_file: a bad fd (EBADF), then the flags (EINVAL), then the new fd
+    // is reserved (EMFILE) before a connection is taken, so no other thread can take it while
+    // this one waits; then ENOTSOCK. The peer's address is written before the fd is installed,
+    // so a bad address drops the connection (do_accept) and gives the fd back
+    cx.fds().get(fd)?;
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
-    let (sock, nonblock) = socket_of(cx, fd)?;
-    // As Linux's __sys_accept4_file: no free fd is EMFILE before a connection is taken, and the
-    // peer's address is written before the fd is installed, so a bad address drops the
-    // connection (do_accept) instead of leaving an fd the program never learns
-    cx.fds().free_slot(0)?;
-    let (new, peer) = if is_unix(&sock) {
-        unix::accept(cx, &sock, nonblock)?
-    } else {
-        accept_host(cx, &sock, nonblock)?
-    };
-    write_addr(cx, addr, addrlen, &peer)?;
-    let fd = install(cx, new, flags)?;
-    Ok(fd as u64)
+    let newfd = cx.fds_mut().reserve(0)?;
+    let accepted = (|| {
+        let (sock, nonblock) = socket_of(cx, fd)?;
+        let (new, peer) = if is_unix(&sock) {
+            unix::accept(cx, &sock, nonblock)?
+        } else {
+            accept_host(cx, &sock, nonblock)?
+        };
+        write_addr(cx, addr, addrlen, &peer)?;
+        Ok(new)
+    })();
+    match accepted {
+        Ok(new) => {
+            let file = socket_file(new, flags);
+            cx.fds_mut().fill(newfd, file, flags & SOCK_CLOEXEC != 0);
+            Ok(newfd as u64)
+        }
+        Err(e) => {
+            cx.fds_mut().unreserve(newfd);
+            Err(e)
+        }
+    }
 }
 
 /// Accepts a connection on the host socket: returns the new socket and the peer's address.
@@ -648,7 +662,7 @@ fn accept_host(
     sock: &SocketRef,
     nonblock: bool,
 ) -> Result<(SocketRef, Vec<u8>), Errno> {
-    let (host_fd, family, ty, proto, (timeout, sndtimeo), net, local_map, vaddr, (mark, filter)) =
+    let (host_fd, family, ty, proto, (timeout, sndtimeo), net, local_map, vaddr, inherited) =
         match &*sock.borrow() {
             Socket::Inet(s) => (
                 s.fd,
@@ -659,7 +673,7 @@ fn accept_host(
                 s.net.clone(),
                 s.local_map,
                 s.vaddr,
-                (s.mark(), s.filter.clone()),
+                (s.mark(), s.filter.clone(), s.v6only),
             ),
             Socket::Netlink(_) => return Err(Errno::EOPNOTSUPP),
             Socket::Unix(_) => unreachable!("handled by accept4"),
@@ -673,13 +687,16 @@ fn accept_host(
                 // The listener's timeouts and the filter kept in Appine carry over (sk_clone_lock
                 // copies the whole sock and shares sk_filter)
                 (new.rcvtimeo, new.sndtimeo) = (timeout, sndtimeo);
+                let (mark, filter, v6only) = &inherited;
                 new.filter = filter.clone();
+                // IPV6_V6ONLY, recorded in a new namespace (sk_clone_lock copies sk_ipv6only)
+                new.v6only = *v6only;
                 new.local_map = local_map;
                 new.net = net.clone();
                 // The accepted connection inherits the listener's SO_MARK (ir_mark in
                 // inet_csk_clone_lock)
-                if mark != 0 {
-                    new.track_mut().mark = mark;
+                if *mark != 0 {
+                    new.track_mut().mark = *mark;
                 }
                 // When nat rewrote the destination of the initiating end: claim the original
                 // destination seen in this namespace (SO_ORIGINAL_DST, crate::origdst)
@@ -708,8 +725,15 @@ fn accept_host(
                 new.net = net;
                 return Ok((Rc::new(RefCell::new(Socket::Inet(new))), peer));
             }
+            // A signal is EINTR when the wait has a timeout (inet_csk_wait_for_connect's
+            // sock_intr_errno), as for AF_UNIX
             Err(e) if e == Errno::EAGAIN.0 => {
-                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN)?;
+                wait_host(cx, sock, host_fd, POLLIN, nonblock, deadline, Errno::EAGAIN).map_err(
+                    |e| match e {
+                        Errno::ERESTARTSYS if timeout.is_some() => Errno::EINTR,
+                        e => e,
+                    },
+                )?;
             }
             Err(e) => return Err(Errno(e)),
         }
@@ -4367,9 +4391,10 @@ fn read_addr(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
 
 /// Writes an address back to the guest: `addrlen` points at the buffer length, and the actual
 /// length is written back (truncated when the buffer is too small). accept's and recvfrom's
-/// `addr` may be NULL, meaning no address is wanted.
+/// `addr` may be NULL, meaning no address is wanted; otherwise a NULL `addrlen` is EFAULT
+/// (move_addr_to_user).
 fn write_addr(cx: &Cx<'_>, addr: u64, addrlen: u64, value: &[u8]) -> Result<(), Errno> {
-    if addr == 0 || addrlen == 0 {
+    if addr == 0 {
         return Ok(());
     }
     write_addr_to(cx, addr, addrlen, value)
@@ -4416,11 +4441,16 @@ fn net_of(cx: &Cx<'_>, s: &InetSocket) -> Rc<crate::nsproxy::NetNs> {
 
 /// Puts a socket into the fd table; `flags` may include `SOCK_NONBLOCK`, `SOCK_CLOEXEC`.
 fn install(cx: &mut Cx<'_>, sock: SocketRef, flags: u32) -> Result<i32, Errno> {
-    let file = OpenFile::new(
+    let file = socket_file(sock, flags);
+    cx.fds_mut().install(file, flags & SOCK_CLOEXEC != 0, 0)
+}
+
+/// The open file of a socket; `flags` may include `SOCK_NONBLOCK`.
+fn socket_file(sock: SocketRef, flags: u32) -> FileRef {
+    OpenFile::new(
         FileKind::Socket(sock),
         oflags::O_RDWR | (flags & SOCK_NONBLOCK),
-    );
-    cx.fds_mut().install(file, flags & SOCK_CLOEXEC != 0, 0)
+    )
 }
 
 /// The port in a sockaddr (AF_INET, AF_INET6).

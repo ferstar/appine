@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `SIOCADDRT`/`SIOCDELRT` turned into rtnetlink route requests)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: accept4's error order, reserved fd, timed-wait EINTR, NULL lengths and inherited `IPV6_V6ONLY`)
 
 ## Responsibilities
 
@@ -155,14 +155,15 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   local address is), no IPv6 flow information, a scope only for link-local addresses.
   getsockname and getpeername unmap host ports and translate addresses; a raw ICMP socket's local
   port is its protocol number; the stub peer is `127.0.0.53:53`.
-- accept4: bad flags `EINVAL`; `EBADF`/`ENOTSOCK`; no free fd `EMFILE` before a connection is
-  taken (the slot is only looked for, not reserved); host accept with waits bounded by the
-  listener's `SO_RCVTIMEO` (`EAGAIN` on timeout, `ERESTARTSYS` on a signal); the new socket inherits
-  protocol, local port map (not the lease), namespace and its address, mark, the claimed original
-  destination, the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO` and a filter kept in Appine (the host's
-  own filter is inherited on the host); the peer address is unmapped,
-  translated and written back before the fd is installed, so a fault drops the connection and
-  leaves no fd.
+- accept4, in `__sys_accept4_file`'s order: a bad fd `EBADF`, bad flags `EINVAL`, then the new fd
+  is reserved in the fd table (`EMFILE`; no other thread can take it while this one waits), then
+  `ENOTSOCK`; host accept with waits bounded by the listener's `SO_RCVTIMEO` (`EAGAIN` on
+  timeout; a signal `ERESTARTSYS`, or `EINTR` when there is a timeout, as AF_UNIX); the new socket
+  inherits protocol, local port map (not the lease), namespace and its address, mark, the claimed
+  original destination, the listener's `SO_RCVTIMEO`/`SO_SNDTIMEO`, recorded `IPV6_V6ONLY` and a
+  filter kept in Appine (the host's own filter is inherited on the host); the peer address is
+  unmapped, translated and written back before the fd is filled (a non-NULL address with a NULL
+  length `EFAULT`, as recvfrom's), so a fault drops the connection and gives the fd back.
 - shutdown: inet goes to the host, and `SHUT_RD`/`SHUT_RDWR` set `rd_shut`, also when the host
   answers `ENOTCONN` (Linux's `inet_shutdown` takes effect then too).
 
@@ -457,12 +458,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **accept4 differs from Linux at its edges:** Linux checks `EBADF` before the flags and
-  `ENOTSOCK` after `EMFILE`, and reserves the fd, where Appine only looks for a free slot (so
-  `install` can fail after a wait took a connection); a signal during an inet accept wait is
-  `ERESTARTSYS` even with `SO_RCVTIMEO` set (Linux `EINTR`; AF_UNIX already answers `EINTR`); a
-  non-NULL address with a NULL length is skipped instead of `EFAULT`; and in a new namespace an
-  accepted IPv6 socket reads `IPV6_V6ONLY` 0 where Linux copies the listener's.
 - **The DNS stub keys on the host socket type:** in the initial namespace a raw ICMP or ping
   socket (both host `SOCK_DGRAM`) sending or connecting to `127.0.0.53:53` is taken as a DNS
   query; a UDP socket that only talks to the stub is never bound on the host, so getsockname shows

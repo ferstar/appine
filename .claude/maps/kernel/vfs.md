@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 36 claims checked by 3 independent verifiers — 26 confirmed and 10 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: read-only write opens, splice out of a pipe, tmpfs recounts, host stdio readv, then mounts, inotify, AIO, timerfd, loop devices, overlayfs, locks, pipes and xattrs split out and wording condensed)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: reserved fds in `FdTable`)
 
 ## Responsibilities
 
@@ -58,7 +58,8 @@ message queues (`kernel/ipc`); the BKL and the no-BKL fast path (`kernel/process
 - `TmpfsParams` / `Tmpfs` — options and usage (pages, inodes), counted lazily with a changed mark.
 - `Cached` / `Pending` — the fast-path stat resolver without the BKL (reads the store's metadata
   cache under its read lock; 64-component stack), with the store inodes that are mount points.
-- `FdTable` — slots (`FileRef` and `cloexec`), the soft `RLIMIT_NOFILE`, `holds_locks`.
+- `FdTable` — slots (`FileRef` and `cloexec`), reserved fds, the soft `RLIMIT_NOFILE`,
+  `holds_locks`.
 - `OpenFile` (`FileRef = Rc<RefCell<OpenFile>>`) — kind, mode and status flags, position and
   `pos_busy` (0 free, 1 taken, 2 with waiters), display path, dentry, mount, `F_SETOWN*` owner
   with the setter's uids, poll bookkeeping (`kernel/poll`), the inotify `Opened` record, lock
@@ -210,7 +211,10 @@ message queues (`kernel/ipc`); the BKL and the no-BKL fast path (`kernel/process
 - Allocation takes the lowest free slot at or above the minimum and below the table's limit
   (`EMFILE`; `F_DUPFD` with min at or over the limit `EINVAL`; dup3 targets over it `EBADF`).
   `prlimit(RLIMIT_NOFILE)` sets the limit on the table, so it changes for every process sharing
-  it through `CLONE_FILES` (Linux checks each process's own rlimit).
+  it through `CLONE_FILES` (Linux checks each process's own rlimit). `reserve` takes an fd for a
+  file made later (accept4 while it waits, Linux's `get_unused_fd_flags`), and `fill` or
+  `unreserve` ends it: new fds skip a reserved one, dup2 or dup3 onto it (and seccomp's
+  `SECCOMP_ADDFD_FLAG_SETFD`) is `EBUSY`, everything else sees it closed, and fork does not copy it.
 - dup and fork share one `OpenFile` (offset and status flags shared). Clone without `CLONE_FILES`
   copies the slots and resets `holds_locks`. Every thread holds two references to its table:
   `unshare(CLONE_FILES)`, execve (after the other threads are gone) and `CLOSE_RANGE_UNSHARE` copy

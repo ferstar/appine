@@ -3,7 +3,7 @@
 # touching the buffer (a NULL one included) and returns its length, with MSG_PEEK and MSG_WAITALL
 # too; a blocking TCP send or write that meets a shutdown after part of its data returns that count
 # without SIGPIPE, and the next call gets EPIPE and SIGPIPE; SIOCADDRT and SIOCDELRT for IPv4 and
-# IPv6
+# IPv6; accept4's error order, fd reservation, signals, addresses and IPV6_V6ONLY
 set -e
 cd /tmp
 cat > trunc.c <<'C'
@@ -254,3 +254,195 @@ route -A inet6 del 2001:db8:9::/48 gw 2001:db8:1::fe || echo "inet6 deleted twic
 ip -6 route show | grep 2001:db8:[89]
 ' 2>&1
 rm -f rt rt.c
+
+# accept4: EBADF before the flags, EMFILE before ENOTSOCK, the new fd reserved while waiting (a
+# file opened meanwhile gets the next one, dup2 onto it is EBUSY), a signal during the wait (EINTR
+# with SO_RCVTIMEO even under SA_RESTART, restarted without), a NULL addrlen with an address
+# (EFAULT, the connection dropped and the fd given back, as for recvfrom), and IPV6_V6ONLY copied
+# to accepted sockets in a new network namespace
+cat > acc.c <<'C'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static void pause_ms(int ms)
+{
+    struct timespec t = {ms / 1000, ms % 1000 * 1000000L};
+    nanosleep(&t, NULL);
+}
+
+static void report(const char *what, int r)
+{
+    printf("%s: %s\n", what, r < 0 ? strerror(errno) : "ok");
+}
+
+static struct sockaddr_in where;
+
+static int listener(void)
+{
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    bind(l, (struct sockaddr *)&a, sizeof a);
+    getsockname(l, (struct sockaddr *)&a, &al);
+    listen(l, 4);
+    where = a;
+    return l;
+}
+
+static int dial(void)
+{
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&where, sizeof where);
+    return c;
+}
+
+static int lst, during_open, during_dup, accepted;
+
+static void *acceptor(void *a)
+{
+    accepted = accept4(lst, NULL, NULL, 0);
+    return a;
+}
+
+static void on_usr1(int sig) { (void)sig; }
+
+static pthread_t main_thread;
+
+static void *poke(void *a)
+{
+    pause_ms(200);
+    pthread_kill(main_thread, SIGUSR1);
+    pause_ms(200);
+    close(dial());
+    return a;
+}
+
+static void v6only(void)
+{
+    int l = socket(AF_INET6, SOCK_STREAM, 0), on = 1;
+    setsockopt(l, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on);
+    struct sockaddr_in6 a = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT};
+    socklen_t al = sizeof a;
+    if (bind(l, (struct sockaddr *)&a, sizeof a) || getsockname(l, (struct sockaddr *)&a, &al) ||
+        listen(l, 1)) {
+        perror("v6 listener");
+        return;
+    }
+    int c = socket(AF_INET6, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    int n = accept(l, NULL, NULL), v = -1;
+    socklen_t vl = sizeof v;
+    getsockopt(n, IPPROTO_IPV6, IPV6_V6ONLY, &v, &vl);
+    printf("accepted IPV6_V6ONLY: %d\n", v);
+}
+
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc > 1) {
+        v6only();
+        return 0;
+    }
+    int p[2];
+    pipe(p);
+    report("bad fd, bad flags", accept4(999, NULL, NULL, 0x7));
+    report("pipe, bad flags", accept4(p[0], NULL, NULL, 0x7));
+    /* No free fd: EMFILE comes before ENOTSOCK */
+    struct rlimit old, low = {16, 16};
+    getrlimit(RLIMIT_NOFILE, &old);
+    int spare[16], n = 0;
+    while ((spare[n] = dup(0)) >= 0 && n < 15)
+        n++;
+    setrlimit(RLIMIT_NOFILE, &low);
+    for (int fd = 0; fd < 16; fd++)
+        if (fcntl(fd, F_GETFD) < 0)
+            dup2(0, fd);
+    report("pipe, no free fd", accept4(p[0], NULL, NULL, 0));
+    for (int fd = 3; fd < 16; fd++)
+        if (fd != p[0] && fd != p[1])
+            close(fd);
+    setrlimit(RLIMIT_NOFILE, &old);
+
+    /* The fd accept4 will return is taken while it waits */
+    lst = listener();
+    int lowest = dup(0);
+    close(lowest);
+    pthread_t t;
+    pthread_create(&t, NULL, acceptor, NULL);
+    pause_ms(200);
+    during_open = open("/dev/null", O_RDONLY);
+    /* The raw call: musl's dup2 retries for as long as it gets EBUSY */
+    during_dup = syscall(SYS_dup3, 0, lowest, 0);
+    report("dup2 onto the waiting accept's fd", during_dup);
+    int c = dial();
+    pthread_join(t, NULL);
+    printf("accepted at the lowest fd: %d, open meanwhile got the next: %d\n", accepted == lowest,
+           during_open == lowest + 1);
+    close(c);
+    close(accepted);
+    close(during_open);
+
+    /* Signals during the wait */
+    main_thread = pthread_self();
+    struct sigaction sa = {.sa_handler = on_usr1, .sa_flags = SA_RESTART};
+    sigaction(SIGUSR1, &sa, NULL);
+    struct timeval tv = {5, 0};
+    setsockopt(lst, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    pthread_create(&t, NULL, poke, NULL);
+    int r = accept(lst, NULL, NULL);
+    report("SA_RESTART, SO_RCVTIMEO", r);
+    pthread_join(t, NULL);
+    if (r < 0)
+        close(accept(lst, NULL, NULL));
+    else
+        close(r);
+    tv.tv_sec = 0;
+    setsockopt(lst, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    pthread_create(&t, NULL, poke, NULL);
+    r = accept(lst, NULL, NULL);
+    report("SA_RESTART, no timeout (restarted, then connected)", r);
+    pthread_join(t, NULL);
+    close(r);
+
+    /* An address without a length: EFAULT, and the connection is gone */
+    c = dial();
+    pause_ms(100);
+    struct sockaddr_in peer;
+    int before = dup(0);
+    close(before);
+    report("address without a length", accept4(lst, (struct sockaddr *)&peer, NULL, 0));
+    int after = dup(0);
+    printf("fd given back: %d\n", after == before);
+    close(after);
+    fcntl(lst, F_SETFL, O_NONBLOCK);
+    report("connection dropped", accept4(lst, NULL, NULL, 0));
+    close(c);
+    int u = socket(AF_INET, SOCK_DGRAM, 0), v = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t ual = sizeof ua;
+    bind(u, (struct sockaddr *)&ua, sizeof ua);
+    getsockname(u, (struct sockaddr *)&ua, &ual);
+    sendto(v, "x", 1, 0, (struct sockaddr *)&ua, sizeof ua);
+    char b[4];
+    report("recvfrom, address without a length",
+           recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&peer, NULL));
+    return 0;
+}
+C
+gcc -O1 -pthread -o acc acc.c
+./acc
+unshare -n sh -c 'ip link set lo up; /tmp/acc v6only'
+rm -f acc acc.c
