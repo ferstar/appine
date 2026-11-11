@@ -4,15 +4,10 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Rect
-import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.SystemClock
@@ -38,21 +33,14 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.OverScroller
-import androidx.core.graphics.createBitmap
-import androidx.core.graphics.withClip
-import androidx.core.graphics.withScale
 import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.Locale
 import kotlin.math.abs
-import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -60,15 +48,10 @@ import kotlin.math.roundToInt
  * it with JetBrains Mono on a fixed cell grid. Sessions belong to [TerminalService] and keep parsing output while no view shows them;
  * [attach] switches the view to another tab.
  *
- * Each frame takes the rows that changed ([VtNative.frame]) into a mirror of the screen and paints
- * them into a bitmap the size of the grid; the cursor and the input method's composing text are
- * drawn over it. Glyphs are placed cell by cell: runs of ASCII share one draw call (the font size
- * is chosen so their advance is exactly one cell), every other glyph is centred in its one or two
- * cells, enlarged evenly to fill two cells when it is wide (the setting, for CJK fallback glyphs
- * narrower than two cells) or shrunk evenly when it is wider, never stretched. Box drawing, block
- * elements and the Powerline triangles are drawn as shapes ([VtGlyphs]). Images programs show
- * (the Kitty graphics protocol) are painted into the rows they reach, below the backgrounds, below
- * the text or above it as the frame places them; their pixels are copied once per change.
+ * Each frame ([VtNative.frame], read as a [VtFrame]) takes the rows that changed into a mirror of
+ * the screen ([VtScreen]), which [VtRenderer] paints into a bitmap the size of the grid together
+ * with the images programs show (the Kitty graphics protocol, [VtImages], whose pixels are copied
+ * once per change); the cursor and the input method's composing text are drawn over it.
  *
  * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
  * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
@@ -118,24 +101,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         fun onSearchCount(total: Int, selected: Int)
     }
 
-    /** Where a frame draws an image, or part of it (vt.c's image placements). */
-    private class Placement {
-        var id = 0
-        var layer = 0
-        var generation = 0L
-        var imageWidth = 0
-        var imageHeight = 0
-
-        /** In the grid's pixels; it can reach past the grid. */
-        val dst = Rect()
-
-        /** In the image's pixels. */
-        val src = Rect()
-    }
-
-    /** An image's bitmap and the [generation] of its pixels it holds, -1 when copying them failed. */
-    private class Picture(val bitmap: Bitmap, var generation: Long)
-
     /** The tab shown, null for none. */
     var session: VtSession? = null
         private set
@@ -143,66 +108,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The shown tab's terminal, 0 when there is none or its shell has not started. */
     private val tab: Long get() = session?.tab ?: 0L
 
-    private val upright = font("fonts/JetBrainsMono.ttf", 400)
-    private val paints = arrayOf(
-        textPaint(upright),
-        textPaint(font("fonts/JetBrainsMono.ttf", 700)),
-        textPaint(font("fonts/JetBrainsMono-Italic.ttf", 400)),
-        textPaint(font("fonts/JetBrainsMono-Italic.ttf", 700)),
-    )
-    private val fill = Paint()
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-    private val curl = Path()
-    private val glyphs = VtGlyphs()
-
-    /** The lock drawn for the cursor while a password is read ([drawLock]). */
-    private val lockPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val shackle = Path()
+    /** The screen as of the last frame, and how it is drawn. */
+    private val screen = VtScreen()
+    private val images = VtImages()
+    private val renderer = VtRenderer(context, screen, images)
 
     /** The font size in pixels; [MainActivity] keeps it across starts. */
     private var fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics)
-    private var cellWidth = 1
-    private var cellHeight = 1
-    private var baseline = 0
-    private var light = 1
-    private var underlineY = 0
-    private var strikeY = 0
-    private var dotted = DashPathEffect(floatArrayOf(1f, 1f), 0f)
-    private var dashed = DashPathEffect(floatArrayOf(3f, 2f), 0f)
 
     /** Whether glyphs in wide cells are enlarged to fill them ([setFillWide]). */
     private var fillWide = true
 
-    /**
-     * How much glyphs in wide cells are enlarged: so that an ideograph's advance fills two cells
-     * when [fillWide], else 1. The system's CJK fallback draws ideographs one em wide, short of two
-     * cells of JetBrains Mono (1.2 em), which leaves wide gaps between them; measured, so a font
-     * with its own ideographs two cells wide gets 1.
-     */
-    private var wideScale = 1f
-
-    /** Advances of single codepoints, per paint (index << 32 | codepoint). */
-    private val widths = HashMap<Long, Float>()
-
-    // The screen, as of the last frame
-    private var cols = 0
-    private var rows = 0
-    private var cp = IntArray(0)
-    private var fg = IntArray(0)
-    private var bg = IntArray(0)
-    private var attrs = IntArray(0)
-
-    /** Whole graphemes of cells with more than one codepoint, else null. */
-    private var clusters = arrayOfNulls<String>(0)
-    private var defaultFg = Color.WHITE
-    private var defaultBg = Color.BLACK
-    private var cursorColor = 0
-    private var cursorShown = false
-    private var cursorStyle = 1
-    private var cursorBlinking = false
-    private var cursorX = 0
-    private var cursorY = 0
-    private var atBottom = true
+    // The grid and the size of its cells
+    private val cols: Int get() = screen.cols
+    private val rows: Int get() = screen.rows
+    private val cellWidth: Int get() = renderer.cellWidth
+    private val cellHeight: Int get() = renderer.cellHeight
 
     /** A blinking cursor ([updateBlink]): whether the timer runs, and the phase it is in. */
     private var blinkRunning = false
@@ -223,7 +144,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var checkingPassword = false
     private val passwordCheck = object : Runnable {
         override fun run() {
-            if (tab != 0L && cursorStyle == CURSOR_LOCK && VtNative.passwordInput(tab)) {
+            if (tab != 0L && screen.cursorStyle == VtRenderer.CURSOR_LOCK && VtNative.passwordInput(tab)) {
                 postDelayed(this, PASSWORD_CHECK_MS)
             } else {
                 checkingPassword = false
@@ -242,10 +163,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var lastBell = 0L
 
     // The scrollable area (scrollback and screen) in rows, the viewport's first row in it and the
-    // rows it shows, for the scroll bar
+    // rows it shows, for the scroll bar; and whether the viewport is at its bottom (the active area)
     private var scrollTotal = 0
     private var scrollOffset = 0
     private var scrollLen = 0
+    private var atBottom = true
 
     /**
      * The mouse pointer: the shape the program asked for (OSC 22, a `GhosttyMouseShape`; an
@@ -292,8 +214,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** The scrollable rows of the frame before, to tell when rows left the scrollback. */
     private var lastScrollTotal = 0
 
-    /** The height of a match's mark along the scroll bar. */
+    /** The height of a match's mark along the scroll bar, and its paint. */
     private val matchMarkHeight = (2 * resources.displayMetrics.density).roundToInt().coerceAtLeast(1)
+    private val matchPaint = Paint()
 
     /**
      * Where the viewport was before a step to another match ([searchStep]) or prompt
@@ -308,29 +231,11 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var selEndX = -1
     private var selEndY = -1
 
-    /** Each row's selected columns (inclusive), -1 when none. */
-    private var selFrom = IntArray(0)
-    private var selTo = IntArray(0)
-
-    /**
-     * Kitty images: the last frame's placements in drawing order (the first [imageCount], from a
-     * pool kept across frames), painted into the rows they reach, and the bitmaps of the images
-     * they show by id, dropped once no placement shows them.
-     */
-    private val placements = ArrayList<Placement>()
-    private var imageCount = 0
-    private val pictures = HashMap<Int, Picture>()
-    private val imagePaint = Paint(Paint.FILTER_BITMAP_FLAG)
-
     /** Draws again for the next frame of an animated image. */
     private val animationTick = Runnable { invalidate() }
 
-    private var bitmap: Bitmap? = null
-    private var canvas: Canvas? = null
-
     /** Ask the next frame for every row (after a resize, a new bitmap, new default colours). */
     private var full = true
-    private val runChars = CharArray(4096)
 
     /** The input method's composing text, drawn at the cursor. */
     private var preedit = ""
@@ -441,8 +346,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
-    private val handleStart = themeDrawable(android.R.attr.textSelectHandleLeft)
-    private val handleEnd = themeDrawable(android.R.attr.textSelectHandleRight)
+    private val handleStart = context.themeDrawable(android.R.attr.textSelectHandleLeft)
+    private val handleEnd = context.themeDrawable(android.R.attr.textSelectHandleRight)
     /** How far around a handle a touch still takes it. */
     private val handleSlop = (8 * resources.displayMetrics.density).toInt()
     /** The handles' areas last kept out of the system's gestures. */
@@ -478,28 +383,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         // The theme's scroll bar, shown and faded as a ScrollView's (computeVerticalScroll*)
         isVerticalScrollBarEnabled = true
         isScrollbarFadingEnabled = true
-        verticalScrollbarThumbDrawable = themeDrawable(android.R.attr.scrollbarThumbVertical)
-        measureCells()
+        verticalScrollbarThumbDrawable = context.themeDrawable(android.R.attr.scrollbarThumbVertical)
+        renderer.setFont(fontPx, fillWide)
     }
-
-    private fun themeDrawable(attr: Int): Drawable? {
-        val a = context.obtainStyledAttributes(intArrayOf(attr))
-        try {
-            return a.getDrawable(0)
-        } finally {
-            a.recycle()
-        }
-    }
-
-    private fun font(path: String, weight: Int): Typeface =
-        Typeface.Builder(context.assets, path).setFontVariationSettings("'wght' $weight").build()
-
-    private fun textPaint(typeface: Typeface) =
-        Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
-            this.typeface = typeface
-            // Ligatures would join cells
-            fontFeatureSettings = "'calt' 0, 'liga' 0"
-        }
 
     /**
      * Shows [s] (null for nothing): the grid is applied to its terminal, the whole screen is taken
@@ -542,16 +428,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
-    /**
-     * Forgets the images of the tab shown: when another tab is attached, whose image ids do not
-     * name them, or while the window is hidden, as libghostty-vt still holds their pixels, which
-     * the next frame copies again.
-     */
+    /** Forgets the images of the tab shown ([VtImages.drop]) and stops their animation. */
     private fun dropImages() {
         removeCallbacks(animationTick)
-        imageCount = 0
-        for (p in pictures.values) p.bitmap.recycle()
-        pictures.clear()
+        images.drop()
     }
 
     /** Stops asking whether a password is still read ([passwordCheck]). */
@@ -641,35 +521,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Metrics and the grid ----
 
-    /**
-     * Cell size for [fontPx]: the width is the font's advance rounded to whole pixels, and the text
-     * size is then adjusted so the advance is exactly that width (ASCII runs stay on the grid).
-     */
-    private fun measureCells() {
-        for (p in paints) p.textSize = fontPx
-        val advance = paints[0].measureText("M")
-        cellWidth = max(1, advance.roundToInt())
-        val size = fontPx * cellWidth / advance
-        for (p in paints) p.textSize = size
-        val fm = paints[0].fontMetrics
-        val height = fm.descent - fm.ascent
-        cellHeight = max(1, ceil(height).toInt())
-        baseline = (-fm.ascent + (cellHeight - height) / 2).roundToInt()
-        light = max(1, paints[0].underlineThickness.roundToInt())
-        underlineY = baseline + max(1, paints[0].underlinePosition.roundToInt())
-        strikeY = baseline + paints[0].strikeThruPosition.roundToInt()
-        dotted = DashPathEffect(floatArrayOf(light.toFloat(), light.toFloat()), 0f)
-        dashed = DashPathEffect(floatArrayOf(light * 3f, light * 2f), 0f)
-        stroke.strokeWidth = light.toFloat()
-        val ideograph = paints[0].measureText("水")
-        wideScale = if (fillWide && ideograph > 0f) max(1f, 2 * cellWidth / ideograph) else 1f
-        widths.clear()
-    }
-
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = regrid()
 
     /**
-     * Fits the grid to the view. The mirror and the bitmap hold one row more than the grid, the
+     * Fits the grid to the view. The screen and the bitmap hold one row more than the grid, the
      * frame's overscan row after the viewport, which shows in part while the grid is drawn
      * shifted up by [scrollPx].
      */
@@ -677,22 +532,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (width == 0 || height == 0) return
         val c = max(1, width / cellWidth)
         val r = max(1, height / cellHeight)
-        val bw = c * cellWidth
-        val bh = (r + 1) * cellHeight
-        if (c == cols && r == rows && bitmap?.width == bw && bitmap?.height == bh) return
-        cols = c
-        rows = r
+        if (!renderer.resize(c, r)) return
         scrollPx = 0
-        val n = c * (r + 1)
-        cp = IntArray(n)
-        fg = IntArray(n)
-        bg = IntArray(n)
-        attrs = IntArray(n)
-        clusters = arrayOfNulls(n)
-        selFrom = IntArray(r + 1) { -1 }
-        selTo = IntArray(r + 1) { -1 }
-        bitmap?.recycle()
-        bitmap = createBitmap(bw, bh).also { canvas = Canvas(it) }
         full = true
         session?.resize(c, r, cellWidth, cellHeight)
         host.onGrid(c, r, cellWidth, cellHeight)
@@ -705,7 +546,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val size = px.coerceIn(6 * density, 32 * density)
         if (size == fontPx) return
         fontPx = size
-        measureCells()
+        renderer.setFont(fontPx, fillWide)
         regrid()
     }
 
@@ -713,7 +554,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     fun setFillWide(on: Boolean) {
         if (on == fillWide) return
         fillWide = on
-        measureCells()
+        renderer.setFont(fontPx, fillWide)
         full = true
         invalidate()
     }
@@ -727,24 +568,22 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     // ---- Frames ----
 
     override fun onDraw(c: Canvas) {
-        c.drawColor(defaultBg)
-        val bmp = bitmap ?: return
+        c.drawColor(screen.defaultBg)
+        if (!renderer.hasGrid) return
         if (tab != 0L) {
             val start = SystemClock.elapsedRealtimeNanos()
             val f = full
             full = false
-            VtNative.frame(tab, f)?.let(::apply)
+            VtNative.frame(tab, f)?.let { apply(VtFrame(it)) }
             stats(SystemClock.elapsedRealtimeNanos() - start)
         }
         // The grid, shifted up by part of a row while the viewport scrolls; the margin below the
         // last whole row keeps the background
-        val s = scrollPx.toFloat()
-        c.withClip(0, 0, cols * cellWidth, rows * cellHeight) {
-            c.drawBitmap(bmp, 0f, -s, null)
-        }
-        c.withTranslation(0f, -s) {
-            drawCursor(c)
-            drawPreedit(c)
+        renderer.drawGrid(c, scrollPx)
+        c.withTranslation(0f, -scrollPx.toFloat()) {
+            // Not in a blinking cursor's hidden phase
+            if (tab != 0L && (!blinkRunning || blinkOn)) renderer.drawCursor(c, hasFocus(), preedit.isNotEmpty())
+            renderer.drawPreedit(c, preedit)
         }
         drawMatchMarks(c)
         drawHandles(c)
@@ -756,58 +595,55 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
     }
 
-    /** Takes a frame (format in `hosts/android/src/vt.c`) into the mirror and the bitmap. */
-    private fun apply(b: ByteBuffer) {
-        b.order(ByteOrder.LITTLE_ENDIAN)
-        val c = b.getShort(0).toInt() and 0xffff
-        val r = b.getShort(2).toInt() and 0xffff
-        if (c != cols || r != rows) {
+    /**
+     * Takes a frame: its header's state, its images ([VtImages.take]) and its rows into the screen,
+     * which the renderer paints into the bitmap.
+     */
+    private fun apply(frame: VtFrame) {
+        if (frame.cols != cols || frame.rows != rows) {
             // Captured before the resize reached the terminal
             full = true
             postInvalidateOnAnimation()
             return
         }
-        val oldCursorX = cursorX
-        val oldCursorY = cursorY
-        cursorShown = b.get(5).toInt() != 0
-        cursorStyle = b.get(6).toInt()
-        cursorBlinking = b.get(7).toInt() != 0
-        if (cursorStyle == CURSOR_LOCK && !checkingPassword && windowVisibility == VISIBLE) {
+        val oldCursorX = screen.cursorX
+        val oldCursorY = screen.cursorY
+        screen.cursorShown = frame.cursorShown
+        screen.cursorStyle = frame.cursorStyle
+        screen.cursorBlinking = frame.cursorBlinking
+        val lock = screen.cursorStyle == VtRenderer.CURSOR_LOCK
+        if (lock && !checkingPassword && windowVisibility == VISIBLE) {
             checkingPassword = true
             postDelayed(passwordCheck, PASSWORD_CHECK_MS)
         }
         // The input method takes what is typed at a password prompt as a password: no suggestions,
         // nothing learnt. Posted, as restarting the input calls into the input method's service
-        if ((cursorStyle == CURSOR_LOCK) != imePassword) {
+        if (lock != imePassword) {
             imePassword = !imePassword
             post(::restartInput)
         }
-        cursorX = b.getShort(8).toInt() and 0xffff
-        cursorY = b.getShort(10).toInt() and 0xffff
-        val newFg = b.getInt(12)
-        val newBg = b.getInt(16)
-        cursorColor = b.getInt(20)
-        val count = b.getShort(24).toInt() and 0xffff
-        atBottom = b.get(26).toInt() != 0
-        val flags = b.get(27).toInt()
-        mouseTracking = flags and FLAG_MOUSE != 0
-        altScreen = flags and FLAG_ALT_SCREEN != 0
-        altScroll = flags and FLAG_ALT_SCROLL != 0
+        screen.cursorX = frame.cursorX
+        screen.cursorY = frame.cursorY
+        screen.cursorColor = frame.cursorColor
+        atBottom = frame.atBottom
+        mouseTracking = frame.mouseTracking
+        altScreen = frame.altScreen
+        altScroll = frame.altScroll
         val hadSelection = selected
-        selected = flags and FLAG_SELECTION != 0
-        rectangle = flags and FLAG_RECTANGLE != 0
+        selected = frame.selection
+        rectangle = frame.rectangle
         if (hadSelection && !selected && menuX < 0) menu?.finish()
-        selStartX = coordinate(b, 28)
-        selStartY = coordinate(b, 30)
-        selEndX = coordinate(b, 32)
-        selEndY = coordinate(b, 34)
-        scrollTotal = b.getInt(36)
-        scrollOffset = b.getInt(40)
-        scrollLen = b.getInt(44)
+        selStartX = frame.selStartX
+        selStartY = frame.selStartY
+        selEndX = frame.selEndX
+        selEndY = frame.selEndY
+        scrollTotal = frame.scrollTotal
+        scrollOffset = frame.scrollOffset
+        scrollLen = frame.scrollLen
         // Without a row after the viewport (at the bottom), or once scrolling no longer moves it
         // (mouse tracking, the alternate screen), the grid is in its place
-        if (b.get(58).toInt() == 0 || scrollWay() != WAY_VIEWPORT) scrollPx = 0
-        pointerShape = b.get(59).toInt()
+        if (!frame.overscan || scrollWay() != WAY_VIEWPORT) scrollPx = 0
+        pointerShape = frame.pointerShape
         updatePointer()
         if (stepFrom >= 0) {
             if (scrollOffset != stepFrom) awakenScrollBars()
@@ -815,9 +651,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         }
         if (searching) {
             // Searching a long scrollback takes more than one frame
-            if (flags and FLAG_SEARCH_PENDING != 0) postInvalidateOnAnimation()
-            val total = b.getInt(48)
-            val selectedMatch = b.getInt(52)
+            if (frame.searchPending) postInvalidateOnAnimation()
+            val total = frame.searchTotal
+            val selectedMatch = frame.searchSelected
             if (total != searchTotal || selectedMatch != searchSelected) {
                 searchTotal = total
                 searchSelected = selectedMatch
@@ -828,75 +664,34 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             // then in case as many rows left as came
             val now = SystemClock.uptimeMillis()
             if (total != matchRowsTotal || selectedMatch != matchRowsSelected || scrollTotal < lastScrollTotal ||
-                (b.get(4).toInt() != DIRTY_NONE && now - matchRowsAt >= MATCH_ROWS_MS)
+                (frame.dirty != VtFrame.DIRTY_NONE && now - matchRowsAt >= MATCH_ROWS_MS)
             ) {
                 takeMatchRows(total, selectedMatch, now)
             }
         }
         lastScrollTotal = scrollTotal
-        if (monitorCursor && (cursorX != oldCursorX || cursorY != oldCursorY)) updateCursorAnchor()
+        val cursorMoved = screen.cursorX != oldCursorX || screen.cursorY != oldCursorY
+        if (monitorCursor && cursorMoved) updateCursorAnchor()
         updateBlink()
-        if (cursorX != oldCursorX || cursorY != oldCursorY) restartBlink()
-        if (newFg != defaultFg || newBg != defaultBg) {
+        if (cursorMoved) restartBlink()
+        if (frame.defaultFg != screen.defaultFg || frame.defaultBg != screen.defaultBg) {
             // Rows that did not change still have the old default colours
-            defaultFg = newFg
-            defaultBg = newBg
+            screen.defaultFg = frame.defaultFg
+            screen.defaultBg = frame.defaultBg
             full = true
             postInvalidateOnAnimation()
         }
-        val images = b.getShort(56).toInt() and 0xffff
-        takeImages(b, HEADER_BYTES, images, b.get(4).toInt() == DIRTY_FULL)
-        removeCallbacks(animationTick)
-        val animationMs = b.getInt(60)
-        if (animationMs > 0) postDelayed(animationTick, animationMs.toLong())
-        frameRows += count
-        val target = canvas ?: return
-        var pos = HEADER_BYTES + images * IMAGE_BYTES
-        repeat(count) {
-            val y = b.getShort(pos).toInt() and 0xffff
-            val n = b.getShort(pos + 2).toInt() and 0xffff
-            val extra = b.getInt(pos + 4)
-            val from = coordinate(b, pos + 8)
-            val to = coordinate(b, pos + 10)
-            pos += ROW_HEADER_BYTES
-            var e = pos + n * 16
-            // Up to the overscan row after the viewport (y == rows)
-            if (y <= rows) {
-                selFrom[y] = if (to >= 0) from else -1
-                selTo[y] = to
-                val base = y * cols
-                for (x in 0 until cols) {
-                    val i = base + x
-                    if (x >= n) {
-                        cp[i] = 0
-                        fg[i] = 0
-                        bg[i] = 0
-                        attrs[i] = 0
-                        clusters[i] = null
-                        continue
-                    }
-                    val o = pos + x * 16
-                    cp[i] = b.getInt(o)
-                    fg[i] = b.getInt(o + 4)
-                    bg[i] = b.getInt(o + 8)
-                    attrs[i] = b.getShort(o + 12).toInt() and 0xffff
-                    val more = b.getShort(o + 14).toInt() and 0xffff
-                    clusters[i] = if (more == 0) {
-                        null
-                    } else {
-                        StringBuilder().apply {
-                            appendCodePoint(cp[i])
-                            repeat(more) {
-                                appendCodePoint(b.getInt(e))
-                                e += 4
-                            }
-                        }.toString()
-                    }
-                }
-                drawRow(target, y)
-            }
-            pos += n * 16 + extra * 4
+        // Pixels that came later than the frame that placed the images (one that did not repaint
+        // every row): the rows they reach are asked for again
+        if (images.take(tab, frame) && frame.dirty != VtFrame.DIRTY_FULL) {
+            full = true
+            postInvalidateOnAnimation()
         }
+        removeCallbacks(animationTick)
+        val animationMs = frame.animationMs
+        if (animationMs > 0) postDelayed(animationTick, animationMs.toLong())
+        frameRows += frame.rowCount
+        renderer.takeRows(frame)
     }
 
     /** Takes the rows of the search's matches along the scroll bar, at a count and selected match. */
@@ -909,10 +704,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         matchRowsAt = now
     }
 
-    /** A u16 coordinate of the frame, -1 for 0xffff (none). */
-    private fun coordinate(b: ByteBuffer, at: Int): Int =
-        (b.getShort(at).toInt() and 0xffff).let { if (it == 0xffff) -1 else it }
-
     /**
      * Shows a mouse over the view the pointer for its place: a hand over a link a Ctrl+click opens
      * (without mouse tracking), else the shape the program asked for (OSC 22) as the closest of
@@ -923,82 +714,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         if (type == pointerSet) return
         pointerSet = type
         pointerIcon = PointerIcon.getSystemIcon(context, type)
-    }
-
-    /**
-     * Takes the frame's [count] image placements at [at] and copies the pixels of the images they
-     * show that are not held at their generation yet; bitmaps no placement shows are dropped. New
-     * pixels come with a frame that repaints every row ([repaintsAll]) since the placements
-     * changed; when they come later (an earlier frame could not get them), the whole screen is
-     * asked for again so that the rows they reach show them.
-     */
-    private fun takeImages(b: ByteBuffer, at: Int, count: Int, repaintsAll: Boolean) {
-        while (placements.size < count) placements.add(Placement())
-        imageCount = count
-        var arrived = false
-        for (k in 0 until count) {
-            val o = at + k * IMAGE_BYTES
-            val p = placements[k]
-            p.id = b.getInt(o)
-            p.layer = b.get(o + 4).toInt()
-            p.generation = b.getLong(o + 8)
-            rect(p.dst, b.getInt(o + 16), b.getInt(o + 20), b.getInt(o + 24), b.getInt(o + 28))
-            rect(p.src, b.getInt(o + 32), b.getInt(o + 36), b.getInt(o + 40), b.getInt(o + 44))
-            p.imageWidth = b.getInt(o + 48)
-            p.imageHeight = b.getInt(o + 52)
-            val held = pictures[p.id]
-            if (held != null && held.generation == p.generation) continue
-            if (copyImage(p, held)) arrived = true
-        }
-        val it = pictures.entries.iterator()
-        while (it.hasNext()) {
-            val e = it.next()
-            if (!shown(e.key)) {
-                e.value.bitmap.recycle()
-                it.remove()
-            }
-        }
-        if (arrived && !repaintsAll) {
-            full = true
-            postInvalidateOnAnimation()
-        }
-    }
-
-    /**
-     * Sets [r] to [w] × [h] pixels at ([x], [y]), the sizes read as unsigned (vt.c's u32) and the
-     * far edges kept within an Int.
-     */
-    private fun rect(r: Rect, x: Int, y: Int, w: Int, h: Int) {
-        val right = min(x + (w.toLong() and 0xffffffffL), Int.MAX_VALUE.toLong())
-        val bottom = min(y + (h.toLong() and 0xffffffffL), Int.MAX_VALUE.toLong())
-        r.set(x, y, right.toInt(), bottom.toInt())
-    }
-
-    /**
-     * Copies the pixels of [p]'s image at its generation into its bitmap, reusing the one [held]
-     * for an older generation when the size is the same; false when they cannot be had now (a
-     * later frame names a newer generation), or the bitmap cannot be made.
-     */
-    private fun copyImage(p: Placement, held: Picture?): Boolean {
-        if (p.imageWidth <= 0 || p.imageHeight <= 0) return false
-        val reuse = held?.bitmap?.takeIf { it.width == p.imageWidth && it.height == p.imageHeight }
-        val bitmap = reuse ?: try {
-            createBitmap(p.imageWidth, p.imageHeight)
-        } catch (_: OutOfMemoryError) {
-            return false
-        } catch (_: IllegalArgumentException) {
-            return false
-        }
-        if (held != null && held.bitmap !== bitmap) held.bitmap.recycle()
-        val copied = VtNative.image(tab, p.id, p.generation, bitmap)
-        pictures[p.id] = Picture(bitmap, if (copied) p.generation else -1L)
-        return copied
-    }
-
-    /** Whether one of the last frame's placements shows image [id]. */
-    private fun shown(id: Int): Boolean {
-        for (k in 0 until imageCount) if (placements[k].id == id) return true
-        return false
     }
 
     private fun stats(nanos: Long) {
@@ -1027,267 +742,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun computeVerticalScrollExtent() = scrollLen * cellHeight
 
-    // ---- Painting ----
-
-    private fun drawRow(c: Canvas, y: Int) {
-        val top = y * cellHeight
-        val base = y * cols
-        c.withClip(0, top, cols * cellWidth, top + cellHeight) {
-            fill.color = defaultBg
-            c.drawRect(0f, top.toFloat(), (cols * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-            // Images below the backgrounds show through cells of the default one
-            drawImages(c, LAYER_BELOW_BACKGROUND, top)
-            var x = 0
-            while (x < cols) {
-                val color = bgOf(base + x)
-                var end = x + 1
-                while (end < cols && bgOf(base + end) == color) end++
-                if (color != defaultBg) {
-                    fill.color = color
-                    c.drawRect((x * cellWidth).toFloat(), top.toFloat(), (end * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-                }
-                x = end
-            }
-            drawImages(c, LAYER_BELOW_TEXT, top)
-            val from = selFrom[y]
-            if (from >= 0) {
-                // The highlight covers a wide character whose first cell ends the selection
-                val to = selTo[y] + if ((attrs[base + selTo[y]] shr 12) and 3 == WIDE) 2 else 1
-                fill.color = SELECTION
-                c.drawRect((from * cellWidth).toFloat(), top.toFloat(), (min(to, cols) * cellWidth).toFloat(), (top + cellHeight).toFloat(), fill)
-            }
-
-            // Runs of plain ASCII in one style go out in one call; other cells one at a time
-            var runStart = -1
-            var runLength = 0
-            var runPaint: Paint? = null
-            var runColor = 0
-            var runDecor = 0
-            fun flush() {
-                if (runLength > 0) {
-                    runPaint!!.color = runColor
-                    c.drawText(runChars, 0, runLength, (runStart * cellWidth).toFloat(), (top + baseline).toFloat(), runPaint!!)
-                    decorate(c, runDecor, runStart, runStart + runLength, top, runColor)
-                }
-                runStart = -1
-                runLength = 0
-            }
-            x = 0
-            while (x < cols) {
-                val i = base + x
-                val a = attrs[i]
-                val wide = (a shr 12) and 3
-                if (wide == SPACER_TAIL || wide == SPACER_HEAD) {
-                    x++
-                    continue
-                }
-                val code = cp[i]
-                val color = fgOf(i)
-                val paint = paintOf(i)
-                val decor = a and DECORATIONS
-                val plain = clusters[i] == null && wide == NARROW && a and INVISIBLE == 0 &&
-                    (code == 0 || code in 0x20..0x7e)
-                if (plain) {
-                    if (runLength > 0 && (paint !== runPaint || color != runColor || decor != runDecor)) flush()
-                    if (runLength == 0) {
-                        runStart = x
-                        runPaint = paint
-                        runColor = color
-                        runDecor = decor
-                    }
-                    runChars[runLength++] = if (code == 0) ' ' else code.toChar()
-                    x++
-                    continue
-                }
-                flush()
-                val span = if (wide == WIDE) 2 else 1
-                if (a and INVISIBLE == 0) drawGlyph(c, i, x, span, top, color, paint)
-                decorate(c, decor, x, x + span, top, color)
-                x += span
-            }
-            flush()
-            drawImages(c, LAYER_ABOVE_TEXT, top)
-        }
-    }
-
-    /**
-     * The images of [layer] that reach into the row at [top], to which the canvas is clipped, in
-     * the frame's order; images whose pixels are not held at the placement's generation are left
-     * out.
-     */
-    private fun drawImages(c: Canvas, layer: Int, top: Int) {
-        for (k in 0 until imageCount) {
-            val p = placements[k]
-            if (p.layer != layer || p.dst.bottom <= top || p.dst.top >= top + cellHeight) continue
-            val picture = pictures[p.id] ?: continue
-            if (picture.generation != p.generation) continue
-            c.drawBitmap(picture.bitmap, p.src, p.dst, imagePaint)
-        }
-    }
-
-    /** A cell's background: a search match's colour, else its own (inverse swaps it with the text's). */
-    private fun bgOf(i: Int): Int = when (markOf(i)) {
-        MARK_MATCH -> SEARCH_MATCH
-        MARK_SELECTED -> SEARCH_SELECTED
-        else -> if (attrs[i] and INVERSE != 0) fg[i].takeIf { it != 0 } ?: defaultFg else bg[i].takeIf { it != 0 } ?: defaultBg
-    }
-
-    /** A cell's text colour: black on a search match, as in Ghostty, else its own. */
-    private fun fgOf(i: Int): Int {
-        if (markOf(i) != MARK_NONE) return SEARCH_TEXT
-        val a = attrs[i]
-        val color = if (a and INVERSE != 0) bg[i].takeIf { it != 0 } ?: defaultBg else fg[i].takeIf { it != 0 } ?: defaultFg
-        return if (a and FAINT != 0) (color and 0x00ffffff) or 0x80000000.toInt() else color
-    }
-
-    /**
-     * A cell's search mark (vt.c's attrs bits 14 and 15): [MARK_MATCH], [MARK_SELECTED] or
-     * [MARK_NONE]. The second cell of a wide character takes the first's, so a match ending on one
-     * covers the whole character.
-     */
-    private fun markOf(i: Int): Int {
-        val a = attrs[i]
-        val own = (a shr 14) and 3
-        if (own != MARK_NONE || (a shr 12) and 3 != SPACER_TAIL || i % cols == 0) return own
-        return (attrs[i - 1] shr 14) and 3
-    }
-
-    private fun paintOf(i: Int): Paint = paints[(attrs[i] and BOLD) or ((attrs[i] and ITALIC))]
-
-    /**
-     * One cell's glyph, centred in its [span] cells: a wide one enlarged by [wideScale], and any
-     * shrunk evenly to fit them.
-     */
-    private fun drawGlyph(c: Canvas, i: Int, x: Int, span: Int, top: Int, color: Int, paint: Paint) {
-        val code = cp[i]
-        // With or without the diacritics that say which part of the image the cell shows
-        if (code == KITTY_PLACEHOLDER) return
-        val cluster = clusters[i]
-        val left = x * cellWidth
-        val w = span * cellWidth
-        if (cluster == null && glyphs.covers(code)) {
-            glyphs.draw(c, code, left, top, w, cellHeight, light, color)
-            return
-        }
-        if (cluster == null && (code == 0 || code == ' '.code)) return
-        val text = cluster ?: String(Character.toChars(code))
-        val advance = if (cluster != null) {
-            paint.measureText(cluster)
-        } else {
-            val key = (paints.indexOf(paint).toLong() shl 32) or code.toLong()
-            widths.getOrPut(key) { paint.measureText(text) }
-        }
-        paint.color = color
-        var s = if (span == 2) wideScale else 1f
-        if (advance * s > w + 0.5f) s = w / advance
-        val l = left + (w - advance * s) / 2
-        if (s == 1f) {
-            c.drawText(text, l, (top + baseline).toFloat(), paint)
-        } else {
-            c.withScale(s, s, l, top + cellHeight / 2f) { c.drawText(text, l, (top + baseline).toFloat(), paint) }
-        }
-    }
-
-    private fun decorate(c: Canvas, decor: Int, from: Int, to: Int, top: Int, color: Int) {
-        if (decor == 0) return
-        val l = (from * cellWidth).toFloat()
-        val r = (to * cellWidth).toFloat()
-        fill.color = color
-        stroke.color = color
-        val underline = (decor shr 8) and 7
-        val uy = (top + underlineY).toFloat()
-        when (underline) {
-            0 -> {}
-            UNDERLINE_DOUBLE -> {
-                c.drawRect(l, uy, r, uy + light, fill)
-                c.drawRect(l, uy + 2 * light, r, uy + 3 * light, fill)
-            }
-            UNDERLINE_CURLY -> {
-                curl.rewind()
-                val amp = light * 1.5f
-                val wave = max(4f, cellWidth / 2f)
-                val mid = uy + amp
-                curl.moveTo(l, mid)
-                var px = l
-                var up = true
-                while (px < r) {
-                    val nx = minOf(r, px + wave)
-                    curl.quadTo((px + nx) / 2, if (up) mid - 2 * amp else mid + 2 * amp, nx, mid)
-                    px = nx
-                    up = !up
-                }
-                c.drawPath(curl, stroke)
-            }
-            UNDERLINE_DOTTED, UNDERLINE_DASHED -> {
-                stroke.pathEffect = if (underline == UNDERLINE_DOTTED) dotted else dashed
-                c.drawLine(l, uy + light / 2f, r, uy + light / 2f, stroke)
-                stroke.pathEffect = null
-            }
-            else -> c.drawRect(l, uy, r, uy + light, fill)
-        }
-        if (decor and STRIKE != 0) {
-            val sy = (top + strikeY).toFloat()
-            c.drawRect(l, sy, r, sy + light, fill)
-        }
-        if (decor and OVERLINE != 0) c.drawRect(l, top.toFloat(), r, (top + light).toFloat(), fill)
-    }
-
-    private fun drawCursor(c: Canvas) {
-        if (tab == 0L || !cursorShown || cursorX >= cols || cursorY >= rows) return
-        if (blinkRunning && !blinkOn) return
-        val i = cursorY * cols + cursorX
-        val span = if ((attrs[i] shr 12) and 3 == WIDE) 2 else 1
-        val l = cursorX * cellWidth
-        val t = cursorY * cellHeight
-        val r = l + span * cellWidth
-        val b = t + cellHeight
-        val color = if (cursorColor != 0) cursorColor else defaultFg
-        fill.color = color
-        stroke.color = color
-        when {
-            // Composing text shows a block, as in Ghostty
-            cursorStyle == CURSOR_LOCK && preedit.isEmpty() -> drawLock(c, l, t, r, b, color)
-            cursorStyle == CURSOR_BAR -> c.drawRect(l.toFloat(), t.toFloat(), (l + 2 * light).toFloat(), b.toFloat(), fill)
-            cursorStyle == CURSOR_UNDERLINE -> c.drawRect(l.toFloat(), (b - 2 * light).toFloat(), r.toFloat(), b.toFloat(), fill)
-            cursorStyle == CURSOR_HOLLOW || !hasFocus() ->
-                c.drawRect(l + light / 2f, t + light / 2f, r - light / 2f, b - light / 2f, stroke)
-            else -> {
-                // A block: the cell's glyph in the background colour on top
-                c.withClip(l, t, r, b) {
-                    c.drawRect(l.toFloat(), t.toFloat(), r.toFloat(), b.toFloat(), fill)
-                    if (attrs[i] and INVISIBLE == 0) drawGlyph(c, i, cursorX, span, t, bgOf(i), paintOf(i))
-                }
-            }
-        }
-    }
-
-    /**
-     * The cursor while the console reads a password: a padlock in the cursor's colour, about as
-     * tall as a capital letter, standing on the baseline in the middle of its cell (or two), where
-     * Ghostty draws a lock glyph (U+F023 from its Nerd Font, which the bundled font lacks); not
-     * blinking, and shown without the focus too.
-     */
-    private fun drawLock(c: Canvas, l: Int, t: Int, r: Int, b: Int, color: Int) {
-        val w = min(cellWidth, b - t) * 0.85f
-        val h = w * 1.15f
-        val cx = (l + r) / 2f
-        val top = t + baseline - h
-        val bodyTop = top + h * 0.42f
-        lockPaint.color = color
-        lockPaint.style = Paint.Style.FILL
-        c.drawRoundRect(cx - w / 2f, bodyTop, cx + w / 2f, top + h, w * 0.12f, w * 0.12f, lockPaint)
-        // The shackle: an arch from the body's top, inset from its sides
-        val sw = max(light.toFloat(), w * 0.16f)
-        val radius = (w * 0.68f - sw) / 2f
-        shackle.rewind()
-        shackle.moveTo(cx - radius, bodyTop)
-        shackle.lineTo(cx - radius, top + sw / 2f + radius)
-        shackle.arcTo(cx - radius, top + sw / 2f, cx + radius, top + sw / 2f + 2 * radius, 180f, 180f, false)
-        shackle.lineTo(cx + radius, bodyTop)
-        lockPaint.style = Paint.Style.STROKE
-        lockPaint.strokeWidth = sw
-        c.drawPath(shackle, lockPaint)
-    }
+    // ---- The cursor's blinking and the search's marks ----
 
     /**
      * Blinks the cursor every [BLINK_MS] (as Android's text fields do) while the frame says it
@@ -1296,7 +751,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * otherwise no timer runs and the cursor stays shown (hollow without the focus).
      */
     private fun updateBlink() {
-        val blinking = cursorBlinking && cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
+        val blinking = screen.cursorBlinking && screen.cursorShown && hasFocus() && hasWindowFocus() && isAttachedToWindow
         if (blinking == blinkRunning) return
         blinkRunning = blinking
         removeCallbacks(blinkTick)
@@ -1320,21 +775,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         postDelayed(blinkTick, BLINK_MS)
     }
 
-    private fun drawPreedit(c: Canvas) {
-        if (preedit.isEmpty() || cursorY >= rows) return
-        val p = paints[0]
-        val w = p.measureText(preedit)
-        // Shifted left when it would run past the right edge
-        val l = min((cursorX * cellWidth).toFloat(), cols * cellWidth - w).coerceAtLeast(0f)
-        val t = (cursorY * cellHeight).toFloat()
-        fill.color = defaultBg
-        c.drawRect(l, t, l + w, t + cellHeight, fill)
-        p.color = defaultFg
-        c.drawText(preedit, l, t + baseline, p)
-        fill.color = defaultFg
-        c.drawRect(l, t + underlineY, l + w, t + underlineY + light, fill)
-    }
-
     /**
      * The search's matches along the scroll bar, as browsers mark found text: a mark as wide as
      * the scroll bar where each row a match starts on lies among the scrollable rows, as the thumb
@@ -1348,19 +788,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val left = right - verticalScrollbarWidth
         val last = height - matchMarkHeight
         val at = { row: Int -> (row.toLong() * height / scrollTotal).toInt().coerceIn(0, max(0, last)) }
-        fill.color = SEARCH_MATCH
+        matchPaint.color = VtRenderer.SEARCH_MATCH
         var drawn = -1
         for (row in matchRows) {
             val top = at(row)
             // Rows closer than a pixel share one mark
             if (top == drawn) continue
             drawn = top
-            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), fill)
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
         }
         if (matchSelectedRow >= 0) {
             val top = at(matchSelectedRow)
-            fill.color = SEARCH_SELECTED
-            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), fill)
+            matchPaint.color = VtRenderer.SEARCH_SELECTED
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
         }
     }
 
@@ -1645,13 +1085,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val location = IntArray(2)
         getLocationOnScreen(location)
         val matrix = Matrix().apply { setTranslate(location[0].toFloat(), location[1].toFloat()) }
-        val x = (cursorX * cellWidth).toFloat() + paints[0].measureText(preedit)
-        val top = (cursorY * cellHeight - scrollPx).toFloat()
+        val x = (screen.cursorX * cellWidth).toFloat() + renderer.advance(preedit)
+        val top = (screen.cursorY * cellHeight - scrollPx).toFloat()
         val info = CursorAnchorInfo.Builder()
             .setMatrix(matrix)
             .setSelectionRange(preedit.length, preedit.length)
             .setComposingText(0, preedit)
-            .setInsertionMarkerLocation(x, top, top + baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
+            .setInsertionMarkerLocation(x, top, top + renderer.baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
             .build()
         context.getSystemService(InputMethodManager::class.java).updateCursorAnchorInfo(this, info)
     }
@@ -1851,6 +1291,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                         return
                     }
                     // The selected rows in the viewport; the top when none is
+                    val selFrom = screen.selFrom
                     val first = selFrom.indexOfFirst { it >= 0 }
                     val last = selFrom.indexOfLast { it >= 0 }
                     if (first < 0) {
@@ -1858,7 +1299,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                         return
                     }
                     val l = if (first == last) selFrom[first] * cellWidth else 0
-                    val r = if (first == last) (selTo[last] + 1) * cellWidth else cols * cellWidth
+                    val r = if (first == last) (screen.selTo[last] + 1) * cellWidth else cols * cellWidth
                     outRect.set(l, first * cellHeight - scrollPx, r, (last + 1) * cellHeight - scrollPx)
                 }
             },
@@ -1901,7 +1342,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val edge = if (start) {
             x * cellWidth
         } else {
-            (x + if ((attrs[y * cols + x] shr 12) and 3 == WIDE) 2 else 1) * cellWidth
+            (x + screen.span(y * cols + x)) * cellWidth
         }
         val left = { d: Drawable, leftHandle: Boolean ->
             // A left handle's point is at three quarters of its width, a right one's at a quarter
@@ -2556,32 +1997,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             KeyEvent.KEYCODE_MOVE_END to VtNative.ADJUST_END,
         )
 
-        // Cell attributes (vt.c)
-        const val BOLD = 1
-        const val ITALIC = 2
-        const val FAINT = 1 shl 2
-        const val INVERSE = 1 shl 4
-        const val INVISIBLE = 1 shl 5
-        const val STRIKE = 1 shl 6
-        const val OVERLINE = 1 shl 7
-        const val DECORATIONS = STRIKE or OVERLINE or (7 shl 8)
-        const val NARROW = 0
-        const val WIDE = 1
-        const val SPACER_TAIL = 2
-        const val SPACER_HEAD = 3
-
-        // GhosttySgrUnderline
-        const val UNDERLINE_DOUBLE = 2
-        const val UNDERLINE_CURLY = 3
-        const val UNDERLINE_DOTTED = 4
-        const val UNDERLINE_DASHED = 5
-
-        // GhosttyCursorStyle (and vt.c's lock)
-        const val CURSOR_BAR = 0
-        const val CURSOR_UNDERLINE = 2
-        const val CURSOR_HOLLOW = 3
-        const val CURSOR_LOCK = 4
-
         /** `GhosttyMouseShape`'s text, the pointer's shape until a program asks for another. */
         const val POINTER_TEXT = 8
 
@@ -2613,35 +2028,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             33 -> PointerIcon.TYPE_ZOOM_OUT
             else -> PointerIcon.TYPE_TEXT
         }
-
-        // The frame format (vt.c)
-        const val HEADER_BYTES = 64
-        const val IMAGE_BYTES = 56
-        const val ROW_HEADER_BYTES = 12
-        const val DIRTY_NONE = 0
-        const val DIRTY_FULL = 2
-        const val FLAG_MOUSE = 1
-        const val FLAG_ALT_SCREEN = 1 shl 1
-        const val FLAG_ALT_SCROLL = 1 shl 2
-        const val FLAG_SELECTION = 1 shl 4
-        const val FLAG_RECTANGLE = 1 shl 5
-        const val FLAG_SEARCH_PENDING = 1 shl 6
-
-        // An image placement's layer (GhosttyImageLayer)
-        const val LAYER_BELOW_BACKGROUND = 0
-        const val LAYER_BELOW_TEXT = 1
-        const val LAYER_ABOVE_TEXT = 2
-
-        /**
-         * The Kitty graphics placeholder (U+10EEEE): its cells show part of an image, which the
-         * frame places, and are drawn blank, as Ghostty draws them.
-         */
-        const val KITTY_PLACEHOLDER = 0x10EEEE
-
-        // A cell's search mark (attrs bits 14 and 15)
-        const val MARK_NONE = 0
-        const val MARK_MATCH = 1
-        const val MARK_SELECTED = 2
 
         // VtNative.mouse
         const val MOUSE_PRESS = 0
@@ -2704,17 +2090,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
         /** Characters of a paste shown when asking whether to paste it. */
         const val PASTE_PREVIEW = 300
-
-        /** The selection's highlight, over cell backgrounds and under text. */
-        const val SELECTION = 0x604A90E2
-
-        /**
-         * Search matches, as Ghostty draws them (its search-background, search-selected-background
-         * and search-foreground): black text on yellow, the selected match on orange.
-         */
-        const val SEARCH_MATCH = 0xFFFFE082.toInt()
-        const val SEARCH_SELECTED = 0xFFF2A57E.toInt()
-        const val SEARCH_TEXT = 0xFF000000.toInt()
 
         /** How often the rows of the search's matches are taken again while output goes on. */
         const val MATCH_ROWS_MS = 500L

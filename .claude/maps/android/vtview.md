@@ -5,20 +5,21 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-11 (targeted verification only since the split: image bitmaps dropped while the window is hidden, then images cut under memory pressure last)
+> Maintained: 2026-11-12 (targeted verification only since the split; latest change: VtView's frame reading, screen mirror, drawing and images moved into VtFrame, VtScreen, VtRenderer and VtImages)
 
 ## Responsibilities
 
-`android/vtview` is the view that draws a tab's terminal and takes its input: `VtView` (drawing
-with the bundled JetBrains Mono, the images programs show, the cursor and the bell, keys, the IME
-and pastes, selection by touch and by mouse, links, search, gestures and scrolling by pixels, and
-the uses of the shell's prompt marks: jumping, selecting a command's output and moving the cursor
-by taps), with `VtKeys` (key codes) and `VtGlyphs` (characters drawn as shapes), and vt.c's side of
-each: the frame format, key, paste and mouse encoding, selection, links, taps on the prompt and
-search.
+`android/vtview` is the view that draws a tab's terminal and takes its input: `VtView` (frames,
+the cursor's blinking and the bell, keys, the IME and pastes, selection by touch and by mouse,
+links, search, gestures and scrolling by pixels, and the uses of the shell's prompt marks: jumping,
+selecting a command's output and moving the cursor by taps), with `VtFrame` (reading a frame),
+`VtScreen` (the screen as of the last frame), `VtRenderer` (drawing it with the bundled JetBrains
+Mono), `VtImages` (the images programs show), `VtKeys` (key codes) and `VtGlyphs` (characters
+drawn as shapes), and vt.c's side of each: the frame format, key, paste and mouse encoding,
+selection, links, taps on the prompt and search.
 
-Root: `VtView.kt`, `VtGlyphs.kt` and `VtKeys.kt` in
-`android/app/src/main/java/io/github/mthli/appine/`, the terminal font in
+Root: `VtView.kt`, `VtFrame.kt`, `VtScreen.kt`, `VtRenderer.kt`, `VtImages.kt`, `VtGlyphs.kt` and
+`VtKeys.kt` in `android/app/src/main/java/io/github/mthli/appine/`, the terminal font in
 `android/app/src/main/assets/fonts/`, and the Frames, Input, Paste, Mouse and focus, Selection,
 Links, Taps on the prompt and Search sections of `hosts/android/src/vt.c`.
 
@@ -28,21 +29,30 @@ opening links (`android/terminal`).
 
 ## Key types
 
-- `VtView` — the view: the attached `VtSession`; cell metrics and four paints; a mirror of the
-  screen (codepoint, colours, attributes with search marks, grapheme clusters, each row's selected
-  columns) and a backing bitmap, both one row taller than the grid (the overscan row); the last
-  frame's modes (`altScreen`), scroll position and selection bounds and shape; `scrollPx` (pixels,
-  less than a row, the grid is drawn above its place while the viewport scrolls) with the drag's
-  sub-pixel remainder; the search's state and count and the rows of its matches along the scroll
-  bar; the last frame's image placements (`Placement`, pooled) and the bitmaps they show by id and
-  generation (`Picture`); the animation's redraw; the IME connection; the mouse pointer (the
-  program's shape, the cell hovered, a link, Ctrl or Meta held); gestures and their drag states
-  (taps in a row; `pointerButton`, a mouse's held button; its last left press; rectangle drags;
-  `pointerSelection`, which hides the handles); the `OverScroller` of flings and of settling on a
-  whole row (`settling`); handles and the floating menu; the cursor's blink timer; the password
-  check (`passwordCheck`, `imePassword`); the bell's last vibration. `Host` (the activity):
-  `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift` and `modifiersUsed`,
-  `onLink` and `onSearchCount`.
+- `VtView` — the view: the attached `VtSession`; its `VtScreen`, `VtImages` and `VtRenderer`
+  (whose cell metrics it reads); the font size and the wide-cell setting; the last frame's modes
+  (`altScreen`), scroll position (and whether the viewport is at the bottom) and selection bounds
+  and shape; `scrollPx` (pixels, less than a row, the grid is drawn above its place while the
+  viewport scrolls) with the drag's sub-pixel remainder; the search's state and count and the rows
+  of its matches along the scroll bar; the animation's redraw; the IME connection; the mouse
+  pointer (the program's shape, the cell hovered, a link, Ctrl or Meta held); gestures and their
+  drag states (taps in a row; `pointerButton`, a mouse's held button; its last left press;
+  rectangle drags; `pointerSelection`, which hides the handles); the `OverScroller` of flings and
+  of settling on a whole row (`settling`); handles and the floating menu; the cursor's blink
+  timer; the password check (`passwordCheck`, `imePassword`); the bell's last vibration. `Host`
+  (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift` and
+  `modifiersUsed`, `onLink` and `onSearchCount`.
+- `VtFrame` — a frame read in place (an inline class over the direct buffer): the header's
+  fields, each image placement, and copying the rows into a `VtScreen`.
+- `VtScreen` — the screen as of the last frame: a mirror of the cells (codepoint, colours,
+  attributes with search marks, grapheme clusters, each row's selected columns), one row taller
+  than the grid (the overscan row), the default colours and the cursor.
+- `VtRenderer` — four paints (regular/bold × upright/italic) and the cell metrics from them, the
+  backing bitmap (one row taller than the grid, like the mirror) and the drawing: rows into the
+  bitmap, the bitmap, the cursor (or the lock) and the composing text into the view's canvas; the
+  cell attribute, underline, cursor and search colour constants.
+- `VtImages` — the last frame's image placements (`Placement`, pooled) and the bitmaps they show
+  by id and generation (`Picture`), copied, drawn per layer into a row and dropped.
 - `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
   triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
@@ -88,8 +98,8 @@ opening links (`android/terminal`).
   each row's source comes in whole image pixels and rows scaled apart leave seams. Every frame
   carries the whole list, and the header the milliseconds to the next animation frame (at least
   8, 0 when none plays), for which the view draws again.
-- The view keeps a bitmap per image shown, by id with the generation of its pixels: a placement
-  of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
+- The view keeps a bitmap per image shown (`VtImages`), by id with the generation of its pixels:
+  a placement of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
   locking, premultiplied as `ARGB_8888` holds them; gray and RGB images widened), reusing the
   bitmap when the size is the same; a copy fails when the terminal has moved on to another
   generation, and the next frame names that. Bitmaps no placement shows are recycled; attaching
@@ -148,7 +158,7 @@ opening links (`android/terminal`).
   draw.
 - While the console reads a password the frame gives the cursor as a lock (style 4), as Ghostty
   shows one at password prompts: wherever the cursor is in the viewport, even when the program
-  hid it, never blinking, with or without the focus; `VtView` draws a padlock about as tall as a
+  hid it, never blinking, with or without the focus; `VtRenderer` draws a padlock about as tall as a
   capital letter on the baseline (Ghostty draws its Nerd Font's U+F023, which JetBrains Mono
   lacks), and a block instead while the IME composes. The pump notes the state at every read;
   while the lock shows in a visible window, `VtView` asks the kernel again every 200 ms (Ghostty
@@ -538,7 +548,7 @@ select a command's output and move the cursor by taps:
   restores no shape (its saved cursor carries none), so the primary keeps the old one until the
   next DECSCUSR 0, DECSTR, RIS or setting change; leaving with mode 47 or 1047 copies the whole
   cursor, shape included, back (from libghostty-vt's source, not tried).
-- The frame format is defined in `vt.c` and parsed in `VtView.apply`; the two change together. The
+- The frame format is defined in `vt.c` and read by `VtFrame`; the two change together. The
   key numbers in `VtKeys` are `GhosttyKey` values, which `key/event.h` spells out and libghostty-vt's
   ABI keeps from 1.0 on; key, action and mouse-button values it does not know make its setters
   fail (vt.c then encodes nothing), where the copy in Ghostty 1.4.0 took them and could crash.

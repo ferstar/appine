@@ -9,7 +9,7 @@
 // around every call, so the terminal, the render state and the buffers below are only used by one
 // thread at a time.
 //
-// Frame format (little-endian), written by appine_vt_frame and read by VtView.kt; the two change
+// Frame format (little-endian), written by appine_vt_frame and read by VtFrame.kt; the two change
 // together:
 //
 //   header, 64 bytes:
