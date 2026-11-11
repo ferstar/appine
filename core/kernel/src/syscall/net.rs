@@ -1944,15 +1944,9 @@ pub(super) fn recvfrom(
     let (sock, nonblock) = socket_of(cx, fd)?;
     let m = recv(cx, &sock, nonblock, len, 0, flags)?;
     cx.mm().write(UserSlice::new(buf, m.data.len()), &m.data)?;
-    let more = recv_rest(
-        cx,
-        &sock,
-        nonblock,
-        m.data.len(),
-        len,
-        flags,
-        |cx, off, d| cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d),
-    );
+    let more = recv_rest(cx, &sock, nonblock, m.len, len, flags, |cx, off, d| {
+        cx.mm().write(UserSlice::new(buf + off as u64, d.len()), d)
+    });
     write_addr(cx, addr, addrlen, &m.addr)?;
     Ok((if flags & MSG_TRUNC != 0 {
         m.len
@@ -1965,7 +1959,8 @@ pub(super) fn recvfrom(
 /// [`recv`] takes at most [`MSG_MAX`], so a longer request goes on piece by piece, each written out
 /// by `put` at its offset, until it is complete or a piece comes up short (end of file, a signal,
 /// the timeout, an error), as Linux's tcp_recvmsg returns what it copied. `first` is the length the
-/// first piece gave; returns how much more was received.
+/// first piece gave (its `len`, as with `MSG_TRUNC` a stream piece carries no data); returns how
+/// much more was received.
 fn recv_rest(
     cx: &mut Cx<'_>,
     sock: &SocketRef,
@@ -1988,7 +1983,7 @@ fn recv_rest(
         if put(cx, got, &m.data).is_err() {
             break;
         }
-        last = m.data.len();
+        last = m.len;
         got += last;
     }
     got - first
@@ -2108,15 +2103,9 @@ pub(super) fn recvmsg(cx: &mut Cx<'_>, fd: i32, msg: u64, flags: u32) -> SysResu
     };
     let mut m = recv(cx, &sock, nonblock, total, room, flags)?;
     scatter(cx, &iovecs, 0, &m.data)?;
-    let more = recv_rest(
-        cx,
-        &sock,
-        nonblock,
-        m.data.len(),
-        total,
-        flags,
-        |cx, off, d| scatter(cx, &iovecs, off, d),
-    );
+    let more = recv_rest(cx, &sock, nonblock, m.len, total, flags, |cx, off, d| {
+        scatter(cx, &iovecs, off, d)
+    });
     // Write msg_namelen, msg_controllen, msg_flags back to the msghdr
     if name != 0 {
         let n = (namelen as usize).min(m.addr.len());
@@ -2236,7 +2225,10 @@ pub(super) fn rw(
             return if done > 0 { Ok(done as u64) } else { Err(e) };
         }
         let last = fault.is_some() || (cur.is_none() && rest.len() == 0);
-        match send(cx, sock, nonblock, &data, &[], &[], 0) {
+        // Once some data has gone, a broken connection ends the write with its count and no
+        // SIGPIPE (the next call gets both)
+        let flags = if done > 0 { MSG_NOSIGNAL } else { 0 };
+        match send(cx, sock, nonblock, &data, &[], &[], flags) {
             Ok(n) => {
                 done += n;
                 if !stream || last || n < data.len() {
@@ -2563,7 +2555,15 @@ pub(crate) fn send(
                     break if done > 0 { Ok(done) } else { Err(err) };
                 }
             }
-            Err(e) if e == Errno::EPIPE.0 => break Err(epipe(cx, flags)),
+            // A stream that sent part of its data returns that count, and the error (with
+            // SIGPIPE) comes with the next call, as tcp_sendmsg returns what it copied
+            Err(e) if e == Errno::EPIPE.0 => {
+                break if done > 0 {
+                    Ok(done)
+                } else {
+                    Err(epipe(cx, flags))
+                };
+            }
             Err(e) if !retried && tap.is_some() && crate::rawicmp::from_icmp(e) => {
                 if let Some(t) = &tap {
                     take_errors(cx, t, host_fd);
@@ -2822,6 +2822,11 @@ pub(crate) fn recv(
                 }
                 buf.truncate(got);
                 let len = if ty == SOCK_STREAM { got } else { r.len };
+                // A stream receive with MSG_TRUNC discards the data, copying nothing to the
+                // buffer, and returns its length (tcp_recvmsg); the host wrote nothing into `buf`
+                if ty == SOCK_STREAM && flags & MSG_TRUNC != 0 {
+                    buf.clear();
+                }
                 if counted {
                     account(cx, sock, true, len, &r.addr);
                 }

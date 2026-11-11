@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: TCP `SO_ATTACH_FILTER` checked for `CAP_NET_ADMIN` and kept in Appine when the host refuses it)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `MSG_TRUNC` on stream receives, and stream sends and writes broken after part of their data)
 
 ## Responsibilities
 
@@ -176,14 +176,17 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   an `IP_PKTINFO`/`IPV6_PKTINFO` may be appended; the host gets the guest flags minus
   `MSG_DONTWAIT`/`MSG_NOSIGNAL` (the host call always adds `MSG_NOSIGNAL`). Blocking stream sends
   loop until done; `EAGAIN` waits (bounded by `SO_SNDTIMEO`, then `EAGAIN` or the partial count);
-  `EPIPE` raises `SIGPIPE` unless `MSG_NOSIGNAL`.
+  `EPIPE` after part of the data returns the partial count (the next call gets the error),
+  otherwise it raises `SIGPIPE` unless `MSG_NOSIGNAL`.
 - recv: AF_UNIX, netlink and raw ICMP go to their own code; queued stub answers come first;
   `MSG_ERRQUEUE` never waits; the host gets the flags minus `MSG_DONTWAIT`/`MSG_WAITALL`; a socket
   connected into a namespace (`vconn`) drops datagrams from anyone else; source addresses are
   unmapped, translated and nat-reversed, and UDP peers recorded for the filter's replies; control
   data is returned verbatim; `EAGAIN` checks the stub queue again, then waits (`SO_RCVTIMEO`,
-  `ERESTARTSYS` on signals). `MSG_WAITALL` on a stream reads until the length is complete, waiting
-  between pieces; nonblocking, the timeout, a signal (even under `SA_RESTART`), end of file or a
+  `ERESTARTSYS` on signals). `MSG_TRUNC` on a stream discards the data the host returns without
+  copying any (a NULL buffer included) and reports its length, as `tcp_recvmsg` does, also with
+  `MSG_PEEK` and `MSG_WAITALL`. `MSG_WAITALL` on a stream reads until the length is complete,
+  waiting between pieces; nonblocking, the timeout, a signal (even under `SA_RESTART`), end of file or a
   host error ends it with what was read, as Linux's `tcp_recvmsg` returns what it copied.
   `MSG_PEEK|MSG_WAITALL` peeks from the head each time and waits with the host socket's
   `SO_RCVLOWAT` raised to the length (restored afterwards); when the host fd was ready but the
@@ -196,8 +199,9 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   address, control data or flags (Linux's `sock_read_iter`/`sock_write_iter`): a datagram or
   seqpacket record is one message whatever the iovecs or the length, a read of nothing returns 0
   at once, and a write of nothing sends an empty datagram (a writev of nothing does not reach the
-  socket); a stream socket's write goes on in 1 MiB pieces until all is sent or one is short. A
-  fault ends a stream write's data there and fails a message with `EFAULT`.
+  socket); a stream socket's write goes on in 1 MiB pieces until all is sent or one is short, the
+  pieces after the first sent with `MSG_NOSIGNAL`, so an error after some data returns the count
+  without `SIGPIPE`. A fault ends a stream write's data there and fails a message with `EFAULT`.
 - Limits: at most 1 MiB per call, 1024 iovecs (`EMSGSIZE`), 4096 bytes of control data each way;
   recvfrom and recvmsg with `MSG_WAITALL` (not `MSG_PEEK`) on an internet stream go on past 1 MiB
   piece by piece, writing each piece out at its offset until one comes up short; msghdr iovecs are
@@ -442,12 +446,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **`MSG_TRUNC` on a TCP recv writes zeros into the guest's buffer:** the host discards the data
-  and returns its length, and Appine copies that many zero bytes out (`EFAULT` for a NULL
-  buffer), where Linux's `tcp_recvmsg` leaves the buffer untouched.
-- **A blocking stream send that meets `EPIPE` after sending part of its data returns `EPIPE`**
-  (and raises `SIGPIPE`), where Linux returns the count it sent and reports the error on the next
-  call.
 - **`SIOCADDRT` and `SIOCDELRT` are `ENOTTY`:** they are wrapped for rtnetlink notifications but
   nothing implements them in any namespace, where Linux answers `EFAULT`, `EPERM` without
   `CAP_NET_ADMIN`, or changes the route (`route add` of net-tools).
