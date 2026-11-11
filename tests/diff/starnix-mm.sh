@@ -26,5 +26,8 @@ SKIP="$SKIP:PersonalityTest.ReadImpliesExecMmapIoUring"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMappedAndUnmapped:ProcTestBase.ProcSelfPagemapMultiChunkBoundary"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapMultipleMappingsAndHoles"
 SKIP="$SKIP:ProcTestBase.ProcSelfPagemapFallbackBoundary"
+# Cannot be compared on CI: PER_LINUX32 needs AArch32 at EL0, which CI's CPU has and Appine and the
+# development Macs do not; the mremap test skips itself on kernels 6.17 and newer
+SKIP="$SKIP:PersonalityTest.UnameMachineName:Mremap.RemapMayMoveSpanningMappings"
 sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" mmap_test aspace_test anon_test mlock_test \
     memfd_test membarrier_test procfs_mem_test personality_test process_mrelease_test

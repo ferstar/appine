@@ -171,15 +171,19 @@ getlink(s)
 print("send binds", s.getsockname() == (os.getpid(), 0))
 s.close()
 s = nl(socket.SOCK_DGRAM)
-for name, opt in [("type", 3), ("protocol", 38), ("domain", 39), ("sndbuf", 7), ("rcvbuf", 8),
+# The default receive buffer and the cap on SO_RCVBUF come from net.core.rmem_default and rmem_max
+# (212992 unless changed; CI's runner sets them to 1 MiB), so only their bounds are compared
+for name, opt in [("type", 3), ("protocol", 38), ("domain", 39), ("sndbuf", 7),
                   ("passcred", 16), ("error", 4), ("acceptconn", 30), ("keepalive", 9),
                   ("rcvlowat", 18), ("sndlowat", 19), ("priority", 12)]:
     print(name, err(s.getsockopt, socket.SOL_SOCKET, opt))
+print("rcvbuf at least 212992", s.getsockopt(socket.SOL_SOCKET, 8) >= 212992)
 print("peercred", struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, 17, 12)))
 print("sndtimeo", s.getsockopt(socket.SOL_SOCKET, 21, 16))
 for opt, val in [(7, 1000), (8, 100000), (8, 1 << 30), (18, 0), (9, 1), (12, 7), (2, 1)]:
     s.setsockopt(socket.SOL_SOCKET, opt, val)
-    print("set", opt, val, s.getsockopt(socket.SOL_SOCKET, opt))
+    got = s.getsockopt(socket.SOL_SOCKET, opt)
+    print("set", opt, val, got if val < 1 << 30 else f"capped {212992 * 2 <= got < val}")
 print("short", err(s.setsockopt, socket.SOL_SOCKET, 7, b"\1"))
 print("read-only", err(s.setsockopt, socket.SOL_SOCKET, 3, 1))
 s.setsockopt(socket.SOL_SOCKET, 13, struct.pack("ii", 1, 30))
@@ -284,8 +288,10 @@ print("tcp wildcard", t.getpeername() == ("127.0.0.1", l.getsockname()[1]))
 PY
 
 # epoll_ctl's error order (the event first, then both fds, poll support, then epfd being an epoll);
-# epoll_wait refusing a buffer outside the address space before looking at epfd; ppoll writing
-# revents back when interrupted; a pipe's write end without readers being writable with POLLERR
+# epoll_wait refusing a buffer outside the address space; ppoll writing revents back when
+# interrupted; a pipe's write end without readers being writable with POLLERR. Not compared: which
+# of a bad buffer and a bad epfd epoll_wait reports, the buffer in 6.1 and 6.8 and the fd in CI's
+# newer kernel (tests/guest/linux61.c checks 6.1's answer)
 python3 - <<'PY'
 import ctypes, errno, os, select, signal, struct
 libc = ctypes.CDLL(None, use_errno=True)
@@ -306,7 +312,7 @@ print("bad target", sc(EPOLL_CTL, ep.fileno(), 1, 999, ctypes.addressof(ev)))
 print("not an epoll, unpollable target", sc(EPOLL_CTL, r, 1, f, ctypes.addressof(ev)))
 print("not an epoll", sc(EPOLL_CTL, w, 1, r, ctypes.addressof(ev)))
 print("delete ignores the event", sc(EPOLL_CTL, ep.fileno(), 2, r, bad))
-print("wait, bad buffer", sc(EPOLL_PWAIT, 999, bad, 1, 0, 0, 8), sc(EPOLL_PWAIT, ep.fileno(), bad, 1, 0, 0, 8))
+print("wait, bad buffer", sc(EPOLL_PWAIT, ep.fileno(), bad, 1, 0, 0, 8))
 
 signal.signal(signal.SIGALRM, lambda *a: None)
 fds = struct.pack("ihh", r, select.POLLIN, 0x7777)

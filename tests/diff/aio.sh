@@ -24,7 +24,6 @@ cat > aio2.c <<'C'
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
-#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -317,18 +316,16 @@ int main(void)
     check("fdatasync with a buffer", cb(fb, 3, buf, 0, 0, 41));
     check("fsync of a pipe", cb(v[1], IOCB_CMD_FSYNC, NULL, 0, 0, 41));
     check("fsync of a file", cb(fb, IOCB_CMD_FSYNC, NULL, 0, 0, 41));
-    sigset_t usr1;
-    sigemptyset(&usr1);
-    sigaddset(&usr1, SIGUSR1);
-    int sfd = signalfd(-1, &usr1, SFD_NONBLOCK);
     int ifd = inotify_init1(IN_NONBLOCK);
     int pfd = syscall(SYS_pidfd_open, getpid(), 0);
     int dfd = open("/tmp", O_RDONLY | O_DIRECTORY);
     struct mq_attr qa = {.mq_maxmsg = 4, .mq_msgsize = 8};
     mqd_t mq = mq_open("/aio-queue", O_RDWR | O_CREAT, 0600, &qa);
     int full = open("/dev/full", O_WRONLY), zero = open("/dev/zero", O_RDWR);
+    /* Not a timerfd or signalfd: 6.10 gave them read_iter, so CI's newer kernel reads them while
+     * 6.1 and 6.8 answer EINVAL (tests/guest/linux61.c checks 6.1's answer) */
     struct { const char *name; int fd; } reads[] = {
-        {"timerfd", tfd}, {"signalfd", sfd}, {"inotify", ifd}, {"epoll", ep}, {"pidfd", pfd},
+        {"inotify", ifd}, {"epoll", ep}, {"pidfd", pfd},
         {"directory", dfd}, {"message queue", mq}, {"eventfd", efd}, {"/dev/zero", zero},
     };
     char what[64];

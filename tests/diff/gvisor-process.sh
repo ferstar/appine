@@ -20,6 +20,11 @@ SKIP="$SKIP:TraceExec/PtraceExecveTest.Execve_GetRegs_PeekUser_SIGKILL_TraceClon
 SKIP="$SKIP:$P.AttachingConvertsGroupStopToPtraceStop"
 # kernel/cred D2: no ACLs
 SKIP="$SKIP:ExecTest.ACLExecuteOnlyBinary"
+# Cannot be compared: PIDFD_THREAD came in 6.9, so these skip themselves on 6.8 and Appine and run
+# on CI's newer kernel; the set-id execs fail natively on CI's runner (not investigated); the
+# non-consuming wait fails on both sides on 6.8 and hangs natively on CI until the 60 s timeout
+SKIP="$SKIP:PidfdTest.PidfdThread*:ExecTest.SUIDExecGainsUID:ExecTest.SGIDExecGainsGID"
+SKIP="$SKIP:WaitTest.NonConsumingWaitPrefersGroupExitStatus"
 # Hang on both sides until the 60 s timeout (only the timeout would be compared)
 SKIP="$SKIP:SigtimedwaitTest.NullTimeoutReturnsEINTR:PidfdTest.SendSignalToStoppedChildSucceeds"
 # Slow by design (they sleep 10 to 30 s each to show that nothing happens), left out for the time

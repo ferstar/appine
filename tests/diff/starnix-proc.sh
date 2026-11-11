@@ -32,5 +32,10 @@ SKIP="$SKIP:SysctlTest/SysctlTestReadBack.ReadBack/core_wmem_max_*"
 # Cannot be compared: pid 2 is kthreadd only on a whole system; docker's pid namespace has no pid 2
 # and Appine gives it to an ordinary process
 SKIP="$SKIP:ProcTaskDirTest.Kthread*"
+# kernel/vfs: no O_TMPFILE (EISDIR; docker's overlay root on 6.8 refuses it too, CI's newer kernel
+# supports it)
+SKIP="$SKIP:ProcSelfFdTest.TmpFileFdName:ProcSelfFdTest.TmpFileLinkIntoAfterFdName"
+# Cannot be compared on CI: the test fails natively on CI's CPU, which has SVE
+SKIP="$SKIP:CpuinfoTest.SveFunctionMultiVersioning"
 sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" procfs_test sysctl_test sysfs_kernel_test \
     cpuinfo_test pressure_test cgroup_test cgroup_freezer_test

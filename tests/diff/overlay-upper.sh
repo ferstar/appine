@@ -5,7 +5,9 @@
 # into a merged directory, EXDEV for renaming a merged directory, links, sockets and locks of
 # files created through the overlay, the upper layer as it is left and seen again after a remount,
 # the probe podman runs before using overlay, and the errors of bad upper and work directories.
-# All layers are on one tmpfs on both sides. Not compared: whiteouts' link counts (6.8 shares one
+# All layers are on one tmpfs on both sides. The overlay is mounted with redirect_dir=follow, 6.1's
+# default, because a kernel built to default to redirect_dir=on (CI's) renames a merged directory
+# in place, where mv would otherwise copy it. Not compared: whiteouts' link counts (6.8 shares one
 # whiteout inode), the work directory's contents and the trusted.overlay.origin/impure attributes
 # Linux writes (Appine keeps origins in memory)
 cd /tmp
@@ -28,7 +30,7 @@ chown 12:34 l1/d/x
 touch -d '2020-01-02 03:04:05' l1/f l1/d l1/mv
 python3 -c 'import os; os.setxattr("l1/f", "trusted.note", b"kept")'
 
-mount -t overlay overlay -o lowerdir=l1:l2,upperdir=u,workdir=w m && echo "mount $?"
+mount -t overlay overlay -o lowerdir=l1:l2,upperdir=u,workdir=w,redirect_dir=follow m && echo "mount $?"
 awk '$5 == "/tmp/ovl/m" {
     for (i = 7; $i != "-"; i++) {}
     split($(i + 3), o, ",")
@@ -132,7 +134,7 @@ for root, dirs, files in sorted(os.walk("u")):
 '
 echo "--- remounted"
 umount m
-mount -t overlay overlay -o lowerdir=l1:l2,upperdir=u,workdir=w m && echo "mount again $?"
+mount -t overlay overlay -o lowerdir=l1:l2,upperdir=u,workdir=w,redirect_dir=follow m && echo "mount again $?"
 (cd m && find . | sort)
 cat m/f m/gone
 umount m

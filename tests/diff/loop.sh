@@ -294,7 +294,8 @@ int main(void)
     rc("set capacity", ioctl(a, LOOP_SET_CAPACITY, 0));
     sizes("after capacity", a);
     rc("block size 1000", ioctl(a, LOOP_SET_BLOCK_SIZE, 1000));
-    rc("block size 8192", ioctl(a, LOOP_SET_BLOCK_SIZE, 8192));
+    /* 8192 is left out: above the page size it is EINVAL in 6.1 and 6.8, while CI's newer kernel
+     * takes it (tests/guest/linux61.c checks 6.1's answer) */
     rc("block size 1024", ioctl(a, LOOP_SET_BLOCK_SIZE, 1024));
     sizes("block size", a);
     sysfs(a_index, "queue/logical_block_size queue/minimum_io_size");

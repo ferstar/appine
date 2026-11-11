@@ -29,6 +29,12 @@ SKIP="$SKIP:ExitTest.SysExitGroupMultipleThread:RobustFutexTest.FutexStateAfterE
 # on Appine's 6.1; the alarm timer is checked 5 µs after it is due, too close under load
 SKIP="$SKIP:KernelDefaults/RLimitDefaultTest.CurAndMaxDefaults/NOFILE"
 SKIP="$SKIP:PrctlTest.SetresuidAndSetresgidNoopPreservesFsIds:Timers.RealtimeAlarm"
+# Cannot be compared on CI: flag 1 of pidfd_send_signal is PIDFD_SIGNAL_THREAD since 6.9, so the
+# native side signals itself; the native side has the stack limit CI's docker gives it, not 8 MiB;
+# the alarm test fails natively on CI, presumably for want of an alarm-capable RTC (Linux answers
+# EOPNOTSUPP for that before checking CAP_WAKE_ALARM)
+SKIP="$SKIP:PidFdTest.PidFdSendSignalInvalidFlagsFails:SetRLimitTest.RLimitStack"
+SKIP="$SKIP:KernelDefaults/RLimitDefaultTest.CurAndMaxDefaults/STACK:Timers.NoWakeAlarmCap"
 sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" exec_test exit_test abort_test zombie_test \
     thread_group_lifecycle_test waitpid_flags_test waitpid_exit_signal_test pidfd_test kcmp_test \
     futex_test sched_test rlimit_test prctl_test sysinfo_test timers_test restart_read_test \

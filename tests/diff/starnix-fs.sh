@@ -36,6 +36,15 @@ SKIP="$SKIP:OverlayFs/*"
 SKIP="$SKIP:FcntlLockTest.CloneFiles:MknodTest.MknodChrZeroDoesNotRequireCapMknod"
 SKIP="$SKIP:DetachedMountTest.BindFails:DetachedMountTest.MoveFails:DetachedMountTest.PivotRootFails"
 SKIP="$SKIP:DetachedMountTest.SubmountFails:DetachedMountTest.UnsharePreservesDetachedState"
+# kernel/vfs: no O_TMPFILE (EISDIR; docker's overlay root on 6.8 refuses it too, CI's newer kernel
+# supports it)
+SKIP="$SKIP:OtmpfileTest.TmpFileLinkIntoAfter:OtmpfileTest.TmpFileWithOExclShouldFailLinkInto"
+# Cannot be compared on CI's newer kernel: tmpfs casefolding (6.13) runs there and skips itself on
+# 6.8 and Appine; the newer kernel refuses changing a detached mount's propagation; musl's pwrite
+# asks for RWF_NOAPPEND (6.9), which 6.8 lacks (EOPNOTSUPP), and the O_APPEND writes the test
+# expects happen natively on CI on docker's overlay root, while Appine writes at the offset
+SKIP="$SKIP:FsCasefold/*/tmpfs:DetachedMountTest.ChangePropagationSucceeds"
+SKIP="$SKIP:ReadWriteTest.PwriteOAppendAtomicity"
 sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" fs_test fcntl_test fallocate_test read_write_test \
     renameat2_exchange_sticky_test symlink_test xattr_test tmpfs_test sync_test sendfile_test \
     vmsplice_test pipe_test aio_test inotify_test mount_test loop_test

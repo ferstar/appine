@@ -406,11 +406,12 @@ mount(b"fd=%d,rootmode=40000,user_id=0,group_id=0,blksize=4096" % fd)
 mount(b"fd=%d,rootmode=40000,user_id=0,group_id=0,subtype=x" % fd, b"fuse.test")
 import fcntl, struct
 other = os.open("/dev/fuse", os.O_RDWR)
-for old in [99, fd]:
-    try:
-        fcntl.ioctl(other, 0x8004e500, struct.pack("I", old))
-    except OSError as e:
-        print("clone of", "a bad fd:" if old == 99 else "an unattached one:", errno.errorcode[e.errno])
+# A clone from an unattached one is left out: EINVAL in 6.1 and 6.8, EPERM in the newer kernel
+# of CI (tests/guest/linux61.c checks the 6.1 answer)
+try:
+    fcntl.ioctl(other, 0x8004e500, struct.pack("I", 99))
+except OSError as e:
+    print("clone of a bad fd:", errno.errorcode[e.errno])
 mount(b"fd=%d,rootmode=40000,user_id=0,group_id=0" % fd, b"fuse.test")
 mount(b"fd=%d" % fd)
 try:

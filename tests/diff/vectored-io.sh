@@ -2,8 +2,10 @@
 # and seqpacket sockets one call is one message whatever the iovecs, and a plain write or read of
 # over 64 KiB is still one message; a readv on a pipe returns what was there instead of waiting
 # again once the first iovec is full; an eventfd value read may span iovecs, while its write (a
-# plain write operation) goes iovec by iovec, as do timerfd reads; zero-length reads and writes on
-# sockets.
+# plain write operation) goes iovec by iovec; zero-length reads and writes on sockets. A timerfd
+# read split across iovecs is not compared: 6.1 and 6.8 read timerfds iovec by iovec (EINVAL),
+# while 6.10 gave them read_iter, so CI's newer kernel reads the count across them
+# (tests/guest/linux61.c checks 6.1's answer).
 cd /tmp
 cat > /tmp/vio.c <<'C'
 #define _GNU_SOURCE
@@ -136,14 +138,12 @@ int main(void)
     rc("eventfd readv 4+4", readv(e, ev_in, 2));
     printf("  value %#llx\n", w);
 
-    /* timerfd: a read operation, so a first iovec smaller than a count is EINVAL */
+    /* timerfd: the count in one iovec */
     int t = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     struct itimerspec its = {.it_value = {0, 1000000}};
     timerfd_settime(t, 0, &its, NULL);
     usleep(20000);
     unsigned long long count = 0;
-    struct iovec tf_in[2] = {{&count, 4}, {(char *)&count + 4, 4}};
-    rc("timerfd readv 4+4", readv(t, tf_in, 2));
     struct iovec tf_whole[1] = {{&count, 8}};
     rc("timerfd readv 8", readv(t, tf_whole, 1));
     printf("  count %llu\n", count);

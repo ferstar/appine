@@ -169,8 +169,16 @@ int main(void)
     close(fd);
     status_ids("process", "/proc/self/status");
     status_ids("worker", status);
-    /* The ID changes made the process not dumpable; dumpable, its files belong to the threads */
-    printf("dumpable: %d\n", prctl(PR_GET_DUMPABLE));
+    /* The ID changes set the process's dumpable flag to fs.suid_dumpable (0 by default, 2 on CI's
+     * runner); dumpable, its files belong to the threads */
+    int suid_dumpable = -1;
+    FILE *sd = fopen("/proc/sys/fs/suid_dumpable", "r");
+    if (sd) {
+        if (fscanf(sd, "%d", &suid_dumpable) != 1)
+            suid_dumpable = -1;
+        fclose(sd);
+    }
+    printf("dumpable as fs.suid_dumpable says: %d\n", prctl(PR_GET_DUMPABLE) == suid_dumpable);
     prctl(PR_SET_DUMPABLE, 1);
     stat(task, &st);
     printf("worker's task directory: uid %d\n", (int)st.st_uid);

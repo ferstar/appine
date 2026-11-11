@@ -17,5 +17,12 @@ SKIP="$SKIP:FileCapTest.FileCapabilityCoercionInsideUserNamespace"
 # Fail on the native side at times: docker's own messages keep the VM's kernel log wrapping, so a
 # read from its start can find the record gone
 SKIP="$SKIP:SyslogTest.Read:SyslogTest.ReadDevKmsg:SyslogTest.DevKmsgSeekSet:SyslogTest.DevKmsgSeekEnd"
+# Cannot be compared on CI: 6.9 dropped syslog's CAP_SYS_ADMIN fallback, which 6.1 (Appine) and
+# 6.8 still have (the tests expect CAP_SYSLOG alone to count); reading /proc/kmsg hangs natively
+# on CI until the 60 s timeout
+S=SyslogAccessTestAll/SyslogAccessTest
+SKIP="$SKIP:$S.SyslogAction*/*_SysAdmin_NoSyslog_*:$S.ProcKmsg*/*_SysAdmin_NoSyslog_DacOverride_*"
+SKIP="$SKIP:$S.ProcKmsgRead/Root_SysAdmin_NoSyslog_*:$S.DevKmsgRead/*_SysAdmin_NoSyslog*_Restrict"
+SKIP="$SKIP:SyslogTest.ReadProcKmsg:SyslogTest.ProcKmsgPoll"
 sh /tmp/difftest-files/gtest/run.sh starnix "$SKIP" signalfd_test vdso_test seccomp_test \
     capabilities_test suid_test syslog_test

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs` registered to kernel/process, difftest's run lock and tool check, then the headers of `ci.yml` and `scripts/survey` last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: CI's native side and the cases' handling of what differs only there, and `linux61.c` among the rootfs tests)
 
 ## Responsibilities
 
@@ -126,7 +126,9 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   job control, procfs/sysfs/net, the PTY (interactive shell, ^C/^Z, vi, end of input without a
   store), limits, OOM and cgroups, the Tier 1 code cache, the `Machine` API (low ports, several
   consoles, inittab with `appine-run --init`, the Files app's inotify and writes), importing into
-  an existing store, user namespaces, and one network test (`apk add`, `git clone`, Python imports
+  an existing store, user namespaces, answers of Linux 6.1 that kernels after 6.8 changed
+  (`tiocsti.c`, and `linux61.c`: timerfd and signalfd reads, epoll_wait's error order, FUSE clones,
+  loop block sizes), and one network test (`apk add`, `git clone`, Python imports
   at Tier 1 in a store of its own, gated by `APPINE_NETWORK_TESTS=1`, run only by `full.yml`).
   Most cases run under both tiers.
 - Without a store or `musl-gcc` the tests skip with a message (each rootfs test that skips says
@@ -235,9 +237,9 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   at the end.
 - Skips are a negative gtest filter in each case, grouped by reason: a deviation recorded in a
   kernel map (named with its module), a feature decided against, or a test that cannot be compared
-  (it fails on the native side because of docker, the VM or a newer kernel, depends on timing, or
-  hangs on both sides), or a gVisor test that sleeps 10 s or more by design (left out for CI
-  time). The runner's header lists the programs in no case and why: those that would reboot,
+  (it fails on the native side because of docker, the VM or a newer kernel, answers differently
+  only on CI's runner, depends on timing, or hangs on both sides), or a gVisor test that sleeps
+  10 s or more by design (left out for CI time). The runner's header lists the programs in no case and why: those that would reboot,
   suspend or set the clock of the VM, features Appine does not have (bpf maps and other program
   types, perf, userfaultfd, tun), devices neither side has, and two with nothing to compare.
 
@@ -335,6 +337,12 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   stderr; release builds kill only the guest process, so the run continues and only the grep
   notices.
 - Difftest compares the two sides only with each other: a failure identical on both sides passes.
+- CI's native side is not the development VM's: a 7.x kernel (overlayfs defaulting to
+  `redirect_dir=on`, Linux 5d39580f68e6's `CAP_NET_ADMIN` check that `appine-run`'s host sockets
+  then fail), a CPU with SVE and AArch32 at EL0, and runner settings (`rmem_default` and `rmem_max`
+  of 1 MiB, `fs.suid_dumpable` 2, docker's stack limit). Cases print only what both kernels give
+  (relations instead of such values, explicit mount options), the suite cases skip the rest, and
+  6.1's answers that newer kernels changed are checked by `tests/guest` programs instead.
 - Store state persists across runs (the survey store, LTP's store, difftest's store and each
   lane's clone, in whatever a case leaves outside `/root` and `/tmp`), while the native side
   starts fresh; `-r` re-exports the image and remakes the clones but installs no packages.

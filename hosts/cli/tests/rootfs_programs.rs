@@ -310,6 +310,29 @@ fn tiocsti_needs_the_controlling_terminal_or_cap_sys_admin() {
 }
 
 #[test]
+fn answers_of_linux_6_1_that_newer_kernels_changed() {
+    // Timerfd and signalfd reads, epoll_wait's error order, FUSE clones and loop block sizes as
+    // Linux 6.1 answers them (tests/guest/linux61.c); the differential tests compare only what
+    // CI's newer native kernel answers the same
+    let (Some(store), Some(program)) = (store(), build_static("linux61")) else {
+        return;
+    };
+    for tier in TIERS {
+        let script = "cat > /tmp/linux61 && chmod +x /tmp/linux61 && /tmp/linux61";
+        let out = command(store, tier, &["/bin/sh", "-c", script])
+            .stdin(std::fs::File::open(&program).unwrap())
+            .output()
+            .unwrap();
+        let text = stdout(&out);
+        assert!(
+            out.status.success() && text.ends_with("all ok\n"),
+            "tier {tier}: {text}{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
 fn kernel_log_is_empty_and_keeps_console_levels() {
     // A new kernel's log is empty (Appine writes no boot messages): dmesg prints nothing; the
     // console level dmesg -n changes is visible in /proc/sys/kernel/printk; with dmesg_restrict at
