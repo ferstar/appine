@@ -366,17 +366,24 @@ exec 3< z/f2
 (cd z/d && sleep 3) &
 sleeper=$!
 sleep 1
+# FUSE_FORGET has no reply, so the daemon records a forget some time after drop_caches: wait up
+# to 5 s for the counts Linux leaves before printing them
+settle() {
+    for i in $(seq 50); do
+        [ "$(cat zs)" = "$1" ] && break
+        sleep 0.1
+    done
+    cat zs
+}
 # Docker mounts /proc/sys read-only
 mount -o remount,rw /proc/sys 2>/dev/null
 # What nothing uses goes; the open file and the current directory stay
 echo 2 > /proc/sys/vm/drop_caches
-sleep 1
-cat zs
+settle "$(printf 'd 1\nf1 0\nf2 1\nf3 0\ng 0')"
 exec 3<&-
 wait $sleeper
 echo 2 > /proc/sys/vm/drop_caches
-sleep 1
-cat zs
+settle "$(printf 'd 0\nf1 0\nf2 0\nf3 0\ng 0')"
 umount z && echo unmounted
 sleep 0.5
 rm -f fz.py zs
