@@ -38,11 +38,11 @@ Root:
 - `core/kernel/src/oom.rs` — the OOM killer and the release of written code views, run from the
   timer thread.
 
-Outside the module (dependencies only): the CPU engine and the Tier 1 translator (`dbt.c`,
-including its inline TLB fast path and refill), SysV IPC objects (`kernel/ipc`), futexes, the ELF
-loader, the timer thread (`kernel/process`), procfs and the cgroup files (`kernel/procfs`), core
-dumps and the vDSO image (`kernel/signal`), FUSE reads (`kernel/fuse`) and the host abstraction
-layer (`core/hal`).
+Outside the module (dependencies only): the CPU engine and the Tier 1 translator (`dbt.c`, including
+its inline TLB fast path and refill), SysV IPC objects (`kernel/ipc`), futexes (`kernel/futex`), the
+ELF loader (`kernel/exec`), the timer thread (`kernel/process`), procfs and the cgroup files
+(`kernel/procfs`), core dumps and the vDSO image (`kernel/signal`), FUSE reads (`kernel/fuse`) and
+the host abstraction layer (`core/hal`).
 
 ## Key types
 
@@ -171,11 +171,11 @@ layer (`core/hal`).
   (emulated as a shared fixed mmap), `msync`, `madvise`, `mlock`/`mlock2`/`munlock`,
   `mlockall`/`munlockall`, `mincore`, `release` (process_mrelease, on another process's address
   space). `brk` calls `Mm::brk` directly. `process_madvise` is `ENOSYS`.
-- **execve / loader**: `Mm::new`, `share_files`, `into_shared`, `set_layout`, `mmap` and `munmap`
-  (segments), `map_anonymous`, `map_vvar`, `find_free` (interpreter and vDSO placement),
-  `set_brk`, `map_stack`, `set_start_stack`, `label`, `write_kernel` (segments, `.bss`), plus the
-  public layout fields.
-- **Time namespaces** (clone, execve, setns, `kernel/process`): `vdso_syscalls`.
+- **execve / loader** (`kernel/exec`): `Mm::new`, `share_files`, `into_shared`, `set_layout`, `mmap`
+  and `munmap` (segments), `map_anonymous`, `map_vvar`, `find_free` (interpreter and vDSO
+  placement), `set_brk`, `map_stack`, `set_start_stack`, `label`, `write_kernel` (segments, `.bss`),
+  plus the public layout fields.
+- **Time namespaces** (clone, execve, setns, `kernel/ns`): `vdso_syscalls`.
 - **Fault path** (task run loop): `cow_break`, `mmu().translate`, `fault_in`, `fill_wanted`,
   `fault_past_eof`, `Cx::grow_stack` (→ `grow_down`), `is_mapped`.
 - **Mappings read on demand** (`kernel/fuse`, the dispatcher): `Fill::new`, `window`, `store`,
@@ -577,7 +577,7 @@ signals may still be delivered).
   does not copy a borrowed page (writing the word, as PI locks, robust lists and `FUTEX_WAKE_OP`
   do, breaks CoW); a private operation's key needs no mapping at all (Linux checks only that it is
   a user address); shared anonymous memory is keyed by host address and shared file mappings by
-  file and offset (`kernel/process`).
+  file and offset (`kernel/futex`).
 - Kernel writes: `Mm::write` breaks CoW per page; `write_kernel` and `write_force` settle CoW
   (`cow_settle`), copy `cow` VMAs and back reservations, and ignore VMA permissions (but
   `write_force` refuses shared mappings without write permission). No-BKL fast-path writes go

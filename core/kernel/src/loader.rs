@@ -1,4 +1,4 @@
-//! The ELF loader (the kernel/process map).
+//! The ELF loader (the kernel/exec map).
 //!
 //! Supports statically linked (`ET_EXEC`) and position-independent (`ET_DYN`) aarch64 programs.
 //! For a program with `PT_INTERP` the interpreter (`ld-musl` on Alpine) is loaded as well, and

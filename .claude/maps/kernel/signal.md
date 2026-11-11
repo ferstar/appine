@@ -32,9 +32,9 @@ unimplemented-syscall handling in `syscall/mod.rs`; `stub.rs`, which counts unim
 (the default arms calling it stay with their modules); the fault-to-signal branch of the run loop
 in `task.rs`.
 
-Outside the module: waking and namespace translation (`kernel/process`), CPU state, kicks and the
-host fault guard (`engine`), page-fault classification (`kernel/mm`), seccomp (with credentials),
-procfs.
+Outside the module: waking (`kernel/process`), namespace translation (`kernel/ns`), CPU state, kicks
+and the host fault guard (`engine`), page-fault classification (`kernel/mm`), seccomp (with
+credentials), procfs.
 
 ## Key types
 
@@ -256,7 +256,7 @@ procfs.
   Linux's special mapping faults its pages back.
 - In a time namespace with offsets the host's code would return the host's clocks, so the clock
   functions' entries of the host's image are overwritten with the same svc stubs (`Mm::vdso_syscalls`)
-  when such a namespace is entered (`kernel/process`), and the kernel layer adds the offsets; this
+  when such a namespace is entered (`kernel/ns`), and the kernel layer adds the offsets; this
   is never undone. An svc from a stub (the svc right after a clock entry, with that entry's
   syscall) takes the no-BKL fast path and skips ptrace and seccomp stops, but only for
   `gettimeofday` and the clocks Linux's vDSO reads in user space (realtime, monotonic, raw, the two
@@ -407,13 +407,14 @@ procfs.
 - Timers, the TTY layer (job-control signals to process groups), process exit (child status),
   seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
   killer, bug handling and the BKL watchdog (kernel log; bug kill reports read `stub::top`).
-- Default arms reporting unimplemented paths: prctl and futex (`kernel/process`), fcntl, file
-  ioctls and device opens (`kernel/vfs`), terminal ioctls (`kernel/tty`), socket ioctls
+- Default arms reporting unimplemented paths: prctl (`kernel/process`), futex (`kernel/futex`),
+  fcntl, file ioctls and device opens (`kernel/vfs`), terminal ioctls (`kernel/tty`), socket ioctls
   (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).
 
 ### Outbound
 
-- `kernel/process`: `request_wake*`, `signal_later`, group exit, namespace translation, wait.
+- `kernel/process`: `request_wake*`, `signal_later`, group exit, wait; `kernel/ns`: namespace
+  translation.
 - `kernel/mm`: `read`/`write`/`write_force`, `grow_stack`, `dump_regions`/`dump_page`/`residency`,
   `regions` (the mapping named in unhandled-exception reports).
 - `engine`: CPU state (registers, FP, DIT), `set_hw_debug`, `Cpu::step`, the `Kicker`; a private

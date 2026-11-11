@@ -1,11 +1,11 @@
-//! Pid namespaces (pid_namespaces(7)). Pids and tids inside the kernel are always global (the
-//! numbers in the boot namespace), and every newly created namespace keeps a table from global
-//! numbers to its own level's numbers: a process has one number in its own namespace and one in
-//! each ancestor namespace. At the syscall and procfs boundaries numbers are translated by the
-//! caller's namespace (for procfs, the mounting process's), and processes that cannot be seen are
-//! ESRCH or 0. The first process in a namespace is numbered 1 and is its reaper: orphans in the
-//! namespace are reparented to it, and when it exits every process in the namespace is ended and
-//! no more processes can be created there.
+//! Pid namespaces (pid_namespaces(7), the kernel/ns map). Pids and tids inside the kernel are
+//! always global (the numbers in the boot namespace), and every newly created namespace keeps a
+//! table from global numbers to its own level's numbers: a process has one number in its own
+//! namespace and one in each ancestor namespace. At the syscall and procfs boundaries numbers are
+//! translated by the caller's namespace (for procfs, the mounting process's), and processes that
+//! cannot be seen are ESRCH or 0. The first process in a namespace is numbered 1 and is its reaper:
+//! orphans in the namespace are reparented to it, and when it exits every process in the namespace
+//! is ended and no more processes can be created there.
 
 use std::collections::HashMap;
 use std::rc::Rc;

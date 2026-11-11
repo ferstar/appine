@@ -16,14 +16,13 @@
 //! The host clocks and the thread's own CPU clock need no kernel state; process CPU clocks and
 //! other threads' go to the BKL path.
 //!
-//! Futex wait and wake and nanosleep are here too: the futex wait queue has its own lock
-//! ([`Shared::futexes`]), and a waiting thread sleeps on its own event, woken by futex wakes,
-//! signals and thread-group exit just as when waiting with the BKL held. Only private memory is
-//! handled, keyed by address space and address (the page is writable in the thread's page table
+//! Futex wait and wake (the kernel/futex map) and nanosleep are here too: the futex wait queue has
+//! its own lock ([`Shared::futexes`]), and a waiting thread sleeps on its own event, woken by futex
+//! wakes, signals and thread-group exit just as when waiting with the BKL held. Only private memory
+//! is handled, keyed by address space and address (the page is writable in the thread's page table
 //! and not in a writable shared mapping, [`Mm::futex_key`](crate::mm::Mm::futex_key)). When the
-//! thread wakes
-//! neither by a futex wake nor by expiry (most likely a signal arrived), the call goes to the BKL
-//! path to be redone, which handles the signal and the restart.
+//! thread wakes neither by a futex wake nor by expiry (most likely a signal arrived), the call goes
+//! to the BKL path to be redone, which handles the signal and the restart.
 //!
 //! sched_yield is here too: it only yields the host thread, which needs no kernel state.
 //!

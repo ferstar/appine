@@ -38,7 +38,7 @@ Outside the module:
 - `kernel/fuse`: FUSE connections and their mount options.
 - `kernel/procfs`: the content of procfs, sysfs, devpts and cgroup2, the mountinfo text and the
   `fs.mount-max` sysctl file.
-- `kernel/process`: the namespace mechanism and its counts (`max_mnt_namespaces`), clone and
+- `kernel/ns`: the namespace mechanism and its counts (`max_mnt_namespaces`), clone and
   unshare, and setns's dispatch and checks.
 
 ## Key types
@@ -221,7 +221,7 @@ Outside the module:
   root or cwd was the old root in the same namespace).
 - `open_tree` (without `OPEN_TREE_CLONE`: an `O_PATH` fd; with it: `CAP_SYS_ADMIN`, a detached
   clone in a new anonymous namespace held by the fd, which counts against `max_mnt_namespaces`
-  (`ENOSPC`, `kernel/process`); without `AT_RECURSIVE` a source with a locked mount under it is
+  (`ENOSPC`, `kernel/ns`); without `AT_RECURSIVE` a source with a locked mount under it is
   `EINVAL`, and the clone's root is not locked in place), `move_mount` (shares `move_tree` with
   `MS_MOVE`; attaching a clone moves its mounts into the caller's namespace;
   `MOVE_MOUNT_SET_GROUP` is always `EINVAL`), `mount_setattr` (size and flag checks per
@@ -285,10 +285,10 @@ Outside the module:
 ### Inbound
 
 - The syscall dispatcher (the mount syscalls; collection at syscall end).
-- `kernel/process`:
+- `kernel/ns`:
   - clone and unshare with `CLONE_NEWNS` (`copy_ns`);
-  - setns and nsfs pins (`find_ns`, `pinned_ns`, `ns_root`);
-  - collection at thread exit.
+  - setns and nsfs pins (`find_ns`, `pinned_ns`, `ns_root`).
+- `kernel/process`: collection at thread exit.
 - `kernel/vfs`:
   - path resolution, which lifts to mounts, climbs out of mount roots and computes paths through
     the table;
@@ -318,8 +318,8 @@ Outside the module:
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.
 - `kernel/procfs`: the `Pseudo` views of mounted synthetic filesystems, and the pid namespace of a
   procfs instance.
+- `kernel/ns`: namespace pins and counts (`nsproxy`'s `NsRef`/`Counted`, `max_mnt_namespaces`).
 - `kernel/process`:
-  - namespace pins and counts (`nsproxy`'s `NsRef`/`Counted`, `max_mnt_namespaces`);
   - `Kernel::mount_max`;
   - every task's root and cwd (`in_use`, pivot_root's rewrite).
 - `kernel/cred`: `capable_wrt` over namespace owners, and `CAP_SYS_ADMIN`/`CAP_SYS_CHROOT`.

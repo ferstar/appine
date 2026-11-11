@@ -29,7 +29,7 @@ Root: `core/kernel/src/vfs/fuse.rs` (connection, device, cache, retries, request
 
 Outside the module: the walker, mount table, fd tables and the dispatch of every file syscall
 (`kernel/vfs`, which hands FUSE nodes and files to this module), the syscall dispatcher's retry
-loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy mappings
+loop (`kernel/process`), execve (`kernel/exec`), poll and epoll (`kernel/poll`), the copy mappings
 (`kernel/mm`), mountinfo (`kernel/procfs`).
 
 ## Key types
@@ -334,8 +334,9 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
   `/dev/fuse`, and every file syscall's FUSE branch (open,
   I/O routes, splice, readv/writev, getdents, lseek, stat, statfs, access, chdir, close paths,
   fsync, attribute and namespace syscalls, xattrs, copy_file_range).
-- `kernel/process`: the dispatcher's retry loop (`new_syscall`, `serve`), execve (`open_fuse`,
-  close-on-exec flush), thread exit (`flush_at_exit`).
+- `kernel/process`: the dispatcher's retry loop (`new_syscall`, `serve`), thread exit
+  (`flush_at_exit`).
+- `kernel/exec`: execve (`open_fuse`, close-on-exec flush).
 - `kernel/mm` (`map_fill` for mmap, `fill` from the fault path), `kernel/poll` (device readiness
   and wake object), `kernel/procfs` (mountinfo type and options, `drop_caches`).
 - The dispatcher: `fill` and `prefault` for mapped pages, `sweep` after every syscall.

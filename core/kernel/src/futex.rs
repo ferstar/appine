@@ -1,4 +1,4 @@
-//! Futex wait queues (the kernel/process map). Keys follow Linux's `get_futex_key`: private
+//! Futex wait queues (the kernel/futex map). Keys follow Linux's `get_futex_key`: private
 //! memory is keyed by address space and address, so a waiter is still found after the memory at
 //! its address has been replaced (a `MAP_FIXED` mmap, or munmap and mmap again); shared anonymous
 //! memory (shared mappings, System V shared memory) by its host address, so processes that share

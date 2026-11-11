@@ -18,10 +18,10 @@
 
 Root: `core/kernel/src/syscall/aio.rs`.
 
-Outside the module: the read, write, vectored and fsync paths and their file checks
-(`kernel/vfs`); readiness, the ppoll-style wait, temporary signal masks and eventfds
-(`kernel/poll`); thread groups, execve, exit and the timer thread (`kernel/process`); the context
-page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr` (`kernel/procfs`).
+Outside the module: the read, write, vectored and fsync paths and their file checks (`kernel/vfs`);
+readiness, the ppoll-style wait, temporary signal masks and eventfds (`kernel/poll`); thread groups,
+exit and the timer thread (`kernel/process`); execve (`kernel/exec`); the context page's mapping
+(`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr` (`kernel/procfs`).
 
 ## Key types
 
@@ -108,8 +108,8 @@ page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr` (`kernel/pr
 ### Inbound
 
 - The syscall dispatcher.
-- `kernel/process`: release at execve and at the thread group's exit; the timer thread's
-  `check_aio_polls`.
+- `kernel/process`: release at the thread group's exit; the timer thread's `check_aio_polls`.
+- `kernel/exec`: release at execve.
 - `kernel/procfs`: `fs.aio-nr` and `fs.aio-max-nr`.
 
 ### Outbound

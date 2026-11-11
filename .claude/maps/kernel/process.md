@@ -1,11 +1,11 @@
 # kernel/process Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/process.md` for the paired decision history.
+> See `.claude/decisions/kernel/process.md` for the paired decision history (it still holds the decisions on execve, namespaces and futexes made before they were split out into `kernel/exec`, `kernel/ns` and `kernel/futex`).
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, mount references moved to kernel/mount, then the watchdog's kernel log record, failed host spawns and fast-path deadline hand-overs last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, the watchdog's kernel log record, failed host spawns, fast-path deadline hand-overs, then execve, namespaces and futexes split out)
 
 ## Responsibilities
 
@@ -13,34 +13,33 @@
 
 - guest tasks (threads) and thread groups (processes): creation (`clone`/`clone3`), the run loop,
   exit, reaping and `wait`, process groups and sessions, pidfds;
-- `execve`: target resolution, credential effects, and the ELF loader that builds the new image;
 - the big kernel lock (BKL) that serialises the kernel layer, its borrow checks, the syscall
   dispatcher's hooks, the no-BKL fast path, and the watchdog that reports holds of it lasting too
   long;
-- the unified wait and wake-up mechanism, and futexes;
+- the unified wait and wake-up mechanism;
 - the timer thread (interval and POSIX timers, CPU-time limits, periodic checks);
 - the built-in virtual init (PID 1) and inittab boot/shutdown, and the host-facing `Machine`;
 - scheduling parameters applied to host threads;
 - kernel-layer bugs: a panic or host fault ends only the guest process that hit it, with a kill
   report for the app, and test hooks plant such bugs;
 - the other process-wide calls in `syscall/misc.rs` (clocks and CPU times, resource use and
-  limits, host and domain names, reboot, sysinfo, getcpu, getrandom);
-- the namespace mechanism (clone/unshare/setns, user and pid ID translation, time offsets, nsfs,
-  namespace counts).
+  limits, host and domain names, reboot, sysinfo, getcpu, getrandom).
 
 Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`, the
-`wake` module), `cell.rs`, `syscall/proc.rs`, `syscall/fast.rs`, `futex.rs`, `loader.rs`,
-`machine.rs` (timer thread, boot/shutdown, host-facing calls), `watchdog.rs`, `itimer.rs`,
-`syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `pidns.rs`, `nsproxy.rs`,
-`syscall/ns.rs`, `UserNs` in `cred.rs`, `bug.rs`, the dispatcher in `syscall/mod.rs` (its restart
-and unimplemented-syscall handling are `kernel/signal`'s), and `syscall/misc.rs` except the
-handlers `kernel/signal` lists there (uname, syslog, adjtimex, clock setting, restart_syscall). Of
-the rest of `syscall/misc.rs`, membarrier is described in `kernel/mm`, umask in `kernel/vfs`, and
-the capability and seccomp prctls in `kernel/cred`.
+`wake` module), `cell.rs`, `syscall/proc.rs` (except its execve and unshare sections),
+`syscall/fast.rs`, `machine.rs` (timer thread, boot/shutdown, host-facing calls), `watchdog.rs`,
+`itimer.rs`, `syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `bug.rs`, the
+dispatcher in `syscall/mod.rs` (its restart and unimplemented-syscall handling are
+`kernel/signal`'s), and `syscall/misc.rs` except the handlers `kernel/signal` lists there (uname,
+syslog, adjtimex, clock setting, restart_syscall), the futex and robust-list handlers and the
+time-namespace offsets. Of the rest of `syscall/misc.rs`, membarrier is described in `kernel/mm`,
+umask in `kernel/vfs`, and the capability and seccomp prctls in `kernel/cred`.
 
-Outside the module: address spaces and fork copy-on-write (`kernel/mm`), CPU state and translation
-(`engine`), signals and ptrace, credentials beyond user namespaces, mount trees (`kernel/mount`),
-network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`), the OOM policy.
+Outside the module: execve and the ELF loader (`kernel/exec`), namespaces, unshare, setns and ID
+translation (`kernel/ns`), futexes and robust lists (`kernel/futex`), address spaces and fork
+copy-on-write (`kernel/mm`), CPU state and translation (`engine`), signals and ptrace, credentials,
+mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and procfs files
+(`kernel/procfs`), the OOM policy.
 
 ## Key types
 
@@ -84,26 +83,17 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - `Bkl` — the held-lock guard; its `Drop` performs release-time work.
 - `Cx` — the context of one syscall or signal delivery; holds the `Bkl` (absent while released).
 
-### Waiting and futexes
+### Waiting and the fast path
 
 - `wake` channels: `FILE`, `OTHER`, `CHILD`, `WATCHED`, `EXITED`, `LOCK`, `SIGNAL` (plus the
   internal `OBJECTS`); `wake::Object` is the address of a value (inside a `RefCell`, or a plain
   counter).
 - Waiter — (event, interest channels, optional sorted object list), stored in `Kernel::waiters`.
-- `futex::Key` — `Private{mm, addr, shared}`, `Host(address)` or `File{dev, ino, offset}`;
-  `Futexes` — one queue (in registration order) of (id, key, bitset, event, and for a
-  `FUTEX_LOCK_PI` waiter a `PiWaiter`: its global tid and the lock's address in its address space)
-  behind `Shared`'s futex lock; `Enqueued` — leaves the queue on the normal path (a wake racing it
-  counts as a wake), and on drop only when unwinding.
 - `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root and cwd, tid, CPU-clock
   base, address-space id and its shared writable mappings, vDSO address, time-namespace offsets).
 
-### Exec, timers, init, namespaces
+### Timers and init
 
-- `loader::Executable`, `ExeCache` (32 opened executables, least recently used dropped), `Args`,
-  `Prepared` (the hand-off between the locked and unlocked exec phases), `Image` (with `doomed`);
-  `process::ExeFile` (the process's `exe_file`: path, store mount and inode, dentry, host file, and
-  for a program found through an overlay its overlay node, held while recorded).
 - `itimer::ITimer` (`ITIMER_REAL`, a monotonic instant), `CpuTimer`, `PosixTimer`;
   `itimer::Expiry` — a wall-clock deadline on Linux's hrtimer base: `Mono(Instant)` (monotonic,
   absolute times converted; relative realtime; relative times of other clocks but boottime and
@@ -111,39 +101,28 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   clocks as realtime and boottime), compared with that clock whenever looked at; the global
   wall-clock jump count (`clock_epoch`, shared by every kernel in the host process);
   `loadavg::LoadAvg`; `inittab::Entry`, `Power`.
-- `NsProxy` (per task: UTS, IPC, net, cgroup, time, time-for-children), `UtsNs`, `IpcNs`,
-  `CgroupNs`, `TimeNs` (offsets, frozen), `UserNs` (parent, level, owner, uid/gid maps, setgroups,
-  whether the creator had `CAP_SETFCAP`; held in credentials), `PidNs` (parent, level, owner,
-  global↔local tables, reaper, dead; held per thread group), `MntNs` (held in `FsContext`), `NsRef`
-  (a strong reference to any namespace), `NsSet`; `Counted` (the eight counted kinds and their
-  sysctls) and `Ucounts` (`Kernel::ucounts`: the live namespaces by kind with the (user namespace,
-  user) pairs each counts for, the counts, and each user namespace's `max_*_namespaces`).
 
 ## Public entry points
 
-- **Syscalls**: `clone` (220), `clone3`, `exit`, `exit_group`, `set_tid_address`, `wait4`,
-  `waitid`, `execve`, `execveat`, `futex`, `futex_waitv`, `set_robust_list`/`get_robust_list`,
+- **Syscalls**: `clone` (220), `clone3`, `exit`, `exit_group`, `set_tid_address`, `wait4`, `waitid`,
   `nanosleep`/`clock_nanosleep`, `setitimer`/`getitimer`, `timer_*`, `getpriority`/`setpriority`,
-  `ioprio_*`, `sched_*`, `unshare`, `setns`, namespace ioctls (`NS_GET_*`), `setsid`/`setpgid`/
-  `getpgid`/`getsid`, `pidfd_open`, `pidfd_getfd`, `kcmp`, `prctl` (`PR_SET/GET_PDEATHSIG`,
-  `PR_SET/GET_CHILD_SUBREAPER`), `kill` to pid 1 (power requests), `clock_gettime`/`clock_getres`/
-  `gettimeofday`, `times`, `getrusage`, `prlimit`, `reboot`, `personality`, `sethostname`/
-  `setdomainname`, `getcpu`, `sysinfo`, `getrandom`, and the test syscall 0xa991 (debug and
-  `test-hooks` builds).
+  `ioprio_*`, `sched_*`, `setsid`/`setpgid`/`getpgid`/`getsid`, `pidfd_open`, `pidfd_getfd`, `kcmp`,
+  `prctl` (`PR_SET/GET_PDEATHSIG`, `PR_SET/GET_CHILD_SUBREAPER`), `kill` to pid 1 (power requests),
+  `clock_gettime`/`clock_getres`/ `gettimeofday`, `times`, `getrusage`, `prlimit`, `reboot`,
+  `personality`, `sethostname`/ `setdomainname`, `getcpu`, `sysinfo`, `getrandom`, and the test
+  syscall 0xa991 (debug and `test-hooks` builds).
 - **Kernel bugs**: `bug::catch`, `host_call`, `kill`/`kill_process`, `record_kill` (also the OOM
   killer's), `report`, `install_panic_hook`, `trap`/`trap_finish`; `Machine::take_kills`.
 - **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
-  `signal_later`/`flush_signals`, `Shared::fast_changed`, `loader::prepare`/`load_prepared`,
-  `kernel::doing`/`done`.
+  `signal_later`/`flush_signals`, `Shared::fast_changed`, `kernel::doing`/`done`.
 - **Host-facing** (`Machine`): `start` (creates PID 1, the timer thread and the BKL watchdog; a
   panic is an internal error), `stall` (the latest too-long hold; takes no BKL), `spawn`, `boot`,
   `shutdown`, `kill_all`, `take_power`, `processes`, `wait`/`try_wait`/`wait_or_power`, `signal`
   (a host signal to a guest process, `SI_KERNEL`); `run` (`appine-run`), which with
   `RunOptions::stop` passes the first stop signal the host got on to the program and ends every
   process at one arriving at least a second later, then finishes as usual.
-- **procfs**: `threads-max`, `ns_last_pid`, `/proc/<pid>/task/<tid>/children`,
-  `uid_map`/`gid_map`/`setgroups`, `timens_offsets`, `max_*_namespaces`, `/proc/<pid>/ns/*`.
+- **procfs**: `threads-max`, `/proc/<pid>/task/<tid>/children`.
 
 ## Data flow / lifecycle
 
@@ -324,91 +303,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   when a non-main thread's execve takes the tgid), and procfs shows it as a zombie thread until
   the group is reaped, as Linux keeps the leader as a zombie task.
 
-### execve
-
-- Arguments: the limit comes from `RLIMIT_STACK` (`bprm_stack_limits`: a quarter of the limit, at
-  most 6 MB, at least 128 KB); a string of 128 KB or more or a larger total is `E2BIG`; an empty
-  argv becomes `[""]`. `execveat` takes only `AT_EMPTY_PATH` and `AT_SYMLINK_NOFOLLOW` (else
-  `EINVAL`; a symlink not followed is `ELOOP`).
-- Target: by path, by fd (`AT_EMPTY_PATH`), through `/proc/<pid>/fd/<n>` (the open file) or
-  `/proc/<pid>/exe`. It must be a regular executable file (`EACCES`), not on a noexec mount;
-  nosuid is noted (memfds ignore both). A program (or interpreter) on a FUSE mount is read whole
-  into a host copy by a retry before anything changes (`kernel/fuse`), runs as if from a nosuid
-  mount, and carries its FUSE key as inode number.
-- `#!` scripts: the interpreter line is parsed (up to 256 bytes) and the interpreter resolved
-  relative to the cwd; five nested scripts run, a sixth is `ELOOP` (Linux 6.1's `exec_binprm`); a
-  script run by fd through a close-on-exec directory is `ENOENT`.
-- `ETXTBSY` if a writable open file refers to a `#!` script being run (checked before its
-  interpreter is opened) or to the final executable (memfds never count as writers).
-- Credentials: setuid and setgid (the latter with group execute) apply unless `no_new_privs`,
-  nosuid, or the owner/group are unmapped; file capabilities come from the xattr; a tracer without
-  `CAP_SYS_PTRACE` or a fs context shared with another process makes the execution unsafe, so it
-  gains nothing (`kernel/cred`). A secure exec clamps the stack limit to 8 MB (written back to
-  `RLIMIT_STACK`).
-- Under the BKL the main ELF is parsed and the interpreter file opened, read and its headers
-  checked; then the BKL is released while a new address space (sharing the kernel's read-only file
-  mappings, the vDSO image, host random bytes) and initial stack are built. Back under the BKL, a
-  killed thread gives up with `EINTR`. What Linux fails to map only after its point of no return
-  makes the image doomed: execve commits as usual and then kills the process with a forced
-  `SIGSEGV` (`force_fatal_sig`); such an image may keep partial mappings and has no stack.
-- Point of no return, in order: the other threads are killed and waited for (the BKL is released
-  while waiting; only the caller being killed can still fail it, with `EINTR`) and a non-leader
-  takes over the tgid; enter the time namespace for children; unshare and close-on-exec the fd
-  table (releasing locks, message-queue registrations, FUSE files and unix sockets of the closed
-  fds); sample RSS; record the new `exe_file`; apply dumpable and pdeathsig rules; set the address
-  space's user namespace (`ThreadGroup::mm_user_ns`, `kernel/cred`); clear `READ_IMPLIES_EXEC` from
-  the personality (arm64's `SET_PERSONALITY`) and on a privileged exec the other
-  `PER_CLEAR_ON_SETID` flags (`kernel/cred`); commit the credentials; clear POSIX timers and AIO;
-  unshare and reset signal handlers; release the old address space (robust list,
-  `clear_child_tid`, vfork) and install the new one with the CPU state reset, reaping shm
-  segments marked for removal it held last; reset the alternate stack and comm; set PC and SP;
-  force the `SIGSEGV` of a doomed image; re-kick if interrupted. The run loop then re-attaches the
-  translator.
-
-### ELF loader
-
-- Before the point of no return, as 6.1's `load_elf_binary`: the program must be a 64-bit
-  little-endian aarch64 `ET_EXEC` or `ET_DYN` with 1 to 65536 bytes of 56-byte program headers
-  (`ENOEXEC`); only the first `PT_INTERP` counts, of 2 to 4096 bytes ending in NUL (`ENOEXEC`;
-  contents past the end of the file `EIO`), its path cut at the first NUL (an empty one is
-  `EACCES`, as opening the working directory is); the interpreter (ld-musl, or glibc's ld.so) must
-  parse as an aarch64 ELF (`ELIBBAD`), and its own `PT_INTERP` is ignored.
-- After it (the image doomed): a `PT_LOAD` with file contents whose offset disagrees with its
-  address within the page, whose file size exceeds its memory size, or that reaches beyond 2^48 or,
-  once placed, above the stack area (2^47 − 8 MB); an interpreter of another type than `ET_EXEC`
-  or `ET_DYN` or with nothing to load; any failure to map; an entry beyond 2^48. A `PT_LOAD` of no
-  memory still goes through these checks (and can give `AT_PHDR`) but maps nothing, a program
-  without `PT_LOAD` loads (and faults at its entry), and contents past the end of the file are
-  mapped (reading them is `SIGBUS`).
-- `AT_PHDR` is the address of `e_phoff` in the last `PT_LOAD` whose file contents hold it, else 0,
-  plus the bias (`PT_PHDR` is not used). `AT_BASE` is the interpreter's bias, 0 for an `ET_EXEC`
-  interpreter, which loads where it says.
-- A position-independent main program loads at `0x5555_5555_0000` (at its own addresses when
-  they start above that); the interpreter and then the vDSO are placed top-down below the mmap
-  area (so the vDSO is below the interpreter), with the host's `[vvar]` right below the vDSO when
-  the vDSO is the host's (`kernel/signal`). There is no ASLR (`engine`'s shared translations rely
-  on that).
-- Segments are mapped in order, each over what earlier ones mapped, as since 6.7's `elf_load`
-  (which the differential tests' native side runs; 6.1 maps a page of the file even for a
-  segment without file contents when its address is not page-aligned): the pages holding its file
-  contents as a private mapping of the host object, the rest of its last file page zeroed when it
-  has more memory than file, and its remaining pages anonymous memory that is readable and
-  writable, and executable when the segment is (`vm_brk_flags`).
-- The initial stack holds argv, envp, the execfn, the platform string and 16 random bytes, and the
-  auxv in this order: `AT_SYSINFO_EHDR`, `AT_MINSIGSTKSZ`, `AT_HWCAP`, `AT_PAGESZ` (4096),
-  `AT_CLKTCK` (100), `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, `AT_UID`,
-  `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_RANDOM`, `AT_HWCAP2`, `AT_EXECFN`, `AT_PLATFORM`
-  (`aarch64`), `AT_NULL`. IDs are mapped into the process's user namespace. Building it checks the
-  argument limit again, counting the pointers, auxv and strings, so it can be `E2BIG` where reading
-  the strings passed.
-- The main program's code and data bounds (Linux 6.1's `start_code`, `end_code`, `start_data`,
-  `end_data` from its segments) are recorded in the address space for `/proc/<pid>/stat`.
-- A Go build-ID note in the main program selects the translator's Go register set (`engine`;
-  `APPINE_DBT_REGS` overrides it).
-- Opened store and overlay executables are cached (32 entries, checked against the host file's
-  device, inode, ctime and size; forgotten when rehomed, cleared under memory pressure).
-  `Machine::spawn` loads through `loader::load`.
-
 ### The BKL
 
 - One mutex over `Kernel`. Kernel objects are shared with `Rc` and the kernel's own `RefCell`; their
@@ -459,8 +353,7 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   `fast_changed` (chdir, chroot, credential and fs changes, mounts, setns, execve, time-namespace
   entry); a call that cannot complete falls back to the BKL path (writes to guest memory it made
   stay). A panic on the fast path kills the process.
-- Fast futex: under the futex lock the value is compared and the waiter enqueued; it sleeps on its
-  event; dequeued means woken, still queued after waking hands over to the BKL path. A timed wait
+- Fast futex (`kernel/futex`): it shares the BKL path's queue and lock. A timed wait
   woken early (futex, `nanosleep`, `clock_nanosleep`; relative or absolute) hands its deadline over
   in `fast_sleep`: the BKL handler takes it instead of reading the time argument again (Linux's
   restart never reads it again either, and the memory may be gone), and a relative sleep's
@@ -504,59 +397,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   thread's ptrace stop (t) and group stop (T) take precedence.
 - Pipes wake like Linux: a write wakes readers only if the pipe was empty; a read wakes writers only
   when enough space for the writer's request appears or `PIPE_BUF` is crossed.
-
-### Futexes
-
-- Keys follow Linux's `get_futex_key`: private memory, and any memory for an operation with
-  `FUTEX_PRIVATE_FLAG`, is keyed by the address space's id and the address (with whether the
-  operation was shared, so private and shared operations never meet), whatever page is there now;
-  without the flag, shared anonymous memory (shared mappings, SysV shm) uses its host address and
-  a shared file mapping (even a read-only one) (device, inode, offset), so processes sharing them
-  meet. Kernel wakes (robust list, `clear_child_tid`) are shared operations. An unaligned address
-  is `EINVAL`, a shared operation on an unreadable page `EFAULT`. The single waiter list is
-  scanned linearly.
-- Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET, WAKE_BITSET, `futex_waitv`,
-  LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI; WAIT_REQUEUE_PI, CMP_REQUEUE_PI and `FUTEX_FD` return
-  `ENOSYS` (counted as unimplemented). As in 6.1's `sys_futex`/`do_futex`: the command is
-  everything but `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`; the timeout of a command taking
-  one is read and checked first (`EFAULT`, `EINVAL`), then `FUTEX_CLOCK_REALTIME` with anything but
-  the absolute waits is `ENOSYS`; a zero bitset is `EINVAL`. Wake counts of WAKE, WAKE_BITSET and
-  WAKE_OP stop after the first waiter, so 0 and negative counts wake one; REQUEUE and CMP_REQUEUE
-  refuse negative counts and wake none for 0.
-- WAKE_OP (`futex_wake_op`): the word at the second address must be writable (`EFAULT`; a page
-  not written since fork or without an entry is made writable first) and is changed atomically
-  (set, add, or, and-not, xor; `FUTEX_OP_OPARG_SHIFT` makes the argument a shift count; another
-  operation `ENOSYS` before the change); up to the first count of waiters on the first address
-  are woken and, when the old value compares as asked with the 12-bit argument (`EQ`, `NE`, `LT`,
-  `LE`, `GT`, `GE`; another comparison `ENOSYS` after the change), up to the fourth argument's
-  count on the second.
-- Wait: compare and enqueue under the futex lock, then wait alone (no channels); dequeued means
-  woken (also when it races a timeout or signal); timeouts are `ETIMEDOUT`; interruptions restart
-  (with a restart block when timed).
-- `futex_waitv`: no flags, 1 to 128 entries of `FUTEX_32` words with no other flags (each with its
-  own private flag), an absolute timeout on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`; it returns the
-  index of the first entry woken. `set_robust_list` takes only the 24-byte head.
-- Wake removes up to n matching waiters in FIFO order and signals their events after the BKL is
-  released (or at once on the fast path). The robust list and `clear_child_tid` at thread exit and
-  execve also wake waiters (`clear_child_tid` only when the address space is shared with another
-  process); a robust lock word on a copy-on-write page (not written since fork) or a page without
-  an entry is made writable first (`cow_break`, `fault_in`), as Linux faults it in.
-- PI locks (6.1's `futex_lock_pi`, `futex_unlock_pi`, without priority inheritance: the host
-  schedules the threads; BKL path only): the word holds the owner's tid as its own pid namespace
-  sees it. LOCK_PI takes a word with no owner (keeping `FUTEX_OWNER_DIED`, adding
-  `FUTEX_WAITERS` while PI waiters are queued); the caller's own word is `EDEADLK`; otherwise it
-  sets `FUTEX_WAITERS`, then needs the owner to exist (`ESRCH`), and TRYLOCK_PI gives up
-  (`EAGAIN`) while a lock queues as a PI waiter until the word is handed to it. A signal restarts
-  it (`ERESTARTNOINTR`); the deadline (absolute, `CLOCK_REALTIME` for LOCK_PI, `CLOCK_MONOTONIC`
-  for LOCK_PI2 unless `FUTEX_CLOCK_REALTIME`) ends it with `ETIMEDOUT`. UNLOCK_PI needs the caller
-  to own the word (`EPERM`) and hands it to the first PI waiter (its tid with `FUTEX_WAITERS`,
-  `wake_futex_pi`) or clears it. Plain wakes and requeues leave PI waiters alone.
-- When a thread exits (after it leaves the task table), every PI lock with waiters whose owner no
-  longer exists goes to its first waiter with `FUTEX_WAITERS` and `FUTEX_OWNER_DIED`
-  (`exit_pi_state_list`, `fixup_pi_state_owner`), so a robust mutex reports `EOWNERDEAD`; a waiter
-  whose word cannot be written then is skipped until a later exit.
-- Lock order is BKL then futex lock; the fast path takes only the futex lock, so BKL and fast paths
-  share one queue without lost wakeups.
 
 ### Timer thread
 
@@ -686,67 +526,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   with `INSECURE`, are `EINVAL`; the bytes come from the host (`fill_random`) 64 KiB at a time,
   never blocking, and a fault in a later piece returns the bytes of the pieces before it.
 
-### Namespaces
-
-- All eight types exist. UTS, IPC, net, cgroup and time live in the task's `NsProxy`; the mount
-  namespace lives in `FsContext` (tasks sharing a fs share it); the pid namespace belongs to the
-  thread group, with a per-task namespace for children; the user namespace lives in the credentials.
-- clone: a new user namespace is created first (level, count, chroot and mapped-ID checks) and the
-  other `CLONE_NEW*` flags then need `CAP_SYS_ADMIN` in it and pass the namespace counts; then the
-  pid namespace, the pid, the mount namespace on the copied fs, UTS, IPC, net and cgroup; a new
-  time namespace becomes time-for-children, which a non-`CLONE_VM` child enters.
-- unshare: `CLONE_NEWUSER` implies a new thread and fs scope, `CLONE_VM` implies signal handlers,
-  which imply a thread, `CLONE_NEWNS` implies fs; asking for (or implying) a thread, signal
-  handlers or memory is `EINVAL` for a multithreaded caller or one sharing them. It creates and
-  charges a new user namespace, checks `CAP_SYS_ADMIN` and the counts, creates a pid namespace,
-  then applies: fd table and fs copies (`EMFILE` above `nr_open`), credentials, mount namespace,
-  pid-for-children, the semaphore exit for `CLONE_SYSVSEM`/`CLONE_NEWIPC`, and a new `NsProxy`
-  (time, cgroup, net, UTS, IPC); a new mount namespace copies the whole mount tree
-  (`kernel/mount`), a new cgroup namespace is rooted at the creator's cgroup.
-- Pid namespaces nest to level 32 and user namespaces to 33 (`ENOSPC` beyond); a new pid
-  namespace's owner must descend from its parent's owner (`EPERM`). Time namespaces follow the
-  Linux 6.2 rule: a new one becomes time-for-children; non-`CLONE_VM` children enter it at fork;
-  threads and vfork children enter at execve. Entering one with offsets, at fork, execve or setns,
-  puts svc stubs over the host vDSO's clock entries in the address space (`Mm::vdso_syscalls`), so
-  clock reads come to the kernel layer, which adds the offsets.
-- Namespace limits (Linux's ucounts): a namespace created by effective user u in user namespace n
-  (for a new user namespace, n is its parent; open_tree's anonymous mount namespaces count too)
-  counts for (n, u), then for (n's parent, n's owner) up to the initial user namespace, and every
-  one of those counts must stay below its user namespace's `max_<kind>_namespaces` (half of
-  threads-max in the initial one, as threads-max is now where Linux fixes it at boot; `INT_MAX`
-  elsewhere), else `ENOSPC`: for a user namespace after the level check and before the chroot and
-  mapping checks, for the others after the `CAP_SYS_ADMIN` check and before any is created. A
-  namespace counts while an `Rc` to it lives; those gone are taken off at the next check (a weak
-  reference per namespace), and a user namespace's limits go with it.
-- setns accepts a namespace file (type 0 or its own) or a pidfd (any non-empty combination of
-  types; the process's main thread must be alive and the caller allowed to ptrace it); every part
-  is validated in Linux order (`validate_nsset`: user, mount, UTS, IPC, pid, cgroup, net, time)
-  before anything switches, then all switch together (a new mount namespace moves root and cwd to
-  its root).
-- User namespaces: credentials hold kernel IDs; IDs shown outward (`get*id`, stat, procfs,
-  `SO_PEERCRED`, `si_uid`) are mapped through the viewer's maps, unmapped as 65534. Each map can be
-  written once, and the checks use the credentials the file was opened with (as Linux's
-  `file_ns_capable`), though the target namespace is looked up through the process when written
-  (`ESRCH` once it is reaped; a process that moved meanwhile gets its new namespace written): the
-  opener must be in the namespace or its parent and have `CAP_SYS_ADMIN` in the
-  namespace; mapping the parent's uid 0 needs `CAP_SETFCAP`, which the creator must have had if
-  the opener is inside, or the opener must have in the parent; otherwise the opener, owning the
-  namespace, may write only a single extent of its own euid (or egid after `setgroups` is set to
-  deny), unless both opener and writer have `CAP_SETUID`/`CAP_SETGID` in the parent;
-  `timens_offsets` checks the opener's `CAP_SYS_TIME`. Capability checks come in four forms
-  (`capable` in the initial namespace, `capable_here`, `ns_capable` following Linux `cap_capable`,
-  `capable_wrt`).
-- Pid namespaces: kernel pids are global; each namespace keeps global↔local tables; syscall
-  arguments are translated at dispatch and results (and wait, siginfo) at exit; invisible results
-  become 0. The first process numbered 1 is the reaper (Exit and reaping for its exit); registering
-  into a dead namespace is `ENOMEM`; procfs instances number by the mounting process's namespace,
-  while `ns_last_pid` and loadavg follow the reader.
-- Time namespaces: monotonic and boottime offsets are added to clock reads (and `/proc/uptime`,
-  sysinfo) and subtracted from absolute waits.
-- Namespace files: `/proc/<pid>/ns/*` link into nsfs; open files and bind mounts hold the namespace
-  (`NsRef`), so `setns` works after its processes exit (`ip netns add`); mqueue and procfs mounts
-  also hold their namespace.
-
 ## Dependencies (inbound / outbound)
 
 ### Inbound
@@ -754,19 +533,21 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - Syscall dispatch (`syscall/mod.rs`), `Machine` and the hosts (CLI, Android JNI: boot, shutdown,
   power, spawn, stall), signals and ptrace (group exit, delivery, exit hooks), procfs, every
   blocking syscall (via the wait API), `kernel/mm` (kicks through `TaskSync`, `quiesce`),
-  `kernel/mount` (nsfs binds, procfs/mqueue mounts, `fast_changed`), the terminal bridge
-  (`block_for`).
+  `kernel/mount` (`fast_changed`), `kernel/exec` (killing the other threads, the tgid takeover,
+  vfork completion, POSIX timers), `kernel/ns` (thread groups, ptrace access for setns), the
+  terminal bridge (`block_for`).
 
 ### Outbound
 
 - `engine`: `Cpu::new`/`run`/`step`/`reset`/`translate`, `Dbt::attach`/`run`, `Kicker`,
   `guest_hwcap`, the spare CPU list.
-- `kernel/mm`: `fork`, `quiesce`, users, `futex_key`, `translate`, `cow_break`/`fault_in`, layout
-  and mapping calls used by the loader, `vdso_syscalls`, `defer_unmaps`/`release_unmapped`/
-  `spare::refill`, `Mm::sync`.
-- vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags, `copy_ns`),
-  `kernel/fuse`
-  (serving retries, prefault, sweeps, the exit flush, FUSE programs), credentials, cgroups
+- `kernel/mm`: `fork`, `quiesce`, users, `translate`,
+  `defer_unmaps`/`release_unmapped`/`spare::refill`, `Mm::sync`.
+- `kernel/exec` (execve, `loader::load` for `Machine::spawn`), `kernel/ns` (namespaces at clone,
+  pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
+  robust lists and PI owners at exit).
+- vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags),
+  `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, cgroups
   (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
   killer (`kernel/mm`), loadavg, the store's deferred commits, signals (`send_to_group`,
   `send_cpu_timer`, `force_fatal`), the kernel log.
@@ -785,8 +566,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - A task leaves the kernel's task table and its address space's users under the BKL before its CPU
   state is freed; kicks rely on this.
 - `begin_exit` is idempotent and runs before any `PTRACE_EVENT_EXIT`.
-- Kernel pids and IDs are global inside the kernel; translation happens only at the syscall, procfs
-  and signal boundaries.
 - The fast path must leave guest memory untouched after it stops being "in guest", because
   `Mm::sync` waits only for threads in guest code; the futex and clock fast paths do not check the
   epoch, relying on the thread that changed state being the one that refreshes.
@@ -798,7 +577,8 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.
 - A syscall handler may run several times for one syscall (FUSE retries): whatever it does before
   a walk that can fail with `FUSE_RETRY` is done again, so handlers change nothing before their
-  last walk (execve changes no process state before killing the other threads). Copies to and from
+  last walk (`kernel/exec`'s execve changes no process state before killing the other threads).
+  Copies to and from
   guest memory can fail with it too (FUSE mappings), which only the read/write buffers read in
   first make safe.
 - Between syscalls no FUSE node is held by the finishing thread, which is when `sweep` may forget
@@ -810,24 +590,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 
 ## Confirmed bugs / technical debt
 
-- **`unshare` is not atomic:** a network-namespace allocation failure (`ENOMEM`, no free loopback
-  block) leaves the earlier fd-table, fs, credential, mount, pid-for-children and semaphore changes
-  in place. A pidfd `setns` combining `CLONE_NEWNS` with other types while the fs is shared
-  switches the mount namespace of every fs sharer (Linux switches only the caller's).
-- **`ETXTBSY` misses the ELF interpreter and nested scripts:** the script itself and the final
-  program are checked, but running a program whose `PT_INTERP` interpreter is open for writing, or
-  a script whose interpreter is another script open for writing, succeeds where Linux returns
-  `ETXTBSY`.
-- **Secure exec caps arguments at 2 MB:** the final argument check uses the clamped 8 MB stack limit,
-  whereas Linux 6.1 computes the argument limit before clamping (up to 6 MB).
-- **PI futexes are partial:** no priority is inherited (waiters are served first come, first
-  served, and owners are not boosted); `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_CMP_REQUEUE_PI` are
-  `ENOSYS` (glibc since 2.25 and musl do not use them); an execve marks robust PI locks the thread
-  holds owner-died with no owner but hands none to its waiters, which sleep until some thread exits
-  or another locker takes and releases the word.
-- **Doomed images:** `Machine::spawn` ignores `Image::doomed` and starts the program at pc 0 and
-  sp 0 instead of failing the spawn; execve reports its ptrace exec event (and a successful syscall
-  exit) for a doomed image, where Linux fails the exec before the event.
 - **POSIX timers on a CPU clock of a thread or process that is gone** never fire, yet keep the
   timer thread ticking every 10 ms while their owner lives, report their whole interval as time
   left, and follow a new task that reuses the number.
@@ -839,7 +601,6 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 
 ## Open questions
 
-- Should a successful execve run the post-syscall sweeps and `Mm::sync` that it now skips?
 - Should a parent's exit signal other than `SIGCHLD`, or a `SA_NOCLDWAIT` handler, change how a
   child is reaped and signalled (Linux reaps directly only for `SIGCHLD` and still signals the
   handler)?
@@ -850,9 +611,7 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 ## To verify
 
 - The Linux 6.1 comparisons above that rest on kernel behaviour rather than repository source
-  (`eligible_child`, `do_notify_parent` and `copy_process` exit signals, `deny_write_access` on
-  scripts and interpreters, argument limits under secure exec, `send_sigqueue` for dead threads,
-  `new_idmap_permitted`, `zap_pid_ns_processes`, `load_elf_binary` without `PT_LOAD`, the keep and
-  uclamp flags of `sched_setattr`, `INIT_RLIMITS`, `create_pid_namespace`'s owner check) were
-  checked from knowledge of the kernel, not against its source; the items found by Starnix's
+  (`eligible_child`, `do_notify_parent` and `copy_process` exit signals, `send_sigqueue` for dead
+  threads, `zap_pid_ns_processes`, the keep and uclamp flags of `sched_setattr`, `INIT_RLIMITS`)
+  were checked from knowledge of the kernel, not against its source; the items found by Starnix's
   syscall tests were also observed on a native 6.8 kernel.

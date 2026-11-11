@@ -23,7 +23,7 @@
 
 Root: `core/kernel/src/cred.rs` (except user namespaces), `syscall/cred.rs`, `seccomp.rs`.
 
-Outside the module: user namespace creation, id maps and namespace entry (`kernel/process`); the
+Outside the module: user namespace creation, id maps and namespace entry (`kernel/ns`); the
 syscalls that call the access helpers and their error ordering, xattr storage of
 `security.capability` (`kernel/vfs`); signal delivery and ptrace stops (`kernel/signal`); procfs
 views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`).
@@ -214,14 +214,14 @@ views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`)
 ### Inbound
 
 - `kernel/vfs` (every permission and ownership check, xattr capability rules, file-cap removal),
-  `kernel/process` (fork/clone copies, execve, namespaces, setpriority/ioprio `PRIO_USER`,
-  `RLIMIT_NPROC`), `kernel/signal` (kill, ptrace access), `kernel/procfs` (status lines, ownership,
-  sysctls), `kernel/unix` (credentials), `kernel/net`/`kernel/netns` (capability checks), the syscall
-  dispatcher and fast path (seccomp).
+  `kernel/process` (fork/clone copies, setpriority/ioprio `PRIO_USER`, `RLIMIT_NPROC`),
+  `kernel/exec` (execve), `kernel/ns` (namespaces), `kernel/signal` (kill, ptrace access),
+  `kernel/procfs` (status lines, ownership, sysctls), `kernel/unix` (credentials),
+  `kernel/net`/`kernel/netns` (capability checks), the syscall dispatcher and fast path (seccomp).
 
 ### Outbound
 
-- User namespaces and id maps (`kernel/process`); `Stat` and modes (`kernel/store`); ptrace stops,
+- User namespaces and id maps (`kernel/ns`); `Stat` and modes (`kernel/store`); ptrace stops,
   `signal::force`/`force_fatal` (`kernel/signal`); the vDSO stub check; fd tables; the kernel's
   waits and wake objects; `appine_hal::fill_random` (notification ids); the debug log.
 

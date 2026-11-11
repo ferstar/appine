@@ -27,7 +27,8 @@ Root: `core/kernel/src/pseudo.rs`, `cgroup.rs`, `bpf.rs`, `syscall/bpf.rs`.
 Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order, open/read/write
 dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps, pagemap and
 `/proc/<pid>/mem` semantics (`kernel/mm`, `kernel/signal`); id maps, `setgroups`,
-`timens_offsets`, `ns/*`, `children`, state letters and namespaces (`kernel/process`);
+`timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children` and state letters
+(`kernel/process`);
 `/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour
 (`kernel/tty`); network semantics behind `/proc/net` and `net.*` (`kernel/net`); the OOM killer
 (`kernel/mm`); SysV IPC and message queues (`kernel/ipc`).
@@ -138,7 +139,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   nsfs files cannot be read (`EINVAL`) and, like write-only cgroup files, never regenerate; a
   `NetConf` file whose generation fails at open reports the error on the first read.
 - Writes pass the whole buffer of each call to `pseudo::write` with the writer's credentials and
-  namespaces (the id maps, `setgroups` and `timens_offsets` also check the opener's, `kernel/process`),
+  namespaces (the id maps, `setgroups` and `timens_offsets` also check the opener's, `kernel/ns`),
   apply immediately, do not advance the position (except `mem`), and mark the snapshot stale.
   Per-process numbers use `proc_number`/`kstrto` (first 12 bytes, base 0, `EINVAL`/`ERANGE`);
   most sysctls parse decimal after trimming.
@@ -245,7 +246,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `domainname` per UTS namespace (one trailing newline stripped, over 64 bytes `EINVAL`);
   `ns_last_pid` per pid namespace; `net.*` per network namespace (`ip_forward` aliases
   `conf/all/forwarding`; `NetConf` directories per interface); `user/max_*_namespaces` per user
-  namespace (the reader's or writer's: the limits of `kernel/process`'s namespace counts,
+  namespace (the reader's or writer's: the limits of `kernel/ns`'s namespace counts,
   `INT_MAX` by default in a new one, 0 to `INT_MAX`); everything else kernel-wide
   (`max_map_count`, `mmap_min_addr`, inotify limits, `aio-max-nr`, `lease-break-time`, `nr_open`,
   `mount-max` (1 to `INT_MAX`; the mount limit of kernel/mount),
@@ -403,8 +404,8 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
 
 - `kernel/vfs` (walker and magic links, pseudo open/read/write/lseek/stat/getdents, chmod/chown/
   utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for devpts and cgroup2, device
-  checks); `kernel/process` (clone/clone3 cgroup placement and pids charge, unshare/setns, the
-  freezer stop in the signal path); the OOM killer (`memory_limits`, `measure_memory`,
+  checks); `kernel/process` (clone/clone3 cgroup placement and pids charge, the freezer stop in
+  the signal path); `kernel/ns` (unshare/setns); the OOM killer (`memory_limits`, `measure_memory`,
   `oom_group`, events); `syscall/poll.rs` (epoll refusal); the machine (`Offline` before boot);
   `kernel/signal` (`recorded_value` for `debug.exception-trace`, `mark_deleted` for the file
   named in unhandled-exception reports).

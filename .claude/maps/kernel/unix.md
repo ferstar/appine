@@ -187,8 +187,8 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 ### Inbound
 
 - `kernel/net` (socket syscalls, read/write, ioctl, readiness, `accept4` installing the fd);
-  `kernel/vfs` close paths (`released`); `kernel/process` (execve close-on-exec, last-thread
-  exit); seccomp addfd; `kernel/procfs` (`/proc/net/unix`).
+  `kernel/vfs` close paths (`released`); `kernel/exec` (execve close-on-exec), `kernel/process`
+  (last-thread exit); seccomp addfd; `kernel/procfs` (`/proc/net/unix`).
 
 ### Outbound
 

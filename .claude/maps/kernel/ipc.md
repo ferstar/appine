@@ -227,8 +227,9 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 ### Inbound
 
 - The syscall dispatcher.
-- `kernel/process`: group exit (`ipc::exit`), unshare and setns (`Ipc::exit`), namespace creation
-  (`MqDir::new`, default `Tunables` and `Limits`).
+- `kernel/process`: group exit (`ipc::exit`).
+- `kernel/ns`: unshare and setns (`Ipc::exit`), namespace creation (`MqDir::new`, default
+  `Tunables` and `Limits`).
 - `kernel/vfs`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown and utimensat on
   the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the `MessageQueue`
   accessors).

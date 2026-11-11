@@ -1,4 +1,4 @@
-//! Namespaces (the kernel/process map): `clone` and `unshare` create mount, user, pid
+//! Namespaces (the kernel/ns map): `clone` and `unshare` create mount, user, pid
 //! (`crate::pidns`), UTS, IPC, network, cgroup and time namespaces (`crate::nsproxy`; a new time
 //! namespace is the one for children, and of the clone calls only clone3 can ask for it);
 //! `/proc/<pid>/ns/*` (`crate::pseudo::NsKind`); ioctls on namespace files; setns(2) through a

@@ -36,8 +36,9 @@ semantics (`kernel/store`); FUSE connections, their node cache and the file sysc
 (`kernel/fuse`, dispatched to from here); procfs/sysfs/cgroup2/devpts content (`kernel/procfs`);
 terminals (`kernel/tty`); sockets (`kernel/net`, `kernel/unix`); poll/epoll, eventfd and timerfd
 (`kernel/poll`); inotify instances, watches and event rules (`kernel/inotify`); native AIO
-(`kernel/aio`); loop devices (`kernel/loop`); message queues (`kernel/ipc`); the BKL, the no-BKL
-fast path and namespaces (`kernel/process`); credentials and file capabilities (`kernel/cred`).
+(`kernel/aio`); loop devices (`kernel/loop`); message queues (`kernel/ipc`); the BKL and the no-BKL
+fast path (`kernel/process`); namespaces (`kernel/ns`); execve (`kernel/exec`); credentials and file
+capabilities (`kernel/cred`).
 
 ## Key types
 
@@ -647,8 +648,9 @@ fast path and namespaces (`kernel/process`); credentials and file capabilities (
 ### Inbound
 
 - The syscall dispatcher, including the overlay sweep at syscall end.
-- `kernel/process`: fd tables and fs contexts at clone and unshare; execve's fd-table handling and
-  mount-flag checks; the fast-path `Cached` resolver.
+- `kernel/process`: fd tables and fs contexts at clone; the fast-path `Cached` resolver.
+- `kernel/ns`: fd-table and fs copies at unshare; `kernel/exec`: execve's fd-table handling and
+  mount-flag checks.
 - `kernel/mount`: walks; new tmpfs, overlay and FUSE instances and tmpfs reconfiguration; the fd
   tables its busy and writer checks scan.
 - `kernel/mm`: mmap `PROT_EXEC` on noexec.

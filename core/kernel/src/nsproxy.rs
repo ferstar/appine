@@ -1,7 +1,7 @@
-//! The UTS, IPC, network, cgroup and time namespaces a thread is in (these kinds of Linux's
-//! `struct nsproxy`; the mount namespace is in `FsContext`, and for the pid namespace see
-//! [`crate::pidns`]). As on Linux they are recorded per thread: unshare and setns change only the
-//! calling thread, and threads and processes created by clone keep the parent thread's.
+//! The UTS, IPC, network, cgroup and time namespaces a thread is in (the kernel/ns map; these kinds
+//! of Linux's `struct nsproxy`; the mount namespace is in `FsContext`, and for the pid namespace
+//! see [`crate::pidns`]). As on Linux they are recorded per thread: unshare and setns change only
+//! the calling thread, and threads and processes created by clone keep the parent thread's.
 //!
 //! A UTS namespace has its own host name and NIS domain name. An IPC namespace has its own System
 //! V IPC objects, POSIX message queues and their limits; the contents are stored by number in

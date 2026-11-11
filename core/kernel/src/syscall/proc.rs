@@ -1,4 +1,5 @@
-//! Processes and threads: clone, execve, exit, wait4, process groups and sessions.
+//! Processes and threads (the kernel/process map): clone, exit, wait4, process groups and
+//! sessions; execve (the kernel/exec map) and unshare (the kernel/ns map).
 
 use std::cell::Cell;
 use std::rc::Rc;

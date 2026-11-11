@@ -24,7 +24,7 @@ Root: `core/kernel/src/netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs`, `netconf.
 
 Outside the module: the socket syscalls that call into it, netlink socket mechanics, host
 interfaces, routes and low-port mapping in the initial namespace (`kernel/net`); creating and
-entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/process`); `/proc/net` and sysfs file
+entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net` and sysfs file
 structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Key types
@@ -255,8 +255,8 @@ structure (`kernel/procfs`); host sockets (`hal`).
 ### Inbound
 
 - `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, netlink
-  configure and netfilter, forward targets, `SO_ORIGINAL_DST`); `kernel/process` (clone/unshare/
-  setns create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`,
+  configure and netfilter, forward targets, `SO_ORIGINAL_DST`); `kernel/ns` (clone/unshare/setns
+  create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`,
   `/sys/class/net`); the machine (the forwarder per kernel).
 
 ### Outbound
