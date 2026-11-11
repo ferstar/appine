@@ -3,7 +3,8 @@
 # touching the buffer (a NULL one included) and returns its length, with MSG_PEEK and MSG_WAITALL
 # too; a blocking TCP send or write that meets a shutdown after part of its data returns that count
 # without SIGPIPE, and the next call gets EPIPE and SIGPIPE; SIOCADDRT and SIOCDELRT for IPv4 and
-# IPv6; accept4's error order, fd reservation, signals, addresses and IPV6_V6ONLY
+# IPv6; accept4's error order, fd reservation, signals, addresses and IPV6_V6ONLY; and which
+# sockets the DNS stub takes and the local address its UDP sockets get
 set -e
 cd /tmp
 cat > trunc.c <<'C'
@@ -446,3 +447,83 @@ gcc -O1 -pthread -o acc acc.c
 ./acc
 unshare -n sh -c 'ip link set lo up; /tmp/acc v6only'
 rm -f acc acc.c
+
+# The DNS stub at 127.0.0.53:53 takes only UDP sockets: a raw ICMP socket and a ping socket get
+# loopback's echo reply from that address; a UDP socket that connected to it reads back 127.0.0.1
+# and a port (and /proc/net/udp shows the connection), and one that only sent to it a port
+cat > stub.c <<'C'
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static struct sockaddr_in stub = {.sin_family = AF_INET, .sin_port = 0x3500};
+
+static void echo(const char *what, int type)
+{
+    int fd = socket(AF_INET, type, IPPROTO_ICMP);
+    if (fd < 0) {
+        printf("%s: socket %s\n", what, strerror(errno));
+        return;
+    }
+    /* An echo request: type 8, checksum filled in below, id 0x77, sequence 1 */
+    unsigned char req[8] = {8, 0, 0, 0, 0, 0x77, 0, 1};
+    unsigned sum = 0;
+    for (int i = 0; i < 8; i += 2)
+        sum += req[i] << 8 | req[i + 1];
+    sum = (sum & 0xffff) + (sum >> 16);
+    req[2] = ~sum >> 8;
+    req[3] = ~sum;
+    if (sendto(fd, req, sizeof req, 0, (struct sockaddr *)&stub, sizeof stub) < 0) {
+        printf("%s: sendto %s\n", what, strerror(errno));
+        return;
+    }
+    /* A raw socket's messages start with the IP header, and on loopback Linux's raw socket also
+     * sees the request itself, so look at up to three */
+    struct pollfd p = {fd, POLLIN, 0};
+    unsigned char buf[256];
+    int off = type == SOCK_RAW ? 20 : 0, reply = 0;
+    for (int i = 0; i < 3 && !reply && poll(&p, 1, 3000) == 1; i++) {
+        ssize_t got = recv(fd, buf, sizeof buf, 0);
+        reply = got >= off + 8 && buf[off] == 0;
+    }
+    printf("%s: echo reply %d\n", what, reply);
+    close(fd);
+}
+
+static void name(const char *what, int fd)
+{
+    struct sockaddr_in a;
+    socklen_t al = sizeof a;
+    getsockname(fd, (struct sockaddr *)&a, &al);
+    char ip[16];
+    inet_ntop(AF_INET, &a.sin_addr, ip, sizeof ip);
+    printf("%s: %s, a port %d\n", what, ip, a.sin_port != 0);
+}
+
+int main(void)
+{
+    inet_pton(AF_INET, "127.0.0.53", &stub.sin_addr);
+    echo("raw ICMP", SOCK_RAW);
+    echo("ping socket", SOCK_DGRAM);
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    connect(c, (struct sockaddr *)&stub, sizeof stub);
+    name("UDP connected to the stub", c);
+    fflush(stdout);
+    system("grep -c ' 3500007F:0035 ' /proc/net/udp");
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    static const unsigned char q[12] = {0x12, 0x34, 1, 0};
+    sendto(u, q, sizeof q, 0, (struct sockaddr *)&stub, sizeof stub);
+    name("UDP that sent to the stub", u);
+    return 0;
+}
+C
+gcc -O1 -o stub stub.c
+./stub
+rm -f stub stub.c

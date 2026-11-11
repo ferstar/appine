@@ -758,11 +758,15 @@ pub(super) fn connect(cx: &mut Cx<'_>, fd: i32, addr: u64, len: u32) -> SysResul
             // The local address may have changed: identify again which interface the traffic
             // counts on
             s.route = None;
-            // UDP connecting to the DNS stub: only record it, and later sends are handled by the
-            // stub (it does not exist in new network namespaces)
-            if s.net.is_none() && s.ty == SOCK_DGRAM {
+            // UDP connecting to the DNS stub: record it, and later sends are handled by the stub
+            // (it does not exist in new network namespaces). The host socket is connected there
+            // too, though nothing is ever sent through it, so that it gets the local address and
+            // port Linux's connect gives (127.0.0.1 and an autobound port) for getsockname and
+            // /proc/net
+            if stub_capable(s) {
                 s.stub_peer = is_stub(&addr);
                 if s.stub_peer {
+                    let _ = appine_hal::net::connect(s.fd, &addr);
                     return Ok(0);
                 }
             }
@@ -2348,9 +2352,7 @@ pub(crate) fn send(
             if let Some(r) = &mut s.icmp {
                 r.sent(data);
             }
-            let to_stub = s.net.is_none()
-                && s.ty == SOCK_DGRAM
-                && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
+            let to_stub = stub_capable(s) && (is_stub(addr) || (addr.is_empty() && s.stub_peer));
             (s.fd, s.ty, s.sndtimeo, to_stub)
         }
         Socket::Netlink(_) | Socket::Unix(_) => unreachable!("handled above"),
@@ -2359,7 +2361,24 @@ pub(crate) fn send(
         // DNS stub: a host thread resolves it while the send returns at once, as a UDP send does
         // on Linux; the answer arrives later like any datagram (deliver_dns), so nonblocking
         // sockets and event loops never wait here, and their own timeouts and parallel queries
-        // keep working
+        // keep working. Like a UDP send, it autobinds an unbound socket (inet_send_prepare), so
+        // the host socket is bound to the wildcard address; past DNS_MAX_INFLIGHT queries
+        // resolving at once, a query is dropped, as by a server too busy to answer
+        if appine_hal::net::sockname(host_fd, false).is_ok_and(|a| port_of(&a) == Some(0)) {
+            let family = match &*sock.borrow() {
+                Socket::Inet(s) => s.family,
+                _ => AF_INET,
+            };
+            let mut any = vec![0u8; if family == AF_INET6 { 28 } else { 16 }];
+            any[..2].copy_from_slice(&(family as u16).to_le_bytes());
+            let _ = appine_hal::net::bind(host_fd, &any);
+        }
+        if cx.kr().dns_queries.len() >= DNS_MAX_INFLIGHT {
+            crate::debug::log(format_args!(
+                "DNS stub: too many queries at once, one dropped"
+            ));
+            return Ok(data.len());
+        }
         let query = data.to_vec();
         let id = {
             let k = cx.k();
@@ -3974,11 +3993,32 @@ pub(crate) fn deliver_dns(k: &mut crate::kernel::Kernel, answers: &crate::kernel
             continue;
         };
         if let Socket::Inet(s) = &mut *sock.borrow_mut() {
+            // A full receive queue drops the answer (__udp_enqueue_schedule_skb: what is queued
+            // already exceeds SO_RCVBUF), counting answers by their length
+            const SO_RCVBUF: i32 = 8;
+            let rcvbuf = appine_hal::net::getsockopt(s.fd, SOL_SOCKET, SO_RCVBUF, 4)
+                .ok()
+                .and_then(|v| Some(i32::from_le_bytes(v.get(..4)?.try_into().ok()?)))
+                .map_or(212_992, |v| v.max(0) as usize);
+            if s.answers.iter().map(Vec::len).sum::<usize>() > rcvbuf {
+                crate::debug::log(format_args!("DNS stub: receive queue full, answer dropped"));
+                continue;
+            }
             s.answers.push_back(answer);
             s.answered += 1;
         }
         request_wake_object(wake::of(&*sock));
     }
+}
+
+/// Most DNS stub queries resolving at once (host threads), across the kernel.
+const DNS_MAX_INFLIGHT: usize = 128;
+
+/// Whether a socket's sends and connects to `127.0.0.53:53` go to the DNS stub: a UDP socket in
+/// the initial network namespace (not UDP-Lite, a ping socket or a raw ICMP socket, which are
+/// datagram sockets on the host too).
+fn stub_capable(s: &InetSocket) -> bool {
+    s.net.is_none() && s.ty == SOCK_DGRAM && s.proto == IPPROTO_UDP && !s.raw && s.icmp.is_none()
 }
 
 /// How many times in-process data has arrived: [read direction, write direction]

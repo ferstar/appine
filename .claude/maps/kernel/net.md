@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: accept4's error order, reserved fd, timed-wait EINTR, NULL lengths and inherited `IPV6_V6ONLY`)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the DNS stub takes only UDP sockets, gives them a host local end, and bounds queries and answers)
 
 ## Responsibilities
 
@@ -132,9 +132,10 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - listen: implicit bind (only in a new namespace; the host autobinds otherwise), host listen,
   then a TCP/MPTCP socket in a new namespace registers its listener once; `forward_socket`; a
   listen on a non-loopback host address is reported to the app.
-- connect: in the initial namespace a socket of host type `SOCK_DGRAM` connecting to the DNS stub
-  only records `stub_peer`. Otherwise `route()` applies OUTPUT nat, the namespace translation,
-  PREROUTING nat when entering another namespace and the filter chains (`kernel/netns`); a TCP
+- connect: in the initial namespace a UDP socket connecting to the DNS stub records `stub_peer`
+  and connects its host socket there too (see below). Otherwise `route()` applies OUTPUT nat,
+  the namespace translation, PREROUTING nat when entering another namespace and the filter chains
+  (`kernel/netns`); a TCP
   reject returns its errno, a drop connects to a blackhole listener (`ETIMEDOUT` without one,
   skipping the bind, the port map, the counters and `SO_ORIGINAL_DST`), no listener in the target
   namespace is `ECONNREFUSED`; then implicit bind, portmap destination mapping and the host
@@ -270,23 +271,29 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 - `Vfs::open` writes `nameserver 127.0.0.53` (mode 0644) when `/etc` exists and has no
   `resolv.conf` entry of any kind (files, empty files and symlinks are left alone; a failure is
   only logged); the Android app overwrites Debian's at import.
-- Interception: in the initial namespace, a socket of host type `SOCK_DGRAM` sending to
+- Interception: in the initial namespace, a UDP socket (`stub_capable`: not UDP-Lite, a ping or a
+  raw ICMP socket, which reach the real `127.0.0.53` on the host's loopback) sending to
   `127.0.0.53:53` (or its IPv4-mapped form), by address or after connecting to it; checked before
   routing and accounting, so nftables never sees these queries and they are not counted; TCP and
-  other ports are not intercepted; sockets in new namespaces are not either. The host socket is
-  neither bound nor connected for the stub.
+  other ports are not intercepted; sockets in new namespaces are not either. Nothing is sent
+  through the host socket, but it gets the local end Linux gives: a connect to the stub connects
+  it there (127.0.0.1 and an autobound port, and `/proc/net/udp` shows the peer), and a send binds
+  an unbound one to the wildcard address with an autobound port.
 - Each query is registered by number in `Kernel::dns_queries` (a weak reference to the socket)
-  and handed to a new host thread (`dns-stub`; `EAGAIN` if it cannot start); the send returns the
-  query length at once, as a UDP send does. The thread resolves it — Android uses
-  `android_res_nsend` on the default network (so Private DNS, VPNs and per-network routing apply;
-  30 s limit, then cancel; the rcode is passed through in the answer); other hosts send to up to
+  and handed to a new host thread (`dns-stub`; `EAGAIN` if it cannot start), unless 128 queries
+  (`DNS_MAX_INFLIGHT`) are already registered kernel-wide, when it is dropped as by a busy server;
+  the send returns the query length at once, as a UDP send does. The thread resolves it —
+  Android uses `android_res_nsend` on the default network (so Private DNS, VPNs and per-network
+  routing apply; 30 s limit, then cancel; the rcode is passed through in the answer); other hosts
+  send to up to
   three servers from the host's `/etc/resolv.conf` (3 s each, ID checked, TCP retry on truncation
   with its own 3 s, then the next server; `EHOSTUNREACH` with none); queries under 12 bytes fail —
   turning failures into a synthesized SERVFAIL, then puts the answer in `Shared::dns_answers` and
   wakes the timer thread, whose `deliver_dns` queues it on the socket (dropped if the socket has
-  closed) with source `127.0.0.53:53` and wakes its waiters. Until then reads are `EAGAIN` or wait
-  as for any datagram; readiness and `FIONREAD` follow the queue. The thread holds no kernel
-  object, only the answer queue and the timer event; nothing bounds the threads or the queues.
+  closed, or when the answers queued already exceed its host `SO_RCVBUF`, counted by length) with
+  source `127.0.0.53:53` and wakes its waiters. Until then reads are `EAGAIN` or wait as for any
+  datagram; readiness and `FIONREAD` follow the queue. The thread holds no kernel object, only the
+  answer queue and the timer event.
 
 ### Low ports and listen events
 
@@ -458,11 +465,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **The DNS stub keys on the host socket type:** in the initial namespace a raw ICMP or ping
-  socket (both host `SOCK_DGRAM`) sending or connecting to `127.0.0.53:53` is taken as a DNS
-  query; a UDP socket that only talks to the stub is never bound on the host, so getsockname shows
-  `0.0.0.0:0` where Linux autobinds a port (and `127.0.0.1` after connect); one host thread per
-  query and the answer queue are unbounded, where Linux bounds the receive queue by `SO_RCVBUF`.
 - **`ip route get` with `iif` is `EOPNOTSUPP`:** Linux 6.1 answers input-route lookups
   (`RTA_IIF`).
 - **`/proc/net/snmp` departs from the namespace's state:** `Forwarding` is always 2 although each

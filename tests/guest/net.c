@@ -343,6 +343,40 @@ static void test_dns_stub_fionread(void)
     ok("dns stub fionread");
 }
 
+/*
+ * The DNS stub's answers queue on the socket only up to its SO_RCVBUF, as UDP datagrams do: with
+ * the smallest receive buffer, 400 queries the stub answers at once (shorter than a DNS header, so
+ * they fail without the network) leave at most a buffer's worth of answers, plus the one that
+ * crossed it. The socket is bound on the host by its first send, so getsockname shows a port.
+ */
+static void test_dns_stub_queue(void)
+{
+    struct sockaddr_in ns = {.sin_family = AF_INET, .sin_port = htons(53)};
+    inet_pton(AF_INET, "127.0.0.53", &ns.sin_addr);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0), one = 1, rcvbuf = 0;
+    socklen_t len = sizeof rcvbuf;
+    CHECK(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &one, sizeof one) == 0, "SO_RCVBUF");
+    CHECK(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &len) == 0 && rcvbuf > 0, "SO_RCVBUF");
+    static const unsigned char q[11] = {0x12, 0x34, 1, 0};
+    for (int i = 0; i < 400; i++)
+        CHECK(sendto(fd, q, sizeof q, 0, (struct sockaddr *)&ns, sizeof ns) == sizeof q, "send");
+    struct sockaddr_in me;
+    socklen_t ml = sizeof me;
+    CHECK(getsockname(fd, (struct sockaddr *)&me, &ml) == 0 && me.sin_port != 0, "autobound");
+    usleep(1500 * 1000);
+    int count = 0, bytes = 0;
+    unsigned char buf[64];
+    ssize_t n;
+    while ((n = recv(fd, buf, sizeof buf, MSG_DONTWAIT)) > 0) {
+        count++;
+        bytes += n;
+    }
+    CHECK(count > 0 && count < 400 && bytes <= rcvbuf + (int)sizeof q,
+          "%d answers, %d bytes, SO_RCVBUF %d", count, bytes, rcvbuf);
+    close(fd);
+    ok("dns stub queue");
+}
+
 /* getifaddrs lists interfaces and addresses through NETLINK_ROUTE */
 static void test_netlink(void)
 {
@@ -471,6 +505,7 @@ int main(void)
     test_tcp_loopback();
     test_udp_loopback();
     test_dns_stub_fionread();
+    test_dns_stub_queue();
     test_netlink();
     test_epoll();
     test_itimer();
