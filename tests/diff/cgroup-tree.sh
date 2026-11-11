@@ -45,7 +45,8 @@ echo $pid > t/a/cgroup.threads
 echo abc > t/a/cgroup.procs
 echo 999999 > t/a/cgroup.procs
 echo -5 > t/a/cgroup.procs
-for v in "+bogus" "memory" "+memory" "-memory" ""; do
+# A token starting with a multi-byte character (Appine's parser once panicked on it)
+for v in "+bogus" "memory" "+memory" "-memory" "" "émemory" "+émemory"; do
     echo "$v" > t/cgroup.subtree_control && echo "subtree_control '$v' ok"
 done
 for f in cgroup.controllers cgroup.events cgroup.stat cpu.stat; do

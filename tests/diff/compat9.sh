@@ -16,7 +16,9 @@
 # /proc/<pid>/syscall (Linux's proc_pid_syscall): the reader's own read, a thread waiting in read,
 # "running" for one running, ESRCH once that thread has gone, -1 with sp and the svc's pc for one
 # stopped by a signal (signal delivery forgets the syscall), -1 with zeros for a zombie, mode 0400,
-# and ptrace access checked when read with the reader's own credentials
+# and ptrace access checked when read with the reader's own credentials; and the ptrace-gated files
+# of /proc/<tid> for a thread other than the main one (maps, smaps, smaps_rollup, auxv, environ,
+# pagemap, mem), which open on the process's address space
 set -e
 cd /tmp
 cat > small.c <<'C'
@@ -606,3 +608,87 @@ C
 gcc -O1 -pthread -o procsyscall procsyscall.c
 ./procsyscall
 rm -f procsyscall procsyscall.c
+
+cat > tidfiles.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static pid_t tid;
+static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t c = PTHREAD_COND_INITIALIZER;
+static int done;
+
+static void *thread(void *a)
+{
+    pthread_mutex_lock(&m);
+    tid = syscall(SYS_gettid);
+    pthread_cond_broadcast(&c);
+    while (!done)
+        pthread_cond_wait(&c, &m);
+    pthread_mutex_unlock(&m);
+    return a;
+}
+
+/* Whether a file opens and reads something, or the error */
+static void first(const char *what, const char *path)
+{
+    char buf[256];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        printf("%s: open %s\n", what, strerror(errno));
+        return;
+    }
+    ssize_t n = read(fd, buf, sizeof buf);
+    close(fd);
+    if (n < 0)
+        printf("%s: read %s\n", what, strerror(errno));
+    else
+        printf("%s: read %s\n", what, n > 0 ? "something" : "nothing");
+}
+
+int main(void)
+{
+    pthread_t t;
+    pthread_create(&t, NULL, thread, NULL);
+    pthread_mutex_lock(&m);
+    while (!tid)
+        pthread_cond_wait(&c, &m);
+    pthread_mutex_unlock(&m);
+    /* Through /proc/<tid>, a thread other than the main one: its process's address space */
+    const char *names[] = {"maps", "smaps", "smaps_rollup", "auxv", "environ", "pagemap", "mem"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%d/%s", tid, names[i]);
+        if (i >= 5) {
+            int fd = open(path, O_RDONLY);
+            printf("/proc/<tid>/%s: open %s\n", names[i], fd < 0 ? strerror(errno) : "ok");
+            close(fd);
+        } else {
+            char what[64];
+            snprintf(what, sizeof what, "/proc/<tid>/%s", names[i]);
+            first(what, path);
+        }
+    }
+    char a[64], b[64], la[256] = "", lb[256] = "";
+    snprintf(a, sizeof a, "/proc/%d/maps", tid);
+    snprintf(b, sizeof b, "/proc/%d/maps", getpid());
+    FILE *fa = fopen(a, "r"), *fb = fopen(b, "r");
+    if (fa && fb && fgets(la, sizeof la, fa) && fgets(lb, sizeof lb, fb))
+        printf("maps first line as the process's: %d\n", strcmp(la, lb) == 0);
+    pthread_mutex_lock(&m);
+    done = 1;
+    pthread_cond_broadcast(&c);
+    pthread_mutex_unlock(&m);
+    pthread_join(t, NULL);
+    return 0;
+}
+C
+gcc -O1 -pthread -o tidfiles tidfiles.c
+./tidfiles
+rm -f tidfiles tidfiles.c

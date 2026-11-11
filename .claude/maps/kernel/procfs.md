@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/procfs.md` for the paired decision history.
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
+>
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `/proc/<tid>`'s ptrace-gated opens, `cgroup.subtree_control` token parsing and `cpu.max`'s kept period)
 
 ## Responsibilities
 
@@ -92,7 +94,9 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
   pid name is mapped through that namespace and may name any thread (`group_of`): `/proc/<tid>` is
   its process's directory seen through that thread (`status`, `comm`, `cwd` and `fd/` are the
   thread's, `stat` adds up the group's CPU time, `task/` lists the group; its ptrace-gated entries
-  fail to open, below), and it disappears when the thread exits. `self`/`thread-self` are `ENOENT` for readers not visible in the instance.
+  open on the process's address space with the check made against that thread), and it
+  disappears when the thread exits. `self`/`thread-self` are `ENOENT` for readers not visible in
+  the instance.
   Numeric names (pids, fds, terminals) are decimal digits only, at most 10 without a leading zero
   and at most `i32::MAX` (Linux's `name_to_int`).
 - `/proc/<pid>` has every `ENTRIES` name except `children`; `task/<tid>` has the `TASK_ENTRIES`
@@ -137,7 +141,8 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
   `CAP_SYS_RESOURCE` in the opener's own user namespace to open for writing; the rest of
   `/proc/sys` decides as `proc_sys_permission`/`test_perm` do, not by DAC (below); other nodes
   check DAC against the synthetic stat. Then: for `mem`, `auxv`, `environ`, `maps`, `smaps`,
-  `smaps_rollup` and `pagemap`, the process must exist (`ESRCH`) and pass one ptrace check with
+  `smaps_rollup` and `pagemap`, the process must exist (found through any of its threads with
+  `group_of`, else `ESRCH`) and the named thread pass one ptrace check with
   filesystem credentials and no read/attach distinction (`EACCES`, as Linux's `proc_mem_open`);
   `mem` and `pagemap` also need a live thread (`ESRCH`); writing `setgroups` needs
   `CAP_SYS_ADMIN` in the process's user namespace (`EACCES`, `proc_setgroups_open`); devpts nodes
@@ -423,12 +428,14 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
   `EOPNOTSUPP`).
 - Writes, in order: a removed cgroup `ENODEV`; on the root and on the writer's namespace root only
   `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable (`EPERM`); a
-  read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (`EINVAL`); enabling a
+  read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
+  including a token starting with a multi-byte character, `EINVAL`); enabling a
   controller not in `cgroup.controllers` `ENOENT`; enabling while the cgroup has processes `EBUSY`
   (except at the real root); disabling one a child still delegates `EBUSY`; disabling clears the
   children's stored values, events and peak for it. Limits are format-checked as Linux reads them
   (`memory.*` with size suffixes rounded to pages, `pids.max` up to 2^22, `cpu.max` with a period
-  of 1000 to 1000000, `cpu.weight`, `cpuset.cpus` against the guest CPUs, and so on) and read back
+  of 1000 to 1000000, a quota alone keeping the stored period as `cpu_max_write` does, 100000 by
+  default, `cpu.weight`, `cpuset.cpus` against the guest CPUs, and so on) and read back
   as stored; a stored value always wins over the computed default.
 - Enforced: `pids.max` (fork and thread creation; `pids.current` counts live threads plus one for
   a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and measurement; a child's
@@ -545,10 +552,6 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
 - **`/proc/zoneinfo`, `/proc/pressure/*` and `/proc/kallsyms` are absent:** low-memory daemons
   (systemd-oomd and oomd need PSI's `/proc/pressure/memory` and its poll triggers), zone readers
   and symbol lookups (perf, bpftrace) find nothing.
-- **`/proc/<tid>`'s ptrace-gated files do not open:** for a thread other than the main one,
-  opening `maps`, `mem`, `auxv`, `environ`, `smaps`, `smaps_rollup` or `pagemap` through
-  `/proc/<tid>` is `ESRCH`, as the open checks the process table by that id while lookup resolves
-  it to the thread; `task/<tid>/…` works.
 - **Access checks under `task/<tid>` use the process's credentials:** `fd/`, `fdinfo/`, the magic
   links and `stat`'s layout fields check the directory pid's (the main thread's) credentials,
   while owners and the open-time check of `mem` and `maps` use the thread's; with per-thread
@@ -567,10 +570,7 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
   `lo` counters are read by name from the kernel-wide traffic table without a namespace check, so
   a new namespace's `lo` shows the initial loopback's counts, while `/proc/net/dev` and netlink
   show zeros there.
-- **cgroup write and read edge cases differ from kernfs:** writing `cpu.max` without a period
-  resets it to 100000 (Linux keeps the previous one; a code comment says "unchanged"); a
-  `cgroup.subtree_control` token starting with a multi-byte character panics in `split_at`
-  (killing the writer, or aborting a debug build) instead of `EINVAL`; writes are checked against
+- **cgroup write and read edge cases differ from kernfs:** writes are checked against
   the global file table, not the cgroup's current files, so a descriptor opened before a
   controller was disabled still stores a value (which returns when the controller is re-enabled;
   a `memory.max` one runs the OOM check) where Linux gives `ENODEV`; a regenerating read of a

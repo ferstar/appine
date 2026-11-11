@@ -798,7 +798,8 @@ pub(crate) fn write(
             _ => Err(Errno::EINVAL),
         },
         _ => {
-            let value = parse_value(name, word)?;
+            let old = k.cgroups.get(id).and_then(|g| g.values.get(name).cloned());
+            let value = parse_value(name, word, old.as_deref())?;
             let g = k.cgroups.map.get_mut(&id).ok_or(Errno::ENOENT)?;
             let key = FILES.iter().find(|f| f.0 == name).ok_or(Errno::EINVAL)?.0;
             g.values.insert(key, value);
@@ -868,21 +869,21 @@ fn migrate(
 fn subtree_control(k: &mut Kernel, id: u64, text: &str) -> Result<(), Errno> {
     let (mut enable, mut disable) = (0u32, 0u32);
     for tok in text.split_ascii_whitespace() {
-        let (sign, name) = tok.split_at(1);
+        let (on, name) = match tok.split_at_checked(1) {
+            Some(("+", name)) => (true, name),
+            Some(("-", name)) => (false, name),
+            _ => return Err(Errno::EINVAL),
+        };
         let i = CONTROLLERS
             .iter()
             .position(|(n, _)| *n == name)
             .ok_or(Errno::EINVAL)?;
-        match sign {
-            "+" => {
-                enable |= 1 << i;
-                disable &= !(1 << i);
-            }
-            "-" => {
-                disable |= 1 << i;
-                enable &= !(1 << i);
-            }
-            _ => return Err(Errno::EINVAL),
+        if on {
+            enable |= 1 << i;
+            disable &= !(1 << i);
+        } else {
+            disable |= 1 << i;
+            enable &= !(1 << i);
         }
     }
     let g = k.cgroups.get(id).ok_or(Errno::ENOENT)?;
@@ -965,8 +966,9 @@ fn refreeze(k: &Kernel, group: &Rc<RefCell<ThreadGroup>>) {
 }
 
 /// Checks the values written to the limit interface files and converts them to the format read
-/// back (Linux's page_counter_memparse, cpu_max_write and the like).
-fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
+/// back (Linux's page_counter_memparse, cpu_max_write and the like); `old` is the value stored
+/// before, if any.
+fn parse_value(name: &[u8], word: &str, old: Option<&str>) -> Result<String, Errno> {
     const PAGE: u64 = 4096;
     let int = |s: &str| s.parse::<i64>().map_err(|_| Errno::EINVAL);
     // memparse: suffixes such as K, M, G, T
@@ -1033,14 +1035,17 @@ fn parse_value(name: &[u8], word: &str) -> Result<String, Errno> {
             v if v >= 0 => v.to_string(),
             _ => return Err(Errno::EINVAL),
         },
-        // `$MAX $PERIOD`: MAX is max or a number of microseconds, PERIOD may be omitted
-        // (unchanged)
+        // `$MAX $PERIOD`: MAX is max or a number of microseconds; an omitted PERIOD keeps the
+        // current one (cpu_max_write starts from tg_get_cfs_period), 100000 by default
         b"cpu.max" => {
             let mut it = word.split_ascii_whitespace();
             let quota = it.next().ok_or(Errno::EINVAL)?;
             let period = match it.next() {
                 Some(p) => int(p)?,
-                None => 100_000,
+                None => old
+                    .and_then(|o| o.split_ascii_whitespace().nth(1))
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(100_000),
             };
             if it.next().is_some() || !(1000..=1_000_000).contains(&period) {
                 return Err(Errno::EINVAL);
@@ -1354,18 +1359,45 @@ mod tests {
     /// Interface file values are checked and converted in Linux's format.
     #[test]
     fn values() {
-        assert_eq!(parse_value(b"memory.max", "1M").unwrap(), "1048576");
-        assert_eq!(parse_value(b"memory.max", "5000").unwrap(), "4096");
-        assert_eq!(parse_value(b"memory.max", "max").unwrap(), "max");
-        assert_eq!(parse_value(b"memory.max", "1x"), Err(Errno::EINVAL));
-        assert_eq!(parse_value(b"pids.max", "-1"), Err(Errno::EINVAL));
-        assert_eq!(parse_value(b"pids.max", "4194304").unwrap(), "4194304");
-        assert_eq!(parse_value(b"pids.max", "4194305"), Err(Errno::EINVAL));
-        assert_eq!(parse_value(b"cgroup.max.depth", "-1"), Err(Errno::ERANGE));
-        assert_eq!(parse_value(b"cpu.weight", "0"), Err(Errno::ERANGE));
-        assert_eq!(parse_value(b"cpu.max", "50000").unwrap(), "50000 100000");
-        assert_eq!(parse_value(b"cpu.max", "max 20000").unwrap(), "max 20000");
-        assert_eq!(parse_value(b"cpu.max", "500"), Err(Errno::EINVAL));
-        assert_eq!(parse_value(b"memory.current", "1"), Err(Errno::EINVAL));
+        assert_eq!(parse_value(b"memory.max", "1M", None).unwrap(), "1048576");
+        assert_eq!(parse_value(b"memory.max", "5000", None).unwrap(), "4096");
+        assert_eq!(parse_value(b"memory.max", "max", None).unwrap(), "max");
+        assert_eq!(parse_value(b"memory.max", "1x", None), Err(Errno::EINVAL));
+        assert_eq!(parse_value(b"pids.max", "-1", None), Err(Errno::EINVAL));
+        assert_eq!(
+            parse_value(b"pids.max", "4194304", None).unwrap(),
+            "4194304"
+        );
+        assert_eq!(
+            parse_value(b"pids.max", "4194305", None),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            parse_value(b"cgroup.max.depth", "-1", None),
+            Err(Errno::ERANGE)
+        );
+        assert_eq!(parse_value(b"cpu.weight", "0", None), Err(Errno::ERANGE));
+        assert_eq!(
+            parse_value(b"cpu.max", "50000", None).unwrap(),
+            "50000 100000"
+        );
+        assert_eq!(
+            parse_value(b"cpu.max", "max 20000", None).unwrap(),
+            "max 20000"
+        );
+        assert_eq!(parse_value(b"cpu.max", "500", None), Err(Errno::EINVAL));
+        // A quota alone keeps the period stored before
+        assert_eq!(
+            parse_value(b"cpu.max", "50000", Some("max 20000")).unwrap(),
+            "50000 20000"
+        );
+        assert_eq!(
+            parse_value(b"cpu.max", "max", Some("30000 200000")).unwrap(),
+            "max 200000"
+        );
+        assert_eq!(
+            parse_value(b"memory.current", "1", None),
+            Err(Errno::EINVAL)
+        );
     }
 }

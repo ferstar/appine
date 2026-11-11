@@ -3,8 +3,9 @@
 # pids.current counts zombies, where pids.events records events, migration ignores the limit,
 # disabling and re-enabling the controller returns to the defaults; exceeding memory.max kills
 # processes, memory.events (accumulated upwards) and .local, lowering memory.max kills those over
-# it, memory.oom.group kills the whole group, and memory several processes share counts once
-# against memory.max. The native side is a privileged container whose
+# it, memory.oom.group kills the whole group, memory several processes share counts once
+# against memory.max, and cpu.max keeps its period when only a quota is written. The native side
+# is a privileged container whose
 # root is not the real root, and controllers cannot be enabled while it has processes, so first
 # move all processes into init as docker-in-docker does (Appine's root is the real root, and
 # does the same). For memory only the event counts are compared (max is the number of times the
@@ -207,3 +208,10 @@ echo "share status $?"
 echo "s events: $(events t/s/memory.events exact)"
 echo "t events: $(events t/memory.events)"
 echo "root events: $(events memory.events)"
+
+# cpu.max (recorded only): a quota alone keeps the period already set, as cpu_max_write starts
+# from the current one
+echo "+cpu" > cgroup.subtree_control && echo "+cpu" > t/cgroup.subtree_control && mkdir t/c
+for v in "50000 200000" 30000 max "max 100000" 20000 500 "max 999"; do
+    echo "$v" > t/c/cpu.max && echo "cpu.max '$v': $(cat t/c/cpu.max)"
+done

@@ -758,7 +758,8 @@ fn open_pseudo(
         | pseudo::Entry::Pagemap),
     ) = node
     {
-        cx.kr().groups.get(&pid).ok_or(Errno::ESRCH)?;
+        // pid may name any thread (/proc/<tid>, pseudo::group_of): the check is on that thread
+        pseudo::group_of(cx.kr(), pid).ok_or(Errno::ESRCH)?;
         if !super::proc::may_ptrace_fs(cx, tid.unwrap_or(pid)) {
             return Err(Errno::EACCES);
         }
