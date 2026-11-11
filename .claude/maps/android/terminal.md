@@ -326,7 +326,7 @@ notices task and the build (`android/native`).
 - android/vt: `VtSession` (`busy`, `cwd()`, `title`, `progress`, `status`, `describe`, `clear`,
   `reset`, `answerClipboardRead`); `ProgressLine` draws the tab's `Progress`.
 - `TerminalService` (`createSession`, with the current tab's directory for a new tab,
-  `removeSession`, `current`, `focus`, `sessions`, `fillWide`); `Documents.fileLink`
+  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide`; `Documents.fileLink`
   (android/documents); `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation

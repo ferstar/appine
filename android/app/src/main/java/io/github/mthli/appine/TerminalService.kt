@@ -3,19 +3,14 @@ package io.github.mthli.appine
 import android.app.ActivityManager
 import android.app.ApplicationExitInfo
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.annotation.SuppressLint
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.icu.text.MeasureFormat
-import android.icu.util.Measure
-import android.icu.util.MeasureUnit
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -26,15 +21,11 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import android.system.Os
-import android.system.OsConstants
 import android.util.Log
 import android.widget.Toast
-import androidx.core.content.edit
 import java.util.concurrent.Executors
 import java.text.DateFormat
 import java.text.DecimalFormat
-import java.time.Instant
 import java.util.Date
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
@@ -118,6 +109,7 @@ class TerminalService : Service() {
 
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
+    private val notifications = Notifications(this)
 
     /**
      * Releasing caches and stopping the kernel are done in order on this thread: both take the BKL,
@@ -144,13 +136,13 @@ class TerminalService : Service() {
      *   android/service map).
      *
      * Before that, on the main thread, whether one kernel operation has held the kernel lock too
-     * long ([reportStall]): the worker would wait for it to end like everything else.
+     * long ([Notifications.stall]): the worker would wait for it to end like everything else.
      */
     private val poll = object : Runnable {
         override fun run() {
             val m = machine
             if (m == 0L) return
-            Native.bklStall(m)?.let { reportStall(m, it) }
+            Native.bklStall(m)?.let { notifications.stall(m, it) }
             runCatching {
                 worker.execute {
                     val lines = Native.takeListens(m)
@@ -163,7 +155,7 @@ class TerminalService : Service() {
                     }
                     main.post {
                         if (machine != m) return@post
-                        lines?.forEach(::notifyListen)
+                        lines?.forEach(notifications::listen)
                         kills?.forEach(::reportKill)
                         when (power) {
                             Native.POWER_REBOOT -> restart()
@@ -187,48 +179,6 @@ class TerminalService : Service() {
      * post the ongoing notification again, which would then have no service behind it.
      */
     private var destroyed = false
-
-    /**
-     * An entry of [Native.bklStall]: one kernel operation has held the kernel lock longer than the
-     * kernel's watchdog allows, and every guest program, and this service's other calls into the
-     * kernel, wait for it. A new one posts a notification with "Copy report" ([bugReport]); once
-     * it has ended, a notification still showing says how long it lasted, without alerting again.
-     */
-    private fun reportStall(m: Long, line: String) {
-        val f = line.split('\t')
-        if (f.size != 4) return
-        val id = f[0].toLongOrNull() ?: return
-        val ended = f[3].isNotEmpty()
-        val seen = Triple(m, id, ended)
-        if (seen == stallNotified) return
-        val manager = getSystemService(NotificationManager::class.java)
-        val updating = stallNotified.first == m && stallNotified.second == id
-        stallNotified = seen
-        if (updating && manager.activeNotifications.none { it.id == STALL_NOTIFICATION_ID }) return
-        val secs = f[1].toIntOrNull() ?: 0
-        val text = getString(if (ended) R.string.stall_ended_text else R.string.stall_text, secs)
-        // The record of its end is a kernel log line
-        val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-            .putExtra(EXTRA_REPORT, bugReport(f[2], f[3]))
-            .putExtra(EXTRA_NOTIFICATION, STALL_NOTIFICATION_ID)
-        val pending = PendingIntent.getService(
-            this, STALL_NOTIFICATION_ID, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(if (ended) R.string.stall_ended_title else R.string.stall_title))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .setOnlyAlertOnce(true)
-            .addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
-            .build()
-        manager.notify(STALL_NOTIFICATION_ID, notification)
-    }
 
     /** A [start] is running: the rootfs is being prepared or the kernel is starting. */
     private var starting = false
@@ -276,31 +226,10 @@ class TerminalService : Service() {
     private var notice: String? = null
 
     /**
-     * The next ended-process notification ([reportKill]), counting up; it starts from the clock so
-     * a new service does not reuse the ids of reports still shown from the last one.
-     */
-    private var killNotifications = (System.currentTimeMillis() % KILL_NOTIFICATION_COUNT).toInt()
-
-    /**
      * The next tab's [VtSession.id], counting up from the clock, so a notification still shown
      * from an earlier service does not open a new tab with its number.
      */
-    private var nextSessionId = (System.currentTimeMillis() % TAB_NOTIFICATION_COUNT).toInt()
-
-    /** When each tab's bell last posted a notification ([notifyTab]). */
-    private val bellNotified = HashMap<VtSession, Long>()
-
-    /**
-     * The program status each tab's notification shows ([notifyStatus]), while it shows one: a
-     * bell or a program's own notification replacing it takes the tab out.
-     */
-    private val statusNotified = HashMap<VtSession, VtSession.Status>()
-
-    /**
-     * The hold of the kernel lock last notified ([reportStall]): the kernel it was in, its id, and
-     * whether it had ended.
-     */
-    private var stallNotified = Triple(0L, 0L, false)
+    private var nextSessionId = (System.currentTimeMillis() % Notifications.TAB_NOTIFICATION_COUNT).toInt()
 
     /**
      * The thread that probes mirror speeds after an import or after "automatic" is chosen in
@@ -342,13 +271,13 @@ class TerminalService : Service() {
 
     /**
      * The tab the Activity is showing (saving tabs records which one it is); showing a tab takes
-     * away its notification ([notifyTab]), and the done and error statuses it was showing have
-     * been seen.
+     * away its notification ([Notifications.cancelTab]), and the done and error statuses it was
+     * showing have been seen.
      */
     internal var current: VtSession? = null
         set(value) {
             field = value
-            value?.let(::cancelTabNotification)
+            value?.let(notifications::cancelTab)
             value?.takeIf(::inFront)?.statusSeen()
         }
 
@@ -362,15 +291,7 @@ class TerminalService : Service() {
         }
 
         override fun onBell(session: VtSession) {
-            if (inFront(session)) {
-                each { it.onBell() }
-                return
-            }
-            val now = System.currentTimeMillis()
-            if (now - (bellNotified[session] ?: 0) < BELL_NOTIFY_MS) return
-            bellNotified[session] = now
-            statusNotified.remove(session)
-            notifyTab(session, "", getString(R.string.bell_rang), quiet = true)
+            if (inFront(session)) each { it.onBell() } else notifications.bell(session)
         }
 
         /**
@@ -390,9 +311,7 @@ class TerminalService : Service() {
         }
 
         override fun onNotification(session: VtSession, title: String, body: String) {
-            if (inFront(session)) return
-            statusNotified.remove(session)
-            notifyTab(session, title, body, quiet = false)
+            if (!inFront(session)) notifications.program(session, title, body)
         }
 
         /**
@@ -407,32 +326,12 @@ class TerminalService : Service() {
 
         override fun onStatusChanged(session: VtSession) {
             each { it.onTabStatus() }
-            notifyStatus(session)
+            notifications.status(session, inFront(session))
         }
 
-        /**
-         * A command that ran at least [COMMAND_NOTIFY_MS] finished in a tab not in front, as
-         * Ghostty's notify-on-command-finish = unfocused tells (it defaults to never, but a phone
-         * shows one tab at a time, and none while the app is away): the tab's notification says
-         * whether it succeeded, how long it took and the exit code it failed with.
-         */
+        /** A long command finished: told in the tab's notification when it is not in front. */
         override fun onCommandFinished(session: VtSession, exitCode: Int?, millis: Long) {
-            if (millis < COMMAND_NOTIFY_MS || inFront(session)) return
-            statusNotified.remove(session)
-            val title = getString(
-                when (exitCode) {
-                    null -> R.string.command_finished
-                    0 -> R.string.command_succeeded
-                    else -> R.string.command_failed
-                },
-            )
-            val took = duration(millis)
-            val text = if (exitCode == null || exitCode == 0) {
-                getString(R.string.command_took, took)
-            } else {
-                getString(R.string.command_took_code, took, exitCode)
-            }
-            notifyTab(session, title, text, quiet = false)
+            if (!inFront(session)) notifications.commandFinished(session, exitCode, millis)
         }
 
         override fun onTmuxDetached(session: VtSession) {
@@ -486,7 +385,7 @@ class TerminalService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        notifications.createChannels()
         val notification = notification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -499,7 +398,7 @@ class TerminalService : Service() {
             val exit = lastExit(killed.pid)
             restore = killed.saved
             ended = endedText(exit?.reason)
-            if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifyCrash(exit)
+            if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifications.crash(exit)
         }
         startOrImport()
     }
@@ -511,23 +410,6 @@ class TerminalService : Service() {
      * in the cache.
      */
     private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
-
-    private fun createChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID, getString(R.string.channel_sessions), NotificationManager.IMPORTANCE_LOW,
-        )
-        val services = NotificationChannel(
-            NETWORK_CHANNEL_ID, getString(R.string.channel_network), NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        val problems = NotificationChannel(
-            PROBLEMS_CHANNEL_ID, getString(R.string.channel_problems), NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        val terminal = NotificationChannel(
-            TERMINAL_CHANNEL_ID, getString(R.string.channel_terminal), NotificationManager.IMPORTANCE_DEFAULT,
-        )
-        getSystemService(NotificationManager::class.java)
-            .createNotificationChannels(listOf(channel, services, problems, terminal))
-    }
 
     /**
      * How this app's process [pid] ended, as Android recorded it; null when that is unknown (no pid,
@@ -557,43 +439,6 @@ class TerminalService : Service() {
         else -> R.string.ended_android
     }
 
-    /**
-     * The last run ended because Appine crashed or stopped responding: posts a notification with
-     * "Copy report" ([bugReport]), as Appine's bugs in the kernel get ([reportKill]).
-     */
-    private fun notifyCrash(exit: ApplicationExitInfo) {
-        val anr = exit.reason == ApplicationExitInfo.REASON_ANR
-        val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(exit.timestamp))
-        val text = getString(if (anr) R.string.anr_text else R.string.crashed_text, time)
-        val what = when (exit.reason) {
-            ApplicationExitInfo.REASON_CRASH -> "crashed (Java)"
-            ApplicationExitInfo.REASON_CRASH_NATIVE -> "crashed (native, signal ${exit.status})"
-            else -> "stopped responding (ANR)"
-        }
-        // Android's description says only "crash" for crashes; for an ANR it says what timed out
-        val line = "The app process (pid ${exit.pid}) $what at ${Instant.ofEpochMilli(exit.timestamp)}" +
-            (exit.description?.takeIf { anr }?.let { ": $it" } ?: "")
-        val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-            .putExtra(EXTRA_REPORT, bugReport(line, ""))
-            .putExtra(EXTRA_NOTIFICATION, CRASH_NOTIFICATION_ID)
-        val pending = PendingIntent.getService(
-            this, CRASH_NOTIFICATION_ID, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(if (anr) R.string.anr_title else R.string.crashed_title))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
-            .build()
-        getSystemService(NotificationManager::class.java).notify(CRASH_NOTIFICATION_ID, notification)
-    }
-
     private fun notification(): Notification {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
@@ -614,7 +459,7 @@ class TerminalService : Service() {
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
         val text = if (wakeLock != null) getString(R.string.kept_awake, state) else state
-        val builder = Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, Notifications.SESSIONS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
@@ -718,7 +563,7 @@ class TerminalService : Service() {
                         // Boot finished: notify when OpenRC services did not start (the output is
                         // in boot.log, which nobody reads)
                         val failed = Rootfs.failedServices(this)
-                        if (failed.isNotEmpty()) main.post { if (machine == it) notifyBootFailures(failed) }
+                        if (failed.isNotEmpty()) main.post { if (machine == it) notifications.bootFailures(failed) }
                     }
                     getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
                     watchingNetwork = true
@@ -787,10 +632,7 @@ class TerminalService : Service() {
             ACTION_EXIT_ALL -> exitAll()
             ACTION_CANCEL_SWITCH -> cancelSwitch()
             ACTION_TOGGLE_KEEP_AWAKE -> setKeepAwake(!keepAwake)
-            ACTION_COPY_REPORT -> copyReport(
-                intent.getStringExtra(EXTRA_REPORT).orEmpty(),
-                intent.getIntExtra(EXTRA_NOTIFICATION, 0),
-            )
+            Notifications.ACTION_COPY_REPORT -> notifications.copyReport(intent)
         }
         return START_NOT_STICKY
     }
@@ -848,7 +690,7 @@ class TerminalService : Service() {
         session.release()
         sessions.remove(session)
         unshown.remove(session)
-        cancelTabNotification(session)
+        notifications.cancelTab(session)
         sessionsChanged()
     }
 
@@ -857,84 +699,6 @@ class TerminalService : Service() {
      * visible (not another tab, and not Settings in front of the terminal).
      */
     private fun inFront(session: VtSession) = session === current && listeners.any { it is MainActivity }
-
-    /**
-     * A program in [session], not the tab in front, asked for attention (a bell, OSC 9, OSC 777,
-     * a program status, [notifyStatus]), or a command there finished:
-     * one notification per tab, replaced by the tab's next one and taken away when the tab is
-     * shown, opening that tab. It is titled [title], or else the tab's title; a [quiet] one (the
-     * bell) alerts only when the tab's notification is not showing already.
-     */
-    private fun notifyTab(session: VtSession, title: String, text: String, quiet: Boolean) {
-        val number = sessions.indexOf(session) + 1
-        if (number == 0) return
-        val id = TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT
-        val open = Intent(this, MainActivity::class.java).putExtra(MainActivity.EXTRA_TAB, session.id)
-        val pending = PendingIntent.getActivity(
-            this, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val notification = Notification.Builder(this, TERMINAL_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title.ifEmpty { session.title?.takeIf { it.isNotBlank() } ?: "sh" })
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setSubText(getString(R.string.tab_number, number))
-            .setContentIntent(pending)
-            .setAutoCancel(true)
-            .setOnlyAlertOnce(quiet)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(id, notification)
-    }
-
-    /**
-     * Tells the user when [session]'s program status (OSC 7501) needs them or has news: blocked
-     * (waiting for an approval, an answer or credentials), done or failed, as the tab's
-     * notification ([notifyTab]) titled with the record's title, or the tab's. Each status
-     * notifies once: the same record again posts nothing, while one that changes posts anew. A
-     * status that goes without the user (the program was killed, or stopped waiting) takes its
-     * notification away, unless something else has replaced it. In the tab in front nothing is
-     * posted, and done and error count as seen at once.
-     */
-    private fun notifyStatus(session: VtSession) {
-        val status = session.status?.takeIf {
-            it.state == VtSession.STATUS_BLOCKED || it.state == VtSession.STATUS_DONE || it.state == VtSession.STATUS_ERROR
-        }
-        if (status == null) {
-            if (statusNotified.remove(session) != null) cancelTabNotification(session)
-            return
-        }
-        if (inFront(session)) {
-            session.statusSeen()
-            return
-        }
-        if (statusNotified[session] == status) return
-        statusNotified[session] = status
-        val what = VtSession.describe(this, status)
-        val text = if (status.message.isEmpty()) what else getString(R.string.status_message, what, status.message)
-        notifyTab(session, status.title, text, quiet = false)
-    }
-
-    /**
-     * How long a command took ([millis]) in the app's language: hours and minutes, minutes and
-     * seconds, or seconds, leaving out a second part of 0.
-     */
-    private fun duration(millis: Long): String {
-        val s = millis / 1000
-        val parts = when {
-            s >= 3600 -> listOf(Measure(s / 3600, MeasureUnit.HOUR), Measure(s % 3600 / 60, MeasureUnit.MINUTE))
-            s >= 60 -> listOf(Measure(s / 60, MeasureUnit.MINUTE), Measure(s % 60, MeasureUnit.SECOND))
-            else -> listOf(Measure(s, MeasureUnit.SECOND))
-        }.filterIndexed { i, m -> i == 0 || m.number.toLong() != 0L }
-        return MeasureFormat.getInstance(resources.configuration.locales[0], MeasureFormat.FormatWidth.SHORT)
-            .formatMeasures(*parts.toTypedArray())
-    }
-
-    private fun cancelTabNotification(session: VtSession) {
-        bellNotified.remove(session)
-        statusNotified.remove(session)
-        getSystemService(NotificationManager::class.java)
-            .cancel(TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT)
-    }
 
     private fun sessionsChanged() {
         updateNotification()
@@ -1020,41 +784,12 @@ class TerminalService : Service() {
     }
 
     /**
-     * An entry of [Native.takeListens]: `<process name>\t<port>\t<host port>`. One notification per
-     * port.
-     */
-    private fun notifyListen(line: String) {
-        val fields = line.split('\t')
-        if (fields.size != 3) return
-        val comm = fields[0]
-        val port = fields[1].toIntOrNull() ?: return
-        val hostPort = fields[2].toIntOrNull() ?: return
-        val text = if (hostPort != port) {
-            getString(R.string.listening_mapped, hostPort, port)
-        } else {
-            getString(R.string.listening_direct)
-        }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, NETWORK_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.listening_title, comm, port))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(LISTEN_NOTIFICATION_BASE + port, notification)
-    }
-
-    /**
      * An entry of [Native.takeKills]: the kernel layer ended a process (kernel bug, engine fault,
      * OOM killer). When its controlling terminal is a tab, the reason is explained in that tab (the
      * shell only prints "Killed" or "Segmentation fault"); when it is not in a tab (a background
      * service), when the tab is in a full-screen program, or when the UI is gone, a notification is
-     * posted. Appine's own bugs always get a notification, with "Copy report" ([bugReport]) on it,
-     * for the user to paste into feedback.
+     * posted. Appine's own bugs always get a notification, with "Copy report" on it
+     * ([Notifications.kill]).
      */
     private fun reportKill(line: String) {
         val f = line.split('\t')
@@ -1085,88 +820,7 @@ class TerminalService : Service() {
         val shown = session?.showMessage("[appine] $text") == true
         // Enough only when that tab is the one in front of the user
         if (shown && inFront(session) && !bug) return
-        val id = KILL_NOTIFICATION_BASE + killNotifications++ % KILL_NOTIFICATION_COUNT
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val builder = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.killed_title, comm))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-        if (bug) {
-            val copy = Intent(this, TerminalService::class.java).setAction(ACTION_COPY_REPORT)
-                .putExtra(EXTRA_REPORT, bugReport(f[4], f[5], f[6]))
-                .putExtra(EXTRA_NOTIFICATION, id)
-            val pending = PendingIntent.getService(
-                this, id, copy, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-            builder.addAction(Notification.Action.Builder(null, getString(R.string.copy_report), pending).build())
-        }
-        getSystemService(NotificationManager::class.java).notify(id, builder.build())
-    }
-
-    /**
-     * The report copied for the user to paste into feedback: the app's version, the device, the
-     * distro and the execution tier, plus the kernel layer's report (process, thread, last guest
-     * pc, the panic message and location, the same as the line in `dmesg`), the kernel log
-     * entries before it and itself ([log] separated by U+001E, with timestamps as `dmesg` writes
-     * them), and the unimplemented paths the guest reached most since boot ([stubs] separated by
-     * U+001E: what the workload asked for that Appine lacks).
-     */
-    private fun bugReport(report: String, log: String, stubs: String = ""): String = buildString {
-        appendLine("Appine ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}, ${BuildConfig.BUILD_TYPE})")
-        appendLine(
-            "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
-                "${Build.SUPPORTED_ABIS.firstOrNull()}, page size ${Os.sysconf(OsConstants._SC_PAGESIZE)}",
-        )
-        appendLine("${Rootfs.installed(this@TerminalService)?.label ?: "unknown distribution"}, Tier $tier")
-        append(report)
-        if (log.isNotEmpty()) {
-            append("\n\nKernel log:\n")
-            append(log.split('\u001e').joinToString("\n"))
-        }
-        if (stubs.isNotEmpty()) {
-            append("\n\nUnimplemented paths reached:\n")
-            append(stubs.split('\u001e').joinToString("\n"))
-        }
-    }
-
-    /**
-     * "Copy report" on the notification: puts it on the clipboard and dismisses that notification.
-     * Since Android 13 the system shows its own copied confirmation.
-     */
-    private fun copyReport(report: String, notification: Int) {
-        if (report.isEmpty()) return
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.copy_report), report))
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            Toast.makeText(this, R.string.report_copied, Toast.LENGTH_SHORT).show()
-        }
-        getSystemService(NotificationManager::class.java).cancel(notification)
-    }
-
-    /**
-     * OpenRC services did not start at boot: posts a notification saying which ones and where the
-     * output is.
-     */
-    private fun notifyBootFailures(services: List<String>) {
-        val title = resources.getQuantityString(R.plurals.boot_failed_title, services.size, services.size)
-        val text = getString(R.string.boot_failed_text, services.joinToString(", "))
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(open)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(BOOT_NOTIFICATION_ID, notification)
+        notifications.kill(comm, text, if (bug) f.subList(4, 7) else null)
     }
 
     /**
@@ -1279,7 +933,7 @@ class TerminalService : Service() {
      */
     private fun replace(distro: Rootfs.Distro) {
         // The old accounts were all deleted with the store
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { remove(KEY_LOGIN) }
+        Settings.clearLogin(this)
         transitioning = true
         val m = detach()
         startError = null
@@ -1337,31 +991,24 @@ class TerminalService : Service() {
         Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
     }
 
-    /**
-     * The login account of new tabs (chosen in Settings, the android/setup map):
-     * [ConsolePty.LOGIN_AUTO], [ConsolePty.LOGIN_ROOT] or an account name. Goes back to automatic
-     * after a distro switch or a rootfs reset.
-     */
-    val login: String get() = login(this)
+    // The settings ([Settings]), which the setters below act on
+
+    val login: String get() = Settings.login(this)
 
     /**
      * A login account was chosen in Settings: tabs opened from now on use it, open ones are
      * unchanged; the home directory in the Files app follows.
      */
     fun setLogin(value: String) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putString(KEY_LOGIN, value) }
+        Settings.setLogin(this, value)
         Documents.rootsChanged(this)
         settingsChanged()
     }
 
-    /**
-     * Keep running with the screen off (a switch in Settings and in the notification, off by
-     * default, the android/service map).
-     */
-    val keepAwake: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_KEEP_AWAKE, false)
+    val keepAwake: Boolean get() = Settings.keepAwake(this)
 
     fun setKeepAwake(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_KEEP_AWAKE, on) }
+        Settings.setKeepAwake(this, on)
         updateWakeLock()
         settingsChanged()
     }
@@ -1400,59 +1047,32 @@ class TerminalService : Service() {
         updateNotification()
     }
 
-    /**
-     * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by
-     * default, the android/documents map).
-     */
-    val systemDocuments: Boolean get() = showSystemDocuments(this)
+    val systemDocuments: Boolean get() = Settings.systemDocuments(this)
 
     fun setSystemDocuments(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_SYSTEM_DOCUMENTS, on) }
+        Settings.setSystemDocuments(this, on)
         Documents.rootsChanged(this)
         settingsChanged()
     }
 
-    /**
-     * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
-     * on by default, the android/vtview map); [MainActivity] reads it whenever it starts.
-     */
-    val fillWide: Boolean get() = fillWide(this)
+    val fillWide: Boolean get() = Settings.fillWide(this)
 
     fun setFillWide(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_FILL_WIDE, on) }
+        Settings.setFillWide(this, on)
         settingsChanged()
     }
 
-    /**
-     * The cursor's default shape, as Ghostty's cursor-style (a choice in Settings): a block by
-     * default ([VtNative.CURSOR_BLOCK]), a bar or an underline. Every tab takes it at once, unless
-     * a program chose its own cursor (DECSCUSR), which the program's reset brings back to it.
-     */
-    val cursorStyle: Int
-        get() = when (getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_CURSOR_STYLE, null)) {
-            CURSOR_BAR -> VtNative.CURSOR_BAR
-            CURSOR_UNDERLINE -> VtNative.CURSOR_UNDERLINE
-            else -> VtNative.CURSOR_BLOCK
-        }
+    val cursorStyle: Int get() = Settings.cursorStyle(this)
 
     fun setCursorStyle(style: Int) {
-        val name = when (style) {
-            VtNative.CURSOR_BAR -> CURSOR_BAR
-            VtNative.CURSOR_UNDERLINE -> CURSOR_UNDERLINE
-            else -> CURSOR_BLOCK
-        }
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putString(KEY_CURSOR_STYLE, name) }
+        Settings.setCursorStyle(this, style)
         cursorChanged()
     }
 
-    /**
-     * Whether the cursor blinks by default, as Ghostty's cursor-style-blink (a switch in Settings,
-     * on by default); programs may still choose otherwise.
-     */
-    val cursorBlink: Boolean get() = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_CURSOR_BLINK, true)
+    val cursorBlink: Boolean get() = Settings.cursorBlink(this)
 
     fun setCursorBlink(on: Boolean) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putBoolean(KEY_CURSOR_BLINK, on) }
+        Settings.setCursorBlink(this, on)
         cursorChanged()
     }
 
@@ -1464,13 +1084,7 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    /**
-     * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
-     * takes it from Settings, effective at the next kernel start; a release build always runs Tier
-     * 1, ignoring a value recorded by an earlier debug install.
-     */
-    val tier: Int
-        get() = if (BuildConfig.DEBUG) getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_TIER, 1) else 1
+    val tier: Int get() = Settings.tier(this)
 
     /**
      * The execution tier was changed in Settings (debug builds only): record it and restart the
@@ -1478,7 +1092,7 @@ class TerminalService : Service() {
      */
     fun setTier(value: Int) {
         if (!BuildConfig.DEBUG || value == tier) return
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit { putInt(KEY_TIER, value) }
+        Settings.setTier(this, value)
         restart()
     }
 
@@ -1572,7 +1186,7 @@ class TerminalService : Service() {
         main.removeCallbacks(periodicSave)
         for (s in sessions) {
             s.release()
-            cancelTabNotification(s)
+            notifications.cancelTab(s)
         }
         sessions.clear()
         unshown.clear()
@@ -1596,7 +1210,7 @@ class TerminalService : Service() {
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
         for (s in sessions) {
             s.release()
-            cancelTabNotification(s)
+            notifications.cancelTab(s)
         }
         sessions.clear()
         val m = machine
@@ -1628,72 +1242,14 @@ class TerminalService : Service() {
         }.toTypedArray()
 
         private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
-        private const val CHANNEL_ID = "sessions"
-        private const val NETWORK_CHANNEL_ID = "network"
-        private const val PROBLEMS_CHANNEL_ID = "problems"
-        private const val TERMINAL_CHANNEL_ID = "terminal"
-        /** The boot failure notification. */
-        private const val BOOT_NOTIFICATION_ID = 2
-        /** The notification that the last run ended in a crash or ANR of Appine. */
-        private const val CRASH_NOTIFICATION_ID = 3
-        /** The notification that a kernel operation held the kernel lock too long ([reportStall]). */
-        private const val STALL_NOTIFICATION_ID = 4
-        /**
-         * Notifications of ended processes: one id per report, above every listen id, so neither a
-         * listen nor a later report replaces one (and with it a bug's "Copy report").
-         */
-        private const val KILL_NOTIFICATION_BASE = 100_000
-        private const val KILL_NOTIFICATION_COUNT = 100_000
-        /** Notifications for tabs ([notifyTab]), one per tab, above the kill reports' ids. */
-        private const val TAB_NOTIFICATION_BASE = 200_000
-        private const val TAB_NOTIFICATION_COUNT = 100_000
-        /** A tab's bell posts at most one notification per this long. */
-        private const val BELL_NOTIFY_MS = 1_000L
-        /**
-         * A command that ran at least this long notifies when it finishes in a tab not in front
-         * (Ghostty's notify-on-command-finish-after is 5 s; a phone's shorter commands, a few
-         * package installs, are more often watched to the end).
-         */
-        private const val COMMAND_NOTIFY_MS = 10_000L
+
+        /** The ongoing notification (the other ids are [Notifications]'). */
         private const val NOTIFICATION_ID = 1
-        /** Listen notifications are numbered by port: 1000 + port, below [KILL_NOTIFICATION_BASE]. */
-        private const val LISTEN_NOTIFICATION_BASE = 1000
         private const val POLL_MS = 2_000L
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"
-        private const val ACTION_COPY_REPORT = "io.github.mthli.appine.COPY_REPORT"
-        private const val EXTRA_REPORT = "report"
-        private const val EXTRA_NOTIFICATION = "notification"
-        private const val KEY_KEEP_AWAKE = "keep_awake"
         private const val WAKE_LOCK_TAG = "appine:keep-awake"
-        private const val PREFS = "settings"
-        private const val KEY_TIER = "tier"
-        private const val KEY_LOGIN = "login"
-        private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
-        private const val KEY_FILL_WIDE = "fill_wide"
-        private const val KEY_CURSOR_STYLE = "cursor_style"
-        private const val KEY_CURSOR_BLINK = "cursor_blink"
-
-        // The cursor shapes as recorded, Ghostty's cursor-style values
-        private const val CURSOR_BLOCK = "block"
-        private const val CURSOR_BAR = "bar"
-        private const val CURSOR_UNDERLINE = "underline"
-
-        /**
-         * The login account in Settings (see the instance's [login]); the DocumentsProvider needs
-         * it too, without going through the service.
-         */
-        fun login(context: Context): String =
-            context.getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LOGIN, null) ?: ConsolePty.LOGIN_AUTO
-
-        /** See the instance's [systemDocuments]. */
-        fun showSystemDocuments(context: Context): Boolean =
-            context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
-
-        /** See the instance's [fillWide]; the activity reads it before the service is bound. */
-        fun fillWide(context: Context): Boolean =
-            context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_FILL_WIDE, true)
         private const val TRIM_DELAY_MS = 60_000L
         private const val SAVE_MS = 60_000L
         private const val SAVE_SOON_MS = 2_000L

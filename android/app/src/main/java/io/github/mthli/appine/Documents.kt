@@ -72,7 +72,7 @@ class Documents : DocumentsProvider() {
             add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
             add(Root.COLUMN_AVAILABLE_BYTES, free)
         }
-        if (TerminalService.showSystemDocuments(context)) {
+        if (Settings.systemDocuments(context)) {
             result.newRow().apply {
                 add(Root.COLUMN_ROOT_ID, ROOT_SYSTEM)
                 add(Root.COLUMN_DOCUMENT_ID, "/")
@@ -225,7 +225,7 @@ class Documents : DocumentsProvider() {
         val context = attached()
         val dir = when (rootId) {
             ROOT_HOME -> home(context)?.path
-            ROOT_SYSTEM -> "/".takeIf { TerminalService.showSystemDocuments(context) }
+            ROOT_SYSTEM -> "/".takeIf { Settings.systemDocuments(context) }
             else -> null
         } ?: throw FileNotFoundException("no root $rootId")
         val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
@@ -246,7 +246,7 @@ class Documents : DocumentsProvider() {
 
     private fun home(context: Context): Home? {
         if (!Rootfs.isReady(context)) return null
-        val login = TerminalService.login(context)
+        val login = Settings.login(context)
         cache?.let { (time, key, home) ->
             if (key == login && SystemClock.elapsedRealtime() - time < CACHE_MS) return home
         }
@@ -274,7 +274,7 @@ class Documents : DocumentsProvider() {
      */
     private fun visible(context: Context, documentId: String): String {
         val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
-        if (TerminalService.showSystemDocuments(context)) return path
+        if (Settings.systemDocuments(context)) return path
         val home = home(context)?.path ?: throw FileNotFoundException("no home directory")
         if (path == home || isChildDocument(home, path)) return path
         throw FileNotFoundException("$documentId is outside $home")

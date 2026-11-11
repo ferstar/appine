@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: failed starts and switches, exiting, kill reports, notifications, snapshots, clipboard reads, cursor settings, tmux -CC, then memory trimming last)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: notifications other than the ongoing one moved to `Notifications`, the settings preferences to `Settings`)
 
 ## Responsibilities
 
@@ -24,9 +24,10 @@ outlives an Activity:
   finish;
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
-  shape and blinking, distro switch, mirror).
+  shape and blinking, distro switch, mirror), the preferences kept in `Settings`.
 
-Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Tabs.kt`.
+Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
+`Settings.kt`, `Tabs.kt`.
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
 and its tab bar (`android/terminal`); rendering (`android/vtview`); sessions' internals and the
@@ -54,16 +55,24 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
   restore), `current` (written only by `MainActivity`; setting it takes the tab's notification and
   bell throttle away and, with the terminal Activity listening, marks the tab's statuses seen),
-  `nextSessionId` (counting up from the clock, never wrapped), `bellNotified` (when each tab's bell
-  last notified), `statusNotified` (the program status a tab's notification shows, while it shows
-  one); `sessionEvents` (title changed, bell, clipboard write, notification, clipboard read,
-  progress or status changed, a command finished, tmux's control mode detached, the shell
-  finished).
+  `nextSessionId` (counting up from the clock, never wrapped); `sessionEvents` (title changed,
+  bell, clipboard write, notification, clipboard read, progress or status changed, a command
+  finished, tmux's control mode detached, the shell finished).
 - Lifecycle state (internal): `exiting`, `starting` (a start thread is running), `transitioning`
   (restart or replace, between letting go of the old kernel and starting the new one),
   `pendingReplace` (a distro download that finished during a start or restart), `startError`,
-  `progress`, `mirrorThread`, `stallNotified` (the stall last notified), `killNotifications` (the
-  next kill notification's offset, seeded from the clock).
+  `progress`, `mirrorThread`.
+- `Notifications` — the service's notifications but the ongoing one, which the service builds
+  itself: the channels, the stuck kernel, the last run's crash, boot failures, listens, kill
+  reports and their "copy report" (the bug report's text and the action the service handles), and
+  each tab's notification; with their state: `stallNotified` (the stall last notified),
+  `killNotifications` (the next kill notification's offset, seeded from the clock), `bellNotified`
+  (when each tab's bell last notified), `statusNotified` (the program status a tab's notification
+  shows, while it shows one). The service decides what is told (the tab in front, a message
+  shown in the tab); `Notifications` builds, posts and cancels.
+- `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
+  tier (always 1 in a release build), login, keep-awake, system documents, wide cells and the
+  cursor's shape (stored as Ghostty's names) and blinking; `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
   the active one, `downloader` the one whose thread has not ended yet.
 - `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
@@ -86,8 +95,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
   `takeNotice`; state read by them: `machine`, `startError`, `progress`, `switching`, `sessions`,
   `focus`, the settings.
-- Static settings read without the service: `login()` and `showSystemDocuments()` by `Documents`,
-  `fillWide()` by `MainActivity` (in `onStart` and `onSettingsChanged`).
+- Settings read without the service: `Settings.login` and `systemDocuments` by `Documents`,
+  `Settings.fillWide` by `MainActivity` (in `onStart` and `onSettingsChanged`); the service's
+  getters read `Settings` too, and its setters write it and act on the change.
 
 ## Data flow / lifecycle
 
@@ -244,8 +254,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   tab's notification, at most once a second per tab and alerting only once. An OSC 9 or OSC 777
   notification becomes the tab's notification unless the tab is in front. A change of a tab's
   progress or program status goes to the listeners' `onTabStatus`; a program status that is
-  blocked, done or failed (`notifyStatus`) becomes the tab's notification, once per status (the
-  same record again posts nothing), unless the tab is in front, where done and error count as seen
+  blocked, done or failed (`Notifications.status`) becomes the tab's notification, once per status
+  (the same record again posts nothing), unless the tab is in front, where done and error count as seen
   at once (`VtSession.statusSeen`). A status that goes without the user (the program was killed or
   stopped waiting) takes its notification away, unless a bell or a program's notification has
   replaced it since. A clipboard write sets
@@ -300,8 +310,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   kernel (the kernel queues at most 32; one dropped from a full queue is reported only when the
   guest listens on that pair again), with remap text when the ports differ; the notification id is
   `1000 + guest port`.
-- Tab notifications (`notifyTab`, on the `terminal` channel): one per tab (id `200000 + tab id mod
-  100000`), replaced by the tab's next one: titled with OSC 777's title or a status record's
+- Tab notifications (`Notifications.tab`, on the `terminal` channel): one per tab (id
+  `200000 + tab id mod 100000`), replaced by the tab's next one: titled with OSC 777's title or a status record's
   title, else the program's title (`sh` when none), with the body, "The terminal bell rang", or
   for a status what it says (`VtSession.describe`: "Waiting for your approval", "Waiting for your
   answer", "Waiting for credentials", "Waiting for you", "Done", "Failed") and its message after a
@@ -321,7 +331,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 - `MainActivity`, `SettingsActivity` (start and bind, listeners, setters, state); `VtSession`
   (`Events`); notification `PendingIntent`s; `ConnectivityManager`; system trim callbacks;
-  `Documents` and `MainActivity` (static settings).
+  `Documents` and `MainActivity` (`Settings`).
 
 ### Outbound
 

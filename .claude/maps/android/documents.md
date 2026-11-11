@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-09 (targeted verification only since the full mapping: a system root apart from the home root, a home of `/` read-only; write fds with a close callback; changes notified in one call; `file:` links; grants below directories last)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the login and system-root settings read from `Settings`)
 
 ## Responsibilities
 
@@ -113,8 +113,8 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ### Outbound
 
-- `Native.browse*`; `Rootfs` (`isReady`, `installed`, `access`, `loginAccount`); the service's
-  static settings.
+- `Native.browse*`; `Rootfs` (`isReady`, `installed`, `access`, `loginAccount`); `Settings`
+  (`login`, `systemDocuments`; android/service).
 
 ## Invariants and gotchas
 
