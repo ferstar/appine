@@ -1171,28 +1171,38 @@ class TerminalService : Service() {
 
     /**
      * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
-     * translations kept in the pool take up to 70–80 MB) and compresses the tabs' scrollback.
-     * Since Android 14 the `RUNNING_*` levels are no longer sent; the UI being hidden
-     * (`UI_HIDDEN`) is handled by [removeListener].
+     * translations kept in the pool take up to 70–80 MB), compresses the tabs' scrollback and
+     * cuts the images of the tabs other than [current] down ([trimMemory]). Since Android 14 the
+     * `RUNNING_*` levels are no longer sent; the UI being hidden (`UI_HIDDEN`) is handled by
+     * [removeListener].
      */
     @Suppress("DEPRECATION") // RUNNING_LOW and RUNNING_CRITICAL are sent only before Android 14
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) {
-            trimMemory()
+            trimMemory(pressure = true)
             saveTabs()
         }
     }
 
     /**
      * Drops the kernel's rebuildable caches and compresses every tab's cold scrollback, including
-     * that of tabs whose output never paused long enough for the idle compression (`vt.rs`).
+     * that of tabs whose output never paused long enough for the idle compression (`vt.rs`). Under
+     * [pressure], also deletes the oldest Kitty images of every tab but [current] (the one shown,
+     * or to be shown when the app comes back) down to a few MiB per screen: they are gone, not
+     * kept elsewhere ([VtNative.dropImages]).
      */
-    private fun trimMemory() {
+    private fun trimMemory(pressure: Boolean = false) {
         val m = machine
         if (m != 0L) {
+            val others = if (pressure) {
+                sessions.filter { it !== current && it.tab != 0L }.map { it.tab }
+            } else {
+                emptyList()
+            }
             worker.execute {
                 Native.trimMemory(m)
+                others.forEach(VtNative::dropImages)
                 VtNative.compressAll()
             }
         }

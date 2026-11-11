@@ -311,6 +311,12 @@ internal object VtNative {
      */
     @JvmStatic external fun compressAll()
 
+    /**
+     * Deletes [tab]'s oldest Kitty images, with their placements, until each screen's take at
+     * most 4 MiB (memory trimming under pressure, for a tab not shown).
+     */
+    @JvmStatic external fun dropImages(tab: Long)
+
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)
 

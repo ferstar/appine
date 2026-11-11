@@ -206,6 +206,10 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // images the size of a phone's screen; Ghostty's default is 320 MB, libghostty-vt's 10 MB
 #define KITTY_STORAGE ((uint64_t)32 << 20)
 
+// What each screen's Kitty images are cut down to when the app trims its memory under pressure, in
+// tabs not shown (appine_vt_drop_images): about one image the size of a phone's screen
+#define KITTY_TRIMMED ((uint64_t)4 << 20)
+
 // The shortest wait between two frames of an animated image (about 120 Hz)
 #define ANIMATION_MIN_MS 8
 
@@ -3337,4 +3341,17 @@ void appine_vt_compress_all(AppineVt *vt) {
     vt->compress_touched = false;
   }
   release_text(vt);
+}
+
+// Deletes Kitty images until each screen's take at most KITTY_TRIMMED (the app trimming its memory
+// under pressure, for a tab not shown), then puts the limit back. Lowering the limit is
+// libghostty-vt's only way to give image memory back: it deletes whole images with their
+// placements, those no placement shows first, then the oldest sent, so images shown in the
+// scrollback or on the screen can go. The last snapshot is left as it was (it still has them): a new
+// one would read, and so decompress, every page of the scrollback; the next change takes one.
+void appine_vt_drop_images(AppineVt *vt) {
+  uint64_t limit = KITTY_TRIMMED;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &limit);
+  limit = KITTY_STORAGE;
+  ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &limit);
 }

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-11 (targeted verification only since the split: image bitmaps dropped while the window is hidden last)
+> Maintained: 2026-11-11 (targeted verification only since the split: image bitmaps dropped while the window is hidden, then images cut under memory pressure last)
 
 ## Responsibilities
 
@@ -582,12 +582,15 @@ select a command's output and move the cursor by taps:
     in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
     the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
     and luminance), of use only with themes;
-- **libghostty-vt's images are never trimmed**: each screen of each tab keeps up to 32 MiB of
-  decoded Kitty images, which memory trimming (`compressAll`) leaves, and while a tab is shown the
-  view holds a second copy of those placed on its screen (dropped while the window is hidden). A
-  tab restored from its snapshot gets its images back (libghostty-vt's snapshot encoder writes
-  them when built with Kitty graphics, though a comment in its `snapshot/terminal.zig` says
-  otherwise); one restored from its plain transcript has text only.
+- **libghostty-vt's images are trimmed only under pressure before Android 14**: each screen of
+  each tab keeps up to 32 MiB of decoded Kitty images, and while a tab is shown the view holds a
+  second copy of those placed on its screen (dropped while the window is hidden). Only the
+  `RUNNING_LOW` and higher trim levels, which Android 14 and later no longer send, cut the tabs
+  not shown down to 4 MiB a screen (android/vt), deleting the oldest images outright; the routine
+  trim after the UI leaves keeps them all. A tab restored from its snapshot gets its images back
+  (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though a comment
+  in its `snapshot/terminal.zig` says otherwise); one restored from its plain transcript has text
+  only.
 
 ## Open questions
 

@@ -205,6 +205,7 @@ unsafe extern "C" {
     fn appine_vt_compress_wanted(vt: *mut AppineVt) -> bool;
     fn appine_vt_compress_step(vt: *mut AppineVt, may_wait: bool) -> i32;
     fn appine_vt_compress_all(vt: *mut AppineVt);
+    fn appine_vt_drop_images(vt: *mut AppineVt);
 }
 
 /// `AndroidBitmapInfo` (`<android/bitmap.h>`).
@@ -1703,6 +1704,21 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_compressAll<'l>(
             // Not through term(): the pass leaves nothing to schedule
             let term = tab.term.lock().unwrap_or_else(PoisonError::into_inner);
             unsafe { appine_vt_compress_all(term.0) };
+        }
+    })
+}
+
+/// Cuts a tab's Kitty images down to a few MiB per screen, the oldest going first (the app trimming
+/// its memory under pressure, for a tab not shown).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_VtNative_dropImages<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) {
+    guarded!("VtNative.dropImages", (), {
+        if let Some(tab) = tab(handle) {
+            unsafe { appine_vt_drop_images(tab.term().0) };
         }
     })
 }

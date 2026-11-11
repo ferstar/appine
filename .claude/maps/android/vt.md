@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-11 (targeted verification only since the split: the transcript kept for saves last)
+> Maintained: 2026-11-11 (targeted verification only since the split: the transcript kept for saves, then images cut under memory pressure last)
 
 ## Responsibilities
 
@@ -54,7 +54,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   started and is not at its prompt) and `cwd()` (its foreground group's directory, from the
   kernel). Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
-- `VtNative` — 47 `@JvmStatic external` functions on the native library, and libghostty-vt's
+- `VtNative` — 48 `@JvmStatic external` functions on the native library, and libghostty-vt's
   cursor styles (`CURSOR_BAR`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`), selection gesture behaviours
   (`GESTURE_WORD`, `GESTURE_LINE`) and selection adjustments (`ADJUST_*`), passed to vt.c as raw
   values, so they must match libghostty-vt's headers.
@@ -95,19 +95,16 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 ## Public entry points
 
 - `VtNative`: `create`, `restore`, `setCursor`, `print`, `pump`, `title`, `atPrompt`, `frame`,
-  `image`, `passwordInput`,
-  `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`, `gesturePress`,
-  `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`, `selectContext`,
-  `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`,
-  `selectAll`, `outputAt`, `selectOutput`, `selectClear`, `copy`, `link`, `promptClick`, `search`,
-  `searchSelect`, `searchRows`, `searchEnd`, `clear`,
-  `reset`, `message`, `transcript`, `snapshot`, `version`, `compressAll`, `destroy`; `pump` runs on
-  `vt-pump` and calls `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`,
-  `onProgress`, `onStatus`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and
-  `onForeground` back;
-  `snapshot` and
-  `compressAll` run on the service's worker, `version` wherever `Tabs` needs it, the rest on the
-  main thread.
+  `image`, `passwordInput`, `resize`, `key`, `paste`, `mouse`, `focus`, `scroll`, `jumpPrompt`,
+  `gesturePress`, `gestureDrag`, `gestureEnd`, `mousePress`, `mouseDrag`, `mouseRelease`,
+  `selectContext`, `selectGrab`, `selectTo`, `selectAdjust`, `selectRectangle`, `selectAll`,
+  `outputAt`, `selectOutput`, `selectClear`, `copy`, `link`, `promptClick`, `search`,
+  `searchSelect`, `searchRows`, `searchEnd`, `clear`, `reset`, `message`, `transcript`, `snapshot`,
+  `version`, `compressAll`, `dropImages`, `destroy`; `pump` runs on `vt-pump` and calls
+  `VtSession.onOutput`, `onTitle`, `onBell`, `onClipboard`, `onNotification`, `onProgress`,
+  `onStatus`, `onClipboardRead`, `onCommandFinished`, `onTmuxDetached` and `onForeground` back;
+  `snapshot`, `compressAll` and `dropImages` run on the service's worker, `version` wherever `Tabs`
+  needs it, the rest on the main thread.
 
 ## Data flow / lifecycle
 
@@ -248,6 +245,12 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   64 KiB.
 - Memory trimming (`VtNative.compressAll`, from android/service) compresses every tab's cold pages
   at once, idle or not, one tab's lock at a time.
+- Under memory pressure the service also cuts the images of the tabs not shown
+  (`VtNative.dropImages`): vt.c lowers the tab's Kitty storage limit to 4 MiB and puts it back to
+  32 MiB, the only way libghostty-vt gives image memory back. On each screen it deletes whole
+  images with their placements, those no placement shows first, then the oldest sent, until the
+  rest fit, so images in the scrollback or on the screen go too. The last snapshot is left as it
+  was, images included: taking a new one would decompress every page of the scrollback.
 - Saving does not format a transcript again while nothing changed the screen, since formatting
   restores every compressed page; a tab whose text changed is formatted at each save and
   compressed again afterwards. A snapshot, which reads every page, marks the terminal touched too.
@@ -335,9 +338,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 ### Inbound
 
 - `TerminalService` (creates and holds the `VtSession`s: `setRestored`, `showMessage`,
-  `transcriptText`, `takeSnapshot` and `savedSnapshot`, `title`, `isRunning`, `console`, `login`
-  and `resolvedLogin`, `id`, `status`, `statusSeen`, `describe`, `setCursor`,
-  `answerClipboardRead`, `release`), its memory trimming (`VtNative.compressAll`) and `Tabs`
+  `transcriptText`, `takeSnapshot` and `savedSnapshot`, `title`, `isRunning`, `console`, `login` and
+  `resolvedLogin`, `id`, `status`, `statusSeen`, `describe`, `setCursor`, `answerClipboardRead`,
+  `release`), its memory trimming (`VtNative.compressAll`, `dropImages`) and `Tabs`
   (`VtNative.version`).
 - `MainActivity` (android/terminal): `VtSession`'s `busy`, `cwd()`, `progress`, `status`, `clear`
   and `reset`.

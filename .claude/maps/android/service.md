@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: a failed start waiting for a switch or its cancel, exiting, kill reports, status and command notifications, scrollback trimming, snapshots, clipboard reads, cursor settings, tmux -CC last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: failed starts and switches, exiting, kill reports, notifications, snapshots, clipboard reads, cursor settings, tmux -CC, then memory trimming last)
 
 ## Responsibilities
 
@@ -186,12 +186,14 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Memory
 
-- The last listener leaving saves tabs at once and starts a 60 s timer that trims memory
-  (on the worker: `Native.trimMemory`, the kernel's rebuildable caches, then
-  `VtNative.compressAll`, every tab's cold scrollback at once, android/vt); a returning
-  listener cancels it. `onTrimMemory` at `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and
-  saves immediately. Tabs also compress their own scrollback within seconds of their output, so
-  the trim mostly finds what the last few seconds left.
+- The last listener leaving saves tabs at once and starts a 60 s timer that trims memory (on the
+  worker: `Native.trimMemory`, the kernel's rebuildable caches, then `VtNative.compressAll`, every
+  tab's cold scrollback at once, android/vt); a returning listener cancels it. `onTrimMemory` at
+  `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately, and also cuts the Kitty
+  images of every started tab but `current` down to 4 MiB a screen, deleting the oldest
+  (`VtNative.dropImages`, android/vt); since Android 14 those levels are no longer sent, so this
+  happens only on Android 11–13. Tabs also compress their own scrollback within seconds of their
+  output, so the trim mostly finds what the last few seconds left.
 
 ### Sessions, saving and restore
 
@@ -323,11 +325,11 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Outbound
 
-- `Native` (start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls, `bklStall`,
-  routes, `consoleCwd`); `VtNative.compressAll`, and `VtNative.version` through `Tabs`; `Rootfs` (readiness, importing, prepare,
-  download, mirrors, ensure-files, profile, access lock, store, reset, failed services, rules
-  refresh, login accounts); `Tabs`;
-  `VtSession` and `ConsolePty`; `Documents` (`rootsChanged`, `dirsChanged`).
+- `Native` (start, boot, spawn, waitFor, shutdown, stop, trim, the poll's calls, `bklStall`, routes,
+  `consoleCwd`); `VtNative.compressAll` and `dropImages`, and `VtNative.version` through `Tabs`;
+  `Rootfs` (readiness, importing, prepare, download, mirrors, ensure-files, profile, access lock,
+  store, reset, failed services, rules refresh, login accounts); `Tabs`; `VtSession` and
+  `ConsolePty`; `Documents` (`rootsChanged`, `dirsChanged`).
 - Android: `ActivityManager` (exit records), `PowerManager`, `NotificationManager`,
   `ConnectivityManager`, `ClipboardManager`, the `settings` preferences, `BuildConfig`.
 
