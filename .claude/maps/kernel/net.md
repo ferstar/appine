@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 20 claims checked by 3 independent verifiers — 16 confirmed and 4 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `MSG_TRUNC` on stream receives, and stream sends and writes broken after part of their data)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `SIOCADDRT`/`SIOCDELRT` turned into rtnetlink route requests)
 
 ## Responsibilities
 
@@ -186,8 +186,9 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `ERESTARTSYS` on signals). `MSG_TRUNC` on a stream discards the data the host returns without
   copying any (a NULL buffer included) and reports its length, as `tcp_recvmsg` does, also with
   `MSG_PEEK` and `MSG_WAITALL`. `MSG_WAITALL` on a stream reads until the length is complete,
-  waiting between pieces; nonblocking, the timeout, a signal (even under `SA_RESTART`), end of file or a
-  host error ends it with what was read, as Linux's `tcp_recvmsg` returns what it copied.
+  waiting between pieces; nonblocking, the timeout, a signal (even under `SA_RESTART`), end of
+  file or a host error ends it with what was read, as Linux's `tcp_recvmsg` returns what it
+  copied.
   `MSG_PEEK|MSG_WAITALL` peeks from the head each time and waits with the host socket's
   `SO_RCVLOWAT` raised to the length (restored afterwards); when the host fd was ready but the
   peek did not grow (end of file, a receive buffer that can never hold the length) it returns what
@@ -251,6 +252,15 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   through a temporary host socket; in a new namespace interface ioctls go to `kernel/netns`, and
   in the initial namespace virtual devices are tried first; anything else is counted as an
   unimplemented path and `ENOTTY` (`SIOCOUTQ`, `SIOCGSTAMP*`).
+- `SIOCADDRT`/`SIOCDELRT` on an internet socket read the whole `struct rtentry` (an IPv6 socket's
+  `struct in6_rtmsg`; `EFAULT`), need `CAP_NET_ADMIN` over the namespace owner (`EPERM`), and
+  become the `RTM_NEWROUTE`/`RTM_DELROUTE` request Linux's `rtentry_to_fib_config` and
+  `rtmsg_to_fib6_config` describe (destination family `EAFNOSUPPORT`, mask checks `EINVAL`,
+  `rt_dev` by name with `name:label` giving the label's address as source `ENODEV`, `RTF_GATEWAY`
+  with a unicast gateway universe-scoped, metric minus one as priority, an added route
+  `RTPROT_BOOT`; IPv6 source prefixes `EOPNOTSUPP`), which `kernel/netns`'s `netdev::request`
+  carries out as for rtnetlink in the socket's namespace, so only routes through virtual devices
+  change; `RTF_MTU`, `RTF_WINDOW` and `RTF_IRTT` are dropped. Other sockets answer `ENOTTY`.
 - Loopback in the initial namespace goes straight to the host, so other apps on the device can
   reach guest services.
 
@@ -406,7 +416,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   `Watch`); `kernel/netns` (`to_host`, `from_host`, `implicit_bind`, nat, filter, listener
   registration), `nft`, `netdev`, `forward`; `kernel/netlink` (netlink sockets dispatched there,
   `rtnl_watched`/`rtnl_notify` around changing ioctls, `message` and `attr` for route messages);
-  `kernel/unix`; credentials (`ns_capable`); the
+  `kernel/unix`; credentials (`ns_capable`); `kernel/netns`'s `netdev::request` for the route
+  ioctls; the
   kernel's waits (`wait_objects`, `unlocked`), wake objects; signals (`SIGPIPE`); the kernel log;
   the table of unimplemented paths; the test hooks (`kernel/process`, host-refused TCP filters).
 
@@ -446,9 +457,6 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
   is only kept in Appine, so a drop-everything filter (dockerd's on each port it publishes, until
   its DNAT rules are in place) still lets connections through and other programs see unfiltered
   data; a guest filter that the host accepts on an older kernel does filter.
-- **`SIOCADDRT` and `SIOCDELRT` are `ENOTTY`:** they are wrapped for rtnetlink notifications but
-  nothing implements them in any namespace, where Linux answers `EFAULT`, `EPERM` without
-  `CAP_NET_ADMIN`, or changes the route (`route add` of net-tools).
 - **accept4 differs from Linux at its edges:** Linux checks `EBADF` before the flags and
   `ENOTSOCK` after `EMFILE`, and reserves the fd, where Appine only looks for a free slot (so
   `install` can fail after a wait took a connection); a signal during an inet accept wait is

@@ -3449,6 +3449,15 @@ pub(super) fn ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -
 fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> SysResult {
     const FIONREAD: u32 = 0x541b;
     const SIOCATMARK: u32 = 0x8905;
+    // Routes on an internet socket, in its namespace
+    if matches!(request, SIOCADDRT | SIOCDELRT)
+        && let Some((family, ns)) = match &*sock.borrow() {
+            Socket::Inet(s) => Some((s.family, net_of(cx, s))),
+            _ => None,
+        }
+    {
+        return route_ioctl(cx, &ns, family, request, arg).map(|()| 0);
+    }
     // A socket in a new network namespace: interface ioctls see only its lo (crate::netns)
     let net = match &*sock.borrow() {
         Socket::Inet(s) => s.net.clone(),
@@ -3511,6 +3520,238 @@ fn socket_ioctl(cx: &mut Cx<'_>, sock: &SocketRef, request: u32, arg: u64) -> Sy
             r
         }
     }
+}
+
+/// `SIOCADDRT` and `SIOCDELRT` on an internet socket (Linux's `ip_rt_ioctl` with a `struct
+/// rtentry`, `ipv6_route_ioctl` with a `struct in6_rtmsg` on an IPv6 socket): the structure is read
+/// whole (EFAULT), `CAP_NET_ADMIN` over the namespace's owner is needed (EPERM), and it becomes the
+/// `RTM_NEWROUTE` or `RTM_DELROUTE` request that `rtentry_to_fib_config` or `rtmsg_to_fib6_config`
+/// describes, carried out by [`crate::netdev::request`] as for rtnetlink (so only routes through
+/// virtual devices can change).
+fn route_ioctl(
+    cx: &mut Cx<'_>,
+    ns: &Rc<crate::nsproxy::NetNs>,
+    family: i32,
+    request: u32,
+    arg: u64,
+) -> Result<(), Errno> {
+    let add = request == SIOCADDRT;
+    let req = if family == AF_INET6 {
+        let m: [u8; 80] = get(cx, arg)?;
+        if !cx.cred().ns_capable(&ns.owner, crate::cred::cap::NET_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        in6_rtmsg_request(add, &m)?
+    } else {
+        let rt: [u8; 120] = get(cx, arg)?;
+        if !cx.cred().ns_capable(&ns.owner, crate::cred::cap::NET_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        rtentry_request(cx, ns, add, &rt)?
+    };
+    let resolve = |_: u16, _: u32| Err(Errno::EINVAL);
+    match crate::netdev::request(ns, &cx.cred(), &req, &resolve) {
+        Some(r) => r.map_err(|f| Errno(f.errno)),
+        None => unreachable!("a route request"),
+    }
+}
+
+const SIOCADDRT: u32 = 0x890b;
+const SIOCDELRT: u32 = 0x890c;
+const RTF_GATEWAY: u16 = 0x2;
+const RTF_HOST: u16 = 0x4;
+const RTF_REJECT: u16 = 0x200;
+const RTN_UNICAST: u8 = 1;
+const RTN_UNREACHABLE: u8 = 7;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
+const RT_SCOPE_HOST: u8 = 254;
+const RT_SCOPE_NOWHERE: u8 = 255;
+const RTPROT_BOOT: u8 = 3;
+const RT_TABLE_MAIN: u8 = 254;
+const NLM_F_CREATE: u16 = 0x400;
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PRIORITY: u16 = 6;
+const RTA_PREFSRC: u16 = 7;
+
+/// The rtnetlink request for an IPv4 `struct rtentry` (Linux's `rtentry_to_fib_config`): the
+/// destination must be `AF_INET` (EAFNOSUPPORT); without `RTF_HOST` the mask must be contiguous,
+/// clear the destination's host bits (EINVAL) and be `AF_INET` unless it and its family are 0
+/// (EAFNOSUPPORT); a metric is one more than the route's priority; `RTF_REJECT` asks for an
+/// unreachable route; `rt_dev` names the interface (ENODEV), and `name:label` also takes the source
+/// of that address label; a gateway on a unicast address with `RTF_GATEWAY` makes the route
+/// universe-scoped. An added route is `RTPROT_BOOT`, link-scoped otherwise, and `RTF_GATEWAY`
+/// without a gateway is EINVAL. `RTF_MTU`, `RTF_WINDOW` and `RTF_IRTT` are not carried.
+fn rtentry_request(
+    cx: &Cx<'_>,
+    ns: &crate::nsproxy::NetNs,
+    add: bool,
+    rt: &[u8; 120],
+) -> Result<Vec<u8>, Errno> {
+    let family = |off: usize| u16::from_le_bytes([rt[off], rt[off + 1]]);
+    let addr = |off: usize| -> [u8; 4] { rt[off + 4..off + 8].try_into().unwrap() };
+    let (dst_off, gw_off, mask_off) = (8, 24, 40);
+    let flags = u16::from_le_bytes([rt[56], rt[57]]);
+    let metric = i16::from_le_bytes([rt[80], rt[81]]);
+    let dev = u64::from_le_bytes(rt[88..96].try_into().unwrap());
+    if i32::from(family(dst_off)) != AF_INET {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let dst = addr(dst_off);
+    let mut prefix = 32;
+    if flags & RTF_HOST == 0 {
+        let mask = u32::from_be_bytes(addr(mask_off));
+        if i32::from(family(mask_off)) != AF_INET && (mask != 0 || family(mask_off) != 0) {
+            return Err(Errno::EAFNOSUPPORT);
+        }
+        // bad_mask: host bits set in the address, or a mask that is not contiguous
+        if u32::from_be_bytes(dst) & !mask != 0 || (!mask & (!mask).wrapping_add(1)) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        prefix = mask.count_ones() as u8;
+    }
+    let mut attrs: Vec<(u16, Vec<u8>)> = vec![(RTA_DST, dst.to_vec())];
+    if metric != 0 {
+        let priority = (i32::from(metric) - 1) as u32;
+        attrs.push((RTA_PRIORITY, priority.to_le_bytes().to_vec()));
+    }
+    let (proto, nlflags) = if add {
+        (RTPROT_BOOT, NLM_F_CREATE)
+    } else {
+        (0, 0)
+    };
+    let rtm = |scope: u8, ty: u8| [AF_INET as u8, prefix, 0, 0, RT_TABLE_MAIN, proto, scope, ty];
+    if flags & RTF_REJECT != 0 {
+        return Ok(route_message(
+            add,
+            nlflags,
+            rtm(RT_SCOPE_HOST, RTN_UNREACHABLE),
+            &attrs,
+        ));
+    }
+    let mut scope = RT_SCOPE_NOWHERE;
+    if dev != 0 {
+        // The first IFNAMSIZ - 1 bytes, ending at a NUL, then at a colon for the device
+        let mut name = [0u8; 15];
+        cx.read_user(UserSlice::new(dev, name.len()), &mut name)?;
+        let name = name.split(|&c| c == 0).next().unwrap_or_default();
+        let base = name.split(|&c| c == b':').next().unwrap_or_default();
+        let index = crate::netdev::interfaces(ns)
+            .iter()
+            .find(|i| i.name.as_bytes() == base)
+            .ok_or(Errno::ENODEV)?
+            .index;
+        attrs.push((RTA_OIF, index.to_le_bytes().to_vec()));
+        if base.len() < name.len() {
+            let local = crate::netdev::views(ns)
+                .into_iter()
+                .find(|v| v.index == index)
+                .and_then(|v| v.v4.into_iter().find(|a| a.label == name))
+                .ok_or(Errno::ENODEV)?
+                .local;
+            attrs.push((RTA_PREFSRC, local.to_vec()));
+        }
+    }
+    let gw = addr(gw_off);
+    let has_gw = i32::from(family(gw_off)) == AF_INET && gw != [0; 4];
+    if has_gw {
+        attrs.push((RTA_GATEWAY, gw.to_vec()));
+        if flags & RTF_GATEWAY != 0 && unicast_v4(ns, gw) {
+            scope = RT_SCOPE_UNIVERSE;
+        }
+    }
+    if add {
+        if flags & RTF_GATEWAY != 0 && !has_gw {
+            return Err(Errno::EINVAL);
+        }
+        if scope == RT_SCOPE_NOWHERE {
+            scope = RT_SCOPE_LINK;
+        }
+    }
+    Ok(route_message(add, nlflags, rtm(scope, RTN_UNICAST), &attrs))
+}
+
+/// Whether IPv4 address `a` is unicast in namespace `ns` (`inet_addr_type_table`): not on the
+/// loopback network, not a local or broadcast address of an interface, not multicast or limited
+/// broadcast.
+fn unicast_v4(ns: &crate::nsproxy::NetNs, a: [u8; 4]) -> bool {
+    let ip = u32::from_be_bytes(a);
+    if a[0] == 127 || a[0] >= 224 || ip == 0 {
+        return false;
+    }
+    !crate::netdev::interfaces(ns).iter().any(|i| {
+        i.addrs.iter().any(|(f, addr, prefix)| {
+            let Ok(local) = <[u8; 4]>::try_from(addr.as_slice()) else {
+                return false;
+            };
+            let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
+            *f == AF_INET
+                && (local == a || (*prefix < 31 && ip == u32::from_be_bytes(local) | !mask))
+        })
+    })
+}
+
+/// The rtnetlink request for an IPv6 `struct in6_rtmsg` (Linux's `rtmsg_to_fib6_config`): the
+/// destination and its length, the gateway when `RTF_GATEWAY` is set, the interface index and the
+/// metric (an added route without one takes 1024 there); `RTF_REJECT` asks for an unreachable
+/// route, and a source prefix (`rtmsg_src_len`) is EOPNOTSUPP, as source routes are not kept.
+fn in6_rtmsg_request(add: bool, m: &[u8; 80]) -> Result<Vec<u8>, Errno> {
+    let u32_at = |off: usize| u32::from_le_bytes(m[off..off + 4].try_into().unwrap());
+    let dst_len = u16::from_le_bytes([m[52], m[53]]);
+    let src_len = u16::from_le_bytes([m[54], m[55]]);
+    let (metric, flags, ifindex) = (u32_at(56), u32_at(72), u32_at(76));
+    if src_len != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let prefix = u8::try_from(dst_len).map_err(|_| Errno::EINVAL)?;
+    let mut attrs: Vec<(u16, Vec<u8>)> = vec![(RTA_DST, m[..16].to_vec())];
+    if flags & u32::from(RTF_GATEWAY) != 0 {
+        attrs.push((RTA_GATEWAY, m[32..48].to_vec()));
+    }
+    if ifindex != 0 {
+        attrs.push((RTA_OIF, ifindex.to_le_bytes().to_vec()));
+    }
+    if metric != 0 {
+        attrs.push((RTA_PRIORITY, metric.to_le_bytes().to_vec()));
+    }
+    let ty = if flags & u32::from(RTF_REJECT) != 0 {
+        RTN_UNREACHABLE
+    } else {
+        RTN_UNICAST
+    };
+    let (proto, nlflags) = if add {
+        (RTPROT_BOOT, NLM_F_CREATE)
+    } else {
+        (0, 0)
+    };
+    let rtm = [
+        AF_INET6 as u8,
+        prefix,
+        0,
+        0,
+        RT_TABLE_MAIN,
+        proto,
+        RT_SCOPE_UNIVERSE,
+        ty,
+    ];
+    Ok(route_message(add, nlflags, rtm, &attrs))
+}
+
+/// A whole `RTM_NEWROUTE` (`add`) or `RTM_DELROUTE` request: `rtm` is `struct rtmsg` without its
+/// flags (family, destination length, source length, tos, table, protocol, scope, type).
+fn route_message(add: bool, nlflags: u16, rtm: [u8; 8], attrs: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    const RTM_NEWROUTE: u16 = 24;
+    const RTM_DELROUTE: u16 = 25;
+    const NLM_F_REQUEST: u16 = 1;
+    let mut body = rtm.to_vec();
+    body.extend_from_slice(&[0; 4]);
+    for (ty, data) in attrs {
+        crate::net::attr(&mut body, *ty, data);
+    }
+    let ty = if add { RTM_NEWROUTE } else { RTM_DELROUTE };
+    crate::net::message(ty, NLM_F_REQUEST | nlflags, 0, 0, &body)
 }
 
 /// Interface ioctls in a new network namespace: virtual devices ([`crate::netdev`]) and lo.

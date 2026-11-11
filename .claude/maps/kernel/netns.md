@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: netlink socket mechanics and encoding attributed to kernel/netlink, split out of kernel/net)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: route ioctls from kernel/net reach `netdev::request`)
 
 ## Responsibilities
 
@@ -255,7 +255,8 @@ file structure (`kernel/procfs`); host sockets (`hal`).
 ### Inbound
 
 - `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, forward targets,
-  `SO_ORIGINAL_DST`); `kernel/netlink` (configure and netfilter); `kernel/ns` (clone/unshare/setns
+  `SO_ORIGINAL_DST`, `SIOCADDRT`/`SIOCDELRT` through `netdev::request`); `kernel/netlink`
+  (configure and netfilter); `kernel/ns` (clone/unshare/setns
   create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`, `/sys/class/net`);
   the machine (the forwarder per kernel).
 
