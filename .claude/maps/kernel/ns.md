@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/ns.md` for the paired decision history (not yet created; decisions from before the split are D12, D13, D28, D40 and the id-map half of D32 in `.claude/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-11 (targeted verification only since the split: CPU clock ids translated by their handlers last)
 
 ## Responsibilities
 
@@ -116,7 +118,8 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 ### Pid namespaces
 
 - Kernel pids are global; each namespace keeps global↔local tables; syscall
-  arguments are translated at dispatch and results (and wait, siginfo) at exit; invisible results
+  arguments are translated at dispatch (pids inside structures and CPU clock ids by their
+  handlers) and results (and wait, siginfo) at exit; invisible results
   become 0. The first process numbered 1 is the reaper (`kernel/process`'s exit and reaping for its
   exit); registering into a dead namespace is `ENOMEM`; procfs instances number by the mounting
   process's namespace, while `ns_last_pid` and loadavg follow the reader.

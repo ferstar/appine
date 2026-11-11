@@ -5,7 +5,8 @@
 # mprotect are Starnix's personality_test's), every execve clears it (arm64's SET_PERSONALITY)
 # and a setuid one the other PER_CLEAR_ON_SETID flags too;
 # a bind mount whose source name was removed shows `//deleted` after its root in mountinfo,
-# whether the source was a directory, a file or one link of a file with another
+# whether the source was a directory, a file or one link of a file with another; and the tenth
+# triage's POSIX timers on the CPU clock of a thread or process that has ended
 set -e
 cd /tmp
 cat > small.c <<'C'
@@ -138,3 +139,150 @@ mount --bind hl hlt
 rm hl
 echo "one of two links: $(root /tmp/hlt), still read: $(cat hlt)"
 umount bdt bft hlt
+
+# POSIX timers on the CPU clock of a thread or process that ends (the tenth map-bug triage): the
+# timer of an exited thread or a reaped process reads as all zeros and cannot be set (ESRCH), and
+# does not follow a process that takes the number over; a zombie's clock still counts as there.
+# Clock ids name pids as the caller's pid namespace numbers them, so it all repeats in a new one.
+cat > deadclock.c <<'C'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static const char *where;
+static int go[2];
+static volatile int started;
+
+static void *idle(void *arg)
+{
+    (void)arg;
+    started = 1;
+    char x;
+    read(go[0], &x, 1);
+    return NULL;
+}
+
+static void show(const char *what, timer_t t)
+{
+    struct itimerspec v;
+    if (timer_gettime(t, &v) != 0) {
+        printf("%s, %s: gettime %s\n", where, what, strerror(errno));
+        return;
+    }
+    printf("%s, %s: interval %ld.%09ld, %s\n", where, what, (long)v.it_interval.tv_sec,
+           v.it_interval.tv_nsec, v.it_value.tv_sec || v.it_value.tv_nsec ? "armed" : "disarmed");
+}
+
+static void set(const char *what, timer_t t)
+{
+    struct itimerspec v = {{1, 0}, {100, 0}};
+    printf("%s, %s: settime %s\n", where, what,
+           timer_settime(t, 0, &v, NULL) == 0 ? "ok" : strerror(errno));
+}
+
+static timer_t make(clockid_t c)
+{
+    struct sigevent ev = {.sigev_notify = SIGEV_NONE};
+    timer_t t = 0;
+    if (timer_create(c, &ev, &t) != 0)
+        printf("%s: timer_create %s\n", where, strerror(errno));
+    return t;
+}
+
+static void thread_clock(void)
+{
+    pipe(go);
+    started = 0;
+    pthread_t th;
+    pthread_create(&th, NULL, idle, NULL);
+    while (!started)
+        usleep(1000);
+    clockid_t c;
+    pthread_getcpuclockid(th, &c);
+    struct timespec now;
+    printf("%s, thread: clock %s\n", where, clock_gettime(c, &now) == 0 ? "read" : strerror(errno));
+    timer_t t = make(c);
+    set("thread", t);
+    show("thread", t);
+    write(go[1], "x", 1);
+    pthread_join(th, NULL);
+    // The clock goes once the thread has left the kernel
+    for (int i = 0; i < 3000 && clock_gettime(c, &now) == 0; i++)
+        usleep(1000);
+    show("exited thread", t);
+    set("exited thread", t);
+    printf("%s, exited thread: delete %s\n", where, timer_delete(t) == 0 ? "ok" : strerror(errno));
+    close(go[0]);
+    close(go[1]);
+}
+
+static void process_clock(void)
+{
+    pid_t p = fork();
+    if (p == 0) {
+        pause();
+        _exit(0);
+    }
+    clockid_t c;
+    int e = clock_getcpuclockid(p, &c);
+    printf("%s, child: clock %s\n", where, e ? strerror(e) : "found");
+    timer_t t = make(c);
+    set("child", t);
+    kill(p, SIGKILL);
+    siginfo_t si;
+    waitid(P_PID, p, &si, WEXITED | WNOWAIT);
+    show("zombie", t);
+    set("zombie", t);
+    waitpid(p, NULL, 0);
+    show("reaped", t);
+    set("reaped", t);
+    // A new process with the same number
+    int f = open("/proc/sys/kernel/ns_last_pid", O_WRONLY);
+    dprintf(f, "%d", p - 1);
+    close(f);
+    pid_t q = fork();
+    if (q == 0) {
+        pause();
+        _exit(0);
+    }
+    printf("%s, new child: %s number\n", where, q == p ? "same" : "another");
+    show("new child", t);
+    set("new child", t);
+    kill(q, SIGKILL);
+    waitpid(q, NULL, 0);
+    timer_delete(t);
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+    where = "here";
+    thread_clock();
+    process_clock();
+    if (unshare(CLONE_NEWPID) != 0) {
+        perror("unshare");
+        return 1;
+    }
+    pid_t p = fork();
+    if (p == 0) {
+        where = "pid namespace";
+        thread_clock();
+        process_clock();
+        _exit(0);
+    }
+    waitpid(p, NULL, 0);
+    return 0;
+}
+C
+gcc -O1 -pthread -o deadclock deadclock.c
+./deadclock
+rm -f deadclock deadclock.c

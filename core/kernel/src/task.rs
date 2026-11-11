@@ -86,6 +86,9 @@ pub(crate) struct TaskRes {
 pub(crate) struct Task {
     /// tid. It changes, because a non-leader thread that calls execve takes over the leader's tid.
     pub tid: Cell<Tid>,
+    /// The thread's serial number, never repeated: after a tid is reused by a new thread it tells
+    /// the old and new thread apart (a POSIX timer on the old one's CPU clock, `crate::itimer`).
+    pub serial: u64,
     /// The thread group it belongs to.
     pub tgid: Tid,
     /// Signals sent to this thread and not yet handled.
@@ -247,6 +250,7 @@ impl Task {
         sigmask: u64,
         comm: [u8; 16],
     ) -> Result<Rc<Task>, Errno> {
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
         let event = Event::new().map_err(|_| Errno::EAGAIN)?;
         let vfork = state.vfork_done.is_some();
         let cred = state.group.borrow().cred.clone();
@@ -257,6 +261,7 @@ impl Task {
         };
         Ok(Rc::new(Task {
             tid: Cell::new(tid),
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             tgid,
             pending: RefCell::default(),
             sigmask: Cell::new(sigmask),

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: `bug.rs`, `syscall/mod.rs` and the rest of `syscall/misc.rs` registered here, the watchdog's kernel log record, failed host spawns, fast-path deadline hand-overs, then execve, namespaces and futexes split out)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: registry additions, the watchdog's log record, failed host spawns, fast-path deadline hand-overs, the exec, ns and futex split, then CPU-clock timers last)
 
 ## Responsibilities
 
@@ -45,15 +45,16 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 ### Tasks and processes
 
-- `Task` — one guest thread: tid (a `Cell`, since a non-leader's execve takes over the tgid), its
-  own credentials (`kernel/cred`), `killed`, `frozen`, `pdeathsig`, exit status and whether its
-  exit started, `vfork` (its vfork completion is still pending, for the OOM killer), `syscall` (the
-  BKL syscall it is in: its number in the global `SYSCALLS` count and the syscall number), CPU-time
-  and context-switch bases and its host tid, nice, scheduling policy, deadline, uclamp, timer slack,
-  affinity, I/O priority, its wake `event`, `sleeping`, `pid_ns_children`, `NsProxy`; `TaskRes` (a
-  copy of its address space, fd table and fs that other threads read, for procfs); thread-private
-  `TaskState` (address space, fd table and `FsContext`, each shared or not per clone flags; thread
-  group; alternate stack; `clear_child_tid`; vfork completion; restart block; `fast_sleep`).
+- `Task` — one guest thread: tid (a `Cell`, since a non-leader's execve takes over the tgid), a
+  serial number never reused (as `ThreadGroup`'s), its own credentials (`kernel/cred`), `killed`,
+  `frozen`, `pdeathsig`, exit status and whether its exit started, `vfork` (its vfork completion is
+  still pending, for the OOM killer), `syscall` (the BKL syscall it is in: its number in the global
+  `SYSCALLS` count and the syscall number), CPU-time and context-switch bases and its host tid,
+  nice, scheduling policy, deadline, uclamp, timer slack, affinity, I/O priority, its wake `event`,
+  `sleeping`, `pid_ns_children`, `NsProxy`; `TaskRes` (a copy of its address space, fd table and fs
+  that other threads read, for procfs); thread-private `TaskState` (address space, fd table and
+  `FsContext`, each shared or not per clone flags; thread group; alternate stack; `clear_child_tid`;
+  vfork completion; restart block; `fast_sleep`).
 - `TaskSync` — lock-free `in_guest` flag and the engine `Kicker` (used by `kernel/mmu` shootdowns).
 - `ThreadGroup` — one process: tgid, ppid, `parent_thread` (the creating thread, Linux
   `real_parent`), pgid, sid, live `threads` (leader first while alive), `children` (zombies
@@ -341,7 +342,8 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   bitset, `FUTEX_CLOCK_REALTIME` only with WAIT_BITSET, on a 4-byte-aligned address that
   translates writable and is not in a shared mapping that may be written), `nanosleep`,
   `clock_nanosleep` (REALTIME, MONOTONIC, BOOTTIME), `clock_gettime` (host clocks, with the time
-  namespace's offsets, or its own CPU clock), `clock_getres`, `gettimeofday`, `sched_yield`
+  namespace's offsets, or its own CPU clock, whose id holds its tid as its own pid namespace
+  numbers it), `clock_getres`, `gettimeofday`, `sched_yield`
   (yields the host thread, not counted as running guest code meanwhile), and `newfstatat`/`statx`
   (absolute or `AT_FDCWD`-relative paths, when the root is the root mount's store directory, the
   root mount is usable, the walk stays in the store's metadata cache and crosses no other mount,
@@ -417,11 +419,21 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   their own clock; the watch's fd is in the timer thread's poll.
 - `ITIMER_REAL` is a monotonic instant (wall-clock jumps leave it); `ITIMER_VIRTUAL`/`PROF` and
   process CPU-time timers use total host thread CPU time and wake a running thread. Armed CPU
-  timers or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the soft `RLIMIT_CPU` (whole
-  seconds) sends `SIGXCPU` and raises the soft limit by 1 s; over the hard limit `SIGKILL`.
+  timers whose clock still advances or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the
+  soft `RLIMIT_CPU` (whole seconds) sends `SIGXCPU` and raises the soft limit by 1 s; over the hard
+  limit `SIGKILL`.
 - POSIX timers: the `_ALARM` clocks need `CAP_WAKE_ALARM`, CPU-clock ids of other threads and
   processes are accepted, at most 4096 per process with the lowest free id; without a `sigevent`
   the signal is `SIGALRM` with the id as value; a `SIGEV_THREAD_ID` target must be in the process.
+  A CPU clock id (`clock_getcpuclockid`, `pthread_getcpuclockid`) names its pid as the caller's
+  pid namespace numbers it, for clock_gettime, clock_getres and clock_nanosleep too.
+- A CPU-clock timer keeps to the thread or process it was made for (number and serial, as Linux's
+  timer holds a `struct pid`), never one that takes the number over. Once that thread has left
+  the task table (an exited main thread included) or that process is reaped, the timer is gone:
+  it never fires and is disarmed, timer_gettime reads all zeros (the interval too) and
+  timer_settime is `ESRCH`, while timer_delete still works. A process whose threads have all
+  exited and that is not reaped yet still reads its stopped clock and can be set, but its timers
+  neither fire nor keep the timer thread ticking.
   A timer whose previous signal is still pending counts an overrun instead (`timer_getoverrun`
   reports the count when the last signal was dequeued). A `SIGEV_THREAD_ID` timer signals its
   thread only while that thread lives in the process; after it exits the signal is dropped, as on
@@ -590,9 +602,9 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 ## Confirmed bugs / technical debt
 
-- **POSIX timers on a CPU clock of a thread or process that is gone** never fire, yet keep the
-  timer thread ticking every 10 ms while their owner lives, report their whole interval as time
-  left, and follow a new task that reuses the number.
+- **An exited main thread's CPU clock is gone at once:** clock_gettime on it is `EINVAL`, and a
+  timer on it reads zeros and cannot be set (`ESRCH`), while the other threads run on; Linux keeps
+  the zombie leader's clock, stopped, until the process is reaped.
 - **`sched_setattr` changes the policy before the nice check**, so a refused nice value can leave
   the policy (and reset-on-fork) changed.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard

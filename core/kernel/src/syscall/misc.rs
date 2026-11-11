@@ -775,14 +775,14 @@ pub(super) fn clock_getres(cx: &mut Cx<'_>, clock: i32, res: u64) -> SysResult {
 /// Nanoseconds used on the CPU clock of a guest process or thread; None when `clock` is not a CPU
 /// clock. Negative clock ids are encoded by `clock_getcpuclockid`/`pthread_getcpuclockid`
 /// (Linux's `MAKE_PROCESS_CPUCLOCK`): `(~pid << 3) | type`, where bit 2 means a thread and pid 0
-/// means ourselves.
+/// means ourselves; the pid is as the caller's pid namespace numbers it.
 fn cpu_clock(cx: &Cx<'_>, clock: i32) -> Option<Result<u64, Errno>> {
     let (pid, thread) = match clock {
         CLOCK_PROCESS_CPUTIME_ID => (0, false),
         CLOCK_THREAD_CPUTIME_ID => (0, true),
         // Type 3 is not a CPU clock (low 3 bits of 3 are a dynamic clock encoded from an fd)
         c if c < 0 && c & 3 == 3 => return Some(Err(Errno::EINVAL)),
-        c if c < 0 => (!(c >> 3), c & 4 != 0),
+        c if c < 0 => (cx.pid_in(!(c >> 3)), c & 4 != 0),
         _ => return None,
     };
     let k = cx.kr();

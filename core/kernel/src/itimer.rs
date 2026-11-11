@@ -216,10 +216,24 @@ pub(crate) enum Clock {
     /// A wall clock (`CLOCK_REALTIME`, `MONOTONIC`, `BOOTTIME`, `TAI`), with deadlines as
     /// [`Deadline::At`] on the clock's base ([`Expiry`]). Carries the matching host clock id.
     Wall(i32),
-    /// CPU time used by the process, with deadlines as [`Deadline::Cpu`].
-    Process(Tid),
-    /// CPU time used by the thread.
-    Thread(Tid),
+    /// CPU time used by the process, with deadlines as [`Deadline::Cpu`]. The serial
+    /// ([`ThreadGroup::serial`]) keeps it on the process it was made for, as Linux's timer holds
+    /// that process's `struct pid`, not a later process reusing the number.
+    Process { tgid: Tid, serial: u64 },
+    /// CPU time used by the thread ([`crate::task::Task::serial`], likewise).
+    Thread { tid: Tid, serial: u64 },
+}
+
+/// A CPU clock's thread or process as it is now ([`PosixTimer::target`]).
+enum Target {
+    /// A wall clock: the expiry compares itself.
+    Wall,
+    /// The clock's CPU nanoseconds, and whether they can still grow (false for a process whose
+    /// threads have all exited and that is not reaped yet).
+    Cpu(u64, bool),
+    /// The thread has exited, or the process has been reaped (Linux's `cpu_timer_task_rcu`
+    /// finds no task).
+    Gone,
 }
 
 /// A POSIX timer's next expiry.
@@ -246,35 +260,53 @@ pub(crate) struct PosixTimer {
 }
 
 impl PosixTimer {
-    /// How long until the next expiry; None when not armed.
+    /// How long until the next expiry; None when not armed (or its clock's thread or process is
+    /// gone).
     pub fn remaining(&self, k: &Kernel) -> Option<Duration> {
-        match self.deadline? {
-            Deadline::At(d) => Some(d.remaining()),
-            Deadline::Cpu(d) => Some(Duration::from_nanos(
-                d.saturating_sub(self.cpu_now(k).unwrap_or(0)),
-            )),
+        match (self.deadline?, self.target(k)) {
+            (Deadline::At(d), _) => Some(d.remaining()),
+            (Deadline::Cpu(d), Target::Cpu(now, _)) => {
+                Some(Duration::from_nanos(d.saturating_sub(now)))
+            }
+            (Deadline::Cpu(_), _) => None,
         }
     }
 
+    /// The thread or process of its CPU clock has exited or been reaped (never one that reused
+    /// the number since): as on Linux, the timer then never fires, reads as all zeros
+    /// (`posix_cpu_timer_get`) and cannot be set (`ESRCH`, `posix_cpu_timer_set`), though it can
+    /// still be deleted.
+    pub fn gone(&self, k: &Kernel) -> bool {
+        matches!(self.target(k), Target::Gone)
+    }
+
     /// Expires `value` from now (with `abs`, `value` is an absolute CPU-clock value; for a wall
-    /// clock the caller gives the expiry as `at`).
+    /// clock the caller gives the expiry as `at`). The caller has checked that the clock is not
+    /// [`gone`](Self::gone).
     pub fn arm(&mut self, k: &Kernel, value: Duration, at: Option<Expiry>, abs: bool) {
-        self.deadline = match self.cpu_now(k) {
-            None => Some(Deadline::At(at.unwrap_or_else(|| Expiry::after(value)))),
-            Some(now) => {
+        self.deadline = match self.target(k) {
+            Target::Wall => Some(Deadline::At(at.unwrap_or_else(|| Expiry::after(value)))),
+            Target::Cpu(now, _) => {
                 let v = value.as_nanos() as u64;
                 Some(Deadline::Cpu(if abs { v } else { now + v }))
             }
+            Target::Gone => None,
         };
     }
 
     /// If expired, returns the number of missed periods (not counting this one, capped at INT_MAX
-    /// as on Linux) and re-arms.
+    /// as on Linux) and re-arms. A CPU-clock timer whose clock no longer advances never fires (on
+    /// Linux an exit takes the target's timers off its queues), and one whose target is gone is
+    /// disarmed, so it no longer keeps the timer thread ticking.
     fn fire(&mut self, k: &Kernel) -> Option<u32> {
-        let (late, deadline) = match (self.deadline?, self.cpu_now(k)) {
+        let (late, deadline) = match (self.deadline?, self.target(k)) {
             (Deadline::At(d), _) => (d.late()?, Deadline::At(d)),
-            (Deadline::Cpu(d), Some(cpu)) if d <= cpu => {
+            (Deadline::Cpu(d), Target::Cpu(cpu, true)) if d <= cpu => {
                 (Duration::from_nanos(cpu - d), Deadline::Cpu(d))
+            }
+            (Deadline::Cpu(_), Target::Gone) => {
+                self.deadline = None;
+                return None;
             }
             _ => return None,
         };
@@ -293,12 +325,28 @@ impl PosixTimer {
         Some(periods.min(i32::MAX as u128) as u32)
     }
 
-    /// The clock's current value: None for a wall clock (the expiry compares itself).
-    fn cpu_now(&self, k: &Kernel) -> Option<u64> {
+    /// Whether its clock is a CPU clock that still advances, which the timer thread must look at
+    /// every [`CPU_TICK`] while the timer is armed.
+    fn ticking(&self, k: &Kernel) -> bool {
+        matches!(self.target(k), Target::Cpu(_, true))
+    }
+
+    /// The clock's thread or process as it is now: the one the timer was made for (an exited
+    /// thread leaves the task table, a reaped process the group table).
+    fn target(&self, k: &Kernel) -> Target {
         match self.clock {
-            Clock::Wall(_) => None,
-            Clock::Process(tgid) => Some(k.groups.get(&tgid).map_or(0, |g| g.borrow().cpu_ns(k))),
-            Clock::Thread(tid) => Some(k.tasks.get(&tid).map_or(0, |t| t.cpu_ns())),
+            Clock::Wall(_) => Target::Wall,
+            Clock::Process { tgid, serial } => match k.groups.get(&tgid) {
+                Some(g) if g.borrow().serial == serial => {
+                    let g = g.borrow();
+                    Target::Cpu(g.cpu_ns(k), !g.threads.is_empty())
+                }
+                _ => Target::Gone,
+            },
+            Clock::Thread { tid, serial } => match k.tasks.get(&tid) {
+                Some(t) if t.serial == serial => Target::Cpu(t.cpu_ns(), true),
+                _ => Target::Gone,
+            },
         }
     }
 }
@@ -393,7 +441,7 @@ fn expire_group(
                 ..SigInfo::default()
             };
             if !add_overrun(k, tgid, tid, sig, id, missed) {
-                let cpu = matches!(t.clock, Clock::Process(_));
+                let cpu = matches!(t.clock, Clock::Process { .. });
                 timer_fired.push((tid, sig, info, cpu));
             }
         }
@@ -402,11 +450,11 @@ fn expire_group(
                 let d = d.instant();
                 next = Some(next.map_or(d, |n| n.min(d)));
             }
-            Some(Deadline::Cpu(_)) => {
+            Some(Deadline::Cpu(_)) if t.ticking(k) => {
                 let tick = now + CPU_TICK;
                 next = Some(next.map_or(tick, |n| n.min(tick)));
             }
-            None => {}
+            _ => {}
         }
     }
     group.borrow_mut().posix_timers = timers;

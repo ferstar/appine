@@ -106,23 +106,30 @@ fn clock_of(cx: &Cx<'_>, clockid: i32) -> Result<Clock, Errno> {
                 CLOCK_BOOTTIME
             })
         }
-        CLOCK_PROCESS_CPUTIME_ID => Clock::Process(cx.tgid()),
-        CLOCK_THREAD_CPUTIME_ID => Clock::Thread(cx.tid()),
-        // Clocks encoded by clock_getcpuclockid: (~pid << 3) | type, bit 2 meaning a thread
+        CLOCK_PROCESS_CPUTIME_ID => Clock::Process {
+            tgid: cx.tgid(),
+            serial: cx.t.group.borrow().serial,
+        },
+        CLOCK_THREAD_CPUTIME_ID => Clock::Thread {
+            tid: cx.tid(),
+            serial: cx.task.serial,
+        },
+        // Clocks encoded by clock_getcpuclockid: (~pid << 3) | type, bit 2 meaning a thread, the
+        // pid as the caller's pid namespace numbers it
         c if c < 0 && c & 3 != 3 => {
             let thread = c & 4 != 0;
             let pid = match !(c >> 3) {
                 0 if thread => cx.tid(),
                 0 => cx.tgid(),
-                p => p,
+                p => cx.pid_in(p),
             };
             let k = cx.kr();
             if thread {
-                k.tasks.get(&pid).ok_or(Errno::EINVAL)?;
-                Clock::Thread(pid)
+                let serial = k.tasks.get(&pid).ok_or(Errno::EINVAL)?.serial;
+                Clock::Thread { tid: pid, serial }
             } else {
-                k.groups.get(&pid).ok_or(Errno::EINVAL)?;
-                Clock::Process(pid)
+                let serial = k.groups.get(&pid).ok_or(Errno::EINVAL)?.borrow().serial;
+                Clock::Process { tgid: pid, serial }
             }
         }
         // CLOCK_MONOTONIC_RAW and the coarse clocks cannot be used for timers
@@ -143,6 +150,10 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
         super::timespec(sec, nsec).ok_or(Errno::EINVAL)
     };
     let (interval, value) = (ts(0)?, ts(16)?);
+    // A CPU clock whose thread or process is gone cannot be set, nor disarmed
+    if t.gone(cx.kr()) {
+        return Err(Errno::ESRCH);
+    }
     if old != 0 {
         let left = t.remaining(cx.kr());
         put(cx, old, encode_itimerspec(&t, left))?;
@@ -168,8 +179,13 @@ pub(super) fn timer_settime(cx: &mut Cx<'_>, id: i32, flags: u32, new: u64, old:
 
 pub(super) fn timer_gettime(cx: &mut Cx<'_>, id: i32, cur: u64) -> SysResult {
     let t = timer(cx, id)?;
-    let left = t.remaining(cx.kr());
-    put(cx, cur, encode_itimerspec(&t, left)).map(|()| 0)
+    // A CPU clock whose thread or process is gone reads as all zeros, the interval too
+    let spec = if t.gone(cx.kr()) {
+        [0; 32]
+    } else {
+        encode_itimerspec(&t, t.remaining(cx.kr()))
+    };
+    put(cx, cur, spec).map(|()| 0)
 }
 
 pub(super) fn timer_getoverrun(cx: &mut Cx<'_>, id: i32) -> SysResult {

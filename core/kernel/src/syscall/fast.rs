@@ -72,6 +72,9 @@ pub(crate) struct Fast {
     /// The thread's own tid (execve may take over the main thread's; [`Shared::fast_epoch`] changes
     /// then too).
     tid: Tid,
+    /// The same tid as the thread's own pid namespace numbers it, which `pthread_getcpuclockid`
+    /// puts into its clock id.
+    ns_tid: Tid,
     /// The host thread's CPU clock and its reading when the thread started ([`Task::cpu_ns`]).
     cpu_clock: Option<(i32, u64)>,
     /// The address space's [`crate::mm::Mm::id`], for futex keys.
@@ -123,6 +126,7 @@ impl Fast {
             traced: crate::debug::tracing(),
             paths,
             tid: task.tid.get(),
+            ns_tid: t.group.borrow().pid_ns.vnr(task.tid.get()).unwrap_or(0),
             cpu_clock: task.clock.get().map(|c| (c, task.cpu_base.get().0)),
             mm: t.mm.borrow().id,
             shared_maps: t.mm.borrow().shared_maps(),
@@ -247,7 +251,7 @@ impl Fast {
         clock == CLOCK_THREAD_CPUTIME_ID
             || clock < 0 && clock & 3 != 3 && clock & 4 != 0 && {
                 let tid = !(clock >> 3);
-                tid == 0 || tid == self.tid
+                tid == 0 || tid == self.ns_tid
             }
     }
 }
