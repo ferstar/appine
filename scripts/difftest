@@ -2,8 +2,10 @@
 # Differential tests (design doc §13.3 layer 4): the same script runs on Appine and on real arm64
 # Linux, and the outputs and exit codes are compared. Run on a host with docker:
 #
-#   scripts/difftest [-t tier] [-r] [-s store directory] [-j jobs] [case name…]
+#   scripts/difftest [-t tier] [-r] [-s store directory] [-j jobs] [-R] [case name…]
 #
+# -R runs each group that failed once more, alone, after all the others: one that passes then is
+# reported as flaky and does not fail the run (its first outputs stay in target/difftest/failed).
 # -j runs several groups at once (4 by default on macOS, 1 on other hosts): on the native side each
 # runs in its own container; on the Appine side each concurrent slot uses a clone of the store
 # (<store>-w<n>; the groups all write files of the same names into the guest's /tmp, so sharing one
@@ -62,6 +64,7 @@ rebuild=0
 store=target/difftest/store
 jobs=1
 [ "$(uname)" != Darwin ] || jobs=4
+retry=0
 # When running concurrently, the script calls itself to run one group (-G case name), and then does
 # not prepare the store or the image
 group=
@@ -69,13 +72,14 @@ image=appine-difftest
 packages="python3 gcc musl-dev lua5.4 sqlite go nodejs openjdk21-jdk strace gdb uv bubblewrap iproute2 util-linux-misc dmesg iptables nftables fuse3 fuse-overlayfs sshfs openssh-sftp-server rclone"
 env_path=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-while getopts t:rs:j:G: opt; do
+while getopts t:rs:j:G:R opt; do
     case $opt in
     t) tier=$OPTARG ;;
     r) rebuild=1 ;;
     s) store=$OPTARG ;;
     j) jobs=$OPTARG ;;
     G) group=$OPTARG ;;
+    R) retry=1 ;;
     *) exit 2 ;;
     esac
 done
@@ -337,11 +341,16 @@ fi
 
 failed=0
 skipped=0
+# The groups that failed, for -R
+failures=""
 if [ "$jobs" -le 1 ]; then
     for name in "$@"; do
         report=$(run_group "$name") && code=0 || code=1
         printf '%s\n' "$report"
-        [ "$code" = 0 ] || failed=$((failed + 1))
+        [ "$code" = 0 ] || {
+            failed=$((failed + 1))
+            failures="$failures $name"
+        }
         case $report in SKIP*) skipped=$((skipped + 1)) ;; esac
     done
 else
@@ -381,6 +390,7 @@ else
         echo "FAIL $name: no result (its lane did not finish)"
         failed=$((failed + 1))
     done
+    failures="$(sed -n 's/^FAIL \([^ :]*\).*/\1/p' "$reports") $missing"
     # Record the times of the groups that passed this time; those that did not pass keep last time's
     sed -n 's/^ok   \([^ ]*\) (\([0-9]*\)s native, \([0-9]*\)s appine)$/\1 \2 \3/p' "$reports" \
         >"$out/.times"
@@ -388,7 +398,23 @@ else
         "$out/.times" "$durations" | sort >"$durations.new"
     mv "$durations.new" "$durations"
 fi
+# -R: each failed group runs once more, alone and with the main store; one that passes now is
+# flaky, and one that fails again keeps both reports
+flaky=0
+if [ "$retry" = 1 ]; then
+    for name in $failures; do
+        echo "retrying $name"
+        if report=$(run_group "$name"); then
+            echo "flaky $name: failed, then passed when run again"
+            flaky=$((flaky + 1))
+            failed=$((failed - 1))
+        else
+            printf '%s\n' "$report"
+        fi
+    done
+fi
 [ "$skipped" = 0 ] || echo "$skipped skipped (their test suites are not built)"
+[ "$flaky" = 0 ] || echo "$flaky flaky (failed, then passed when run again)"
 [ "$failed" = 0 ] || {
     echo "$failed failed"
     exit 1

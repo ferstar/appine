@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: full.yml saves the suite caches on their own and uploads the difftest stderr, failures and vmstat samples)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: difftest's -R retry of failed cases, used by full.yml)
 
 ## Responsibilities
 
@@ -67,7 +67,7 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   `--version`; `appine-run --rootfs <dir> --import <tar.gz>` makes a store.
 - `cargo test --workspace` (the three integration test files build only on aarch64 Linux).
 - `appine-bench [--runs N] [--quick] [--skip-tier0] [--only NAME] [--stats]`.
-- `scripts/dev [command…]`; `scripts/difftest [-t tier] [-r] [-s store] [-j n] [case…]`;
+- `scripts/dev [command…]`; `scripts/difftest [-t tier] [-r] [-s store] [-j n] [-R] [case…]`;
   `scripts/build-ltp`; `scripts/ltp [-a] [-j n] [-t tier] [regex]`; `scripts/build-starnix-tests`;
   `scripts/build-gvisor-tests [--list | --all]`;
   `scripts/survey [-t tier] [-s store] [-n image] [names…]`;
@@ -193,6 +193,10 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
 - A case name without `tests/diff/<name>.sh` is a failure, and so is every requested case that no
   lane reported (a lane that died); lanes rerun the script by its absolute path, so a run started
   from another directory works.
+- With `-R` every failed case runs once more after all the others, alone and on the main store: one
+  that passes then is reported `flaky` (counted in the summary, the run's exit status 0 if nothing
+  else failed), one that fails again prints both reports; the first failure's outputs stay in
+  `failed/`.
 - A case running a prebuilt suite (`run.sh <suite> "$SKIP" <program>…`) is reported `SKIP` when
   that suite's tarball has not been built, and fails when the tarball lacks a program it names
   (unless `SKIPPED.txt` lists it as not building); the summary counts the skipped cases, which do
@@ -311,7 +315,7 @@ reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tes
   `tests/starnix/compat`) and `scripts/build-gvisor-tests` (cached by the hash of the script,
   `tests/gvisor` and its program list), both caches restored and saved in steps of their own so
   that a build is saved even when a later step fails, a release build of `appine-run`,
-  `scripts/difftest` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
+  `scripts/difftest -R` at Tier 1 with one lane (`ping_group_range` opened, `vmstat` sampling the
   runner every 10 s, `target/difftest` deleted before and after, so every run imports the store and
   installs its packages again; every case's `.appine.err`, the failed cases' outputs and the
   samples uploaded as the `difftest` artifact whatever the result), and the engine tests built

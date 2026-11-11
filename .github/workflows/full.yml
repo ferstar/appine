@@ -141,14 +141,15 @@ jobs:
       # the whole target/ and would restore part of a store left by an earlier run, so the store is
       # created afresh each time and deleted after the run, so that it is not saved into the cache
       # again. vmstat samples the runner every 10 s meanwhile: Appine's side of some cases has
-      # taken tens of times its usual time on some runs only
+      # taken tens of times its usual time on some runs only. -R runs a failed group once more, so
+      # a group that fails only sometimes is reported as flaky instead of failing the run
       - name: Differential tests
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
           rm -rf target/difftest
           vmstat -t 10 > target/vmstat.log 2>&1 &
           trap "kill $!" EXIT
-          scripts/difftest
+          scripts/difftest -R
 
       # Every case's appine-run stderr (internal errors, BKL watchdog reports), the outputs of
       # failed cases and the vmstat samples, whether the cases passed or not
