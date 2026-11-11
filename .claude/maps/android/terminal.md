@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: the terminal view split out to android/vtview and the sessions, consoles and emulator shim to android/vt; recreation, a new activity's tab and the font size in dp last)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `TabNumber` moved to its own file, and the screens' dp and theme helpers shared from `Ui.kt`)
 
 ## Responsibilities
 
@@ -24,9 +24,9 @@
   the Material 3 page layouts (`page.xml` and `list_item.xml`, shared by Settings and the licenses;
   `list_header.xml`, Settings only).
 
-Root: `MainActivity.kt`, `TabBarView.kt`, `SearchBarView.kt`, `ProgressLine.kt`,
-`ExtraKeysView.kt` and `LicensesActivity.kt` in `android/app/src/main/java/io/github/mthli/appine/`,
-and `android/app/src/main/res/`.
+Root: `MainActivity.kt`, `TabBarView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`,
+`ExtraKeysView.kt`, `LicensesActivity.kt` and `Ui.kt` in
+`android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
 
 Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
 native emulator shim around libghostty-vt (`android/vt`); session ownership, saving, kill reports
@@ -52,8 +52,8 @@ notices task and the build (`android/native`).
   buttons, the ⋮ anchor and the titles long presses show to a `Target` (`show`, `closeCurrent`,
   `newTab`, `menu`, `notice`); it draws the other tabs' progress and status marks and redraws them
   on `refreshStatus`; `Tab` (one per session: its number in the row, which slides, rolls to a new
-  number and fades out when closed); `TabNumber` (the number, a `TextView` drawing its digits
-  itself so they can roll).
+  number and fades out when closed); `TabNumber` (in its own file: the number, a `TextView`
+  drawing its digits itself so they can roll).
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
@@ -69,6 +69,9 @@ notices task and the build (`android/native`).
 - `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
   report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
   rectangle (`draw`, a fill or a sweep) and gives a report's fraction (`fractionOf`).
+- `Ui.kt` — extension functions the screens and views share (`VtView` too): `dp`, `themeColor`
+  (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
+  `selectableItemBackground`).
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
   `assets/notices/index.tsv` (one `list_item.xml` row per line with three fields), full text view;
   an `OnBackPressedCallback`, enabled while a full text is shown, returns to the list.

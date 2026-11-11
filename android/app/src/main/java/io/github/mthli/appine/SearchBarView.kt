@@ -3,7 +3,6 @@ package io.github.mthli.appine
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Color
-import android.graphics.drawable.Drawable
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -17,7 +16,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
-import com.google.android.material.color.MaterialColors
 
 /**
  * The search bar, in the tab bar's place and of its height while a search is open, so the terminal
@@ -147,16 +145,6 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
     }
 
     private fun item() = LayoutParams(dp(TabBarView.BAR_DP), ViewGroup.LayoutParams.MATCH_PARENT)
-
-    /** The theme's ripple for something that can be tapped. */
-    private fun touchFeedback(): Drawable? {
-        val a = context.obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
-        return a.getDrawable(0).also { a.recycle() }
-    }
-
-    private fun dp(v: Int) = (v * density).toInt()
-
-    private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
 
     private companion object {
         /** The room before the text and around the count (dp). */

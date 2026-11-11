@@ -20,7 +20,6 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.graphics.drawable.toDrawable
-import com.google.android.material.color.MaterialColors
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -221,8 +220,6 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT, Gravity.END))
         refresh()
     }
-
-    private fun themeColor(attr: Int) = MaterialColors.getColor(context, attr, Color.WHITE)
 
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }

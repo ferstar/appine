@@ -143,8 +143,6 @@ class LicensesActivity : AppCompatActivity() {
         appBar.setLifted(list.scrollY > 0)
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
     companion object {
         private const val COLUMNS = 74
         private const val STATE_SHOWING = "showing"

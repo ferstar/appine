@@ -37,7 +37,6 @@ import androidx.core.view.WindowInsetsAnimationCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import com.google.android.material.color.DynamicColors
-import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlin.concurrent.thread
 
@@ -771,10 +770,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         toast?.cancel()
         toast = Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).apply { show() }
     }
-
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
-    private fun themeColor(attr: Int) = MaterialColors.getColor(this, attr, Color.WHITE)
 
     companion object {
         /** A [VtSession.id]: the tab to show (a tab's notification, from the service). */
