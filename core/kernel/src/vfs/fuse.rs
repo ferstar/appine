@@ -1,4 +1,4 @@
-//! FUSE (Linux 6.1's `fs/fuse`, the kernel/vfs map): filesystems whose content a guest process
+//! FUSE (Linux 6.1's `fs/fuse`, the kernel/fuse map): filesystems whose content a guest process
 //! (the daemon: sshfs, rclone mount, any libfuse program) serves through `/dev/fuse`.
 //!
 //! Opening `/dev/fuse` gives a device file with no connection ([`DevFile`]); mount(2) of type

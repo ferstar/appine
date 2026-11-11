@@ -1,4 +1,5 @@
-//! timerfd: timerfd_create, timerfd_settime, timerfd_gettime, and reads from it.
+//! timerfd (the kernel/poll map): timerfd_create, timerfd_settime, timerfd_gettime, and reads from
+//! it.
 //!
 //! Expiration times are kept on the clock's base ([`crate::itimer::Expiry`]: relative realtime and
 //! monotonic times on the host's monotonic clock, absolute realtime times on its realtime clock,

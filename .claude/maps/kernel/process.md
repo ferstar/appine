@@ -566,7 +566,7 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
   again); expire interval timers, POSIX timers and CPU-time limits; run the OOM check (only with a
   memory limit or a cgroup `memory.max`), compare watched cgroup files, the translator code-view
   release, load-average sampling, deferred store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks,
-  AIO polls that signal eventfds (`kernel/vfs`), DNS stub answers (`kernel/net`) and raw ICMP taps;
+  AIO polls that signal eventfds (`kernel/aio`), DNS stub answers (`kernel/net`) and raw ICMP taps;
   then wait (BKL released) until the earliest deadline (timerfds of those AIO polls and of
   exclusive gates included), its event or the host fds of those checks and the clock watch. It
   listens on `OTHER` (or all channels while `O_ASYNC` files, exclusive gates or such AIO polls
@@ -767,7 +767,7 @@ network namespaces (`kernel/netns`), cgroups and procfs files (`kernel/procfs`),
 - vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags, `copy_ns`),
   `kernel/fuse`
   (serving retries, prefault, sweeps, the exit flush, FUSE programs), credentials, cgroups
-  (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/vfs`), the OOM
+  (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
   killer (`kernel/mm`), loadavg, the store's deferred commits, signals (`send_to_group`,
   `send_cpu_timer`, `force_fatal`), the kernel log.
 - `appine_hal`: `poll`, `Event`, thread CPU clocks and system time, host thread

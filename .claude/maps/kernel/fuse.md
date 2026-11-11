@@ -345,15 +345,15 @@ loop and execve (`kernel/process`), poll and epoll (`kernel/poll`), the copy map
 - `kernel/process`: the wait API (`wait_object`, wake objects), `interrupted`, `killed`,
   `stopping`.
 - `kernel/mount`: the mount table (`readonly`, `mount_flags`, `is_point_in`, `dev_of`).
-- `kernel/vfs`: `resolve_parent`, inotify hooks, `open_mask`, `encode_stat`, `executing`,
-  `check_fsize`.
+- `kernel/vfs`: `resolve_parent`, `open_mask`, `encode_stat`, `executing`, `check_fsize`.
+- `kernel/inotify`: the hooks for FUSE namespace changes.
 - `kernel/cred`: `Cred`, user namespace ID maps, `permission`, `owns`, `may_delete`,
   `capable_wrt`.
 - `kernel/signal`: `SIGXFSZ` through the VFS's `file_too_big`.
 - `hal`: `memfd` for program copies and mapping fills.
 - `kernel/mm`: `Fill` (`window`, `store`, `first_unread`, `has_fills`).
-- The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and the inotify registry (`watched`)
-  for `in_use`.
+- The task table, fd tables, mm `exe`, `Vfs::mount_nodes` and `kernel/inotify`'s registry
+  (`watched`) for `in_use`.
 
 ## Invariants and gotchas
 

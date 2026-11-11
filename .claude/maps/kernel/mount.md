@@ -313,8 +313,8 @@ Outside the module:
   - walks and nodes;
   - new tmpfs, overlay and FUSE instances (`new_tmpfs`, `new_overlay`, `new_fuse`) and tmpfs
     reconfiguration;
-  - the fd tables that `in_use` and `writers` scan;
-  - loop devices' backing files (`Loops::backing_files`).
+  - the fd tables that `in_use` and `writers` scan.
+- `kernel/loop`: loop devices' backing files (`Loops::backing_files`).
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.
 - `kernel/procfs`: the `Pseudo` views of mounted synthetic filesystems, and the pid namespace of a
   procfs instance.

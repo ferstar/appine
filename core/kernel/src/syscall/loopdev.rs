@@ -1,4 +1,4 @@
-//! Loop devices (the kernel/vfs map): block devices whose contents are a file, after Linux 6.1's
+//! Loop devices (the kernel/loop map): block devices whose contents are a file, after Linux 6.1's
 //! `drivers/block/loop.c` together with the block-device parts of `block/fops.c` and
 //! `block/ioctl.c`.
 //!

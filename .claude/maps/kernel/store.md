@@ -281,9 +281,9 @@ provider and rootfs installation UI (`android`).
 
 - `kernel/vfs` (path walks, file syscalls, tmpfs instances, the no-BKL resolver), `kernel/mount`
   (`Vfs::open`'s boot with the volatile list), `kernel/process` (`syscall::fast`), the machine
-  (waker, timer `commit_due`,
-  `sync`, `trim_memory`, teardown, the store registry, `take_changed_dirs`), inotify (`host_change`),
-  host wrappers in `lib.rs` (JNI and `appine-run`).
+  (waker, timer `commit_due`, `sync`, `trim_memory`, teardown, the store registry,
+  `take_changed_dirs`), `kernel/inotify` (`host_change`), host wrappers in `lib.rs` (JNI and
+  `appine-run`).
 
 ### Outbound
 

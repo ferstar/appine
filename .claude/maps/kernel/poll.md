@@ -1,11 +1,11 @@
 # kernel/poll Map
 
 > Static understanding snapshot, not a decision history.
-> See `.claude/decisions/kernel/poll.md` for the paired decision history.
+> See `.claude/decisions/kernel/poll.md` for the paired decision history (timerfd's decisions from before it moved here are D23 and the timerfd halves of D16 and D41 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: timeouts; loop devices; eventfd readv; suite findings; pipes, `F_SETOWN`; epoll, ppoll; anonymous fds; AIO; `/dev/fuse`; exclusive timerfds; synthetic files; per-thread SIGIO checks last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: timeouts, loop devices, eventfd readv, suite findings, pipes, `F_SETOWN`, epoll, ppoll, anonymous fds, AIO, `/dev/fuse`, synthetic files, SIGIO, then timerfd moved in from kernel/vfs last)
 
 ## Responsibilities
 
@@ -15,15 +15,17 @@
 - ppoll and pselect6;
 - epoll, including Linux's `EPOLLET` timing, nested epolls, `EPOLLONESHOT` and
   `EPOLLEXCLUSIVE`;
-- eventfd2;
+- eventfd2 and timerfd;
 - signal-driven I/O (`O_ASYNC`, `F_SETOWN*`, `F_SETSIG`) checked by the timer thread.
 
-Root: `core/kernel/src/syscall/poll.rs`.
+Root: `core/kernel/src/syscall/poll.rs` and `syscall/timerfd.rs` (the `EventFd` and `TimerFd` state
+lives in `fd.rs`, a `kernel/vfs` file).
 
 Outside the module: the wait mechanism, wake objects, the BKL and the timer thread (`kernel/process`);
-per-kind readiness of sockets (`kernel/net`, `kernel/unix`), terminals (`kernel/tty`), pipes,
-inotify, timerfd and eventfd objects (`kernel/vfs`), signalfd (`kernel/signal`), message queues
-(`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl entry points (`kernel/vfs`);
+per-kind readiness of sockets (`kernel/net`, `kernel/unix`), terminals (`kernel/tty`), pipes
+(`kernel/vfs`), inotify (`kernel/inotify`), signalfd (`kernel/signal`), message queues
+(`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl entry points and the read paths
+(`kernel/vfs`); clock bases, `Expiry` and the wall-clock jump count (`itimer`, `kernel/process`);
 signal delivery (`kernel/signal`).
 
 ## Key types
@@ -43,11 +45,18 @@ signal delivery (`kernel/signal`).
 - `Fasync` — one `O_ASYNC` file: weak open file, fd, last events, counter snapshots
   (`Kernel::fasync`).
 - `EventFd` (in `fd.rs`) — counter, semaphore flag, `writes`/`reads` generations.
+- `TimerFd` (in `fd.rs`) — clock, the next expiration (`itimer::Expiry` on the clock's base; None
+  when not armed), interval, expirations not yet read, `fired` (every expiration, the `EPOLLET`
+  generation), the `TFD_TIMER_CANCEL_ON_SET` state (the wall-clock jump count when set and whether
+  a jump is pending) and the last settime flags (fdinfo); `update` adds the expirations that have
+  passed, lazily, whenever it is read, polled or asked.
 
 ## Public entry points
 
 - Syscalls: `ppoll` (73), `pselect6` (72), `epoll_create1` (20), `epoll_ctl` (21), `epoll_pwait`
-  (22), `epoll_pwait2` (441), `eventfd2` (19); eventfd read/write through `IoPath::EventFd`.
+  (22), `epoll_pwait2` (441), `eventfd2` (19), `timerfd_create` (85), `timerfd_settime` (86),
+  `timerfd_gettime` (87); eventfd read/write and timerfd read through `IoPath::EventFd` and
+  `IoPath::TimerFd`; `TimerFd::fdinfo` for `kernel/procfs`.
 - Shared helpers: `readiness`, `poll_once`, `poll_now`, `arrivals`, `wake_objects`, `host_fd`,
   `set_temp_mask`/`restore_mask`, `deadline_ms`/`deadline_ts` (also used by AIO); for AIO's
   pending polls, `wait_aio_polls` (io_getevents) and `watch_aio_poll` (the timer thread).
@@ -156,6 +165,32 @@ signal delivery (`kernel/signal`).
   still counts as an arrival. Readiness: `POLLIN` when nonzero, `POLLOUT` below `u64::MAX - 1`
   (no `RDNORM`/`WRNORM`, as eventfd_poll); never `POLLERR`. Generations `[writes, reads]`.
 
+### timerfd
+
+- `timerfd_create`: realtime, monotonic, boottime and the two alarm clocks (others `EINVAL`),
+  flags `O_CLOEXEC|O_NONBLOCK` (`EINVAL`); the alarm clocks need `CAP_WAKE_ALARM` in the initial
+  namespace (`EPERM`), at creation and again at every settime. The file opens read-write as
+  `anon_inode_getfd` gives it, so a write is `EINVAL` (no write operation), not `EBADF`.
+- `timerfd_settime`: flags `TFD_TIMER_ABSTIME|TFD_TIMER_CANCEL_ON_SET` (`EINVAL`); another kind of
+  fd `EINVAL`; timespecs go through the shared `timespec()` helper (`EINVAL` for negative seconds
+  or nanoseconds out of range), so no deadline can overflow. It writes the old value first, then
+  resets the expiration count and records the flags; a zero value disarms. Expirations are kept on
+  the clock's base: relative realtime and monotonic on the host's monotonic clock, absolute
+  realtime on its realtime clock, boottime on its boottime clock; an alarm clock reads as its
+  ordinary one, and absolute times are first moved out of the caller's time namespace. Setting
+  wakes the timer's object, so waits using the old deadline compute it again.
+- `TFD_TIMER_CANCEL_ON_SET` applies only to an absolute realtime timer: it records the wall-clock
+  jump count; after a jump (the host's clock set, or the device resuming) the timer counts one
+  expiration and the next read is `ECANCELED` (the count dropped, the timer still armed). The
+  guest cannot set the clock itself.
+- read: a buffer under 8 bytes is `EINVAL`; returns the expirations passed (taking them), or waits
+  on the timer's object with its deadline as the timeout (`EAGAIN` when nonblocking,
+  `ERESTARTSYS` on a signal). A periodic timer advances by whole intervals, counting each.
+  `timerfd_gettime` gives the interval and the time left (zeros when not armed).
+- Readiness is `POLLIN` alone while expirations are pending (timerfd_poll); waits that include a
+  timerfd take its next expiration as a deadline (see Waiting), as do exclusive gates and AIO
+  polls watched by the timer thread.
+
 ### Signal-driven I/O
 
 - Turning `O_ASYNC` on (`F_SETFL`, `FIOASYNC`) registers a `Fasync` entry only for the kinds whose
@@ -176,15 +211,18 @@ signal delivery (`kernel/signal`).
 
 ### Inbound
 
-- The syscall dispatcher (also the drain hook after I/O syscalls); AIO (`poll_once`,
+- The syscall dispatcher (also the drain hook after I/O syscalls; timerfd reads through
+  `kernel/vfs`'s read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
   `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); fdinfo and kcmp.
 
 ### Outbound
 
+- `itimer` (`Expiry`, `clock_epoch`) and the time-namespace offsets for timerfd; `CAP_WAKE_ALARM`
+  (`kernel/cred`).
 - The kernel's waits (`wait_objects`, `block_for`, `interrupted`), wake objects and channels,
   `edge_waiters`; `appine_hal::poll` and `appine_hal::Edges` (host epoll); per-kind readiness
-  functions in `net`, `unix`, `tty`, inotify, signalfd, message queues, seccomp; signals
+  functions in `net`, `unix`, `tty`, `kernel/inotify`, signalfd, message queues, seccomp; signals
   (`send_to_task`, `send_to_group`, `send_to_pgrp`).
 
 ## Invariants and gotchas
@@ -220,5 +258,5 @@ signal delivery (`kernel/signal`).
 ## To verify
 
 - Linux 6.1 comparisons above come from knowledge of `fs/select.c`, `fs/eventpoll.c`,
-  `fs/eventfd.c`, `fs/fcntl.c` and `fs/pipe.c`, not a source checkout; the bits anonymous fds
-  report were also observed on a native 6.8 kernel.
+  `fs/eventfd.c`, `fs/timerfd.c`, `fs/fcntl.c` and `fs/pipe.c`, not a source checkout; the bits
+  anonymous fds report were also observed on a native 6.8 kernel.

@@ -192,10 +192,10 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 
 ### Outbound
 
-- `kernel/vfs` and `kernel/store` (path lookup, creation checks, `mknod`, tmpfs accounting,
-  inotify); fd tables (`get`, `install`); credentials and namespaces (`permission`, `new_owner`,
-  `uid_out`/`gid_out`, `pid_in`/`pid_out`, `ns_capable`); the kernel's waits and wake objects;
-  signals (`SIGPIPE`).
+- `kernel/vfs` and `kernel/store` (path lookup, creation checks, `mknod` with its inotify
+  `IN_CREATE`, tmpfs accounting); fd tables (`get`, `install`); credentials and namespaces
+  (`permission`, `new_owner`, `uid_out`/`gid_out`, `pid_in`/`pid_out`, `ns_capable`); the
+  kernel's waits and wake objects; signals (`SIGPIPE`).
 
 ## Invariants and gotchas
 

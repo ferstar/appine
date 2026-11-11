@@ -1,4 +1,5 @@
-//! Linux native AIO: io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents.
+//! Linux native AIO (the kernel/aio map): io_setup, io_destroy, io_submit, io_cancel, io_getevents,
+//! io_pgetevents.
 //!
 //! Requests run synchronously in io_submit, and completion events go into the context's queue,
 //! where io_getevents takes them; only `IOCB_CMD_POLL` stays pending while the fd is not ready.

@@ -296,7 +296,7 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `metacopy`, `nfs_export`, `redirect_dir`, `xino_auto` N; containerd adds `index=off` and
   BuildKit `redirect_dir=off` because the files exist). No `kernel/`, other modules, `dev/`,
   `bus/`, `firmware/`, `power/`, NUMA nodes, other classes or `uevent` files.
-- `/sys/block/loop<n>/` exists for every loop device (`kernel/vfs`): `dev`, `removable`, `ro`,
+- `/sys/block/loop<n>/` exists for every loop device (`kernel/loop`): `dev`, `removable`, `ro`,
   `size` (sectors), `queue/` (logical, physical, minimum and hardware sector sizes, optimal I/O 0,
   `dma_alignment` 511, `rotational`, `read_ahead_kb`, `max_sectors_kb`, `rq_affinity`), and while
   the device is bound `loop/` (`backing_file` as the backing open file's display path, `offset`,
@@ -415,10 +415,9 @@ dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`); maps, smaps,
   `uid_out`/`gid_out`), pid namespaces (`vnr`, `find`), nsproxy, `mm` (sizes, residency, argument
   ranges, pagemap, forced writes), `signal`, `tty` (`Tty` owner/mode/times, `new_pty`), `netdev`/
   `netconf`/`route`/`net`/`unix`/`traffic`, `ipc` tunables, `mqueue` limits, `seccomp`, `klog`,
-  `loadavg`, the VFS (`reach`, `path_of`, the loop devices' `Loops`, `proc_locks` and
-  `fd_locks`), the mount table (`mounts_from`, devpts options; `kernel/mount`), the OOM killer
-  (`proc_score`), unimplemented-path counting
-  (`stub::record`).
+  `loadavg`, the VFS (`reach`, `path_of`, `proc_locks` and `fd_locks`), the loop devices'
+  `Loops` (`kernel/loop`), the mount table (`mounts_from`, devpts options; `kernel/mount`), the
+  OOM killer (`proc_score`), unimplemented-path counting (`stub::record`).
 - Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
   `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine
   (`guest_hwcap*`, `guest_midr`).

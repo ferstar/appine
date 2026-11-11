@@ -1,4 +1,5 @@
-//! inotify: inotify_init1, inotify_add_watch, inotify_rm_watch, and reads from it.
+//! inotify (the kernel/inotify map): inotify_init1, inotify_add_watch, inotify_rm_watch, and reads
+//! from it.
 //!
 //! Every filesystem change goes through the kernel layer, and each syscall reports its events
 //! after changing the store, at the same places and in the same order as Linux's fsnotify hooks.
@@ -24,7 +25,8 @@
 //!   overlay is reported to the node and its overlay directory, not to the layers' inodes behind
 //!   it, which copying up changes. Linux's overlay also changes the upper layer through the VFS,
 //!   which reports there too; here only creations are also reported to the upper directory.
-//! - Watches can be added on synthetic filesystems (procfs, devpts), but never get events.
+//! - Watches can be added on synthetic filesystems, but only cgroup2 files and directories get
+//!   events ([`kernfs_modified`]).
 //! - As on Linux: an event identical to the unread event at the tail of the queue is merged; once
 //!   `max_queued_events` events are queued, new ones are dropped and one `IN_Q_OVERFLOW` is
 //!   queued. Each user's (effective uid's) instances and watches are limited by

@@ -1,4 +1,4 @@
-//! File syscalls on FUSE nodes and open files (the kernel/vfs map): what 6.1's `fs/fuse/dir.c`
+//! File syscalls on FUSE nodes and open files (the kernel/fuse map): what 6.1's `fs/fuse/dir.c`
 //! and `file.c` do for them, through requests to the daemon ([`crate::vfs::fuse`]). Each request
 //! here changes something or needs the open file, so it is made directly with the BKL released;
 //! what only a walk needs (lookups, attributes, links) comes from the cache or a retry.
