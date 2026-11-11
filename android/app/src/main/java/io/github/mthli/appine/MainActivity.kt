@@ -77,8 +77,6 @@ class MainActivity : Activity(), TerminalService.Listener {
      */
     private var requestedTab = -1
 
-    private var fontSize = 0
-
     /** The last toast ([showToast]), cancelled by the next. */
     private var toast: Toast? = null
 
@@ -172,10 +170,14 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
-        requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
-        fontSize = getPreferences(MODE_PRIVATE).getInt(PREF_FONT_SIZE, dp(12))
+        // A notification's tab only when it starts this activity: one recreated (a configuration
+        // change, or the system bringing it back after killing the app) or opened from Recents
+        // still has the intent that first started it, whose tab the user has left since
+        if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
+            requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
+        }
         screen = VtView(this, Host()).apply {
-            setFontSize(fontSize.toFloat())
+            setFontSize(savedFontSize())
             setBackgroundColor(Color.BLACK)
         }
         status = TextView(this).apply {
@@ -233,6 +235,24 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
+    /**
+     * The terminal's font size in pixels. It is kept in dp, so that after a display size change
+     * (which recreates this activity) the text keeps its size relative to the rest; a size kept in
+     * pixels by earlier versions is taken at the current density and kept in dp from then on.
+     */
+    private fun savedFontSize(): Float {
+        val prefs = getPreferences(MODE_PRIVATE)
+        val density = resources.displayMetrics.density
+        if (prefs.contains(PREF_FONT_SIZE_PX)) {
+            val dp = prefs.getInt(PREF_FONT_SIZE_PX, 0) / density
+            prefs.edit {
+                putFloat(PREF_FONT_SIZE, dp)
+                remove(PREF_FONT_SIZE_PX)
+            }
+        }
+        return prefs.getFloat(PREF_FONT_SIZE, DEFAULT_FONT_DP) * density
+    }
+
     /** A notification of a tab was tapped while this activity exists (it is `singleTask`). */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -285,8 +305,13 @@ class MainActivity : Activity(), TerminalService.Listener {
         if (s.sessions.isEmpty()) {
             newSession()
         } else {
-            // Tabs restored after a kill: show the one that was being viewed
-            show(current?.takeIf { it in s.sessions } ?: s.focus?.takeIf { it in s.sessions } ?: s.sessions.last())
+            // The tab this activity shows; for a new one (recreated, or opened again after Back
+            // finished the last one), the tab the last one showed; after tabs were restored from
+            // a kill, the one that was being viewed then; else the last
+            show(
+                current?.takeIf { it in s.sessions } ?: s.current?.takeIf { it in s.sessions }
+                    ?: s.focus?.takeIf { it in s.sessions } ?: s.sessions.last(),
+            )
         }
     }
 
@@ -649,8 +674,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
 
         override fun onZoom(fontPx: Int) {
-            fontSize = fontPx
-            getPreferences(MODE_PRIVATE).edit { putInt(PREF_FONT_SIZE, fontSize) }
+            getPreferences(MODE_PRIVATE).edit { putFloat(PREF_FONT_SIZE, fontPx / resources.displayMetrics.density) }
         }
 
         override val ctrl: Boolean get() = keys.ctrl
@@ -755,7 +779,14 @@ class MainActivity : Activity(), TerminalService.Listener {
     companion object {
         /** A [VtSession.id]: the tab to show (a tab's notification, from the service). */
         const val EXTRA_TAB = "tab"
-        private const val PREF_FONT_SIZE = "font_size"
+
+        /** The terminal's font size in dp (a float). */
+        private const val PREF_FONT_SIZE = "font_size_dp"
+
+        /** The font size in pixels, as versions before [PREF_FONT_SIZE] kept it (an int). */
+        private const val PREF_FONT_SIZE_PX = "font_size"
+
+        private const val DEFAULT_FONT_DP = 12f
 
         /**
          * Characters of the clipboard shown when asking whether a program may read it, as many as

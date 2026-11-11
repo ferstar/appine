@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; the profile's prompt marks and replaced versions; the cursor settings last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; prompt marks and replaced versions; cursor settings; display size recreation last)
 
 ## Responsibilities
 
@@ -165,8 +165,9 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   opacity. Choices and confirmations are `MaterialAlertDialogBuilder` dialogs; the login change is
   a toast.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
-  (`DynamicColors`), edge to edge. A dark-mode change recreates the screen (it does not handle
-  `uiMode`), which rebinds and renders again and drops an open dialog.
+  (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
+  handles neither `uiMode` nor `density`), which rebinds and renders again and drops an open
+  dialog.
 
 ## Dependencies (inbound / outbound)
 

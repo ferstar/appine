@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: the terminal view split out to android/vtview and the sessions, consoles and emulator shim to android/vt last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping: the terminal view split out to android/vtview and the sessions, consoles and emulator shim to android/vt; recreation, a new activity's tab and the font size in dp last)
 
 ## Responsibilities
 
@@ -76,7 +76,8 @@ notices task and the build (`android/native`).
 ## Public entry points
 
 - Launcher activity `MainActivity` (`singleTask`, `adjustResize`, `Theme.Appine.Terminal`, handles
-  most configuration changes itself, the dark mode and density included), started with
+  most configuration changes itself, the dark mode included, but not density, locale or font
+  scale, which recreate it), started with
   `EXTRA_TAB` (a `VtSession.id`) by a tab's notification; listener callbacks `onProgress`,
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
   `onSettingsChanged`,
@@ -87,23 +88,25 @@ notices task and the build (`android/native`).
 
 ### Binding and choosing a tab
 
-- `onCreate` applies dynamic colours, reads `EXTRA_TAB` and the font size, builds the views (the
-  status line says "Starting…"), sets up insets and, on Android 13 and later, asks for the
-  notification permission. `onStart` applies the wide-cell setting, starts and binds the service;
-  `onServiceConnected` registers the listener and replays the start's result or progress and
-  pending notices; `onStop` unregisters and unbinds.
+- `onCreate` applies dynamic colours, reads `EXTRA_TAB` (only when the activity is not being
+  recreated and was not opened from Recents: such an activity still has the intent that first
+  started it), reads the font size (kept in dp as `font_size_dp`, so it scales with a display size
+  change; a pixel size an earlier version kept as `font_size` is converted at the current density
+  and removed), builds the views (the status line says "Starting…"), sets up insets and, on
+  Android 13 and later, asks for the notification permission. `onStart` applies the wide-cell
+  setting, starts and binds the service; `onServiceConnected` registers the listener and replays
+  the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
   from `onCreate` or `onNewIntent`; a tab closed meanwhile is skipped), the activity's own current
-  tab if it still exists, the service's `focus` (the restored current tab) if it still exists, the
-  last tab; with no
+  tab, the service's `current` (the tab the last activity showed, for a new one: recreated, or
+  opened again after Back finished the last on Android 11), the service's `focus` (the restored
+  current tab), each if it still exists, else the last tab; with no
   sessions a new one opens. A failed start hides the terminal and shows "Cannot start: …";
   `onRestarting` detaches and shows "Restarting…". `onServiceConnected` calls `onMachineReady` on
   every bind (each `onStart`) when the kernel runs or failed to start (while it starts, the
   progress, and `onMachineReady` later from the service), so coming back to the activity (from
   Settings, a link's app, the background) shows the current tab again, which closes the search
-  bar. A new activity instance has no current tab of its own: it falls back to `EXTRA_TAB` (read
-  again from its intent), then the service's `focus` (set only by a restore), then the last tab,
-  never the service's `current`.
+  bar.
 - Showing a tab sets it as the service's `current` (which takes its notification away), attaches
   it to the view (`VtView.attach`) and renders the bar; `onRestarting` and `onDestroy` detach it,
   so sessions never keep a destroyed Activity's view.
@@ -299,7 +302,8 @@ notices task and the build (`android/native`).
   and the scroll view clear of the navigation bar. The toolbar shows the entry's title over its
   full text; the back arrow and back both return to the list, then close.
 - It follows the system's dark mode: a change recreates the activity, which shows the same full
-  text again (saved state). A rotation does not recreate it, so a full text shown keeps its size.
+  text again (saved state), as a display size change does. A rotation does not recreate it, so a
+  full text shown keeps its size.
 
 ## Dependencies (inbound / outbound)
 
@@ -397,7 +401,14 @@ notices task and the build (`android/native`).
   glyph is larger and thinner than the others.
 - Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
   change recreates them with the other colours; an AppCompat activity that handles `uiMode`
-  itself would keep the views it already made in the old ones.
+  itself would keep the views it already made in the old ones. No activity handles `density`,
+  for the same reason: every view is sized in dp when built.
+- An activity the system recreates (a configuration change it does not handle, or after killing
+  the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
+  is read in `onCreate` only without a saved state and without
+  `FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`; otherwise a notification's tab would come back to the
+  front. A recreated `MainActivity` starts without open dialogs, the search bar or the extra
+  keys' modifiers and page.
 - Up to Android 15 Back reaches `MainActivity.onBackPressed` (the manifest does not opt in to
   predictive back, so an `OnBackInvokedCallback` would be ignored there); from Android 16 on, the
   app targeting it, `onBackPressed` is never called and only the callback registered while
@@ -405,17 +416,7 @@ notices task and the build (`android/native`).
 
 ## Confirmed bugs / technical debt
 
-- **A new terminal activity loses the tab being viewed**: it shows the tab its intent's
-  `EXTRA_TAB` names (a recreated activity keeps the intent a notification once created it with),
-  else the
-  service's `focus`, which only a restore after a kill sets and nothing updates, else the last tab,
-  never the service's `current`. So when the activity is created again while the service lives
-  (Back on Android 11 finishes the root activity; a locale or font scale change recreates it, as
-  `configChanges` leaves them out), another tab than the one the user was on comes to the front.
-- **A display size change while the terminal is open** keeps the sizes its views were built with
-  (tab bar, extra keys, the terminal's font in pixels, `VtView`'s touch and double-tap slops,
-  fling velocity and handle margin): `MainActivity` handles `density` itself and builds its views
-  once in `onCreate`, so the new sizes apply only once the activity is created again.
+none
 
 ## Open questions
 
@@ -443,4 +444,6 @@ notices task and the build (`android/native`).
     rolling numbers' blur on Android 11 and real GPUs;
   - the progress line and the other tabs' marks for real programs (cargo, systemd, AI coding CLIs),
     and TalkBack's descriptions heard rather than read through uiautomator;
-  - the search bar's Back callback on Android 16.
+  - the search bar's Back callback on Android 16;
+  - Back finishing the activity on Android 11 (a new activity's tab was tried after removing the
+    task, a font scale change and a display size change on API 34).

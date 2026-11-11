@@ -22,11 +22,12 @@
         android:theme="@style/Theme.Appine">
 
         <!-- Settings and the license pages leave out uiMode: they follow the system's dark mode,
-             so a change recreates them with the other colours -->
+             so a change recreates them with the other colours. No activity handles density: a
+             display size change recreates it, so the views it built in dp take the new sizes -->
 
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.Appine.Terminal"
@@ -39,13 +40,13 @@
 
         <activity
             android:name=".SettingsActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation"
             android:exported="false"
             android:label="@string/settings" />
 
         <activity
             android:name=".LicensesActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation"
             android:exported="false"
             android:label="@string/settings_licenses" />
 
