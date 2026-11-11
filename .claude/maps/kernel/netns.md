@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 6 research concerns; 19 claims checked by 3 independent verifiers — 13 confirmed and 6 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: IPv6-only binds get their own host port; `DELTABLE` without family, name or handle flushes tables; route-request deviations found by gVisor's tests; forwarder back-off and resets; onlink, limit and quota; no TUN device last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: netlink socket mechanics and encoding attributed to kernel/netlink, split out of kernel/net)
 
 ## Responsibilities
 
@@ -22,10 +22,10 @@ provides:
 
 Root: `core/kernel/src/netns.rs`, `netdev.rs`, `nft.rs`, `forward.rs`, `netconf.rs`.
 
-Outside the module: the socket syscalls that call into it, netlink socket mechanics, host
-interfaces, routes and low-port mapping in the initial namespace (`kernel/net`); creating and
-entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net` and sysfs file
-structure (`kernel/procfs`); host sockets (`hal`).
+Outside the module: the socket syscalls that call into it, host interfaces, routes and low-port
+mapping in the initial namespace (`kernel/net`); netlink socket mechanics (`kernel/netlink`);
+creating and entering namespaces, nsproxy and `/proc/<pid>/ns` (`kernel/ns`); `/proc/net` and sysfs
+file structure (`kernel/procfs`); host sockets (`hal`).
 
 ## Key types
 
@@ -254,15 +254,16 @@ structure (`kernel/procfs`); host sockets (`hal`).
 
 ### Inbound
 
-- `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, netlink
-  configure and netfilter, forward targets, `SO_ORIGINAL_DST`); `kernel/ns` (clone/unshare/setns
-  create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`,
-  `/sys/class/net`); the machine (the forwarder per kernel).
+- `kernel/net` (bind, listen, connect, accept, send, recv, getsockname/getpeername, forward targets,
+  `SO_ORIGINAL_DST`); `kernel/netlink` (configure and netfilter); `kernel/ns` (clone/unshare/setns
+  create and enter namespaces); `kernel/procfs` (`/proc/net`, `/proc/sys/net`, `/sys/class/net`);
+  the machine (the forwarder per kernel).
 
 ### Outbound
 
-- `appine_hal::net` (host sockets, host interfaces, poll, dup, events); `kernel/net`'s portmap,
-  routes (`route::merge`, `attrs`) and netlink encoding; credentials (`ns_capable`); the kernel
+- `appine_hal::net` (host sockets, host interfaces, poll, dup, events); `kernel/net`'s portmap
+  and routes (`route::merge`, `attrs`); `kernel/netlink`'s encoding (`message`, `attr`,
+  `configure_host_link`); credentials (`ns_capable`); the kernel
   log; `std::thread` for the forwarder.
 
 ## Invariants and gotchas

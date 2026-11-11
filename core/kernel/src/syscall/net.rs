@@ -1,4 +1,5 @@
-//! Socket syscalls (the kernel/net map).
+//! Socket syscalls (the kernel/net map; the `netlink_*` functions, the netlink section and the
+//! `Socket::Netlink` arms are the kernel/netlink map).
 //!
 //! Host sockets are nonblocking; on EAGAIN a blocking guest call waits for the host fd to become
 //! ready through [`Cx::wait`], releasing the BKL meanwhile; it can be interrupted by signals and
@@ -3010,7 +3011,7 @@ fn account(cx: &mut Cx<'_>, sock: &SocketRef, rx: bool, bytes: usize, peer: &[u8
     }
 }
 
-// ---- netlink ----
+// ---- netlink (the kernel/netlink map) ----
 
 /// Sends a netlink request: the kernel answers it at once into the socket's queue. A change
 /// request on `NETLINK_ROUTE` also notifies the sockets that joined the link, address or route

@@ -1,4 +1,4 @@
-//! Sockets (the kernel/net map).
+//! Sockets (the kernel/net map; its netlink sections are the kernel/netlink map).
 //!
 //! - TCP and UDP passthrough: a guest socket holds a nonblocking host socket, and addresses and
 //!   options are passed through byte for byte. The guest's `SOCK_RAW + IPPROTO_ICMP` becomes a
@@ -296,7 +296,7 @@ pub fn servfail(query: &[u8]) -> Vec<u8> {
     r
 }
 
-// ---- netlink ----
+// ---- netlink (the kernel/netlink map, through NETLINK_SOCK_DIAG) ----
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;

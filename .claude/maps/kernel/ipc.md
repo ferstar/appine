@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-06 (full mapping: 3 research concerns; 11 claims checked by 2 independent verifiers — 10 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-08 (targeted verification only since the full mapping: mremap duplicates of segments; mqueue timeouts; sysctl bounds, fallible allocations; restarted mqueue waits; registrations ended by close; shm reaping, capped mqueue defaults; SysV capabilities over the namespace owner last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: mq_notify's netlink sockets attributed to kernel/netlink, split out of kernel/net)
 
 ## Responsibilities
 
@@ -31,7 +31,7 @@ Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, a
 `shm_attachments`) (`kernel/mm`); the mqueue filesystem's node views, the `/proc/sysvipc` files and
 sysctl plumbing (`kernel/procfs`); mqueue mounts and the generic file syscalls that dispatch to
 queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
-(`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/net`); credentials
+(`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/netlink`); credentials
 (`kernel/cred`).
 
 ## Key types
@@ -245,7 +245,7 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
   `request_wake_object`, `interrupted`, pid namespaces (`vnr`, `pid_seen_by`).
 - `kernel/cred`: `capable`, `capable_wrt`, `permission`, id mapping; the umask of the fs context.
 - `kernel/signal`: `send_to_group` with `SigInfo` for notifications.
-- `kernel/net`: netlink socket queues for `SIGEV_THREAD`.
+- `kernel/netlink`: netlink socket queues for `SIGEV_THREAD`.
 - `kernel/vfs`: fd tables and `OpenFile`; `Vfs::mq_dev` for fstat.
 - `appine_hal`: the realtime clock for SysV times.
 

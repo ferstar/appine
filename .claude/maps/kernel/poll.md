@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: timeouts, loop devices, eventfd readv, suite findings, pipes, `F_SETOWN`, epoll, ppoll, anonymous fds, AIO, `/dev/fuse`, synthetic files, SIGIO, then timerfd moved in from kernel/vfs last)
+> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: netlink socket readiness attributed to kernel/netlink, split out of kernel/net)
 
 ## Responsibilities
 
@@ -21,12 +21,12 @@
 Root: `core/kernel/src/syscall/poll.rs` and `syscall/timerfd.rs` (the `EventFd` and `TimerFd` state
 lives in `fd.rs`, a `kernel/vfs` file).
 
-Outside the module: the wait mechanism, wake objects, the BKL and the timer thread (`kernel/process`);
-per-kind readiness of sockets (`kernel/net`, `kernel/unix`), terminals (`kernel/tty`), pipes
-(`kernel/pipe`), inotify (`kernel/inotify`), signalfd (`kernel/signal`), message queues
-(`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl entry points and the read paths
-(`kernel/vfs`); clock bases, `Expiry` and the wall-clock jump count (`itimer`, `kernel/process`);
-signal delivery (`kernel/signal`).
+Outside the module: the wait mechanism, wake objects, the BKL and the timer thread
+(`kernel/process`); per-kind readiness of sockets (`kernel/net`, `kernel/netlink`, `kernel/unix`),
+terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
+(`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
+entry points and the read paths (`kernel/vfs`); clock bases, `Expiry` and the wall-clock jump count
+(`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
 
 ## Key types
 
