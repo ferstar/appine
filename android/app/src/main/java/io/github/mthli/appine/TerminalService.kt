@@ -122,6 +122,16 @@ class TerminalService : Service() {
     private val worker = Executors.newSingleThreadExecutor { Thread(it, "appine-worker") }
 
     /**
+     * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
+     * when all have stopped (switched to another app, screen off) and none has come back after
+     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released and the tabs' scrollback is
+     * compressed ([trimMemory]): since Android 14 a process with a foreground service no longer
+     * gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch whether the UI is there itself; when
+     * the user switches back quickly, nothing has to be translated again either.
+     */
+    private val listeners = mutableListOf<Listener>()
+
+    /**
      * Caches are released only when the UI has been hidden for a while and has not come back
      * ([addListener]).
      */
@@ -373,16 +383,6 @@ class TerminalService : Service() {
         }
     }
 
-    /**
-     * The visible UIs (terminal, settings), added by Activities in onStart and removed in onStop;
-     * when all have stopped (switched to another app, screen off) and none has come back after
-     * [TRIM_DELAY_MS], the kernel's rebuildable caches are released and the tabs' scrollback is
-     * compressed ([trimMemory]): since Android 14 a process with a foreground service no longer
-     * gets `onTrimMemory`'s `UI_HIDDEN`, so it has to watch whether the UI is there itself; when
-     * the user switches back quickly, nothing has to be translated again either.
-     */
-    private val listeners = mutableListOf<Listener>()
-
     override fun onCreate() {
         super.onCreate()
         notifications.createChannels()
@@ -401,42 +401,6 @@ class TerminalService : Service() {
             if (exit != null && (ended == R.string.ended_crash || ended == R.string.ended_anr)) notifications.crash(exit)
         }
         startOrImport()
-    }
-
-    /**
-     * Starts the kernel, importing first when no store is ready: on the first run the Alpine in
-     * the APK (other distros are switched to in Settings); after an import or switch that the app
-     * was killed in, or that failed, the same distro again, its download reused when it is still
-     * in the cache.
-     */
-    private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
-
-    /**
-     * How this app's process [pid] ended, as Android recorded it; null when that is unknown (no pid,
-     * or the record is gone: Android keeps a limited number per app).
-     */
-    private fun lastExit(pid: Int): ApplicationExitInfo? {
-        if (pid <= 0) return null
-        return runCatching {
-            getSystemService(ActivityManager::class.java)
-                .getHistoricalProcessExitReasons(packageName, pid, 1).firstOrNull()
-        }.onFailure { Log.w(TAG, "cannot read how the last run ended", it) }.getOrNull()
-    }
-
-    /**
-     * The start of the restore notice for a run that ended with [reason] (null when unknown).
-     * Android reports the low-memory killer only where `isLowMemoryKillReportSupported`; elsewhere
-     * such a kill is a plain signal and gets the general text.
-     */
-    @SuppressLint("InlinedApi") // REASON_PACKAGE_UPDATED (API 34) is a constant earlier versions never report
-    private fun endedText(reason: Int?): Int = when (reason) {
-        ApplicationExitInfo.REASON_LOW_MEMORY -> R.string.ended_memory
-        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> R.string.ended_resources
-        ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED -> R.string.ended_user
-        ApplicationExitInfo.REASON_PACKAGE_UPDATED -> R.string.ended_updated
-        ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> R.string.ended_crash
-        ApplicationExitInfo.REASON_ANR -> R.string.ended_anr
-        else -> R.string.ended_android
     }
 
     private fun notification(): Notification {
@@ -494,6 +458,42 @@ class TerminalService : Service() {
         if (destroyed) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification())
     }
+
+    /**
+     * How this app's process [pid] ended, as Android recorded it; null when that is unknown (no pid,
+     * or the record is gone: Android keeps a limited number per app).
+     */
+    private fun lastExit(pid: Int): ApplicationExitInfo? {
+        if (pid <= 0) return null
+        return runCatching {
+            getSystemService(ActivityManager::class.java)
+                .getHistoricalProcessExitReasons(packageName, pid, 1).firstOrNull()
+        }.onFailure { Log.w(TAG, "cannot read how the last run ended", it) }.getOrNull()
+    }
+
+    /**
+     * The start of the restore notice for a run that ended with [reason] (null when unknown).
+     * Android reports the low-memory killer only where `isLowMemoryKillReportSupported`; elsewhere
+     * such a kill is a plain signal and gets the general text.
+     */
+    @SuppressLint("InlinedApi") // REASON_PACKAGE_UPDATED (API 34) is a constant earlier versions never report
+    private fun endedText(reason: Int?): Int = when (reason) {
+        ApplicationExitInfo.REASON_LOW_MEMORY -> R.string.ended_memory
+        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> R.string.ended_resources
+        ApplicationExitInfo.REASON_USER_REQUESTED, ApplicationExitInfo.REASON_USER_STOPPED -> R.string.ended_user
+        ApplicationExitInfo.REASON_PACKAGE_UPDATED -> R.string.ended_updated
+        ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> R.string.ended_crash
+        ApplicationExitInfo.REASON_ANR -> R.string.ended_anr
+        else -> R.string.ended_android
+    }
+
+    /**
+     * Starts the kernel, importing first when no store is ready: on the first run the Alpine in
+     * the APK (other distros are switched to in Settings); after an import or switch that the app
+     * was killed in, or that failed, the same distro again, its download reused when it is still
+     * in the cache.
+     */
+    private fun startOrImport() = start(if (Rootfs.isReady(this)) null else Rootfs.importing(this))
 
     /**
      * Starts the kernel; when [distro] is non-null, prepares its rootfs first (the store must
@@ -599,6 +599,40 @@ class TerminalService : Service() {
         }
     }
 
+    /**
+     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
+     * while the switch is on and the kernel is starting, running, restarting, being replaced or
+     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
+     * goes off and the guest's processes stop with it.
+     *
+     * The app always has a foreground service, so the lock stays effective in Doze:
+     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
+     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
+     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
+     * needed.
+     */
+    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
+    // fixed duration, and not released within the same call
+    @SuppressLint("WakelockTimeout", "Wakelock")
+    private fun updateWakeLock() {
+        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
+        val held = wakeLock
+        if (want && held == null) {
+            wakeLock = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                .apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+        } else if (!want && held != null) {
+            held.release()
+            wakeLock = null
+        } else {
+            return
+        }
+        updateNotification()
+    }
+
     private fun preparing(text: String) {
         progress = text
         updateNotification()
@@ -616,13 +650,6 @@ class TerminalService : Service() {
 
     /** Takes what there is to tell the user (given to one UI only). */
     fun takeNotice(): String? = notice.also { notice = null }
-
-    private fun setRoutes(routes: Array<String>) {
-        val m = machine
-        // Callbacks may interleave with onDestroy: once worker is shut down there is no need to
-        // hand it over
-        if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
-    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -830,6 +857,13 @@ class TerminalService : Service() {
         notifications.kill(comm, text, if (bug) f.subList(4, 7) else null)
     }
 
+    private fun setRoutes(routes: Array<String>) {
+        val m = machine
+        // Callbacks may interleave with onDestroy: once worker is shut down there is no need to
+        // hand it over
+        if (m != 0L) runCatching { worker.execute { Native.setRoutes(m, routes) } }
+    }
+
     /**
      * When host memory is short, drops the kernel's rebuildable caches at once (the Tier 1
      * translations kept in the pool take up to 70–80 MB), compresses the tabs' scrollback and
@@ -867,6 +901,89 @@ class TerminalService : Service() {
                 VtNative.compressAll()
             }
         }
+    }
+
+    // The settings ([Settings]), which the setters below act on
+
+    val login: String get() = Settings.login(this)
+
+    /**
+     * A login account was chosen in Settings: tabs opened from now on use it, open ones are
+     * unchanged; the home directory in the Files app follows.
+     */
+    fun setLogin(value: String) {
+        Settings.setLogin(this, value)
+        Documents.rootsChanged(this)
+        settingsChanged()
+    }
+
+    val keepAwake: Boolean get() = Settings.keepAwake(this)
+
+    fun setKeepAwake(on: Boolean) {
+        Settings.setKeepAwake(this, on)
+        updateWakeLock()
+        settingsChanged()
+    }
+
+    val systemDocuments: Boolean get() = Settings.systemDocuments(this)
+
+    fun setSystemDocuments(on: Boolean) {
+        Settings.setSystemDocuments(this, on)
+        Documents.rootsChanged(this)
+        settingsChanged()
+    }
+
+    val fillWide: Boolean get() = Settings.fillWide(this)
+
+    fun setFillWide(on: Boolean) {
+        Settings.setFillWide(this, on)
+        settingsChanged()
+    }
+
+    val cursorStyle: Int get() = Settings.cursorStyle(this)
+
+    fun setCursorStyle(style: Int) {
+        Settings.setCursorStyle(this, style)
+        cursorChanged()
+    }
+
+    val cursorBlink: Boolean get() = Settings.cursorBlink(this)
+
+    fun setCursorBlink(on: Boolean) {
+        Settings.setCursorBlink(this, on)
+        cursorChanged()
+    }
+
+    /** Gives every tab, restored ones not shown yet included, the cursor settings. */
+    private fun cursorChanged() {
+        val style = cursorStyle
+        val blink = cursorBlink
+        sessions.forEach { it.setCursor(style, blink) }
+        settingsChanged()
+    }
+
+    val volumeKeysSwitchTabs: Boolean get() = Settings.volumeKeysSwitchTabs(this)
+
+    fun setVolumeKeysSwitchTabs(on: Boolean) {
+        Settings.setVolumeKeysSwitchTabs(this, on)
+        settingsChanged()
+    }
+
+    val tier: Int get() = Settings.tier(this)
+
+    /**
+     * The execution tier was changed in Settings (debug builds only): record it and restart the
+     * kernel.
+     */
+    fun setTier(value: Int) {
+        if (!BuildConfig.DEBUG || value == tier) return
+        Settings.setTier(this, value)
+        restart()
+    }
+
+    private fun settingsChanged() {
+        updateNotification()
+        each { it.onSettingsChanged() }
     }
 
     /**
@@ -958,121 +1075,23 @@ class TerminalService : Service() {
         }
     }
 
-    // The settings ([Settings]), which the setters below act on
-
-    val login: String get() = Settings.login(this)
-
     /**
-     * A login account was chosen in Settings: tabs opened from now on use it, open ones are
-     * unchanged; the home directory in the Files app follows.
+     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
+     * shut down, then start a new kernel (after which the Activity opens new sessions).
      */
-    fun setLogin(value: String) {
-        Settings.setLogin(this, value)
-        Documents.rootsChanged(this)
-        settingsChanged()
-    }
-
-    val keepAwake: Boolean get() = Settings.keepAwake(this)
-
-    fun setKeepAwake(on: Boolean) {
-        Settings.setKeepAwake(this, on)
-        updateWakeLock()
-        settingsChanged()
-    }
-
-    /**
-     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
-     * while the switch is on and the kernel is starting, running, restarting, being replaced or
-     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
-     * goes off and the guest's processes stop with it.
-     *
-     * The app always has a foreground service, so the lock stays effective in Doze:
-     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
-     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
-     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
-     * needed.
-     */
-    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
-    // fixed duration, and not released within the same call
-    @SuppressLint("WakelockTimeout", "Wakelock")
-    private fun updateWakeLock() {
-        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
-        val held = wakeLock
-        if (want && held == null) {
-            wakeLock = getSystemService(PowerManager::class.java)
-                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
-                .apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-        } else if (!want && held != null) {
-            held.release()
-            wakeLock = null
-        } else {
-            return
+    private fun restart() {
+        if (machine == 0L) return
+        transitioning = true
+        val m = detach()
+        each { it.onRestarting() }
+        worker.execute {
+            Native.shutdown(m)
+            main.post {
+                transitioning = false
+                // "Exit all" meanwhile left the rest to here
+                if (exiting) finishExit(0) else start(null)
+            }
         }
-        updateNotification()
-    }
-
-    val systemDocuments: Boolean get() = Settings.systemDocuments(this)
-
-    fun setSystemDocuments(on: Boolean) {
-        Settings.setSystemDocuments(this, on)
-        Documents.rootsChanged(this)
-        settingsChanged()
-    }
-
-    val fillWide: Boolean get() = Settings.fillWide(this)
-
-    fun setFillWide(on: Boolean) {
-        Settings.setFillWide(this, on)
-        settingsChanged()
-    }
-
-    val cursorStyle: Int get() = Settings.cursorStyle(this)
-
-    fun setCursorStyle(style: Int) {
-        Settings.setCursorStyle(this, style)
-        cursorChanged()
-    }
-
-    val cursorBlink: Boolean get() = Settings.cursorBlink(this)
-
-    fun setCursorBlink(on: Boolean) {
-        Settings.setCursorBlink(this, on)
-        cursorChanged()
-    }
-
-    /** Gives every tab, restored ones not shown yet included, the cursor settings. */
-    private fun cursorChanged() {
-        val style = cursorStyle
-        val blink = cursorBlink
-        sessions.forEach { it.setCursor(style, blink) }
-        settingsChanged()
-    }
-
-    val volumeKeysSwitchTabs: Boolean get() = Settings.volumeKeysSwitchTabs(this)
-
-    fun setVolumeKeysSwitchTabs(on: Boolean) {
-        Settings.setVolumeKeysSwitchTabs(this, on)
-        settingsChanged()
-    }
-
-    val tier: Int get() = Settings.tier(this)
-
-    /**
-     * The execution tier was changed in Settings (debug builds only): record it and restart the
-     * kernel.
-     */
-    fun setTier(value: Int) {
-        if (!BuildConfig.DEBUG || value == tier) return
-        Settings.setTier(this, value)
-        restart()
-    }
-
-    private fun settingsChanged() {
-        updateNotification()
-        each { it.onSettingsChanged() }
     }
 
     /**
@@ -1120,25 +1139,6 @@ class TerminalService : Service() {
                 // when an import the exit came during failed), otherwise the UI stays at
                 // "Starting…" forever
                 if (listeners.isNotEmpty()) startOrImport() else stopSelf()
-            }
-        }
-    }
-
-    /**
-     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
-     * shut down, then start a new kernel (after which the Activity opens new sessions).
-     */
-    private fun restart() {
-        if (machine == 0L) return
-        transitioning = true
-        val m = detach()
-        each { it.onRestarting() }
-        worker.execute {
-            Native.shutdown(m)
-            main.post {
-                transitioning = false
-                // "Exit all" meanwhile left the rest to here
-                if (exiting) finishExit(0) else start(null)
             }
         }
     }
