@@ -8,13 +8,18 @@ import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.icu.text.ListFormatter
 import android.icu.text.MeasureFormat
 import android.icu.util.Measure
 import android.icu.util.MeasureUnit
 import android.os.Build
+import android.os.LocaleList
 import android.system.Os
 import android.system.OsConstants
 import android.widget.Toast
+import io.github.mthli.appine.Notifications.Companion.BELL_NOTIFY_MS
+import io.github.mthli.appine.Notifications.Companion.COMMAND_NOTIFY_MS
+import io.github.mthli.appine.Notifications.Companion.KILL_NOTIFICATION_BASE
 import java.text.DateFormat
 import java.time.Instant
 import java.util.Date
@@ -29,13 +34,19 @@ import java.util.Date
  */
 internal class Notifications(private val service: TerminalService) {
 
-    private val manager: NotificationManager get() = service.getSystemService(NotificationManager::class.java)
+    private val manager by lazy { service.getSystemService(NotificationManager::class.java) }
+
+    /** The app's language, for what the string resources do not format: lists and durations. */
+    private val locale get() = service.resources.configuration.locales[0]
 
     /**
      * The next ended-process notification ([kill]), counting up; it starts from the clock so a new
      * service does not reuse the ids of reports still shown from the last one.
      */
     private var killNotifications = (System.currentTimeMillis() % KILL_NOTIFICATION_COUNT).toInt()
+
+    /** The languages the channels were last named in ([createChannels]). */
+    private var channelLocales: LocaleList? = null
 
     /** When each tab's bell last posted a notification ([bell]). */
     private val bellNotified = HashMap<VtSession, Long>()
@@ -52,7 +63,14 @@ internal class Notifications(private val service: TerminalService) {
      */
     private var stallNotified = Triple(0L, 0L, false)
 
-    fun createChannels() {
+    /**
+     * Creates the channels, or names them anew: their names are in the app's language. Returns
+     * whether that language is another than the last time's (the first time included).
+     */
+    fun createChannels(): Boolean {
+        val locales = service.resources.configuration.locales
+        if (locales == channelLocales) return false
+        channelLocales = locales
         val channel = NotificationChannel(
             SESSIONS_CHANNEL_ID, service.getString(R.string.channel_sessions), NotificationManager.IMPORTANCE_LOW,
         )
@@ -66,6 +84,7 @@ internal class Notifications(private val service: TerminalService) {
             TERMINAL_CHANNEL_ID, service.getString(R.string.channel_terminal), NotificationManager.IMPORTANCE_DEFAULT,
         )
         manager.createNotificationChannels(listOf(channel, services, problems, terminal))
+        return true
     }
 
     /**
@@ -81,16 +100,12 @@ internal class Notifications(private val service: TerminalService) {
             ApplicationExitInfo.REASON_CRASH_NATIVE -> "crashed (native, signal ${exit.status})"
             else -> "stopped responding (ANR)"
         }
-        // Android's description says only "crash" for crashes; for an ANR it says what timed out
+        // The report is in English, for whoever reads the feedback. Android's description says
+        // only "crash" for crashes; for an ANR it says what timed out
         val line = "The app process (pid ${exit.pid}) $what at ${Instant.ofEpochMilli(exit.timestamp)}" +
             (exit.description?.takeIf { anr }?.let { ": $it" } ?: "")
-        val notification = Notification.Builder(service, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(service.getString(if (anr) R.string.anr_title else R.string.crashed_title))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openApp())
-            .setAutoCancel(true)
+        val title = service.getString(if (anr) R.string.anr_title else R.string.crashed_title)
+        val notification = builder(PROBLEMS_CHANNEL_ID, title, text)
             .addAction(copyReportAction(CRASH_NOTIFICATION_ID, bugReport(line, "")))
             .build()
         manager.notify(CRASH_NOTIFICATION_ID, notification)
@@ -110,19 +125,13 @@ internal class Notifications(private val service: TerminalService) {
         val ended = f[3].isNotEmpty()
         val seen = Triple(m, id, ended)
         if (seen == stallNotified) return
-        val manager = manager
         val updating = stallNotified.first == m && stallNotified.second == id
         stallNotified = seen
         if (updating && manager.activeNotifications.none { it.id == STALL_NOTIFICATION_ID }) return
         val secs = f[1].toIntOrNull() ?: 0
         val text = service.getString(if (ended) R.string.stall_ended_text else R.string.stall_text, secs)
-        val notification = Notification.Builder(service, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(service.getString(if (ended) R.string.stall_ended_title else R.string.stall_title))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openApp())
-            .setAutoCancel(true)
+        val title = service.getString(if (ended) R.string.stall_ended_title else R.string.stall_title)
+        val notification = builder(PROBLEMS_CHANNEL_ID, title, text)
             .setOnlyAlertOnce(true)
             // The record of its end is a kernel log line
             .addAction(copyReportAction(STALL_NOTIFICATION_ID, bugReport(f[2], f[3])))
@@ -132,20 +141,12 @@ internal class Notifications(private val service: TerminalService) {
 
     /**
      * OpenRC services did not start at boot: posts a notification saying which ones and where the
-     * output is.
+     * output is, the services listed as the app's language lists things.
      */
     fun bootFailures(services: List<String>) {
         val title = service.resources.getQuantityString(R.plurals.boot_failed_title, services.size, services.size)
-        val text = service.getString(R.string.boot_failed_text, services.joinToString(", "))
-        val notification = Notification.Builder(service, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openApp())
-            .setAutoCancel(true)
-            .build()
-        manager.notify(BOOT_NOTIFICATION_ID, notification)
+        val text = service.getString(R.string.boot_failed_text, ListFormatter.getInstance(locale).format(services))
+        manager.notify(BOOT_NOTIFICATION_ID, builder(PROBLEMS_CHANNEL_ID, title, text).build())
     }
 
     /**
@@ -163,15 +164,8 @@ internal class Notifications(private val service: TerminalService) {
         } else {
             service.getString(R.string.listening_direct)
         }
-        val notification = Notification.Builder(service, NETWORK_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(service.getString(R.string.listening_title, comm, port))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openApp())
-            .setAutoCancel(true)
-            .build()
-        manager.notify(LISTEN_NOTIFICATION_BASE + port, notification)
+        val title = service.getString(R.string.listening_title, comm, port)
+        manager.notify(LISTEN_NOTIFICATION_BASE + port, builder(NETWORK_CHANNEL_ID, title, text).build())
     }
 
     /**
@@ -182,19 +176,14 @@ internal class Notifications(private val service: TerminalService) {
      */
     fun kill(comm: String, text: String, bug: List<String>?) {
         val id = KILL_NOTIFICATION_BASE + killNotifications++ % KILL_NOTIFICATION_COUNT
-        val builder = Notification.Builder(service, PROBLEMS_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(service.getString(R.string.killed_title, comm))
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
-            .setContentIntent(openApp())
-            .setAutoCancel(true)
+        val builder = builder(PROBLEMS_CHANNEL_ID, service.getString(R.string.killed_title, comm), text)
         if (bug != null) builder.addAction(copyReportAction(id, bugReport(bug[0], bug[1], bug[2])))
         manager.notify(id, builder.build())
     }
 
     /**
-     * The report copied for the user to paste into feedback: the app's version, the device, the
+     * The report copied for the user to paste into feedback, in English whatever the app's
+     * language (its reader is whoever gets the feedback): the app's version, the device, the
      * distro and the execution tier, plus the kernel layer's report (process, thread, last guest
      * pc, the panic message and location, the same as the line in `dmesg`), the kernel log
      * entries before it and itself ([log] separated by U+001E, with timestamps as `dmesg` writes
@@ -327,7 +316,7 @@ internal class Notifications(private val service: TerminalService) {
             s >= 60 -> listOf(Measure(s / 60, MeasureUnit.MINUTE), Measure(s % 60, MeasureUnit.SECOND))
             else -> listOf(Measure(s, MeasureUnit.SECOND))
         }.filterIndexed { i, m -> i == 0 || m.number.toLong() != 0L }
-        return MeasureFormat.getInstance(service.resources.configuration.locales[0], MeasureFormat.FormatWidth.SHORT)
+        return MeasureFormat.getInstance(locale, MeasureFormat.FormatWidth.SHORT)
             .formatMeasures(*parts.toTypedArray())
     }
 
@@ -346,14 +335,9 @@ internal class Notifications(private val service: TerminalService) {
         val pending = PendingIntent.getActivity(
             service, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val notification = Notification.Builder(service, TERMINAL_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(title.ifEmpty { session.title?.takeIf { it.isNotBlank() } ?: "sh" })
-            .setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
+        val shown = title.ifEmpty { session.title?.takeIf { it.isNotBlank() } ?: "sh" }
+        val notification = builder(TERMINAL_CHANNEL_ID, shown, text, pending)
             .setSubText(service.getString(R.string.tab_number, number))
-            .setContentIntent(pending)
-            .setAutoCancel(true)
             .setOnlyAlertOnce(quiet)
             .build()
         manager.notify(id, notification)
@@ -367,6 +351,19 @@ internal class Notifications(private val service: TerminalService) {
     }
 
     private fun tabId(session: VtSession) = TAB_NOTIFICATION_BASE + session.id % TAB_NOTIFICATION_COUNT
+
+    /**
+     * A notification on [channel] with [title] and all of [text], which a tap takes away, opening
+     * [intent] (the terminal, unless given).
+     */
+    private fun builder(channel: String, title: String, text: String, intent: PendingIntent = openApp()) =
+        Notification.Builder(service, channel)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(intent)
+            .setAutoCancel(true)
 
     /** Opens the terminal, for a notification's tap. */
     private fun openApp(): PendingIntent = PendingIntent.getActivity(

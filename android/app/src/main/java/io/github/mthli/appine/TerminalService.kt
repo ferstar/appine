@@ -1,16 +1,17 @@
 package io.github.mthli.appine
 
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.ApplicationExitInfo
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.annotation.SuppressLint
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -23,10 +24,13 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
-import java.util.concurrent.Executors
+import io.github.mthli.appine.TerminalService.Companion.POLL_MS
+import io.github.mthli.appine.TerminalService.Companion.SAVE_MS
+import io.github.mthli.appine.TerminalService.Companion.TRIM_DELAY_MS
 import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
+import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
 
@@ -638,6 +642,16 @@ class TerminalService : Service() {
     }
 
     override fun onBind(intent: Intent): IBinder = binder
+
+    /**
+     * The user changed the system's or the app's language while the service runs: the channels'
+     * names and the ongoing notification follow it (the other notifications keep the language
+     * they were posted in).
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (notifications.createChannels()) updateNotification()
+    }
 
     fun addListener(l: Listener) {
         if (l !in listeners) listeners.add(l)

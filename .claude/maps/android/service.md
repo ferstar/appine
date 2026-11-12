@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the setting whether the volume keys switch tabs)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: channel names and the ongoing notification following a language change, the list of services that failed at boot)
 
 ## Responsibilities
 
@@ -69,7 +69,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   each tab's notification; with their state: `stallNotified` (the stall last notified),
   `killNotifications` (the next kill notification's offset, seeded from the clock), `bellNotified`
   (when each tab's bell last notified), `statusNotified` (the program status a tab's notification
-  shows, while it shows one). The service decides what is told (the tab in front, a message
+  shows, while it shows one), `channelLocales` (the languages the channels were last named in).
+  The service decides what is told (the tab in front, a message
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
   tier (always 1 in a release build), login, keep-awake, system documents, wide cells, the
@@ -309,7 +310,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   again (a dismissed one stays dismissed); a stall first seen after it ended posts "was stuck"
   directly.
 - Boot failures: `ERROR: <service> failed to start` lines in `/var/log/boot.log` after boot (id 2,
-  "N services did not start").
+  "N services did not start", with the services listed as the
+  app's language lists things (ICU's `ListFormatter`)).
 - Listens: the first `listen()` on a non-loopback address per (guest port, host port) pair and
   kernel (the kernel queues at most 32; one dropped from a full queue is reported only when the
   guest listens on that pair again), with remap text when the ports differ; the notification id is
@@ -327,7 +329,10 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   it takes it away.
 - Channels: `sessions` (low), `network`, `problems`, `terminal` (named "Bells, notifications from
   programs and finished commands"); kill reports take ids from 100000,
-  counting up from a clock-seeded start and wrapping after 100000.
+  counting up from a clock-seeded start and wrapping after 100000. Their names are in the app's
+  language: `onConfigurationChanged` names them anew when the configuration's languages have
+  changed and posts the ongoing notification again; the other notifications keep the language
+  they were posted in. The bug report is in English whatever the language.
 
 ## Dependencies (inbound / outbound)
 
@@ -386,6 +391,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ## To verify
 
+- The channel names and the ongoing notification following a language change while the service
+  runs (`onConfigurationChanged`) was compiled only, not tried on a device.
 - Whether tapping "copy report" after the service stopped recreates the service (and starts a
   kernel) through its `getService` pending intent.
 - Finished-command notifications were tried only on a Pixel 4a API 34 emulator (busybox ash and
