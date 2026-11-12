@@ -24,6 +24,9 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
+import io.github.mthli.appine.TerminalService.Companion.POLL_MS
+import io.github.mthli.appine.TerminalService.Companion.SAVE_MS
+import io.github.mthli.appine.TerminalService.Companion.TRIM_DELAY_MS
 import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
