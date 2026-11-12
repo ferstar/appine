@@ -55,7 +55,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   kernel). Its companion holds
   libghostty-vt's progress states, status states and kinds, and `describe` (a status in words).
 - `VtNative` — 48 `@JvmStatic external` functions on the native library, and libghostty-vt's
-  cursor styles (`CURSOR_BAR`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`), selection gesture behaviours
+  cursor styles (`CURSOR_BAR`, `CURSOR_BLOCK`, `CURSOR_UNDERLINE`, and for frames `CURSOR_HOLLOW`
+  and vt.c's `CURSOR_LOCK`), selection gesture behaviours
   (`GESTURE_WORD`, `GESTURE_LINE`) and selection adjustments (`ADJUST_*`), passed to vt.c as raw
   values, so they must match libghostty-vt's headers.
 - `ConsolePty` — `start` (open a console, spawn `login.sh` through `sh -c` with the tab's login

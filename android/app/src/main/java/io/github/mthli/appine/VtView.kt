@@ -12,7 +12,6 @@ import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.SystemClock
 import android.text.InputType
-import android.util.Log
 import android.util.TypedValue
 import android.view.ActionMode
 import android.view.GestureDetector
@@ -45,8 +44,8 @@ import kotlin.math.roundToInt
 
 /**
  * The terminal view on libghostty-vt (the android/vtview map): draws the [VtSession] attached to
- * it with JetBrains Mono on a fixed cell grid. Sessions belong to [TerminalService] and keep parsing output while no view shows them;
- * [attach] switches the view to another tab.
+ * it with JetBrains Mono on a fixed cell grid. Sessions belong to [TerminalService] and keep
+ * parsing output while no view shows them; [attach] switches the view to another tab.
  *
  * Each frame ([VtNative.frame], read as a [VtFrame]) takes the rows that changed into a mirror of
  * the screen ([VtScreen]), which [VtRenderer] paints into a bitmap the size of the grid together
@@ -144,7 +143,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private var checkingPassword = false
     private val passwordCheck = object : Runnable {
         override fun run() {
-            if (tab != 0L && screen.cursorStyle == VtRenderer.CURSOR_LOCK && VtNative.passwordInput(tab)) {
+            if (tab != 0L && screen.cursorStyle == VtNative.CURSOR_LOCK && VtNative.passwordInput(tab)) {
                 postDelayed(this, PASSWORD_CHECK_MS)
             } else {
                 checkingPassword = false
@@ -239,12 +238,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     /** The input method's composing text, drawn at the cursor. */
     private var preedit = ""
-
-    // Frame statistics for logcat (tag appine-vt): taking and painting a frame
-    private var frames = 0
-    private var frameNanos = 0L
-    private var frameMax = 0L
-    private var frameRows = 0
 
     private var scrollRemainder = 0f
     private var scaleRemainder = 1f
@@ -348,8 +341,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     private val handleStart = context.themeDrawable(android.R.attr.textSelectHandleLeft)
     private val handleEnd = context.themeDrawable(android.R.attr.textSelectHandleRight)
+
     /** How far around a handle a touch still takes it. */
     private val handleSlop = (8 * resources.displayMetrics.density).toInt()
+
     /** The handles' areas last kept out of the system's gestures. */
     private var handleExclusion = emptyList<Rect>()
 
@@ -445,7 +440,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * password is typed; nothing happens while the view is not the one it serves.
      */
     private fun restartInput() {
-        context.getSystemService(InputMethodManager::class.java).restartInput(this)
+        inputMethod.restartInput(this)
     }
 
     /** The session's shell started: take the whole screen. */
@@ -574,11 +569,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         c.drawColor(screen.defaultBg)
         if (!renderer.hasGrid) return
         if (tab != 0L) {
-            val start = SystemClock.elapsedRealtimeNanos()
             val f = full
             full = false
             VtNative.frame(tab, f)?.let { apply(VtFrame(it)) }
-            stats(SystemClock.elapsedRealtimeNanos() - start)
         }
         // The grid, shifted up by part of a row while the viewport scrolls; the margin below the
         // last whole row keeps the background
@@ -614,7 +607,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         screen.cursorShown = frame.cursorShown
         screen.cursorStyle = frame.cursorStyle
         screen.cursorBlinking = frame.cursorBlinking
-        val lock = screen.cursorStyle == VtRenderer.CURSOR_LOCK
+        val lock = screen.cursorStyle == VtNative.CURSOR_LOCK
         if (lock && !checkingPassword && windowVisibility == VISIBLE) {
             checkingPassword = true
             postDelayed(passwordCheck, PASSWORD_CHECK_MS)
@@ -693,7 +686,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         removeCallbacks(animationTick)
         val animationMs = frame.animationMs
         if (animationMs > 0) postDelayed(animationTick, animationMs.toLong())
-        frameRows += frame.rowCount
         renderer.takeRows(frame)
     }
 
@@ -708,31 +700,31 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     }
 
     /**
-     * Shows a mouse over the view the pointer for its place: a hand over a link a Ctrl+click opens
-     * (without mouse tracking), else the shape the program asked for (OSC 22) as the closest of
-     * Android's system pointers. Set on the view, so it changes at once, the mouse still or not.
+     * The search's matches along the scroll bar, as browsers mark found text: a mark as wide as
+     * the scroll bar where each row a match starts on lies among the scrollable rows, as the thumb
+     * lies over the rows shown (its top where the mark of the viewport's first row is, unless the
+     * thumb is held at its least length), the selected match's in its own colour, while a search
+     * runs and there is a scrollback to scroll. They do not fade, unlike the thumb drawn over them.
      */
-    private fun updatePointer() {
-        val type = if (hoverLink && hoverCtrl && !mouseTracking) PointerIcon.TYPE_HAND else pointerType(pointerShape)
-        if (type == pointerSet) return
-        pointerSet = type
-        pointerIcon = PointerIcon.getSystemIcon(context, type)
-    }
-
-    private fun stats(nanos: Long) {
-        frames++
-        frameNanos += nanos
-        frameMax = max(frameMax, nanos)
-        if (frames == 120) {
-            Log.d(TAG,
-                "frames: avg %.2f ms, max %.2f ms, %.1f rows each".format(
-                    frameNanos / 1e6 / frames, frameMax / 1e6, frameRows.toFloat() / frames,
-                ),
-            )
-            frames = 0
-            frameNanos = 0
-            frameMax = 0
-            frameRows = 0
+    private fun drawMatchMarks(c: Canvas) {
+        if (!searching || scrollTotal <= scrollLen || (matchRows.isEmpty() && matchSelectedRow < 0)) return
+        val right = width.toFloat()
+        val left = right - verticalScrollbarWidth
+        val last = height - matchMarkHeight
+        val at = { row: Int -> (row.toLong() * height / scrollTotal).toInt().coerceIn(0, max(0, last)) }
+        matchPaint.color = VtRenderer.SEARCH_MATCH
+        var drawn = -1
+        for (row in matchRows) {
+            val top = at(row)
+            // Rows closer than a pixel share one mark
+            if (top == drawn) continue
+            drawn = top
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
+        }
+        if (matchSelectedRow >= 0) {
+            val top = at(matchSelectedRow)
+            matchPaint.color = VtRenderer.SEARCH_SELECTED
+            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
         }
     }
 
@@ -744,7 +736,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun computeVerticalScrollExtent() = scrollLen * cellHeight
 
-    // ---- The cursor's blinking and the search's marks ----
+    // ---- The cursor's blinking ----
 
     /**
      * Blinks the cursor every [BLINK_MS] (as Android's text fields do) while the frame says it
@@ -777,32 +769,47 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         postDelayed(blinkTick, BLINK_MS)
     }
 
-    /**
-     * The search's matches along the scroll bar, as browsers mark found text: a mark as wide as
-     * the scroll bar where each row a match starts on lies among the scrollable rows, as the thumb
-     * lies over the rows shown (its top where the mark of the viewport's first row is, unless the
-     * thumb is held at its least length), the selected match's in its own colour, while a search
-     * runs and there is a scrollback to scroll. They do not fade, unlike the thumb drawn over them.
-     */
-    private fun drawMatchMarks(c: Canvas) {
-        if (!searching || scrollTotal <= scrollLen || (matchRows.isEmpty() && matchSelectedRow < 0)) return
-        val right = width.toFloat()
-        val left = right - verticalScrollbarWidth
-        val last = height - matchMarkHeight
-        val at = { row: Int -> (row.toLong() * height / scrollTotal).toInt().coerceIn(0, max(0, last)) }
-        matchPaint.color = VtRenderer.SEARCH_MATCH
-        var drawn = -1
-        for (row in matchRows) {
-            val top = at(row)
-            // Rows closer than a pixel share one mark
-            if (top == drawn) continue
-            drawn = top
-            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
+    // ---- Focus and visibility ----
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        // A fling not drawn to its end would jump there when the window draws again; a viewport it
+        // leaves between rows comes to rest on the nearest (a short scroll that may end unseen)
+        if (!hasWindowFocus) {
+            scroller.forceFinished(true)
+            if (scrollPx != 0) settle()
         }
-        if (matchSelectedRow >= 0) {
-            val top = at(matchSelectedRow)
-            matchPaint.color = VtRenderer.SEARCH_SELECTED
-            c.drawRect(left, top.toFloat(), right, (top + matchMarkHeight).toFloat(), matchPaint)
+        // Focus events (mode 1004): editors reload changed files when they regain focus
+        if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
+        updateBlink()
+        invalidate()
+    }
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        updateBlink()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // Still counted as attached during this call
+        blinkRunning = false
+        blinkOn = true
+        removeCallbacks(blinkTick)
+        stopPasswordCheck()
+    }
+
+    /**
+     * A hidden window asks the kernel nothing and keeps no copies of the images' pixels; the frame
+     * drawn when it shows again resumes both (the bitmap still holds the rows painted with them).
+     */
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) {
+            stopPasswordCheck()
+            dropImages()
+        } else {
+            invalidate()
         }
     }
 
@@ -962,47 +969,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         host.onInput(data)
     }
 
-    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
-        super.onWindowFocusChanged(hasWindowFocus)
-        // A fling not drawn to its end would jump there when the window draws again; a viewport it
-        // leaves between rows comes to rest on the nearest (a short scroll that may end unseen)
-        if (!hasWindowFocus) {
-            scroller.forceFinished(true)
-            if (scrollPx != 0) settle()
-        }
-        // Focus events (mode 1004): editors reload changed files when they regain focus
-        if (tab != 0L) send(VtNative.focus(tab, hasWindowFocus))
-        updateBlink()
-        invalidate()
-    }
-
-    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
-        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
-        updateBlink()
-    }
-
-    override fun onDetachedFromWindow() {
-        super.onDetachedFromWindow()
-        // Still counted as attached during this call
-        blinkRunning = false
-        blinkOn = true
-        removeCallbacks(blinkTick)
-        stopPasswordCheck()
-    }
-
-    /**
-     * A hidden window asks the kernel nothing and keeps no copies of the images' pixels; the frame
-     * drawn when it shows again resumes both (the bitmap still holds the rows painted with them).
-     */
-    override fun onWindowVisibilityChanged(visibility: Int) {
-        super.onWindowVisibilityChanged(visibility)
-        if (visibility != VISIBLE) {
-            stopPasswordCheck()
-            dropImages()
-        } else {
-            invalidate()
-        }
-    }
+    // ---- The input method ----
 
     override fun onCheckIsTextEditor() = true
 
@@ -1095,12 +1062,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             .setComposingText(0, preedit)
             .setInsertionMarkerLocation(x, top, top + renderer.baseline, top + cellHeight, CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION)
             .build()
-        context.getSystemService(InputMethodManager::class.java).updateCursorAnchorInfo(this, info)
+        inputMethod.updateCursorAnchorInfo(this, info)
     }
 
     // ---- Clipboard ----
 
     private val clipboard get() = context.getSystemService(ClipboardManager::class.java)
+    private val inputMethod get() = context.getSystemService(InputMethodManager::class.java)
 
     private fun copySelection() {
         val text = VtNative.copy(tab) ?: return
@@ -1382,7 +1350,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         invalidate()
     }
 
-    // ---- Gestures ----
+    // ---- Touch ----
 
     /**
      * A touch, then: a viewport left between rows comes to rest on the nearest whole row once the
@@ -1468,145 +1436,6 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             }
         }
         return true
-    }
-
-    /**
-     * A mouse (or touchpad) button pressed, dragged and released, for a program tracking the
-     * mouse; the first button pressed is the one reported until it is released.
-     */
-    private fun mouseButtons(e: MotionEvent) {
-        val mods = VtKeys.mods(e.metaState)
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                if (selected || menu != null) clearSelection()
-                requestFocus()
-                mouseButton = when {
-                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
-                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
-                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
-                }
-                send(VtNative.mouse(tab, MOUSE_PRESS, mouseButton, mods, e.x, e.y, true))
-            }
-            MotionEvent.ACTION_MOVE -> if (mouseButton != 0) {
-                send(VtNative.mouse(tab, MOUSE_MOTION, mouseButton, mods, e.x, e.y, true))
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (mouseButton != 0) {
-                send(VtNative.mouse(tab, MOUSE_RELEASE, mouseButton, mods, e.x, e.y, false))
-                mouseButton = 0
-            }
-        }
-    }
-
-    /**
-     * A touchpad's swipe or pinch, which Android may deliver as touches from the mouse source
-     * (Android 14 and later classify them): not a press of a button.
-     */
-    private fun touchpadGesture(e: MotionEvent) = Build.VERSION.SDK_INT >= 34 &&
-            (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || e.classification == MotionEvent.CLASSIFICATION_PINCH)
-
-    /**
-     * A mouse (or touchpad) button pressed, dragged and released to select, as Ghostty does on
-     * Linux, the first button pressed owning the rest: the left one (a touchpad's tap) clicks
-     * through libghostty-vt's selection gesture, which counts the clicks (within the double-tap
-     * timeout and a cell's width): a first click clears the selection and dragging from it
-     * selects by cells (a rectangle while Ctrl+Alt is held), a second selects the word and a third
-     * the line (the command's output with Ctrl), each dragging on by its unit and scrolling past
-     * the grid's edges; Shift+press after the timeout extends the selection from the last press
-     * instead. A click that did not drag opens the link under it with Ctrl, else moves the shell's
-     * cursor there (at its prompt) and opens the keyboard, as a tap does. The right button selects
-     * the word under it unless the selection holds it and brings up the menu there. No menu comes
-     * up otherwise, and the selection shows no handles.
-     */
-    private fun pointer(e: MotionEvent) {
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                requestFocus()
-                pointerButton = when {
-                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
-                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
-                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
-                }
-                if (pointerButton == MOUSE_MIDDLE) return
-                menu?.finish()
-                menuLink = null
-                menuOutput = false
-                pointerSelection = true
-                if (pointerButton == MOUSE_LEFT) pointerPress(e) else contextMenu(e)
-            }
-            MotionEvent.ACTION_MOVE -> if (pointerButton == MOUSE_LEFT && drag == DRAG_POINTER) {
-                pointerRectangle = rectangleHeld(e)
-                dragTo(e.x, e.y)
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (pointerButton == MOUSE_LEFT) pointerRelease(e)
-                pointerButton = 0
-            }
-        }
-    }
-
-    private fun pointerPress(e: MotionEvent) {
-        val interval = ViewConfiguration.getDoubleTapTimeout().toLong()
-        pointerRectangle = rectangleHeld(e)
-        startDrag(DRAG_POINTER, e.x, e.y)
-        val cx = cellX(e.x)
-        val cy = cellY(e.y)
-        val py = e.y + scrollPx
-        // Shift+press extends the selection from the last press, unless it may be its next click
-        if (e.held(KeyEvent.META_SHIFT_ON) && selected && e.eventTime - lastPointerPress > interval) {
-            val extended = VtNative.mouseDrag(tab, cx, cy, e.x, py, pointerRectangle)
-            if (extended >= 0) {
-                selected = extended == 1
-                invalidate()
-                return
-            }
-        }
-        lastPointerPress = e.eventTime
-        val ctrl = e.held(CTRL_OR_META)
-        val clicks = VtNative.mousePress(tab, cx, cy, e.x, py, e.eventTime * 1_000_000, interval * 1_000_000, ctrl)
-        // The button still owns the rest of its stream, which then does nothing
-        if (clicks == 0) drag = DRAG_NONE
-        // The next frame tells whether a word or line was there
-        selected = clicks >= 2
-        invalidate()
-    }
-
-    private fun pointerRelease(e: MotionEvent) {
-        val dragging = drag == DRAG_POINTER
-        drag = DRAG_NONE
-        autoscroll = 0
-        removeCallbacks(autoscrollTick)
-        if (!dragging) return
-        val inside = e.x >= 0 && e.y >= 0 && e.x < cols * cellWidth && e.y < rows * cellHeight
-        val clicks = VtNative.mouseRelease(tab, if (inside) cellX(e.x) else -1, if (inside) cellY(e.y) else -1)
-        // A click that did not drag: Ctrl opens a link, else as a tap
-        if (clicks != 1 || e.actionMasked != MotionEvent.ACTION_UP) return
-        val link = if (e.held(CTRL_OR_META)) linkAt(e.x, e.y) else null
-        if (link != null) {
-            host.onLink(link)
-            return
-        }
-        send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
-        context.getSystemService(InputMethodManager::class.java).showSoftInput(this, 0)
-    }
-
-    /** Ctrl (or Meta) and Alt held: Ghostty's rectangle selection on Linux. */
-    private fun rectangleHeld(e: MotionEvent) = e.held(CTRL_OR_META) && e.held(KeyEvent.META_ALT_ON)
-
-    /** Any of the [meta] modifiers is held during the event. */
-    private fun MotionEvent.held(meta: Int) = metaState and meta != 0
-
-    /**
-     * A right-click: as Ghostty's before its context menu, the word under it is selected unless
-     * the selection holds it, and the menu comes up there once the frame has the selection.
-     */
-    private fun contextMenu(e: MotionEvent) {
-        selected = VtNative.selectContext(tab, cellX(e.x), cellY(e.y))
-        menuLink = linkAt(e.x, e.y)
-        menuOutput = VtNative.outputAt(tab, cellX(e.x), cellY(e.y))
-        menuX = e.x
-        menuY = e.y
-        menuPending = true
-        invalidate()
     }
 
     /**
@@ -1713,7 +1542,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                     send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
                 }
                 requestFocus()
-                context.getSystemService(InputMethodManager::class.java).showSoftInput(this@VtView, 0)
+                inputMethod.showSoftInput(this@VtView, 0)
                 return true
             }
 
@@ -1785,15 +1614,151 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         },
     )
 
+    /** A left click at a tap, for a program tracking the mouse. */
+    private fun click(e: MotionEvent) {
+        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
+        send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    }
+
+    // ---- A mouse or touchpad ----
+
     /**
-     * The pointer [updatePointer] set, also when the system resolves it again after it was set
-     * while the mouse rests (a program's OSC 22): that event comes from no mouse, and the view's
-     * own resolution returns the pointer for mouse events only, which would leave the default
-     * arrow. A stylus keeps its own.
+     * A touchpad's swipe or pinch, which Android may deliver as touches from the mouse source
+     * (Android 14 and later classify them): not a press of a button.
      */
-    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
-        val resolved = super.onResolvePointerIcon(event, pointerIndex)
-        return if (resolved != null || event.isFromSource(InputDevice.SOURCE_STYLUS)) resolved else pointerIcon
+    private fun touchpadGesture(e: MotionEvent) = Build.VERSION.SDK_INT >= 34 &&
+            (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || e.classification == MotionEvent.CLASSIFICATION_PINCH)
+
+    /**
+     * A mouse (or touchpad) button pressed, dragged and released, for a program tracking the
+     * mouse; the first button pressed is the one reported until it is released.
+     */
+    private fun mouseButtons(e: MotionEvent) {
+        val mods = VtKeys.mods(e.metaState)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (selected || menu != null) clearSelection()
+                requestFocus()
+                mouseButton = when {
+                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
+                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
+                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
+                }
+                send(VtNative.mouse(tab, MOUSE_PRESS, mouseButton, mods, e.x, e.y, true))
+            }
+            MotionEvent.ACTION_MOVE -> if (mouseButton != 0) {
+                send(VtNative.mouse(tab, MOUSE_MOTION, mouseButton, mods, e.x, e.y, true))
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (mouseButton != 0) {
+                send(VtNative.mouse(tab, MOUSE_RELEASE, mouseButton, mods, e.x, e.y, false))
+                mouseButton = 0
+            }
+        }
+    }
+
+    /**
+     * A mouse (or touchpad) button pressed, dragged and released to select, as Ghostty does on
+     * Linux, the first button pressed owning the rest: the left one (a touchpad's tap) clicks
+     * through libghostty-vt's selection gesture, which counts the clicks (within the double-tap
+     * timeout and a cell's width): a first click clears the selection and dragging from it
+     * selects by cells (a rectangle while Ctrl+Alt is held), a second selects the word and a third
+     * the line (the command's output with Ctrl), each dragging on by its unit and scrolling past
+     * the grid's edges; Shift+press after the timeout extends the selection from the last press
+     * instead. A click that did not drag opens the link under it with Ctrl, else moves the shell's
+     * cursor there (at its prompt) and opens the keyboard, as a tap does. The right button selects
+     * the word under it unless the selection holds it and brings up the menu there. No menu comes
+     * up otherwise, and the selection shows no handles.
+     */
+    private fun pointer(e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                requestFocus()
+                pointerButton = when {
+                    e.buttonState and MotionEvent.BUTTON_SECONDARY != 0 -> MOUSE_RIGHT
+                    e.buttonState and MotionEvent.BUTTON_TERTIARY != 0 -> MOUSE_MIDDLE
+                    else -> MOUSE_LEFT // Also a touchpad's tap, which holds no button
+                }
+                if (pointerButton == MOUSE_MIDDLE) return
+                menu?.finish()
+                menuLink = null
+                menuOutput = false
+                pointerSelection = true
+                if (pointerButton == MOUSE_LEFT) pointerPress(e) else contextMenu(e)
+            }
+            MotionEvent.ACTION_MOVE -> if (pointerButton == MOUSE_LEFT && drag == DRAG_POINTER) {
+                pointerRectangle = rectangleHeld(e)
+                dragTo(e.x, e.y)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (pointerButton == MOUSE_LEFT) pointerRelease(e)
+                pointerButton = 0
+            }
+        }
+    }
+
+    private fun pointerPress(e: MotionEvent) {
+        val interval = ViewConfiguration.getDoubleTapTimeout().toLong()
+        pointerRectangle = rectangleHeld(e)
+        startDrag(DRAG_POINTER, e.x, e.y)
+        val cx = cellX(e.x)
+        val cy = cellY(e.y)
+        val py = e.y + scrollPx
+        // Shift+press extends the selection from the last press, unless it may be its next click
+        if (e.held(KeyEvent.META_SHIFT_ON) && selected && e.eventTime - lastPointerPress > interval) {
+            val extended = VtNative.mouseDrag(tab, cx, cy, e.x, py, pointerRectangle)
+            if (extended >= 0) {
+                selected = extended == 1
+                invalidate()
+                return
+            }
+        }
+        lastPointerPress = e.eventTime
+        val ctrl = e.held(CTRL_OR_META)
+        val clicks = VtNative.mousePress(tab, cx, cy, e.x, py, e.eventTime * 1_000_000, interval * 1_000_000, ctrl)
+        // The button still owns the rest of its stream, which then does nothing
+        if (clicks == 0) drag = DRAG_NONE
+        // The next frame tells whether a word or line was there
+        selected = clicks >= 2
+        invalidate()
+    }
+
+    private fun pointerRelease(e: MotionEvent) {
+        val dragging = drag == DRAG_POINTER
+        drag = DRAG_NONE
+        autoscroll = 0
+        removeCallbacks(autoscrollTick)
+        if (!dragging) return
+        val inside = e.x >= 0 && e.y >= 0 && e.x < cols * cellWidth && e.y < rows * cellHeight
+        val clicks = VtNative.mouseRelease(tab, if (inside) cellX(e.x) else -1, if (inside) cellY(e.y) else -1)
+        // A click that did not drag: Ctrl opens a link, else as a tap
+        if (clicks != 1 || e.actionMasked != MotionEvent.ACTION_UP) return
+        val link = if (e.held(CTRL_OR_META)) linkAt(e.x, e.y) else null
+        if (link != null) {
+            host.onLink(link)
+            return
+        }
+        send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
+        inputMethod.showSoftInput(this, 0)
+    }
+
+    /** Ctrl (or Meta) and Alt held: Ghostty's rectangle selection on Linux. */
+    private fun rectangleHeld(e: MotionEvent) = e.held(CTRL_OR_META) && e.held(KeyEvent.META_ALT_ON)
+
+    /** Any of the [meta] modifiers is held during the event. */
+    private fun MotionEvent.held(meta: Int) = metaState and meta != 0
+
+    /**
+     * A right-click: as Ghostty's before its context menu, the word under it is selected unless
+     * the selection holds it, and the menu comes up there once the frame has the selection.
+     */
+    private fun contextMenu(e: MotionEvent) {
+        selected = VtNative.selectContext(tab, cellX(e.x), cellY(e.y))
+        menuLink = linkAt(e.x, e.y)
+        menuOutput = VtNative.outputAt(tab, cellX(e.x), cellY(e.y))
+        menuX = e.x
+        menuY = e.y
+        menuPending = true
+        invalidate()
     }
 
     /**
@@ -1856,20 +1821,30 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         updatePointer()
     }
 
-    /** A left click at a tap, for a program tracking the mouse. */
-    private fun click(e: MotionEvent) {
-        send(VtNative.mouse(tab, MOUSE_PRESS, MOUSE_LEFT, 0, e.x, e.y, true))
-        send(VtNative.mouse(tab, MOUSE_RELEASE, MOUSE_LEFT, 0, e.x, e.y, false))
+    /**
+     * Shows a mouse over the view the pointer for its place: a hand over a link a Ctrl+click opens
+     * (without mouse tracking), else the shape the program asked for (OSC 22) as the closest of
+     * Android's system pointers. Set on the view, so it changes at once, the mouse still or not.
+     */
+    private fun updatePointer() {
+        val type = if (hoverLink && hoverCtrl && !mouseTracking) PointerIcon.TYPE_HAND else pointerType(pointerShape)
+        if (type == pointerSet) return
+        pointerSet = type
+        pointerIcon = PointerIcon.getSystemIcon(context, type)
     }
 
     /**
-     * The link at a touch that may be opened: one with a scheme in [LINK_SCHEMES] (a program's
-     * OSC 8 link can name any, other apps' deep links among them); null for none.
+     * The pointer [updatePointer] set, also when the system resolves it again after it was set
+     * while the mouse rests (a program's OSC 22): that event comes from no mouse, and the view's
+     * own resolution returns the pointer for mouse events only, which would leave the default
+     * arrow. A stylus keeps its own.
      */
-    private fun linkAt(x: Float, y: Float): String? {
-        val link = VtNative.link(tab, cellX(x), cellY(y)) ?: return null
-        return link.takeIf { link.toUri().scheme?.lowercase(Locale.ROOT) in LINK_SCHEMES }
+    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? {
+        val resolved = super.onResolvePointerIcon(event, pointerIndex)
+        return if (resolved != null || event.isFromSource(InputDevice.SOURCE_STYLUS)) resolved else pointerIcon
     }
+
+    // ---- Scrolling ----
 
     /** Scrolls by [n] rows (positive: towards the newest output), the way [scrollWay] says. */
     private fun scrollBy(n: Int, x: Float, y: Float) {
@@ -1981,14 +1956,21 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         postInvalidateOnAnimation()
     }
 
+    /**
+     * The link at a touch that may be opened: one with a scheme in [LINK_SCHEMES] (a program's
+     * OSC 8 link can name any, other apps' deep links among them); null for none.
+     */
+    private fun linkAt(x: Float, y: Float): String? {
+        val link = VtNative.link(tab, cellX(x), cellY(y)) ?: return null
+        return link.takeIf { link.toUri().scheme?.lowercase(Locale.ROOT) in LINK_SCHEMES }
+    }
+
     private fun cellX(x: Float) = floor(x / cellWidth).toInt().coerceIn(0, cols - 1)
 
     /** The row of the viewport at [y], counting the [scrollPx] (the overscan row's part as the last row). */
     private fun cellY(y: Float) = floor((y + scrollPx) / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
-        private const val TAG = "VtView"
-
         /** Shift with these keys moves a selection's end ([VtNative.selectAdjust]), as in Ghostty. */
         val ADJUSTMENTS = mapOf(
             KeyEvent.KEYCODE_DPAD_LEFT to VtNative.ADJUST_LEFT,

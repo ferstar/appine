@@ -99,9 +99,9 @@ internal object VtNative {
     /**
      * Encodes a mouse event at pixel ([x], [y]) of the grid in the program's tracking mode and
      * format: [action] 0 press, 1 release, 2 motion; [button] 0 none, 1 left, 2 right, 3 middle,
-     * 4 and 5 the wheel up and down, 6 and 7 left and right; [mods] as for [key]; [pressed] whether a button is held after this event.
-     * Empty when the program does not take it (motion is sent once per cell, and only as its
-     * tracking mode asks), null when it fails.
+     * 4 and 5 the wheel up and down, 6 and 7 left and right; [mods] as for [key]; [pressed] whether
+     * a button is held after this event. Empty when the program does not take it (motion is sent
+     * once per cell, and only as its tracking mode asks), null when it fails.
      */
     @JvmStatic external fun mouse(tab: Long, action: Int, button: Int, mods: Int, x: Float, y: Float, pressed: Boolean): ByteArray?
 
@@ -143,16 +143,7 @@ internal object VtNative {
      * selection, a second selects the word, a third the line (the command's output with
      * [output]). Returns the click count (1 to 3), 0 when it failed.
      */
-    @JvmStatic external fun mousePress(
-        tab: Long,
-        x: Int,
-        y: Int,
-        px: Float,
-        py: Float,
-        timeNs: Long,
-        intervalNs: Long,
-        output: Boolean,
-    ): Int
+    @JvmStatic external fun mousePress(tab: Long, x: Int, y: Int, px: Float, py: Float, timeNs: Long, intervalNs: Long, output: Boolean): Int
 
     /**
      * The held left button dragged on to viewport cell ([x], [y]), pixel ([px], [py]): the
@@ -320,10 +311,14 @@ internal object VtNative {
     /** Forgets a tab; a running [pump] keeps its terminal until it returns. */
     @JvmStatic external fun destroy(tab: Long)
 
-    // libghostty-vt's GhosttyCursorStyle ([setCursor])
+    // libghostty-vt's GhosttyCursorStyle ([setCursor], and a frame's cursor)
     const val CURSOR_BAR = 0
     const val CURSOR_BLOCK = 1
     const val CURSOR_UNDERLINE = 2
+
+    /** A hollow block, and vt.c's lock while the console reads a password; frames only. */
+    const val CURSOR_HOLLOW = 3
+    const val CURSOR_LOCK = 4
 
     // libghostty-vt's GhosttySelectionGestureBehavior ([gesturePress])
     const val GESTURE_WORD = 1

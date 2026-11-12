@@ -23,7 +23,7 @@ internal value class VtFrame(private val b: ByteBuffer) {
     val dirty: Int get() = b.get(4).toInt()
     val cursorShown: Boolean get() = b.get(5).toInt() != 0
 
-    /** `GhosttyCursorStyle`, or vt.c's lock ([VtRenderer.CURSOR_LOCK]). */
+    /** `GhosttyCursorStyle`, or vt.c's lock ([VtNative.CURSOR_LOCK]). */
     val cursorStyle: Int get() = b.get(6).toInt()
     val cursorBlinking: Boolean get() = b.get(7).toInt() != 0
     val cursorX: Int get() = u16(8)

@@ -10,6 +10,9 @@ import android.graphics.Typeface
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withClip
 import androidx.core.graphics.withScale
+import io.github.mthli.appine.VtRenderer.Companion.MARK_MATCH
+import io.github.mthli.appine.VtRenderer.Companion.MARK_NONE
+import io.github.mthli.appine.VtRenderer.Companion.MARK_SELECTED
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -135,17 +138,6 @@ internal class VtRenderer(
         frame.takeRows(screen) { y -> drawRow(target, y) }
     }
 
-    /** The rows as last painted, [scrollPx] above their place, clipped to the grid's whole cells. */
-    fun drawGrid(c: Canvas, scrollPx: Int) {
-        val bmp = bitmap ?: return
-        c.withClip(0, 0, screen.cols * cellWidth, screen.rows * cellHeight) {
-            c.drawBitmap(bmp, 0f, -scrollPx.toFloat(), null)
-        }
-    }
-
-    /** How wide [text] is in the regular paint (the composing text). */
-    fun advance(text: String): Float = paints[0].measureText(text)
-
     private fun drawRow(c: Canvas, y: Int) {
         val cols = screen.cols
         val cp = screen.cp
@@ -263,7 +255,7 @@ internal class VtRenderer(
         return (attrs[i - 1] shr 14) and 3
     }
 
-    private fun paintOf(i: Int): Paint = paints[(screen.attrs[i] and BOLD) or ((screen.attrs[i] and ITALIC))]
+    private fun paintOf(i: Int): Paint = paints[screen.attrs[i] and (BOLD or ITALIC)]
 
     /**
      * One cell's glyph, centred in its [span] cells: a wide one enlarged by [wideScale], and any
@@ -343,6 +335,14 @@ internal class VtRenderer(
         if (decor and OVERLINE != 0) c.drawRect(l, top.toFloat(), r, (top + light).toFloat(), fill)
     }
 
+    /** The rows as last painted, [scrollPx] above their place, clipped to the grid's whole cells. */
+    fun drawGrid(c: Canvas, scrollPx: Int) {
+        val bmp = bitmap ?: return
+        c.withClip(0, 0, screen.cols * cellWidth, screen.rows * cellHeight) {
+            c.drawBitmap(bmp, 0f, -scrollPx.toFloat(), null)
+        }
+    }
+
     /**
      * The cursor in its shape (a block hollow without the view's [focused] focus), or the lock
      * while a password is read, unless the IME is [composing]; nothing when it is hidden or outside
@@ -362,10 +362,10 @@ internal class VtRenderer(
         stroke.color = color
         when {
             // Composing text shows a block, as in Ghostty
-            s.cursorStyle == CURSOR_LOCK && !composing -> drawLock(c, l, t, r, b, color)
-            s.cursorStyle == CURSOR_BAR -> c.drawRect(l.toFloat(), t.toFloat(), (l + 2 * light).toFloat(), b.toFloat(), fill)
-            s.cursorStyle == CURSOR_UNDERLINE -> c.drawRect(l.toFloat(), (b - 2 * light).toFloat(), r.toFloat(), b.toFloat(), fill)
-            s.cursorStyle == CURSOR_HOLLOW || !focused ->
+            s.cursorStyle == VtNative.CURSOR_LOCK && !composing -> drawLock(c, l, t, r, b, color)
+            s.cursorStyle == VtNative.CURSOR_BAR -> c.drawRect(l.toFloat(), t.toFloat(), (l + 2 * light).toFloat(), b.toFloat(), fill)
+            s.cursorStyle == VtNative.CURSOR_UNDERLINE -> c.drawRect(l.toFloat(), (b - 2 * light).toFloat(), r.toFloat(), b.toFloat(), fill)
+            s.cursorStyle == VtNative.CURSOR_HOLLOW || !focused ->
                 c.drawRect(l + light / 2f, t + light / 2f, r - light / 2f, b - light / 2f, stroke)
             else -> {
                 // A block: the cell's glyph in the background colour on top
@@ -405,6 +405,9 @@ internal class VtRenderer(
         c.drawPath(shackle, lockPaint)
     }
 
+    /** How wide [text] is in the regular paint (the composing text). */
+    fun advance(text: String): Float = paints[0].measureText(text)
+
     /** The input method's composing [text] at the cursor, underlined. */
     fun drawPreedit(c: Canvas, text: String) {
         val s = screen
@@ -442,12 +445,6 @@ internal class VtRenderer(
         private const val UNDERLINE_CURLY = 3
         private const val UNDERLINE_DOTTED = 4
         private const val UNDERLINE_DASHED = 5
-
-        // GhosttyCursorStyle (and vt.c's lock)
-        private const val CURSOR_BAR = 0
-        private const val CURSOR_UNDERLINE = 2
-        private const val CURSOR_HOLLOW = 3
-        const val CURSOR_LOCK = 4
 
         /**
          * The Kitty graphics placeholder (U+10EEEE): its cells show part of an image, which the

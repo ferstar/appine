@@ -39,7 +39,7 @@ internal class VtScreen {
     var defaultBg = Color.BLACK
     var cursorColor = 0
     var cursorShown = false
-    var cursorStyle = 1
+    var cursorStyle = VtNative.CURSOR_BLOCK
     var cursorBlinking = false
     var cursorX = 0
     var cursorY = 0

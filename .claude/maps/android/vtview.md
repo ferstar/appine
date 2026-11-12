@@ -148,8 +148,7 @@ opening links (`android/terminal`).
   (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
   (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
   double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
-  invisible hides the glyph but not its decorations; blink is ignored. Every 120 frames the view
-  logs frame statistics.
+  invisible hides the glyph but not its decorations; blink is ignored.
 - The cursor (bar and underline two light lines thick, block with the glyph redrawn in the
   background colour, underline, hollow; a block is drawn hollow while the view lacks focus; all
   but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
