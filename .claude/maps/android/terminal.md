@@ -69,10 +69,11 @@ notices task and the build (`android/native`).
   touch on one key. Its companion's `FADE_DP`, `indicatorPaint`, `drawIndicator` (the indicator
   under a label) and `indicatorBounds` (where it lies, where the tab row also draws a tab's
   progress) serve the tab row too.
-- `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
+- `ProgressLine` — a 1 dp view over the top of the terminal showing the current tab's progress
   report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
   rectangle (`draw`, a fill or a sweep) and gives a report's fraction (`fractionOf`).
-- `Ui.kt` — extension functions the screens and views share (`VtView` too): `dp`, `themeColor`
+- `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
+  the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
   `selectableItemBackground`).
 - `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
@@ -287,8 +288,9 @@ notices task and the build (`android/native`).
 
 ### The progress line
 
-- The current tab's progress report is drawn by `ProgressLine`, 2 dp high over the top of the
-  terminal's first row, as Ghostty draws it: filled from the left to the percentage in the primary
+- The current tab's progress report is drawn by `ProgressLine`, as high as the tab bar's
+  indicator (`LINE_DP`, 1 dp and at least a pixel; Ghostty's is 2 points) over the top of the terminal's first
+  row, otherwise as Ghostty draws it: filled from the left to the percentage in the primary
   colour, the error colour for an error, the muted colour while paused (all of it for a pause
   without a percentage); without a percentage, or indeterminate, a quarter of its width sweeps
   across and back (1.2 s each way, ease-in-out, timed by the clock) over a track at 30% opacity,

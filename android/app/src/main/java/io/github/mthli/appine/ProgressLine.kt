@@ -12,19 +12,35 @@ import android.view.View
 import android.view.animation.PathInterpolator
 import androidx.core.graphics.ColorUtils
 import com.google.android.material.color.MaterialColors
+import io.github.mthli.appine.ProgressLine.Companion.SWEEP_MS
 
 /**
  * The line along the top of the terminal that shows the current tab's progress report (OSC 9;4)
- * as Ghostty shows it: [HEIGHT_DP] high over the terminal's first row, filled from the left to the
- * percentage in the primary colour, the error colour for an error, the muted colour while paused
- * (full when a pause gives no percentage); with no percentage, a quarter of its width sweeps
- * across and back over a faint track. It fades in and out, and a new percentage slides there. It
- * takes no touches. The android/terminal map.
+ * as Ghostty shows it, but as thin as the tab bar's indicator ([LINE_DP], half of Ghostty's 2
+ * points): over the terminal's first row, filled from the left to the percentage in the primary
+ * colour, the error colour for an error, the muted colour while paused (full when a pause gives
+ * no percentage); with no percentage, a quarter of its width sweeps across and back over a faint
+ * track. It fades in and out, and a new percentage slides there. It takes no touches. The
+ * android/terminal map.
  *
  * The companion draws progress into any rectangle, for the tab bar's marks too.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ProgressLine(context: Context) : View(context) {
+
+    /** The theme's colours for progress, on black like the terminal. */
+    class Colors(context: Context) {
+        private val primary = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorPrimary, Color.WHITE)
+        private val error = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorError, Color.RED)
+        private val muted = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnSurfaceVariant, Color.GRAY)
+
+        /** The colour of progress in [state] (a `VtSession.PROGRESS_` constant). */
+        fun of(state: Int) = when (state) {
+            VtSession.PROGRESS_ERROR -> error
+            VtSession.PROGRESS_PAUSE -> muted
+            else -> primary
+        }
+    }
 
     /** The report shown, null when none (the line may still be fading out with [drawn]). */
     private var progress: VtSession.Progress? = null
@@ -51,7 +67,8 @@ internal class ProgressLine(context: Context) : View(context) {
      * [jump] (another tab is shown).
      */
     fun show(p: VtSession.Progress?, jump: Boolean) {
-        if (p == progress) return
+        // Another tab's equal report still ends the slide and the fade in of the one before
+        if (p == progress && (!jump || p == null)) return
         progress = p
         slide?.cancel()
         if (p == null) {
@@ -59,11 +76,9 @@ internal class ProgressLine(context: Context) : View(context) {
             return
         }
         val to = fractionOf(p)
-        val from = fraction
-        if (jump || drawn == null || alpha == 0f || to < 0f || from < 0f) {
-            fraction = to
-        } else {
-            slide = ValueAnimator.ofFloat(from, to).apply {
+        // A percentage slides only from another one on the screen
+        if (!jump && drawn != null && alpha > 0f && to >= 0f && fraction >= 0f) {
+            slide = ValueAnimator.ofFloat(fraction, to).apply {
                 duration = SLIDE_MS
                 interpolator = EASE_IN_OUT
                 addUpdateListener {
@@ -72,6 +87,8 @@ internal class ProgressLine(context: Context) : View(context) {
                 }
                 start()
             }
+        } else {
+            fraction = to
         }
         drawn = p
         animate().alpha(1f).setDuration(if (jump) 0L else FADE_MS)
@@ -89,24 +106,7 @@ internal class ProgressLine(context: Context) : View(context) {
         }
     }
 
-    /** The theme's colours for progress, on black like the terminal. */
-    class Colors(context: Context) {
-        private val primary = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorPrimary, Color.WHITE)
-        private val error = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorError, Color.RED)
-        private val muted = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnSurfaceVariant, Color.GRAY)
-
-        /** The colour of progress in [state] (a `VtSession.PROGRESS_` constant). */
-        fun of(state: Int) = when (state) {
-            VtSession.PROGRESS_ERROR -> error
-            VtSession.PROGRESS_PAUSE -> muted
-            else -> primary
-        }
-    }
-
     companion object {
-        /** The line's height (dp), Ghostty's 2 points. */
-        const val HEIGHT_DP = 2
-
         /** How opaque the track under a sweep is, as Ghostty's 30%. */
         const val TRACK_ALPHA = 77
 

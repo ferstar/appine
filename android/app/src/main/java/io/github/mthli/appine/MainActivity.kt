@@ -38,6 +38,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
 import kotlin.concurrent.thread
 
 /**
@@ -202,7 +203,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             setBackgroundColor(Color.BLACK)
             addView(screen)
             addView(status)
-            addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(ProgressLine.HEIGHT_DP), Gravity.TOP))
+            addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, line(), Gravity.TOP))
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

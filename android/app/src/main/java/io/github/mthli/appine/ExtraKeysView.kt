@@ -528,9 +528,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         /** How often a held key repeats after the long-press timeout, as in Termux. */
         private const val REPEAT_MS = 80L
 
-        /** The size of the indicator (dp). */
+        /** The indicator's width (dp); it is [LINE_DP] high. */
         private const val INDICATOR_WIDTH_DP = 16
-        private const val INDICATOR_HEIGHT_DP = 1
 
         /** How far the indicator lies below its label's baseline (dp). */
         private const val INDICATOR_GAP_DP = 4
@@ -580,7 +579,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             // In whole pixels, rounded down as TabBarView's dp
             val density = label.resources.displayMetrics.density
             val width = (INDICATOR_WIDTH_DP * density).toInt()
-            val height = max(1, (INDICATOR_HEIGHT_DP * density).toInt())
+            val height = label.line()
             val left = x + (label.width - width) / 2f + dx
             val top = (y + label.baseline + (INDICATOR_GAP_DP * density).toInt()).toFloat()
             out.set(left, top, left + width, top + height)
