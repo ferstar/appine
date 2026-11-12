@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-11 (targeted verification only since the split: the transcript kept for saves, then images cut under memory pressure last)
+> Maintained: 2026-11-13 (targeted verification only since the split; latest change: zsh's prompt marks from the profile and the marks fish and nushell send themselves, in Shell integration, the partial-integration debt and the open question)
 
 ## Responsibilities
 
@@ -310,24 +310,25 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 
 ### Shell integration
 
-- The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks
-  the prompt, the typed command and the output's start; busybox ash the prompt, and the command
-  ending with its line). libghostty-vt keeps the marks in the rows and cells it writes (prompt,
-  input, output) and the cursor's place among them, which closing, jumping, Select output and taps
-  on the input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click
-  selects a command's output through libghostty-vt's selection gesture, and a right-click looks
-  for one for the menu's Select output. A shell without the marks (zsh,
-  fish, dash, a nested non-login shell, a remote one over ssh that sends none) leaves every cell
-  output: it is never at a prompt, there is nothing to jump to and no output to select, and no
-  command is timed.
+- The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks the
+  prompt, the typed command and the output's start, and so does zsh where it reads the profile;
+  busybox ash the prompt, and the command ending with its line; fish 4 and nushell send their own,
+  all four marks, fish's prompt start with `click_events=1` and nushell's with no way for taps to
+  move the cursor). libghostty-vt keeps the marks in the rows and cells it writes (prompt, input,
+  output) and the cursor's place among them, which closing, jumping, Select output and taps on the
+  input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click selects a
+  command's output through libghostty-vt's selection gesture, and a right-click looks for one for
+  the menu's Select output. A shell without the marks (zsh on Debian, dash, mksh, tcsh, elvish, a
+  nested non-login shell, a remote one over ssh that sends none) leaves every cell output: it is
+  never at a prompt, there is nothing to jump to and no output to select, and no command is timed.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
-  starts at the output's mark (bash's PS0, `C`) or, as busybox ash marks none, when a feed ends
-  with the cursor no longer at the prompt where the one before left it there (the line feed that
-  ends the typed input, but also output of a background job at the prompt); it finishes at the
-  command end (`D` with the exit code) the next prompt sends, and a primary prompt's start
-  without one forgets it. A command end with nothing timed (a prompt drawn again after a resize,
-  Ctrl-C at the prompt) reports nothing. The pump hands the last finished command of a read to
-  `VtSession.onCommandFinished`, and the service notifies for one that ran at least 10 s in a tab
+  starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
+  none, when a feed ends with the cursor no longer at the prompt where the one before left it there
+  (the line feed that ends the typed input, but also output of a background job at the prompt); it
+  finishes at the command end (`D` with the exit code) the next prompt sends, and a primary prompt's
+  start without one forgets it. A command end with nothing timed (a prompt drawn again after a
+  resize, Ctrl-C at the prompt) reports nothing. The pump hands the last finished command of a read
+  to `VtSession.onCommandFinished`, and the service notifies for one that ran at least 10 s in a tab
   not in front (android/service).
 - At the prompt (`VtNative.atPrompt`, libghostty-vt's cursor-at-prompt: the cursor in a prompt or
   the input after it, on the primary screen): `VtSession.busy` is false and closing asks nothing.
@@ -524,7 +525,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 - With prompt marks, every resize while the cursor is at a prompt (the keyboard showing or hiding
   is one) clears the prompt's rows, from its first row down, for the shell to redraw them on
   SIGWINCH (bash's marks ask for the last row only, `redraw=last`, as readline redraws). busybox
-  ash and bash redraw on every resize, rows only included; a shell given the marks that did not
+  ash, bash and zsh redraw on every resize, rows only included; a shell given the marks that did not
   would lose its prompt and typed input until the next one.
 - Shell integration lives in the guest (`/etc/profile.d/appine.sh`): a tab's behaviour (closing
   without asking, jumps, Select output) follows whatever the shell in it sends, so a user's own
@@ -535,14 +536,16 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 
 ## Confirmed bugs / technical debt
 
-- **Shell integration is partial**: only bash and busybox ash get prompt marks (not zsh, fish or
-  nested non-login shells); ash's mark the typed command as ending with its line, so the rows of a
-  command longer than the screen's width after the first count as output (ash breaks such lines
-  itself), and with the cursor on one of them a tap moves nothing, ash marks no output start, so a
-  background job's output at its prompt starts the next command's timing early, and a PS1 set
-  after the profile (ash's `~/.profile`) has none; and the progress and status records still go by
-  the foreground process group rather than the next prompt, though the OSC 133 callback is now set
-  (for command timing only).
+- **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
+  (not for nested non-login shells, or zsh on Debian, whose zprofile does not read `/etc/profile`;
+  fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
+  of several lines are not continuation rows; ash's mark the typed command as ending with its line,
+  so the rows of a command longer than the screen's width after the first count as output (ash
+  breaks such lines itself), and with the cursor on one of them a tap moves nothing, ash marks no
+  output start, so a background job's output at its prompt starts the next command's timing early,
+  and a PS1 set after the profile (ash's `~/.profile`) has none; and the progress and status records
+  still go by the foreground process group rather than the next prompt, though the OSC 133 callback
+  is now set (for command timing only).
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),
   XTCHECKSUM and window resizing (CSI 8 t) are left unanswered, as Ghostty's defaults leave them
   (`enquiry-response` empty, `title-report`, `vt-xt-checksum-report` and
@@ -566,10 +569,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 
 - Should a status notification name the record's `app` when it has no title, as a key for grouping
   (the specification says it is not a label), rather than the tab's title?
-- Should zsh and fish get prompt marks too (Ghostty's bash script, derived from Kitty's, is
-  GPLv3; its zsh and fish scripts' licences were not checked), and should a background tab's
-  progress and status be dropped at the next prompt mark rather than when the foreground group
-  changes?
+- Should zsh on Debian get prompt marks too (the app would have to write or inject a zprofile), and
+  should a background tab's progress and status be dropped at the next prompt mark rather than when
+  the foreground group changes?
 - Should the menu's Reset terminal also drop the tab's progress and status records, as a program's
   RIS does?
 
@@ -578,8 +580,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 - Tried only on a Pixel 4a API 34 emulator (4 KB pages) and through vt.c's harnesses on a macOS
   build, where the figures for scrollback rows and memory also come from; not on real or 16 KB-page
   devices. Unverified beyond that:
-  - shell integration: bash's marks in the app (seen only in a container); the console's password
-    state at sudo, passwd, ssh or doas prompts;
+  - shell integration: bash's and zsh's marks in the app, and those fish 4.6 and nushell 0.104 send
+    themselves (all seen only in containers); the console's password state at sudo, passwd, ssh or
+    doas prompts;
   - output: progress and status from real programs (cargo, systemd, AI coding CLIs); the copy toast
     on Android 12 and earlier; tmux -CC with versions other than 3.5a and 3.7c; how programs that
     probe for the Glyph Protocol fall back;

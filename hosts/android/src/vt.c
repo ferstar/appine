@@ -653,12 +653,12 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
   vt->statuses.len += STATUS_HEADER_BYTES + id + title + message;
 }
 
-// OSC 133: a command starts when the shell marks its output's start (bash's PS0) or, as busybox ash
-// marks none (its input ends at the line feed), when the cursor leaves the prompt
-// (appine_vt_feed), which output of a background job at the prompt does too; it finishes at the
-// command end the next prompt reports, with the exit code (both shells send it). Only a command
-// that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the prompt) reports
-// a command end too, with none running
+// OSC 133: a command starts when the shell marks its output's start (bash's PS0, zsh's preexec)
+// or, as busybox ash marks none (its input ends at the line feed), when the cursor leaves the
+// prompt (appine_vt_feed), which output of a background job at the prompt does too; it finishes at
+// the command end the next prompt reports, with the exit code (every marked shell sends it). Only
+// a command that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the
+// prompt) reports a command end too, with none running
 static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
                                const GhosttyTerminalSemanticPrompt *e) {
   (void)t;
@@ -1309,10 +1309,10 @@ void appine_vt_scroll(AppineVt *vt, int32_t delta) {
 
 // ---- Shell integration ----
 //
-// The shells' prompt marks (OSC 133, sent by /etc/profile.d/appine.sh for bash and busybox ash)
-// tell libghostty-vt which rows are prompts and which cells are a prompt, the input typed at it or
-// a command's output. Without them there are no prompts: the cursor is never at one, there is
-// nothing to scroll to, and no output to select.
+// The shells' prompt marks (OSC 133, sent by /etc/profile.d/appine.sh for bash, busybox ash and
+// zsh) tell libghostty-vt which rows are prompts and which cells are a prompt, the input typed at
+// it or a command's output. Without them there are no prompts: the cursor is never at one, there
+// is nothing to scroll to, and no output to select.
 
 // Whether the cursor is at the shell's prompt or in the input typed at it, on the primary screen:
 // no command runs in the foreground, as far as the marks tell (closing the tab then ends nothing

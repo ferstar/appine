@@ -718,7 +718,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
 /// was last reported no longer is.
 ///
 /// That stands in for the shell's next prompt (OSC 133), which only some shells mark (the guest's
-/// login shells, bash and busybox ash, android/setup): the program status specification drops a
+/// login shells, bash, busybox ash and zsh, android/setup): the program status specification drops a
 /// program's `working` and `blocked` records when the next prompt starts or the program exits.
 /// Without it, a program that exits without clearing them
 /// (killed, or interrupted with Ctrl-C) would leave its tab working forever. The group is the one

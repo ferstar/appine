@@ -249,8 +249,8 @@ internal object Rootfs {
 
     /**
      * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
-     * language environment variables, and gives bash and busybox ash a coloured prompt with shell
-     * integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
+     * language environment variables, and gives bash, busybox ash and zsh a coloured prompt with
+     * shell integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
      * android/vt map). Which directory the shell starts in is decided by the assets'
      * `login.sh` (restored tabs start in their original directory, the android/service map, new
      * tabs in the current tab's, the android/terminal map).
@@ -446,11 +446,13 @@ netns = "host"
     /**
      * The sha256s of the assets' `profile.sh` as later versions replaced it, whose texts (shell
      * code full of `$`) are not kept here: the first with prompt marks, until taps on the prompt
-     * moved the cursor. A change to `profile.sh` adds the sha256 of the text it replaces
+     * moved the cursor, and the one that marked them for bash and busybox ash only, until zsh got
+     * its marks. A change to `profile.sh` adds the sha256 of the text it replaces
      * (`git show HEAD:android/app/src/main/assets/profile.sh | shasum -a 256` before committing).
      */
     private val REPLACED_PROFILES = setOf(
         "4a35d44e55e23aaf94543d87dc02deafcc7b324902e90ae18872fe20242642fc",
+        "d4daedd69558e1efe41b143f71b74b67708388299584706a9bf55052a7fc3f21",
     )
 
     /**

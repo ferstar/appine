@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the mirror is written once after an import into untouched sources; Settings' mirror row, the manual choice and the mirror records are gone)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: the profile's zsh branch and its prompt marks, and the sha256 of the profile it replaces)
 
 ## Responsibilities
 
@@ -128,8 +128,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
     http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
     `/etc/profile.d/appine.sh` (the assets' `profile.sh`: motd, `TERM`, `LANG`,
-    `NMAP_UNPRIVILEGED`, and for bash and busybox ash only a coloured prompt with prompt marks,
-    below; other shells keep the distro's prompt);
+    `NMAP_UNPRIVILEGED`, and for bash, busybox ash and zsh only a coloured prompt with prompt
+    marks, below; other shells keep the distro's prompt);
   - Alpine: `hosts` only when absent (the minirootfs ships one, so nothing is written), and no
     `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
     missing);
@@ -169,10 +169,23 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - busybox ash, which has no hook before a command or a prompt: PS1 itself carries D with `$?`
     (expanded at each prompt and redraw), A with `cl=line`, and after the prompt I (the input ends
     with its line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
-  - `cl=line` tells the terminal that both line editors move the cursor with the left and right
-    arrows, so a tap on the typed command moves the cursor there.
+  - zsh: `__appine_precmd`, appended to `precmd_functions`, prints D with the status before each
+    prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
+    marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
+    theme's own hook sets is wrapped (a theme setting PS1 before each prompt gets its first prompt
+    unmarked); `__appine_preexec`, appended to `preexec_functions`, prints the output's start (C).
+    A and B are in PS1, so every redraw by zle sends them again; D is sent once per prompt.
+  - `cl=line` tells the terminal that the three line editors move the cursor with the left and
+    right arrows, so a tap on the typed command moves the cursor there.
 - Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
-  for others); nested non-login shells and other shells get no marks.
+  for others) when the shell reads `/etc/profile`: zsh does only where its `/etc/zsh/zprofile`
+  sources it (Alpine's does, in sh emulation; Debian trixie's does not, so zsh there has no marks
+  unless the user's `~/.zprofile` sources `/etc/profile.d/appine.sh`). Nested non-login shells and
+  other shells get no marks from it (fish and nushell send their own, android/vt), and shells that
+  do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
+  environment (android/vt), but show no motd.
+- ash, bash and dash parse the zsh branch too, so what only zsh understands (the hook arrays) is
+  inside `eval`.
 
 ### Mirrors
 
@@ -295,7 +308,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
   the version they have; and the motd is written only at import, so it is never updated.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
-  rows on a resize; android/vt): bash and busybox ash do.
+  rows on a resize; android/vt): bash, busybox ash and zsh do.
 - The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
   trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
 - `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
@@ -327,3 +340,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
   26.04's bash 5.3; busybox ash's in the app and an instrumentation test), and with a
   `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
+- The profile's zsh marks in the app (tried only in a Docker container with Alpine's zsh 5.9 under
+  a pty: the marks, a theme-like hook setting PS1, redraws on resizes), and with a right prompt
+  (its cells follow B, so they count as input), a PS1 of several lines (rows after the first are
+  not marked as continuation rows), `prompt_percent` unset, or a prompt framework (oh-my-zsh,
+  powerlevel10k).

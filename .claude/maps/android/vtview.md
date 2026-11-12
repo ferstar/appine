@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-12 (targeted verification only since the split; latest change: VtView's frame reading, screen mirror, drawing and images moved into VtFrame, VtScreen, VtRenderer and VtImages)
+> Maintained: 2026-11-12 (targeted verification only since the split; latest change: the profile sends `cl=line` from zsh too)
 
 ## Responsibilities
 
@@ -456,7 +456,7 @@ select a command's output and move the cursor by taps:
   from the OSC string (the C API does not expose the value libghostty-vt keeps) and holds until
   another declares a way or a full reset: Kitty's `click_events=1` or `2` (fish's) first, else
   `cl=` (`line`, or `m`, `v` and `w`, which Ghostty treats as line too; the profile sends
-  `cl=line` from bash and ash); an option with a value it does not know is ignored like a missing
+  `cl=line` from bash, ash and zsh); an option with a value it does not know is ignored like a missing
   one, so the way the last prompt declared stays, and only OSC strings of at most 64 bytes, not
   cancelled, are read. A tap without mouse tracking that is not on a link, or a mouse's left click
   (without tracking, or with Shift) that did not drag and is no Ctrl+click on a link, with the
