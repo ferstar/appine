@@ -3,9 +3,7 @@
 > Static understanding snapshot, not a decision history.
 > See `.claude/decisions/android/setup.md` for the paired decision history.
 >
-> Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 4 confirmed and 1 partial; bugs and debts recorded)
->
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: NOPASSWD rules and admins; mirrors; downloads and resumed imports; podman setup; prompt marks and replaced versions; cursor settings; display size recreation last)
+> Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 
 ## Responsibilities
 
@@ -13,12 +11,12 @@
 
 - the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
   importing them into a new store, and writing first-boot configuration;
-- files refreshed before every kernel start (network interfaces, the bundled doas package, the
-  profile script with its prompt marks for the terminal's shell integration) and the osclock
-  script run before boot;
+- files refreshed before every kernel start (network interfaces, rootless podman's network, the
+  bundled doas package, the profile script with its prompt marks for the terminal's shell
+  integration), the osclock script run before boot and the boot log's failed services;
 - package mirrors: built-in lists, speed probes, rewriting the sources file;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
-  admin setup;
+  admin setup and the NOPASSWD rules;
 - the settings screen, which only displays the service's state and forwards choices;
 - the store lock shared by the kernel start, store deletion and the Files provider.
 
@@ -26,76 +24,133 @@ Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsAct
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
 `scripts/fetch-rootfs`.
 
-Outside the module: when imports, switches and logins happen (`android/service`); the import and
-`write_file`/`read_file` implementations (`kernel/store`, `kernel/vfs`); bundling the assets
-(`android/native`).
+Outside the module: when imports, switches, restarts and logins happen, and the `settings`
+preferences (`android/service`); the import and `write_file`/`read_file` implementations
+(`kernel/store`, `kernel/vfs`); bundling the assets (`android/native`); the shared page layouts and
+the licences (`android/terminal`); what the terminal does with the prompt marks (`android/vt`,
+`android/vtview`).
 
 ## Key types
 
-- `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe), `Download`
-  (urls, sha256, size), `Cancelled`, `Account`, `access` (a `ReentrantReadWriteLock`).
-- Preferences: file `rootfs` (`distro`, `mirror`, `mirror_manual`); file `settings` (`tier`, read
-  by debug builds only; `login`, `keep_awake`, `system_documents`, `fill_wide`, `cursor_style` (a
-  Ghostty `cursor-style` name: `block`, the default, `bar` or `underline`), `cursor_blink`).
-- `SettingsActivity` — an `AppCompatActivity` on the Material 3 page that it shares with the
-  licenses (`android/terminal`'s `page.xml`, `list_item.xml`, `list_header.xml`); rows in groups
-  under headings: System (distro, mirror, login account, reset), Android (keep-awake, system
-  documents), Terminal (CJK characters filling two cells, the cursor's shape and whether it
-  blinks, `android/vtview`), Debugging (tier, debug builds only) and About (licenses).
-- `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console.
+- `Rootfs` — object: `Distro` (`ALPINE`, `DEBIAN`: label, download, mirrors, probe path),
+  `Download` (urls, sha256, size), `Cancelled` and the private `Oversize` (both `IOException`s),
+  `Account` (name, uid, gid, home from `/etc/passwd`), `access` (a `ReentrantReadWriteLock`).
+  - `ALPINE`: labelled with the branch the APK bundles (`BuildConfig.ALPINE_BRANCH`); no download;
+    mirrors are URLs ending in `/alpine` (dl-cdn, Tsinghua, USTC, Aliyun), probed at the branch's
+    `main/aarch64/APKINDEX.tar.gz`.
+  - `DEBIAN`: "Debian 13"; one pinned GitHub URL (debuerreotype's `debian:trixie`) with fixed
+    length and sha256; mirrors are host names (deb.debian.org, Tsinghua, USTC, Aliyun), probed at
+    `debian/dists/trixie/InRelease` over https.
+  - The first mirror of each list is the official one: the import writes it, and probing falls
+    back to it.
+- Preferences: file `rootfs`, owned here (`distro`, `mirror`, `mirror_manual`); the `settings`
+  file is android/service's `Settings` (`tier`, read by debug builds only; `login`, `keep_awake`,
+  `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
+  which Settings shows through the service.
+- `SettingsActivity` — an `AppCompatActivity` and `TerminalService.Listener` on the Material 3
+  page that it shares with the licenses (`android/terminal`'s `page.xml`, `list_item.xml`,
+  `list_header.xml`); `Row` (title, summary, an optional display-only `MaterialSwitch`,
+  `set(text, enabled, checked)`). Rows in groups under headings: System (distro, mirror, login
+  account, reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
+  cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (tier,
+  debug builds only) and About (licenses).
+- `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
+  without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
   `/etc/profile.d/appine.sh`; `Rootfs` keeps the texts of the versions without prompt marks
   (`OLD_PROFILE`, `UNMARKED_PROFILE`) and the sha256s of the later ones (`REPLACED_PROFILES`) to
   recognise them.
+- Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
+  and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
+  (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`.
 
 ## Public entry points
 
-- `Rootfs.prepare(distro)`, `download`, `fetch`, `isReady`, `installed`, `reset`, `configure`,
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`,
-  `PREFER_OSCLOCK`, `failedServices`,
-  `chooseMirror`, `setMirror`, `retarget`, `loginAccount`, `regularAccounts`.
-- `scripts/fetch-rootfs` (build-time download of the Alpine minirootfs and the doas package).
+- `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
+  `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
+  `updateProfile`; around boot: `PREFER_OSCLOCK`, `failedServices`.
+- Mirrors: `chooseMirror`, `setMirror`, `retarget`, `mirror`, `isMirrorManual`, `host`.
+- Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
+- `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the doas
+  package into `target/rootfs` by default).
 - `login.sh` arguments: login setting (`auto`, `root` or an account name) and an optional start
-  directory.
+  directory; or `--refresh-rules`.
+- `SettingsActivity`, opened from the terminal's ⋮ menu (not exported).
 
 ## Data flow / lifecycle
 
 ### Tarballs
 
-- Alpine: `scripts/fetch-rootfs` downloads the minirootfs and the doas package at build time (pinned
-  version and sha256; the GPG signature is checked when gpg is available); Gradle bundles them as
-  `rootfs.tgz` and `doas.apk`; `prepare` copies the asset to the cache.
-- Debian: one pinned GitHub URL (debuerreotype `debian:trixie`) with fixed length and sha256.
-  `fetch` probes sources when there are several, writes `.part` while hashing, resumes with `Range`
-  up to 5 times when an attempt made progress (restarting on a non-206 reply), stops at once (no
-  resume) when a source sends more than the pinned length, checks length and sha256, and renames;
-  a verified cached tarball is reused; cancellation is checked before each read.
+- Alpine: `scripts/fetch-rootfs` downloads the doas package (checked by its pinned sha256 only)
+  and, unless a copy with the pinned sha256 is already there, the minirootfs: its GPG signature is
+  checked when both gpg and gpgv are installed (a failed signature download counts as bad; without
+  gpg a warning), then its pinned sha256. Gradle bundles the newest fetched files by version
+  (`BuildConfig.ALPINE_BRANCH` is taken from the name, `edge` without one) as `rootfs.tgz` and
+  `doas.apk` without checking them again, and fails without them; `prepare` copies the asset to
+  the cache.
+- Debian (`download`): a cached `cacheDir/<distro>.tar.gz` with the pinned length and sha256 is
+  reused; else `fetch` tries the sources in order (probed by speed when there are several; Debian
+  has one), checking for cancellation before each, moving to the next on any error but a cancel,
+  and throwing the last error.
+- One source: 30 s timeouts; written to `.part` while hashing (64 KiB reads, cancellation checked
+  before each, progress every 0.5%); an attempt that failed after getting data is resumed with
+  `Range` up to 5 times, and one that got none ends the source. A resume answered with anything but
+  206 starts again from zero, so an error status on a resume restarts the download too and uses up
+  a resume. More than the pinned length stops the source at once (no resume). Length and sha256
+  are checked and `.part` is renamed into place; any other exit deletes `.part` (a kill can leave
+  it), and every call starts from zero, truncating it, so nothing resumes across calls or kills. A
+  206 reply's range is not checked; the final hash catches a wrong one.
+- A switch's download can be cancelled (between reads; a blocked connect or read waits for its
+  timeout); a download inside `prepare` cannot.
 
 ### Import
 
-- `prepare`: record the distro it imports (`commit`), delete `rootfs.tmp`, import into it,
-  `configure`, record the distro and its first mirror in preferences (`commit`), sync the store,
-  rename to the real store, fsync `files/` and only then delete the tarball. A store without a
-  distro record counts as Alpine. While there is no store, the record names the distro an import
-  was last started for (`importing`; Alpine when there is none), which the service imports at the
-  next launch.
-- `configure` writes: package sources (apk `main` and `community`; Debian deb822 over http for
-  trixie, -updates, -security), `hostname`, `hosts` (Alpine only when absent, Debian always),
-  Debian's `resolv.conf` pointing at the DNS stub, `motd`, and `/etc/profile.d/appine.sh` (the
-  assets' `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, and for bash and busybox ash
-  only a coloured prompt with prompt marks, below; other shells keep the distro's prompt).
-- Before every start: a loopback-only `/etc/network/interfaces` when absent;
+- `prepare` (does nothing for a ready store, one whose `meta.db` exists):
+  1. for the app's store, commit the distro it imports (`distro`);
+  2. delete `<store>.tmp`;
+  3. get the tarball into the cache: Alpine's asset copied over it, unchecked; others through
+     `download`;
+  4. import into `<store>.tmp` (`Native.importRootfs`) and `configure` it;
+  5. for the app's store, commit the distro, its first mirror and `mirror_manual = false`;
+  6. sync the store (`syncfs`), rename it to the real store, fsync `files/` (a failure only
+     logged) and only then delete the tarball.
+- `installed` is the recorded distro of a ready store (Alpine when there is no record); while
+  there is no store, `importing` names the distro an import was last started for (Alpine when
+  there is none), which the service imports at the next launch. `reset` deletes `rootfs.tmp` and
+  the store under the write lock and leaves the preferences and the cache alone.
+- `configure` writes, with mode 0644 for new files (an overwritten file keeps its mode, and an
+  existing entry that is not a regular file fails the import):
+  - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
+    http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
+    `/etc/profile.d/appine.sh` (the assets' `profile.sh`: motd, `TERM`, `LANG`,
+    `NMAP_UNPRIVILEGED`, and for bash and busybox ash only a coloured prompt with prompt marks,
+    below; other shells keep the distro's prompt);
+  - Alpine: `hosts` only when absent (the minirootfs ships one, so nothing is written), and no
+    `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
+    missing);
+  - Debian: `hosts` and `resolv.conf` (the DNS stub) always.
+
+### Before every start and boot
+
+- On the start thread, after an import and the start of its mirror probe when there is one, in
+  this order, before the kernel starts under the write lock: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent
   (rootless podman's pasta and slirp4netns need a TUN device Appine lacks; only rootless podman
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
-  `doas.apk` into `/var/cache/appine/`; a profile left exactly as an earlier version wrote it
-  (with `cd "$HOME"`, without prompt marks, or with marks that do not declare `cl=line`) replaced
-  by the current one, an edited one kept.
-  Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
+  `doas.apk` into `/var/cache/appine/`, rewritten at every start; a profile left exactly as an
+  earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
+  declare `cl=line`) replaced by the current one, an edited one kept and a missing one not
+  recreated. The first two apply to every distro. A failed write in any of them fails the start.
+- Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
-- Before boot (`PREFER_OSCLOCK`): with OpenRC installed and no clock service in any runlevel, add
-  osclock to boot.
+- On the boot thread, which runs while tabs can already log in (a restored tab starts its shell
+  when first shown): `PREFER_OSCLOCK`, without a console, adds osclock to the boot runlevel when
+  `rc-update` and the osclock service exist and no runlevel has hwclock, osclock or swclock (a
+  dangling link counts); the thread waits for it, ignores its exit status and only logs an
+  exception. After boot, `failedServices` lists the services `/var/log/boot.log` says failed to
+  start, for the service's notification.
 
 ### Prompt marks
 
@@ -105,7 +160,8 @@ Outside the module: when imports, switches and logins happen (`android/service`)
     prompt, the last command's end with its status (D) and the prompt's start on a fresh line (A,
     `redraw=last;cl=line`), and wraps PS1 (P with `k=i` … B, the input starting) and PS2 (`k=s`),
     and appends the output's start (C) to PS0, each again whenever it is missing, so a PS1 that
-    `~/.bashrc` or anything later sets is wrapped from the next prompt on;
+    `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later plain assignment
+    to `PROMPT_COMMAND` drops the function and with it every mark;
   - busybox ash, which has no hook before a command or a prompt: PS1 itself carries D with `$?`
     (expanded at each prompt and redraw), A with `cl=line`, and after the prompt I (the input ends
     with its line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
@@ -116,54 +172,89 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ### Mirrors
 
-- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After an import the service
-  probes them concurrently (up to 512 KB or 5 s each, by throughput) and writes the fastest unless
-  the user chose one; manual choice and automatic writes are serialised by one lock. The recorded
-  mirror changes only after the sources were written (a write that fails leaves both alone).
-- `retarget` rewrites only built-in mirror hosts (http or https, commented lines too), keeps the
-  scheme and the rest of each line, and leaves other sources alone; a missing sources file is
-  written from the template; a file with no built-in mirror is left alone with a hint.
+- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After an import, on the
+  `appine-mirrors` thread, and when Settings picks "Fastest (measured)", `chooseMirror` clears the
+  manual flag, probes every mirror at once (one thread each, up to 512 KB or 5 s each, waiting at
+  most 10 s for each result), and takes the highest throughput (ties to the earlier mirror). If
+  every probe failed it writes and records nothing (the manual flag already cleared); otherwise,
+  under the `Rootfs` monitor, it writes the winner unless a manual choice was recorded meanwhile.
+- A manual choice (`setMirror`, on the service's worker) writes and records the mirror as manual
+  under the same monitor. Neither path takes the store lock.
+- Writing (`writeMirror`): a missing sources file is written from the template; otherwise
+  `retarget` rewrites the built-in mirror part of each line (Alpine's host and `/alpine`, Debian's
+  host with any path), keeping the scheme and the rest of each line, commented lines included, and
+  leaving other sources alone, and the file is written only when the text changed. Only the
+  distro's own sources file (`/etc/apk/repositories` or `debian.sources`) is touched. The
+  recorded mirror changes only after the write; a write that fails leaves both alone, and is only
+  logged.
+- A file with no built-in mirror is left alone: a Settings action then toasts a hint, while the
+  probe after an import ignores it.
+- Every import records the official mirror again and clears the manual flag; `mirror` is null
+  while there is no store.
 
 ### Accounts and login
 
-- `loginAccount`: `auto` is the regular account (UID 1000–65533, a real login shell) with the
-  lowest UID, else root; `root`; or a named passwd entry, falling back to root.
-- `login.sh` traps SIGINT for itself, picks the account the same way, and:
-  - every login, root's included: rewrite `/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`
-    with NOPASSWD lines for recorded admins still in the group that have no password: a shadow
-    field that, after any leading `!`s, is empty or `*` (`adduser -D` writes `!`); `passwd -l`'s `!`
-    before a hash still counts as a password, and so do a missing shadow entry and an unreadable
-    `/etc/shadow`; the file is written beside it and renamed into place;
+- `loginAccount`: `auto` is the regular account (UID 1000–65533, a shell other than empty,
+  `nologin` or `false`) with the lowest UID, else root; `root`; or a named passwd entry, falling
+  back to root. `regularAccounts` lists the same accounts for Settings. `login.sh` picks the
+  account by the same rules, except that it does not require a numeric GID or all seven fields.
+- `login.sh` traps SIGINT, so Ctrl-C does not end the login but still interrupts the command
+  running (normally apk or apt, skipping the install until the next login), chooses wheel, doas and
+  `/etc/doas.d/30-appine.conf` on Alpine (`/etc/alpine-release`), else sudo, sudo and
+  `/etc/sudoers.d/appine`, picks the account, and:
+  - every login, root's included: rewrite the NOPASSWD rules for recorded admins still in the
+    group that have no password: a shadow field that, after any leading `!`s, is empty or `*`
+    (`adduser -D` writes `!`); `passwd -l`'s `!` before a hash still counts as a password, and so
+    do a missing shadow entry and an unreadable `/etc/shadow`. The file is written beside it,
+    made 0440 and renamed into place; with nobody qualifying, or without the rules' directory
+    (on Debian, until sudo is installed), it is deleted;
   - `--refresh-rules` as the first argument only rewrites the rules: `Rootfs.dirsChanged` runs
     it as root, without a console and without waiting, when the service's poll finds `/etc`
-    among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
+    itself among the directories the guest changed (`passwd`, `chpasswd` and `adduser` replace
     `/etc/shadow`; group changes replace `/etc/group`), so a password set in a running session
     makes escalating ask for it within about one poll (2 s);
-  - root: `cd` to the directory and `exec` root's passwd shell as a login shell;
-  - a regular account the first time (not in `/var/lib/appine/admins`, matched literally): add it
-    to wheel (Alpine, with `permit persist :wheel`) or sudo (Debian) and record it once it really is
-    in the group (otherwise say so and retry at the next login), install doas from the bundled
-    package and re-add it by name, or install sudo from the network showing apt's progress (Ctrl-C
-    skips until the next login); marker files stop reinstalls;
+  - root: `cd` to the directory (else root's home, else `/`) and `exec` root's passwd shell (or
+    `/bin/sh` when it is not executable) as a login shell;
+  - a regular account not yet in `/var/lib/appine/admins` (matched literally): add it to wheel
+    (Alpine, with `permit persist :wheel` in `20-wheel.conf`) or sudo (Debian) and record it once
+    it really is in the group (otherwise say so and retry at the next login);
+  - a regular account, while the tool's marker is missing and the tool is not on PATH (whether or
+    not the account was just made an admin): install doas from the bundled package and re-add it
+    by name, or sudo from the network showing apt's progress (Ctrl-C skips until the next login),
+    and touch the marker once the tool is there;
   - switch with `su <account> -c '<cd dir or home>; exec "$SHELL" -l'` (`--session-command` when
     util-linux su offers it); package commands read from `/dev/null` so early typing reaches the
     shell.
 
 ### Settings
 
-- Every row reads the service's state and calls it; rows that need a running kernel (mirror, tier)
-  are disabled otherwise; distro and reset stay usable after a start failure; a running download
-  turns the distro row into "cancel".
-- The tier row exists only in a debug build (`BuildConfig.DEBUG`); a release build has no way to
-  choose and always runs Tier 1.
-- The terminal's rows are usable at any time: the cursor shape is a choice of Block, Bar and
-  Underline (the summary names the current one), blinking a toggle (on by default); the service
-  gives every tab the new values at once (android/service).
+- Binding: `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
+  renders, shows a pending notice and loads the regular accounts on a background thread, again
+  when the kernel is ready. `onSettingsChanged` renders; `onProgress`, `onRestarting` and
+  `onExitAll` finish the screen, so a switch, reset or restart goes back to the terminal, which
+  shows the progress.
+- Every row reads the service's state and calls it:
+  - distro: usable during a switch (it then cancels the download, after a confirmation) or when a
+    switch is possible, a start failure included; choosing another distro or Reset asks first;
+  - mirror: only while the kernel runs with no switch and no probe running; "Fastest (measured)"
+    or one host; the summary names the host, marked as measured unless chosen by hand;
+  - login account: whenever a store is installed and no switch runs, with a toast naming the
+    account new tabs log in as;
+  - reset: whenever a switch is possible;
+  - tier (debug builds only, `BuildConfig.DEBUG`; a release build always runs Tier 1): while the
+    kernel runs with no switch, a different tier asking to restart;
+  - keep-awake, system documents, CJK fill, cursor shape (Block, Bar or Underline, the summary
+    naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
+    by default): usable at any time; the service gives every tab the new cursor values at once
+    (android/service), and the terminal reads the CJK and volume-key values itself
+    (android/terminal).
+- Before the service is bound the rows are enabled with empty summaries; mirror (with a store
+  installed) and reset can then open dialogs, whose choice does nothing only if the service is
+  still unbound when it is made. The licenses row is always usable.
 - Display: a row is a title over its value or description; a toggle row adds a `MaterialSwitch`
   that only shows the state (tapping the row toggles, and accessibility services see the row as a
   switch), whose first state jumps into place instead of sliding; a disabled row is drawn at 38%
-  opacity. Choices and confirmations are `MaterialAlertDialogBuilder` dialogs; the login change is
-  a toast.
+  opacity and takes no taps. Choices and confirmations are `MaterialAlertDialogBuilder` dialogs.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
   (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
   handles neither `uiMode` nor `density`), which rebinds and renders again and drops an open
@@ -173,26 +264,36 @@ Outside the module: when imports, switches and logins happen (`android/service`)
 
 ### Inbound
 
-- `TerminalService` (start, switch, mirrors, login, tier), `Documents` (`loginAccount`, `installed`,
-  `access`), `ConsolePty` (runs `login.sh`), `MainActivity` (opens Settings).
+- `TerminalService` (start, import, switch, reset, mirrors, per-start files, boot, the poll's
+  `dirsChanged`, login accounts), `Documents` (`loginAccount`, `installed`, `isReady`, `access`),
+  `ConsolePty` (runs `login.sh`), `MainActivity` (opens Settings), the instrumentation tests
+  (`fetch`, `prepare` into another store, `retarget`, `updateProfile`, `PREFER_OSCLOCK`).
 
 ### Outbound
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
-  symlinks), `readFile` (null when missing); `HttpURLConnection` (system proxy); `BuildConfig`
-  (Alpine branch); the assets; `LicensesActivity`.
+  symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
+  proxy); `BuildConfig` (Alpine branch, debug); the assets; `TerminalService` and its
+  `Listener` (Settings); `LicensesActivity`; Material Components and AndroidX (Settings).
 
 ## Invariants and gotchas
 
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
-  mirror-probing thread reads and writes the sources without the lock; it writes only after its
-  probes finish (seconds later, never offline) and only after a fresh import, so an overlap with the
-  kernel's open is unlikely and would skip a cleanup that has nothing to clean.
+  mirror writes, the import (on `rootfs.tmp`) and the per-start files run without it.
+- Only a distro switch's `replace` joins the mirror thread, so a probe (after an import, or
+  "Fastest" from Settings before a restart) can write the sources while the next kernel opens the
+  store. Each write opens its own store connection: at worst the kernel then skips one boot
+  cleanup (the store's leftovers under `/dev/shm` and `/run`, hidden by the tmpfs mounts, and
+  orphaned objects reclaimed later), with no corruption.
+- A store becomes ready only when the synced import is renamed into place, so a half-imported
+  `rootfs.tmp` never counts and is deleted by the next `prepare` or `reset`.
 - An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
   distro on the next launch, from the verified tarball still in the cache or by downloading it
   again with the usual progress; if that fails, the service falls back to Alpine with its notice.
-- Preferences are written before the rename, so an existing store always has its distro record.
+- Preferences are written before the rename, so an existing store always has its distro record;
+  only the app's own store writes them, but an import into another store (only the
+  instrumentation tests make one) still overwrites (Alpine) and deletes the shared cached tarball.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
 - `updateProfile` replaces only the versions it knows, compared whole (`OLD_PROFILE` and
@@ -201,22 +302,49 @@ Outside the module: when imports, switches and logins happen (`android/service`)
   the version they have; and the motd is written only at import, so it is never updated.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; android/vt): bash and busybox ash do.
+- The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
+  trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
+- `login.sh` runs without job control, so its children share its process group: a Ctrl-C that
+  lands during another command than an install (the passwd lookup, the group check, the shadow
+  read, the `su --help` probe) can log a named account in as root, leave an admin out of the
+  NOPASSWD rules until the next refresh, or make Debian fall back to `su -c`. The window is short.
 
 ## Confirmed bugs / technical debt
 
 - **The rules miss changes that rename nothing in `/etc`.** A shadow or group file edited in place
-  (an append, a text editor writing the file itself) changes no entry of `/etc`, and a burst of
-  more than 256 changed directories between two polls stops recording the rest, so such a change
-  waits for the next login; while the app is not running there is nothing to refresh.
+  (an append, a text editor writing the file itself) changes no entry of `/etc`, a burst of more
+  than 256 changed directories between two polls stops recording the rest, and changes before the
+  service's first poll are not recorded, so such a change waits for the next login; while the app
+  is not running there is nothing to refresh.
+- **"Fastest (measured)" can mislabel a hand-picked mirror.** `chooseMirror` clears the manual flag
+  before probing, so when every probe fails, or the write fails with an I/O error, the mirror
+  chosen by hand stays in the sources but Settings shows it as "fastest when measured", with no
+  message.
+- **"Fastest (measured)" from Settings shows no measuring.** `autoMirror` starts its probe without
+  telling the listeners, so the mirror row keeps its old summary and stays enabled until the probe
+  ends; choosing "Fastest" again meanwhile is silently ignored.
+- **Debian retargeting rewrites repositories on a built-in host.** The Debian patterns are bare
+  host names, so a repository the user added to `debian.sources` itself on one of those hosts (for
+  example docker-ce on `mirrors.aliyun.com`) is moved to the new mirror with its path, where it may
+  not exist, breaking `apt update` for it. Repositories in other files are not touched.
 
 ## Open questions
 
-none
+- Should a failed optional per-start write (the network, containers, doas package or profile file,
+  for example through a directory the user replaced with a symlink, which `writeFile` refuses) fail
+  the whole start rather than be logged?
+- Should an HTTP error status on a resume restart the download from zero and use up a resume, as
+  it does, when the code's comment says resumes count only attempts that got data?
+- Should a Debian tarball left in the cache after its import failed and fell back to Alpine be
+  deleted?
 
 ## To verify
 
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
-  after `20-wheel.conf`).
+  after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
+  temporary rules files rely on it).
 - The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
   26.04's bash 5.3; busybox ash's in the app and an instrumentation test), and with a
   `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
+- Whether the mirror row can stay "Measuring the mirrors…" and disabled after a probe ends: the
+  probe thread posts the render itself, which may run before the thread counts as ended.
