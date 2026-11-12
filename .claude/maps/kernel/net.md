@@ -412,8 +412,8 @@ virtual devices, nftables, namespace port registration and the inbound forwarder
 
 ### Inbound
 
-- The syscall dispatcher; `kernel/vfs` (read/write/ioctl on sockets, `Vfs::open` writing
-  `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`, sysfs counters); the machine
+- The syscall dispatcher; `kernel/files` (read/write/ioctl on sockets), `kernel/vfs` (`Vfs::open`
+  writing `resolv.conf`); `kernel/poll`; `kernel/procfs` (`/proc/net`, sysfs counters); the machine
   (timer thread `check_taps` and `deliver_dns`, `set_routes`, `take_listens`); `kernel/netns`
   (forward targets); `kernel/netlink` (route and rule messages and `ip route get`, `SockOpts`, the
   timeout parser, traffic counters for link statistics, `forward_all` after a ruleset change).

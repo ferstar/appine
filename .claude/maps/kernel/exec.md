@@ -28,7 +28,7 @@ POSIX timers and the run loop that re-attaches the translator (`kernel/process`)
 transition and file capabilities (`kernel/cred`); entering the time namespace for children
 (`kernel/ns`); building and laying out the address space (`kernel/mm`); signal handler reset,
 forced fatal signals, the ptrace exec event and the vDSO image (`kernel/signal`); close-on-exec and
-writer checks (`kernel/vfs`); noexec and nosuid (`kernel/mount`); FUSE programs (`kernel/fuse`).
+writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE programs (`kernel/fuse`).
 
 ## Key types
 
@@ -150,10 +150,10 @@ writer checks (`kernel/vfs`); noexec and nosuid (`kernel/mount`); FUSE programs 
   `set_brk`, `map_stack`, `set_start_stack`, `label`, `write_kernel` (segments, `.bss`).
 - `kernel/cred` (set-id bits, file capabilities, unsafe execs, `mm_user_ns`, personality),
   `kernel/ns` (the time namespace for children and its vDSO stubs), `kernel/signal` (handler reset,
-  `force_fatal`, the ptrace exec event, the vDSO image), `kernel/vfs` and `kernel/mount`
-  (resolution, noexec and nosuid, writers, close-on-exec), `kernel/fuse` (`open_fuse`, the
-  close-on-exec flush), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at exec), `engine`
-  (the Go register set).
+  `force_fatal`, the ptrace exec event, the vDSO image), `kernel/vfs`, `kernel/files` and
+  `kernel/mount` (resolution, noexec and nosuid, writers, close-on-exec), `kernel/fuse`
+  (`open_fuse`, the close-on-exec flush), `kernel/aio`, `kernel/ipc` and `kernel/unix` (released at
+  exec), `engine` (the Go register set).
 
 ## Invariants and gotchas
 

@@ -25,12 +25,12 @@ the syscalls on them:
 Root: `core/kernel/src/ipc.rs` (object model), `syscall/ipc.rs` (SysV syscalls),
 `syscall/mqueue.rs` (POSIX message queues).
 
-Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, and
-`Kernel::ipcs`, `new_ipc_ns` and `collect_ipc` in `kernel.rs`) and clone/unshare/setns
-(`kernel/process`); host shared memory and shm VMAs (`SharedMemory`, `attach_shm`, `detach_shm`,
-`shm_attachments`) (`kernel/mm`); the mqueue filesystem's node views, the `/proc/sysvipc` files and
-sysctl plumbing (`kernel/procfs`); mqueue mounts and the generic file syscalls that dispatch to
-queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
+Outside the module: creating, entering and collecting IPC namespaces (`IpcNs`, and `Kernel::ipcs`,
+`new_ipc_ns` and `collect_ipc` in `kernel.rs`) and clone/unshare/setns (`kernel/process`); host
+shared memory and shm VMAs (`SharedMemory`, `attach_shm`, `detach_shm`, `shm_attachments`)
+(`kernel/mm`); the mqueue filesystem's node views, the `/proc/sysvipc` files and sysctl plumbing
+(`kernel/procfs`); mqueue mounts and the generic file syscalls that dispatch to queues
+(`kernel/vfs`, `kernel/files`); readiness and epoll of queue fds (`kernel/poll`); signal delivery
 (`kernel/signal`); the netlink sockets used by `SIGEV_THREAD` (`kernel/netlink`); credentials
 (`kernel/cred`).
 
@@ -230,9 +230,9 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - `kernel/process`: group exit (`ipc::exit`).
 - `kernel/ns`: unshare and setns (`Ipc::exit`), namespace creation (`MqDir::new`, default
   `Tunables` and `Limits`).
-- `kernel/vfs`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown and utimensat on
-  the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the `MessageQueue`
-  accessors).
+- `kernel/vfs` and `kernel/files`: open, create, unlink, read, lseek, fstat, fstatfs, chmod, chown
+  and utimensat on the mqueue filesystem (`new_queue`, `insert_queue`, `remove_queue`, `find`, the
+  `MessageQueue` accessors).
 - `kernel/procfs`: `/proc/sysvipc/*` (`proc_listing`), the IPC and mqueue sysctls, mqueue node
   views (`find`, `MqDir`, `MessageQueue::stat`).
 - `kernel/poll`: readiness, arrivals and the wake object of queue fds.
@@ -246,7 +246,7 @@ queues (`kernel/vfs`); readiness and epoll of queue fds (`kernel/poll`); signal 
 - `kernel/cred`: `capable`, `capable_wrt`, `permission`, id mapping; the umask of the fs context.
 - `kernel/signal`: `send_to_group` with `SigInfo` for notifications.
 - `kernel/netlink`: netlink socket queues for `SIGEV_THREAD`.
-- `kernel/vfs`: fd tables and `OpenFile`; `Vfs::mq_dev` for fstat.
+- `kernel/files`: fd tables and `OpenFile`; `kernel/vfs`: `Vfs::mq_dev` for fstat.
 - `appine_hal`: the realtime clock for SysV times.
 
 ## Invariants and gotchas

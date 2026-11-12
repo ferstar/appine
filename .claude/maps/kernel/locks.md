@@ -19,16 +19,16 @@ Root: `core/kernel/src/locks.rs`, `syscall/lease.rs`, and in `syscall/fs.rs` `fl
 fcntl lock commands (`record_lock`).
 
 Outside the module: closing fds and open files, which call `locks::closed`, and the opens and
-truncations that call `break_leases` (`kernel/vfs`); the lock keys of overlay and FUSE nodes
-(`lock_ino`, `kernel/vfs`); owners and the signals a lease break sends (`kernel/vfs`'s `F_SETOWN`,
-`kernel/signal`); the procfs files that show the listings (`kernel/procfs`).
+truncations that call `break_leases` (`kernel/files`); the lock keys of overlay and FUSE nodes
+(`lock_ino`, `kernel/files`); owners and the signals a lease break sends (`kernel/files`'
+`F_SETOWN`, `kernel/signal`); the procfs files that show the listings (`kernel/procfs`).
 
 ## Key types
 
 - `Locks` (owners `Posix(Weak<FdTable>)` or `Ofd(Weak<OpenFile>)`, ranges, taker's pid, waiters),
   `FlockHolder`, `Lease` (with its setter's pid); leases are registered by inode in
   `Kernel::leases`.
-- `FdTable::holds_locks`, and lock ownership in `OpenFile` (`kernel/vfs`).
+- `FdTable::holds_locks`, and lock ownership in `OpenFile` (`kernel/files`).
 
 ## Public entry points
 
@@ -81,14 +81,14 @@ truncations that call `break_leases` (`kernel/vfs`); the lock keys of overlay an
 
 ### Inbound
 
-- `kernel/vfs`: fcntl's dispatch, every close path (`locks::closed`), opens and truncation
+- `kernel/files`: fcntl's dispatch, every close path (`locks::closed`), opens and truncation
   (`break_leases`), the last reference to an open file.
 - `kernel/procfs`: `/proc/locks` and fdinfo `lock:` lines; the `lease-break-time` sysctl.
 - `kernel/overlay` and `kernel/fuse`: the nodes whose keys locks use.
 
 ### Outbound
 
-- `kernel/vfs`: fd tables, open files, `lock_ino`, the file's owner for lease-break signals.
+- `kernel/files`: fd tables, open files, `lock_ino`, the file's owner for lease-break signals.
 - `kernel/process` (the lock wake channel and waits), `kernel/signal` (`SIGIO` and `F_SETSIG`
   signals), `kernel/cred` (`CAP_LEASE`, ownership), `kernel/ns` (pids the reader can see).
 

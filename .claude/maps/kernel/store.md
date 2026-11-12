@@ -26,7 +26,8 @@ Root: `core/kernel/src/vfs/store.rs`, `vfs/import.rs`, `vfs/browse.rs`, and the 
 `core/kernel/src/lib.rs` (`import_rootfs`, `sync_store`, `browse`, `browse_changing`,
 `write_file`, `read_file`).
 
-Outside the module: path resolution, the no-BKL resolver and file syscalls (`kernel/vfs`), mounts
+Outside the module: path resolution, the no-BKL resolver and namespace and metadata syscalls
+(`kernel/vfs`), file I/O and moving open files to an unshared object (`kernel/files`), mounts
 (`kernel/mount`),
 synthetic filesystems (`kernel/procfs`), the BKL and fast path (`kernel/process`), the Android
 provider and rootfs installation UI (`android`).
@@ -128,7 +129,7 @@ provider and rootfs installation UI (`android`).
 - `open_object` for writing, `open_object_append` and `truncate` call `make_private` first, so host
   callers (the browse API, `write_file`) never write a shared object; they do not move the kernel's
   open descriptions themselves: the browse API's `Opened` change says when it unshared the file
-  (`unshared`), and the kernel then moves its own (`kernel/vfs`).
+  (`unshared`), and the kernel then moves its own (`kernel/files`).
 - Objects the provider handed out for writing are recorded process-wide (`HOST_WRITERS`: the
   store's identity, the object, the path it was opened by) from `open_write` until `written`
   reports the close by the same path, whatever became of the file; `host_writing` tells the kernel
@@ -279,7 +280,8 @@ provider and rootfs installation UI (`android`).
 
 ### Inbound
 
-- `kernel/vfs` (path walks, file syscalls, tmpfs instances, the no-BKL resolver), `kernel/mount`
+- `kernel/vfs` (path walks, namespace and metadata syscalls, tmpfs instances, the no-BKL
+  resolver), `kernel/files` (objects, sharing and unsharing, syncs), `kernel/mount`
   (`Vfs::open`'s boot with the volatile list), `kernel/process` (`syscall::fast`), the machine
   (waker, timer `commit_due`, `sync`, `trim_memory`, teardown, the store registry,
   `take_changed_dirs`), `kernel/inotify` (`host_change`), host wrappers in `lib.rs` (JNI and

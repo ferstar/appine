@@ -1,4 +1,4 @@
-//! Open files and fd tables.
+//! Open files and fd tables (the kernel/files map).
 //!
 //! An open file (Linux's `struct file`) records the file position and status flags and can be
 //! shared by several fds (dup, fork); the close-on-exec flag belongs to the fd itself. Open files

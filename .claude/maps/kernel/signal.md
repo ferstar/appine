@@ -410,8 +410,8 @@ credentials), procfs.
   seccomp (`force_fatal`, `SECCOMP` event stops), procfs (signal state, `/proc/<pid>/mem`), the OOM
   killer, bug handling and the BKL watchdog (kernel log; bug kill reports read `stub::top`).
 - Default arms reporting unimplemented paths: prctl (`kernel/process`), futex (`kernel/futex`),
-  fcntl, file ioctls and device opens (`kernel/vfs`), terminal ioctls (`kernel/tty`), socket ioctls
-  (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).
+  fcntl, file ioctls and device opens (`kernel/files`), terminal ioctls (`kernel/tty`), socket
+  ioctls (`kernel/net`), madvise (`kernel/mm`); missing names from procfs views (`kernel/procfs`).
 
 ### Outbound
 

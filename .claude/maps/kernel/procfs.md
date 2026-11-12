@@ -24,14 +24,14 @@ stored:
 
 Root: `core/kernel/src/pseudo.rs`, `cgroup.rs`, `bpf.rs`, `syscall/bpf.rs`.
 
-Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order, open/read/write
-dispatch for pseudo nodes and magic-link resolution (`kernel/vfs`, whose `open_pseudo` and
-`refresh_pseudo` behaviour this map describes as procfs sees it); maps and `/proc/<pid>/mem`
-semantics (`kernel/mm`, `kernel/signal`); smaps, pagemap and the Rss figures (`kernel/oom`); id
-maps, `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`); `children`, state
-letters and the kernel-entry record behind `syscall` (`kernel/process`); `/proc/kmsg`,
-`/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour (`kernel/tty`); network
-semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM killer
+Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order and magic-link
+resolution (`kernel/vfs`); open/read/write dispatch for pseudo nodes (`kernel/files`, whose
+`open_pseudo` and `refresh_pseudo` behaviour this map describes as procfs sees it); maps and
+`/proc/<pid>/mem` semantics (`kernel/mm`, `kernel/signal`); smaps, pagemap and the Rss figures
+(`kernel/oom`); id maps, `setgroups`, `timens_offsets`, `ns/*` and namespaces (`kernel/ns`);
+`children`, state letters and the kernel-entry record behind `syscall` (`kernel/process`);
+`/proc/kmsg`, `/proc/version` and ABI sysctls (`kernel/signal`); terminal behaviour (`kernel/tty`);
+network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM killer
 (`kernel/oom`); SysV IPC and message queues (`kernel/ipc`); locks (`kernel/locks`); loop devices
 (`kernel/loop`); the mount table (`kernel/mount`).
 
@@ -136,7 +136,7 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
 
 ### Opening, reading and writing
 
-- Open (`open_pseudo` in `kernel/vfs`), in order: `O_TRUNC` asks for write permission too; nsfs
+- Open (`open_pseudo` in `kernel/files`), in order: `O_TRUNC` asks for write permission too; nsfs
   files refuse any write intent (`EPERM`, before DAC); `/proc/sys/user/max_*` skip DAC and need
   `CAP_SYS_RESOURCE` in the opener's own user namespace to open for writing; the rest of
   `/proc/sys` decides as `proc_sys_permission`/`test_perm` do, not by DAC (below); other nodes
@@ -478,16 +478,16 @@ semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`); the OOM
 
 ### Inbound
 
-- `kernel/vfs` (walker and magic links, pseudo open/read/write/lseek/stat/getdents, chmod/chown/
-  utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for devpts and cgroup2, device
-  checks, `mount_events`); `kernel/process` (clone/clone3 cgroup placement and pids charge, the
-  freezer stop in the signal path, `notify_changes` at thread exit, the kernel-entry record);
-  `kernel/ns` (unshare/setns, nsfs files); the OOM killer (`memory_limits`, `measure_memory`,
-  `oom_group`, events); `syscall/poll.rs` (epoll refusal, readiness); `syscall/inotify.rs`
-  (cgroup watches and keys); the machine (`Offline` before boot, the timer thread's
-  `notify_changes`); `kernel/signal` (`recorded_value` for `debug.exception-trace`,
-  `mark_deleted` for the file named in unhandled-exception reports); `kernel/net` (`sockets`,
-  `socket_ino`).
+- `kernel/files` (pseudo open/read/write/lseek), `kernel/vfs` (walker and magic links, pseudo
+  stat/getdents, chmod/chown/utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for
+  devpts and cgroup2, device checks, `mount_events`); `kernel/process` (clone/clone3 cgroup
+  placement and pids charge, the freezer stop in the signal path, `notify_changes` at thread exit,
+  the kernel-entry record); `kernel/ns` (unshare/setns, nsfs files); the OOM killer
+  (`memory_limits`, `measure_memory`, `oom_group`, events); `syscall/poll.rs` (epoll refusal,
+  readiness); `syscall/inotify.rs` (cgroup watches and keys); the machine (`Offline` before boot,
+  the timer thread's `notify_changes`); `kernel/signal` (`recorded_value` for
+  `debug.exception-trace`, `mark_deleted` for the file named in unhandled-exception reports);
+  `kernel/net` (`sockets`, `socket_ino`).
 
 ### Outbound
 

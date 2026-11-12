@@ -23,7 +23,7 @@
 Root: `core/kernel/src/tty.rs`, `syscall/tty.rs`, `terminal.rs`.
 
 Outside the module: devpts as a filesystem, instances, and the owner, mode and times shown for
-`/dev/pts/N` (`kernel/procfs`); device-number dispatch on open (`kernel/vfs`); signal delivery,
+`/dev/pts/N` (`kernel/procfs`); device-number dispatch on open (`kernel/files`); signal delivery,
 stops and orphaned-group stop rules (`kernel/signal`); `setsid`/`setpgid`, process exit and the
 exit-time orphan signals (`kernel/process`); the host terminal's raw mode and signal pipes
 (`harness`, `hal`); the Android terminal UI (`android`).
@@ -62,7 +62,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ## Public entry points
 
-- Opening (from `kernel/vfs`'s device dispatch): `open_ptmx` (which allocates through `new_pty`),
+- Opening (from `kernel/files`' device dispatch): `open_ptmx` (which allocates through `new_pty`),
   `open_slave`, `open_peer` (`TIOCGPTPEER`), `open_ctty` (5:0 and 5:1).
 - I/O: `syscall::tty::read`, `write`, `readiness`, `ioctl`.
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
@@ -304,7 +304,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 
 ### Inbound
 
-- `kernel/vfs` (open by device number, `devpts_beside`, read/write/ioctl dispatch, devpts
+- `kernel/files` (open by device number, `devpts_beside`, read/write/ioctl dispatch, devpts
   `nodev`), poll/epoll (`readiness`, `arrivals`), `kernel/process` (fork copying the ctty, setsid,
   exit releasing the ctty, spawn with `Stdio::Console`), `Bkl::drop` (`hang_up_closed`), the
   machine and JNI/CLI hosts (console API, bridge), the bug reporter (console of a killed process),

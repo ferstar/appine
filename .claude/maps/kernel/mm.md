@@ -484,7 +484,7 @@ signals may still be delivered).
   file: no thread can reach the dropped tail through a stale translation, so an access there faults
   into the kernel and gets the guest's `SIGBUS` once the BKL is free. A host truncation that then
   fails leaves the mappings' EOF at the requested length.
-- When a store file that shared its object gets one of its own (`kernel/vfs`'s `make_private`),
+- When a store file that shared its object gets one of its own (`kernel/files`' `make_private`),
   its shared mappings follow it, picked by store inode and old host file so other files' mappings
   of the old object stay (nothing moves if an address space cannot be borrowed): `file_moving`
   first removes, in every address space, the entries past the new object's length (as truncation

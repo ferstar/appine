@@ -20,7 +20,7 @@ commands, `pipe_read`, `pipe_write` and `broken_pipe`, and the splice block from
 `wait_splice_done`.
 
 Outside the module: fd tables, open files and the read, write and vectored paths that reach pipes
-(`kernel/vfs`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
+(`kernel/files`); the wait mechanism and wake objects (`kernel/process`); readiness and `EPOLLET`
 (`kernel/poll`); `/dev/fuse` and AF_UNIX sockets as splice ends (`kernel/fuse`, `kernel/unix`); the
 `pipe-max-size` sysctl (`kernel/procfs`).
 
@@ -28,7 +28,7 @@ Outside the module: fd tables, open files and the read, write and vectored paths
 
 - `Pipe` / `PipeEnd` — buffer, capacity, reader and writer counts, `writer_need`, EPOLLET
   counters, `splicing`; FIFOs by inode in `Kernel::fifos` (weak).
-- `FileKind::Pipe` (`kernel/vfs`).
+- `FileKind::Pipe` (`kernel/files`).
 
 ## Public entry points
 
@@ -80,19 +80,19 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   opened read-write too), reads otherwise, and waits unless `SPLICE_F_NONBLOCK`, whatever the
   pipe's `O_NONBLOCK`. Room is the free space in whole pages, as Linux counts free page buffers.
 - vmsplice's write side reads guest memory directly; every other copy to or from a guest buffer
-  first grows a grows-down mapping below it (`kernel/vfs`).
+  first grows a grows-down mapping below it (`kernel/files`).
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/vfs`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close.
+- `kernel/files`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close.
 - `kernel/poll` (pipe readiness, `EPOLLET` counters), `kernel/fuse` (`/dev/fuse` as a splice end),
   `kernel/unix` (stream sockets as splice inputs).
 
 ### Outbound
 
-- `kernel/vfs` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
+- `kernel/files` (the read and write paths of the other end, file checks, `RLIMIT_FSIZE`),
   `kernel/process` (waits and wake objects), `kernel/signal` (`SIGPIPE`), `kernel/procfs`
   (`pipe-max-size`), `kernel/cred` (`CAP_SYS_RESOURCE`).
 

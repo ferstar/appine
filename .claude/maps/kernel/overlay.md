@@ -23,8 +23,9 @@ to `overlay_readdir`, `sweep_overlays`); in `syscall/fs.rs` `open_overlay`, `fol
 `unlink_overlay`, `link_overlay` and `rename_overlay`; in `syscall/mount.rs` the overlay options
 (`overlay_layers`, `overlay_dir`) and the node sweep at syscall end.
 
-Outside the module: the walk, open, attribute and namespace syscalls that branch into this module,
-and the rules every file operation keeps for overlay nodes (`kernel/vfs`); store transactions,
+Outside the module: the walk, attribute and namespace syscalls that branch into this module, and
+the rules every file operation keeps for overlay nodes (`kernel/vfs`); the opens and truncations
+that branch into it (`kernel/files`); store transactions,
 objects shared by copy-up and whiteout inodes (`kernel/store`); the mount table, `collect` and
 mountinfo (`kernel/mount`); inotify on overlay nodes (`kernel/inotify`); locks keyed on overlay
 nodes (`kernel/locks`); syscall numbering for the sweep (`kernel/process`); a program's `exe_file`
@@ -48,8 +49,8 @@ holding its node (`kernel/exec`).
   `overlay_upper`, `overlay_remove`, `overlay_rename`, `overlay_child`, `overlay_prefix`,
   `sweep_overlays`; `Overlays::upper_of` (copy-up), `remove`, `rename`.
 - **Syscall paths**: mount(2) of type `overlay`; `open_overlay`, `follow_copy_up`, `unlink_overlay`,
-  `link_overlay`, `rename_overlay`; overlay branches of creation, attribute changes, truncate and
-  readdir in `kernel/vfs`, and of xattr calls in `kernel/xattr`.
+  `link_overlay`, `rename_overlay`; overlay branches of creation, attribute changes and readdir in
+  `kernel/vfs`, of opening and truncate in `kernel/files`, and of xattr calls in `kernel/xattr`.
 
 ## Data flow / lifecycle
 
@@ -158,8 +159,8 @@ holding its node (`kernel/exec`).
 
 ### Inbound
 
-- `kernel/vfs`: the walk, opening, creation, attribute changes, truncate, readdir, stat and statfs
-  on overlay nodes; `kernel/xattr`: xattr calls on overlay nodes.
+- `kernel/vfs`: the walk, creation, attribute changes, readdir, stat and statfs on overlay nodes;
+  `kernel/files`: opening and truncating them; `kernel/xattr`: xattr calls on overlay nodes.
 - `kernel/mount`: mount(2) of type `overlay`, `collect`, mountinfo's superblock options.
 - The syscall dispatcher (the sweep at syscall end; `Task::syscall` numbering, `kernel/process`),
   `kernel/exec` (`ExeFile` holding a program's node), `kernel/inotify` (overlay keys),
@@ -169,7 +170,8 @@ holding its node (`kernel/exec`).
 
 - `kernel/store`: lookups in each layer, one transaction per copy-up, shared objects, whiteouts,
   xattrs.
-- `kernel/vfs`: `open_store`, `prepare_write`, the tmpfs instances its layers are in.
+- `kernel/files`: `open_store`, `prepare_write`; `kernel/vfs`: the tmpfs instances its layers are
+  in.
 - `kernel/mount` (layer checks, `clone_private_mount`'s rules), `kernel/cred` (permission and
   ownership on what the overlay shows), every task's root and cwd and the inotify registry for the
   sweep.

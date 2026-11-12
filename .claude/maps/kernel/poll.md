@@ -19,14 +19,14 @@
 - signal-driven I/O (`O_ASYNC`, `F_SETOWN*`, `F_SETSIG`) checked by the timer thread.
 
 Root: `core/kernel/src/syscall/poll.rs` and `syscall/timerfd.rs` (the `EventFd` and `TimerFd` state
-lives in `fd.rs`, a `kernel/vfs` file).
+lives in `fd.rs`, a `kernel/files` file).
 
 Outside the module: the wait mechanism, wake objects, the BKL and the timer thread
 (`kernel/process`); per-kind readiness of sockets (`kernel/net`, `kernel/netlink`, `kernel/unix`),
 terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
 (`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
-entry points and the read paths (`kernel/vfs`); clock bases, `Expiry` and the wall-clock jump count
-(`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
+entry points and the read paths (`kernel/files`); clock bases, `Expiry` and the wall-clock jump
+count (`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
 
 ## Key types
 
@@ -212,7 +212,7 @@ entry points and the read paths (`kernel/vfs`); clock bases, `Expiry` and the wa
 ### Inbound
 
 - The syscall dispatcher (also the drain hook after I/O syscalls; timerfd reads through
-  `kernel/vfs`'s read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
+  `kernel/files`' read path); `kernel/procfs` (timerfd fdinfo); `kernel/aio` (`poll_once`,
   `wait_aio_polls`, `watch_aio_poll`, masks, resfd eventfds); the timer thread (`check_exclusive`,
   `check_fasync`); fcntl/ioctl (`register_fasync`); pipe writes (`arrived`); fdinfo and kcmp.
 

@@ -20,7 +20,8 @@ Root: `core/kernel/src/syscall/xattr.rs`.
 
 Outside the module: storage of the values (`kernel/store`); the overlay's own attributes and
 copy-up before a change (`kernel/overlay`); xattrs of FUSE files (`kernel/fuse`); capability
-checks and `FileCaps` (`kernel/cred`); path and fd resolution (`kernel/vfs`); `IN_ATTRIB`
+checks and `FileCaps` (`kernel/cred`); path resolution (`kernel/vfs`); fd lookup (`kernel/files`);
+`IN_ATTRIB`
 (`kernel/inotify`).
 
 ## Key types

@@ -296,10 +296,10 @@ Outside the module:
   - the read-only and other mount-flag checks (`readonly`, `mount_flags`, `sb_flags`);
   - unlink and rename detaching mount points (`is_store_point`, `detach_store_point`,
     `roots_removed`);
-  - open files and `FsContext` reporting released mounts;
-  - statfs's flags;
-  - the mount event counter (`mount_events`) attached to an opened mounts or mountinfo file for
-    poll.
+  - `FsContext` reporting released mounts;
+  - statfs's flags.
+- `kernel/files`: open files reporting released mounts; the mount event counter (`mount_events`)
+  attached to an opened mounts or mountinfo file for poll.
 - `kernel/procfs`:
   - mountinfo and mounts (`mounts_from`, `sb_options`, `type_of`, `root_path`, `sb_flags`);
   - procfs instances' pid namespaces;
@@ -312,9 +312,9 @@ Outside the module:
 
 - `kernel/vfs`:
   - walks and nodes;
-  - new tmpfs and FUSE instances (`new_tmpfs`, `new_fuse`) and tmpfs reconfiguration;
-- `kernel/overlay`: new overlayfs instances (`new_overlay`);
-  - the fd tables that `in_use` and `writers` scan.
+  - new tmpfs and FUSE instances (`new_tmpfs`, `new_fuse`) and tmpfs reconfiguration.
+- `kernel/files`: the fd tables that `in_use` and `writers` scan.
+- `kernel/overlay`: new overlayfs instances (`new_overlay`).
 - `kernel/loop`: loop devices' backing files (`Loops::backing_files`).
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.
 - `kernel/procfs`: the `Pseudo` views of mounted synthetic filesystems, and the pid namespace of a

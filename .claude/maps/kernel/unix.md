@@ -23,7 +23,7 @@ sockets:
 Root: `core/kernel/src/unix.rs`, `syscall/unix.rs`.
 
 Outside the module: the generic socket syscalls that dispatch here (`kernel/net`); creating socket
-nodes and path resolution (`kernel/vfs`, `kernel/store`); fd tables (`kernel/vfs`); poll/epoll
+nodes and path resolution (`kernel/vfs`, `kernel/store`); fd tables (`kernel/files`); poll/epoll
 mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting (`kernel/process`).
 
 ## Key types
@@ -187,14 +187,14 @@ mechanics (`kernel/poll`); `/proc/net` file structure (`kernel/procfs`); waiting
 ### Inbound
 
 - `kernel/net` (socket syscalls, read/write, ioctl, readiness, `accept4` installing the fd);
-  `kernel/vfs` close paths (`released`); `kernel/exec` (execve close-on-exec), `kernel/process`
+  `kernel/files` close paths (`released`); `kernel/exec` (execve close-on-exec), `kernel/process`
   (last-thread exit); seccomp addfd; `kernel/procfs` (`/proc/net/unix`).
 
 ### Outbound
 
 - `kernel/vfs` and `kernel/store` (path lookup, creation checks, `mknod` with its inotify
-  `IN_CREATE`, tmpfs accounting); fd tables (`get`, `install`); credentials and namespaces
-  (`permission`, `new_owner`, `uid_out`/`gid_out`, `pid_in`/`pid_out`, `ns_capable`); the
+  `IN_CREATE`, tmpfs accounting); fd tables (`get`, `install`; `kernel/files`); credentials and
+  namespaces (`permission`, `new_owner`, `uid_out`/`gid_out`, `pid_in`/`pid_out`, `ns_capable`); the
   kernel's waits and wake objects; signals (`SIGPIPE`).
 
 ## Invariants and gotchas

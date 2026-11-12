@@ -22,12 +22,12 @@ kernel, so no host notification is used. It provides:
 
 Root: `core/kernel/src/syscall/inotify.rs`.
 
-Outside the module: where the hooks are called — the file syscalls, opens and renames in
-`kernel/vfs`, FUSE operations in `kernel/fuse`, cgroup2 file changes in `kernel/procfs`;
-readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`); `/proc/sys/fs/inotify/*` and the
-fdinfo text's place (`kernel/procfs`); the Files app's change list (`kernel/store`) and the
-machine's `store_changed`, which finds each kernel and takes its BKL (`kernel/process`); overlay
-node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
+Outside the module: where the hooks are called — the file syscalls and renames in `kernel/vfs`,
+opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
+`kernel/procfs`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
+`/proc/sys/fs/inotify/*` and the fdinfo text's place (`kernel/procfs`); the Files app's change list
+(`kernel/store`) and the machine's `store_changed`, which finds each kernel and takes its BKL
+(`kernel/process`); overlay node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 
 ## Key types
 
@@ -49,7 +49,7 @@ node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 ## Public entry points
 
 - Syscalls `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`; `read` through
-  `kernel/vfs`'s `IoPath::Inotify`; `FIONREAD` in `kernel/vfs`'s ioctl dispatch.
+  `kernel/files`' `IoPath::Inotify`; `FIONREAD` in `kernel/files`' ioctl dispatch.
 - Hooks for the file syscalls: `active` (whether any watch exists), `path_event`, `file_event`,
   `dir_event`, `cookie`, `opened`, `renamed`, `deleted`, `watched_at`, `key_of`.
 - `host_change` (the Files app's changes, from the machine's `store_changed`), `kernfs_modified`
@@ -110,15 +110,17 @@ node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 - Files app changes (`host_change`, under the target kernel's BKL) map `Created`, `Removed`,
   `Moved`, `Opened` (write opens) and `Written` to the same event sequences; the provider reports
   no access, close-nowrite, read-open or attribute events. An `Opened` that gave a held file an
-  object of its own also moves this kernel's descriptions of it there (`kernel/vfs`'s
+  object of its own also moves this kernel's descriptions of it there (`kernel/files`'
   `host_unshared` and `rehome`), even with no watches.
 
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/vfs`: every hook from the file syscalls, opens (`opened`), renames (`renamed`) and
-  removals (`deleted`); the instance's read and `FIONREAD`; the overlay sweep reading `watched`.
+- `kernel/vfs`: the hooks from the metadata and namespace syscalls, renames (`renamed`) and
+  removals (`deleted`); the overlay sweep reading `watched`.
+- `kernel/files`: the hooks from opens (`opened`), I/O and closes; the instance's read and
+  `FIONREAD`.
 - `kernel/fuse`: hooks for FUSE namespace changes; `watched` in `in_use`.
 - `kernel/procfs`: `kernfs_modified` for cgroup2 file changes; the registry's limits behind
   `/proc/sys/fs/inotify/*`; the instance's fdinfo lines.
@@ -128,9 +130,9 @@ node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
 
 ### Outbound
 
-- `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), `OpenFile`,
-  overlay keys and `Overlays::linked`, the store's link counts for `IN_EXCL_UNLINK`,
-  `host_unshared`.
+- `kernel/vfs`: `Node`, path resolution (`read_path`, `watched_at`'s second walk), overlay keys
+  and `Overlays::linked`, the store's link counts for `IN_EXCL_UNLINK`; `kernel/files`:
+  `OpenFile`, `host_unshared`.
 - `kernel/store`: the `Change` records of the browse API.
 - Credentials: `MAY_READ` permission on the watched node.
 - The kernel's wake objects (`request_wake_object`).

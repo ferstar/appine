@@ -18,10 +18,11 @@
 
 Root: `core/kernel/src/syscall/aio.rs`.
 
-Outside the module: the read, write, vectored and fsync paths and their file checks (`kernel/vfs`);
-readiness, the ppoll-style wait, temporary signal masks and eventfds (`kernel/poll`); thread groups,
-exit and the timer thread (`kernel/process`); execve (`kernel/exec`); the context page's mapping
-(`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr` (`kernel/procfs`).
+Outside the module: the read, write, vectored and fsync paths and their file checks
+(`kernel/files`); readiness, the ppoll-style wait, temporary signal masks and eventfds
+(`kernel/poll`); thread groups, exit and the timer thread (`kernel/process`); execve
+(`kernel/exec`); the context page's mapping (`kernel/mm`); `/proc/sys/fs/aio-nr` and `aio-max-nr`
+(`kernel/procfs`).
 
 ## Key types
 
@@ -74,7 +75,7 @@ exit and the timer thread (`kernel/process`); execve (`kernel/exec`); the contex
   `aio_rw_flags` is `EINVAL`. The first failure is returned when nothing was submitted, otherwise
   the count so far.
 - PREAD, PWRITE, PREADV, PWRITEV, FSYNC and FDSYNC run synchronously inside io_submit through
-  `kernel/vfs`'s read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
+  `kernel/files`' read, write, vectored and fsync paths (blocking pipe or socket I/O blocks
   io_submit), and their result or negative errno is queued at once (an interrupted one as
   `-EINTR`, as `aio_rw_done` turns restart codes into it). `aio_offset` is used only for
   positional files; `RWF_NOWAIT` and `RWF_APPEND` are set temporarily as `O_NONBLOCK`/`O_APPEND`
@@ -114,8 +115,9 @@ exit and the timer thread (`kernel/process`); execve (`kernel/exec`); the contex
 
 ### Outbound
 
-- `kernel/vfs`: fd lookup, `read_file`, `write_file`, `vectored`, `fsync`, `has_fsync`,
-  `seekable`, `append_offset`, `write_sync`; `FileKind` and `Device` for `has_iter`.
+- `kernel/files`: fd lookup, `read_file`, `write_file`, `vectored`, `fsync`, `has_fsync`,
+  `seekable`, `append_offset`, `write_sync`; `FileKind` for `has_iter`; `kernel/vfs`: `Device`
+  for `has_iter`.
 - `kernel/poll`: `poll_once`, `wait_aio_polls`, `watch_aio_poll`, `set_temp_mask`/`restore_mask`,
   the resfd eventfds it signals.
 - `kernel/mm`: mapping and unmapping the context page; `UserSlice` copies.
@@ -133,7 +135,8 @@ exit and the timer thread (`kernel/process`); execve (`kernel/exec`); the contex
   Linux's wake-up completes it: a nonblocking read of the eventfd right after that write may still
   find 0.
 - io_getevents sleeps on the context's wake object, so a path that queues an event must wake it.
-- `has_iter` and `has_fsync` must follow new `FileKind`s and devices added in `kernel/vfs`.
+- `has_iter` and `has_fsync` must follow new `FileKind`s and devices added in `kernel/files` and
+  `kernel/vfs`.
 
 ## Confirmed bugs / technical debt
 
