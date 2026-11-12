@@ -20,6 +20,13 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.graphics.drawable.toDrawable
+import io.github.mthli.appine.ExtraKeysView.Companion.COLUMNS
+import io.github.mthli.appine.ExtraKeysView.Companion.FUNCTIONS
+import io.github.mthli.appine.ExtraKeysView.Companion.INDICATOR_GAP_DP
+import io.github.mthli.appine.ExtraKeysView.Companion.KEYS
+import io.github.mthli.appine.ExtraKeysView.Companion.MIN_COLUMN_DP
+import io.github.mthli.appine.ExtraKeysView.Companion.REPEAT_MS
+import io.github.mthli.appine.ExtraKeysView.Companion.SYMBOLS
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -109,7 +116,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /** The page shown: [KEYS], [SYMBOLS] or [FUNCTIONS]. */
     private var shown = KEYS
-    private lateinit var symView: TextView
+    private val symView: TextView
 
     private val density = resources.displayMetrics.density
 
@@ -233,11 +240,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             },
         )
         fixed.addView(symView)
-        show(pages[0])
+        turnTo(KEYS)
         // Their widths are set in onMeasure: the scroll view's end padding and the last column's
         addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         addView(fixed, LayoutParams(0, LayoutParams.WRAP_CONTENT, Gravity.END))
-        refresh()
     }
 
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
@@ -324,8 +330,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private fun refresh() {
         symView.setTextColor(if (shown != KEYS) onColor else labelColor)
         for (m in modifiers) m.view.setTextColor(if (m.on) onColor else labelColor)
-        // Their indicators
-        for (page in pages) page.grid.invalidate()
+        // Their indicators; only the page shown is in the view
+        pages[shown].grid.invalidate()
         fixed.invalidate()
     }
 
@@ -372,26 +378,27 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
      * slide on a key that is not yet held scrolls the grid, if it can scroll, and cancels the key.
      */
     private inner class Press(private val key: Key, private val view: View) : OnTouchListener, Runnable {
-        private var held = 0
+        /** The long-press timeout passed with the finger still on the key. */
+        private var held = false
         private var cancelled = false
 
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    held = 0
+                    held = false
                     cancelled = false
-                    v.setBackgroundColor(pressedColor)
+                    view.setBackgroundColor(pressedColor)
                     if (key.repeats || key.longPress != null) {
-                        v.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
+                        view.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
                     }
                 }
-                MotionEvent.ACTION_MOVE -> if (!cancelled && outside(v, e)) cancel()
+                MotionEvent.ACTION_MOVE -> if (!cancelled && outside(e)) cancel()
                 MotionEvent.ACTION_UP -> {
-                    val tapped = !cancelled && held == 0
+                    val tapped = !cancelled && !held
                     cancel()
                     if (tapped) {
-                        v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                        v.performClick()
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        view.performClick()
                     }
                 }
                 MotionEvent.ACTION_CANCEL -> cancel()
@@ -401,7 +408,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
         /** The long-press timeout passed, then every [REPEAT_MS] while a repeating key is held. */
         override fun run() {
-            if (held++ == 0) keepTouch()
+            if (!held) {
+                held = true
+                keepTouch()
+            }
             val longPress = key.longPress
             if (longPress != null) {
                 view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -415,8 +425,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         /** From now on the grid does not take the finger to scroll. */
         private fun keepTouch() = view.parent.requestDisallowInterceptTouchEvent(true)
 
-        private fun outside(v: View, e: MotionEvent) =
-            e.x < -slop || e.y < -slop || e.x > v.width + slop || e.y > v.height + slop
+        private fun outside(e: MotionEvent) =
+            e.x < -slop || e.y < -slop || e.x > view.width + slop || e.y > view.height + slop
 
         private fun cancel() {
             cancelled = true
@@ -427,11 +437,14 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /** A tap, also what accessibility services perform as a click. */
     private fun tap(key: Key) {
-        key.modifier?.let {
-            it.on = !it.on
-            it.locked = false
+        val m = key.modifier
+        if (m == null) {
+            key.send()
+        } else {
+            m.on = !m.on
+            m.locked = false
             refresh()
-        } ?: key.send()
+        }
     }
 
     /**
@@ -458,7 +471,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
-    val shift get() = shiftKey.on && shown != SYMBOLS
+    val shift get() = shiftKey.on && !waits(shiftKey)
 
     /**
      * The next key or character took the one-shot modifiers; locked ones stay on, and so does
@@ -467,13 +480,16 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     fun modifiersUsed() {
         var changed = false
         for (m in modifiers) {
-            if (m.on && !m.locked && !(shown == SYMBOLS && m === shiftKey)) {
+            if (m.on && !m.locked && !waits(m)) {
                 m.on = false
                 changed = true
             }
         }
         if (changed) post { refresh() }
     }
+
+    /** Whether [m] waits for another page: Shift with the symbols shown, where it has no key. */
+    private fun waits(m: Modifier) = m === shiftKey && shown == SYMBOLS
 
     companion object {
         /** The pages, as indices into [pages]: the keys, the symbols and the function keys. */
@@ -525,12 +541,12 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         /**
          * Draws the indicator under [label], which lies in [container] (directly or deeper), for a
          * state that stays until changed: the current tab, a locked modifier, SYM with the symbols
-         * or the function keys shown. As in Material's tabs, a short rounded bar, the same width under any label, and a
-         * shape, so it shows without telling colours apart. It hangs [INDICATOR_GAP_DP] below the
-         * label's baseline, where its letters and digits end, so it stays with the label whatever
-         * the height of the bar or the size of the text; it fades with the label. Nothing is drawn
-         * when [label] is not in [container]. [dx] moves it right of the label's place (the tab
-         * row slides it there after tabs close).
+         * or the function keys shown. As in Material's tabs, a short rounded bar, the same width
+         * under any label, and a shape, so it shows without telling colours apart. It hangs
+         * [INDICATOR_GAP_DP] below the label's baseline, where its letters and digits end, so it
+         * stays with the label whatever the height of the bar or the size of the text; it fades
+         * with the label. Nothing is drawn when [label] is not in [container]. [dx] moves it right
+         * of the label's place (the tab row slides it there after tabs close).
          */
         fun drawIndicator(canvas: Canvas, container: View, label: TextView, paint: Paint, dx: Float = 0f) {
             val r = indicator
