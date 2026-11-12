@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the volume keys switch tabs, behind a setting)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: a long press on SYM shows a page of function keys with PGUP and PGDN)
 
 ## Responsibilities
 
@@ -59,14 +59,16 @@ notices task and the build (`android/native`).
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
   SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
   symbols Gboard gives neither on its letters nor from a long press on one, with `/ - | ~` where
-  they are on the first page): a `Page` is a grid of the first seven columns and the key above
+  they are on the first page) and a third of function keys for every key but SHIFT and SYM (F1–F6,
+  PGUP; F7–F12, PGDN): a `Page` is a grid of the first seven columns and the key above
   SYM; the grid shown is in a `HorizontalScrollView` across the view, the last column (SHIFT or `%`
   over SYM) fixed over its end. It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads
-  false while the symbols are shown) and the page shown, exposes them with `modifiersUsed`, and
-  sends keys, text and notices (a modifier locked) to a `Target`; `Press` handles the touch on one
-  key. Its companion's `FADE_DP`, `indicatorPaint`, `drawIndicator` (the indicator under a label)
-  and `indicatorBounds` (where it lies, where the tab row also draws a tab's progress) serve the tab
-  row too.
+  false while the symbols are shown) and the page shown (`KEYS`, `SYMBOLS` or `FUNCTIONS`), exposes
+  them with `modifiersUsed`, and sends keys, text and notices (a modifier locked) to a `Target`; a
+  `Key` may have a `longPress` (the modifiers' lock, SYM's function keys); `Press` handles the
+  touch on one key. Its companion's `FADE_DP`, `indicatorPaint`, `drawIndicator` (the indicator
+  under a label) and `indicatorBounds` (where it lies, where the tab row also draws a tab's
+  progress) serve the tab row too.
 - `ProgressLine` — a 2 dp view over the top of the terminal showing the current tab's progress
   report; `Colors` (primary, error, muted by progress state); its companion draws progress into any
   rectangle (`draw`, a fill or a sweep) and gives a report's fraction (`fractionOf`).
@@ -251,21 +253,28 @@ notices task and the build (`android/native`).
   edge its gesture. No lines are drawn between or around the keys.
 - A key is shaded while pressed and acts when the finger lifts (with a key-click haptic), not at
   all if the finger left it by more than the touch slop. Held past the long-press timeout, the
-  arrows repeat every 80 ms until the finger lifts or leaves the key (no act on release then);
-  other keys but the modifiers still act once on release. No key has a swipe or popup.
+  arrows, PGUP and PGDN repeat every 80 ms until the finger lifts or leaves the key (no act on
+  release then); the modifiers and SYM act on their long press then, with a long-press haptic, and
+  not again on release; other keys still act once on release. No key has a swipe or popup. Keys
+  with a long press also answer an accessibility service's long click (the touch never reaches
+  the view's own long-press detection).
 - CTRL, ALT and SHIFT: a tap turns them on for the next key (primary colour only) or off, a locked
-  one too; a long press (with a long-press haptic) locks them on (primary colour and the
+  one too; a long press locks them on (primary colour and the
   indicator) until tapped, one a tap turned on included, with a toast naming the key ("CTRL
   locked"), or turns a locked one off. Keys go to `VtView.press` and `type`, which read the
   modifiers through the host and report when a key took them; that clears one-shot modifiers and
   leaves locked ones on.
-- SYM shows the symbols in place of every other key (`%` in place of SHIFT) and keeps them, for
-  any number of keys, until tapped again; its label takes the primary colour and the indicator
-  while they are shown. Turning the page leaves the modifiers as they are: CTRL and ALT apply to
-  symbols too (CTRL, SYM, `]` sends Ctrl+]), though they cannot be seen on the symbols page, while
-  SHIFT waits there: it applies to no key, the symbols or the IME's, and a one-shot SHIFT is not
-  used up, so it applies again once the first page is back. A key still held on the page going
-  away is cancelled. The page lives as long as the view: a new activity starts on the first.
+- A tap on SYM shows the symbols in place of every other key (`%` in place of SHIFT), and from
+  either other page shows the first again; a long press shows the function keys in place of
+  every key but SHIFT and SYM, and from them the first page again. A page stays, for any number
+  of keys, until SYM turns it; SYM's label takes the primary colour and the indicator while another
+  page than the first is shown. The function keys and PGUP/PGDN go to `VtView.press` as their key
+  codes, so the modifiers apply as on a keyboard (SHIFT, F5 sends `CSI 15;2~`). Turning the page
+  leaves the modifiers as they are: CTRL and ALT apply to symbols and function keys too (CTRL,
+  SYM, `]` sends Ctrl+]), though they cannot be seen on those pages, while SHIFT waits on the
+  symbols page: it applies to no key, the symbols or the IME's, and a one-shot SHIFT is not used
+  up, so it applies again once another page is back. A key still held on the page going away is
+  cancelled. The page lives as long as the view: a new activity starts on the first.
 
 ### Insets and the IME
 
@@ -382,8 +391,11 @@ notices task and the build (`android/native`).
   under it.
 - The column width is set on the keys' layout params during `ExtraKeysView.onMeasure`; the rows
   and the grids inside the scroll view are measured without a width limit, so they are forced to
-  measure again whenever the column width changes, the page not shown too (it keeps the flag until
-  it is added back).
+  measure again whenever the column width changes, the pages not shown too (each keeps the flag
+  until it is added back).
+- SHIFT's view is the last key of both the first page and the function keys' (a view has one
+  parent, and a `Modifier` one view), so turning between those pages leaves it in place in the
+  fixed column, and a SHIFT held meanwhile is not cancelled.
 - The indicators are drawn by the containers (the tab row, each page's grid, the fixed column) in
   `dispatchDraw`, over their labels, so a change of state must invalidate the container, not the
   label: `refresh` invalidates every grid and the fixed column, and `TabBarView.render` the tab
@@ -463,6 +475,8 @@ none
     rolling numbers' blur on Android 11 and real GPUs;
   - the progress line and the other tabs' marks for real programs (cargo, systemd, AI coding CLIs),
     and TalkBack's descriptions heard rather than read through uiautomator;
+  - the extra keys' long presses (SYM's function keys, locking a modifier) through TalkBack, and
+    the function keys in real programs (mc, htop) rather than `cat -v`;
   - the search bar's Back callback on Android 16;
   - the volume keys as real buttons (tried with adb key events: presses, a long press, the
     setting off and on, with three tabs; not with a single tab) and under vendor volume handling;

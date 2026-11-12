@@ -27,9 +27,11 @@ import kotlin.math.roundToInt
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
  * widened to eight columns, with Shift and SYM in the last. Until it is tapped again, SYM puts
  * symbols in place of the keys that are not, so that page has every ASCII symbol Gboard types
- * neither directly nor from a long press on a letter. SYM is under Shift as the symbol key of a
- * phone keyboard is and fn on a laptop, and on the edge next to the IME, where a stray tap turns
- * the whole page rather than silently shifting the IME's next letter.
+ * neither directly nor from a long press on a letter. A long press on SYM puts the function keys
+ * there instead, with Page Up and Down beside them as on fn's layer of a laptop and Shift kept,
+ * until SYM is tapped or long-pressed again. SYM is under Shift as the symbol key of a phone
+ * keyboard is and fn on a laptop, and on the edge next to the IME, where a stray tap turns the
+ * whole page rather than silently shifting the IME's next letter.
  *
  * ```
  * ESC  /   -  HOME  ↑  END  |  │ SHIFT
@@ -37,6 +39,9 @@ import kotlin.math.roundToInt
  *
  *  `   /   -   =   ^   \   |   │  %
  *  [   ]   {   }   <   >   ~   │ SYM
+ *
+ *  F1  F2  F3  F4  F5  F6 PGUP │ SHIFT
+ *  F7  F8  F9 F10 F11 F12 PGDN │ SYM
  * ```
  *
  * The columns share the width but are never narrower than [MIN_COLUMN_DP], so all eight fit from
@@ -44,12 +49,12 @@ import kotlin.math.roundToInt
  * sideways under it, fading out into the blank left of SHIFT while more of them lie beyond, as the
  * tab row fades out into ×.
  *
- * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow
- * repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply to the next key typed,
- * which reads them ([ctrl], [alt], [shift]) and reports taking them ([modifiersUsed]); held, they
- * stay on until tapped again. SYM is no modifier: turning the page leaves them as they are, and
- * Ctrl and Alt apply to a symbol too, while Shift, not shown with the symbols, waits for the first
- * page. The android/terminal map.
+ * A key acts when the finger lifts, and not at all if the finger left it first. Holding an arrow,
+ * Page Up or Page Down repeats it. Ctrl, Alt and Shift are one-shot modifiers: tapped, they apply
+ * to the next key typed, which reads them ([ctrl], [alt], [shift]) and reports taking them
+ * ([modifiersUsed]); held, they stay on until tapped again. SYM is no modifier: turning the page
+ * leaves them as they are, and Ctrl and Alt apply to a symbol or a function key too, while Shift,
+ * not shown with the symbols, waits there for another page. The android/terminal map.
  */
 @SuppressLint("ViewConstructor") // Created only in code, never in layout files
 internal class ExtraKeysView(context: Context, private val target: Target) : FrameLayout(context) {
@@ -74,18 +79,20 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     /**
-     * One key: its label, what it sends, whether holding it repeats, or the modifier it toggles.
+     * One key: its label, what it sends, whether holding it repeats, the modifier it toggles, or
+     * what a long press does instead of repeating (a modifier locked, SYM's function keys).
      */
     private class Key(
         val label: String,
         val repeats: Boolean = false,
         val modifier: Modifier? = null,
+        val longPress: (() -> Unit)? = null,
         val send: () -> Unit = {},
     )
 
     /**
-     * A page: the [grid] of its first seven columns, and the [last] key, above SYM. Only the page
-     * shown is in the view.
+     * A page: the [grid] of its first seven columns, and the [last] key, above SYM (the first
+     * page's SHIFT on the function keys' page too). Only the page shown is in the view.
      */
     private class Page(val grid: LinearLayout, val last: View)
 
@@ -94,14 +101,14 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private val shiftKey = Modifier()
     private val modifiers = arrayOf(ctrlKey, altKey, shiftKey)
 
-    /** The keys, then the symbols SYM shows. */
+    /** The keys, the symbols SYM shows, and the function keys a long press on it shows. */
     private val pages = mutableListOf<Page>()
 
     /** The keys in the pages' grids (sized in [onMeasure]). */
     private val gridKeys = mutableListOf<View>()
 
-    /** Whether SYM shows the symbols. */
-    private var symbols = false
+    /** The page shown: [KEYS], [SYMBOLS] or [FUNCTIONS]. */
+    private var shown = KEYS
     private lateinit var symView: TextView
 
     private val density = resources.displayMetrics.density
@@ -199,20 +206,32 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             ),
             arrayOf(
                 special("TAB", KeyEvent.KEYCODE_TAB),
-                Key("CTRL", modifier = ctrlKey),
-                Key("ALT", modifier = altKey),
+                modifier("CTRL", ctrlKey),
+                modifier("ALT", altKey),
                 special("←", KeyEvent.KEYCODE_DPAD_LEFT, repeats = true),
                 special("↓", KeyEvent.KEYCODE_DPAD_DOWN, repeats = true),
                 special("→", KeyEvent.KEYCODE_DPAD_RIGHT, repeats = true),
                 char("~"),
             ),
-            last = Key("SHIFT", modifier = shiftKey),
+            last = fixedView(modifier("SHIFT", shiftKey)),
         )
         // The ASCII symbols that Gboard's letters do not give from a long press (as they give
         // $ & ; : and the like), and -: / - | ~ where they are on the first page, ` in the corner
         // it has on a keyboard, - = and \ | side by side as there, and ^ in place of ↑
-        page(chars("`/-=^\\|"), chars("[]{}<>~"), last = char("%"))
-        symView = fixedView(Key("SYM") { turnPage() })
+        page(chars("`/-=^\\|"), chars("[]{}<>~"), last = fixedView(char("%")))
+        // F1 to F12 in order, six to a row, then Page Up and Down, which fn's arrows type on a
+        // laptop and have no other place; SHIFT stays for the shifted function keys (mc's
+        // Shift+F4 and Shift+F6)
+        page(
+            Array(6) { function(it) } + special("PGUP", KeyEvent.KEYCODE_PAGE_UP, repeats = true),
+            Array(6) { function(it + 6) } + special("PGDN", KeyEvent.KEYCODE_PAGE_DOWN, repeats = true),
+            last = pages[KEYS].last,
+        )
+        symView = fixedView(
+            Key("SYM", longPress = { turnTo(if (shown == FUNCTIONS) KEYS else FUNCTIONS) }) {
+                turnTo(if (shown == KEYS) SYMBOLS else KEYS)
+            },
+        )
         fixed.addView(symView)
         show(pages[0])
         // Their widths are set in onMeasure: the scroll view's end padding and the last column's
@@ -224,13 +243,22 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     private fun special(label: String, keyCode: Int, repeats: Boolean = false) =
         Key(label, repeats = repeats) { target.key(keyCode) }
 
+    /** Ctrl, Alt or Shift: a tap toggles [m], a long press locks it ([hold]). */
+    private fun modifier(label: String, m: Modifier) = Key(label, modifier = m, longPress = { hold(m) })
+
     private fun char(text: String) = Key(text) { target.text(text) }
 
     /** A key for each character of [text]. */
     private fun chars(text: String) = Array(text.length) { char(text[it].toString()) }
 
-    /** A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last]. */
-    private fun page(vararg rows: Array<Key>, last: Key) {
+    /** The function key F1 to F12 at [index] from 0. */
+    private fun function(index: Int) = special("F${index + 1}", KeyEvent.KEYCODE_F1 + index)
+
+    /**
+     * A page: a row of the grid for each of [rows], of [COLUMNS] − 1 keys each, and [last], the
+     * view of the key above SYM.
+     */
+    private fun page(vararg rows: Array<Key>, last: View) {
         val grid = object : LinearLayout(context) {
             // Drawn here, inside the scroll view, the indicators scroll with the keys
             override fun dispatchDraw(canvas: Canvas) {
@@ -249,13 +277,21 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             }
             grid.addView(row, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, rowHeight))
         }
-        pages.add(Page(grid, fixedView(last)))
+        pages.add(Page(grid, last))
     }
 
     @SuppressLint("ClickableViewAccessibility") // Press calls performClick on release
     private fun keyView(key: Key) = label(key.label).also { view ->
         key.modifier?.view = view
         view.setOnClickListener { tap(key) }
+        // For accessibility services only: Press takes every touch, so the view's own long-press
+        // detection never runs and Press acts on a held finger itself
+        key.longPress?.let { longPress ->
+            view.setOnLongClickListener {
+                longPress()
+                true
+            }
+        }
         view.setOnTouchListener(Press(key, view))
     }
 
@@ -272,18 +308,21 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         keyView(key).apply { layoutParams = LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, rowHeight) }
 
     /**
-     * Puts [page] in the view in place of the other one, its last key above SYM. Removing a key's
-     * view cancels its touch, so a key still held on the page going away stops repeating.
+     * Puts [page] in the view in place of the one shown, its last key above SYM. Removing a key's
+     * view cancels its touch, so a key still held on the page going away stops repeating; SHIFT,
+     * on both the first page and the function keys', stays between them.
      */
     private fun show(page: Page) {
         scroll.removeAllViews()
         scroll.addView(page.grid)
-        if (fixed.childCount > 1) fixed.removeViewAt(0)
-        fixed.addView(page.last, 0)
+        if (fixed.getChildAt(0) !== page.last) {
+            if (fixed.childCount > 1) fixed.removeViewAt(0)
+            fixed.addView(page.last, 0)
+        }
     }
 
     private fun refresh() {
-        symView.setTextColor(if (symbols) onColor else labelColor)
+        symView.setTextColor(if (shown != KEYS) onColor else labelColor)
         for (m in modifiers) m.view.setTextColor(if (m.on) onColor else labelColor)
         // Their indicators
         for (page in pages) page.grid.invalidate()
@@ -292,12 +331,13 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /**
      * Draws the indicator, as under the current tab, under the keys in [container] that stay on
-     * until tapped (a locked modifier, and SYM with the symbols shown; a modifier on for the next
-     * key only shows the colour), over the keys so that a pressed key's shading does not hide it.
+     * until tapped (a locked modifier, and SYM with another page than the first shown; a modifier
+     * on for the next key only shows the colour), over the keys so that a pressed key's shading
+     * does not hide it.
      */
     private fun indicateKeys(canvas: Canvas, container: View) {
         for (m in modifiers) if (m.locked) drawIndicator(canvas, container, m.view, indicatorPaint)
-        if (symbols) drawIndicator(canvas, container, symView, indicatorPaint)
+        if (shown != KEYS) drawIndicator(canvas, container, symView, indicatorPaint)
     }
 
     /**
@@ -328,8 +368,8 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
 
     /**
      * The touch on one key: highlights it while pressed, taps it on release (through
-     * [View.performClick]), and repeats it or locks its modifier while held. A sideways slide on a
-     * key that is not yet held scrolls the grid, if it can scroll, and cancels the key.
+     * [View.performClick]), and while held repeats it or does its [Key.longPress] once. A sideways
+     * slide on a key that is not yet held scrolls the grid, if it can scroll, and cancels the key.
      */
     private inner class Press(private val key: Key, private val view: View) : OnTouchListener, Runnable {
         private var held = 0
@@ -341,7 +381,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
                     held = 0
                     cancelled = false
                     v.setBackgroundColor(pressedColor)
-                    if (key.repeats || key.modifier != null) {
+                    if (key.repeats || key.longPress != null) {
                         v.postDelayed(this, ViewConfiguration.getLongPressTimeout().toLong())
                     }
                 }
@@ -362,10 +402,10 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         /** The long-press timeout passed, then every [REPEAT_MS] while a repeating key is held. */
         override fun run() {
             if (held++ == 0) keepTouch()
-            val m = key.modifier
-            if (m != null) {
+            val longPress = key.longPress
+            if (longPress != null) {
                 view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                hold(m)
+                longPress()
             } else {
                 key.send()
                 view.postDelayed(this, REPEAT_MS)
@@ -395,8 +435,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     /**
-     * A long press on Ctrl, Alt or Shift: locks it on, also when a tap had turned it on for the
-     * next key, saying which one it locked, or turns it off when locked.
+     * A long press on Ctrl, Alt or Shift (or an accessibility service's): locks it on, also when a
+     * tap had turned it on for the next key, saying which one it locked, or turns it off when
+     * locked.
      */
     private fun hold(m: Modifier) {
         m.locked = !m.locked
@@ -405,16 +446,19 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         if (m.locked) target.notice(context.getString(R.string.modifier_locked, m.view.text))
     }
 
-    /** SYM: shows the symbols in place of the first page, or the first page again. */
-    private fun turnPage() {
-        symbols = !symbols
-        show(pages[if (symbols) 1 else 0])
+    /**
+     * SYM: shows page [index], the symbols from the first page on a tap or the function keys on a
+     * long press, or the first page again.
+     */
+    private fun turnTo(index: Int) {
+        shown = index
+        show(pages[index])
         refresh()
     }
 
     val ctrl get() = ctrlKey.on
     val alt get() = altKey.on
-    val shift get() = shiftKey.on && !symbols
+    val shift get() = shiftKey.on && shown != SYMBOLS
 
     /**
      * The next key or character took the one-shot modifiers; locked ones stay on, and so does
@@ -423,7 +467,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     fun modifiersUsed() {
         var changed = false
         for (m in modifiers) {
-            if (m.on && !m.locked && !(symbols && m === shiftKey)) {
+            if (m.on && !m.locked && !(shown == SYMBOLS && m === shiftKey)) {
                 m.on = false
                 changed = true
             }
@@ -432,6 +476,11 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
     }
 
     companion object {
+        /** The pages, as indices into [pages]: the keys, the symbols and the function keys. */
+        private const val KEYS = 0
+        private const val SYMBOLS = 1
+        private const val FUNCTIONS = 2
+
         /** The number of columns: seven in the grid and the fixed one. */
         private const val COLUMNS = 8
 
@@ -476,7 +525,7 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
         /**
          * Draws the indicator under [label], which lies in [container] (directly or deeper), for a
          * state that stays until changed: the current tab, a locked modifier, SYM with the symbols
-         * shown. As in Material's tabs, a short rounded bar, the same width under any label, and a
+         * or the function keys shown. As in Material's tabs, a short rounded bar, the same width under any label, and a
          * shape, so it shows without telling colours apart. It hangs [INDICATOR_GAP_DP] below the
          * label's baseline, where its letters and digits end, so it stays with the label whatever
          * the height of the bar or the size of the text; it fades with the label. Nothing is drawn
