@@ -26,13 +26,14 @@ import com.google.android.material.materialswitch.MaterialSwitch
 import kotlin.concurrent.thread
 
 /**
- * Settings: distro, package mirror, reset rootfs, execution tier (debug builds only; the
- * android/setup map), login account (likewise), keep running with the screen off (the
- * android/service map), CJK characters filling two cells (the android/vtview map), open source
- * licenses (design doc §13.4). All the state is in [TerminalService]; this only displays and
- * forwards it, and while the kernel is not running (starting, replacing the store) everything can
- * be viewed but not changed. When replacing the store or a restart begins, it goes back to the
- * terminal, which shows the progress.
+ * Settings: distro, package mirror, login account and reset rootfs (the android/setup map); keep
+ * running with the screen off (the android/service map) and the whole system in the Files app
+ * (the android/documents map); CJK characters filling two cells, the cursor's shape and blinking
+ * (the android/vtview map) and the volume keys switching tabs (the android/terminal map); the
+ * execution tier (debug builds only); open source licenses. All the state is in
+ * [TerminalService]; this only displays and forwards it, and while the kernel is not running
+ * (starting, replacing the store) the rows that need it can be viewed but not changed. When
+ * replacing the store or a restart begins, it goes back to the terminal, which shows the progress.
  *
  * Material 3 (`Theme.Appine`, page.xml): rows in groups under headings, light or dark with the
  * system, with the wallpaper's colours from Android 12 on.
@@ -59,6 +60,7 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
     private lateinit var fillWide: Row
     private lateinit var cursorStyle: Row
     private lateinit var cursorBlink: Row
+    private lateinit var volumeKeys: Row
     private lateinit var licenses: Row
 
     private val connection = object : ServiceConnection {
@@ -99,15 +101,18 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         fillWide = Row(R.string.settings_fill_wide, toggle = true) { service?.let { it.setFillWide(!it.fillWide) } }
         cursorStyle = Row(R.string.settings_cursor_style) { onCursorStyle() }
         cursorBlink = Row(R.string.settings_cursor_blink, toggle = true) { service?.let { it.setCursorBlink(!it.cursorBlink) } }
+        volumeKeys = Row(R.string.settings_volume_keys, toggle = true) {
+            service?.let { it.setVolumeKeysSwitchTabs(!it.volumeKeysSwitchTabs) }
+        }
         // AGPL sections 0 and 5's "Appropriate Legal Notices": copyright, no warranty, the license,
         // and where to read the full text
         licenses = Row(R.string.settings_licenses) { startActivity(Intent(this, LicensesActivity::class.java)) }
         licenses.set(getString(R.string.licenses_summary), true)
 
-        // The guest system; the Android side (power, the Files app); the terminal's look
+        // The guest system; the Android side (power, the Files app); the terminal's look and keys
         group(R.string.settings_group_system, distro, mirror, account, reset)
         group(R.string.settings_group_android, keepAwake, systemDocuments)
-        group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink)
+        group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         tier?.let { group(R.string.settings_group_debug, it) }
         group(R.string.settings_group_about, licenses)
 
@@ -263,6 +268,11 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
         cursorStyle.set(getString(CURSOR_LABELS[CURSOR_STYLES.indexOf(s.cursorStyle).coerceAtLeast(0)]), true)
         cursorBlink.set(getString(if (s.cursorBlink) R.string.cursor_blink_on else R.string.cursor_blink_off), true, s.cursorBlink)
+        volumeKeys.set(
+            getString(if (s.volumeKeysSwitchTabs) R.string.volume_keys_on else R.string.volume_keys_off),
+            true,
+            s.volumeKeysSwitchTabs,
+        )
     }
 
     private fun loginSummary(login: String): String = when (login) {

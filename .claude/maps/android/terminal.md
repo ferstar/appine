@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `TabNumber` moved to its own file, and the screens' dp and theme helpers shared from `Ui.kt`)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the volume keys switch tabs, behind a setting)
 
 ## Responsibilities
 
@@ -13,7 +13,8 @@
 `android/vtview`):
 
 - `MainActivity`: the screen's layout and status text, the tab shown and its successor, closing
-  tabs, keyboard shortcuts, keeping the font size, insets and the IME's animation, opening links,
+  tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size, insets and
+  the IME's animation, opening links,
   and the question whether a program may read the clipboard, with the tab bar (`TabBarView`), the
   search bar in its place while searching (`SearchBarView`), the current tab's progress line over
   the terminal (`ProgressLine`) and the extra keys (`ExtraKeysView`);
@@ -204,6 +205,17 @@ notices task and the build (`android/native`).
   the tab ones under Tabs, Find and the two prompt jumps under Terminal). The extra keys' modifiers
   do not make shortcuts: with them these keys reach the program.
 
+### The volume keys
+
+- While Settings has them switch tabs (`Settings.volumeKeysSwitchTabs`, on by default, read at
+  each press), the activity (`dispatchKeyEvent`) takes a volume key's press when there is another
+  tab to show: volume up shows the previous tab and volume down the next, going round as Ctrl+Tab
+  does, once per press; the key's repeats and release are swallowed with it, so holding it neither
+  switches again nor changes the volume. With a single tab (or none, as while the kernel starts) or
+  the setting off, the press, its repeats and its release go to the system, which changes the
+  volume; programs never get the volume keys either way (`VtView` leaves system keys alone). Open
+  dialogs and the ⋮ menu are windows of their own, where the volume keys change the volume.
+
 ### Finding text
 
 - "Find" (⋮) or Ctrl+Shift+F, with a current tab, puts the search bar in the tab bar's place
@@ -218,8 +230,8 @@ notices task and the build (`android/native`).
   view reports it (`Host.onSearchCount`), the selected one counted from the newest, 0 before a step.
 - `×`, Esc in the text, or Back (after Back has hidden the keyboard) closes the bar: the search
   ends and its marks go (`VtView.endSearch`), the tab bar comes back, the terminal takes the focus
-  and the viewport stays where the search left it. Showing a tab (another one, Ctrl+Tab while
-  searching, or the same one again when the activity comes back, see Binding and choosing a tab) or
+  and the viewport stays where the search left it. Showing a tab (another one, Ctrl+Tab or a volume
+  key while searching, or the same one again when the activity comes back, see Binding and choosing a tab) or
   a restart closes it too, as a search belongs to the tab it was opened in.
 - Tapping the terminal (or pressing a mouse on it) while the bar is open gives the keyboard back to
   the terminal and leaves the bar and its marks; the extra keys always go to the terminal, the
@@ -326,7 +338,8 @@ notices task and the build (`android/native`).
 - android/vt: `VtSession` (`busy`, `cwd()`, `title`, `progress`, `status`, `describe`, `clear`,
   `reset`, `answerClipboardRead`); `ProgressLine` draws the tab's `Progress`.
 - `TerminalService` (`createSession`, with the current tab's directory for a new tab,
-  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide`; `Documents.fileLink`
+  `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide` and
+  `volumeKeysSwitchTabs`; `Documents.fileLink`
   (android/documents); `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation
@@ -341,6 +354,9 @@ notices task and the build (`android/native`).
   swallowed too, so the Kitty protocol sees no release without a press. Other releases are never
   matched to presses: Ctrl+Shift+C/V's, a Shift+arrow's (or Page Up or Down, Home or End) that
   moved a selection, or Esc's when the IME took the press, reach the program alone.
+- A taken shortcut or volume key is remembered (`shortcutKey`) until its release, which is
+  swallowed; a volume key's repeats are taken only while it is the remembered key, so a press
+  left to the system keeps its repeats and release there and the volume changes as usual.
 - The tab bar's buttons sit over the row's end, so their group is clickable and black but for the
   left part of `×` the fade reaches into: a hidden (`INVISIBLE`) `×` takes no touches, and
   without the group's a tap there would reach a tab under it. The black is an `InsetDrawable`,
@@ -448,5 +464,7 @@ none
   - the progress line and the other tabs' marks for real programs (cargo, systemd, AI coding CLIs),
     and TalkBack's descriptions heard rather than read through uiautomator;
   - the search bar's Back callback on Android 16;
+  - the volume keys as real buttons (tried with adb key events: presses, a long press, the
+    setting off and on, with three tabs; not with a single tab) and under vendor volume handling;
   - Back finishing the activity on Android 11 (a new activity's tab was tried after removing the
     task, a font scale change and a display size change on API 34).

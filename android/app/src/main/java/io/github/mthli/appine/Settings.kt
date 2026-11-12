@@ -17,6 +17,7 @@ internal object Settings {
     private const val KEY_FILL_WIDE = "fill_wide"
     private const val KEY_CURSOR_STYLE = "cursor_style"
     private const val KEY_CURSOR_BLINK = "cursor_blink"
+    private const val KEY_VOLUME_KEYS_SWITCH_TABS = "volume_keys_switch_tabs"
 
     // The cursor shapes as recorded, Ghostty's cursor-style values
     private const val CURSOR_BLOCK = "block"
@@ -97,4 +98,14 @@ internal object Settings {
     fun cursorBlink(context: Context): Boolean = prefs(context).getBoolean(KEY_CURSOR_BLINK, true)
 
     fun setCursorBlink(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_CURSOR_BLINK, on) }
+
+    /**
+     * Whether the volume keys switch tabs in the terminal, up to the previous and down to the next
+     * (a switch in Settings, on by default, the android/terminal map); off, they change the volume.
+     * [MainActivity] reads it at each press.
+     */
+    fun volumeKeysSwitchTabs(context: Context): Boolean = prefs(context).getBoolean(KEY_VOLUME_KEYS_SWITCH_TABS, true)
+
+    fun setVolumeKeysSwitchTabs(context: Context, on: Boolean) =
+        prefs(context).edit { putBoolean(KEY_VOLUME_KEYS_SWITCH_TABS, on) }
 }

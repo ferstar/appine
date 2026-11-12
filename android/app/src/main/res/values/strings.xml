@@ -148,6 +148,9 @@
     <string name="settings_cursor_blink">Blinking cursor</string>
     <string name="cursor_blink_on">The cursor blinks, unless a program asks for a steady one.</string>
     <string name="cursor_blink_off">The cursor stays steady, unless a program asks for it to blink.</string>
+    <string name="settings_volume_keys">Volume keys switch tabs</string>
+    <string name="volume_keys_on">Volume up shows the previous tab and volume down the next, going round; with a single tab they change the volume.</string>
+    <string name="volume_keys_off">The volume keys change the volume.</string>
     <string name="documents_home" translatable="false">%1$s · %2$s</string>
     <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">

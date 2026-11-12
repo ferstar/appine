@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: notifications other than the ongoing one moved to `Notifications`, the settings preferences to `Settings`)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the setting whether the volume keys switch tabs)
 
 ## Responsibilities
 
@@ -24,7 +24,8 @@ outlives an Activity:
   finish;
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
-  shape and blinking, distro switch, mirror), the preferences kept in `Settings`.
+  shape and blinking, whether the volume keys switch tabs, distro switch, mirror), the preferences
+  kept in `Settings`.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
 `Settings.kt`, `Tabs.kt`.
@@ -71,8 +72,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   shows, while it shows one). The service decides what is told (the tab in front, a message
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (always 1 in a release build), login, keep-awake, system documents, wide cells and the
-  cursor's shape (stored as Ghostty's names) and blinking; `clearLogin` for a replaced store.
+  tier (always 1 in a release build), login, keep-awake, system documents, wide cells, the
+  cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
+  (on by default); `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
   the active one, `downloader` the one whose thread has not ended yet.
 - `Tabs` — the `files/tabs/` store: `running` marker (the pid of the run that left it),
@@ -93,11 +95,13 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier` (ignored in a release
   build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`, `setMirror`/`autoMirror`,
   `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
-  `takeNotice`; state read by them: `machine`, `startError`, `progress`, `switching`, `sessions`,
-  `focus`, the settings.
+  `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
+  `progress`, `switching`, `sessions`, `focus`, the settings.
 - Settings read without the service: `Settings.login` and `systemDocuments` by `Documents`,
-  `Settings.fillWide` by `MainActivity` (in `onStart` and `onSettingsChanged`); the service's
-  getters read `Settings` too, and its setters write it and act on the change.
+  `Settings.fillWide` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
+  `Settings.volumeKeysSwitchTabs` by it at each volume key press; the service's getters read
+  `Settings` too, and its setters write it and act on the change (`setVolumeKeysSwitchTabs` only
+  tells the listeners).
 
 ## Data flow / lifecycle
 

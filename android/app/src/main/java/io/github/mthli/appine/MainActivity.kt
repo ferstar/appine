@@ -79,7 +79,10 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The last toast ([showToast]), cancelled by the next. */
     private var toast: Toast? = null
 
-    /** The key of the shortcut last taken ([dispatchKeyEvent]), whose release is taken too. */
+    /**
+     * The key of the shortcut or volume key last taken ([dispatchKeyEvent]), whose release is
+     * taken too.
+     */
     private var shortcutKey = 0
 
     /**
@@ -581,7 +584,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     // ---- Keyboard shortcuts ----
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN && shortcut(event)) {
+        if (event.action == KeyEvent.ACTION_DOWN && (shortcut(event) || volumeKey(event))) {
             shortcutKey = event.keyCode
             return true
         }
@@ -619,12 +622,33 @@ class MainActivity : Activity(), TerminalService.Listener {
         return true
     }
 
-    /** Shows the tab [delta] places after the current one, going round from the last to the first. */
-    private fun switchBy(delta: Int) {
-        val sessions = service?.sessions ?: return
+    /**
+     * Shows the tab [delta] places after the current one, going round from the last to the first;
+     * false when there is no other tab to show.
+     */
+    private fun switchBy(delta: Int): Boolean {
+        val sessions = service?.sessions ?: return false
         val i = sessions.indexOf(current)
-        if (i < 0 || sessions.size < 2) return
+        if (i < 0 || sessions.size < 2) return false
         show(sessions[Math.floorMod(i + delta, sessions.size)])
+        return true
+    }
+
+    /**
+     * The volume keys switch tabs while Settings has them do so ([Settings.volumeKeysSwitchTabs], on
+     * by default): up shows the previous tab and down the next, going round, once per press (a held
+     * key's repeats are swallowed). With no other tab to show, or with the setting off, they are
+     * left to the system, which changes the volume. False for any other key.
+     */
+    private fun volumeKey(event: KeyEvent): Boolean {
+        val delta = when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP -> -1
+            KeyEvent.KEYCODE_VOLUME_DOWN -> 1
+            else -> return false
+        }
+        // Repeats follow the press: swallowed after a switch, else the volume keeps changing
+        if (event.repeatCount > 0) return shortcutKey == event.keyCode
+        return Settings.volumeKeysSwitchTabs(this) && switchBy(delta)
     }
 
     /** Lists the shortcuts in the system's keyboard shortcuts screen (Meta+/). */

@@ -1084,6 +1084,13 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
+    val volumeKeysSwitchTabs: Boolean get() = Settings.volumeKeysSwitchTabs(this)
+
+    fun setVolumeKeysSwitchTabs(on: Boolean) {
+        Settings.setVolumeKeysSwitchTabs(this, on)
+        settingsChanged()
+    }
+
     val tier: Int get() = Settings.tier(this)
 
     /**
