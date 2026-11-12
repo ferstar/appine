@@ -14,6 +14,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.annotation.StringRes
 import androidx.core.view.isVisible
 import androidx.core.widget.doAfterTextChanged
 
@@ -42,8 +43,6 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         fun close()
     }
 
-    private val density = resources.displayMetrics.density
-
     // On black like the tab bar it stands in for, in the theme's colours
     private val mutedColor = themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant)
     private val textColor = themeColor(com.google.android.material.R.attr.colorOnSurface)
@@ -58,6 +57,9 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
         setHintTextColor(mutedColor)
         setHint(R.string.find)
         isSingleLine = true
+        // The line stays as tall as the bar's font when a character comes from a fallback font
+        // (CJK text to find), so the text does not move in the bar as it is typed
+        isFallbackLineSpacing = false
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN
@@ -134,7 +136,7 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
     }
 
     /** A button as the tab bar's: a square as tall as the bar with its label centred. */
-    private fun button(label: String, description: Int, onClick: (View) -> Unit) = TextView(context).apply {
+    private fun button(label: String, @StringRes description: Int, onClick: (View) -> Unit) = TextView(context).apply {
         text = label
         contentDescription = context.getString(description)
         setTextColor(mutedColor)
