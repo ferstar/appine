@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: what a resumed download does with an error status and with nothing left to get)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the mirror is written once after an import into untouched sources; Settings' mirror row, the manual choice and the mirror records are gone)
 
 ## Responsibilities
 
@@ -16,7 +16,8 @@
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
   bundled doas package, the profile script with its prompt marks for the terminal's shell
   integration), the osclock script run before boot and the boot log's failed services;
-- package mirrors: built-in lists, speed probes, rewriting the sources file;
+- package mirrors: built-in lists, one speed probe after an import, writing the fastest into
+  sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
   admin setup and the NOPASSWD rules;
 - the settings screen, which only displays the service's state and forwards choices;
@@ -45,15 +46,15 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     `debian/dists/trixie/InRelease` over https.
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
-- Preferences: file `rootfs`, owned here (`distro`, `mirror`, `mirror_manual`); the `settings`
+- Preferences: file `rootfs`, owned here (`distro`); the `settings`
   file is android/service's `Settings` (`tier`, read by debug builds only; `login`, `keep_awake`,
   `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` and `TerminalService.Listener` on the Material 3
   page that it shares with the licenses (`android/terminal`'s `page.xml`, `list_item.xml`,
   `list_header.xml`); `Row` (title, summary, an optional display-only `MaterialSwitch`,
-  `set(text, enabled, checked)`). Rows in groups under headings: System (distro, mirror, login
-  account, reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
+  `set(text, enabled, checked)`). Rows in groups under headings: System (distro, login account,
+  reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (tier,
   debug builds only) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -72,7 +73,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
 - Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
   `updateProfile`; around boot: `PREFER_OSCLOCK`, `failedServices`.
-- Mirrors: `chooseMirror`, `setMirror`, `retarget`, `mirror`, `isMirrorManual`, `host`.
+- Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
 - `scripts/fetch-rootfs [outdir]` (build-time download of the Alpine minirootfs and the doas
   package into `target/rootfs` by default).
@@ -111,13 +112,12 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 ### Import
 
 - `prepare` (does nothing for a ready store, one whose `meta.db` exists):
-  1. for the app's store, commit the distro it imports (`distro`);
+  1. for the app's store, commit the distro it imports (`distro`), the only record;
   2. delete `<store>.tmp`;
   3. get the tarball into the cache: Alpine's asset copied over it, unchecked; others through
      `download`;
   4. import into `<store>.tmp` (`Native.importRootfs`) and `configure` it;
-  5. for the app's store, commit the distro, its first mirror and `mirror_manual = false`;
-  6. sync the store (`syncfs`), rename it to the real store, fsync `files/` (a failure only
+  5. sync the store (`syncfs`), rename it to the real store, fsync `files/` (a failure only
      logged) and only then delete the tarball.
 - `installed` is the recorded distro of a ready store (Alpine when there is no record); while
   there is no store, `importing` names the distro an import was last started for (Alpine when
@@ -176,25 +176,18 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Mirrors
 
-- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After an import, on the
-  `appine-mirrors` thread, and when Settings picks "Fastest (measured)", `chooseMirror` clears the
-  manual flag, probes every mirror at once (one thread each, up to 512 KB or 5 s each, waiting at
-  most 10 s for each result), and takes the highest throughput (ties to the earlier mirror). If
-  every probe failed it writes and records nothing (the manual flag already cleared); otherwise,
-  under the `Rootfs` monitor, it writes the winner unless a manual choice was recorded meanwhile.
-- A manual choice (`setMirror`, on the service's worker) writes and records the mirror as manual
-  under the same monitor. Neither path takes the store lock.
-- Writing (`writeMirror`): a missing sources file is written from the template; otherwise
-  `retarget` rewrites the built-in mirror part of each line (Alpine's host and `/alpine`, Debian's
-  host with any path), keeping the scheme and the rest of each line, commented lines included, and
-  leaving other sources alone, and the file is written only when the text changed. Only the
-  distro's own sources file (`/etc/apk/repositories` or `debian.sources`) is touched. The
-  recorded mirror changes only after the write; a write that fails leaves both alone, and is only
-  logged.
-- A file with no built-in mirror is left alone: a Settings action then toasts a hint, while the
-  probe after an import ignores it.
-- Every import records the official mirror again and clears the manual flag; `mirror` is null
-  while there is no store.
+- Each distro has built-in mirrors (official, Tsinghua, USTC, Aliyun). After every import, and
+  only then, on the `appine-mirrors` thread, `chooseMirror` probes every mirror at once (one
+  thread each, up to 512 KB or 5 s each, waiting at most 10 s for each result) and takes the
+  highest throughput (ties to the earlier mirror); if every probe failed it does nothing.
+- Writing (`useMirror`): only while the distro's sources file (`/etc/apk/repositories` or
+  `debian.sources`) is byte for byte what the import wrote, with the official mirror, it is
+  written again from the same template with the winner (nothing is written when the official
+  mirror won). A file that differs in any way (already switched, edited by the user) or is
+  missing is left alone, so the mirror is switched at most once per import and the sources are
+  the user's from then on. It does not take the store lock; a failed write is only logged.
+- Nothing records the mirror in use and nothing in the app shows or changes it later: the user
+  edits the sources in the guest.
 
 ### Accounts and login
 
@@ -240,8 +233,6 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Every row reads the service's state and calls it:
   - distro: usable during a switch (it then cancels the download, after a confirmation) or when a
     switch is possible, a start failure included; choosing another distro or Reset asks first;
-  - mirror: only while the kernel runs with no switch and no probe running; "Fastest (measured)"
-    or one host; the summary names the host, marked as measured unless chosen by hand;
   - login account: whenever a store is installed and no switch runs, with a toast naming the
     account new tabs log in as;
   - reset: whenever a switch is possible;
@@ -252,9 +243,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
     (android/terminal).
-- Before the service is bound the rows are enabled with empty summaries; mirror (with a store
-  installed) and reset can then open dialogs, whose choice does nothing only if the service is
-  still unbound when it is made. The licenses row is always usable.
+- Before the service is bound the rows are enabled with empty summaries; reset can then open its
+  dialog, whose choice does nothing only if the service is still unbound when it is made. The licenses row is always usable.
 - Display: a row is a title over its value or description; a toggle row adds a `MaterialSwitch`
   that only shows the state (tapping the row toggles, and accessibility services see the row as a
   switch), whose first state jumps into place instead of sliding; a disabled row is drawn at 38%
@@ -268,10 +258,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Inbound
 
-- `TerminalService` (start, import, switch, reset, mirrors, per-start files, boot, the poll's
+- `TerminalService` (start, import, switch, reset, the mirror probe, per-start files, boot, the poll's
   `dirsChanged`, login accounts), `Documents` (`loginAccount`, `installed`, `isReady`, `access`),
   `ConsolePty` (runs `login.sh`), `MainActivity` (opens Settings), the instrumentation tests
-  (`fetch`, `prepare` into another store, `retarget`, `updateProfile`, `PREFER_OSCLOCK`).
+  (`fetch`, `prepare` into another store, `useMirror`, `updateProfile`, `PREFER_OSCLOCK`).
 
 ### Outbound
 
@@ -284,10 +274,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
-  mirror writes, the import (on `rootfs.tmp`) and the per-start files run without it.
-- Only a distro switch's `replace` joins the mirror thread, so a probe (after an import, or
-  "Fastest" from Settings before a restart) can write the sources while the next kernel opens the
-  store. Each write opens its own store connection: at worst the kernel then skips one boot
+  mirror write, the import (on `rootfs.tmp`) and the per-start files run without it.
+- The probe starts as the import ends, so it can write the sources while the kernel opens the
+  store (a distro switch's `replace` joins the mirror thread before deleting the store). The write
+  opens its own store connection: at worst the kernel then skips one boot
   cleanup (the store's leftovers under `/dev/shm` and `/run`, hidden by the tmpfs mounts, and
   orphaned objects reclaimed later), with no corruption.
 - A store becomes ready only when the synced import is renamed into place, so a half-imported
@@ -295,8 +285,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - An import interrupted by a kill (a first run, a distro switch, a reset) is redone with the same
   distro on the next launch, from the verified tarball still in the cache or by downloading it
   again with the usual progress; if that fails, the service falls back to Alpine with its notice.
-- Preferences are written before the rename, so an existing store always has its distro record;
-  only the app's own store writes them, but an import into another store (only the
+- The distro record is committed before the import starts, so an existing store always has it;
+  only the app's own store writes it, but an import into another store (only the
   instrumentation tests make one) still overwrites (Alpine) and deletes the shared cached tarball.
 - `writeFile` while the kernel runs is seen at once (the store's commit counter invalidates kernel
   caches).
@@ -320,17 +310,6 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   than 256 changed directories between two polls stops recording the rest, and changes before the
   service's first poll are not recorded, so such a change waits for the next login; while the app
   is not running there is nothing to refresh.
-- **"Fastest (measured)" can mislabel a hand-picked mirror.** `chooseMirror` clears the manual flag
-  before probing, so when every probe fails, or the write fails with an I/O error, the mirror
-  chosen by hand stays in the sources but Settings shows it as "fastest when measured", with no
-  message.
-- **"Fastest (measured)" from Settings shows no measuring.** `autoMirror` starts its probe without
-  telling the listeners, so the mirror row keeps its old summary and stays enabled until the probe
-  ends; choosing "Fastest" again meanwhile is silently ignored.
-- **Debian retargeting rewrites repositories on a built-in host.** The Debian patterns are bare
-  host names, so a repository the user added to `debian.sources` itself on one of those hosts (for
-  example docker-ce on `mirrors.aliyun.com`) is moved to the new mirror with its path, where it may
-  not exist, breaking `apt update` for it. Repositories in other files are not touched.
 
 ## Open questions
 
@@ -348,5 +327,3 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
   26.04's bash 5.3; busybox ash's in the app and an instrumentation test), and with a
   `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
-- Whether the mirror row can stay "Measuring the mirrors…" and disabled after a probe ends: the
-  probe thread posts the render itself, which may run before the thread counts as ended.

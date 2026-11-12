@@ -78,8 +78,7 @@ class TerminalService : Service() {
         fun onTabStatus() {}
 
         /**
-         * State shown in Settings changed: the download progress of a distro switch ([switching]),
-         * the mirror.
+         * State shown in Settings changed: the download progress of a distro switch ([switching]).
          */
         fun onSettingsChanged() {}
 
@@ -179,7 +178,7 @@ class TerminalService : Service() {
     private var exiting = false
 
     /**
-     * [onDestroy] has run: threads that outlive the service (a download, mirror probes) must not
+     * [onDestroy] has run: a thread that outlives the service (a download) must not
      * post the ongoing notification again, which would then have no service behind it.
      */
     private var destroyed = false
@@ -236,14 +235,11 @@ class TerminalService : Service() {
     private var nextSessionId = (System.currentTimeMillis() % Notifications.TAB_NOTIFICATION_COUNT).toInt()
 
     /**
-     * The thread that probes mirror speeds after an import or after "automatic" is chosen in
-     * Settings: replacing the store must wait until it has written the sources.
+     * The thread that probes mirror speeds after an import: replacing the store must wait until
+     * it has written the sources.
      */
     @Volatile
     private var mirrorThread: Thread? = null
-
-    /** Mirror speeds are being probed. */
-    val measuring: Boolean get() = mirrorThread?.isAlive == true
 
     /** [network] is registered. */
     private var watchingNetwork = false
@@ -516,10 +512,7 @@ class TerminalService : Service() {
                         val text = getString(R.string.downloading, distro.label, done shr 20, total shr 20)
                         main.post { preparing(text) }
                     })
-                    mirrorThread = thread(name = "appine-mirrors") {
-                        Rootfs.chooseMirror(this, distro)
-                        main.post { settingsChanged() }
-                    }
+                    mirrorThread = thread(name = "appine-mirrors") { Rootfs.chooseMirror(this, distro) }
                 }
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
@@ -963,46 +956,6 @@ class TerminalService : Service() {
                 start(distro)
             }
         }
-    }
-
-    /**
-     * A mirror was chosen in Settings: write it into the sources (on [worker], as the store has to
-     * be opened).
-     */
-    fun setMirror(mirror: String) {
-        val distro = Rootfs.installed(this) ?: return
-        if (machine == 0L || switching != null) return
-        worker.execute {
-            val written = runCatching { Rootfs.setMirror(this, distro, mirror) }
-                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-                .getOrDefault(true)
-            main.post {
-                if (!written) mirrorNotFound()
-                settingsChanged()
-            }
-        }
-    }
-
-    /** "Automatic" was chosen in Settings: probe again and write the fastest. */
-    fun autoMirror() {
-        val distro = Rootfs.installed(this) ?: return
-        if (machine == 0L || switching != null || mirrorThread?.isAlive == true) return
-        mirrorThread = thread(name = "appine-mirrors") {
-            val written = Rootfs.chooseMirror(this, distro)
-            main.post {
-                if (!written) mirrorNotFound()
-                settingsChanged()
-            }
-        }
-    }
-
-    /**
-     * The sources contain no built-in mirror at all (all replaced by mirrors outside the list), so
-     * the mirror chosen in Settings was not written: tell the user to edit them by hand. Since
-     * Android 12 toasts have at most two lines, so no path is given.
-     */
-    private fun mirrorNotFound() {
-        Toast.makeText(this, R.string.mirror_not_found, Toast.LENGTH_LONG).show()
     }
 
     // The settings ([Settings]), which the setters below act on

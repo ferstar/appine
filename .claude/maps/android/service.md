@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: channel names and the ongoing notification following a language change, the list of services that failed at boot)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `setMirror`, `autoMirror` and `measuring` are gone; the mirror thread runs only after an import and posts nothing)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@ outlives an Activity:
   finish;
 - the settings state that the activities only display and forward (tier in debug builds,
   keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
-  shape and blinking, whether the volume keys switch tabs, distro switch, mirror), the preferences
+  shape and blinking, whether the volume keys switch tabs, distro switch), the preferences
   kept in `Settings`.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
@@ -50,7 +50,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   and the BKL in the background (the poll's fetches, `setRoutes`, `consoleCwd`, `trimMemory` with
   the tabs' scrollback compression after it, `shutdown`, `stop`), together with what must stay
   ordered with them: saving tabs (their terminals' snapshots included), resolving an `auto` login, changed directories,
-  `Rootfs.setMirror`, and a replacement's mirror join and store reset.
+  and a replacement's mirror join and store reset.
 - Session state (internal): `sessions` (every tab, ended ones included), `unshown` (restored tabs
   whose terminal does not exist yet, with their saved copy), `restore` (saved tabs from a killed
   run, kept until a start restores them), `ended` (why that run ended), `focus` (set only by the
@@ -94,7 +94,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `START_NOT_STICKY`), `onBind`, `onTrimMemory`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier` (ignored in a release
-  build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`, `setMirror`/`autoMirror`,
+  build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
   `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
@@ -116,7 +116,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   import was last started for), else `start(null)`.
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
-  notification and listeners, then an `appine-mirrors` thread choosing a mirror),
+  notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
   `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`, then
   `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the setting in a debug
   build and always 1 in a release build, whatever an earlier debug install recorded).
@@ -180,7 +180,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   thread and delete the store, then `start(distro)` — also after "exit all" meanwhile, so the
   chosen distro is imported (and then stopped) rather than the next start importing Alpine.
 - `onDestroy` marks the service destroyed (from then on nothing posts the ongoing notification,
-  which threads outliving it, the download's and the mirror probes', would otherwise post again),
+  which a thread outliving it, the download's, would otherwise post again),
   cancels a distro switch still downloading, removes the pending callbacks, clears saved tabs
   unless tabs of a killed run are still waiting to be restored, unregisters the network callback,
   releases the sessions, shuts a remaining kernel down on the worker (best effort), shuts the
@@ -370,8 +370,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - An `exitAll` during a start, restart or replace leaves the rest of the exit to them: every path
   that ends `starting` or `transitioning` must check `exiting` (a replacement does so through the
   start it ends with), or the service stops with a kernel still running (or never stops).
-- Threads that outlive the service (a download, mirror probes) post to the main thread after
-  `onDestroy`: they reach notification 1 only through `updateNotification`, which does nothing once
+- A thread that outlives the service (a download; the mirror probe posts nothing) posts to the
+  main thread after `onDestroy`: it reaches notification 1 only through `updateNotification`, which does nothing once
   destroyed, so a new way of posting it must go through that too.
 - The marker is rewritten at a start before the first save replaces the old run's index, so a kill
   in between restores the old tabs again; tabs of a killed run kept through a replacement are

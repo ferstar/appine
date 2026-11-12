@@ -72,7 +72,6 @@
     <string name="settings_group_debug">调试</string>
     <string name="settings_group_about">关于</string>
     <string name="settings_distro">发行版</string>
-    <string name="settings_mirror">软件源镜像</string>
     <string name="settings_reset">重置 rootfs</string>
     <string name="settings_tier">执行层</string>
     <string name="switch_title">换成 %1$s？</string>
@@ -86,10 +85,6 @@
     <string name="download_failed">无法下载 %1$s：%2$s</string>
     <string name="switch_failed">无法准备 %1$s：%2$s\n\n已改用 %3$s。</string>
     <string name="reset_summary">删掉 rootfs 里的所有文件，重新导入 %1$s</string>
-    <string name="mirror_auto">自动选择最快的</string>
-    <string name="mirror_measured">%1$s（测速选出的）</string>
-    <string name="mirror_measuring">正在测速…</string>
-    <string name="mirror_not_found">源里没有列表中的镜像，没有改动，请手动修改。</string>
     <string name="tier_1">Tier 1：翻译执行（默认）</string>
     <string name="tier_0">Tier 0：解释执行，慢几十倍，排查问题用</string>
     <string name="restart_title">重启？</string>

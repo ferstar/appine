@@ -74,7 +74,6 @@
     <string name="settings_group_debug">Debugging</string>
     <string name="settings_group_about">About</string>
     <string name="settings_distro">Distribution</string>
-    <string name="settings_mirror">Package mirror</string>
     <string name="settings_reset">Reset rootfs</string>
     <string name="settings_tier">Execution tier</string>
     <string name="switch_title">Switch to %1$s?</string>
@@ -88,10 +87,6 @@
     <string name="download_failed">Cannot download %1$s: %2$s</string>
     <string name="switch_failed">Cannot prepare %1$s: %2$s\n\nUsing %3$s instead.</string>
     <string name="reset_summary">Delete every file in the rootfs and import %1$s again</string>
-    <string name="mirror_auto">Fastest (measured)</string>
-    <string name="mirror_measured">%1$s (fastest when measured)</string>
-    <string name="mirror_measuring">Measuring the mirrors…</string>
-    <string name="mirror_not_found">No listed mirror in the package sources; edit them by hand.</string>
     <string name="tier_1">Tier 1: translated (default)</string>
     <string name="tier_0">Tier 0: interpreted, tens of times slower; for troubleshooting</string>
     <string name="restart_title">Restart?</string>

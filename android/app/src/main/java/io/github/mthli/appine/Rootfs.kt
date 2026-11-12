@@ -9,10 +9,9 @@ import android.util.Log
 import androidx.core.content.edit
 import io.github.mthli.appine.Rootfs.RESUMES
 import io.github.mthli.appine.Rootfs.UNMARKED_PROFILE
+import io.github.mthli.appine.Rootfs.configure
 import io.github.mthli.appine.Rootfs.fetch
 import io.github.mthli.appine.Rootfs.profile
-import io.github.mthli.appine.Rootfs.sources
-import io.github.mthli.appine.Rootfs.writeMirror
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -29,8 +28,8 @@ import kotlin.concurrent.write
  * the APK, and Settings can switch to Debian (downloaded only when chosen; the version and sha256
  * are fixed here, and as with `scripts/fetch-rootfs` only a tarball whose digest matches is
  * accepted). After the import the configuration files are written, mirror speeds are probed in the
- * background, and the fastest one is written into the package manager's sources; it can also be
- * chosen by hand in Settings.
+ * background, and the fastest one is written into the package manager's sources, once: from then on
+ * the sources are the user's to edit.
  */
 internal object Rootfs {
     private const val TAG = "appine"
@@ -112,13 +111,10 @@ internal object Rootfs {
     private const val RESUMES = 5
 
     /**
-     * Records (SharedPreferences): the installed distro (while there is no store, the one an
-     * import was last started for), the mirror written into the sources, whether the user chose
-     * the mirror in Settings.
+     * The record (SharedPreferences): the installed distro (while there is no store, the one an
+     * import was last started for).
      */
     private const val KEY_DISTRO = "distro"
-    private const val KEY_MIRROR = "mirror"
-    private const val KEY_MIRROR_MANUAL = "mirror_manual"
 
     /**
      * The store's read-write lock. The kernel must be the only user of the store when it opens it;
@@ -162,7 +158,7 @@ internal object Rootfs {
      * retrying a failed or killed import needs no new download. Blocks; call it on a background
      * thread.
      */
-    @SuppressLint("ApplySharedPref") // The record must be on disk before the rename into place
+    @SuppressLint("ApplySharedPref") // The record must be on disk before the import starts
     @Throws(IOException::class)
     fun prepare(
         context: Context,
@@ -171,10 +167,10 @@ internal object Rootfs {
         store: File = store(context),
     ) {
         if (isReady(store)) return
-        // Only the app's own store has records (the instrumentation tests import into others)
-        val own = store == store(context)
-        // The next launch resumes this distro if the app is killed before the store is in place
-        if (own) prefs(context).edit(commit = true) { putString(KEY_DISTRO, distro.name) }
+        // The next launch resumes this distro if the app is killed before the store is in place,
+        // and once the store is there, the record is its own. Only the app's own store has one (the
+        // instrumentation tests import into others)
+        if (store == store(context)) prefs(context).edit(commit = true) { putString(KEY_DISTRO, distro.name) }
         val tmp = File(store.parentFile, "${store.name}.tmp")
         tmp.deleteRecursively()
         val tarball = tarball(context, distro)
@@ -187,14 +183,6 @@ internal object Rootfs {
         }
         Native.importRootfs(tmp.path, tarball.path)
         configure(context, tmp.path, distro)
-        if (own) {
-            // Written to disk before the rename: once the store is there, the record is its own
-            prefs(context).edit(commit = true) {
-                putString(KEY_DISTRO, distro.name)
-                putString(KEY_MIRROR, distro.mirrors[0])
-                putBoolean(KEY_MIRROR_MANUAL, false)
-            }
-        }
         // Sync before the rename: otherwise after a power loss the store could be in place while
         // its files are empty; after the rename, sync the directory too, so what is later written
         // into the store does not fall back into rootfs.tmp on a power loss and get deleted as an
@@ -291,32 +279,37 @@ internal object Rootfs {
     }
 
     /**
-     * Probes the mirrors of [distro] concurrently and writes the fastest into the package manager's
-     * sources ([writeMirror]); if all fail, nothing changes. When the user chose a mirror in
-     * Settings (also during the probe), it is left alone. Returns false when the sources have no
-     * built-in mirror and nothing changed. Blocks for a few seconds; call it on a background
-     * thread. Debian's mirrors are written as host names only, and probed with https.
+     * Probes the mirrors of [distro] concurrently and puts the fastest into the package manager's
+     * sources ([useMirror]); when every probe fails, nothing changes. Run once, right after an
+     * import. Blocks for a few seconds; call it on a background thread. Debian's mirrors are
+     * written as host names only, and probed with https.
      */
-    fun chooseMirror(context: Context, distro: Distro): Boolean {
-        prefs(context).edit { putBoolean(KEY_MIRROR_MANUAL, false) }
+    fun chooseMirror(context: Context, distro: Distro) {
         val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
         val speeds = distro.mirrors.zip(probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" }))
-        val best = speeds.filter { it.second != null }.maxByOrNull { it.second!! }?.first ?: return true
+        val best = speeds.filter { it.second != null }.maxByOrNull { it.second!! }?.first ?: return
         Log.i(TAG, "mirror speeds: $speeds, using $best")
-        synchronized(this) {
-            if (isMirrorManual(context)) return true
-            // Could not write (an I/O error): the sources and the recorded mirror both stay as they
-            // were, and the "no built-in mirror" hint would be wrong
-            val written = runCatching { writeMirror(store(context).path, distro, best) }
-                .onFailure { Log.w(TAG, "cannot write the package sources", it) }
-                .getOrElse { return true }
-            if (written) {
-                prefs(context).edit { putString(KEY_MIRROR, best) }
-            } else {
-                Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
-            }
-            return written
-        }
+        runCatching { useMirror(context, distro, best) }
+            .onSuccess { if (!it) Log.i(TAG, "the package sources are not as imported, leaving them alone") }
+            .onFailure { Log.w(TAG, "cannot write the package sources", it) }
+    }
+
+    /**
+     * Makes [mirror] the one in the package manager's sources of [distro], only while the sources
+     * file is still exactly what the import wrote ([configure], with the official mirror): once it
+     * was changed, by this or by the user, it is left alone, and false is returned. It can be
+     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
+     * caches are invalidated with it (the kernel/store map).
+     */
+    @Throws(IOException::class)
+    fun useMirror(context: Context, distro: Distro, mirror: String): Boolean {
+        val store = store(context).path
+        val official = distro.mirrors[0]
+        val (path, imported) = sources(distro, official)
+        val old = Native.readFile(store, path) ?: return false
+        if (String(old) != imported) return false
+        if (mirror != official) write(store, path, sources(distro, mirror).second)
+        return true
     }
 
     /**
@@ -374,64 +367,6 @@ internal object Rootfs {
             conn.disconnect()
         }
     }.getOrNull()
-
-    /**
-     * [mirror] was chosen in Settings: write it into the package manager's sources of [distro]
-     * ([writeMirror]), after which no probe replaces it. Returns false when the sources have no
-     * built-in mirror and nothing changed.
-     */
-    @Throws(IOException::class)
-    fun setMirror(context: Context, distro: Distro, mirror: String): Boolean = synchronized(this) {
-        if (!writeMirror(store(context).path, distro, mirror)) return false
-        prefs(context).edit {
-            putString(KEY_MIRROR, mirror)
-            putBoolean(KEY_MIRROR_MANUAL, true)
-        }
-        return true
-    }
-
-    /**
-     * Switches the package manager's sources of [distro] to [mirror] ([retarget]); when the sources
-     * file is gone it is rewritten by [sources]. When the sources contain no built-in mirror at all
-     * (all replaced by mirrors outside the list), nothing changes and false is returned. It can be
-     * written while the kernel runs too: the store's commit counter changes and the kernel layer's
-     * caches are invalidated with it (the kernel/store map).
-     */
-    @Throws(IOException::class)
-    private fun writeMirror(store: String, distro: Distro, mirror: String): Boolean {
-        val (path, content) = sources(distro, mirror)
-        val old = Native.readFile(store, path) ?: return true.also { write(store, path, content) }
-        val new = retarget(distro, String(old), mirror) ?: return false
-        if (new != String(old)) write(store, path, new)
-        return true
-    }
-
-    /**
-     * Replaces the addresses of built-in mirrors (any of [Distro.mirrors], http or https) in the
-     * sources file content [text] with [mirror], keeping the scheme; other addresses (repositories
-     * the user added, mirrors outside the list) are left alone. Lines the user added (Alpine's
-     * testing, Debian's backports) and changed components stay, and commented-out lines are
-     * replaced too. Returns null when there is no built-in mirror anywhere.
-     */
-    fun retarget(distro: Distro, text: String, mirror: String): String? {
-        val bare = { m: String -> m.substringAfter("://") }
-        val known = distro.mirrors.joinToString("|") { Regex.escape(bare(it)) }
-        val address = Regex("""(https?://)(?:$known)(?=[/\s]|$)""")
-        if (!address.containsMatchIn(text)) return null
-        return address.replace(text) { it.groupValues[1] + bare(mirror) }
-    }
-
-    /** The mirror's host name, for display in Settings. */
-    fun host(mirror: String): String = mirror.substringAfter("://").substringBefore('/')
-
-    /**
-     * The mirror written into the package manager's sources (an entry of [Distro.mirrors]); null
-     * while there is no store.
-     */
-    fun mirror(context: Context): String? = if (isReady(context)) prefs(context).getString(KEY_MIRROR, null) else null
-
-    /** The user chose the mirror in Settings (rather than a probe). */
-    fun isMirrorManual(context: Context): Boolean = prefs(context).getBoolean(KEY_MIRROR_MANUAL, false)
 
     /**
      * An `/etc/network/interfaces` with only the loopback interface (written before every kernel

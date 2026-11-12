@@ -700,84 +700,43 @@ class MachineTest {
     }
 
     /**
-     * A mirror chosen by hand in Settings is written into the sources: also while the kernel runs,
-     * and the guest sees it at once; it is recorded as chosen by hand. Only the built-in mirrors'
-     * addresses are replaced, and lines the user added (testing, their own repositories,
-     * commented-out ones) stay; when there is no built-in mirror anywhere, nothing changes.
+     * The fastest mirror goes into the sources only while they are still exactly what the import
+     * wrote: also while the kernel runs, and the guest sees it at once. Sources already switched,
+     * edited by the user or deleted are left alone.
      */
     @Test
-    fun manualMirrorIsWritten() {
+    fun mirrorIsWrittenOnlyIntoUntouchedSources() {
         val machine = start(1)
         val distro = Rootfs.Distro.ALPINE
-        val before = sh(machine, "cat /etc/apk/repositories").first
-        val prefs = context.getSharedPreferences("rootfs", android.content.Context.MODE_PRIVATE)
-        val saved = prefs.all
+        val path = "/etc/apk/repositories"
+        val before = sh(machine, "cat $path").first
         val (official, tuna, ustc) = distro.mirrors
         val branch = BuildConfig.ALPINE_BRANCH
+        val sources = { mirror: String -> "$mirror/$branch/main\n$mirror/$branch/community\n" }
+        val write = { text: String -> Native.writeFile(Rootfs.store(context).path, path, text.toByteArray(), 420, true) }
         try {
-            sh(machine, "echo '@testing http://${official.removePrefix("https://")}/edge/testing' >> /etc/apk/repositories")
-            sh(machine, "echo '#$official/$branch/community' >> /etc/apk/repositories")
-            sh(machine, "echo 'https://packages.example.com/alpine/$branch/main' >> /etc/apk/repositories")
-            assertTrue(Rootfs.setMirror(context, distro, ustc))
-            assertTrue(Rootfs.isMirrorManual(context))
-            assertEquals(ustc, Rootfs.mirror(context))
-            val bare = ustc.removePrefix("https://")
-            // The app's speed probe may already have replaced the mirror in the original sources
-            assertEquals(
-                distro.mirrors.fold(before) { text, m -> text.replace(m, ustc) } +
-                    "@testing http://$bare/edge/testing\n#$ustc/$branch/community\n" +
-                    "https://packages.example.com/alpine/$branch/main\n",
-                sh(machine, "cat /etc/apk/repositories").first,
-            )
-            // Switch once more: the previous choice is a built-in mirror too
-            assertTrue(Rootfs.setMirror(context, distro, tuna))
-            assertTrue(sh(machine, "cat /etc/apk/repositories").first.startsWith("$tuna/$branch/main\n"))
-            // Everything replaced by mirrors outside the list: no change, and the record stays too
-            val custom = "https://mirror.example.org/alpine/$branch/main\n"
-            sh(machine, "printf '$custom' > /etc/apk/repositories")
-            assertFalse(Rootfs.setMirror(context, distro, ustc))
-            assertEquals(custom, sh(machine, "cat /etc/apk/repositories").first)
-            assertEquals(tuna, Rootfs.mirror(context))
-            // The sources file is gone: rewrite it as at import
-            sh(machine, "rm /etc/apk/repositories")
-            assertTrue(Rootfs.setMirror(context, distro, ustc))
-            assertEquals("$ustc/$branch/main\n$ustc/$branch/community\n", sh(machine, "cat /etc/apk/repositories").first)
-            // Debian's deb822: only the host of built-in mirrors changes; scheme, components and
-            // other repositories stay
-            val debian = """
-                Types: deb
-                URIs: https://deb.debian.org/debian
-                Suites: trixie trixie-updates trixie-backports
-                Components: main contrib non-free
-
-                Types: deb
-                URIs: http://deb.debian.org/debian-security
-                Suites: trixie-security
-                Components: main
-
-                Types: deb
-                URIs: https://download.docker.com/linux/debian
-                Suites: trixie
-                Components: stable
-
-            """.trimIndent()
-            assertEquals(
-                debian.replace("deb.debian.org", "mirrors.aliyun.com"),
-                Rootfs.retarget(Rootfs.Distro.DEBIAN, debian, "mirrors.aliyun.com"),
-            )
-            assertEquals(null, Rootfs.retarget(Rootfs.Distro.DEBIAN, "URIs: http://ftp.cn.debian.org/debian\n", "mirrors.aliyun.com"))
+            // The app's speed probe may already have switched the mirror: start as at import
+            write(sources(official))
+            // The official mirror being the fastest writes nothing
+            assertTrue(Rootfs.useMirror(context, distro, official))
+            assertEquals(sources(official), sh(machine, "cat $path").first)
+            assertTrue(Rootfs.useMirror(context, distro, ustc))
+            assertEquals(sources(ustc), sh(machine, "cat $path").first)
+            // Once switched, never again
+            assertFalse(Rootfs.useMirror(context, distro, tuna))
+            assertEquals(sources(ustc), sh(machine, "cat $path").first)
+            // A line the user added, even with the official mirror still there
+            val edited = sources(official) + "@testing $official/edge/testing\n"
+            write(edited)
+            assertFalse(Rootfs.useMirror(context, distro, ustc))
+            assertEquals(edited, sh(machine, "cat $path").first)
+            // The sources file is gone: not written again
+            sh(machine, "rm $path")
+            assertFalse(Rootfs.useMirror(context, distro, ustc))
+            assertEquals(null, Native.readFile(Rootfs.store(context).path, path))
         } finally {
-            // Restore the original sources and record: other test cases and the app itself use this
-            // store
-            Native.writeFile(Rootfs.store(context).path, "/etc/apk/repositories", before.toByteArray(), 420, true)
-            prefs.edit().clear().apply {
-                for ((k, v) in saved) {
-                    when (v) {
-                        is String -> putString(k, v)
-                        is Boolean -> putBoolean(k, v)
-                    }
-                }
-            }.commit()
+            // Restore the original sources: other test cases and the app itself use this store
+            write(before)
         }
     }
 
@@ -1310,8 +1269,8 @@ class MachineTest {
         val titles = index.map { it[0] }
         assertTrue(text("Appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
         assertTrue(text("Fuchsia Starnix").let { it.contains("The Fuchsia Authors") && it.contains("Redistribution and use") })
-        assertTrue(text("Ghostty ").contains("Mitchell Hashimoto"))
-        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "Zig ")) {
+        assertTrue(text("libghostty-vt ").contains("Mitchell Hashimoto"))
+        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "translate-c ", "Zig ")) {
             assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))
         }
         assertTrue(text("JetBrains Mono").contains("SIL OPEN FONT LICENSE"))

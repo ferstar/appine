@@ -26,7 +26,7 @@ import com.google.android.material.materialswitch.MaterialSwitch
 import kotlin.concurrent.thread
 
 /**
- * Settings: distro, package mirror, login account and reset rootfs (the android/setup map); keep
+ * Settings: distro, login account and reset rootfs (the android/setup map); keep
  * running with the screen off (the android/service map) and the whole system in the Files app
  * (the android/documents map); CJK characters filling two cells, the cursor's shape and blinking
  * (the android/vtview map) and the volume keys switching tabs (the android/terminal map); the
@@ -43,7 +43,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
     private var service: TerminalService? = null
     private lateinit var list: LinearLayout
     private lateinit var distro: Row
-    private lateinit var mirror: Row
     private lateinit var reset: Row
     private lateinit var account: Row
 
@@ -90,7 +89,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         distro = Row(R.string.settings_distro) { onDistro() }
-        mirror = Row(R.string.settings_mirror) { onMirror() }
         reset = Row(R.string.settings_reset) { onReset() }
         account = Row(R.string.settings_login) { onLogin() }
         if (BuildConfig.DEBUG) tier = Row(R.string.settings_tier) { onTier() }
@@ -110,7 +108,7 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
         licenses.set(getString(R.string.licenses_summary), true)
 
         // The guest system; the Android side (power, the Files app); the terminal's look and keys
-        group(R.string.settings_group_system, distro, mirror, account, reset)
+        group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, keepAwake, systemDocuments)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         tier?.let { group(R.string.settings_group_debug, it) }
@@ -246,16 +244,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             },
             sw != null || s.canSwitch,
         )
-        val current = Rootfs.mirror(this)
-        mirror.set(
-            when {
-                s.measuring -> getString(R.string.mirror_measuring)
-                current == null -> ""
-                Rootfs.isMirrorManual(this) -> Rootfs.host(current)
-                else -> getString(R.string.mirror_measured, Rootfs.host(current))
-            },
-            idle && !s.measuring,
-        )
         // Reset is possible even when the start failed: it is the only way to recover a broken
         // store
         reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
@@ -314,21 +302,6 @@ class SettingsActivity : AppCompatActivity(), TerminalService.Listener {
             .setSingleChoiceItems(labels.toTypedArray(), distros.indexOf(installed)) { dialog, i ->
                 dialog.dismiss()
                 if (distros[i] != installed) confirmSwitch(distros[i], getString(R.string.switch_title, distros[i].label))
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    private fun onMirror() {
-        val distro = Rootfs.installed(this) ?: return
-        val current = Rootfs.mirror(this)
-        val checked = if (Rootfs.isMirrorManual(this)) distro.mirrors.indexOf(current) + 1 else 0
-        val labels = listOf(getString(R.string.mirror_auto)) + distro.mirrors.map(Rootfs::host)
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.settings_mirror)
-            .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, i ->
-                dialog.dismiss()
-                if (i == 0) service?.autoMirror() else service?.setMirror(distro.mirrors[i - 1])
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
