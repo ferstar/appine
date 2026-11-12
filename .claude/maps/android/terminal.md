@@ -230,7 +230,7 @@ notices task and the build (`android/native`).
 - No match is selected until a step: `↑`, Enter or the keyboard's Search key selects the next match
   above (towards older output; the first step selects the newest), `↓` or Shift+Enter the one
   below, going round at either end (`VtView.searchStep`). The count reads "selected/total" as the
-  view reports it (`Host.onSearchCount`), the selected one counted from the newest, 0 before a step.
+  view reports it (`Host.onSearchCount`), the selected one counted from the newest, 0 before a step; text that is not found reads "0/0".
 - `×`, Esc in the text, or Back (after Back has hidden the keyboard) closes the bar: the search
   ends and its marks go (`VtView.endSearch`), the tab bar comes back, the terminal takes the focus
   and the viewport stays where the search left it. Showing a tab (another one, Ctrl+Tab or a volume

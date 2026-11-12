@@ -78,7 +78,7 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
 
     private val count = TextView(context).apply {
         setTextColor(mutedColor)
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, COUNT_DP)
+        setTextSize(TypedValue.COMPLEX_UNIT_DIP, TabBarView.BAR_LABEL_DP)
         gravity = Gravity.CENTER_VERTICAL
         setPadding(dp(BAR_PADDING_DP), 0, dp(BAR_PADDING_DP), 0)
         // Digits of one width, so the count does not jiggle as it grows
@@ -151,8 +151,5 @@ internal class SearchBarView(context: Context, private val target: Target) : Lin
     private companion object {
         /** The room before the text and around the count (dp). */
         const val BAR_PADDING_DP = 12
-
-        /** The count's size, as the tab numbers' (dp, like the bar's labels). */
-        const val COUNT_DP = 12f
     }
 }

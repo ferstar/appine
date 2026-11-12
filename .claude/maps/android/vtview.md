@@ -421,7 +421,8 @@ opening links (`android/terminal`).
   uses the alternate one); empty text searches for nothing. `searchStep` (`VtNative.searchSelect`)
   selects the next match above or below, going round, and scrolls the viewport to it unless it is
   shown (the scroll bar shows only when it scrolled; a step stops a fling and puts the grid on a
-  whole row). The count, reported to the activity when it changes, grows as a long scrollback is
+  whole row). The count, reported to the activity when it changes and once after every `search` (so a needle
+  that is not found reads "0/0"), grows as a long scrollback is
   searched over several frames (Frames and drawing). `endSearch` (`VtNative.searchEnd`) ends it and
   takes its marks away.
 - Matches are drawn as Ghostty draws them: black text on yellow, the selected match on orange, the

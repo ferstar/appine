@@ -464,6 +464,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         VtNative.search(tab, needle)
         // Another needle can find as many matches elsewhere
         matchRowsTotal = -1
+        // And the next frame reports its count even when it is the last one's ("0/0" for a
+        // needle that is not found, where nothing was reported before)
+        searchTotal = -1
         invalidate()
     }
 
