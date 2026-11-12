@@ -24,9 +24,6 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
-import io.github.mthli.appine.TerminalService.Companion.POLL_MS
-import io.github.mthli.appine.TerminalService.Companion.SAVE_MS
-import io.github.mthli.appine.TerminalService.Companion.TRIM_DELAY_MS
 import java.text.DateFormat
 import java.text.DecimalFormat
 import java.util.Date
@@ -531,70 +528,82 @@ class TerminalService : Service() {
                     finishExit(result.getOrDefault(0L), booted = false)
                     return@post
                 }
-                result.onSuccess {
-                    machine = it
-                    progress = null
-                    // The store may have just been imported (first run, distro switch)
-                    Documents.rootsChanged(this)
-                    val next = pendingReplace
-                    if (next != null) {
-                        // A distro download finished while this kernel was starting
-                        pendingReplace = null
-                        replace(next)
-                        return@onSuccess
-                    }
-                    updateWakeLock()
-                    Tabs.markRunning(this)
-                    restore?.let { saved -> restoreTabs(saved) }
-                    restore = null
-                    main.removeCallbacks(periodicSave)
-                    main.postDelayed(periodicSave, SAVE_MS)
-                    // Booting waits for the sysinit and wait commands (OpenRC starting services)
-                    // without occupying worker: tabs open as usual
-                    thread(name = "appine-boot") {
-                        runCatching {
-                            val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
-                            Native.waitFor(it, Native.spawn(it, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
-                        }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
-                        Native.boot(it)
-                        // Boot finished: notify when OpenRC services did not start (the output is
-                        // in boot.log, which nobody reads)
-                        val failed = Rootfs.failedServices(this)
-                        if (failed.isNotEmpty()) main.post { if (machine == it) notifications.bootFailures(failed) }
-                    }
-                    getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
-                    watchingNetwork = true
-                    main.post(poll)
-                    updateNotification()
-                    each { l -> l.onMachineReady(null) }
-                }.onFailure {
-                    Log.e(TAG, "cannot start", it)
-                    val error = it.message ?: it.toString()
-                    if (distro != null && distro != Rootfs.Distro.ALPINE && !Rootfs.isReady(this)) {
-                        // The import failed while switching to another distro (the download was
-                        // already verified, so most likely space ran out) or while resuming one
-                        // the app was killed in (its download may have been needed again): the old
-                        // store is already deleted, so fall back to the Alpine in the APK rather
-                        // than leave the user facing an app that does not work
-                        tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
-                        start(Rootfs.Distro.ALPINE)
-                    } else {
-                        val next = pendingReplace
-                        pendingReplace = null
-                        if (next != null) {
-                            // A distro download finished while this kernel was starting: replacing
-                            // the store is also how a failed one is recovered
-                            replace(next)
-                        } else {
-                            progress = null
-                            startError = error
-                            updateWakeLock()
-                            updateNotification()
-                            each { l -> l.onMachineReady(error) }
-                            stopIfFailed()
-                        }
-                    }
-                }
+                result.onSuccess(::started).onFailure { startFailed(distro, it) }
+            }
+        }
+    }
+
+    /**
+     * The kernel [m] has started: restores the tabs of a killed run, boots, and starts polling;
+     * or replaces the store at once when a distro download finished meanwhile.
+     */
+    private fun started(m: Long) {
+        machine = m
+        progress = null
+        // The store may have just been imported (first run, distro switch)
+        Documents.rootsChanged(this)
+        val next = pendingReplace
+        if (next != null) {
+            // A distro download finished while this kernel was starting
+            pendingReplace = null
+            replace(next)
+            return
+        }
+        updateWakeLock()
+        Tabs.markRunning(this)
+        restore?.let { saved -> restoreTabs(saved) }
+        restore = null
+        main.removeCallbacks(periodicSave)
+        main.postDelayed(periodicSave, SAVE_MS)
+        // Booting waits for the sysinit and wait commands (OpenRC starting services) without
+        // occupying worker: tabs open as usual
+        thread(name = "appine-boot") {
+            runCatching {
+                val argv = arrayOf("sh", "-c", Rootfs.PREFER_OSCLOCK)
+                Native.waitFor(m, Native.spawn(m, -1, "/bin/sh", argv, ConsolePty.ENVIRONMENT))
+            }.onFailure { e -> Log.w(TAG, "cannot prefer osclock", e) }
+            Native.boot(m)
+            // Boot finished: notify when OpenRC services did not start (the output is in
+            // boot.log, which nobody reads)
+            val failed = Rootfs.failedServices(this)
+            if (failed.isNotEmpty()) main.post { if (machine == m) notifications.bootFailures(failed) }
+        }
+        getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
+        watchingNetwork = true
+        main.post(poll)
+        updateNotification()
+        each { l -> l.onMachineReady(null) }
+    }
+
+    /**
+     * The start failed with [e], after preparing [distro]'s rootfs when it is non-null: falls back
+     * to Alpine, replaces the store with a distro downloaded meanwhile, or reports the failure.
+     */
+    private fun startFailed(distro: Rootfs.Distro?, e: Throwable) {
+        Log.e(TAG, "cannot start", e)
+        val error = e.message ?: e.toString()
+        if (distro != null && distro != Rootfs.Distro.ALPINE && !Rootfs.isReady(this)) {
+            // The import failed while switching to another distro (the download was already
+            // verified, so most likely space ran out) or while resuming one the app was killed
+            // in (its download may have been needed again): the old store is already deleted,
+            // so fall back to the Alpine in the APK rather than leave the user facing an app
+            // that does not work
+            tell(getString(R.string.switch_failed, distro.label, error, Rootfs.Distro.ALPINE.label))
+            start(Rootfs.Distro.ALPINE)
+        } else {
+            val next = pendingReplace
+            pendingReplace = null
+            if (next != null) {
+                // A distro download finished while this kernel was starting: replacing the store
+                // is also how a failed one is recovered
+                replace(next)
+            } else {
+                progress = null
+                startError = error
+                updateWakeLock()
+                updateNotification()
+                each { l -> l.onMachineReady(error) }
+                stopIfFailed()
             }
         }
     }
@@ -1158,14 +1167,19 @@ class TerminalService : Service() {
         updateWakeLock()
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
+        releaseSessions()
+        sessionsChanged()
+        return m
+    }
+
+    /** Ends every session (its shell receives SIGHUP) and takes its notification away. */
+    private fun releaseSessions() {
         for (s in sessions) {
             s.release()
             notifications.cancelTab(s)
         }
         sessions.clear()
         unshown.clear()
-        sessionsChanged()
-        return m
     }
 
     override fun onDestroy() {
@@ -1182,11 +1196,7 @@ class TerminalService : Service() {
         // here
         if (restore == null) Tabs.clear(this)
         if (watchingNetwork) getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
-        for (s in sessions) {
-            s.release()
-            notifications.cancelTab(s)
-        }
-        sessions.clear()
+        releaseSessions()
         val m = machine
         machine = 0
         // Stopped without going through exitAll: shut down anyway, best effort. It has to wait for
