@@ -45,6 +45,28 @@ import kotlin.concurrent.read
  * the old home directory after the login account changes.
  */
 class Documents : DocumentsProvider() {
+    /** What a `file:` link names ([fileLink]). */
+    sealed interface FileLink {
+        /** A document shown now, and its MIME type. */
+        data class Found(val uri: Uri, val mime: String) : FileLink
+
+        /** A file on another machine: a program there (over ssh) wrote the link. */
+        data class Remote(val host: String) : FileLink
+
+        /** A file outside the home directory while the whole system is not shown. */
+        data object Hidden : FileLink
+
+        /** No directory or regular file there in the store (or no store). */
+        data object Missing : FileLink
+    }
+
+    /**
+     * The login account, its UID and GID, and the home directory (as a document ID). null while
+     * there is no store or no home directory; a home of `/` counts as none, since it would make the
+     * whole system writable (the native side refuses it too).
+     */
+    private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
+
     override fun onCreate(): Boolean = true
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
@@ -87,6 +109,30 @@ class Documents : DocumentsProvider() {
         return result
     }
 
+    private fun home(context: Context): Home? {
+        if (!Rootfs.isReady(context)) return null
+        val login = Settings.login(context)
+        cache?.let { (time, key, home) ->
+            if (key == login && SystemClock.elapsedRealtime() - time < CACHE_MS) return home
+        }
+        val home = Rootfs.access.read {
+            val account = Rootfs.loginAccount(context, login)
+            val path = canonical("/" + account.home.trim('/'))?.takeIf { it != "/" } ?: return@read null
+            // No root is listed when the home directory does not exist (the account has none)
+            runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
+            Home(account.name, account.uid, account.gid, path)
+        }
+        cache = Triple(SystemClock.elapsedRealtime(), login, home)
+        return home
+    }
+
+    /**
+     * The home directory computed last: one browse queries several times, so /etc/passwd need not
+     * be read every time.
+     */
+    @Volatile
+    private var cache: Triple<Long, String, Home?>? = null
+
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val context = attached()
         val path = visible(context, documentId)
@@ -115,112 +161,6 @@ class Documents : DocumentsProvider() {
         return result
     }
 
-    override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
-        val context = attached()
-        val flags = ParcelFileDescriptor.parseMode(mode)
-        if (flags == ParcelFileDescriptor.MODE_READ_ONLY) {
-            val path = visible(context, documentId)
-            return ParcelFileDescriptor.adoptFd(browse { Native.browseOpen(it, path) })
-        }
-        val home = writableHome(context)
-        val path = writable(home, documentId)
-        val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
-        val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
-        val fd = browse { Native.browseOpenWrite(it, home.path, path, truncate, append) }
-        // The other side writes the host object directly, and the kernel sees neither what was
-        // written nor when it is closed: hand the fd out with a close callback, and tell the
-        // running kernel on close (programs watching in the guest receive IN_MODIFY and
-        // IN_CLOSE_WRITE)
-        return try {
-            ParcelFileDescriptor.wrap(ParcelFileDescriptor.adoptFd(fd), closer) {
-                runCatching { browse { Native.browseWritten(it, home.path, path) } }
-            }
-        } catch (e: IOException) {
-            // wrap lets go of the fd before it creates the socket pair that carries the close, so
-            // the fd is still open here: hand it out without the close events
-            Log.w(TAG, "cannot watch $documentId for closing", e)
-            ParcelFileDescriptor.adoptFd(fd)
-        }
-    }
-
-    /** Close callbacks for files handed out for writing run on this thread ([openDocument]). */
-    private val closer: Handler by lazy { Handler(HandlerThread("documents-close").apply { start() }.looper) }
-
-    override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
-        val context = attached()
-        val home = writableHome(context)
-        val dir = writable(home, parentDocumentId, top = true)
-        val directory = mimeType == Document.MIME_TYPE_DIR
-        val name = fileName(displayName, mimeType, directory)
-        val created = browse { Native.browseCreate(it, home.path, dir, name, directory, home.uid, home.gid) }
-        childrenChanged(context, dir)
-        return child(dir, created)
-    }
-
-    override fun deleteDocument(documentId: String) {
-        val context = attached()
-        val home = writableHome(context)
-        val path = writable(home, documentId)
-        browse { Native.browseRemove(it, home.path, path) }
-        revokeTree(context, documentId, path)
-        childrenChanged(context, parent(path))
-    }
-
-    override fun renameDocument(documentId: String, displayName: String): String {
-        val context = attached()
-        val home = writableHome(context)
-        val path = writable(home, documentId)
-        val name = browse { Native.browseRename(it, home.path, path, fileName(displayName, "", true)) }
-        val renamed = child(parent(path), name)
-        if (renamed != path) revokeTree(context, documentId, path)
-        childrenChanged(context, parent(path))
-        return renamed
-    }
-
-    override fun moveDocument(
-        sourceDocumentId: String,
-        sourceParentDocumentId: String,
-        targetParentDocumentId: String,
-    ): String {
-        val context = attached()
-        val home = writableHome(context)
-        val path = writable(home, sourceDocumentId)
-        val target = writable(home, targetParentDocumentId, top = true)
-        browse { Native.browseMove(it, home.path, path, target) }
-        revokeTree(context, sourceDocumentId, path)
-        childrenChanged(context, parent(path))
-        childrenChanged(context, target)
-        return child(target, path.substringAfterLast('/'))
-    }
-
-    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
-        val parent = canonical(parentDocumentId) ?: return false
-        val doc = canonical(documentId) ?: return false
-        return doc != parent && doc.startsWith(if (parent == "/") "/" else "$parent/")
-    }
-
-    /**
-     * The documents from a root (or [parentDocumentId]) down to a document: the Files app needs it
-     * to open a directory it is sent to (a `file:` link to one), and without it shows its default
-     * place. The home root is preferred for what lies in both.
-     */
-    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
-        val context = attached()
-        val child = visible(context, childDocumentId)
-        val home = home(context)?.path
-        val (rootId, top) = when {
-            parentDocumentId != null -> null to visible(context, parentDocumentId)
-            home != null && (child == home || isChildDocument(home, child)) -> ROOT_HOME to home
-            else -> ROOT_SYSTEM to "/"
-        }
-        if (child != top && !isChildDocument(top, child)) {
-            throw FileNotFoundException("$childDocumentId is not under $top")
-        }
-        val path = mutableListOf(child)
-        while (path.last() != top) path.add(parent(path.last()))
-        return DocumentsContract.Path(rootId, path.reversed())
-    }
-
     override fun querySearchDocuments(rootId: String, query: String, projection: Array<out String>?): Cursor {
         val context = attached()
         val dir = when (rootId) {
@@ -237,36 +177,8 @@ class Documents : DocumentsProvider() {
         return result
     }
 
-    /**
-     * The login account, its UID and GID, and the home directory (as a document ID). null while
-     * there is no store or no home directory; a home of `/` counts as none, since it would make the
-     * whole system writable (the native side refuses it too).
-     */
-    private data class Home(val account: String, val uid: Int, val gid: Int, val path: String)
-
-    private fun home(context: Context): Home? {
-        if (!Rootfs.isReady(context)) return null
-        val login = Settings.login(context)
-        cache?.let { (time, key, home) ->
-            if (key == login && SystemClock.elapsedRealtime() - time < CACHE_MS) return home
-        }
-        val home = Rootfs.access.read {
-            val account = Rootfs.loginAccount(context, login)
-            val path = canonical("/" + account.home.trim('/'))?.takeIf { it != "/" } ?: return@read null
-            // No root is listed when the home directory does not exist (the account has none)
-            runCatching { Native.browseStat(Rootfs.store(context).path, path) }.getOrNull() ?: return@read null
-            Home(account.name, account.uid, account.gid, path)
-        }
-        cache = Triple(SystemClock.elapsedRealtime(), login, home)
-        return home
-    }
-
-    /**
-     * The home directory computed last: one browse queries several times, so /etc/passwd need not
-     * be read every time.
-     */
-    @Volatile
-    private var cache: Triple<Long, String, Home?>? = null
+    /** ContentProvider's requireContext needs API 30. */
+    private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
 
     /**
      * Returns the document ID when it is canonical and inside a root shown now; otherwise treated
@@ -276,7 +188,7 @@ class Documents : DocumentsProvider() {
         val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
         if (Settings.systemDocuments(context)) return path
         val home = home(context)?.path ?: throw FileNotFoundException("no home directory")
-        if (path == home || isChildDocument(home, path)) return path
+        if (within(home, path)) return path
         throw FileNotFoundException("$documentId is outside $home")
     }
 
@@ -290,9 +202,6 @@ class Documents : DocumentsProvider() {
             throw FileNotFoundException(e.message)
         }
     }
-
-    /** ContentProvider's requireContext needs API 30. */
-    private fun attached(): Context = context ?: throw IllegalStateException("the provider is not attached")
 
     /**
      * The regular files in [docs] (paths and metadata) whose type the extension cannot tell and
@@ -343,6 +252,63 @@ class Documents : DocumentsProvider() {
         return common or if (dir) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
     }
 
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        val parent = canonical(parentDocumentId) ?: return false
+        val doc = canonical(documentId) ?: return false
+        return doc != parent && within(parent, doc)
+    }
+
+    /**
+     * The documents from a root (or [parentDocumentId]) down to a document: the Files app needs it
+     * to open a directory it is sent to (a `file:` link to one), and without it shows its default
+     * place. The home root is preferred for what lies in both.
+     */
+    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+        val context = attached()
+        val child = visible(context, childDocumentId)
+        val home = home(context)?.path
+        val (rootId, top) = when {
+            parentDocumentId != null -> null to visible(context, parentDocumentId)
+            home != null && within(home, child) -> ROOT_HOME to home
+            else -> ROOT_SYSTEM to "/"
+        }
+        if (!within(top, child)) throw FileNotFoundException("$childDocumentId is not under $top")
+        val path = mutableListOf(child)
+        while (path.last() != top) path.add(parent(path.last()))
+        return DocumentsContract.Path(rootId, path.reversed())
+    }
+
+    override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
+        val context = attached()
+        val flags = ParcelFileDescriptor.parseMode(mode)
+        if (flags == ParcelFileDescriptor.MODE_READ_ONLY) {
+            val path = visible(context, documentId)
+            return ParcelFileDescriptor.adoptFd(browse { Native.browseOpen(it, path) })
+        }
+        val home = writableHome(context)
+        val path = writable(home, documentId)
+        val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
+        val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
+        val fd = browse { Native.browseOpenWrite(it, home.path, path, truncate, append) }
+        // The other side writes the host object directly, and the kernel sees neither what was
+        // written nor when it is closed: hand the fd out with a close callback, and tell the
+        // running kernel on close (programs watching in the guest receive IN_MODIFY and
+        // IN_CLOSE_WRITE)
+        return try {
+            ParcelFileDescriptor.wrap(ParcelFileDescriptor.adoptFd(fd), closer) {
+                runCatching { browse { Native.browseWritten(it, home.path, path) } }
+            }
+        } catch (e: IOException) {
+            // wrap lets go of the fd before it creates the socket pair that carries the close, so
+            // the fd is still open here: hand it out without the close events
+            Log.w(TAG, "cannot watch $documentId for closing", e)
+            ParcelFileDescriptor.adoptFd(fd)
+        }
+    }
+
+    /** Close callbacks for files handed out for writing run on this thread ([openDocument]). */
+    private val closer: Handler by lazy { Handler(HandlerThread("documents-close").apply { start() }.looper) }
+
     private fun writableHome(context: Context): Home =
         home(context) ?: throw FileNotFoundException("no home directory")
 
@@ -354,6 +320,53 @@ class Documents : DocumentsProvider() {
         val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
         if ((top && path == home.path) || isChildDocument(home.path, path)) return path
         throw UnsupportedOperationException("$documentId is read-only")
+    }
+
+    override fun createDocument(parentDocumentId: String, mimeType: String, displayName: String): String {
+        val context = attached()
+        val home = writableHome(context)
+        val dir = writable(home, parentDocumentId, top = true)
+        val directory = mimeType == Document.MIME_TYPE_DIR
+        val name = fileName(displayName, mimeType, directory)
+        val created = browse { Native.browseCreate(it, home.path, dir, name, directory, home.uid, home.gid) }
+        childrenChanged(context, dir)
+        return child(dir, created)
+    }
+
+    override fun deleteDocument(documentId: String) {
+        val context = attached()
+        val home = writableHome(context)
+        val path = writable(home, documentId)
+        browse { Native.browseRemove(it, home.path, path) }
+        revokeTree(context, documentId, path)
+        childrenChanged(context, parent(path))
+    }
+
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val context = attached()
+        val home = writableHome(context)
+        val path = writable(home, documentId)
+        val name = browse { Native.browseRename(it, home.path, path, fileName(displayName, "", true)) }
+        val renamed = child(parent(path), name)
+        if (renamed != path) revokeTree(context, documentId, path)
+        childrenChanged(context, parent(path))
+        return renamed
+    }
+
+    override fun moveDocument(
+        sourceDocumentId: String,
+        sourceParentDocumentId: String,
+        targetParentDocumentId: String,
+    ): String {
+        val context = attached()
+        val home = writableHome(context)
+        val path = writable(home, sourceDocumentId)
+        val target = writable(home, targetParentDocumentId, top = true)
+        browse { Native.browseMove(it, home.path, path, target) }
+        revokeTree(context, sourceDocumentId, path)
+        childrenChanged(context, parent(path))
+        childrenChanged(context, target)
+        return child(target, path.substringAfterLast('/'))
     }
 
     /** Something in directory [dir] changed: the Files app lists it again. */
@@ -373,21 +386,6 @@ class Documents : DocumentsProvider() {
         revokeDocumentPermission(documentId)
         val held = runCatching { context.contentResolver.outgoingPersistedUriPermissions }.getOrDefault(emptyList())
         grantedUnder(held.map { it.uri }, authority(context), path).forEach(::revokeDocumentPermission)
-    }
-
-    /** What a `file:` link names ([fileLink]). */
-    sealed interface FileLink {
-        /** A document shown now, and its MIME type. */
-        data class Found(val uri: Uri, val mime: String) : FileLink
-
-        /** A file on another machine: a program there (over ssh) wrote the link. */
-        data class Remote(val host: String) : FileLink
-
-        /** A file outside the home directory while the whole system is not shown. */
-        data object Hidden : FileLink
-
-        /** No directory or regular file there in the store (or no store). */
-        data object Missing : FileLink
     }
 
     companion object {
@@ -469,22 +467,31 @@ class Documents : DocumentsProvider() {
          */
         private fun linkPath(encoded: String): String? {
             if (!encoded.startsWith("/")) return null
-            val bytes = ByteArrayOutputStream()
+            val parts = documentId(percentDecode(encoded)).split('/').filter { it.isNotEmpty() && it != "." }
+            if (parts.any { it == ".." }) return null
+            return canonical("/" + parts.joinToString("/"))
+        }
+
+        /**
+         * [text] as bytes: each `%XX` is the byte it names, and everything else (a `%` not followed
+         * by two hex digits included) is written as UTF-8.
+         */
+        private fun percentDecode(text: String): ByteArray {
+            val out = ByteArrayOutputStream()
             var i = 0
-            while (i < encoded.length) {
-                val hex = encoded.substring(i + 1, minOf(i + 3, encoded.length))
-                if (encoded[i] == '%' && hex.length == 2 && hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
-                    bytes.write(hex.toInt(16))
+            while (i < text.length) {
+                val c = text[i]
+                val hex = if (c == '%' && i + 3 <= text.length) text.substring(i + 1, i + 3) else ""
+                if (hex.isNotEmpty() && hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+                    out.write(hex.toInt(16))
                     i += 3
                 } else {
-                    val end = if (Character.isHighSurrogate(encoded[i]) && i + 1 < encoded.length) i + 2 else i + 1
-                    bytes.write(encoded.substring(i, end).toByteArray(Charsets.UTF_8))
+                    val end = if (Character.isHighSurrogate(c) && i + 1 < text.length) i + 2 else i + 1
+                    out.write(text.substring(i, end).toByteArray(Charsets.UTF_8))
                     i = end
                 }
             }
-            val parts = documentId(bytes.toByteArray()).split('/').filter { it.isNotEmpty() && it != "." }
-            if (parts.any { it == ".." }) return null
-            return canonical("/" + parts.joinToString("/"))
+            return out.toByteArray()
         }
 
         /**
@@ -539,6 +546,11 @@ class Documents : DocumentsProvider() {
 
         fun child(dir: String, name: String) = if (dir == "/") "/$name" else "$dir/$name"
 
+        fun parent(path: String) = path.substringBeforeLast('/').ifEmpty { "/" }
+
+        /** Whether canonical [path] is directory [dir] or lies below it. */
+        fun within(dir: String, path: String) = path == dir || path.startsWith(if (dir == "/") "/" else "$dir/")
+
         /**
          * Of the granted URIs [uris], the document IDs of those on this provider ([authority]) that
          * name [path] or a document below it: a tree URI by its tree's document, other URIs by
@@ -546,14 +558,13 @@ class Documents : DocumentsProvider() {
          */
         fun grantedUnder(uris: List<Uri>, authority: String, path: String): List<String> = uris.mapNotNull { uri ->
             if (uri.authority != authority) return@mapNotNull null
+            val tree = DocumentsContract.isTreeUri(uri)
             val id = runCatching {
-                if (DocumentsContract.isTreeUri(uri)) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
+                if (tree) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
             }.getOrNull() ?: return@mapNotNull null
             val doc = canonical(id) ?: return@mapNotNull null
-            id.takeIf { doc == path || doc.startsWith(if (path == "/") "/" else "$path/") }
+            id.takeIf { within(path, doc) }
         }.distinct()
-
-        fun parent(path: String) = path.substringBeforeLast('/').ifEmpty { "/" }
 
         /**
          * The name used when creating and renaming: `/` and NUL become `_`, and empty, `.` and `..`
@@ -576,23 +587,7 @@ class Documents : DocumentsProvider() {
          */
         fun displayName(path: String): String {
             val last = path.substringAfterLast('/').ifEmpty { return "/" }
-            val out = ByteArrayOutputStream()
-            var i = 0
-            while (i < last.length) {
-                val c = last[i]
-                if (c == '%' && i + 3 <= last.length) {
-                    val hex = last.substring(i + 1, i + 3)
-                    if (hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
-                        out.write(hex.toInt(16))
-                        i += 3
-                        continue
-                    }
-                }
-                val end = if (Character.isHighSurrogate(c) && i + 1 < last.length) i + 2 else i + 1
-                out.write(last.substring(i, end).toByteArray())
-                i = end
-            }
-            return String(out.toByteArray(), Charsets.UTF_8)
+            return String(percentDecode(last), Charsets.UTF_8)
         }
 
         /** Guesses the MIME type by extension; application/octet-stream when it cannot tell. */
