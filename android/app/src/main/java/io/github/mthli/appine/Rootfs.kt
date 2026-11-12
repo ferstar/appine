@@ -7,6 +7,12 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import androidx.core.content.edit
+import io.github.mthli.appine.Rootfs.RESUMES
+import io.github.mthli.appine.Rootfs.UNMARKED_PROFILE
+import io.github.mthli.appine.Rootfs.fetch
+import io.github.mthli.appine.Rootfs.profile
+import io.github.mthli.appine.Rootfs.sources
+import io.github.mthli.appine.Rootfs.writeMirror
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -133,15 +139,11 @@ internal object Rootfs {
     private fun prefs(context: Context) = context.getSharedPreferences("rootfs", Context.MODE_PRIVATE)
 
     /**
-     * The distro installed in the app's store, null while there is no store. Recorded at import;
-     * stores imported before round 190 have no record and count as Alpine (the app had not been
-     * released yet, so only development installs have such stores).
+     * The distro installed in the app's store, null while there is no store. Recorded at import
+     * (the record [importing] reads); stores imported before round 190 have no record and count as
+     * Alpine (the app had not been released yet, so only development installs have such stores).
      */
-    fun installed(context: Context): Distro? {
-        if (!isReady(context)) return null
-        val name = prefs(context).getString(KEY_DISTRO, null) ?: return Distro.ALPINE
-        return Distro.entries.firstOrNull { it.name == name } ?: Distro.ALPINE
-    }
+    fun installed(context: Context): Distro? = if (isReady(context)) importing(context) else null
 
     /**
      * The distro to import when the app's store is missing: the one an import was last started for
@@ -169,8 +171,10 @@ internal object Rootfs {
         store: File = store(context),
     ) {
         if (isReady(store)) return
+        // Only the app's own store has records (the instrumentation tests import into others)
+        val own = store == store(context)
         // The next launch resumes this distro if the app is killed before the store is in place
-        if (store == store(context)) prefs(context).edit(commit = true) { putString(KEY_DISTRO, distro.name) }
+        if (own) prefs(context).edit(commit = true) { putString(KEY_DISTRO, distro.name) }
         val tmp = File(store.parentFile, "${store.name}.tmp")
         tmp.deleteRecursively()
         val tarball = tarball(context, distro)
@@ -183,7 +187,7 @@ internal object Rootfs {
         }
         Native.importRootfs(tmp.path, tarball.path)
         configure(context, tmp.path, distro)
-        if (store == store(context)) {
+        if (own) {
             // Written to disk before the rename: once the store is there, the record is its own
             prefs(context).edit(commit = true) {
                 putString(KEY_DISTRO, distro.name)
@@ -266,21 +270,11 @@ internal object Rootfs {
     private fun profile(context: Context): String =
         context.assets.open("profile.sh").bufferedReader().readText()
 
-    /**
-     * The copy written from round 194 until shell integration came: the coloured prompt for any
-     * shell (zsh and dash showed its bash escapes as they are), without prompt marks.
-     */
-    private val UNMARKED_PROFILE = """
-        cat /etc/motd 2>/dev/null
-        export TERM=xterm-256color
-        export LANG=C.UTF-8
-        export NMAP_UNPRIVILEGED=1
-        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-
-    """.trimIndent()
-
     private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
-        Native.writeFile(store, path, text.toByteArray(), 420 /* 0644 */, overwrite)
+        write(store, path, text.toByteArray(), overwrite)
+
+    private fun write(store: String, path: String, data: ByteArray, overwrite: Boolean = true) =
+        Native.writeFile(store, path, data, 420 /* 0644 */, overwrite)
 
     /** Makes renames and deletions in directory [dir] durable. */
     private fun syncDir(dir: File) {
@@ -306,18 +300,18 @@ internal object Rootfs {
     fun chooseMirror(context: Context, distro: Distro): Boolean {
         prefs(context).edit { putBoolean(KEY_MIRROR_MANUAL, false) }
         val base = { mirror: String -> if (distro == Distro.ALPINE) mirror else "https://$mirror" }
-        val speeds = probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" })
-        val best = distro.mirrors.zip(speeds).filter { it.second != null }.maxByOrNull { it.second!! } ?: return true
-        Log.i(TAG, "mirror speeds: ${distro.mirrors.zip(speeds)}, using ${best.first}")
+        val speeds = distro.mirrors.zip(probeAll(distro.mirrors.map { "${base(it)}/${distro.probe}" }))
+        val best = speeds.filter { it.second != null }.maxByOrNull { it.second!! }?.first ?: return true
+        Log.i(TAG, "mirror speeds: $speeds, using $best")
         synchronized(this) {
             if (isMirrorManual(context)) return true
             // Could not write (an I/O error): the sources and the recorded mirror both stay as they
             // were, and the "no built-in mirror" hint would be wrong
-            val written = runCatching { writeMirror(store(context).path, distro, best.first) }
+            val written = runCatching { writeMirror(store(context).path, distro, best) }
                 .onFailure { Log.w(TAG, "cannot write the package sources", it) }
                 .getOrElse { return true }
             if (written) {
-                prefs(context).edit { putString(KEY_MIRROR, best.first) }
+                prefs(context).edit { putString(KEY_MIRROR, best) }
             } else {
                 Log.i(TAG, "no built-in mirror in the package sources, leaving them alone")
             }
@@ -492,8 +486,21 @@ netns = "host"
     fun ensureLoginTools(context: Context) {
         if (installed(context) != Distro.ALPINE) return
         val data = context.assets.open("doas.apk").use { it.readBytes() }
-        Native.writeFile(store(context).path, "/var/cache/appine/doas.apk", data, 420 /* 0644 */, true)
+        write(store(context).path, "/var/cache/appine/doas.apk", data)
     }
+
+    /**
+     * The copy written from round 194 until shell integration came: the coloured prompt for any
+     * shell (zsh and dash showed its bash escapes as they are), without prompt marks.
+     */
+    private val UNMARKED_PROFILE = """
+        cat /etc/motd 2>/dev/null
+        export TERM=xterm-256color
+        export LANG=C.UTF-8
+        export NMAP_UNPRIVILEGED=1
+        PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+
+    """.trimIndent()
 
     /**
      * The copy written before round 194: [UNMARKED_PROFILE] with one more line, `cd "$HOME"`, which
@@ -517,11 +524,12 @@ netns = "host"
      */
     @Throws(IOException::class)
     fun updateProfile(context: Context) {
+        val store = store(context).path
         val path = "/etc/profile.d/appine.sh"
-        val old = runCatching { Native.readFile(store(context).path, path) }.getOrNull() ?: return
+        val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
             hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
-        if (earlier) write(store(context).path, path, profile(context))
+        if (earlier) write(store, path, profile(context))
     }
 
     /**
@@ -655,7 +663,8 @@ netns = "host"
     /**
      * Downloads from [url]. When a timeout or a dropped connection interrupts it, it continues from
      * where it broke off with `Range` (counted only when this attempt got data, at most [RESUMES]
-     * times); when the server does not support resuming, it starts over.
+     * times); when the server does not support resuming (it replies 200), it starts over. An attempt
+     * that got no data ends this source, and so does an error status on a resume.
      */
     @Throws(IOException::class)
     private fun fetch(
@@ -679,10 +688,15 @@ netns = "host"
                 if (done > 0) conn.setRequestProperty("Range", "bytes=$done-")
                 val before = done
                 try {
-                    if (done > 0 && http?.responseCode != HttpURLConnection.HTTP_PARTIAL) {
-                        done = 0
-                        reported = 0
-                        digest = MessageDigest.getInstance("SHA-256")
+                    if (done > 0) when (val code = http?.responseCode) {
+                        HttpURLConnection.HTTP_PARTIAL -> {}
+                        HttpURLConnection.HTTP_OK -> {
+                            done = 0
+                            reported = 0
+                            digest = MessageDigest.getInstance("SHA-256")
+                        }
+                        // Keeps what it has, so this counts as an attempt that got no data
+                        else -> throw IOException("$url: HTTP $code on resuming at $done bytes")
                     }
                     conn.getInputStream().use { input ->
                         FileOutputStream(part, done > 0).use { output ->
@@ -708,6 +722,9 @@ netns = "host"
                     break
                 } catch (e: IOException) {
                     if (e is Cancelled || e is Oversize || http == null || done == before || ++resumes > RESUMES) throw e
+                    // Everything arrived before it broke off: there is nothing left to ask for (a
+                    // Range starting at the end is answered 416), only to verify
+                    if (done == download.size) break
                     Log.w(TAG, "download of $url broke off at $done bytes, resuming", e)
                 } finally {
                     http?.disconnect()

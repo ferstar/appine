@@ -4,6 +4,8 @@
 > See `.claude/decisions/android/setup.md` for the paired decision history.
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
+>
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: what a resumed download does with an error status and with nothing left to get)
 
 ## Responsibilities
 
@@ -95,9 +97,11 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   and throwing the last error.
 - One source: 30 s timeouts; written to `.part` while hashing (64 KiB reads, cancellation checked
   before each, progress every 0.5%); an attempt that failed after getting data is resumed with
-  `Range` up to 5 times, and one that got none ends the source. A resume answered with anything but
-  206 starts again from zero, so an error status on a resume restarts the download too and uses up
-  a resume. More than the pinned length stops the source at once (no resume). Length and sha256
+  `Range` up to 5 times, and one that got none ends the source. A resume answered 206 continues,
+  one answered 200 starts again from zero, and any other status ends the source like an attempt
+  that got no data. An attempt that broke off with the whole pinned length received is not resumed
+  but verified at once (a `Range` from the end would be answered 416). More than the pinned length
+  stops the source at once (no resume). Length and sha256
   are checked and `.part` is renamed into place; any other exit deletes `.part` (a kill can leave
   it), and every call starts from zero, truncating it, so nothing resumes across calls or kills. A
   206 reply's range is not checked; the final hash catches a wrong one.
@@ -333,8 +337,6 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Should a failed optional per-start write (the network, containers, doas package or profile file,
   for example through a directory the user replaced with a symlink, which `writeFile` refuses) fail
   the whole start rather than be logged?
-- Should an HTTP error status on a resume restart the download from zero and use up a resume, as
-  it does, when the code's comment says resumes count only attempts that got data?
 - Should a Debian tarball left in the cache after its import failed and fell back to Alpine be
   deleted?
 

@@ -552,6 +552,54 @@ class MachineTest {
     }
 
     /**
+     * An error status on a resume ends the source at once: the download neither starts over nor
+     * asks again. And a download that broke off with every byte received (the server promised more
+     * than it sent) is verified without another request, whose Range would start at the end.
+     */
+    @Test
+    fun downloadsHandleResumesWithNothingToGet() {
+        val data = ByteArray(300_000) { (it * 7 + it / 251).toByte() }
+        val sha = MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
+        val dest = File(context.cacheDir, "download-resumed.tgz")
+        for (complete in listOf(false, true)) {
+            val server = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+            val asked = mutableListOf<String>()
+            val serving = thread {
+                // Closed after the requests expected, so one too many is refused instead of waiting
+                server.use {
+                    repeat(if (complete) 1 else 2) { n ->
+                        server.accept().use { c ->
+                            val reader = c.getInputStream().bufferedReader()
+                            val headers = generateSequence { reader.readLine() }.takeWhile { it.isNotEmpty() }.toList()
+                            asked.add(headers.firstOrNull { it.startsWith("Range:", ignoreCase = true) } ?: "-")
+                            val out = c.getOutputStream()
+                            if (n == 0) {
+                                out.write("HTTP/1.1 200 OK\r\nContent-Length: ${data.size + 10}\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.write(data, 0, if (complete) data.size else data.size / 3)
+                            } else {
+                                out.write("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                            }
+                            out.flush()
+                        }
+                    }
+                }
+            }
+            val download = Rootfs.Download(listOf("http://127.0.0.1:${server.localPort}/rootfs.tgz"), sha, data.size.toLong())
+            if (complete) {
+                Rootfs.fetch(download, dest) { _, _ -> }
+                assertTrue(dest.readBytes().contentEquals(data))
+                dest.delete()
+            } else {
+                assertThrows(IOException::class.java) { Rootfs.fetch(download, dest) { _, _ -> } }
+                assertFalse(dest.exists())
+            }
+            serving.join(5000)
+            assertEquals("complete=$complete", if (complete) listOf("-") else listOf("-", "Range: bytes=100000-"), asked)
+            assertFalse(File(dest.path + ".part").exists())
+        }
+    }
+
+    /**
      * An aborted download (cancelling a distro switch in Settings) throws [Rootfs.Cancelled] and
      * keeps no partial file. The local HTTP server stalls after a third and waits for the client to
      * cancel and disconnect.
