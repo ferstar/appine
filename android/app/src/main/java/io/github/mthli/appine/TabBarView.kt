@@ -80,28 +80,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     private var indicatorShift = 0f
     private var indicatorSlide: ValueAnimator? = null
 
-    /**
-     * Once the row is laid out after a change, slides each tab from where its place was on screen
-     * to its new one, then gives it the number of that place ([Tab.renumber]). A closed tab keeps
-     * fading out where it was, though the row's scroll moved: a shorter row may scroll less.
-     */
-    private val slideTabs = object : ViewTreeObserver.OnPreDrawListener {
-        override fun onPreDraw(): Boolean {
-            row.viewTreeObserver.removeOnPreDrawListener(this)
-            val from = slideFrom ?: return true
-            slideFrom = null
-            for ((tab, x) in from) {
-                val shift = x - (tab.view.left - scroll.scrollX)
-                tab.view.translationX += shift
-                // A tab whose place stays on screen but whose number changes waits as long as
-                // those that slide (a 0 to 0 slide); one still sliding renumbers at its end
-                if (tab in rowTabs && (shift != 0 || tab.stale && tab.view.translationX == 0f)) tab.slide()
-            }
-            moveIndicator()
-            return true
-        }
-    }
-
     /** Whether a finger is on the row, which holds off [returnToCurrentTab]. */
     private var touched = false
 
@@ -273,6 +251,92 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     }
 
     /**
+     * Once the row is laid out after a change, slides each tab from where its place was on screen
+     * to its new one, then gives it the number of that place ([Tab.renumber]). A closed tab keeps
+     * fading out where it was, though the row's scroll moved: a shorter row may scroll less.
+     */
+    private val slideTabs = object : ViewTreeObserver.OnPreDrawListener {
+        override fun onPreDraw(): Boolean {
+            row.viewTreeObserver.removeOnPreDrawListener(this)
+            val from = slideFrom ?: return true
+            slideFrom = null
+            for ((tab, x) in from) {
+                val shift = x - (tab.view.left - scroll.scrollX)
+                tab.view.translationX += shift
+                // A tab whose place stays on screen but whose number changes waits as long as
+                // those that slide (a 0 to 0 slide); one still sliding renumbers at its end
+                if (tab in rowTabs && (shift != 0 || tab.stale && tab.view.translationX == 0f)) tab.slide()
+            }
+            moveIndicator()
+            return true
+        }
+    }
+
+    /**
+     * Moves the indicator to the current tab's new place on screen ([slideTabs]), sliding there
+     * from where it was drawn, whether another tab was shown or tabs closed; a change while it
+     * slides (a held Ctrl+Tab) slides on from where it is. Closing the current tab of a row that
+     * does not scroll leaves its place where it was, so the indicator stays while the next tab
+     * slides in above it; a row scrolled to its end scrolls back as it shortens, and the indicator
+     * slides on to the next tab. With no place to come from (the row's first layout) it is put
+     * there at once.
+     */
+    private fun moveIndicator() {
+        val tab = currentTab
+        val from = indicatorFrom
+        indicatorFrom = null
+        val shift = if (tab == null || from == null) null else from - (tab.left - scroll.scrollX)
+        when (shift) {
+            0 -> {} // the same place: a slide still running goes on
+            null -> {
+                indicatorSlide?.cancel()
+                indicatorShift = 0f
+            }
+            else -> {
+                indicatorSlide?.cancel()
+                indicatorSlide = ValueAnimator.ofFloat(indicatorShift + shift, 0f).apply {
+                    duration = SLIDE_MS
+                    interpolator = STANDARD
+                    addUpdateListener {
+                        indicatorShift = it.animatedValue as Float
+                        row.invalidate()
+                    }
+                    start()
+                }
+            }
+        }
+    }
+
+    /**
+     * Scrolls the row to bring the current tab into view, clear of the fade towards the buttons;
+     * nothing when it already is, or when there is none.
+     */
+    private fun revealCurrentTab() {
+        val tab = currentTab ?: return
+        val fade = scroll.horizontalFadingEdgeLength
+        val shownWidth = scroll.width - scroll.paddingRight
+        val end = row.width - shownWidth
+        // Where the fade begins, from the row's visible left edge
+        val clearWidth = shownWidth + dp(FADE_INTO_CLOSE_DP) - fade
+        when {
+            tab.left < scroll.scrollX -> scroll.smoothScrollTo(tab.left, 0)
+            tab.right > scroll.scrollX + clearWidth -> {
+                val x = tab.right - clearWidth
+                // Less than a fade's width of tabs left beyond the padding would fade only inside
+                // ×, leaving the last tab barely faded against it: go to the row's end, where
+                // nothing fades
+                scroll.smoothScrollTo(if (end - x < fade) end else x, 0)
+            }
+        }
+    }
+
+    /** Starts, or starts again, the wait before [returnToCurrentTab]. */
+    private fun returnToCurrentTabLater() {
+        scroll.removeCallbacks(returnToCurrentTab)
+        scroll.postDelayed(returnToCurrentTab, RETURN_TO_CURRENT_TAB_MS)
+    }
+
+    /**
      * A tab's progress or program status changed: redraws the marks ([drawMarks]) and updates what
      * TalkBack reads. Numbers are left alone, as tabs may be on their way to new ones.
      */
@@ -343,91 +407,6 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
         ColorUtils.setAlphaComponent(color, (Color.alpha(color) * shown).roundToInt())
 
     /**
-     * What TalkBack adds to a tab's title for its program's progress or status: what it says it
-     * is doing or needs ([VtSession.describe]), working for progress (failed or paused as
-     * reported), with the percentage when there is one; null with nothing to say.
-     */
-    private fun statusText(session: VtSession): String? {
-        if (!session.isRunning) return null
-        val status = session.status?.takeIf { it.state != VtSession.STATUS_IDLE }
-        val progress = session.progress
-        val what = when {
-            status != null && status.state != VtSession.STATUS_WORKING -> VtSession.describe(context, status)
-            progress?.state == VtSession.PROGRESS_ERROR -> context.getString(R.string.status_error)
-            progress?.state == VtSession.PROGRESS_PAUSE -> context.getString(R.string.status_paused)
-            progress != null || status != null -> context.getString(R.string.status_working)
-            else -> return null
-        }
-        val percent = progress?.takeIf { it.state != VtSession.PROGRESS_INDETERMINATE }?.percent?.takeIf { it >= 0 }
-            ?: status?.percent?.takeIf { it >= 0 }
-        return if (percent == null) what else context.getString(R.string.status_percent, what, percent)
-    }
-
-    /**
-     * Moves the indicator to the current tab's new place on screen ([slideTabs]), sliding there
-     * from where it was drawn, whether another tab was shown or tabs closed; a change while it
-     * slides (a held Ctrl+Tab) slides on from where it is. Closing the current tab of a row that
-     * does not scroll leaves its place where it was, so the indicator stays while the next tab
-     * slides in above it; a row scrolled to its end scrolls back as it shortens, and the indicator
-     * slides on to the next tab. With no place to come from (the row's first layout) it is put
-     * there at once.
-     */
-    private fun moveIndicator() {
-        val tab = currentTab
-        val from = indicatorFrom
-        indicatorFrom = null
-        val shift = if (tab == null || from == null) null else from - (tab.left - scroll.scrollX)
-        when (shift) {
-            0 -> {} // the same place: a slide still running goes on
-            null -> {
-                indicatorSlide?.cancel()
-                indicatorShift = 0f
-            }
-            else -> {
-                indicatorSlide?.cancel()
-                indicatorSlide = ValueAnimator.ofFloat(indicatorShift + shift, 0f).apply {
-                    duration = SLIDE_MS
-                    interpolator = STANDARD
-                    addUpdateListener {
-                        indicatorShift = it.animatedValue as Float
-                        row.invalidate()
-                    }
-                    start()
-                }
-            }
-        }
-    }
-
-    /**
-     * Scrolls the row to bring the current tab into view, clear of the fade towards the buttons;
-     * nothing when it already is, or when there is none.
-     */
-    private fun revealCurrentTab() {
-        val tab = currentTab ?: return
-        val fade = scroll.horizontalFadingEdgeLength
-        val shownWidth = scroll.width - scroll.paddingRight
-        val end = row.width - shownWidth
-        // Where the fade begins, from the row's visible left edge
-        val clearWidth = shownWidth + dp(FADE_INTO_CLOSE_DP) - fade
-        when {
-            tab.left < scroll.scrollX -> scroll.smoothScrollTo(tab.left, 0)
-            tab.right > scroll.scrollX + clearWidth -> {
-                val x = tab.right - clearWidth
-                // Less than a fade's width of tabs left beyond the padding would fade only inside
-                // ×, leaving the last tab barely faded against it: go to the row's end, where
-                // nothing fades
-                scroll.smoothScrollTo(if (end - x < fade) end else x, 0)
-            }
-        }
-    }
-
-    /** Starts, or starts again, the wait before [returnToCurrentTab]. */
-    private fun returnToCurrentTabLater() {
-        scroll.removeCallbacks(returnToCurrentTab)
-        scroll.postDelayed(returnToCurrentTab, RETURN_TO_CURRENT_TAB_MS)
-    }
-
-    /**
      * A tab in the row: its number (from [i]) in a square as tall as the bar, the current one in
      * the primary colour above the row's indicator ([currentTab]), an ended one faded. Tap shows
      * it; a long press shows its title.
@@ -463,7 +442,7 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
             describe(i)
             view.alpha = if (session.isRunning) 1f else ENDED_ALPHA
             if (slideFrom?.containsKey(this) != true) view.text = number(i)
-            view.setTextColor(if (session == current) currentColor else mutedColor)
+            view.setTextColor(if (session === current) currentColor else mutedColor)
         }
 
         /** What TalkBack reads for it as the [i]th tab: its number, title and status. */
@@ -509,6 +488,27 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
     private fun title(session: VtSession): String {
         val text = session.title?.takeIf { it.isNotBlank() } ?: "sh"
         return if (session.isRunning) text else context.getString(R.string.tab_ended, text)
+    }
+
+    /**
+     * What TalkBack adds to a tab's title for its program's progress or status: what it says it
+     * is doing or needs ([VtSession.describe]), working for progress (failed or paused as
+     * reported), with the percentage when there is one; null with nothing to say.
+     */
+    private fun statusText(session: VtSession): String? {
+        if (!session.isRunning) return null
+        val status = session.status?.takeIf { it.state != VtSession.STATUS_IDLE }
+        val progress = session.progress
+        val what = when {
+            status != null && status.state != VtSession.STATUS_WORKING -> VtSession.describe(context, status)
+            progress?.state == VtSession.PROGRESS_ERROR -> context.getString(R.string.status_error)
+            progress?.state == VtSession.PROGRESS_PAUSE -> context.getString(R.string.status_paused)
+            progress != null || status != null -> context.getString(R.string.status_working)
+            else -> return null
+        }
+        val percent = progress?.takeIf { it.state != VtSession.PROGRESS_INDETERMINATE }?.percent?.takeIf { it >= 0 }
+            ?: status?.percent?.takeIf { it >= 0 }
+        return if (percent == null) what else context.getString(R.string.status_percent, what, percent)
     }
 
     /** A button: a square as tall as the bar ([item]) with its label centred. */

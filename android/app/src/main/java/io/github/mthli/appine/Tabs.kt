@@ -60,10 +60,11 @@ internal object Tabs {
     private fun marker(context: Context) = File(dir(context), "running")
 
     /**
-     * Hashes of the index contents already written: an unchanged index is not written again (saved
-     * every minute, so as not to keep writing flash; transcripts are skipped by their names).
+     * The hash of the index contents last written, null with none: an unchanged index is not
+     * written again (saved every minute, so as not to keep writing flash; transcripts are skipped
+     * by their names).
      */
-    private val written = HashMap<String, Int>()
+    private var writtenLayout: Int? = null
 
     /**
      * Called once when the service starts: returns the killed run when the last run did not exit
@@ -194,14 +195,14 @@ internal object Tabs {
             // the current directories are all unchanged
             val layout = (entries.toString() + current).hashCode()
             val index = File(dir, "index.json")
-            if (written[index.name] != layout || !index.isFile) {
+            if (writtenLayout != layout || !index.isFile) {
                 val json = JSONObject()
                     .put("time", System.currentTimeMillis())
                     .put("current", current)
                     .put("vt", version)
                     .put("tabs", entries)
                 replace(index, json.toString())
-                written[index.name] = layout
+                writtenLayout = layout
             }
             // Transcripts and snapshots of closed tabs and old contents, and leftovers of a save
             // that was killed (including the t<i>.txt names of earlier versions)
@@ -234,7 +235,7 @@ internal object Tabs {
     /** Normal exit: delete the marker and the saved tabs. */
     fun clear(context: Context) {
         synchronized(this) {
-            written.clear()
+            writtenLayout = null
             dir(context).deleteRecursively()
         }
     }
