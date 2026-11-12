@@ -721,8 +721,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         frameNanos += nanos
         frameMax = max(frameMax, nanos)
         if (frames == 120) {
-            Log.d(
-                "appine-vt",
+            Log.d(TAG,
                 "frames: avg %.2f ms, max %.2f ms, %.1f rows each".format(
                     frameNanos / 1e6 / frames, frameMax / 1e6, frameRows.toFloat() / frames,
                 ),
@@ -1012,7 +1011,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN or
-            EditorInfo.IME_ACTION_NONE or (if (imePassword) EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING else 0)
+                EditorInfo.IME_ACTION_NONE or (if (imePassword) EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING else 0)
         return Connection()
     }
 
@@ -1500,7 +1499,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      * (Android 14 and later classify them): not a press of a button.
      */
     private fun touchpadGesture(e: MotionEvent) = Build.VERSION.SDK_INT >= 34 &&
-        (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || e.classification == MotionEvent.CLASSIFICATION_PINCH)
+            (e.classification == MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE || e.classification == MotionEvent.CLASSIFICATION_PINCH)
 
     /**
      * A mouse (or touchpad) button pressed, dragged and released to select, as Ghostty does on
@@ -1617,7 +1616,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun tapPress(e: MotionEvent): Boolean {
         if (tab == 0L || mouseTracking || stoppedFling) return false
         val again = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
-            hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
+                hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
         if (!again) return false
         val behavior = if (taps + 1 == 3) VtNative.GESTURE_LINE else VtNative.GESTURE_WORD
         if (!VtNative.gesturePress(tab, behavior, cellX(e.x), cellY(e.y), e.x, e.y + scrollPx)) return false
@@ -1683,7 +1682,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 // Only stops the fling, as a tap on a flinging ScrollView does
                 if (stoppedFling) return true
                 val again = e.downTime - lastTapTime <= ViewConfiguration.getDoubleTapTimeout() &&
-                    hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
+                        hypot(e.x - lastTapX, e.y - lastTapY) <= doubleTapSlop
                 taps = if (again) taps + 1 else 1
                 // A fourth tap starts over
                 lastTapTime = if (taps < 3) e.eventTime else 0L
@@ -1985,6 +1984,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun cellY(y: Float) = floor((y + scrollPx) / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
+        private const val TAG = "VtView"
+
         /** Shift with these keys moves a selection's end ([VtNative.selectAdjust]), as in Ghostty. */
         val ADJUSTMENTS = mapOf(
             KeyEvent.KEYCODE_DPAD_LEFT to VtNative.ADJUST_LEFT,

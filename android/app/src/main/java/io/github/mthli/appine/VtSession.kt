@@ -5,6 +5,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.util.Log
+import io.github.mthli.appine.VtSession.Companion.MAX_STATUS_RECORDS
+import io.github.mthli.appine.VtSession.Companion.PROGRESS_TIMEOUT_MS
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -341,7 +343,7 @@ internal class VtSession(
         if (snapshot != null) {
             val t = VtNative.restore(machine, pty.console, snapshot, cols, rows, cellWidth, cellHeight)
             if (t != 0L) return t
-            Log.w("appine", "cannot restore a tab's snapshot; showing its transcript")
+            Log.w(TAG, "cannot restore a tab's snapshot; showing its transcript")
         }
         val t = VtNative.create(machine, pty.console, cols, rows, cellWidth, cellHeight)
         if (t != 0L && text != null) VtNative.print(t, text)
@@ -619,6 +621,8 @@ internal class VtSession(
     }
 
     companion object {
+        private const val TAG = "VtSession"
+
         // libghostty-vt's GhosttyTerminalProgressState (OSC 9;4)
         const val PROGRESS_REMOVE = 0
         const val PROGRESS_SET = 1

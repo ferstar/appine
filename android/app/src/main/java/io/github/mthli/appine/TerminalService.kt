@@ -1199,7 +1199,7 @@ class TerminalService : Service() {
     }
 
     companion object {
-        private const val TAG = "appine"
+        private const val TAG = "TerminalService"
 
         /**
          * The format of [Native.setRoutes]. Before Android 13 the route type cannot be told, so all

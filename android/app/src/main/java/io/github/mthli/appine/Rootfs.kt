@@ -32,7 +32,7 @@ import kotlin.concurrent.write
  * the sources are the user's to edit.
  */
 internal object Rootfs {
-    private const val TAG = "appine"
+    private const val TAG = "Rootfs"
 
     /**
      * A tarball to download: `urls` are several sources of the same file; the digest is fixed, so

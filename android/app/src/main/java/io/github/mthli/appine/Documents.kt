@@ -394,7 +394,7 @@ class Documents : DocumentsProvider() {
         const val ROOT_HOME = "home"
         const val ROOT_SYSTEM = "system"
 
-        private const val TAG = "appine"
+        private const val TAG = "Documents"
 
         /** The most results one search gives. */
         private const val SEARCH_LIMIT = 200

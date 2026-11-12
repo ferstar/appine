@@ -24,7 +24,7 @@ import java.util.zip.InflaterInputStream
  * process ended as far as Android recorded it. Processes are not restored.
  */
 internal object Tabs {
-    private const val TAG = "appine"
+    private const val TAG = "Tabs"
 
     /**
      * The most characters saved per transcript (the last part is kept): a 2000-line transcript
