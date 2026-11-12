@@ -471,7 +471,7 @@ fn writable_ino(cx: &Cx<'_>, node: Node, name: &[u8]) -> Result<Ino, Errno> {
             ovl.node(o).real()
         };
         permission(cx, &vfs.store().attrs(real)?, name, true)?;
-        return vfs.overlay_upper(o, crate::vfs::overlay::CopyUp::All);
+        return super::fs::copy_up(cx, &vfs, o, crate::vfs::overlay::CopyUp::All);
     }
     store_ino(node, Errno::EOPNOTSUPP)
 }

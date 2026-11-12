@@ -743,6 +743,13 @@ pub(super) fn io_of(file: &FileRef) -> Option<(Io, bool)> {
 /// close(2) of a FUSE file: `FUSE_FLUSH`, whose error close returns (the descriptor is gone
 /// anyway), as 6.1's `filp_close` does.
 pub(super) fn flush(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
+    let table = Rc::as_ptr(&cx.t.fds) as usize;
+    flush_as(cx, file, table)
+}
+
+/// [`flush`] for a file closed in the fd table at address `table`, whose lock owner the daemon
+/// is told (seccomp's `SECCOMP_ADDFD_FLAG_SETFD` replaces an fd in another process's table).
+pub(super) fn flush_as(cx: &mut Cx<'_>, file: &FileRef, table: usize) -> Result<(), Errno> {
     let h = match &file.borrow().kind {
         FileKind::Fuse(h) => Io::of(h),
         _ => return Ok(()),
@@ -757,7 +764,7 @@ pub(super) fn flush(cx: &mut Cx<'_>, file: &FileRef) -> Result<(), Errno> {
     if skip || h.conn.borrow().no & fuse::no::FLUSH != 0 {
         return Ok(());
     }
-    let owner = fuse::lock_owner(Rc::as_ptr(&cx.t.fds) as usize);
+    let owner = fuse::lock_owner(table);
     let args = Args::default().u64(h.fh).u32(0).u32(0).u64(owner);
     match fuse::call_forced(cx, &h.conn, op::FLUSH, h.nodeid, &args.0) {
         Err(Errno::ENOSYS) => Ok(()),

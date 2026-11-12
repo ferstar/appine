@@ -1355,7 +1355,29 @@ impl Vfs {
             }
         }
         let up = self.parent_in_fs(ps, &dir)?;
+        // A directory renamed out of a bind's subtree through another mount is disconnected from
+        // the bind: its parent is not visible through it (Linux's path_connected)
+        if let Node::Store(mnt, up_ino) = up
+            && let Some(Node::Store(_, top)) = self.with_mount(mnt, |m| m.root.clone())
+            && top != ROOT
+            && !self.store_below(up_ino, top)
+        {
+            return Err(Errno::ENOENT);
+        }
         Ok(self.mounted(up))
+    }
+
+    /// Whether store directory `dir` is `top` or inside it (Linux's `is_subdir`).
+    fn store_below(&self, mut dir: Ino, top: Ino) -> bool {
+        loop {
+            if dir == top {
+                return true;
+            }
+            match self.store.parent(dir) {
+                Ok(up) if up != dir => dir = up,
+                _ => return false,
+            }
+        }
     }
 
     /// Whether, with `fs.protected_symlinks` on, symlink `link` in directory `dir` may be
@@ -2137,6 +2159,12 @@ impl Vfs {
                 None => {}
             }
         }
+    }
+
+    /// The device number of mount `id`'s instance, attached or detached; None once the mount is
+    /// gone (unlike [`Vfs::dev_of`], which then falls back to the boot instance's).
+    pub(crate) fn mount_dev(&self, id: MountId) -> Option<u64> {
+        self.with_mount(id, |m| m.dev)
     }
 
     /// The device number of `node` (stat's `st_dev`): that of the mount it is in; when the mount

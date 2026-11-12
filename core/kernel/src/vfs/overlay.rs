@@ -397,7 +397,11 @@ pub(crate) fn whiteout_at(store: &Store, dir: Ino, name: &[u8]) -> Result<bool, 
 /// `O_TRUNC` needs no data.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyUp {
+    /// Everything, a regular file's data by sharing the lower object until either is written.
     All,
+    /// Everything, a regular file's data copied now: the lower object may still be written in
+    /// place (`syscall::fs::copy_up`).
+    Copied,
     NoData,
 }
 
@@ -727,9 +731,18 @@ impl Overlays {
                 // it is written (Store::share), as overlayfs on a filesystem with reflinks
                 // clones it (6.1's ovl_copy_up_data, through vfs_clone_file_range)
                 mode::S_IFREG => {
-                    let (ino, _) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
-                    if what == CopyUp::All {
-                        s.share(lower, ino)?;
+                    let (ino, file) = s.create_file(dir, &name, perm, st.uid, st.gid)?;
+                    match what {
+                        CopyUp::All => s.share(lower, ino)?,
+                        CopyUp::Copied => {
+                            let from = s.open_object(lower, false)?;
+                            let len = from
+                                .metadata()
+                                .map_err(|e| e.raw_os_error().map_or(Errno::EIO, Errno))?;
+                            let len = len.len();
+                            super::store::copy_object(&from, &file, len)?;
+                        }
+                        CopyUp::NoData => {}
                     }
                     ino
                 }

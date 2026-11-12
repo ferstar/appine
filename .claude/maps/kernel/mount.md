@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: instance owners and remount's capability check, then the stale propagation comments corrected)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: turning an instance read-only is busy with deleted files in use and writers through detached mounts, memfds are not root writers)
 
 ## Responsibilities
 
@@ -83,8 +83,9 @@ Outside the module:
   `set_root_at`, `remove_mount`, `umount_tree`, `propagation_targets`, `propagate`,
   `propagated_busy`, `set_propagation`, `attached`, `propagation`, `update_mount`.
 - **Instances**: `sb_flags`/`set_sb_flags`, `sb_readonly`, `readonly`, `mount_flags` (read by
-  `kernel/vfs`'s checks), `dev_of`, `fs_of`, `proc_pid_ns`/`set_proc_pid_ns`,
-  `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev` (`kernel/ipc`).
+  `kernel/vfs`'s checks), `dev_of`, `mount_dev` (None for a mount that is gone), `fs_of`,
+  `proc_pid_ns`/`set_proc_pid_ns`, `devpts_options`/`set_devpts_options` (`kernel/tty`), `mq_dev`
+  (`kernel/ipc`).
 - **Mount points that file operations remove**: `is_store_point`, `detach_store_point`,
   `roots_removed` (from `kernel/vfs`'s unlink and rename).
 - **Collection**: `collect`, `released_detached`, `has_dead_ns`, `vfs::released`;
@@ -173,10 +174,14 @@ Outside the module:
   `MS_BIND` the instance's superblock flags too, for every bind and namespace copy of it
   (read-only, sync, mand and lazytime as given, dirsync kept: Linux's `MS_RMT_MASK`); going
   read-only while regular or synthetic files are open for writing (in fd tables, or backing a loop
-  device) is `EBUSY`: through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`),
-  through any attached mount of the same device, in any namespace, when the instance turns
-  read-only without it (`sb_prepare_remount_readonly`; writers through detached mounts are not
-  counted). A tmpfs remount without `MS_BIND` reconfigures the shared
+  device; memfds, which Linux keeps on an internal tmpfs, are not writers of the root's) is
+  `EBUSY`: through this mount with `MS_BIND` or `mount_setattr` (`mnt_make_readonly`), through any
+  mount of the instance, attached or detached and in any namespace, when the instance turns
+  read-only without it (`sb_busy`, 6.1's `sb_prepare_remount_readonly`), which is also `EBUSY`
+  while a file of the instance whose last name was removed is still in use (Linux's
+  `s_remove_count`): a store file with no links or an unlinked overlay node, open (fd tables,
+  AF_UNIX messages in flight, loop devices), a task's root or cwd, or a running program; memfds
+  do not count. A tmpfs remount without `MS_BIND` reconfigures the shared
   instance (`size=`/`nr_inodes=`/`inode32|64` per `shmem_reconfigure`); other filesystems ignore
   the remount data. Remounting an overlay without an upper layer read-write without `MS_BIND` is
   `EROFS` (6.1's `ovl_remount`).
@@ -313,7 +318,11 @@ Outside the module:
 - `kernel/vfs`:
   - walks and nodes;
   - new tmpfs and FUSE instances (`new_tmpfs`, `new_fuse`) and tmpfs reconfiguration.
-- `kernel/files`: the fd tables that `in_use` and `writers` scan.
+- `kernel/files`: the fd tables that `in_use`, `writers` and `sb_busy` scan, and memfds' seals
+  (which files are memfds).
+- `kernel/unix`: files in flight in AF_UNIX messages (`sb_busy`).
+- `kernel/store`: link counts (`sb_busy`).
+- `kernel/exec`: running programs' exe files (`sb_busy`).
 - `kernel/overlay`: new overlayfs instances (`new_overlay`).
 - `kernel/loop`: loop devices' backing files (`Loops::backing_files`).
 - `kernel/store`: detached directories for tmpfs instances; the exclusive flock and boot cleanup.
@@ -413,7 +422,9 @@ Outside the module:
     `max_mnt_namespaces` until the open file goes (6.1's `do_move_mount` frees it at attach);
   - an open_tree clone of `/proc/<pid>/ns/*` is a procfs mount pinning nothing, not an nsfs mount
     keeping the namespace;
-  - turning an instance read-only ignores files open for writing through its detached mounts.
+  - turning an instance read-only ignores its deleted files that are only mapped (mappings do not
+    record their mount) and deleted FUSE files, which 6.1's `s_remove_count` counts until the
+    inode is evicted.
 
 ## Open questions
 
@@ -428,8 +439,8 @@ Outside the module:
   namespace's, sysfs and cgroup2 the initial one through `fc->global`) comes from knowledge of
   6.1's `fs_context` code; only the `EPERM` for remounting a sysfs mounted in a user namespace,
   and for remounting the root and a tmpfs of the initial one, was observed on a native 6.8 kernel.
-- The remount `EBUSY` with writers found by Starnix's syscall tests was observed on a native 6.8
-  kernel and attributed to 6.1 from knowledge of the kernel.
+- The remount `EBUSY` with writers found by Starnix's syscall tests, and with deleted files in
+  use, was observed on a native 6.8 kernel and attributed to 6.1 from knowledge of the kernel.
 - The 6.1 behaviour cited in the fidelity gaps and the propagation bug (`IS_MNT_NEW`,
   `user_path_at`, `do_mount_setattr`, `do_move_mount`, `can_umount`) comes from knowledge of the
   kernel, not 6.1 source; so does whether 6.1's `propagate_mnt` also copies a moved attached tree

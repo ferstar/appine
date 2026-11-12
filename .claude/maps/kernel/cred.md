@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-10 (targeted verification only since the full mapping: new files' owners; ptrace access and credentials; seccomp pids; v3 file caps; vDSO seccomp bypass; shared fs at execve; per-thread credentials; personality clearing; mm user namespace last)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: an fd ADDFD replaces is closed as the target process's)
 
 ## Responsibilities
 
@@ -198,13 +198,13 @@ procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/p
   thread), KILL_PROCESS and unknown actions (fatal `SIGSYS` with core dump). Logged actions go to
   Appine's debug log only (stderr with `APPINE_LOG`); USER_NOTIF is never logged.
 - User notifications: the waiting thread is woken by replies, ends on fatal signals, and returns
-  `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a
-  signal costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
+  `ERESTARTSYS` on other signals (unless `WAIT_KILLABLE_RECV` and already received, where a signal
+  costs one spurious wakeup before blocking again). RECV (zeroed struct, blocks even when
   nonblocking, `ENOENT` for withdrawn; the `pid` field is the notified thread as the receiver's pid
-  namespace sees it, 0 when invisible), SEND (flags, `CONTINUE`, `ENOENT`,
-  `EINPROGRESS` for a second answer), ID_VALID, ADDFD (installs into the target's table, optionally
-  replacing an fd and answering); closing the listener answers waiters with `ENOSYS`; poll readiness
-  and `POLLHUP` when no thread uses the filter.
+  namespace sees it, 0 when invisible), SEND (flags, `CONTINUE`, `ENOENT`, `EINPROGRESS` for a
+  second answer), ID_VALID, ADDFD (installs into the target's table, optionally replacing an fd,
+  closed as the target's, and answering); closing the listener answers waiters with `ENOSYS`; poll
+  readiness and `POLLHUP` when no thread uses the filter.
 - The cache: for numbers 0..511, a filter whose evaluation with only nr/arch known reaches
   `RET ALLOW` marks the number always allowed; such calls skip the interpreter and keep the no-BKL
   fast path.

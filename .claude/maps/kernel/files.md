@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/files.md` for the paired decision history (not yet created; decisions from before the split are D5, D11, D17, D22, D24, D26, D27, D29, D33, D34, D41, D44, D45, the owner half of D25, the `open_pseudo` half of D19 and the file I/O halves of D36 and D37 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-12 (targeted verification only since the split; latest change: sendfile needs ends that splice, as /dev/full and /dev/null are EINVAL, and takes seekable FUSE inputs)
 
 ## Responsibilities
 
@@ -20,11 +22,11 @@
 - opening the character devices by device number, and their reads, writes and ioctls.
 
 Root: `core/kernel/src/fd.rs` (its `EventFd` and `TimerFd` are described by `kernel/poll`), and in
-`syscall/fs.rs` the section Opening, closing, duplicating (except `open_overlay`, `flock`, the
-fcntl lock commands, `pipe2`, `open_fifo` and the pipe-size fcntl commands), the section Reading and
-writing (except `follow_copy_up`, the pipe reads and writes and the splice block), `lseek`, the
-sections Cache hints and syncing and truncate and fallocate, and the shared helpers `executing`,
-`open_for_write`, `check_seals`, `remove_privs` and `truncating`.
+`syscall/fs.rs` the section Opening, closing, duplicating (except `open_overlay`, `flock`, the fcntl
+lock commands, `pipe2`, `open_fifo` and the pipe-size fcntl commands), the section Reading and
+writing (except `follow_copy_up`, `copy_up`, the pipe reads and writes and the splice block),
+`lseek`, the sections Cache hints and syncing and truncate and fallocate, and the shared helpers
+`executing`, `open_for_write`, `check_seals`, `remove_privs` and `truncating`.
 
 Outside the module: path resolution, mount-flag checks, tmpfs accounting, metadata and namespace
 syscalls, `getdents64`, `/dev` population and the `Device` numbers (`kernel/vfs`); the mount table
@@ -55,6 +57,9 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   (`Local`: regular files through `unlocked_io`; other local files, and `O_APPEND` writes to
   regular files, while borrowed under the BKL).
 - `Kernel::unsharing` — inodes `make_private` is copying with the BKL released.
+- `StoreOpen` — how `open_store` reached the inode: found by path (every check), created by this
+  open (none), or a nameless file reopened through a magic link (every check, through its own host
+  handle; a memfd never read-only).
 
 ## Public entry points
 
@@ -65,7 +70,8 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   `FICLONE`/`FICLONERANGE`/`FIDEDUPERANGE`, random ioctls, and the dispatch of other ioctls by kind.
 - **Cache hints and syncing**: `fadvise64`, `sync_file_range`, `readahead`, `syncfs`, `cachestat`
   (a 6.5 call), `fsync`/`fdatasync`, `sync`.
-- **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps),
+- **Kernel-internal**: `create_exclusive`, `unlink_path`, `write_at` (core dumps), `close_replaced`
+  (seccomp's ADDFD),
   `FdTable::with_host_stdio` (boot), `FdTable::reserve`/`fill`/`unreserve` (accept4);
   `prepare_write`, `make_private`; `host_unshared` (from `kernel/inotify`'s `host_change`);
   `read_file`, `write_file`, `read_bytes`, `write_bytes`, `write_sync`, `vectored`, `fsync`,
@@ -96,7 +102,9 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   others ignore it) and `unix::released`; the last reference's `Drop` tells `vfs::released` its
   mount (and a pinned PTY's devpts mount), wakes host-socket (not AF_UNIX) waiters, wakes lock
   waiters when the file held locks, and drops the `Opened` record (`IN_CLOSE_*` when any watch
-  exists). A table's drop wakes lock waiters when it held locks.
+  exists). A table's drop wakes lock waiters when it held locks. A file seccomp's
+  `SECCOMP_ADDFD_FLAG_SETFD` replaces in another process's table is closed as that process's (its
+  locks, message-queue notifications and FUSE flush; `close_replaced`).
 - Open keeps only the access mode, `O_APPEND`, `O_NONBLOCK`, `O_PATH`, `O_DSYNC` and `__O_SYNC`
   (`kept`; with `O_PATH` only `O_PATH`), and every other open adds `O_LARGEFILE`. An `O_PATH` fd
   takes only `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD` and `F_GETFL` (else `EBADF`), and
@@ -164,11 +172,14 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   writes.
 - Magic links to nameless targets — `/proc/<pid>/fd/N` of a deleted or memfd file, a pipe or a host
   fd (`OpenFd`), `/proc/<pid>/exe` of a deleted program (`OpenExe`) — skip the synthetic stat and
-  go to `reopen`/`reopen_exe`: permission against the host object's stat (`O_TRUNC` asks for
-  write), seals only for `O_TRUNC` with a write mode, `ETXTBSY` for a program, then `open_store` on
-  the original mount as if just created, so `EROFS`, `O_NOATIME`, lease breaks and (for fds)
-  `ETXTBSY` are skipped; pipes reopen a new end and host fds the same fd, with no check. Linked
-  targets resolve to store or overlay nodes and get the normal checks.
+  go to `reopen`/`reopen_exe`: a regular file checks seals for `O_TRUNC` with a write mode, then
+  gets `open_store`'s checks on the mount it was opened or run through (`StoreOpen::Reopened`,
+  through a duplicate of its host handle, or a writable one opened through the host's
+  `/proc/self/fd`); pipes reopen a new end and host fds the same fd, with no check. The new
+  description takes the original's mount and display path (`/memfd:<name> (deleted)`,
+  `pipe:[<n>]`) and records an `Opened`; unlike the memfd it reopens it is not `pseudo`, so it
+  counts as a writer (exec `ETXTBSY`) as on Linux. Linked targets resolve to store or overlay
+  nodes and get the normal checks.
 - File handles: `name_to_handle_at` (`AT_SYMLINK_FOLLOW`, `AT_EMPTY_PATH`, and 6.5's
   `AT_HANDLE_FID` ignored) encodes store nodes only (else `EOPNOTSUPP`) as 8 bytes of type 1 holding
   the inode number, and returns the mount id; over 128 bytes is `EINVAL`, too small `EOVERFLOW`.
@@ -199,10 +210,13 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   `copy_regular` for its host copy. lseek, `O_APPEND` writes, sendfile's and `copy_data`'s
   rollbacks, copy_file_range's shared path, `read_file`'s fault fix-up, loop devices and synthetic
   files move the position without it.
-- A write (`write_bytes`) checks `RLIMIT_FSIZE` (cut, or `SIGXFSZ` and `EFBIG` at or past it),
-  tmpfs room and seals at the position read before waiting for `pos_busy`, calls `prepare_write`
-  and `remove_privs`, writes, and charges tmpfs. Writes and truncation call `remove_privs`
-  (`CAP_FSETID` checked in the initial namespace), which clears setgid only with group exec (6.1).
+- write and writev check `RLIMIT_FSIZE` once for the whole call (cut, or `SIGXFSZ` and `EFBIG` at
+  or past it), so a piece or iovec ending at the limit only shortens the call. A write at the
+  position of a regular file (not `O_APPEND`) takes `pos_busy` before its checks and holds it to
+  the end (`write_local`); each piece checks `RLIMIT_FSIZE`, tmpfs room and seals at its position,
+  calls `prepare_write` and `remove_privs`, writes, and charges tmpfs. Writes and truncation call
+  `remove_privs` (`CAP_FSETID` checked in the initial namespace), which clears setgid only with
+  group exec (6.1).
 - `O_APPEND` writes run under the BKL at the current host length; `pwrite` on an `O_APPEND` file
   appends too unless `RWF_NOAPPEND` (6.9's flag, honoured only with an explicit offset; FUSE files
   ignore it). preadv2/pwritev2 refuse unknown flags, `RWF_NOWAIT` and `RWF_APPEND` included
@@ -233,23 +247,28 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
 - A copy to or from the guest buffer that faults grows a grows-down mapping below it
   (`kernel/mm`) and retries (not for vmsplice's write side or a `/dev/kmsg` writev). A read whose
   buffer faults partway returns the bytes before the faulting page (`EFAULT` when none): regular
-  and FUSE files move the position back past what was not copied, other files keep what they
+  and FUSE files move the position back past what was not copied (`give_back`: never further than
+  the read moved it, so FUSE stream files keep theirs), other files keep what they
   consumed (pipe and terminal data, synthetic and loop positions). Writes copy one piece at a time,
   all or nothing, so a fault fails with `EFAULT` only in the first piece (a pipe writev also writes
   the iovecs before the faulting one); earlier pieces stay written and count.
-- `sendfile` (input regular or a device, else `EINVAL`; an `O_APPEND` output other than a pipe
-  `EINVAL`, `do_splice_direct`) and `copy_file_range` between distinct regular store files use the
+- `sendfile` (input a regular file, a seekable FUSE file or a device that can be spliced from, so
+  not `/dev/null`, else `EINVAL`; an output other than a pipe that is `O_APPEND` or cannot be
+  spliced into, such as `/dev/full` or an eventfd, `EINVAL` with the input position unchanged,
+  as `do_splice_direct`; both ends judged by `kernel/pipe`'s `splice_reads`/`splice_writes`) and
+  `copy_file_range` between distinct regular store files use the
   host's sendfile without the BKL (`copy_regular`, capped at `MAX_RW_COUNT`), falling back to
   chunked copies for an `O_APPEND` output, the same inode, a file without a host handle (devices;
   FUSE files, which copy_file_range takes as regular and copies block by block, as 6.1 falls back
   without `FUSE_COPY_FILE_RANGE`), a sealed or tmpfs output, or host
-  `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`. sendfile's fallback moves the input position back over
-  what was not written. `copy_file_range` checks fds, offsets, then flags (`EINVAL`), then in
-  `generic_copy_file_checks` order per file (a non-regular input before a directory output):
-  directories `EISDIR`, other non-regular files `EINVAL`, modes and `O_APPEND` `EBADF`, different
-  devices `EXDEV` (the mounts' device numbers; a memfd counts as the root filesystem), wrapping
-  ranges `EOVERFLOW`, then the length cut to the input's end, `RLIMIT_FSIZE` and the largest file
-  size (`EFBIG`), overlap in one file `EINVAL`, negative positions `EINVAL`.
+  `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV`. The fallbacks move the input position back over what was
+  not written, never further than the read moved it (devices keep their positions), and an error
+  after some bytes were copied returns those bytes. `copy_file_range` checks fds, offsets, then
+  flags (`EINVAL`), then in `generic_copy_file_checks` order per file (a non-regular input before a
+  directory output): directories `EISDIR`, other non-regular files `EINVAL`, modes and `O_APPEND`
+  `EBADF`, different devices `EXDEV` (the mounts' device numbers; a memfd counts as the root
+  filesystem), wrapping ranges `EOVERFLOW`, then the length cut to the input's end, `RLIMIT_FSIZE`
+  and the largest file size (`EFBIG`), overlap in one file `EINVAL`, negative positions `EINVAL`.
 
 ### Size changes, cache hints and syncing
 
@@ -260,10 +279,12 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   the mode falls back to writing zeros (with the BKL held) and lengthening.
 - truncate: `EISDIR`, `EINVAL` for non-regular, `EROFS`, write permission (a synthetic regular file
   then succeeds unchanged), `ETXTBSY`, `RLIMIT_FSIZE`, then leases (6.1 breaks leases before
-  `inode_newsize_ok`), `make_private`, unmapping the dropped tail (busy address spaces skipped) and
-  the host truncation; ftruncate breaks leases for a writable regular file, then `prepare_write`,
-  then `EINVAL` unless writable and regular (`EBADF` on `O_PATH`), `RLIMIT_FSIZE` and seals, with
-  no `ETXTBSY` check.
+  `inode_newsize_ok`), seals, `make_private`, unmapping the dropped tail (busy address spaces
+  skipped) and the host truncation. A deleted file or memfd reached through `/proc/<pid>/fd/N` is
+  truncated itself: its store inode on the mount it was opened through, through the description's
+  host handle when the store has no object (a memfd's), a memfd never read-only; ftruncate breaks
+  leases for a writable regular file, then `prepare_write`, then `EINVAL` unless writable and
+  regular (`EBADF` on `O_PATH`), `RLIMIT_FSIZE` and seals, with no `ETXTBSY` check.
 - Cache hints and syncing: fadvise64 is `ESPIPE` on pipes and sockets and `EINVAL` for a negative
   length or unknown advice, else a no-op; sync_file_range passes regular files with flags to the
   host, directories succeed, other files are `ESPIPE`; readahead accepts readable regular files;
@@ -282,7 +303,8 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   are removed. `make_private` waits on the lock channel while the inode is in `Kernel::unsharing`,
   asks `kernel/store` to unshare, and when a copy is needed makes it (or what a truncation keeps)
   with the BKL released while the inode is in that set, retrying when the object changed
-  meanwhile. Then `rehome` gives every description of the file it can borrow (fd tables, AF_UNIX
+  meanwhile. Then, when the file was held or a description of it is still `cow`, `rehome` gives
+  every description of the file it can borrow (fd tables, AF_UNIX
   messages in flight, loop backing files) a new handle on its current object, read-only and `cow`
   while still shared, retires the old handles and forgets the cached executable; a busy
   description is logged and skipped. Only after a copy, shared mappings move to the new object
@@ -305,6 +327,9 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   are `EINVAL`. Other ranges are copied in `MAX_RW_COUNT` pieces. `FIDEDUPERANGE` checks its
   reserved fields (`EINVAL`), directories (`EISDIR`) and other non-regular files (`EINVAL`), then
   is `EOPNOTSUPP`.
+- An overlay copy-up shares the lower file's object too, through `kernel/overlay`'s `copy_up`,
+  which copies the data instead when a writable shared mapping or the Files app could write the
+  lower object in place, and rehomes the lower file's descriptions open for writing.
 
 ### Character devices
 
@@ -349,7 +374,8 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
 - `kernel/store`: objects, sharing and unsharing, commits and syncs.
 - `kernel/inotify` (the hooks, `opened`), `kernel/overlay` (opens through an overlay,
   `follow_copy_up`), `kernel/locks` (fcntl lock commands, `locks::closed`, `break_leases`),
-  `kernel/pipe` (pipes, FIFOs, pipe-size fcntl), `kernel/loop`, and `kernel/fuse` (opens and I/O on
+  `kernel/pipe` (pipes, FIFOs, pipe-size fcntl, which files splice at either end for sendfile),
+  `kernel/loop`, and `kernel/fuse` (opens and I/O on
   FUSE files, flushes).
 - `kernel/procfs` (synthetic opens and content), `kernel/tty` (terminal opens and ioctls),
   `kernel/ipc` (mqueue objects), `kernel/poll` (eventfd and timerfd reads, fasync), `kernel/net`
@@ -375,8 +401,9 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
 - A path that changes a store regular file's size or pages must call `kernel/vfs`'s tmpfs hooks
   (`tmpfs_size`/`tmpfs_resized`, the write-room check), or usage drifts until the next full count.
 - `kernel/aio`'s `has_iter` and `has_fsync` must follow new `FileKind`s and devices.
-- `open_store`'s "just created" bypass is also how `reopen` and `reopen_exe` enter it, so a check
-  added behind that bypass is skipped for `/proc/<pid>/fd` and `exe` reopens unless they repeat it.
+- `open_store` skips its checks only for a file this open created (`StoreOpen::Created`); reopens
+  through `/proc/<pid>/fd` and `exe` get them, so a check added there must also hold for a nameless
+  file opened through its host handle (a memfd has no store object, no mount of the store).
 - A held file's object is shared and must never be written in place: every path that changes a
   regular file calls `prepare_write` (or `make_private`) first, with no borrow of the open file
   held, and takes the host fd only afterwards. A `cow` description's handle is read-only, so a
@@ -386,59 +413,26 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   BKL still uses the old fd number: old handles are kept until the description closes.
 - `rehome` skips descriptions borrowed at that moment, and a skipped read-only one would keep
   reading the old object, so no code may hold a borrow of an open file across a BKL release or a
-  wait (checking builds assert it). The known exception is ftruncate's (see the bugs).
+  wait (checking builds assert it).
 - Unlocked I/O snapshots the position before releasing the BKL and writes it back afterwards, so
-  other code that moves the position must take `pos_busy` or accept being overwritten.
+  other code that moves the position must take `pos_busy` (`take_pos`/`release_pos`) or accept
+  being overwritten; a rollback moves it back only as far as the read moved it (`give_back`).
 
 ## Confirmed bugs / technical debt
 
-- **`/proc/<pid>/fd` reopens skip open checks and lose the mount:** a nameless target (deleted or
-  memfd file, pipe, host fd) is checked only against the host object (pipes and host fds not at
-  all) — no `EROFS`, `O_NOATIME`, `ETXTBSY` or lease breaks; the new description (also for `exe`)
-  is on the root mount, so fexecve of a deleted file reopened from a noexec or nosuid mount runs
-  with neither, fstat shows the root's `st_dev`, tmpfs writes go uncharged, and mount release,
-  busy and writer checks miss it; no `IN_OPEN` or `Opened`; the display path is the reopening path
-  (`/proc/self/fd/3`, ` (deleted)` for a memfd), not `pipe:[N]`, `/memfd:name` or the host path.
-- **truncate through `/proc/<pid>/fd/N` of a memfd or deleted file does nothing:** it takes the
-  synthetic branch, so it is `EACCES` (a root-owned 0444 node) without `CAP_DAC_OVERRIDE`, and
-  succeeds without truncating with it.
-- **truncate(2) leaks host fds:** it calls `make_private` even for an unshared file, whose
-  `rehome` gives every open description a new handle and retires the old one until close, so each
-  truncate of a file kept open (a log) adds a host fd per description.
-- **Position underflow:** sendfile from a device (`/dev/zero`, random, `/dev/full`, `/dev/kmsg`)
-  into a full nonblocking pipe or `/dev/full` moves the never-advanced input position back, and
-  `read_file`'s fault fix-up and `copy_data` do the same for FUSE stream files: a debug build
-  aborts the whole app on the overflow check, a release build leaves the position near 2^64.
-- **Spurious `SIGXFSZ`:** a write piece or iovec ending exactly at `RLIMIT_FSIZE` with more to
-  write makes the next one send `SIGXFSZ` (default: terminate with core) and the call return the
-  short count; Linux only shortens the write.
-- **ftruncate holds a borrow across its lease wait:** the `if let` that reads the file kind keeps
-  a `Ref` while `break_leases` waits, so checking builds (debug, `borrow-check`) panic and others
-  panic if another thread mutably borrows the description meanwhile; reachable because the lease
-  writer count misses descriptions in flight in `SCM_RIGHTS` (6.1's ftruncate breaks no leases).
-- **Overlay copy-up shares under an open writer:** copy-up shares the lower file's object without
-  `try_share`'s writer and mapping checks or rehoming, so a description of the lower file opened
-  for writing before (not `cow`) or a writable shared mapping of it changes the copied-up file.
-- **`copy_data` loses progress:** an error after earlier pieces returns the error though bytes
-  were copied and positions moved (sendfile returns the count).
-- **Stale positions in write checks:** a write checks `RLIMIT_FSIZE`, tmpfs room and `F_SEAL_GROW`
-  at the position read before waiting for `pos_busy`, so racing another I/O on one description it
-  can pass them.
 - **Writes keep a setgid bit chown would clear:** `remove_privs` clears setgid only with group
   exec (6.1), while chown follows 6.2; since 6.2 Linux's writes match its chown.
 - **File position races:** lseek and the other paths that move the position without `pos_busy` can
   be overwritten by a piece finishing without the BKL (Linux's lseek takes `f_pos_lock`), and a
   synchronous writev releases the position between iovecs.
-- **seccomp's fd replacement:** `SECCOMP_ADDFD_FLAG_SETFD` over an existing fd sends no FUSE flush
-  and removes message-queue notifications of the supervisor's process, not the target's.
 - **Fidelity gaps**, one per line:
   - no `O_TMPFILE`;
   - a write open on a read-only instance is `EROFS` only after permission (6.1's `sb_permission`
     comes first; overlay opens already do);
   - `F_GETFL` never shows `O_DIRECT`, `O_NOATIME`, `O_ASYNC`, `O_DIRECTORY` or `O_NOFOLLOW` given at
     open (`F_SETFL` can set the first three);
-  - open_by_handle_at, nameless reopens and memfds report no `IN_OPEN`, and cgroup2 files no
-    `IN_CLOSE_*`; handles open a store inode through any store mount;
+  - open_by_handle_at and memfds report no `IN_OPEN`, and cgroup2 files no `IN_CLOSE_*`; handles
+    open a store inode through any store mount;
   - `RLIMIT_NOFILE` from prlimit applies to the whole shared fd table, and `CLOSE_RANGE_UNSHARE`
     skips `unshare`'s `nr_open` check;
   - sendfile, copy_file_range and splice into an `O_SYNC`/`O_DSYNC` file do not sync it, nor do

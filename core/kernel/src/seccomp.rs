@@ -1083,9 +1083,7 @@ fn addfd(cx: &mut Cx<'_>, f: &Filter, arg: u64, size: usize) -> Result<u64, Errn
         match replaced {
             Ok(old) => {
                 let old: Vec<_> = old.into_iter().collect();
-                crate::locks::closed(cx.k(), &fds, &old);
-                crate::syscall::mqueue_closed(cx.tgid(), &old);
-                crate::unix::released(cx.k(), old);
+                crate::syscall::close_replaced(cx, &fds, task.tgid, old);
                 Ok(newfd as i32)
             }
             Err(e) => Err(e),

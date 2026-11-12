@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/overlay.md` for the paired decision history (decisions from before the split are D39, D40 and D49 in `.claude/decisions/kernel/vfs.md`, and D45 and D46 in `.claude/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-12 (targeted verification only since the split; latest change: copy-ups go through `copy_up`, which copies when the lower object could change in place)
 
 ## Responsibilities
 
@@ -20,8 +22,8 @@ synthetic nodes:
 
 Root: `core/kernel/src/vfs/overlay.rs`; the overlay methods of `Vfs` in `vfs/mod.rs` (`new_overlay`
 to `overlay_readdir`, `sweep_overlays`); in `syscall/fs.rs` `open_overlay`, `follow_copy_up`,
-`unlink_overlay`, `link_overlay` and `rename_overlay`; in `syscall/mount.rs` the overlay options
-(`overlay_layers`, `overlay_dir`) and the node sweep at syscall end.
+`copy_up`, `unlink_overlay`, `link_overlay` and `rename_overlay`; in `syscall/mount.rs` the overlay
+options (`overlay_layers`, `overlay_dir`) and the node sweep at syscall end.
 
 Outside the module: the walk, attribute and namespace syscalls that branch into this module, and
 the rules every file operation keeps for overlay nodes (`kernel/vfs`); the opens and truncations
@@ -112,14 +114,17 @@ holding its node (`kernel/exec`).
   inode is (directory; regular file sharing the lower object, as 6.1 clones with reflink; symlink;
   special file), with mode (set-id bits too), owner, non-overlay attributes and times, in one store
   transaction; the parent's times are put back. Sharing marks both inodes held, so a later write
-  open of either first gives it an object of its own; unlike `try_share`, copy-up does not check
-  for writers already holding the lower object. A non-directory then forgets its lower inodes; a
+  open of either first gives it an object of its own. The syscalls copy up through
+  `syscall::fs::copy_up`, which, as `try_share` does, copies a regular file's data instead
+  (`CopyUp::Copied`) when a writable shared mapping or the Files app could write the lower object in
+  place, and after sharing rehomes the lower file's descriptions open for writing (`cow`); a rename
+  copies up the files it moves that way first. A non-directory then forgets its lower inodes; a
   copied-up directory keeps them and stays merged (one link, rename `EXDEV`). A file opened with
   `O_TRUNC` or truncated to 0 is copied without data. chmod, chown, utimensat (`Attrs::Overlay`),
   setxattr, removexattr, truncate and write opens check `EROFS` and permission on what the overlay
-  shows (the last two also `ETXTBSY` for a program run from the lower inode), copy up only then,
-  and change the upper inode. utimensat by fd goes by number, never through the open (possibly
-  lower) object.
+  shows (the last two also `ETXTBSY` for a program run from the lower inode), copy up only then, and
+  change the upper inode. utimensat by fd goes by number, never through the open (possibly lower)
+  object.
 
 ### Creating, removing and renaming
 
@@ -200,9 +205,6 @@ holding its node (`kernel/exec`).
   - nodes of existing names are never freed while mounted (one per name looked up), and removed
     ones stay while a path-based syscall begun before their removal runs in another thread;
   - the no-BKL stat never serves overlay paths;
-  - copy-up shares the lower object without `try_share`'s checks, so writers already holding it
-    in place (a writable description, a writable shared mapping, a Files app writer) keep changing
-    the upper file too (Linux copies the data);
   - a FIFO opened through an overlay fstats as its layer inode, so after a copy-up fstat and stat
     disagree;
   - no `trusted.overlay.origin`, `impure` or shared whiteout inode: a copied-up file's inode

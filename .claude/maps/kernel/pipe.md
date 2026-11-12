@@ -4,6 +4,8 @@
 > See `.claude/decisions/kernel/pipe.md` for the paired decision history (decisions from before the split are D31 and D54 in `.claude/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: which files splice at either end, shared with sendfile, so /dev/full cannot be written and /dev/null cannot be read)
 
 ## Responsibilities
 
@@ -62,13 +64,19 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   lock; writers do not wait. Unknown flags `EINVAL`; a zero length returns 0 first in splice,
   after the flags in tee, and in vmsplice after the flags, access mode and iovecs (a non-pipe fd
   is `EBADF` only after that). splice checks access modes (`EBADF`), then its `EINVAL` cases (no
-  pipe, an `O_APPEND` output including FIFOs, kinds that cannot splice), then offsets on a pipe
-  (`ESPIPE`); an offset with an AF_UNIX stream input is ignored for the read and written back
+  pipe, an `O_APPEND` output including FIFOs, an end that cannot splice that way), then offsets on
+  a pipe (`ESPIPE`); an offset with an AF_UNIX stream input is ignored for the read and written back
   advanced, on other unseekable inputs `ESPIPE` only after the wait for room. `/dev/fuse` splices
   one whole request into a pipe (waiting as the device's own `O_NONBLOCK` says, `EIO` without
   room) and takes a reply of exactly the length asked, setting its header length to it (libfuse
   fixes the length in user memory after vmsplicing the header, which a copying vmsplice does not
   see).
+- Which files splice at each end follows Linux's `splice_read` and `splice_write`
+  (`splice_reads`, `splice_writes`, also used by sendfile): pipes, regular and FUSE files,
+  sockets, terminals, host fds, `/dev/fuse`, procfs and sysfs files, and the devices, except that
+  `/dev/null` cannot be read from, `/dev/full` cannot be written to, and `/dev/kmsg` and
+  `/dev/loop-control` neither; directories, eventfd, epoll and the other anonymous files cannot
+  splice at all.
 - When splice waits follows 6.1: between two pipes and for tee, for data (going on at end of file)
   and then room, unless `SPLICE_F_NONBLOCK` or either end's `O_NONBLOCK`, then moving or copying
   what is there and fits (splice waits again if a race took it, tee returns 0); from a pipe, for
@@ -86,7 +94,8 @@ Outside the module: fd tables, open files and the read, write and vectored paths
 
 ### Inbound
 
-- `kernel/files`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close.
+- `kernel/files`: opening FIFO nodes, the read, write and vectored paths, fcntl, ioctl, close;
+  sendfile asks `splice_reads`/`splice_writes` about its ends.
 - `kernel/poll` (pipe readiness, `EPOLLET` counters), `kernel/fuse` (`/dev/fuse` as a splice end),
   `kernel/unix` (stream sockets as splice inputs).
 
@@ -123,7 +132,10 @@ Outside the module: fd tables, open files and the read, write and vectored paths
   - `O_NOTIFICATION_PIPE` is `EINVAL` (6.1 makes one, or `ENOPKG` without watch queues);
   - vmsplice copies at the call, so later changes to the buffer are not seen by the reader;
   - `F_SETPIPE_SZ` is `EPERM` over `pipe-max-size` even when not growing, and checks `EBUSY`
-    against bytes rather than occupied pages.
+    against bytes rather than occupied pages;
+  - every procfs and sysfs file is taken as splicing both ways, so splice reads a per-process
+    file such as `/proc/<pid>/status` into a pipe, which has no `splice_read` on Linux (`EINVAL`
+    on a native 6.8 kernel).
 
 ## Open questions
 

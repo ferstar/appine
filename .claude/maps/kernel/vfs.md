@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: fd tables, opening, file I/O, clones, truncation, lseek and syncing split out as `kernel/files`)
+> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `..` out of a bind's subtree, tmpfs `uid=`/`gid=` mapping, reopened files' display paths)
 
 ## Responsibilities
 
@@ -94,19 +94,20 @@ capabilities (`kernel/cred`).
   trailing `/` appends `.`, forcing a directory and following a trailing symlink as an
   intermediate one.
 - Per component, in order: over 255 bytes `ENAMETOOLONG`; not a directory `ENOTDIR`; search
-  permission, also for `.` and `..`: on store directories and the store directory behind an
-  overlay one unless the credentials have `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE` in the
-  initial user namespace, on cgroup directories (`Pseudo::searched`; other synthetic directories
-  never), and on FUSE directories through `fuse_permission` (allow_other first, for everyone);
-  `.` is skipped; `..` (`dotdot`) stays at the process root without lifting, climbs stacked mount
-  points at a mount root, takes the parent within the mount (a namespace-tree or detached root
-  stays put) and enters anything mounted there; other names are looked up and lifted to the
-  topmost mount stacked on the result. `NO_XDEV` makes a `..` or lookup that changes mount
-  `EXDEV`, `BENEATH` a `..` from the start. A FUSE lookup or readlink reads `kernel/fuse`'s cache
-  or fails with the internal `FUSE_RETRY`: the dispatcher asks the daemon and reruns the syscall
-  (`EIO` after 16384 reruns). A name not found is first passed to `Pseudo::missing` (only here),
-  so procfs counts fixed names Linux has under `/proc` and `/sys` and names directly in the boot
-  `/dev` (`kernel/signal`'s unimplemented paths).
+  permission, also for `.` and `..`: on store directories and the store directory behind an overlay
+  one unless the credentials have `CAP_DAC_READ_SEARCH` or `CAP_DAC_OVERRIDE` in the initial user
+  namespace, on cgroup directories (`Pseudo::searched`; other synthetic directories never), and on
+  FUSE directories through `fuse_permission` (allow_other first, for everyone); `.` is skipped; `..`
+  (`dotdot`) stays at the process root without lifting, climbs stacked mount points at a mount root,
+  takes the parent within the mount (a namespace-tree or detached root stays put; a parent outside
+  the subtree of a bind's root, as after a rename through another mount, is `ENOENT`:
+  `path_connected`) and enters anything mounted there; other names are looked up and lifted to the
+  topmost mount stacked on the result. `NO_XDEV` makes a `..` or lookup that changes mount `EXDEV`,
+  `BENEATH` a `..` from the start. A FUSE lookup or readlink reads `kernel/fuse`'s cache or fails
+  with the internal `FUSE_RETRY`: the dispatcher asks the daemon and reruns the syscall (`EIO` after
+  16384 reruns). A name not found is first passed to `Pseudo::missing` (only here), so procfs counts
+  fixed names Linux has under `/proc` and `/sys` and names directly in the boot `/dev`
+  (`kernel/signal`'s unimplemented paths).
 - Symlinks (intermediate, or last with `follow`): over 40 `ELOOP`; `protected_symlinks` (default
   on) for a last-component store link in a store directory (`EACCES`); `NO_SYMLINKS` or
   nosymfollow `ELOOP`; then procfs's `follow`, which refuses magic links to readers failing the
@@ -144,9 +145,8 @@ capabilities (`kernel/cred`).
   its name is removed) is `ENOENT` for getcwd and `/proc/<pid>/cwd`. mountinfo's `mounts_from`
   does the same for every mount through an index built once and skips unreachable mounts. `getcwd`
   prefixes `(unreachable)`; `/proc/<pid>/{cwd,root}` are computed live against the reader's root;
-  an fd's display path is fixed at open (a magic-link reopen of a pipe, memfd or host fd freezes
-  the path it was opened by, such as `/proc/self/fd/3`), with ` (deleted)` appended when a regular
-  file's nlink is 0.
+  an fd's display path is fixed at open (a magic-link reopen of a nameless file takes the
+  original's), with ` (deleted)` appended when a regular file's nlink is 0.
 - `Cached` (no-BKL newfstatat and statx) runs only when the thread's root is in the root
   filesystem's mount, the credentials search everything, that mount is attached and not
   nosymfollow, the fast epoch is current, the flags are valid, the thread is not syscall-traced,
@@ -188,14 +188,15 @@ capabilities (`kernel/cred`).
 ### tmpfs
 
 - An instance is a detached store directory (`create_detached_dir`); files are ordinary objects.
-  Options follow 6.1's `shmem_parse_one`: `size=` with suffixes or `%`, `nr_blocks=`,
-  `nr_inodes=`, octal `mode=`, `uid=` and `gid=` (C-style numbers stored as kernel IDs; `u32::MAX`
-  `EINVAL`), `inode32`/`inode64` (shown only), `huge=` (only Linux's values) and `mpol=` ignored,
-  generic words such as `ro` ignored, anything else `EINVAL`; the root defaults to 1777 owned by
-  the mounter's fsuid/fsgid. mountinfo shows `size=` and `nr_inodes=` when not default, `mode=`
-  when not 1777, `uid=`/`gid=` when not 0, then `inode64` or `inode32`. A remount parses before its
-  `CAP_SYS_ADMIN` check, then checks writers, and takes only the limits (0 is unlimited) and
-  `inode32|64`; turning an unlimited instance limited, or going below what is in use, is `EINVAL`.
+  Options follow 6.1's `shmem_parse_one`: `size=` with suffixes or `%`, `nr_blocks=`, `nr_inodes=`,
+  octal `mode=`, `uid=` and `gid=` (C-style numbers in the mounter's user namespace, stored as
+  kernel IDs; unmapped there or `u32::MAX` `EINVAL`, a remount's too), `inode32`/`inode64` (shown
+  only), `huge=` (only Linux's values) and `mpol=` ignored, generic words such as `ro` ignored,
+  anything else `EINVAL`; the root defaults to 1777 owned by the mounter's fsuid/fsgid. mountinfo
+  shows `size=` and `nr_inodes=` when not default, `mode=` when not 1777, `uid=`/`gid=` when not 0,
+  then `inode64` or `inode32`. A remount parses before its `CAP_SYS_ADMIN` check, then checks
+  writers, and takes only the limits (0 is unlimited) and `inode32|64`; turning an unlimited
+  instance limited, or going below what is in use, is `EINVAL`.
 - Boot instances (`/dev` 0755 nosuid, `/dev/shm` 1777 nosuid,nodev, `/run` 0755 nosuid,nodev with
   20% of RAM and 800Ki inodes) start uncounted: charges are dropped until the first count, at a
   create, write or fallocate check, a statfs or a remount.
@@ -356,16 +357,10 @@ capabilities (`kernel/cred`).
 
 ## Confirmed bugs / technical debt
 
-- **`..` escapes a bind mount after a rename:** `..` stops only at its mount's root, with no
-  `path_connected` check, so when a directory inside a bind's subtree is renamed outside it through
-  another mount, a cwd or fd there walks `..` up to the store root under the bind's mount id
-  (`reach` reports such paths unreachable; resolution does not). Linux returns `ENOENT`.
 - **tmpfs charges drift for unlinked open files:** writes through a description still open after
   the last unlink are charged and never given back (nothing uncharges at close; recounts skip
   unlinked files), while truncating or punching one uncharges pages already given back, so writes
   can pass the limit until the next recount. Linux charges until eviction at the last close.
-- **tmpfs `uid=`/`gid=` are not mapped:** they are stored as kernel IDs, so a mount in a user
-  namespace gives its root to the wrong owner (6.1 maps them through the mounter's namespace).
 - **No inode flags:** `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` are unsupported, while 6.1's tmpfs has
   append-only, immutable, nodump and noatime (LTP unlink09, copy_file_range02).
 - **atime ignores the guest:** a regular file's atime is its host object's, updated by the host's
@@ -404,5 +399,4 @@ capabilities (`kernel/cred`).
 
 ## To verify
 
-- Whether anything else (such as `mm`'s `shmem_like`, which looks for a `/memfd:` mapping name)
-  depends on the display path a `/proc/<pid>/fd` reopen freezes.
+- None.

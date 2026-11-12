@@ -3,9 +3,9 @@
 # network or sshd), mounted by root and by an ordinary user through the setuid fusermount3 (the
 # descriptor passed back over a socket), root refused by a mount without allow_other, unmounting
 # with fusermount3 -u; rclone mount of a local directory (Go's FUSE library, also through
-# fusermount3); copy_file_range between two FUSE files; inotify events of changes made through a
-# mount. Everything lives on one tmpfs on both sides; sizes of directories (sftp reports the
-# server's) and times are not compared
+# fusermount3); copy_file_range between two FUSE files, sendfile out of one; inotify events of
+# changes made through a mount. Everything lives on one tmpfs on both sides; sizes of directories
+# (sftp reports the server's) and times are not compared
 cd /tmp
 umount -l /tmp/ft/sm 2>/dev/null
 umount -l /tmp/ft/um 2>/dev/null
@@ -58,6 +58,19 @@ while True:
 print("copy_file_range", n)
 '
 cmp big ss/copy && echo "copy: same"
+python3 -c '
+import os
+src = os.open("/tmp/ft/sm/big", os.O_RDONLY)
+dst = os.open("/tmp/ft/sent", os.O_WRONLY | os.O_CREAT, 0o644)
+n = 0
+while True:
+    k = os.sendfile(dst, src, None, 1 << 20)
+    if k == 0:
+        break
+    n += k
+print("sendfile", n)
+'
+cmp big sent && echo "sendfile: same"
 chmod 600 sm/a
 stat -c '%n %a' ss/a
 python3 -c '

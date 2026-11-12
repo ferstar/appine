@@ -552,11 +552,21 @@ fn empty_mount_point(point: &Node) -> bool {
 /// memory, inode64).
 fn tmpfs_options(data: &[u8], cred: &crate::cred::Cred) -> Result<TmpfsParams, Errno> {
     let o = parse_tmpfs(data)?;
+    // uid= and gid= are IDs in the mounter's user namespace (shmem_parse_one's make_kuid), EINVAL
+    // when unmapped there
+    let uid = o
+        .uid
+        .map(|u| cred.uid_in(u).ok_or(Errno::EINVAL))
+        .transpose()?;
+    let gid = o
+        .gid
+        .map(|g| cred.gid_in(g).ok_or(Errno::EINVAL))
+        .transpose()?;
     let default = TmpfsParams::default_limit();
     Ok(TmpfsParams {
         perm: o.perm.unwrap_or(0o1777),
-        uid: o.uid.unwrap_or(cred.fsuid),
-        gid: o.gid.unwrap_or(cred.fsgid),
+        uid: uid.unwrap_or(cred.fsuid),
+        gid: gid.unwrap_or(cred.fsgid),
         blocks: o.blocks.unwrap_or(default),
         inodes: o.inodes.unwrap_or(default),
         inode64: o.inode64.unwrap_or(true),
@@ -701,7 +711,7 @@ fn remount(
     // check), so root of a user namespace cannot remount the boot root or a shared tmpfs
     if let Some((data, _)) = data {
         if m.fs == Fs::Tmpfs {
-            parse_tmpfs(data)?;
+            tmpfs_options(data, &cx.cred())?;
         }
         let init = UserNs::init();
         if !cx
@@ -711,16 +721,11 @@ fn remount(
             return Err(Errno::EPERM);
         }
     }
-    // Going read-only: the superblock while no mount of it has writers (sb_prepare_remount_readonly),
-    // or just this mount while it has none (mnt_make_readonly)
+    // Going read-only: the superblock while it is not busy (sb_prepare_remount_readonly), or just
+    // this mount while it has no writers (mnt_make_readonly)
     let sb_ro = vfs.sb_readonly(&m);
     let busy = match data {
-        Some((_, sb)) if sb & ms::RDONLY != 0 && !sb_ro => {
-            let writers = writers(cx.kr());
-            vfs.mounts()
-                .iter()
-                .any(|o| o.dev == m.dev && writers.contains(&o.id))
-        }
+        Some((_, sb)) if sb & ms::RDONLY != 0 && !sb_ro => sb_busy(cx.kr(), &vfs, m.dev),
         None if flags & ms::RDONLY != 0 && m.flags & ms::RDONLY == 0 => {
             writers(cx.kr()).contains(&id)
         }
@@ -1509,14 +1514,16 @@ fn try_in_use(k: &crate::kernel::Kernel) -> Option<HashSet<MountId>> {
 
 /// The mounts with files open for writing through them (Linux's `mnt_get_writers`): regular and
 /// synthetic files opened with write access in some process's fd table, or backing a loop device
-/// opened writable; devices, FIFOs and sockets do not count (`special_file`).
+/// opened writable; devices, FIFOs and sockets do not count (`special_file`), nor do memfds,
+/// which Linux keeps on an internal tmpfs (here they have the store's root mount).
 fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
     let writes = |f: &crate::fd::OpenFile| {
         f.writable()
-            && matches!(
-                f.kind,
-                crate::fd::FileKind::Regular { .. } | crate::fd::FileKind::Proc { .. }
-            )
+            && match &f.kind {
+                FileKind::Regular { ino, .. } => !k.seals.contains_key(ino),
+                FileKind::Proc { .. } => true,
+                _ => false,
+            }
     };
     let mut mounts = HashSet::new();
     for task in k.tasks.values() {
@@ -1540,6 +1547,56 @@ fn writers(k: &crate::kernel::Kernel) -> HashSet<MountId> {
         }
     }
     mounts
+}
+
+/// Whether instance `dev` cannot turn read-only (6.1's `sb_prepare_remount_readonly`, EBUSY): a
+/// file of it is open for writing through any of its mounts, attached or detached ([`writers`]), or
+/// a file of it whose last name was removed is still in use (Linux's `s_remove_count`, inodes
+/// with no links not yet evicted): open (in an fd table, in flight in an AF_UNIX message, or
+/// backing a loop device), a task's root or cwd, or a running program. memfds do not count (as
+/// in [`writers`]); neither do files that are only mapped, whose mappings do not record their
+/// mount, nor FUSE files.
+fn sb_busy(k: &crate::kernel::Kernel, vfs: &Vfs, dev: u64) -> bool {
+    let of_dev = |mnt: MountId| vfs.mount_dev(mnt) == Some(dev);
+    if writers(k).into_iter().any(of_dev) {
+        return true;
+    }
+    let removed = |node: &Node| {
+        let gone = match node {
+            Node::Store(_, ino) => {
+                !k.seals.contains_key(ino) && vfs.store().attrs(*ino).is_ok_and(|st| st.nlink == 0)
+            }
+            Node::Overlay(_, o) => !vfs.overlay().linked(*o),
+            Node::Pseudo(..) | Node::Fuse(..) => false,
+        };
+        gone && of_dev(node.mnt())
+    };
+    let mut files = k.open_files();
+    files.extend(crate::unix::inflight_files(k));
+    files.extend(k.loops.backing_files());
+    if files.iter().any(|f| {
+        f.try_borrow()
+            .is_ok_and(|f| f.node().is_some_and(|n| removed(&n)))
+    }) {
+        return true;
+    }
+    k.tasks.values().any(|task| {
+        let res = task.res.borrow();
+        let fs = res.fs.borrow();
+        let exe = k
+            .groups
+            .get(&task.tgid)
+            .and_then(|g| g.borrow().exe.clone());
+        removed(&fs.root)
+            || removed(&fs.cwd)
+            || exe.is_some_and(|e| {
+                e.node
+                    .is_some_and(|(mnt, ino)| removed(&Node::Store(mnt, ino)))
+                    || e.ovl
+                        .as_ref()
+                        .is_some_and(|(mnt, o, _)| removed(&Node::Overlay(*mnt, *o)))
+            })
+    })
 }
 
 // ---- Shared helpers ----
