@@ -147,13 +147,30 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
                 Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
             }
         }.apply { summary = PROJECT_URL }
+        val version = action(R.string.settings_version) { onVersion() }.apply {
+            summary = BuildConfig.VERSION_NAME
+        }
 
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, runPolicy, systemDocuments)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         group(R.string.settings_group_debug, tier)
-        group(R.string.settings_group_about, project, licenses)
+        group(R.string.settings_group_about, project, licenses, version)
         render()
+    }
+
+    private fun onVersion() {
+        val intent = Intent(Intent.ACTION_VIEW,
+            "https://play.google.com/store/apps/details?id=${BuildConfig.APPLICATION_ID}".toUri())
+        try {
+            startActivity(intent.setPackage("com.android.vending"))
+        } catch (e: ActivityNotFoundException) {
+            try {
+                startActivity(intent.setPackage(null))
+            } catch (e: ActivityNotFoundException) {
+                Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {

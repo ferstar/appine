@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: the terminal's overflow menu adds a saved Keep screen on checkbox, with a popup theme that removes the checkbox's own ripple)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: About's final version action has English and Simplified Chinese labels)
 
 ## Responsibilities
 
@@ -329,6 +329,8 @@ notices task and the build (`android/native`).
 
 - Settings' About group has a separate localized Project website action (android/setup); the
   license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
+  Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
+  version summary and Google Play navigation.
 - The build writes `notices/` (Appine's licence; Fuchsia's for the line discipline; Ghostty's
   libghostty-vt, uucode, simdutf, Highway, Wuffs, translate-c, Zig's compiler_rt and JetBrains
   Mono; Alpine

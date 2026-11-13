@@ -103,6 +103,7 @@
     <string name="settings_licenses">开源许可</string>
     <string name="licenses_summary">GNU AGPL 3.0 或更新版本</string>
     <string name="settings_project">项目地址</string>
+    <string name="settings_version">版本号</string>
     <string name="settings_login">登录账号</string>
     <string name="login_auto_choice">自动（优先普通用户）</string>
     <string name="login_auto">自动（%1$s）</string>
