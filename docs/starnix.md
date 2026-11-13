@@ -126,28 +126,24 @@ in the module maps, not here.
 | df6ee70 | Store reflinks: `FICLONE`, `FICLONERANGE` over a whole file, a whole-file `copy_file_range` and overlay copy-up make files share one store object, and the first change to one (any write, truncation, `fallocate`, a writable shared mapping) gives it its own, copied without the BKL; its open descriptions and shared mappings move along. Other clone ranges are copied; tmpfs, overlay files and memfds stay `EOPNOTSUPP` |
 | c008749 | FUSE after Linux 6.1's `fs/fuse` rather than Starnix's module: `/dev/fuse`, `mount -t fuse[.subtype]` (and through the setuid fusermount3), INIT, interrupts and aborts, about 30 opcodes; walks read a node cache and a miss makes the dispatcher ask the daemon with the BKL released and run the syscall again; no page cache (mapped pages are read from the daemon as they are touched, programs are copies), unused nodes forgotten above a limit or on `drop_caches`; fuse-overlayfs, sshfs and rclone mount in the `fuse` and `fuse-tools` cases |
 | 16364c0 | vDSO clock reads, from the host kernel's own vDSO rather than a vvar page of Appine's (whose parameters would drift from the host's NTP-adjusted clocks): its code is copied into each process with the host's vvar data mapped read-only below it as `[vvar]`, after a check in the interpreter at first use, with the svc-stub image as fallback; `clock_gettime` at Tier 1 went from 90 to 28 ns (19 natively). Time namespaces with offsets get svc stubs at the clock entries; tracers and seccomp see only the clocks Linux's vDSO leaves to the kernel; ECV's `CNTVCTSS_EL0` |
+| 1e5de64e | Stay awake while busy: Settings offers allow sleep, run while busy and always run; busy mode releases the Android wake lock after 30 seconds without observed guest CPU activity, checked every 2 seconds, while protecting startup, boot, restart, replacement, shutdown and distro downloads. The notification shows the selected policy and toggles always run against the last chosen non-always policy. Network waits and scheduled work can still need always run; polling does not wake a sleeping device |
 
 b295644, 5dcf7db and 63b9e59 fix bugs found while comparing Starnix's code with Appine's: readv
 and writev split datagrams per iovec, mremap with an old length of 0 was always `EINVAL`, and
 absolute timers were converted to the host's monotonic clock when set. The commits after 4e64e74
 fix deviations the full runs found (0b2c3c8, 0a4712e, b3e134a and 6d05aa9 those of gVisor's;
 b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instead), except
-7b7f73b, 39ea702, 99b4216, 64a6107, df6ee70, 16364c0 and c008749, which take ideas from the list
-below.
-
-“Stay awake while busy” is implemented: Settings offers allow sleep, run while busy
-and always run. Busy mode releases after 30 seconds without observed guest CPU activity (checked
-every 2 seconds), protecting startup, boot, shutdown and distro downloads. The notification
-toggles always run against the last chosen non-always policy. This is an activity heuristic:
-network waits and scheduled work can still need always run; the poll does not wake a sleeping device.
+7b7f73b, 39ea702, 99b4216, 64a6107, df6ee70, 16364c0, c008749 and 1e5de64e, which take ideas from
+the list below.
 
 ## Not yet taken
 
-Ordered by value for effort.
+The host's activity-based wake-lock policy is implemented in 1e5de64e. The remaining power work
+is guest-facing interfaces:
 
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
-| Guest power interfaces | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | Map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED`. The host's run-while-busy policy is implemented above. | Medium |
+| Guest wake locks and battery information | Explicit wake locks through `/sys/power/wake_lock` | Let guest programs request wake locks through `/sys/power/wake_lock`; expose Android battery information under `/sys/class/power_supply` using `ACTION_BATTERY_CHANGED` | Medium |
 
 ## Not worth taking
 
