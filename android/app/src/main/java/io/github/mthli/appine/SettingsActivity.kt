@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.app.Dialog
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.DialogInterface
@@ -12,6 +13,8 @@ import android.view.View
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
+import androidx.browser.customtabs.CustomTabsIntent
+import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
@@ -132,18 +135,24 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
         cursorBlink = toggle(R.string.settings_cursor_blink, TerminalService::setCursorBlink)
         volumeKeys = toggle(R.string.settings_volume_keys, TerminalService::setVolumeKeysSwitchTabs)
-        // AGPL sections 0 and 5's "Appropriate Legal Notices": copyright, no warranty, the license,
-        // and where to read the full text.
+        // The license page includes the full text, copyright and warranty disclaimer.
         licenses = action(R.string.settings_licenses) {
             startActivity(Intent(requireContext(), LicensesActivity::class.java))
         }
         licenses.setSummary(R.string.licenses_summary)
+        val project = action(R.string.settings_project) {
+            try {
+                CustomTabsIntent.Builder().build().launchUrl(requireContext(), PROJECT_URL.toUri())
+            } catch (e: ActivityNotFoundException) {
+                Toast.makeText(requireContext(), R.string.link_no_app, Toast.LENGTH_SHORT).show()
+            }
+        }.apply { summary = PROJECT_URL }
 
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, runPolicy, systemDocuments)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         group(R.string.settings_group_debug, tier)
-        group(R.string.settings_group_about, licenses)
+        group(R.string.settings_group_about, project, licenses)
         render()
     }
 
@@ -450,6 +459,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
 
     companion object {
+        private const val PROJECT_URL = "https://github.com/mthli/appine"
         private const val CHOICE_DIALOG = "settings.choice"
 
         /** The cursor shapes offered, in order, and their names. */

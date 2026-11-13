@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings shares only the page frame with licenses and uses a MaterialSwitch widget for standard AndroidX preferences)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: English and Chinese About labels separate the project website and shorten the license summary to its name)
 
 ## Responsibilities
 
@@ -316,6 +316,8 @@ notices task and the build (`android/native`).
 
 ### Licenses
 
+- Settings' About group has a separate localized Project website action (android/setup); the
+  license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
 - The build writes `notices/` (Appine's licence; Fuchsia's for the line discipline; Ghostty's
   libghostty-vt, uucode, simdutf, Highway, Wuffs, translate-c, Zig's compiler_rt and JetBrains
   Mono; Alpine

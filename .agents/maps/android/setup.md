@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: new Alpine imports stage procps-ng and its libraries for offline first-login installation)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: About has a separate project website action using Custom Tabs and a shorter license summary)
 
 ## Responsibilities
 
@@ -59,7 +59,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (running policy, system documents), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
-  mode, in all builds) and About (licenses).
+  mode, in all builds) and About (project website, licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -319,8 +319,13 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
     (android/terminal).
+- About's project website shows `https://github.com/mthli/appine` as its summary and opens it
+  with AndroidX `CustomTabsIntent`, without pinning a browser package. A browser without Custom
+  Tabs can handle the same VIEW intent; no handler produces the shared `link_no_app` toast.
+  The licenses summary names GNU AGPL 3.0 or later; the full copyright, warranty disclaimer and
+  license text remain in the Appine notice on the license page.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  licenses remains usable. All preferences have stable resource-name keys and persistence
+  project website and licenses remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
   writing a second preference store. AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
@@ -351,7 +356,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
   proxy); `BuildConfig` (Alpine branch); the assets; `TerminalService` and its
-  `Listener` (Settings); `LicensesActivity`; Material Components and AndroidX (Settings).
+  `Listener` (Settings); `LicensesActivity`; Material Components and AndroidX (Settings),
+  including AndroidX Browser for the project website.
 
 ## Invariants and gotchas
 
@@ -417,6 +423,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ## To verify
 
+- About's project link and return to Settings on a device, including Custom Tabs, a browser
+  without Custom Tabs and no URL handler; this change was checked by build and lint only.
 - That Alpine's doas reads `/etc/doas.d/*.conf` in lexical order (the NOPASSWD file relies on coming
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
   temporary rules files rely on it).

@@ -102,7 +102,8 @@
     <string name="allow_sleep">Allow sleep</string>
     <string name="run_notification">%1$s · %2$s</string>
     <string name="settings_licenses">Open source licenses</string>
-    <string name="licenses_summary">Appine is free software under the GNU AGPL 3.0 or later, and comes with no warranty. Copyright © 2026 Matthew Lee. Source code: github.com/mthli/appine</string>
+    <string name="licenses_summary">GNU AGPL 3.0 or later</string>
+    <string name="settings_project">Project website</string>
     <string name="settings_login">Login account</string>
     <string name="login_auto_choice">Automatic (prefer a regular user)</string>
     <string name="login_auto">Automatic (%1$s)</string>

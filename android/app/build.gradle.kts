@@ -121,6 +121,7 @@ kotlin {
 }
 
 dependencies {
+    implementation(libs.androidx.browser)
     implementation(libs.androidx.core)
     implementation(libs.androidx.preference)
     implementation(libs.material)
