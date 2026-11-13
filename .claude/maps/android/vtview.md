@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-12 (targeted verification only since the split; latest change: the profile sends `cl=line` from zsh too)
+> Maintained: 2026-11-13 (targeted verification only since the split; latest change: taps on the input cross the rows busybox ash breaks a long command into)
 
 ## Responsibilities
 
@@ -463,7 +463,9 @@ select a command's output and move the cursor by taps:
   cursor at the prompt and the tapped row not above the prompt's
   first one (found going up from the cursor, at most 64 rows) moves the cursor there: with `cl`,
   left or right arrows (in the cursor key mode's form), one for each input cell between the cursor
-  and the tapped cell over the soft-wrapped rows of the cursor's line (rows after it must continue
+  and the tapped cell over the soft-wrapped rows of the cursor's line and, for a shell whose line feeds are
+  read (busybox ash, android/vt), the rows it broke the line into itself: continuation rows that
+  do not start with a secondary prompt (rows after it must continue
   the prompt), a tap on the prompt going to the input's start and one past it or below to its end
   (one more arrow when the cursor is on input); unlike Ghostty, which counts both halves, a wide
   character takes one arrow and its second half stands for it; with `click_events`, a left button
@@ -627,7 +629,8 @@ select a command's output and move the cursor by taps:
     mice and touchpads (their swipe and pinch classification), DeX, ChromeOS and desktop
     windowing; sideways scrolling and wheel events to a mouse-tracking program on a device; the
     autoscroll of a drag held past the grid's edges; taps on the input with fish, or ash with wide
-    characters;
+    characters or a command of several rows (tried only through vt.c's harness, the latter with
+    bytes recorded from ash 1.37);
   - drawing: Kitty graphics with yazi, timg, `kitten icat`, tmux passthrough and the 32 MiB storage
     filled; the bell with haptics off; the cursor setting in Chinese or while a full-screen program
     shows; the lock cursor with other IMEs composing at it; the search's marks while rows leave a

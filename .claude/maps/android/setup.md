@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: the profile's zsh branch and its prompt marks, and the sha256 of the profile it replaces)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: ash's prompt marks moved to `ashrc.sh`, which the profile names in `ENV` (a `~/.profile` prompt and nested ash are marked), with B and `appine_lf=output` in place of I)
 
 ## Responsibilities
 
@@ -14,8 +14,8 @@
 - the distributions (Alpine from the APK, Debian downloaded), downloading and verifying tarballs,
   importing them into a new store, and writing first-boot configuration;
 - files refreshed before every kernel start (network interfaces, rootless podman's network, the
-  bundled doas package, the profile script with its prompt marks for the terminal's shell
-  integration), the osclock script run before boot and the boot log's failed services;
+  bundled doas package, the profile script and ash's `ENV` file with their prompt marks for the
+  terminal's shell integration), the osclock script run before boot and the boot log's failed services;
 - package mirrors: built-in lists, one speed probe after an import, writing the fastest into
   sources nobody has changed;
 - resolving the login account and the per-tab login script (`login.sh`), including the first-login
@@ -25,7 +25,7 @@
 
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
-`scripts/fetch-rootfs`.
+`android/app/src/main/assets/ashrc.sh`, `scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
@@ -63,6 +63,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   `/etc/profile.d/appine.sh`; `Rootfs` keeps the texts of the versions without prompt marks
   (`OLD_PROFILE`, `UNMARKED_PROFILE`) and the sha256s of the later ones (`REPLACED_PROFILES`) to
   recognise them.
+- `ashrc.sh` — copied verbatim into the guest as `/etc/profile.d/appine.ashrc` (not `.sh`, so
+  `/etc/profile` does not read it): ash's prompt marks, read through `ENV`. `Rootfs.writeProfile`
+  writes it and then the profile.
 - Guest-side state: `/var/lib/appine/admins` (recorded admins), `/var/lib/appine/doas-installed`
   and `sudo-installed` (markers), `/etc/doas.d/20-wheel.conf`, the NOPASSWD rules
   (`/etc/doas.d/30-appine.conf` or `/etc/sudoers.d/appine`), `/var/cache/appine/doas.apk`.
@@ -127,9 +130,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   existing entry that is not a regular file fails the import):
   - always: package sources from the first mirror (apk `main` and `community`; Debian deb822 over
     http for trixie, -updates, -security), `hostname` (`localhost`), `motd`, and
-    `/etc/profile.d/appine.sh` (the assets' `profile.sh`: motd, `TERM`, `LANG`,
-    `NMAP_UNPRIVILEGED`, and for bash, busybox ash and zsh only a coloured prompt with prompt
-    marks, below; other shells keep the distro's prompt);
+    `/etc/profile.d/appine.ashrc` and then `/etc/profile.d/appine.sh` (the assets' `ashrc.sh`
+    and `profile.sh`: motd, `TERM`, `LANG`, `NMAP_UNPRIVILEGED`, `ENV` naming the first file
+    unless one is set or the file is unreadable, and for bash, busybox ash and zsh only a coloured
+    prompt with prompt marks, below; other shells keep the distro's prompt);
   - Alpine: `hosts` only when absent (the minirootfs ships one, so nothing is written), and no
     `resolv.conf` (the kernel writes one pointing at the DNS stub at every start when it is
     missing);
@@ -144,8 +148,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   reads that directory, and a user's own `containers.conf` overrides it); on Alpine the bundled
   `doas.apk` into `/var/cache/appine/`, rewritten at every start; a profile left exactly as an
   earlier version wrote it (with `cd "$HOME"`, without prompt marks, or with marks that do not
-  declare `cl=line`) replaced by the current one, an edited one kept and a missing one not
-  recreated. The first two apply to every distro. A failed write in any of them fails the start.
+  declare `cl=line`, or with ash's marks in itself) replaced by the current one, with
+  `appine.ashrc` written before it; an edited one is kept and a missing one not recreated, and
+  then `appine.ashrc` is not written either. The first two apply to every distro. A failed write in any of them fails the start.
 - Storage is left to the packages: podman's overlay driver and docker's (containerd's) overlayfs
   snapshotter run on the kernel's overlayfs, rootful and rootless. A `storage.conf` choosing vfs or
   a `daemon.json` choosing native that an earlier build wrote stays until the user removes it.
@@ -166,9 +171,16 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     and appends the output's start (C) to PS0, each again whenever it is missing, so a PS1 that
     `~/.bashrc` or anything later sets is wrapped from the next prompt on; a later plain assignment
     to `PROMPT_COMMAND` drops the function and with it every mark;
-  - busybox ash, which has no hook before a command or a prompt: PS1 itself carries D with `$?`
-    (expanded at each prompt and redraw), A with `cl=line`, and after the prompt I (the input ends
-    with its line); PS2 is P with `k=s` and I. A PS1 set after the profile goes without them.
+  - busybox ash, which has no hook before a command or a prompt (1.37 has no `PROMPT_COMMAND`):
+    PS1 itself carries D with `$?` (expanded at each prompt and redraw), A with `cl=line`, and
+    after the prompt B (the input starts); PS2 is P with `k=s` and B. ash marks no output start
+    and breaks a command longer than the screen's width into rows itself, so A and P also carry
+    `appine_lf=output`, the app's own option, asking the terminal to read ash's line feeds
+    (android/vt): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
+    wraps whatever PS1 and PS2 are when they have no marks, and only in busybox ash: the profile
+    sources it after setting its coloured PS1, and every interactive ash reads it again through
+    `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
+    marked; one set later (typed, or by a file the user's own `ENV` names) goes without.
   - zsh: `__appine_precmd`, appended to `precmd_functions`, prints D with the status before each
     prompt, wraps PS1 (A with `cl=line` … B) and PS2 (P with `k=s` … B) in `%{ %}` whenever the
     marks are missing, and moves itself last in `precmd_functions`, so a PS1 that `~/.zshrc` or a
@@ -180,7 +192,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Every login shell of a tab reads it (root's shell `-l`, and `su <account> -c … exec "$SHELL" -l`
   for others) when the shell reads `/etc/profile`: zsh does only where its `/etc/zsh/zprofile`
   sources it (Alpine's does, in sh emulation; Debian trixie's does not, so zsh there has no marks
-  unless the user's `~/.zprofile` sources `/etc/profile.d/appine.sh`). Nested non-login shells and
+  unless the user's `~/.zprofile` sources `/etc/profile.d/appine.sh`). `ENV` is exported from every
+  shell that reads the profile, so a nested interactive ash that inherits it (`ash`, `su` without
+  `-l`, also under bash or zsh) marks its own prompt, the distro's; one started through `doas -s`,
+  which resets the environment, does not. Other nested non-login shells and
   other shells get no marks from it (fish and nushell send their own, android/vt), and shells that
   do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
   environment (android/vt), but show no motd.
@@ -306,7 +321,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - `updateProfile` replaces only the versions it knows, compared whole (`OLD_PROFILE` and
   `UNMARKED_PROFILE` by text, later ones by sha256 in `REPLACED_PROFILES`): changing `profile.sh`
   must add the sha256 of the text it replaces (the committed asset, byte for byte), or stores keep
-  the version they have; and the motd is written only at import, so it is never updated.
+  the version they have; `ashrc.sh` is written only with the profile, so a change to it alone
+  reaches no existing store (change `profile.sh` with it); and the motd is written only at import, so it is never updated.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
   rows on a resize; android/vt): bash, busybox ash and zsh do.
 - The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
@@ -338,7 +354,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   after `20-wheel.conf`), and that doas reads only `*.conf` and sudo skips names with a dot (the
   temporary rules files rely on it).
 - The profile's bash marks in the app on Debian (tried only in a Docker container with Ubuntu
-  26.04's bash 5.3; busybox ash's in the app and an instrumentation test), and with a
+  26.04's bash 5.3; busybox ash's in an instrumentation test, a `~/.profile` prompt and a nested
+  ash included), and with a
   `PROMPT_COMMAND` array or a prompt tool that rewrites PS1 after it each time.
 - The profile's zsh marks in the app (tried only in a Docker container with Alpine's zsh 5.9 under
   a pty: the marks, a theme-like hook setting PS1, redraws on resizes), and with a right prompt

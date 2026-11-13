@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-13 (targeted verification only since the split; latest change: zsh's prompt marks from the profile and the marks fish and nushell send themselves, in Shell integration, the partial-integration debt and the open question)
+> Maintained: 2026-11-13 (targeted verification only since the split; latest change: ash's line feeds are read on `appine_lf=output` (rows ash breaks stay input, an output start is fed at the input's end), and nested ash and a `~/.profile` prompt are marked)
 
 ## Responsibilities
 
@@ -312,19 +312,32 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 
 - The guest's login shells mark their prompts with OSC 133 (android/setup's profile: bash marks the
   prompt, the typed command and the output's start, and so does zsh where it reads the profile;
-  busybox ash the prompt, and the command ending with its line; fish 4 and nushell send their own,
+  busybox ash the prompt and the typed command, asking with `appine_lf=output` for its line feeds
+  to be read, below; fish 4 and nushell send their own,
   all four marks, fish's prompt start with `click_events=1` and nushell's with no way for taps to
   move the cursor). libghostty-vt keeps the marks in the rows and cells it writes (prompt, input,
   output) and the cursor's place among them, which closing, jumping, Select output and taps on the
   input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click selects a
   command's output through libghostty-vt's selection gesture, and a right-click looks for one for
   the menu's Select output. A shell without the marks (zsh on Debian, dash, mksh, tcsh, elvish, a
-  nested non-login shell, a remote one over ssh that sends none) leaves every cell output: it is
+  nested non-login shell other than busybox ash, a remote one over ssh that sends none) leaves every cell output: it is
   never at a prompt, there is nothing to jump to and no output to select, and no command is timed.
+- A prompt start or prompt mark (OSC 133;A or P, on the primary screen) with `appine_lf=output`
+  has `appine_vt_feed` read the shell's line feeds from there on, outside OSC and DCS strings,
+  until one ends the input: a line feed after two carriage returns is ash breaking a long command
+  (it writes CR LF, and the console's ONLCR adds a CR; counted across feeds), so the input goes on
+  and libghostty-vt marks the next row as the prompt's continuation; any other line feed with the
+  cursor at the prompt (the typed command's end, but also the start of a completion list, Ctrl-C's
+  echo, or a background job's output) gets an output start (OSC 133;C) fed after it, which also
+  takes the continuation mark off the new row. A primary prompt without the option, a program's
+  full reset and the app's Reset terminal end the reading. So a command of several rows is all
+  input: the cursor stays at the prompt while it is typed, and its rows are not selected as output.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
   starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
   none, when a feed ends with the cursor no longer at the prompt where the one before left it there
-  (the line feed that ends the typed input, but also output of a background job at the prompt); it
+  (the line feed that ends the typed input, but also output of a background job at the prompt; the
+  output start vt.c feeds for ash starts no timing itself, as a completion list or Ctrl-C at the
+  prompt also gets one); it
   finishes at the command end (`D` with the exit code) the next prompt sends, and a primary prompt's
   start without one forgets it. A command end with nothing timed (a prompt drawn again after a
   resize, Ctrl-C at the prompt) reports nothing. The pump hands the last finished command of a read
@@ -490,7 +503,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   callback, so vt.c forgets that itself there (Clearing and resetting).
 - Command timing's at-prompt state (`was_at_prompt`) changes only in `appine_vt_feed`, which the
   app's own printed text also goes through; clearing, resetting, messages and resizes leave it.
-  For busybox ash, which marks no output start, output of a background job while the shell waits
+  For busybox ash, which marks no output start (and for an edited profile's older ash marks,
+  whose input ends with its line), output of a background job while the shell waits
   at its prompt starts the timing, so the next command's time is counted from then; bash's output
   mark replaces such a start. libghostty-vt is built ReleaseFast, so its log emits info and
   above, of which `on_log` passes warnings and errors; the log is installed when the first
@@ -537,13 +551,13 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 ## Confirmed bugs / technical debt
 
 - **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
-  (not for nested non-login shells, or zsh on Debian, whose zprofile does not read `/etc/profile`;
+  (not for nested non-login shells other than ash, or zsh on Debian, whose zprofile does not read `/etc/profile`;
   fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
-  of several lines are not continuation rows; ash's mark the typed command as ending with its line,
-  so the rows of a command longer than the screen's width after the first count as output (ash
-  breaks such lines itself), and with the cursor on one of them a tap moves nothing, ash marks no
-  output start, so a background job's output at its prompt starts the next command's timing early,
-  and a PS1 set after the profile (ash's `~/.profile`) has none; and the progress and status records
+  of several lines are not continuation rows; ash marks no
+  output start, so a background job's output at its prompt starts the next command's timing early
+  (and, the line feeds being read, ends the input there: what is typed after it counts as output
+  until the next prompt),
+  and an ash PS1 set after its `ENV` file was read has none; and the progress and status records
   still go by the foreground process group rather than the next prompt, though the OSC 133 callback
   is now set (for command timing only).
 - **libghostty-vt features not wired**: ENQ, the title report (CSI 21 t),

@@ -11,7 +11,7 @@ import io.github.mthli.appine.Rootfs.RESUMES
 import io.github.mthli.appine.Rootfs.UNMARKED_PROFILE
 import io.github.mthli.appine.Rootfs.configure
 import io.github.mthli.appine.Rootfs.fetch
-import io.github.mthli.appine.Rootfs.profile
+import io.github.mthli.appine.Rootfs.writeProfile
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -209,7 +209,7 @@ internal object Rootfs {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
-        write(store, "/etc/profile.d/appine.sh", profile(context))
+        writeProfile(context, store)
         val install = when (distro) {
             Distro.ALPINE -> "apk add git python3"
             Distro.DEBIAN -> "apt update && apt install git python3"
@@ -251,12 +251,21 @@ internal object Rootfs {
      * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
      * language environment variables, and gives bash, busybox ash and zsh a coloured prompt with
      * shell integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
-     * android/vt map). Which directory the shell starts in is decided by the assets'
+     * android/vt map). ash's marks are in `/etc/profile.d/appine.ashrc`, the assets' `ashrc.sh`,
+     * which the profile names in `ENV`, so that every interactive ash reads it (a login shell after
+     * `~/.profile`); it is written first, as the profile uses it only when it is there, and its
+     * name does not end in `.sh`, so `/etc/profile` does not read it. Which directory the shell starts in is decided by the assets'
      * `login.sh` (restored tabs start in their original directory, the android/service map, new
      * tabs in the current tab's, the android/terminal map).
      */
-    private fun profile(context: Context): String =
-        context.assets.open("profile.sh").bufferedReader().readText()
+    @Throws(IOException::class)
+    private fun writeProfile(context: Context, store: String) {
+        write(store, "/etc/profile.d/appine.ashrc", asset(context, "ashrc.sh"))
+        write(store, "/etc/profile.d/appine.sh", asset(context, "profile.sh"))
+    }
+
+    private fun asset(context: Context, name: String): String =
+        context.assets.open(name).bufferedReader().readText()
 
     private fun write(store: String, path: String, text: String, overwrite: Boolean = true) =
         write(store, path, text.toByteArray(), overwrite)
@@ -446,18 +455,21 @@ netns = "host"
     /**
      * The sha256s of the assets' `profile.sh` as later versions replaced it, whose texts (shell
      * code full of `$`) are not kept here: the first with prompt marks, until taps on the prompt
-     * moved the cursor, and the one that marked them for bash and busybox ash only, until zsh got
-     * its marks. A change to `profile.sh` adds the sha256 of the text it replaces
+     * moved the cursor, the one that marked them for bash and busybox ash only, until zsh got
+     * its marks, and the one with ash's marks in itself, until `ashrc.sh` took them. A change to
+     * `profile.sh` adds the sha256 of the text it replaces
      * (`git show HEAD:android/app/src/main/assets/profile.sh | shasum -a 256` before committing).
      */
     private val REPLACED_PROFILES = setOf(
         "4a35d44e55e23aaf94543d87dc02deafcc7b324902e90ae18872fe20242642fc",
         "d4daedd69558e1efe41b143f71b74b67708388299584706a9bf55052a7fc3f21",
+        "b6dbef9f24826d036570704f8ed15439375032f0f72163e3c6cd219ef5e83336",
     )
 
     /**
      * Replaces the profile the app wrote into a previously imported store with the current one
-     * ([profile]), if it is an earlier version left unchanged.
+     * ([writeProfile], with the file of ash's marks), if it is an earlier version left unchanged. A
+     * change to `ashrc.sh` alone reaches no existing store: change `profile.sh` with it.
      */
     @Throws(IOException::class)
     fun updateProfile(context: Context) {
@@ -466,7 +478,7 @@ netns = "host"
         val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
             hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
-        if (earlier) write(store, path, profile(context))
+        if (earlier) writeProfile(context, store)
     }
 
     /**

@@ -6,13 +6,18 @@
 # command typed at it and the command's output are. With them a tab waiting at its prompt closes
 # without asking, Ctrl+Shift+Up and Down scroll to the previous and the next prompt, a long press
 # in a command's output offers to select all of it, and a tap on the command being typed moves the
-# cursor there (cl=line: the terminal sends left and right arrows). A prompt set later (~/.profile
-# for ash) goes without the marks; bash and zsh put them back around whatever PS1 is before each
-# prompt.
+# cursor there (cl=line: the terminal sends left and right arrows). bash and zsh put the marks back
+# around whatever PS1 is before each prompt; ash gets them from /etc/profile.d/appine.ashrc, which
+# ENV names so that ash reads it again after ~/.profile and in nested shells.
 cat /etc/motd 2>/dev/null
 export TERM=xterm-256color
 export LANG=C.UTF-8
 export NMAP_UNPRIVILEGED=1
+# Interactive ash (and dash, which the file ignores) reads the file ENV names; one already set is
+# the user's
+if [ -z "${ENV-}" ] && [ -r /etc/profile.d/appine.ashrc ]; then
+    export ENV=/etc/profile.d/appine.ashrc
+fi
 if [ -n "${BASH_VERSION-}" ]; then
     PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
     # Before each prompt: the end of the last command with its status (D), then the prompt's start
@@ -32,12 +37,10 @@ if [ -n "${BASH_VERSION-}" ]; then
     *) PROMPT_COMMAND="__appine_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
     esac
 elif [ -n "${BB_ASH_VERSION-}" ]; then
-    # ash runs nothing before a command, so the prompt itself reports the last command's status
-    # (D) and starts on a fresh line (A, its cursor moved with the arrows), and the typed command
-    # ends with its line (I); a command longer than the screen's width is therefore partly taken
-    # for output, as ash breaks its lines
-    PS1='\[\e]133;D;$?\a\e]133;A;cl=line\a\]\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ \[\e]133;I\a\]'
-    PS2='\[\e]133;P;k=s\a\]> \[\e]133;I\a\]'
+    # ash runs nothing before a command or a prompt, so its marks are in PS1 and PS2 themselves:
+    # appine.ashrc puts them there, now and again when ash reads ENV
+    PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+    if [ -r /etc/profile.d/appine.ashrc ]; then . /etc/profile.d/appine.ashrc; fi
 elif [ -n "${ZSH_VERSION-}" ]; then
     # zsh reads this file where its /etc/zsh/zprofile sources /etc/profile (Alpine's does, in sh
     # emulation; Debian's does not). The other shells parse this branch too, so what only zsh

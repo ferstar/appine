@@ -198,6 +198,15 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 #define PROMPT_CLICK_ABSOLUTE 2
 #define PROMPT_CLICK_RELATIVE 3
 
+// The option by which a prompt (OSC 133;A or P) says that its shell marks no output start and
+// breaks the lines of a long command itself, as busybox ash does (appine_vt_feed's line feeds):
+// the profile's ash prompts carry it (android/setup's ashrc.sh)
+#define PROMPT_LF_OPTION "appine_lf"
+#define PROMPT_LF_OUTPUT "output"
+
+// The output start (OSC 133;C) appine_vt_feed marks for such a shell
+#define OUTPUT_START "\x1b]133;C\x1b\\"
+
 // Rows above the cursor searched for the first row of the prompt it is at (appine_vt_prompt_click)
 #define PROMPT_ROWS 64
 
@@ -436,6 +445,15 @@ typedef struct AppineVt {
   // How a tap on the shell's input moves its cursor (PROMPT_CLICK_*), as the primary screen's last
   // prompt start declared it (osc_ended); a full reset forgets it, as libghostty-vt's screen does
   uint8_t prompt_click;
+  // The shell's last prompt asked for its line feeds to be read (PROMPT_LF_OPTION): lf_output
+  // while that shell's prompts are the last seen (rows it broke itself are one line to taps),
+  // lf_armed from such a prompt until the line feed that ends its input, lf_marking while the
+  // output start fed there is processed, and lf_returns, the carriage returns that ended the last
+  // feed (at most 2)
+  bool lf_output;
+  bool lf_armed;
+  bool lf_marking;
+  uint8_t lf_returns;
   // The fixed end of a selection being dragged by a handle (appine_vt_select_to): the end opposite
   // the handle, or a whole output selected; tracked, so output does not move it
   GhosttyTrackedGridRef anchor_start;
@@ -654,8 +672,9 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
 }
 
 // OSC 133: a command starts when the shell marks its output's start (bash's PS0, zsh's preexec)
-// or, as busybox ash marks none (its input ends at the line feed), when the cursor leaves the
-// prompt (appine_vt_feed), which output of a background job at the prompt does too; it finishes at
+// or, as busybox ash marks none (its input ends at a line feed, where appine_vt_feed marks the
+// output's start for it), when a feed ends with the cursor no longer at the prompt
+// (appine_vt_feed), which output of a background job at the prompt does too; it finishes at
 // the command end the next prompt reports, with the exit code (every marked shell sends it). Only
 // a command that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the
 // prompt) reports a command end too, with none running
@@ -665,8 +684,10 @@ static void on_semantic_prompt(GhosttyTerminal t, void *userdata,
   AppineVt *vt = userdata;
   switch (e->kind) {
     case GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START:
-      // The mark is the command's start, whatever left the prompt before it
-      vt->command_start = now_ns();
+      // The mark is the command's start, whatever left the prompt before it; one appine_vt_feed
+      // made at a line feed is not the shell's word that a command runs (the line feed may begin
+      // a list of completions or follow Ctrl-C), so the cursor leaving the prompt decides there
+      if (!vt->lf_marking) vt->command_start = now_ns();
       break;
     case GHOSTTY_SEMANTIC_PROMPT_COMMAND_END:
       if (vt->command_start == 0) break;
@@ -702,6 +723,8 @@ static void on_reset(GhosttyTerminal t, void *userdata) {
   (void)t;
   AppineVt *vt = userdata;
   vt->prompt_click = PROMPT_CLICK_NONE;
+  vt->lf_output = false;
+  vt->lf_armed = false;
 }
 
 // ---- PNG images (Kitty graphics) ----
@@ -1106,13 +1129,45 @@ static void tmux_started(AppineVt *vt);
 // once and so without asking the user, as Ghostty's clipboard-read = ask does: they are counted
 // for the app (appine_vt_take_effects), which asks and answers itself, as Ghostty's own app does.
 // It also stops at the starts and ends of DCS strings to find tmux's control mode (TMUX_CONTROL).
+//
+// For a shell whose prompt asked for it (PROMPT_LF_OPTION: busybox ash, which runs nothing before
+// a command and so marks no output start, and breaks a command longer than the screen's width
+// into rows itself), it stops at each line feed from that prompt on, outside OSC and DCS strings:
+// one that follows two carriage returns is ash breaking the line (it writes CR LF, and the
+// console's ONLCR adds a CR), so the input goes on in the next row, which libghostty-vt marks as
+// the prompt's continuation; any other at the prompt ends the input, and the output's start
+// (OSC 133;C) is fed after it, where it also takes that mark off the new row.
 void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
   uint32_t want = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END |
                   GHOSTTY_TERMINAL_BOUNDARY_DCS_START | GHOSTTY_TERMINAL_BOUNDARY_DCS_END;
   size_t off = 0;
   while (off < len) {
+    size_t take = len - off;
+    if (vt->lf_armed && !vt->osc_open && !vt->dcs_open) {
+      const uint8_t *lf = memchr(data + off, '\n', take);
+      if (lf == data + off) {
+        size_t returns = 0;
+        size_t i = off;
+        for (; i > 0 && data[i - 1] == '\r'; i--) returns++;
+        if (i == 0) returns += vt->lf_returns;
+        bool ends = returns < 2;
+        bool input = ends && appine_vt_at_prompt(vt);
+        ghostty_terminal_vt_write(vt->term, data + off, 1);
+        if (input) {
+          vt->lf_marking = true;
+          ghostty_terminal_vt_write(vt->term, (const uint8_t *)OUTPUT_START,
+                                    sizeof(OUTPUT_START) - 1);
+          vt->lf_marking = false;
+        }
+        // Away from the prompt there is no input to end: the next prompt asks again
+        if (ends) vt->lf_armed = false;
+        off++;
+        continue;
+      }
+      if (lf != NULL) take = (size_t)(lf - (data + off));
+    }
     GhosttyTerminalWriteStop stop = GHOSTTY_INIT_SIZED(GhosttyTerminalWriteStop);
-    GhosttyResult r = ghostty_terminal_vt_write_until(vt->term, data + off, len - off, want, &stop);
+    GhosttyResult r = ghostty_terminal_vt_write_until(vt->term, data + off, take, want, &stop);
     if (r != GHOSTTY_SUCCESS && r != GHOSTTY_NO_VALUE) {
       ghostty_terminal_vt_write(vt->term, data + off, len - off);
       vt->osc_open = false;
@@ -1123,7 +1178,7 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
     uint32_t reached = r == GHOSTTY_SUCCESS ? stop.reached : 0;
     bool ended = reached & GHOSTTY_TERMINAL_BOUNDARY_OSC_END;
     bool dcs_ended = reached & GHOSTTY_TERMINAL_BOUNDARY_DCS_END;
-    size_t n = r == GHOSTTY_SUCCESS ? stop.consumed : len - off;
+    size_t n = r == GHOSTTY_SUCCESS ? stop.consumed : take;
     if (vt->osc_open) {
       // The string's content: what was consumed but the byte that ended it
       size_t content = ended ? n - 1 : n;
@@ -1173,6 +1228,10 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
       vt->dcs_len = 0;
     }
   }
+  size_t returns = 0;
+  while (returns < len && returns < 2 && data[len - 1 - returns] == '\r') returns++;
+  if (returns == len && returns + vt->lf_returns >= 2) returns = 2;
+  vt->lf_returns = (uint8_t)returns;
   // A command's start for a shell that does not mark it (on_semantic_prompt): the input ended
   bool at_prompt = appine_vt_at_prompt(vt);
   if (vt->was_at_prompt && !at_prompt && vt->command_start == 0) vt->command_start = now_ns();
@@ -1191,17 +1250,22 @@ static void tmux_started(AppineVt *vt) {
 }
 
 static void prompt_started(AppineVt *vt, const uint8_t *options, size_t len);
+static void prompt_line_feeds(AppineVt *vt, const uint8_t *options, size_t len, bool primary);
 
 // An OSC string ended: a prompt's start (OSC 133;A) on the primary screen tells how a tap moves
-// the shell's cursor; a clipboard read (OSC 52 ; clipboards ; ?) is counted, with the clipboard it
+// the shell's cursor, and it or a prompt (OSC 133;P) whether the shell's line feeds are read
+// (PROMPT_LF_OPTION); a clipboard read (OSC 52 ; clipboards ; ?) is counted, with the clipboard it
 // names first ('c' for the standard one, also when it names none; 'p' primary, 's' selection), which
 // the answer names as Ghostty's does
 static void osc_ended(AppineVt *vt) {
   const uint8_t *s = vt->osc_head;
   size_t n = vt->osc_len;
   if (n > OSC_HEAD) return;
-  if (n >= 5 && memcmp(s, "133;A", 5) == 0 && (n == 5 || s[5] == ';')) {
-    if (!is_alternate(vt)) prompt_started(vt, s + 5, n - 5);
+  if (n >= 5 && (memcmp(s, "133;A", 5) == 0 || memcmp(s, "133;P", 5) == 0) &&
+      (n == 5 || s[5] == ';')) {
+    if (is_alternate(vt)) return;
+    prompt_line_feeds(vt, s + 5, n - 5, s[4] == 'A');
+    if (s[4] == 'A') prompt_started(vt, s + 5, n - 5);
     return;
   }
   if (n < 5 || memcmp(s, "52;", 3) != 0) return;
@@ -1248,6 +1312,18 @@ static void prompt_started(AppineVt *vt, const uint8_t *options, size_t len) {
                     (n == 1 && (v[0] == 'm' || v[0] == 'v' || v[0] == 'w')))) {
     vt->prompt_click = PROMPT_CLICK_ARROWS;
   }
+}
+
+// A prompt started (OSC 133;A, primary) or one was marked (OSC 133;P, as ash's secondary prompt
+// is): with PROMPT_LF_OPTION its line feeds are read from here on (appine_vt_feed); a prompt start
+// without it is another shell's, whose line feeds are not
+static void prompt_line_feeds(AppineVt *vt, const uint8_t *options, size_t len, bool primary) {
+  size_t n = 0;
+  const uint8_t *v = prompt_option(options, len, PROMPT_LF_OPTION, &n);
+  bool asked = v != NULL && n == sizeof(PROMPT_LF_OUTPUT) - 1 && memcmp(v, PROMPT_LF_OUTPUT, n) == 0;
+  if (!asked && !primary) return;
+  vt->lf_output = asked;
+  vt->lf_armed = asked;
 }
 
 // The answers collected since the last call; valid until the next feed
@@ -2783,6 +2859,22 @@ static bool input_stop(AppineVt *vt, uint16_t x, uint32_t y) {
          (wide == GHOSTTY_CELL_WIDE_NARROW || wide == GHOSTTY_CELL_WIDE_WIDE);
 }
 
+// Whether screen row y goes on the line of the row above it, which the shell broke there itself
+// (lf_output: busybox ash, appine_vt_feed): a continuation row of the prompt that is no soft wrap
+// and does not start with a secondary prompt
+static bool shell_broken(AppineVt *vt, uint32_t y) {
+  GhosttyRowSemanticPrompt prompt;
+  bool continues, wraps;
+  GhosttyGridRef ref;
+  GhosttyCell cell;
+  GhosttyCellSemanticContent content = GHOSTTY_CELL_SEMANTIC_OUTPUT;
+  return vt->lf_output && prompt_row(vt, y, &prompt, &continues, &wraps) &&
+         prompt == GHOSTTY_ROW_SEMANTIC_PROMPT_CONTINUATION && !continues &&
+         screen_ref(vt, 0, y, &ref) && ghostty_grid_ref_cell(&ref, &cell) == GHOSTTY_SUCCESS &&
+         ghostty_cell_get(cell, GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, &content) == GHOSTTY_SUCCESS &&
+         content != GHOSTTY_CELL_SEMANTIC_PROMPT;
+}
+
 // The first row of the prompt the cursor's row is in, found as libghostty-vt finds prompts going
 // up: the nearest prompt row at or above it, or the first of the continuation rows that lead up to
 // it when no prompt row begins them (it left the scrollback). False when there is none within
@@ -2809,8 +2901,8 @@ static bool prompt_top(AppineVt *vt, uint32_t from, uint32_t *top) {
 }
 
 // Right arrows from the cursor to a cell after it (Ghostty's promptClickLine): the input after the
-// cursor up to and including that cell, over the rows that soft-wrap on from the cursor's and
-// continue its prompt; a cell past the line's input moves to the end of it (one more arrow when
+// cursor up to and including that cell, over the rows that soft-wrap on from the cursor's (or go on
+// after the shell's own break, shell_broken) and continue its prompt; a cell past the line's input moves to the end of it (one more arrow when
 // the cursor is on input, to the cell after the last).
 static size_t moves_right(AppineVt *vt, GhosttyPointCoordinate cursor,
                           GhosttyPointCoordinate click) {
@@ -2825,7 +2917,7 @@ static size_t moves_right(AppineVt *vt, GhosttyPointCoordinate cursor,
       count++;
       if (y == click.y && x == click.x) return count;
     }
-    if (!wraps) {
+    if (!wraps && !shell_broken(vt, y + 1)) {
       GhosttyCellWide wide;
       if (input_cell(vt, cursor.x, cursor.y, &wide)) count++;
       break;
@@ -2848,7 +2940,8 @@ static size_t moves_left(AppineVt *vt, GhosttyPointCoordinate cursor,
     }
     GhosttyRowSemanticPrompt prompt;
     bool continues, wraps;
-    if (y == click.y || y == 0 || !prompt_row(vt, y, &prompt, &continues, &wraps) || !continues) {
+    if (y == click.y || y == 0 || !prompt_row(vt, y, &prompt, &continues, &wraps) ||
+        !(continues || shell_broken(vt, y))) {
       break;
     }
   }
@@ -3084,6 +3177,8 @@ bool appine_vt_reset(AppineVt *vt) {
   // with the screen's prompt state (on_reset hears only a program's reset)
   vt->held = false;
   vt->prompt_click = PROMPT_CLICK_NONE;
+  vt->lf_output = false;
+  vt->lf_armed = false;
   changed(vt);
   return prompt;
 }

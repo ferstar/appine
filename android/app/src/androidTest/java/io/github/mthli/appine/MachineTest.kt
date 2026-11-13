@@ -316,18 +316,29 @@ class MachineTest {
     /**
      * The profile gives the login shell (busybox ash) its shell integration (the android/vt
      * map): each prompt reports the last command's status (OSC 133 D) and starts the prompt (A,
-     * whose cursor taps move with the arrows), the typed command starts after it and ends with its
-     * line (I), and continuation lines are secondary prompts.
+     * whose cursor taps move with the arrows, and which asks the terminal to read ash's line feeds),
+     * the typed command starts after it (B), and continuation lines are secondary prompts. The marks come from the file ENV
+     * names (the android/setup map).
      */
     @Test
     fun profileMarksPrompts() {
         val machine = start(1)
         val out = login(machine, "false\nfor i in 1; do\ntrue; done\nexit\n", ConsolePty.LOGIN_ROOT)
-        assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;cl=line\u0007"))
-        assertTrue(out, Regex("""\u001b]133;A;cl=line\u0007.*# \u001b]133;I\u0007""").containsMatchIn(out))
-        assertTrue(out, out.contains("\u001b]133;P;k=s\u0007> \u001b]133;I\u0007"))
+        assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;cl=line;appine_lf=output\u0007"))
+        assertTrue(out, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007.*# \u001b]133;B\u0007""").containsMatchIn(out))
+        assertTrue(out, out.contains("\u001b]133;P;k=s;appine_lf=output\u0007> \u001b]133;B\u0007"))
         // The loop's status, after its continuation line
         assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))
+        // A prompt that ~/.profile sets gets the marks when ash reads ENV after it, and so does a
+        // nested ash, which reads no profile
+        try {
+            sh(machine, "echo 'PS1=\"mine> \"' > /root/.profile")
+            val own = login(machine, "ash\nexit\nexit\n", ConsolePty.LOGIN_ROOT)
+            assertTrue(own, own.contains("\u001b]133;A;cl=line;appine_lf=output\u0007mine> \u001b]133;B\u0007"))
+            assertTrue(own, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007[^\u001b]*# \u001b]133;B\u0007""").containsMatchIn(own))
+        } finally {
+            sh(machine, "rm -f /root/.profile")
+        }
     }
 
     /**
