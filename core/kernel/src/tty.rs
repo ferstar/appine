@@ -496,6 +496,12 @@ pub struct Tty {
     echoes: Vec<Echo>,
     /// Output waiting for the master to read it.
     output: VecDeque<u8>,
+    /// How many bytes of output the master has taken so far: where `output` starts in the stream
+    /// of everything written, which `background` counts in
+    taken: u64,
+    /// The parts of `output` written by a process group that was not in the foreground, for the
+    /// host console ([`Tty::take_output_run`])
+    background: VecDeque<std::ops::Range<u64>>,
     /// The cursor column output processing follows (Linux's `ldata->column`), and the column the
     /// canonical line being edited started at (`canon_column`): erasing a tab moves back by what
     /// it took.
@@ -584,6 +590,8 @@ impl Tty {
             raw: VecDeque::new(),
             echoes: Vec::new(),
             output: VecDeque::new(),
+            taken: 0,
+            background: VecDeque::new(),
             column: 0,
             canon_column: 0,
             lnext: false,
@@ -1230,6 +1238,19 @@ impl Tty {
         self.arrivals[1] += 1;
     }
 
+    /// A slave write by a process group that is not the terminal's foreground one: as
+    /// [`Tty::write_output`], and remembers which bytes of the output queue it added.
+    pub fn write_background(&mut self, data: &[u8]) {
+        let from = self.taken + self.output.len() as u64;
+        self.write_output(data);
+        let to = self.taken + self.output.len() as u64;
+        match self.background.back_mut() {
+            Some(last) if last.end == from => last.end = to,
+            _ if to > from => self.background.push_back(from..to),
+            _ => {}
+        }
+    }
+
     /// One byte of output (Linux's `do_output_char`), following the cursor column: with OPOST, NL
     /// becomes CR NL (ONLCR) and returns the carriage (ONLRET), CR is dropped at column 0 (ONOCR)
     /// or becomes NL (OCRNL), tabs expand to spaces (XTABS), and other printable characters go
@@ -1315,7 +1336,34 @@ impl Tty {
     /// One master read: takes output.
     pub fn take_output(&mut self, max: usize) -> Vec<u8> {
         let n = max.min(self.output.len());
+        self.taken += n as u64;
+        while self.background.front().is_some_and(|b| b.end <= self.taken) {
+            self.background.pop_front();
+        }
         self.output.drain(..n).collect()
+    }
+
+    /// One read by the host console: takes output up to where its writer changes between the
+    /// foreground process group (or the line discipline's echo) and another, and says whether
+    /// another wrote it, so the app's terminal can tell a background job's output at the shell's
+    /// prompt from the shell's own (the android/vt map).
+    pub fn take_output_run(&mut self, max: usize) -> (Vec<u8>, bool) {
+        let (run, background) = match self.background.front() {
+            Some(b) if b.start <= self.taken => (b.end - self.taken, true),
+            Some(b) => (b.start - self.taken, false),
+            None => (u64::MAX, false),
+        };
+        let max = max.min(usize::try_from(run).unwrap_or(usize::MAX));
+        (self.take_output(max), background)
+    }
+
+    /// After output was dropped from the queue's end: forgets who wrote it.
+    fn clip_background(&mut self) {
+        let end = self.taken + self.output.len() as u64;
+        self.background.retain_mut(|b| {
+            b.end = b.end.min(end);
+            b.start < b.end
+        });
     }
 
     // ---- ioctl helpers ----
@@ -1401,12 +1449,14 @@ impl Tty {
     /// has not taken yet ([`PASSED_ON`]).
     pub fn flush_output(&mut self) {
         self.output.truncate(PASSED_ON);
+        self.clip_background();
     }
 
     /// TCIFLUSH on the master, a hangup of the master side and signal characters: all output the
     /// master has not read.
     pub fn clear_output(&mut self) {
         self.output.clear();
+        self.clip_background();
     }
 
     /// In packet mode, reports a flush on the slave side (Linux's `n_tty_packet_mode_flush` for
@@ -1783,6 +1833,35 @@ mod tests {
             t.take_output(64),
             b"x\t\x08\x08\x08\x08\x08\x08 \x08\t\x08\x08\x08\x08\x08\x08"
         );
+    }
+
+    /// The host console reads output in runs by who wrote it: a background write is told apart
+    /// from the foreground's and from echoes around it, read in pieces or not, and output dropped
+    /// from the queue takes its marks along.
+    #[test]
+    fn output_runs_follow_their_writers() {
+        let mut t = Tty::new(0);
+        t.write_output(b"$ ");
+        t.write_background(b"one\n");
+        t.write_background(b"two\n");
+        t.write_input(b"x");
+        t.write_output(b"y");
+        assert_eq!(t.take_output_run(64), (b"$ ".to_vec(), false));
+        assert_eq!(t.take_output_run(3), (b"one".to_vec(), true));
+        assert_eq!(t.take_output_run(64), (b"\r\ntwo\r\n".to_vec(), true));
+        assert_eq!(t.take_output_run(64), (b"xy".to_vec(), false));
+        assert_eq!(t.take_output_run(64), (Vec::new(), false));
+        // A plain master read passes over the marks
+        t.write_background(b"a");
+        t.write_output(b"b");
+        t.write_background(b"c");
+        assert_eq!(t.take_output(2), b"ab");
+        assert_eq!(t.take_output_run(64), (b"c".to_vec(), true));
+        // Dropped output is no longer marked
+        t.write_background(b"gone");
+        t.clear_output();
+        t.write_output(b"kept");
+        assert_eq!(t.take_output_run(64), (b"kept".to_vec(), false));
     }
 
     /// Echo and erase rules of n_tty: ECHOCTL shows a newline taken literally as `^J`, ECHOPRT

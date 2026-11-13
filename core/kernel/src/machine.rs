@@ -417,6 +417,22 @@ impl Machine {
         Ok(out.len())
     }
 
+    /// As [`Machine::read_console`], but reads only up to where the output's writer changes
+    /// between the console's foreground process group and another, and returns whether another
+    /// wrote these bytes: a job the shell left in the background, or a process of another session.
+    /// What the line discipline echoes counts as the foreground's.
+    pub fn read_console_run(&self, id: u32, buf: &mut [u8]) -> Result<(usize, bool), Errno> {
+        let objects = terminal::wake_objects(&self.shared.lock(), id);
+        let (out, background) = self.wait_objects(wake::FILE, objects.as_deref(), |k| {
+            on_console(k, id, "Machine::read_console_run", |k| {
+                terminal::take_output_run(k, id, buf.len())
+            })
+            .transpose()
+        })?;
+        buf[..out.len()].copy_from_slice(&out);
+        Ok((out.len(), background))
+    }
+
     /// Writes input to the console (through the line discipline), waiting while the input queue is
     /// full. Returns the number of bytes written; EIO if the session has already ended.
     pub fn write_console(&self, id: u32, data: &[u8]) -> Result<usize, Errno> {

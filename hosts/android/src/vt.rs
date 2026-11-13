@@ -103,7 +103,7 @@ unsafe extern "C" {
     ) -> *mut AppineVt;
     fn appine_vt_set_cursor(vt: *mut AppineVt, style: i32, blink: bool);
     fn appine_vt_free(vt: *mut AppineVt);
-    fn appine_vt_feed(vt: *mut AppineVt, data: *const u8, len: usize);
+    fn appine_vt_feed(vt: *mut AppineVt, data: *const u8, len: usize, background: bool);
     fn appine_vt_take_replies(vt: *mut AppineVt, len: *mut usize) -> *const u8;
     fn appine_vt_set_password_input(vt: *mut AppineVt, on: bool);
     fn appine_vt_resize(vt: *mut AppineVt, cols: u16, rows: u16, cell_width: u32, cell_height: u32);
@@ -245,9 +245,10 @@ struct Term(*mut AppineVt);
 unsafe impl Send for Term {}
 
 impl Term {
-    /// Feeds bytes and returns the replies they produced.
-    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        unsafe { appine_vt_feed(self.0, data.as_ptr(), data.len()) };
+    /// Feeds bytes and returns the replies they produced. `background`: the console's foreground
+    /// process group did not write them (`Machine::read_console_run`).
+    fn feed(&mut self, data: &[u8], background: bool) -> Vec<u8> {
+        unsafe { appine_vt_feed(self.0, data.as_ptr(), data.len(), background) };
         self.take_replies()
     }
 
@@ -703,7 +704,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_print<'l>(
             return;
         };
         let mut term = tab.term();
-        term.feed(&data);
+        term.feed(&data, false);
         // The app's own text asks nothing of it
         term.take_effects();
     })
@@ -740,9 +741,9 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
         loop {
             // Looked up again for every read, so the kernel is not kept once the service stops it
             let Some(m) = tab.machine() else { break };
-            let n = match m.read_console(tab.console, &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
+            let (n, background) = match m.read_console_run(tab.console, &mut buf) {
+                Ok((0, _)) | Err(_) => break,
+                Ok(read) => read,
             };
             // Whether a password is read now, for the cursor: programs turn echo off before they
             // print their prompt, so it is known by the time this output shows. Asked before the
@@ -751,7 +752,7 @@ pub extern "system" fn Java_io_github_mthli_appine_VtNative_pump<'l>(
             let (replies, titled, effects) = {
                 let mut term = tab.term();
                 unsafe { appine_vt_set_password_input(term.0, password) };
-                let replies = term.feed(&buf[..n]);
+                let replies = term.feed(&buf[..n], background);
                 let titled = unsafe { appine_vt_take_title_changed(term.0) };
                 (replies, titled, term.take_effects())
             };

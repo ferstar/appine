@@ -630,6 +630,87 @@ fn console_tells_password_input() {
 }
 
 #[test]
+fn console_tells_background_output() {
+    // The app's terminal reads busybox ash's line feeds at its prompt to find where a command's
+    // output starts, and must not take those of a job left in the background for the shell's
+    // (Machine::read_console_run): output is read in runs by whether the console's foreground
+    // process group wrote it
+    use appine_kernel::{ExitStatus, Machine, MachineOptions, Stdio, Tier};
+    let Some(store) = store() else {
+        return;
+    };
+    let machine = Machine::start(&MachineOptions {
+        tier: Tier::Interpreter,
+        rootfs: Some(store.to_path_buf()),
+        memory_limit: None,
+        low_port_offset: None,
+        always_map_low_ports: false,
+        exception_trace: false,
+    })
+    .unwrap();
+    let env = [PATH.as_bytes().to_vec()];
+    let id = machine.open_console(24, 80).unwrap();
+    // With job control the job gets a process group of its own while the shell keeps the terminal
+    let script = "set -m; echo one; echo job & wait; echo two";
+    let argv = [b"sh".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let (n, background) = machine.read_console_run(id, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf[..n]);
+        match runs.last_mut() {
+            Some((run, b)) if *b == background => run.push_str(&text),
+            _ => runs.push((text.into_owned(), background)),
+        }
+    }
+    let want = [("one\r\n", false), ("job\r\n", true), ("two\r\n", false)];
+    let got: Vec<(&str, bool)> = runs.iter().map(|(run, b)| (run.as_str(), *b)).collect();
+    assert_eq!(got, want);
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    machine.close_console(id).unwrap();
+
+    // An interactive shell, as in a tab: only the job's line is the background's; the typed
+    // commands' echo, a foreground command's output and every prompt are the foreground's
+    let id = machine.open_console(24, 80).unwrap();
+    let argv = [b"sh".to_vec(), b"-i".to_vec()];
+    let pid = machine
+        .spawn(b"/bin/sh", &argv, &env, Stdio::Console(id))
+        .unwrap();
+    let (mut fore, mut back) = (String::new(), String::new());
+    let mut read_until = |mark: &str, background: bool| {
+        loop {
+            let (n, b) = machine.read_console_run(id, &mut buf).unwrap();
+            assert!(n > 0, "{fore:?} {back:?}");
+            let run = if b { &mut back } else { &mut fore };
+            run.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if b == background && run.contains(mark) {
+                break;
+            }
+        }
+    };
+    machine.write_console(id, b"echo fore-$((1+1))\r").unwrap();
+    read_until("fore-2\r\n", false);
+    machine
+        .write_console(id, b"(sleep 1; echo back-$((1+1))) &\r")
+        .unwrap();
+    read_until("back-2\r\n", true);
+    machine.write_console(id, b"echo last-$((1+1))\r").unwrap();
+    read_until("last-2\r\n", false);
+    machine.write_console(id, b"exit\r").unwrap();
+    while machine.read_console_run(id, &mut buf).unwrap().0 > 0 {}
+    assert_eq!(back, "back-2\r\n", "{fore:?}");
+    assert!(!fore.contains("back-2"), "{fore:?}");
+    assert_eq!(machine.wait(pid), ExitStatus::Exited(0));
+    machine.close_console(id).unwrap();
+}
+
+#[test]
 fn each_step_of_finishing_a_process_survives_kernel_bugs() {
     // When a step of process finish hits a kernel-layer bug (simulated with the test hooks of debug
     // builds), only what that step does is lost, and the later steps are done all the same

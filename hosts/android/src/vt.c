@@ -206,6 +206,10 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 
 // The output start (OSC 133;C) appine_vt_feed marks for such a shell
 #define OUTPUT_START "\x1b]133;C\x1b\\"
+// The marks appine_vt_feed puts after another writer's output at such a shell's prompt: a
+// continuation prompt with no text (OSC 133;P;k=s) and the input's start (OSC 133;B), so what is
+// typed from there on is input again
+#define INPUT_RESUMED "\x1b]133;P;k=s\x1b\\\x1b]133;B\x1b\\"
 
 // Rows above the cursor searched for the first row of the prompt it is at (appine_vt_prompt_click)
 #define PROMPT_ROWS 64
@@ -674,7 +678,8 @@ static void on_program_status(GhosttyTerminal t, void *userdata,
 // OSC 133: a command starts when the shell marks its output's start (bash's PS0, zsh's preexec)
 // or, as busybox ash marks none (its input ends at a line feed, where appine_vt_feed marks the
 // output's start for it), when a feed ends with the cursor no longer at the prompt
-// (appine_vt_feed), which output of a background job at the prompt does too; it finishes at
+// (appine_vt_feed; output of a background job at the prompt ends no input and so starts none,
+// except with an edited profile's older marks, whose input ends with its line); it finishes at
 // the command end the next prompt reports, with the exit code (every marked shell sends it). Only
 // a command that started is reported: a prompt drawn again (after a resize, or Ctrl-C at the
 // prompt) reports a command end too, with none running
@@ -1136,14 +1141,27 @@ static void tmux_started(AppineVt *vt);
 // one that follows two carriage returns is ash breaking the line (it writes CR LF, and the
 // console's ONLCR adds a CR), so the input goes on in the next row, which libghostty-vt marks as
 // the prompt's continuation; any other at the prompt ends the input, and the output's start
-// (OSC 133;C) is fed after it, where it also takes that mark off the new row.
-void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
+// (OSC 133;C) is fed after it, where it also takes that mark off the new row. Bytes another
+// process group than the console's foreground one wrote (`background`: a job the shell left in
+// the background writing while the shell waits at its prompt, which the kernel tells apart) are
+// not read so: they end no input. At the prompt they are marked as output themselves, between an
+// output start before them and INPUT_RESUMED after them, so the cursor stays at the prompt, what
+// is typed after them is still input, and they are selected with the output around them.
+void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len, bool background) {
   uint32_t want = GHOSTTY_TERMINAL_BOUNDARY_OSC_START | GHOSTTY_TERMINAL_BOUNDARY_OSC_END |
                   GHOSTTY_TERMINAL_BOUNDARY_DCS_START | GHOSTTY_TERMINAL_BOUNDARY_DCS_END;
   size_t off = 0;
+  // Strings cut in two by another writer are left alone
+  bool aside = background && vt->lf_armed && len > 0 && !vt->osc_open && !vt->dcs_open &&
+               appine_vt_at_prompt(vt);
+  if (aside) {
+    vt->lf_marking = true;
+    ghostty_terminal_vt_write(vt->term, (const uint8_t *)OUTPUT_START, sizeof(OUTPUT_START) - 1);
+    vt->lf_marking = false;
+  }
   while (off < len) {
     size_t take = len - off;
-    if (vt->lf_armed && !vt->osc_open && !vt->dcs_open) {
+    if (vt->lf_armed && !background && !vt->osc_open && !vt->dcs_open) {
       const uint8_t *lf = memchr(data + off, '\n', take);
       if (lf == data + off) {
         size_t returns = 0;
@@ -1228,10 +1246,18 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len) {
       vt->dcs_len = 0;
     }
   }
-  size_t returns = 0;
-  while (returns < len && returns < 2 && data[len - 1 - returns] == '\r') returns++;
-  if (returns == len && returns + vt->lf_returns >= 2) returns = 2;
-  vt->lf_returns = (uint8_t)returns;
+  if (aside && !vt->osc_open && !vt->dcs_open) {
+    vt->lf_marking = true;
+    ghostty_terminal_vt_write(vt->term, (const uint8_t *)INPUT_RESUMED, sizeof(INPUT_RESUMED) - 1);
+    vt->lf_marking = false;
+  }
+  // Another writer's bytes do not come between the shell's carriage returns and its line feed
+  if (!background) {
+    size_t returns = 0;
+    while (returns < len && returns < 2 && data[len - 1 - returns] == '\r') returns++;
+    if (returns == len && returns + vt->lf_returns >= 2) returns = 2;
+    vt->lf_returns = (uint8_t)returns;
+  }
   // A command's start for a shell that does not mark it (on_semantic_prompt): the input ended
   bool at_prompt = appine_vt_at_prompt(vt);
   if (vt->was_at_prompt && !at_prompt && vt->command_start == 0) vt->command_start = now_ns();

@@ -427,7 +427,14 @@ fn slave_write(
             let echoed = t.echoes_before_write();
             let n = t.output_room().min(data.len() - done);
             if n > 0 {
-                t.write_output(&data[done..done + n]);
+                // Noted for the host console: a job the shell left in the background writes
+                // while another group (the shell at its prompt) has the terminal
+                let pgid = cx.t.group.borrow().pgid;
+                if t.fg.is_some_and(|fg| fg != pgid) {
+                    t.write_background(&data[done..done + n]);
+                } else {
+                    t.write_output(&data[done..done + n]);
+                }
                 done += n;
             }
             if n > 0 || echoed {

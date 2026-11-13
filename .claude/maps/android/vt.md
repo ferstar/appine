@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-13 (targeted verification only since the split; latest change: ash's line feeds are read on `appine_lf=output` (rows ash breaks stay input, an output start is fed at the input's end), and nested ash and a `~/.profile` prompt are marked)
+> Maintained: 2026-11-13 (targeted verification only since the split; latest change: the pump reads output in runs by writer, and a background job's output at ash's prompt no longer ends the input or starts command timing, and is marked as output)
 
 ## Responsibilities
 
@@ -327,17 +327,25 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   until one ends the input: a line feed after two carriage returns is ash breaking a long command
   (it writes CR LF, and the console's ONLCR adds a CR; counted across feeds), so the input goes on
   and libghostty-vt marks the next row as the prompt's continuation; any other line feed with the
-  cursor at the prompt (the typed command's end, but also the start of a completion list, Ctrl-C's
-  echo, or a background job's output) gets an output start (OSC 133;C) fed after it, which also
-  takes the continuation mark off the new row. A primary prompt without the option, a program's
+  cursor at the prompt (the typed command's end, but also the start of a completion list or
+  Ctrl-C's echo) gets an output start (OSC 133;C) fed after it, which also
+  takes the continuation mark off the new row. Bytes the console's foreground process group did
+  not write are not read so: the pump reads output in runs by writer
+  (`Machine::read_console_run`, kernel/tty) and feeds each with whether another group wrote it,
+  so a line from a job left in the background ends no input. At the prompt vt.c marks such bytes
+  as output itself: an output start before them, and after them a continuation prompt with no
+  text and an input start (OSC 133;P;k=s and B), unless an OSC or DCS string is open. So the
+  cursor stays at the prompt, what is typed after them is input again, and they are selected as
+  one output (from the prompt's row down to the row the input resumes on). A primary prompt without the option, a program's
   full reset and the app's Reset terminal end the reading. So a command of several rows is all
   input: the cursor stays at the prompt while it is typed, and its rows are not selected as output.
 - Commands are timed through libghostty-vt's OSC 133 callback (`on_semantic_prompt`): a command
   starts at the output's mark (bash's PS0 and zsh's preexec hook, `C`) or, as busybox ash marks
   none, when a feed ends with the cursor no longer at the prompt where the one before left it there
-  (the line feed that ends the typed input, but also output of a background job at the prompt; the
+  (the line feed that ends the typed input; the
   output start vt.c feeds for ash starts no timing itself, as a completion list or Ctrl-C at the
-  prompt also gets one); it
+  prompt also gets one; a background job's output at the prompt does not move the cursor off
+  it); it
   finishes at the command end (`D` with the exit code) the next prompt sends, and a primary prompt's
   start without one forgets it. A command end with nothing timed (a prompt drawn again after a
   resize, Ctrl-C at the prompt) reports nothing. The pump hands the last finished command of a read
@@ -383,7 +391,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   graphics with their render-state image list and animation), and the Wuffs PNG decoder it
   carries, linked into
   `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
-  pixels, android/vtview's); `Machine::read_console`,
+  pixels, android/vtview's); `Machine::read_console_run`,
   `write_console`, `resize_console`, `console_foreground` and `console_password_input`
   (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly.
@@ -503,10 +511,10 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   callback, so vt.c forgets that itself there (Clearing and resetting).
 - Command timing's at-prompt state (`was_at_prompt`) changes only in `appine_vt_feed`, which the
   app's own printed text also goes through; clearing, resetting, messages and resizes leave it.
-  For busybox ash, which marks no output start (and for an edited profile's older ash marks,
-  whose input ends with its line), output of a background job while the shell waits
-  at its prompt starts the timing, so the next command's time is counted from then; bash's output
-  mark replaces such a start. libghostty-vt is built ReleaseFast, so its log emits info and
+  With an edited profile's older ash marks (input ends with its line, OSC 133;I, and no
+  `appine_lf=output`), output of a background job while the shell waits
+  at its prompt starts the timing, so the next command's time is counted from then; the current
+  ash marks, bash and zsh are not affected. libghostty-vt is built ReleaseFast, so its log emits info and
   above, of which `on_log` passes warnings and errors; the log is installed when the first
   terminal is wrapped, after it was created or restored, so what that first decode and settle
   would log goes nowhere.
@@ -553,10 +561,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 - **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
   (not for nested non-login shells other than ash, or zsh on Debian, whose zprofile does not read `/etc/profile`;
   fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
-  of several lines are not continuation rows; ash marks no
-  output start, so a background job's output at its prompt starts the next command's timing early
-  (and, the line feeds being read, ends the input there: what is typed after it counts as output
-  until the next prompt),
+  of several lines are not continuation rows; after a background
+  job's output at ash's prompt, a tap on a row above the one the input resumed on counts arrow
+  keys as if ash had broken the command there (ash still has its cursor on the prompt's row),
   and an ash PS1 set after its `ENV` file was read has none; and the progress and status records
   still go by the foreground process group rather than the next prompt, though the OSC 133 callback
   is now set (for command timing only).

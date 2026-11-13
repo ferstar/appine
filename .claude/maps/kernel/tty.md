@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping: echoes sent before slave writes, consoles given back after a failed spawn, VTIME as an inter-byte timer, the console's foreground group and its cwd for the app, then whether it reads a password last)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: output written by another group than the foreground one is remembered, and the host console can read output in runs by writer, `read_console_run`)
 
 ## Responsibilities
 
@@ -67,9 +67,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
 - I/O: `syscall::tty::read`, `write`, `readiness`, `ioctl`.
 - Hangup: `hang_up`, `vhangup_ctty` (`vhangup(2)`), `hang_up_closed` (run when the BKL is
   released).
-- Host console: `terminal::{open, attach, detach, wake_objects, take_output, input_room, feed,
-  fg_pgrp, fg_cwd, password_input, resize, close, initial_size, bridge}`, wrapped by
-  `Machine::{open_console, read_console, write_console, resize_console, close_console,
+- Host console: `terminal::{open, attach, detach, wake_objects, take_output, take_output_run,
+  input_room, feed, fg_pgrp, fg_cwd, password_input, resize, close, initial_size, bridge}`,
+  wrapped by `Machine::{open_console, read_console, read_console_run, write_console,
+  resize_console, close_console,
   console_foreground, console_cwd, console_password_input}`,
   `Stdio::Console` at spawn and the kernel's `run`.
 
@@ -168,7 +169,11 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   `OPOST`, `ONLCR`, `OCRNL`, `ONOCR` (CR at column 0 dropped), `ONLRET`, `OLCUC` (Latin-1
   `toupper`), tab expansion with `XTABS`; control characters take no column, UTF-8 continuation
   bytes none with `IUTF8`. Without `OPOST` bytes pass unchanged and the column is not followed.
-  `EIO` without a master; `TOSTOP` background check.
+  `EIO` without a master; `TOSTOP` background check. A write by a process whose group is not the
+  terminal's foreground group (whether or not the terminal is its controlling one; never when
+  there is no foreground group) is remembered as a range of the output stream (`background`,
+  against `taken`, the bytes read so far): adjacent ranges join, a read drops those it passed, and
+  output discarded from the queue takes its ranges along. Echoes are never in a range.
 - While output is stopped, slave writes block and echoes wait; restarting writes them. Echoes also
   go out only while the output queue has room for each whole one (`__process_echoes`); the rest
   wait for the next commit, at most 4096 of them (the oldest dropped): the next batch of input, or
@@ -272,7 +277,10 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   again); when the spawn then fails, `detach` clears that session and puts back whether one was
   ever attached.
 - The host takes output (`take_output`: bytes, nothing yet, or empty once a session was attached
-  and the terminal's slaves are all closed, by any process), feeds input under `input_room`
+  and the terminal's slaves are all closed, by any process; `take_output_run`, which the app
+  uses: the same, but only up to where the writer changes between the foreground group and
+  another, with whether another wrote it, so the app's terminal does not take a background job's
+  line feed at the shell's prompt for the shell's, android/vt), feeds input under `input_room`
   backpressure (`feed` delivers resulting signals), resizes (`SIGWINCH` on change), asks for the
   foreground group (`fg_pgrp`: its id as the kernel sees it, untranslated, `ESRCH` with none; the
   app drops what a program reported about its progress once another group has the terminal) and

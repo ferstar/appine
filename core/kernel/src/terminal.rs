@@ -111,13 +111,36 @@ pub(crate) fn wake_objects(k: &Kernel, id: u32) -> Option<Vec<wake::Object>> {
 pub(crate) fn take_output(k: &Kernel, id: u32, max: usize) -> Result<Option<Vec<u8>>, Errno> {
     let tty = tty_of(k, id)?;
     let out = tty.borrow_mut().take_output(max);
+    Ok(taken(k, id, &tty, out, false).map(|(out, _)| out))
+}
+
+/// As [`take_output`], but only up to where the output's writer changes between the foreground
+/// process group and another, with whether another wrote it (a job left in the background, or a
+/// process of another session).
+pub(crate) fn take_output_run(
+    k: &Kernel,
+    id: u32,
+    max: usize,
+) -> Result<Option<(Vec<u8>, bool)>, Errno> {
+    let tty = tty_of(k, id)?;
+    let (out, background) = tty.borrow_mut().take_output_run(max);
+    Ok(taken(k, id, &tty, out, background))
+}
+
+fn taken(
+    k: &Kernel,
+    id: u32,
+    tty: &Rc<RefCell<Tty>>,
+    out: Vec<u8>,
+    background: bool,
+) -> Option<(Vec<u8>, bool)> {
     if !out.is_empty() {
         // The output queue has room again, so threads waiting to write the terminal can go on
-        request_wake_object(wake::of(&tty));
-        return Ok(Some(out));
+        request_wake_object(wake::of(tty));
+        return Some((out, background));
     }
     let ended = k.consoles[&id].attached && tty.borrow().slaves == 0;
-    Ok(ended.then(Vec::new))
+    ended.then(|| (Vec::new(), false))
 }
 
 /// How many more bytes the input queue can hold.
