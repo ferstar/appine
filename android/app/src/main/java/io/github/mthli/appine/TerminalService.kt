@@ -469,6 +469,7 @@ class TerminalService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+            .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
         if (sw != null) {
             // A distro switch download: progress on the second line, cancellable from the
             // notification
@@ -488,9 +489,7 @@ class TerminalService : Service() {
             val label = getString(Settings.nextRunPolicy(this).label)
             builder.addAction(Notification.Action.Builder(null, label, toggle).build())
         }
-        return builder
-            .addAction(Notification.Action.Builder(null, getString(R.string.exit_all), exit).build())
-            .build()
+        return builder.build()
     }
 
     private fun updateNotification() {
