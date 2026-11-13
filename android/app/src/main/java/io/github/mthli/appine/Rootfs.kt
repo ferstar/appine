@@ -203,6 +203,7 @@ internal object Rootfs {
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
             useBash(context, store)
+            cachePackages(context, store, "procps")
         } else {
             // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
             // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
@@ -248,6 +249,17 @@ internal object Rootfs {
             """.trimIndent()
     }
 
+    /** Stages a bundled package set only at import; login removes it after a successful install. */
+    @Throws(IOException::class)
+    private fun cachePackages(context: Context, store: String, bundle: String): Boolean {
+        val packages = context.assets.list(bundle).orEmpty()
+        for (name in packages) {
+            val data = context.assets.open("$bundle/$name").use { it.readBytes() }
+            write(store, "/var/cache/appine/$bundle/$name", data)
+        }
+        return packages.isNotEmpty()
+    }
+
     /**
      * Makes bash the login shell of a system imported from Alpine instead of busybox ash: puts the
      * packages bundled with the app (bash and the libraries it needs that the minirootfs lacks) into
@@ -259,12 +271,7 @@ internal object Rootfs {
      */
     @Throws(IOException::class)
     private fun useBash(context: Context, store: String) {
-        val packages = context.assets.list("bash").orEmpty()
-        if (packages.isEmpty()) return
-        for (name in packages) {
-            val data = context.assets.open("bash/$name").use { it.readBytes() }
-            write(store, "/var/cache/appine/bash/$name", data)
-        }
+        if (!cachePackages(context, store, "bash")) return
         val passwd = Native.readFile(store, "/etc/passwd") ?: return
         val lines = String(passwd).split('\n').map { line ->
             val fields = line.split(':')

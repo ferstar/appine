@@ -20,7 +20,9 @@
 # /var/cache/appine/bash, and the first login with an account whose shell is /bin/bash installs
 # them offline and deletes them, so bash is not installed again if the user removes it. While bash
 # cannot be installed (Ctrl-C, below), the login uses /bin/sh, and the next one tries again.
-# apk takes its database lock without waiting, so logins install the bundled packages (doas, bash)
+# procps-ng and its libraries are staged at import in /var/cache/appine/procps. Any first login
+# installs them offline and removes the cache on success, so user removal is respected.
+# apk takes its database lock without waiting, so logins install the bundled packages (doas, bash, procps-ng)
 # one at a time, and while an apk the user runs holds the lock, a login says so and waits for it;
 # Ctrl-C then skips installing until the next login. Installing sudo waits for an apt the user runs
 # in the same way.
@@ -107,6 +109,19 @@ install_bash() {
     [ -x /bin/bash ] || { apk_add "$bundle"/*.apk && apk_add bash; }
 }
 
+# A separate bundle so procps-ng also installs when the login shell is not bash. Check the package
+# database: busybox already provides ps/top/free. Recheck and remove the cache under the same lock
+# so concurrent first logins cannot reinstall a completed bundle.
+install_procps() {
+    procps_bundle=/var/cache/appine/procps
+    [ -d "$procps_bundle" ] || return 0
+    if ! apk info -e procps-ng >/dev/null 2>&1; then
+        apk_add "$procps_bundle"/*.apk || return 1
+    fi
+    apk_add procps-ng || return 1
+    rm -rf "$procps_bundle"
+}
+
 # apt-get update, its progress shown as usual. apt-get fails at once when another apt holds the lock
 # of the package lists (the user's, in another tab; DPkg::Lock::Timeout does not cover that lock),
 # so this then says so and tries again every two seconds until it gets through, or until Ctrl-C.
@@ -183,6 +198,11 @@ refresh_rules() {
 if [ "$want" = --refresh-rules ]; then
     refresh_rules
     exit 0
+fi
+
+if [ -d /var/cache/appine/procps ]; then
+    locked install_procps ||
+        echo "appine: cannot install procps-ng now; Appine tries again at the next login" >&2
 fi
 
 case $want in

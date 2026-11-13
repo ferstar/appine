@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: guestCpuTime exposes live and exited guest CPU time for the screen-off running policy, with preference and CPU sampling tests)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: bundle procps-ng with its dependencies, package notices and LGPL text, and cover offline installation)
 
 ## Responsibilities
 
@@ -49,7 +49,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   to run); helpers `byVersion` (compares file names by their runs of digits, then by how many
   runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
-  and `alpineBranch` (from the tarball's name, `edge` without one).
+  and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
+  packages, null when any is missing), and `alpineBranch` (from the tarball's name, `edge` without one).
 - `MachineTest` — kernel and app instrumentation tests; `RunPolicyTest` — isolated preferences and idle-grace tests.
 
 ## Public entry points
@@ -167,7 +168,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
   since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
-  with their own file names (all by `byVersion`; `rootfsAsset` fails with "run
+  with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
+  ncurses so either bundle installs independently; all by `byVersion`; `rootfsAsset` fails with "run
   scripts/fetch-rootfs first" when any is missing), generated `notices/`, and
   the terminal font (`fonts/`, `android/vtview`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
@@ -188,10 +190,11 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
   from the tarball's `lib/apk/db/installed`, then the bundled packages' from their `.PKGINFO`, doas
-  and bash's four in sections of their own, all counted in the entry's package count and
+  and bash's four and procps-ng's five additional packages in sections of their own (shared ncurses
+  counted only once), all counted in the entry's package count and
   licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
-  texts of GPL-3.0, GPL-2.0, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
+  texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
   file), which `LicensesActivity` reads.
 - Every Android library must belong to a group known to be Apache-2.0 (a prefix match against
   AndroidX, Kotlin, kotlinx, JetBrains annotations, Guava's listenablefuture, Material Components,
@@ -200,7 +203,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   from `appine-android` over normal dependencies, skipping proc-macros and workspace members; when a
   crate's licence offers MIT, only the MIT (and unrelated) licence files are attached; a crate
   without a licence file only warns.
-- The component texts and versions in `android/licenses/` (15 files, all used) are copies kept by
+- The component texts and versions in `android/licenses/` (16 files, all used) are copies kept by
   hand and change with the libghostty-vt version; the release's
   `deps/libghostty-vt-third-party.json` lists which projects are linked (translate-c among them,
   though nothing of it shows as an object of its own in `libghostty-vt.a`).
@@ -225,7 +228,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
 - The Alpine part takes the tarball `scripts/fetch-rootfs` prints last and the bundled packages
   it prints before it, picks packages whose licence (the tarball's `lib/apk/db/installed`, each
-  package's `.PKGINFO`) contains `GPL` (LGPL included; so bash and readline, not doas or ncurses),
+  package's `.PKGINFO`) contains `GPL` (LGPL included; so bash, readline, procps-ng/libproc2 and
+  libintl, not doas, ncurses, utmps-libs or skalibs-libs),
   downloads each origin's
   aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
@@ -251,7 +255,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
   the notices, prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
   new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
-  install, the `/bin/sh` fallback, bash's marks and nested shells'). Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
+  install, the `/bin/sh` fallback, bash's marks and nested shells'). `newSystemsInstallProcpsOffline`
+  uses its own store and ash, omits a dependency to check failure/retry, retries in two concurrent
+  logins without repositories, runs ps/top/free/vmstat/uptime/pgrep, and checks that user removal
+  persists. Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set

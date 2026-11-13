@@ -45,6 +45,13 @@ val bashPackages: List<File>? = listOf("bash", "readline", "libncursesw", "ncurs
     .takeIf { null !in it }
     ?.filterNotNull()
 
+/** procps-ng and its missing libraries, installed offline on the first login of a new Alpine system. */
+val procpsPackages: List<File>? = listOf(
+    "procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs", "libncursesw", "ncurses-terminfo-base",
+).map { newestFetched(Regex("""$it-\d.*\.apk""")) }
+    .takeIf { null !in it }
+    ?.filterNotNull()
+
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
@@ -125,6 +132,7 @@ val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     rootfsTarball?.let { tarball.set(it) }
     doasPackage?.let { doas.set(it) }
     bashPackages?.let { bash.from(it) }
+    procpsPackages?.let { procps.from(it) }
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -145,6 +153,7 @@ androidComponents {
             rootfsTarball?.let { tarball.set(it) }
             doasPackage?.let { doas.set(it) }
             bashPackages?.let { bash.from(it) }
+            procpsPackages?.let { procps.from(it) }
             cargoLock.set(repoRoot.file("Cargo.lock"))
             workspace.set(repoRoot)
             // Modules in the dependency graph (not in-project modules), resolving only the graph without downloading.
@@ -215,7 +224,7 @@ abstract class CargoNdkTask : CargoTask() {
 /**
  * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), the
  * doas package (for the login account) as `doas.apk`, and bash's packages (the login shell of the
- * systems the app imports) under `bash/` with their own names.
+ * systems the app imports) under `bash/`, and procps-ng with its libraries under `procps/`.
  */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
@@ -228,6 +237,9 @@ abstract class RootfsAssetTask : DefaultTask() {
 
     @get:InputFiles
     abstract val bash: ConfigurableFileCollection
+
+    @get:InputFiles
+    abstract val procps: ConfigurableFileCollection
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -245,6 +257,8 @@ abstract class RootfsAssetTask : DefaultTask() {
         doasFile.copyTo(File(out, "doas.apk"))
         if (bash.isEmpty) throw GradleException("bash packages not found: run scripts/fetch-rootfs first")
         for (apk in bash) apk.copyTo(File(out, "bash/${apk.name}"))
+        if (procps.isEmpty) throw GradleException("procps-ng packages not found: run scripts/fetch-rootfs first")
+        for (apk in procps) apk.copyTo(File(out, "procps/${apk.name}"))
     }
 }
 
@@ -254,7 +268,7 @@ abstract class RootfsAssetTask : DefaultTask() {
  * the files are plain text. In order: Appine itself (AGPL), the parts of Appine adapted from
  * Fuchsia's Starnix (the terminal line discipline, BSD-style), the terminal (libghostty-vt and the
  * libraries it links, and the JetBrains Mono font, from texts in `android/licenses/`), the packages
- * of the Alpine minirootfs in the APK and those bundled beside it (doas, and bash with its
+ * of the Alpine minirootfs in the APK and those bundled beside it (doas, bash and procps-ng with their
  * libraries), the Android libraries, the Rust crates linked into
  * libappine.so (with the license files each one publishes attached as they are), SQLite, and last
  * a few full license texts (`android/licenses/`).
@@ -279,6 +293,9 @@ abstract class NoticesTask : CargoTask() {
 
     @get:InputFiles
     abstract val bash: ConfigurableFileCollection
+
+    @get:InputFiles
+    abstract val procps: ConfigurableFileCollection
 
     @get:InputFile
     abstract val cargoLock: RegularFileProperty
@@ -396,6 +413,7 @@ abstract class NoticesTask : CargoTask() {
 
         entry("GNU General Public License 3.0", "Full text", "GPL-3.0.txt", text("GPL-3.0.txt"))
         entry("GNU General Public License 2.0", "Full text", "GPL-2.0.txt", text("GPL-2.0.txt"))
+        entry("GNU Lesser General Public License 2.1", "Full text", "LGPL-2.1.txt", text("LGPL-2.1.txt"))
         entry("Apache License 2.0", "Full text", "Apache-2.0.txt", text("Apache-2.0.txt"))
         entry("Mozilla Public License 2.0", "Full text", "MPL-2.0.txt", text("MPL-2.0.txt"))
         File(out, "index.tsv").writeText(index.toString())
@@ -433,7 +451,9 @@ abstract class NoticesTask : CargoTask() {
         }
         val doasRows = listOfNotNull(doas.orNull?.asFile).map(::bundled)
         val bashRows = bash.files.sortedBy { it.name }.map(::bundled)
-        val licenses = (rows + doasRows + bashRows).map { it[2] }.distinct().sorted()
+        // ncurses is shared by bash and procps-ng; list and count each package only once.
+        val procpsRows = (procps.files - bash.files).sortedBy { it.name }.map(::bundled)
+        val licenses = (rows + doasRows + bashRows + procpsRows).map { it[2] }.distinct().sorted()
         val body = StringBuilder()
         body.append(
             wrap(
@@ -465,10 +485,17 @@ abstract class NoticesTask : CargoTask() {
             ).append("\n\n")
             list(bashRows)
         }
+        if (procpsRows.isNotEmpty()) {
+            body.append("\n").append(
+                wrap("And these process monitoring tools and libraries, installed at the first login of a new Alpine system " +
+                    "(the ncurses libraries listed above are shared with bash):"),
+            ).append("\n\n")
+            list(procpsRows)
+        }
         body.append("\n").append(
-            wrap("The full texts of the GPL 3.0, GPL 2.0, Apache 2.0 and MPL 2.0 are at the end of this list."),
+            wrap("The full texts of the GPL 3.0, GPL 2.0, LGPL 2.1, Apache 2.0 and MPL 2.0 are at the end of this list."),
         ).append('\n')
-        val count = rows.size + doasRows.size + bashRows.size
+        val count = rows.size + doasRows.size + bashRows.size + procpsRows.size
         return Triple("Alpine Linux $version minirootfs", "$count packages: ${licenses.joinToString(", ")}", body.toString())
     }
 

@@ -429,6 +429,60 @@ class MachineTest {
         }
     }
 
+    /** Offline procps-ng install is independent of bash, retries failures, and respects removal. */
+    @Test
+    fun newSystemsInstallProcpsOffline() {
+        val store = File(context.cacheDir, "store-procps")
+        store.deleteRecursively()
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        val machine = Native.start(store.path, 1)
+        try {
+            // Keep ash as the login shell and omit a required library for the first attempt.
+            assertEquals(0, sh(machine,
+                "sed -i 's@/bin/bash$@/bin/sh@' /etc/passwd; " +
+                    "mkdir /var/cache/appine/procps.off; " +
+                    "mv /var/cache/appine/procps/libproc2-*.apk /var/cache/appine/procps.off/; " +
+                    "rm -f /etc/apk/repositories"
+            ).second)
+            val failed = plain(login(machine, "echo login-ok\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(failed, failed.contains("cannot install procps-ng now"))
+            assertTrue(failed, failed.contains("\nlogin-ok\n"))
+            assertEquals(0, sh(machine,
+                "test -d /var/cache/appine/procps && ! apk info -e procps-ng"
+            ).second)
+            assertEquals(0, sh(machine,
+                "mv /var/cache/appine/procps.off/*.apk /var/cache/appine/procps/"
+            ).second)
+
+            // Two tabs retry together: both must reach a working procps-ng after sharing the lock.
+            val outputs = arrayOf("", "")
+            val logins = (0..1).map { i ->
+                thread { outputs[i] = login(machine, "ps --version\nexit\n", ConsolePty.LOGIN_ROOT) }
+            }
+            logins.forEach { it.join(120_000) }
+            assertTrue("first logins did not finish", logins.none { it.isAlive })
+            for (out in outputs) assertTrue(out, plain(out).contains("\nps from procps-ng "))
+            assertEquals("" to 0, sh(machine,
+                "test ! -e /var/cache/appine/procps && grep -qx procps-ng /etc/apk/world && " +
+                    "test ! -x /bin/bash"
+            ))
+            val smoke = sh(machine,
+                "ps -eo pid,comm && top -b -n 1 && free -m && vmstat && uptime && " +
+                    "pgrep -x sh && echo procps-ok"
+            )
+            assertEquals(smoke.first, 0, smoke.second)
+            assertTrue(smoke.first, smoke.first.contains("procps-ok"))
+
+            assertEquals(0, sh(machine, "apk del --no-network procps-ng").second)
+            val removed = plain(login(machine, "echo login-ok\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(removed, removed.contains("\nlogin-ok\n"))
+            assertEquals(0, sh(machine, "! apk info -e procps-ng && test ! -e /var/cache/appine/procps").second)
+        } finally {
+            Native.stop(machine)
+            store.deleteRecursively()
+        }
+    }
+
     /**
      * A restored tab starts in its original directory (the android/service map): root enters it if
      * it can; if the directory is gone, the home directory; a regular user enters as itself, and
@@ -1430,10 +1484,15 @@ class MachineTest {
         assertFalse(titles.any { it.contains("Termux") })
         val alpine = text("Alpine Linux")
         assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
-        // The packages bundled beside it: doas, and bash with the libraries it needs
+        // The packages bundled beside it: doas, bash and procps-ng with their libraries
         assertTrue(alpine, Regex("""\ndoas \S+\n\s+License: ISC\n""").containsMatchIn(alpine))
         assertTrue(alpine, Regex("""\nbash \S+\n\s+License: GPL-3.0-or-later\n\s+aports: main/bash at [0-9a-f]{40}""").containsMatchIn(alpine))
         assertTrue(alpine, alpine.contains("\nreadline ") && alpine.contains("\nlibncursesw "))
+        for (name in listOf("procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs")) {
+            assertTrue(alpine, alpine.contains("\n$name "))
+        }
+        assertEquals(1, Regex("""\nlibncursesw """).findAll(alpine).count())
+        assertTrue(text("GNU Lesser General Public License 2.1").contains("Version 2.1, February 1999"))
         assertTrue(text("Android libraries").contains("androidx.core:core:"))
         assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
         assertTrue(titles.any { it.startsWith("SQLite ") })

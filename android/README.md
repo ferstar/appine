@@ -15,6 +15,7 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),
+  installs the bundled bash and procps-ng packages offline on a new Alpine system,
   and switches to it with `su` (`--session-command` where su is util-linux's, so that the
   shell keeps its controlling terminal and job control). `Native` is the JNI interface to
   `libappine.so`, which is built from `hosts/android` with cargo-ndk.
