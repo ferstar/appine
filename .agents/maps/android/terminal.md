@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: About's final version action has English and Simplified Chinese labels)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: terminal HTTP and HTTPS links use AndroidX Custom Tabs)
 
 ## Responsibilities
 
@@ -313,8 +313,11 @@ notices task and the build (`android/native`).
 ### Links and the clipboard question
 
 - The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
-  link; which links count and which schemes open are android/vtview's). The activity opens a web or
-  mail link as a browsable `ACTION_VIEW` intent; a `file:` link (`ls --hyperlink`) is looked up off
+  link; which links count and which schemes open are android/vtview's). The activity opens HTTP and
+  HTTPS links with AndroidX Custom Tabs, without binding a browser package or session, and other
+  non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
+  `startViewer` passes the Custom Tabs launch options and shows a toast if no app handles the link.
+  A `file:` link (`ls --hyperlink`) is looked up off
   the main thread through the Files app's provider (`Documents.fileLink`) and opened as its
   document, typed by it and with read access granted: a directory in the Files app, a file in the
   app the system picks. A link from another host, outside the home while the whole system is not
@@ -370,7 +373,7 @@ notices task and the build (`android/native`).
   (android/documents); `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation
-  compat; the app the system picks for a link.
+  compat; androidx.browser's Custom Tabs for web links; the app the system picks for a link.
 
 ## Invariants and gotchas
 
@@ -487,7 +490,8 @@ none
 - Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
   10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
   real phones, tablets or foldables. Unverified beyond that:
-  - links with other browsers, mail apps, viewers and file managers, and `mailto` at all;
+  - terminal Custom Tabs navigation and return, App Links, browsers without Custom Tabs and missing
+    handlers; links with other mail apps, viewers and file managers, and `mailto` at all;
   - the cutout insets and the keys following the IME with other IMEs;
   - the tab bar's 32 dp tabs and buttons (below the 48 dp touch target) under real fingers, and the
     rolling numbers' blur on Android 11 and real GPUs;

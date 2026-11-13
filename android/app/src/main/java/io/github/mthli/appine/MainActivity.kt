@@ -31,6 +31,7 @@ import android.window.OnBackInvokedDispatcher
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
@@ -730,14 +731,21 @@ class MainActivity : Activity(), TerminalService.Listener {
         override fun onSearchCount(total: Int, selected: Int) = searchBar.setCount(total, selected)
 
         /**
-         * Opens it in the app the system picks: a web page or mail as a browsable intent, which
-         * reaches only apps that take links from the web, a guest file through the Files app's
-         * provider ([openFile]).
+         * Opens web pages with Custom Tabs, other schemes as browsable intents, and guest files
+         * through the Files app's provider ([openFile]).
          */
         override fun onLink(uri: String) {
             val link = uri.toUri()
             if (link.scheme.equals("file", ignoreCase = true)) {
                 openFile(link)
+            } else if (link.scheme.equals("http", ignoreCase = true) ||
+                link.scheme.equals("https", ignoreCase = true)
+            ) {
+                val tab = CustomTabsIntent.Builder().build()
+                startViewer(
+                    tab.intent.setData(link).addCategory(Intent.CATEGORY_BROWSABLE),
+                    tab.startAnimationBundle,
+                )
             } else {
                 startViewer(Intent(Intent.ACTION_VIEW, link).addCategory(Intent.CATEGORY_BROWSABLE))
             }
@@ -765,9 +773,9 @@ class MainActivity : Activity(), TerminalService.Listener {
             }
         }
 
-        private fun startViewer(intent: Intent) {
+        private fun startViewer(intent: Intent, options: Bundle? = null) {
             try {
-                startActivity(intent)
+                startActivity(intent, options)
             } catch (e: ActivityNotFoundException) {
                 showToast(getString(R.string.link_no_app))
             }
