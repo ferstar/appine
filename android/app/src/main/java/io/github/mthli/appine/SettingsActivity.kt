@@ -317,7 +317,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         )
         // Reset is possible even when the start failed: it is the only way to recover a broken
         // store
-        reset.set(getString(R.string.reset_summary, (installed ?: Rootfs.Distro.ALPINE).label), s.canSwitch)
+        reset.set(getString(R.string.reset_summary), s.canSwitch)
         tier?.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
         account.entries = (listOf(getString(R.string.login_auto_choice), ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
         account.entryValues = (listOf(ConsolePty.LOGIN_AUTO, ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
@@ -350,8 +350,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
 
     private fun loginSummary(login: String): String = when (login) {
-        ConsolePty.LOGIN_AUTO -> accounts.firstOrNull()?.let { getString(R.string.login_auto_user, it.name) }
-            ?: getString(R.string.login_auto_root)
+        ConsolePty.LOGIN_AUTO -> getString(R.string.login_auto, accounts.firstOrNull()?.name ?: ConsolePty.LOGIN_ROOT)
         ConsolePty.LOGIN_ROOT -> login
         else -> if (accounts.any { it.name == login }) login else getString(R.string.login_missing, login)
     }
@@ -385,9 +384,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
         val distros = Rootfs.Distro.entries
         val installed = Rootfs.installed(requireContext())
-        val labels = distros.map { d ->
-            d.download?.let { getString(R.string.distro_download, d.label, it.size shr 20) } ?: d.label
-        }
+        val labels = distros.map { it.label }
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.settings_distro)
             .setSingleChoiceItems(labels.toTypedArray(), distros.indexOf(installed)) { dialog, i ->
