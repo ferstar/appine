@@ -3,14 +3,11 @@ package io.github.mthli.appine
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.ActivityNotFoundException
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.graphics.Color
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -20,36 +17,27 @@ import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
 import android.view.Menu
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
-import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.edit
-import androidx.core.net.toUri
-import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsAnimationCompat
-import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import io.github.mthli.appine.MainActivity.Companion.PREF_FONT_SIZE
-import kotlin.concurrent.thread
 
 /**
  * The terminal screen: the tab bar ([TabBarView]) on top, the terminal ([VtView]) in the middle,
  * and below it the keys the soft keyboard lacks ([ExtraKeysView]: Esc, Ctrl, arrows and so on).
  * Sessions belong to [TerminalService]; this only handles display and input: the bar shows every
  * tab, the view the current tab's [VtSession]. While the current tab is searched, the search bar
- * ([SearchBarView]) takes the tab bar's place.
+ * ([SearchBarView]) takes the tab bar's place. [TerminalLayout] builds the views and handles
+ * insets and the IME animation; [TerminalLinks] opens links from the terminal.
  *
  * Its dialogs and menus are Material 3 (`Theme.Appine.Terminal`, always dark); the tab bar and the
  * extra keys are black like the terminal, with labels in the theme's colours. The activity itself
@@ -57,16 +45,8 @@ import kotlin.concurrent.thread
  */
 class MainActivity : Activity(), TerminalService.Listener {
 
-    private lateinit var screen: VtView
-
-    /** The current tab's progress (OSC 9;4), along the top of the terminal. */
-    private lateinit var progressLine: ProgressLine
-    private lateinit var tabBar: TabBarView
-
-    /** In the tab bar's place while the current tab is searched ([openSearch]). */
-    private lateinit var searchBar: SearchBarView
-    private lateinit var status: TextView
-    private lateinit var keys: ExtraKeysView
+    private lateinit var layout: TerminalLayout
+    private val links = TerminalLinks(this, ::showToast)
 
     private var service: TerminalService? = null
     private var current: VtSession? = null
@@ -125,61 +105,6 @@ class MainActivity : Activity(), TerminalService.Listener {
         }
     }
 
-    /**
-     * Moves the extra keys with the IME as it shows or hides. The system lays the root out for the
-     * end as the animation starts (so the terminal regrids once, at the start), and the keys are
-     * drawn from where they were on screen to their new place along the IME's own curve: as it
-     * shows, they rise through the IME's room (black) to the terminal's new bottom; as it hides,
-     * they sink over the terminal's new rows, which they hide while passing, being black.
-     */
-    private val keysFollowIme = object : WindowInsetsAnimationCompat.Callback(DISPATCH_MODE_STOP) {
-        /** The IME animation being followed; an earlier one ending late leaves the keys alone. */
-        private var following: WindowInsetsAnimationCompat? = null
-
-        /** The keys' bottom on screen before the change (relative to the root). */
-        private var startBottom = 0f
-
-        /** How far from their place the keys start: below it as the IME shows, above as it hides. */
-        private var shift = 0f
-
-        override fun onPrepare(animation: WindowInsetsAnimationCompat) {
-            if (!isIme(animation)) return
-            following = animation
-            // Where they are drawn, which is not their place while an earlier animation ran
-            startBottom = keys.bottom + keys.translationY
-        }
-
-        override fun onStart(
-            animation: WindowInsetsAnimationCompat,
-            bounds: WindowInsetsAnimationCompat.BoundsCompat,
-        ): WindowInsetsAnimationCompat.BoundsCompat {
-            if (animation === following) {
-                shift = startBottom - keys.bottom
-                keys.translationY = shift
-            }
-            return bounds
-        }
-
-        override fun onProgress(
-            insets: WindowInsetsCompat,
-            runningAnimations: List<WindowInsetsAnimationCompat>,
-        ): WindowInsetsCompat {
-            following?.takeIf { it in runningAnimations }?.let {
-                keys.translationY = shift * (1 - it.interpolatedFraction)
-            }
-            return insets
-        }
-
-        override fun onEnd(animation: WindowInsetsAnimationCompat) {
-            if (animation !== following) return
-            following = null
-            keys.translationY = 0f
-        }
-
-        private fun isIme(animation: WindowInsetsAnimationCompat) =
-            animation.typeMask and WindowInsetsCompat.Type.ime() != 0
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
@@ -190,57 +115,10 @@ class MainActivity : Activity(), TerminalService.Listener {
         if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
             requestedTab = intent.getIntExtra(EXTRA_TAB, -1)
         }
-        screen = VtView(this, Host()).apply {
-            setFontSize(savedFontSize())
-            setBackgroundColor(Color.BLACK)
-        }
-        status = TextView(this).apply {
-            // In the muted colour of the bars' labels, read once onCreate has applied the
-            // wallpaper's colours (Android 12 and later)
-            setTextColor(themeColor(com.google.android.material.R.attr.colorOnSurfaceVariant))
-            gravity = Gravity.CENTER
-            setText(R.string.starting)
-        }
-        progressLine = ProgressLine(this)
-        tabBar = TabBarView(this, Bar())
-        searchBar = SearchBarView(this, Find()).apply { isVisible = false }
-        keys = ExtraKeysView(this, Keys())
-        // One bar's place: the search bar, as tall as the tab bar, stands in for it
-        val bars = FrameLayout(this).apply {
-            addView(tabBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(searchBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
-        val body = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            addView(screen)
-            addView(status)
-            addView(progressLine, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, line(), Gravity.TOP))
-        }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.BLACK)
-            // The extra keys are drawn in the IME's room while they follow it up (keysFollowIme)
-            clipToPadding = false
-            addView(bars, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(keys)
-        }
+        layout = TerminalLayout(this, savedFontSize(), Host(), Bar(), Find(), Keys())
         renderTabs()
-        // Content is drawn behind the system bars (the default for targetSdk 35 from Android 15 on;
-        // done here on every version): leave room for the system bars, the display cutout and the
-        // IME. From Android 15 on the window also reaches into the cutout, which in landscape is
-        // at a side, over the terminal's first or last columns
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
-            val room = insets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or
-                    WindowInsetsCompat.Type.ime(),
-            )
-            v.setPadding(room.left, room.top, room.right, room.bottom)
-            WindowInsetsCompat.CONSUMED
-        }
-        ViewCompat.setWindowInsetsAnimationCallback(root, keysFollowIme)
-        setContentView(root)
+        setContentView(layout.root)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -278,7 +156,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onStart() {
         super.onStart()
         // Settings may have changed it while this activity was stopped
-        screen.setFillWide(Settings.fillWide(this))
+        layout.screen.setFillWide(Settings.fillWide(this))
         val intent = Intent(this, TerminalService::class.java)
         startForegroundService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
@@ -293,28 +171,23 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     override fun onDestroy() {
         // Sessions outlive the Activity: do not leave them pointing at this view
-        screen.attach(null)
+        layout.screen.attach(null)
         super.onDestroy()
     }
 
     // ---- TerminalService.Listener ----
 
     override fun onProgress(text: String) {
-        screen.visibility = View.INVISIBLE
-        status.visibility = View.VISIBLE
-        status.text = text
+        layout.showStatus(text)
     }
 
     override fun onMachineReady(error: String?) {
         val s = service ?: return
         if (error != null) {
-            screen.visibility = View.INVISIBLE
-            status.visibility = View.VISIBLE
-            status.text = getString(R.string.start_failed, error)
+            layout.showStatus(getString(R.string.start_failed, error))
             return
         }
-        status.visibility = View.GONE
-        screen.visibility = View.VISIBLE
+        layout.showTerminal()
         if (showRequestedTab()) return
         if (s.sessions.isEmpty()) {
             newSession()
@@ -348,7 +221,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     }
 
     /** The program in the tab shown rang the bell (the service sends only those). */
-    override fun onBell() = screen.bell()
+    override fun onBell() = layout.screen.bell()
 
     /**
      * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
@@ -376,20 +249,20 @@ class MainActivity : Activity(), TerminalService.Listener {
                 clipboardQuestion = null
                 session.answerClipboardRead(if (allowed) text else null)
                 // The terminal takes the keyboard again
-                screen.requestFocus()
+                layout.screen.requestFocus()
             }
             .show()
     }
 
     /** A tab's progress or program status changed: its marks in the bar, the progress line. */
     override fun onTabStatus() {
-        tabBar.refreshStatus()
-        progressLine.show(current?.progress, jump = false)
+        layout.tabBar.refreshStatus()
+        layout.progressLine.show(current?.progress, jump = false)
     }
 
     /** Settings changed while this activity is visible too (split screen). */
     override fun onSettingsChanged() {
-        screen.setFillWide(Settings.fillWide(this))
+        layout.screen.setFillWide(Settings.fillWide(this))
     }
 
     /**
@@ -406,11 +279,9 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onRestarting() {
         closeSearch()
         current = null
-        progressLine.show(null, jump = true)
-        screen.attach(null)
-        screen.visibility = View.INVISIBLE
-        status.visibility = View.VISIBLE
-        status.setText(R.string.restarting)
+        layout.progressLine.show(null, jump = true)
+        layout.screen.attach(null)
+        layout.showStatus(getString(R.string.restarting))
     }
 
     override fun onExitAll() {
@@ -447,11 +318,11 @@ class MainActivity : Activity(), TerminalService.Listener {
         // A search belongs to the tab it was opened in
         closeSearch()
         current = session
-        progressLine.show(session.progress, jump = true)
+        layout.progressLine.show(session.progress, jump = true)
         service?.current = session
         // Starts the shell once the view knows the grid (Host.onGrid)
-        screen.attach(session)
-        screen.requestFocus()
+        layout.screen.attach(session)
+        layout.screen.requestFocus()
         renderTabs()
     }
 
@@ -463,7 +334,7 @@ class MainActivity : Activity(), TerminalService.Listener {
         val sessions = service?.sessions.orEmpty().toList()
         val shown = current?.takeIf { it in sessions }
         if (shown != null) currentIndex = sessions.indexOf(shown)
-        tabBar.render(sessions, shown)
+        layout.tabBar.render(sessions, shown)
     }
 
     // ---- The menu and closing tabs ----
@@ -484,7 +355,7 @@ class MainActivity : Activity(), TerminalService.Listener {
                 true
             }
             val terminal = current?.takeIf { it.tab != 0L }
-            menu.add(R.string.clear_screen).apply { isEnabled = terminal != null && !screen.altScreen }
+            menu.add(R.string.clear_screen).apply { isEnabled = terminal != null && !layout.screen.altScreen }
                 .setOnMenuItemClickListener {
                     terminal?.clear()
                     true
@@ -541,7 +412,7 @@ class MainActivity : Activity(), TerminalService.Listener {
             }
             .setNegativeButton(android.R.string.cancel, null)
             // The terminal takes the keyboard again
-            .setOnDismissListener { screen.requestFocus() }
+            .setOnDismissListener { layout.screen.requestFocus() }
             .show()
     }
 
@@ -565,8 +436,8 @@ class MainActivity : Activity(), TerminalService.Listener {
      */
     private fun openSearch() {
         if (current == null) return
-        tabBar.isVisible = false
-        searchBar.open()
+        layout.tabBar.isVisible = false
+        layout.searchBar.open()
         if (closeSearchOnBack == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
             val callback = OnBackInvokedCallback { closeSearch() }
             onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT, callback)
@@ -576,11 +447,11 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** Ends the search and brings the tab bar back; the terminal takes the keyboard again. */
     private fun closeSearch() {
-        if (!searchBar.isVisible) return
-        searchBar.isVisible = false
-        tabBar.isVisible = true
-        screen.endSearch()
-        screen.requestFocus()
+        if (!layout.searchBar.isVisible) return
+        layout.searchBar.isVisible = false
+        layout.tabBar.isVisible = true
+        layout.screen.endSearch()
+        layout.screen.requestFocus()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA) {
             (closeSearchOnBack as? OnBackInvokedCallback)?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         }
@@ -596,7 +467,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     @SuppressLint("GestureBackNavigation") // Android 16 and later: closeSearchOnBack
     @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
     override fun onBackPressed() {
-        if (searchBar.isVisible) {
+        if (layout.searchBar.isVisible) {
             closeSearch()
             return
         }
@@ -637,8 +508,8 @@ class MainActivity : Activity(), TerminalService.Listener {
             event.keyCode == KeyEvent.KEYCODE_T -> if (first) newSession()
             event.keyCode == KeyEvent.KEYCODE_W -> if (first) current?.let { close(it) }
             event.keyCode == KeyEvent.KEYCODE_F -> if (first) openSearch()
-            event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return screen.jumpToPrompt(-1)
-            event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return screen.jumpToPrompt(1)
+            event.keyCode == KeyEvent.KEYCODE_DPAD_UP -> return layout.screen.jumpToPrompt(-1)
+            event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN -> return layout.screen.jumpToPrompt(1)
             else -> return false
         }
         return true
@@ -722,64 +593,15 @@ class MainActivity : Activity(), TerminalService.Listener {
             getPreferences(MODE_PRIVATE).edit { putFloat(PREF_FONT_SIZE, fontPx / resources.displayMetrics.density) }
         }
 
-        override val ctrl: Boolean get() = keys.ctrl
-        override val alt: Boolean get() = keys.alt
-        override val shift: Boolean get() = keys.shift
+        override val ctrl: Boolean get() = layout.keys.ctrl
+        override val alt: Boolean get() = layout.keys.alt
+        override val shift: Boolean get() = layout.keys.shift
 
-        override fun modifiersUsed() = keys.modifiersUsed()
+        override fun modifiersUsed() = layout.keys.modifiersUsed()
 
-        override fun onSearchCount(total: Int, selected: Int) = searchBar.setCount(total, selected)
+        override fun onSearchCount(total: Int, selected: Int) = layout.searchBar.setCount(total, selected)
 
-        /**
-         * Opens web pages with Custom Tabs, other schemes as browsable intents, and guest files
-         * through the Files app's provider ([openFile]).
-         */
-        override fun onLink(uri: String) {
-            val link = uri.toUri()
-            if (link.scheme.equals("file", ignoreCase = true)) {
-                openFile(link)
-            } else if (link.scheme.equals("http", ignoreCase = true) ||
-                link.scheme.equals("https", ignoreCase = true)
-            ) {
-                val tab = CustomTabsIntent.Builder().build()
-                startViewer(
-                    tab.intent.setData(link).addCategory(Intent.CATEGORY_BROWSABLE),
-                    tab.startAnimationBundle,
-                )
-            } else {
-                startViewer(Intent(Intent.ACTION_VIEW, link).addCategory(Intent.CATEGORY_BROWSABLE))
-            }
-        }
-
-        /**
-         * A guest file from a program's `file:` link, opened as the Files app opens one, read-only;
-         * looked up off the main thread, since that reads the store ([Documents.fileLink]).
-         */
-        private fun openFile(link: Uri) {
-            thread(name = "appine-link") {
-                val found = Documents.fileLink(this@MainActivity, link)
-                runOnUiThread {
-                    if (isDestroyed) return@runOnUiThread
-                    when (found) {
-                        is Documents.FileLink.Found -> startViewer(
-                            Intent(Intent.ACTION_VIEW).setDataAndType(found.uri, found.mime)
-                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                        )
-                        is Documents.FileLink.Remote -> showToast(getString(R.string.link_remote_file, found.host))
-                        Documents.FileLink.Hidden -> showToast(getString(R.string.link_hidden_file), long = true)
-                        Documents.FileLink.Missing -> showToast(getString(R.string.link_missing_file))
-                    }
-                }
-            }
-        }
-
-        private fun startViewer(intent: Intent, options: Bundle? = null) {
-            try {
-                startActivity(intent, options)
-            } catch (e: ActivityNotFoundException) {
-                showToast(getString(R.string.link_no_app))
-            }
-        }
+        override fun onLink(uri: String) = links.open(uri)
     }
 
     /** Taps on the tab bar: a tab, its title, `×`, `+` and `⋮`. */
@@ -799,18 +621,18 @@ class MainActivity : Activity(), TerminalService.Listener {
 
     /** The search bar's text and buttons go to the view, which searches the current tab. */
     private inner class Find : SearchBarView.Target {
-        override fun search(needle: String) = screen.search(needle)
+        override fun search(needle: String) = layout.screen.search(needle)
 
-        override fun step(older: Boolean) = screen.searchStep(older)
+        override fun step(older: Boolean) = layout.screen.searchStep(older)
 
         override fun close() = closeSearch()
     }
 
     /** The extra keys go to the view, which reads the one-shot modifiers through [Host]. */
     private inner class Keys : ExtraKeysView.Target {
-        override fun key(keyCode: Int) = screen.press(keyCode)
+        override fun key(keyCode: Int) = layout.screen.press(keyCode)
 
-        override fun text(text: String) = screen.type(text)
+        override fun text(text: String) = layout.screen.type(text)
 
         override fun notice(text: String) = showToast(text)
     }

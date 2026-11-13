@@ -5,19 +5,20 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: license components sorted alphabetically by name, ignoring case)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: MainActivity delegates layout and IME animation to TerminalLayout and link opening to TerminalLinks)
 
 ## Responsibilities
 
 `android/terminal` is the terminal screen around the tabs' terminals (`android/vt`, drawn by
 `android/vtview`):
 
-- `MainActivity`: the screen's layout and status text, the tab shown and its successor, closing
+- `MainActivity`: the screen's lifecycle and status text, the tab shown and its successor, closing
   tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size and the
-  screen-on choice, insets and the IME's animation, opening links,
-  and the question whether a program may read the clipboard, with the tab bar (`TabBarView`), the
+  screen-on choice, and the question whether a program may read the clipboard, with the tab bar (`TabBarView`), the
   search bar in its place while searching (`SearchBarView`), the current tab's progress line over
   the terminal (`ProgressLine`) and the extra keys (`ExtraKeysView`);
+- `TerminalLayout`: the view hierarchy, status visibility, insets and the IME's animation;
+  `TerminalLinks`: opening web, mail and guest-file links, using the activity's shared toast queue;
 - `LicensesActivity`, `LicenseActivity` and `LicenseCatalog`: the static notices list and its offline HTML reader;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
@@ -27,8 +28,9 @@
   `list_item.xml`, and `preference_switch.xml` (Settings' MaterialSwitch with the standard
   AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
-Root: `MainActivity.kt`, `TabBarView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`,
-`ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`, `LicenseCatalog.kt` and `Ui.kt` in
+Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TabBarView.kt`, `TabNumber.kt`,
+`SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`,
+`LicenseCatalog.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
 
 Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
@@ -38,14 +40,20 @@ notice assets and the build (`android/native`).
 
 ## Key types
 
-- `MainActivity` — a `TerminalService.Listener` built in code: a black column of one bar's place
-  (`TabBarView`, or `SearchBarView` while searching), a frame with the `VtView`, a status line and
-  the `ProgressLine` along its top, and `ExtraKeysView`; adapters `Host : VtView.Host`,
+- `MainActivity` — a `TerminalService.Listener` with a `TerminalLayout` and `TerminalLinks`;
+  adapters `Host : VtView.Host`,
   `Bar : TabBarView.Target`, `Find : SearchBarView.Target` and `Keys : ExtraKeysView.Target`; the
   current session and its index, from which its successor is taken; a tab requested by a
-  notification (`EXTRA_TAB`); the IME animation callback `keysFollowIme`; Back's callback while
-  the search bar is open (`closeSearchOnBack`, Android 16 and later); the open question whether a
+  notification (`EXTRA_TAB`); Back's callback while the search bar is open (`closeSearchOnBack`,
+  Android 16 and later); the open question whether a
   program may read the clipboard (`clipboardQuestion`).
+- `TerminalLayout` — builds the views with the activity's adapters after dynamic colours are
+  applied: a black column of one bar's place (`TabBarView`, or `SearchBarView` while searching),
+  a frame with `VtView`, the status text and `ProgressLine` along its top, and `ExtraKeysView`;
+  exposes the root and interactive views, keeps the status view private behind `showStatus` and
+  `showTerminal`, and owns the IME animation callback `keysFollowIme`.
+- `TerminalLinks` — activity-scoped link routing through `open`, the guest-file lookup thread and
+  `startViewer`; keeps the activity and its toast callback, with no service or session state.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
@@ -105,9 +113,9 @@ notice assets and the build (`android/native`).
   recreated and was not opened from Recents: such an activity still has the intent that first
   started it), reads the font size (kept in dp as `font_size_dp`, so it scales with a display size
   change; a pixel size an earlier version kept as `font_size` is converted at the current density
-  and removed), applies the saved Keep screen on choice (off by default), builds the views
-  (the status line says "Starting…"), sets up insets and, on Android 13 and later, asks for the
-  notification permission. `onStart` applies the wide-cell
+  and removed), applies the saved Keep screen on choice (off by default), builds `TerminalLayout`
+  (the status line says "Starting…", insets and IME animation are wired there), installs its root
+  edge-to-edge and, on Android 13 and later, asks for the notification permission. `onStart` applies the wide-cell
   setting, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
@@ -299,7 +307,7 @@ notice assets and the build (`android/native`).
   (from Android 15 the window reaches into the cutout, which in landscape is at a side). As the IME
   shows or hides, the root is laid out for the end at once (the terminal regrids once, at the
   start) and the extra keys are drawn moving from their old place to the new one along the IME
-  animation's curve (`keysFollowIme`), rising through the IME's room or sinking over the
+  animation's curve (`TerminalLayout.keysFollowIme`), rising through the IME's room or sinking over the
   terminal's new rows; an animation that interrupts another starts from where the keys are drawn.
 
 ### The progress line
@@ -317,8 +325,9 @@ notice assets and the build (`android/native`).
 ### Links and the clipboard question
 
 - The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
-  link; which links count and which schemes open are android/vtview's). The activity opens HTTP and
-  HTTPS links with AndroidX Custom Tabs, without binding a browser package or session, and other
+  link; which links count and which schemes open are android/vtview's). The activity delegates to
+  `TerminalLinks.open`, which opens HTTP and HTTPS links with AndroidX Custom Tabs, without binding
+  a browser package or session, and other
   non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
   `startViewer` passes the Custom Tabs launch options and shows a toast if no app handles the link.
   A `file:` link (`ls --hyperlink`) is looked up off
@@ -326,6 +335,7 @@ notice assets and the build (`android/native`).
   document, typed by it and with read access granted: a directory in the Files app, a file in the
   app the system picks. A link from another host, outside the home while the whole system is not
   shown, or to nothing in the store gets a toast instead, as does a link no app takes.
+  The lookup result returns on the UI thread and is ignored if its activity has been destroyed.
 - A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
   the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as
   text and, when there is some, asks ("Let the program read the clipboard?", up to 300 characters
@@ -456,6 +466,9 @@ notice assets and the build (`android/native`).
   AppCompat forwards to the Material 3 colours (the handles are the primary colour).
   Theme.Material3 does not set the system bars' colours, which Android applies up to version 14,
   so `Theme.Appine.Terminal` sets them black, as the framework theme had them.
+- `TerminalLayout` must be built after dynamic colours are applied and assigned before attaching
+  its root to the window: its view adapters access the activity's layout once input, grid and
+  search callbacks begin. The activity still detaches the session on restart and destruction.
 - The system lays the window out with the IME's end insets as its animation starts, when it hides
   as well as when it shows, so without a `WindowInsetsAnimation` callback the extra keys jump
   there at once. The keys rising with the IME are drawn inside the root's bottom padding, which
