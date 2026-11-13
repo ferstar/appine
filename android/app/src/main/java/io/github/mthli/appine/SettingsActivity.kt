@@ -75,8 +75,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private var accounts: List<Rootfs.Account> = emptyList()
     private var accountLoad = 0
 
-    /** Only in debug builds: a release build always runs Tier 1 ([TerminalService.tier]). */
-    private var tier: Preference? = null
+    private lateinit var tier: Preference
     private lateinit var keepAwake: SwitchPreferenceCompat
     private lateinit var systemDocuments: SwitchPreferenceCompat
     private lateinit var fillWide: SwitchPreferenceCompat
@@ -114,7 +113,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             }
             Toast.makeText(requireContext(), getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
         }
-        if (BuildConfig.DEBUG) tier = action(R.string.settings_tier) { onTier() }
+        tier = action(R.string.settings_tier) { onTier() }
         keepAwake = toggle(R.string.settings_keep_awake, TerminalService::setKeepAwake)
         systemDocuments = toggle(R.string.settings_system_documents, TerminalService::setSystemDocuments)
         fillWide = toggle(R.string.settings_fill_wide, TerminalService::setFillWide)
@@ -134,7 +133,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, keepAwake, systemDocuments)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
-        tier?.let { group(R.string.settings_group_debug, it) }
+        group(R.string.settings_group_debug, tier)
         group(R.string.settings_group_about, licenses)
         render()
     }
@@ -299,7 +298,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOfNotNull(distro, reset, account, tier, keepAwake, systemDocuments,
+            for (row in listOf(distro, reset, account, tier, keepAwake, systemDocuments,
                 fillWide, cursorStyle, cursorBlink, volumeKeys)) row.isEnabled = false
             return
         }
@@ -318,7 +317,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         // Reset is possible even when the start failed: it is the only way to recover a broken
         // store
         reset.set(getString(R.string.reset_summary), s.canSwitch)
-        tier?.set(getString(if (s.tier == 0) R.string.tier_0 else R.string.tier_1), idle)
+        tier.set(getString(if (s.tier == 0) R.string.tier_0_summary else R.string.tier_1_summary), idle)
         account.entries = (listOf(getString(R.string.login_auto_choice), ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
         account.entryValues = (listOf(ConsolePty.LOGIN_AUTO, ConsolePty.LOGIN_ROOT) + accounts.map { it.name }).toTypedArray()
         account.value = s.login

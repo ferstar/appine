@@ -27,11 +27,10 @@ internal object Settings {
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /**
-     * The execution tier (see the engine map): 1 is Tier 1, 0 is the interpreter. A debug build
-     * takes it from Settings, effective at the next kernel start; a release build always runs Tier
-     * 1, ignoring a value recorded by an earlier debug install.
+     * The execution tier (see the engine map): 1 is Tier 1 (the default), 0 is the interpreter.
+     * Both debug and release builds use the saved choice, effective at the next kernel start.
      */
-    fun tier(context: Context): Int = if (BuildConfig.DEBUG) prefs(context).getInt(KEY_TIER, 1) else 1
+    fun tier(context: Context): Int = prefs(context).getInt(KEY_TIER, 1)
 
     fun setTier(context: Context, value: Int) = prefs(context).edit { putInt(KEY_TIER, value) }
 

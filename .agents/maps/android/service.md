@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `setMirror`, `autoMirror` and `measuring` are gone; the mirror thread runs only after an import and posts nothing)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: all builds read and save the execution tier, defaulting to Tier 1, and restart on a tier change)
 
 ## Responsibilities
 
@@ -22,7 +22,7 @@ outlives an Activity:
   lifecycle actions, and the routing of what programs ask of the app (bells, notifications,
   program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
   finish;
-- the settings state that the activities only display and forward (tier in debug builds,
+- the settings state that the activities only display and forward (tier in all builds,
   keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
   shape and blinking, whether the volume keys switch tabs, distro switch), the preferences
   kept in `Settings`.
@@ -73,7 +73,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   The service decides what is told (the tab in front, a message
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (always 1 in a release build), login, keep-awake, system documents, wide cells, the
+  tier (default 1 in all builds), login, keep-awake, system documents, wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default); `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
@@ -93,8 +93,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - Lifecycle: `onCreate`, `onStartCommand` (EXIT_ALL, CANCEL_SWITCH, TOGGLE_KEEP_AWAKE, COPY_REPORT;
   `START_NOT_STICKY`), `onBind`, `onTrimMemory`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
-  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier` (ignored in a release
-  build), `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
+  cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
+  `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
   `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
@@ -118,8 +118,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
   `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`, then
-  `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the setting in a debug
-  build and always 1 in a release build, whatever an earlier debug install recorded).
+  `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
+  all builds, defaulting to 1).
 - Back on the main thread it clears `starting`; if "exit all" came meanwhile it finishes the exit
   with the new kernel (`Native.stop`, not booted). On success: set `machine`, clear `progress`,
   refresh Files roots; a `pendingReplace` replaces the store at once; otherwise update the wake
@@ -165,7 +165,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   not treat it as the last tab closing), update the wake lock, cancel the poll and saves, release
   (hang up and free) every session and take its notification away, clear `sessions` and
   `unshown`; it runs before the kernel is shut down or stopped.
-- `restart` (guest reboot, tier change in a debug build; nothing without a kernel):
+- `setTier` ignores the current value; otherwise it saves the choice and calls `restart` in all
+  builds. `restart` (guest reboot or tier change; nothing without a kernel):
   `transitioning`, `detach`, `onRestarting`, shutdown on the worker, then `start(null)` (or, after
   "exit all" meanwhile, finish the exit); the UI opens a new tab when the new kernel is ready and
   no sessions exist.
@@ -293,7 +294,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   always for an Appine bug. OOM kills say whether the app's limit or a cgroup's `memory.max` (in
   MiB or GiB) was reached.
 - Bugs always notify with "copy report": app version and build, device (Android release and API,
-  maker and model, ABI, page size), distro and tier (always 1 in a release build), the kernel's
+  maker and model, ABI, page size), distro and the saved tier, the kernel's
   report line, its kernel log records (up to 10 earlier ones and the report's own, one per line of
   it), and under
   "Unimplemented paths reached" the 10 the guest reached most since boot, with a line for the rest
@@ -354,6 +355,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ## Invariants and gotchas
 
+- Debug and release builds share the saved tier preference; a Tier 0 choice from an earlier
+  debug install is also honoured by a release build when that preference is retained.
 - Calls that take the BKL in the background go through the single worker, so polls and saves are
   ordered before stop and shutdown; `Native.start` runs on `appine-start`, the boot calls on
   `appine-boot`, a tab's console opening on the main thread. A stale kernel handle is harmless

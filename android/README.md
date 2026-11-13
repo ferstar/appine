@@ -10,7 +10,8 @@ The Gradle project for the Android shell (design doc §3 and the `android/*` map
   picks the fastest mirror, and can replace it with Debian (downloaded and checked
   against a pinned sha256 digest). `SettingsActivity`, opened from the tab bar's menu,
   switches the distribution, resets the rootfs, chooses the package mirror, the login
-  account and, in debug builds only, the execution tier (release builds always run Tier 1).
+  account and the execution mode (Tier 1 by default; Tier 0 for troubleshooting in both debug
+  and release builds).
   Each tab runs `assets/login.sh` as root: it picks the
   login account (the first regular user by default), gives a regular user doas or sudo the
   first time it logs in (the doas package from `scripts/fetch-rootfs` is in the assets),

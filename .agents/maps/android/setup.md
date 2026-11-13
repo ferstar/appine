@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings uses AndroidX Preferences, with service-owned values and Material 3 switches and choice dialogs)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: execution mode is available in all builds, with separate summaries and choice labels)
 
 ## Responsibilities
 
@@ -49,7 +49,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
-  file is android/service's `Settings` (`tier`, read by debug builds only; `login`, `keep_awake`,
+  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `keep_awake`,
   `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
@@ -58,8 +58,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account and cursor shape). Groups: System (distro, login account,
   reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
-  cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (tier,
-  debug builds only) and About (licenses).
+  cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
+  mode, in all builds) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -301,8 +301,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - login account: whenever a store is installed and no switch runs, with a toast naming the
     account new tabs log in as;
   - reset: whenever a switch is possible;
-  - tier (debug builds only, `BuildConfig.DEBUG`; a release build always runs Tier 1): while the
-    kernel runs with no switch, a different tier asking to restart;
+  - execution mode (tier, in all builds): while the kernel runs with no switch, a different tier
+    asking to restart; the summary names the current mode and Tier number, with a slower hint
+    for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
   - keep-awake, system documents, CJK fill, cursor shape (Block, Bar or Underline, the summary
     naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
     by default): usable at any time; the service gives every tab the new cursor values at once
@@ -339,7 +340,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
-  proxy); `BuildConfig` (Alpine branch, debug); the assets; `TerminalService` and its
+  proxy); `BuildConfig` (Alpine branch); the assets; `TerminalService` and its
   `Listener` (Settings); `LicensesActivity`; Material Components and AndroidX (Settings).
 
 ## Invariants and gotchas

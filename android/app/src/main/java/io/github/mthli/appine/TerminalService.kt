@@ -86,7 +86,7 @@ class TerminalService : Service() {
         fun onNotice() {}
 
         /**
-         * About to restart: the guest's `reboot`, or (in a debug build) the execution tier changed
+         * About to restart: the guest's `reboot`, or the execution tier changed
          * in Settings. All sessions have ended; the kernel shuts down and starts again (followed by
          * [onMachineReady]).
          */
@@ -983,12 +983,9 @@ class TerminalService : Service() {
 
     val tier: Int get() = Settings.tier(this)
 
-    /**
-     * The execution tier was changed in Settings (debug builds only): record it and restart the
-     * kernel.
-     */
+    /** The execution tier was changed in Settings: record it and restart the kernel. */
     fun setTier(value: Int) {
-        if (!BuildConfig.DEBUG || value == tier) return
+        if (value == tier) return
         Settings.setTier(this, value)
         restart()
     }
@@ -1088,7 +1085,7 @@ class TerminalService : Service() {
     }
 
     /**
-     * Restart (the guest's `reboot`, or the execution tier changed in a debug build's Settings):
+     * Restart (the guest's `reboot`, or the execution tier changed in Settings):
      * shut down, then start a new kernel (after which the Activity opens new sessions).
      */
     private fun restart() {

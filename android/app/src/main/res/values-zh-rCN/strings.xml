@@ -72,7 +72,7 @@
     <string name="settings_group_about">关于</string>
     <string name="settings_distro">发行版</string>
     <string name="settings_reset">重置 rootfs</string>
-    <string name="settings_tier">执行层</string>
+    <string name="settings_tier">执行模式</string>
     <string name="switch_title">换成 %1$s？</string>
     <string name="switch_message">所有会话都会结束，rootfs 里的所有文件（包括 /root）都会删除，然后导入 %1$s。</string>
     <string name="switch_message_download">先在后台下载 %1$s（%2$d MB），这期间照常可以用现在的系统。下载好之后所有会话都会结束，rootfs 里的所有文件（包括 /root）都会删除。</string>
@@ -85,9 +85,11 @@
     <string name="switch_failed">无法准备 %1$s：%2$s\n\n已改用 %3$s。</string>
     <string name="reset_summary">删除所有文件并重新初始化 rootfs</string>
     <string name="tier_1">Tier 1：翻译执行（默认）</string>
-    <string name="tier_0">Tier 0：解释执行，慢几十倍，排查问题用</string>
+    <string name="tier_0">Tier 0：解释执行（较慢，用于排查问题）</string>
+    <string name="tier_1_summary">翻译执行 · Tier 1</string>
+    <string name="tier_0_summary">解释执行 · Tier 0（较慢）</string>
     <string name="restart_title">重启？</string>
-    <string name="restart_message">所有会话都会结束，然后以新的执行层重新启动。</string>
+    <string name="restart_message">所有会话都会结束，系统将以新的执行模式重新启动。</string>
     <string name="restart">重启</string>
     <string name="settings_keep_awake">熄屏时保持运行</string>
     <string name="keep_awake_on">熄屏后继续运行，更耗电</string>
