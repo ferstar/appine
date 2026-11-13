@@ -6,11 +6,15 @@ Run Alpine Linux as Android App 🤖
 
 ## Development
 
+Coding agents should start with [AGENTS.md](AGENTS.md). Shared module knowledge lives in
+[.agents](.agents).
+
 The architecture and the milestone plan are described in [docs/design](docs/design/README.md);
-how each subsystem works today is described in its map under [.claude/maps](.claude/maps)
-(modules are listed in [.claude/MODULES.md](.claude/MODULES.md)), and its design rationale in
-[.claude/decisions](.claude/decisions). Each milestone and round of work has a record in
-[docs/rounds](docs/rounds), indexed in [docs/milestones.md](docs/milestones.md).
+how each subsystem works today is described in its map under [.agents/maps](.agents/maps)
+(modules are listed in [.agents/MODULES.md](.agents/MODULES.md)), and its design rationale in
+[.agents/decisions](.agents/decisions). Historical rounds through round 208 are preserved in
+[docs/rounds](docs/rounds), indexed in [docs/milestones.md](docs/milestones.md); later changes
+are recorded in commits and module maps.
 
 The primary development host is Linux arm64. On macOS, `scripts/dev` runs a command in an
 arm64 Linux container (colima, OrbStack or Docker Desktop):

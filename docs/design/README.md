@@ -1,7 +1,7 @@
 # Appine design
 
 - **Status**: the design decisions were confirmed one by one in the design review of 2026-10-24. M0–M8 are done; M9 (release) is in progress, with real-device validation, the license obligations and the Play submission still to go (§14.1).
-- **Scope**: v1. Sections 1–13 describe how things work now and are updated with each round's changes; how a change came about, its measurements and its sources are recorded in the rounds (written in Chinese, indexed in [milestones.md](../milestones.md)). Subsystems are moving section by section to their module's map under `.claude/maps/` (modules are listed in [MODULES.md](../../.claude/MODULES.md)); a migrated section is removed from here and the section numbers stay.
+- **Scope**: v1. Sections 1–13 describe how things work now and are updated with each round's changes; how a change came about, its measurements and its sources are recorded in the rounds (written in Chinese, indexed in [milestones.md](../milestones.md)). Subsystems are moving section by section to their module's map under `.agents/maps/` (modules are listed in [MODULES.md](../../.agents/MODULES.md)); a migrated section is removed from here and the section numbers stay.
 - **In one sentence**: a **single-process** Android app that can ship on Google Play and runs unmodified Alpine Linux aarch64 user-space programs in its own process, with an interpreter and a same-ISA binary translator. Same idea as iSH; its Android counterpart.
 
 ## Contents
@@ -9,14 +9,14 @@
 1. [Goals and non-goals](#1-goals-and-non-goals)
 2. [Hard constraints](#2-hard-constraints)
 3. [Overall architecture](#3-overall-architecture)
-4. CPU engine, moved to the [engine map](../../.claude/maps/engine.md)
-5. Memory: a lightweight user-space soft-MMU, moved to the [kernel/mm map](../../.claude/maps/kernel/mm.md)
-6. Processes, threads and scheduling, moved to the [kernel/process map](../../.claude/maps/kernel/process.md)
-7. Signals and ABI, moved to the [kernel/signal map](../../.claude/maps/kernel/signal.md)
-8. File system, moved to the [kernel/store](../../.claude/maps/kernel/store.md), [kernel/vfs](../../.claude/maps/kernel/vfs.md) and [kernel/procfs](../../.claude/maps/kernel/procfs.md) maps
-9. TTY and terminal, moved to the [kernel/tty map](../../.claude/maps/kernel/tty.md); the terminal UI is in the [android/terminal](../../.claude/maps/android/terminal.md), [android/vt](../../.claude/maps/android/vt.md) and [android/vtview](../../.claude/maps/android/vtview.md) maps
-10. Networking, moved to the [kernel/net](../../.claude/maps/kernel/net.md), [kernel/netlink](../../.claude/maps/kernel/netlink.md), [kernel/netns](../../.claude/maps/kernel/netns.md), [kernel/unix](../../.claude/maps/kernel/unix.md) and [kernel/poll](../../.claude/maps/kernel/poll.md) maps
-11. Users, permissions and Android integration, moved to the [kernel/cred](../../.claude/maps/kernel/cred.md), [android/service](../../.claude/maps/android/service.md), [android/setup](../../.claude/maps/android/setup.md), [android/documents](../../.claude/maps/android/documents.md), [android/terminal](../../.claude/maps/android/terminal.md) and [android/native](../../.claude/maps/android/native.md) maps
+4. CPU engine, moved to the [engine map](../../.agents/maps/engine.md)
+5. Memory: a lightweight user-space soft-MMU, moved to the [kernel/mm map](../../.agents/maps/kernel/mm.md)
+6. Processes, threads and scheduling, moved to the [kernel/process map](../../.agents/maps/kernel/process.md)
+7. Signals and ABI, moved to the [kernel/signal map](../../.agents/maps/kernel/signal.md)
+8. File system, moved to the [kernel/store](../../.agents/maps/kernel/store.md), [kernel/vfs](../../.agents/maps/kernel/vfs.md) and [kernel/procfs](../../.agents/maps/kernel/procfs.md) maps
+9. TTY and terminal, moved to the [kernel/tty map](../../.agents/maps/kernel/tty.md); the terminal UI is in the [android/terminal](../../.agents/maps/android/terminal.md), [android/vt](../../.agents/maps/android/vt.md) and [android/vtview](../../.agents/maps/android/vtview.md) maps
+10. Networking, moved to the [kernel/net](../../.agents/maps/kernel/net.md), [kernel/netlink](../../.agents/maps/kernel/netlink.md), [kernel/netns](../../.agents/maps/kernel/netns.md), [kernel/unix](../../.agents/maps/kernel/unix.md) and [kernel/poll](../../.agents/maps/kernel/poll.md) maps
+11. Users, permissions and Android integration, moved to the [kernel/cred](../../.agents/maps/kernel/cred.md), [android/service](../../.agents/maps/android/service.md), [android/setup](../../.agents/maps/android/setup.md), [android/documents](../../.agents/maps/android/documents.md), [android/terminal](../../.agents/maps/android/terminal.md) and [android/native](../../.agents/maps/android/native.md) maps
 12. [Threat model](12-threat-model.md)
 13. [Engineering](13-engineering.md)
 14. [Milestones](14-milestones.md)
@@ -42,9 +42,9 @@
 | C difficult runtimes | static Go binaries, node/V8, JVM | **correct behavior, speed not required** |
 | D not promised | containers, init systems, kernel modules, X11/GUI | — |
 
-Classes A–C are all met. In class D, podman and docker (namespaces in the [kernel/process map](../../.claude/maps/kernel/process.md), the [kernel/netns map](../../.claude/maps/kernel/netns.md)) and OpenRC (PID 1 in the [kernel/process map](../../.claude/maps/kernel/process.md)) actually work; systemd, kernel modules and GUI are out of scope. strace and gdb work ([kernel/signal map](../../.claude/maps/kernel/signal.md)).
+Classes A–C are all met. In class D, podman and docker (namespaces in the [kernel/process map](../../.agents/maps/kernel/process.md), the [kernel/netns map](../../.agents/maps/kernel/netns.md)) and OpenRC (PID 1 in the [kernel/process map](../../.agents/maps/kernel/process.md)) actually work; systemd, kernel modules and GUI are out of scope. strace and gdb work ([kernel/signal map](../../.agents/maps/kernel/signal.md)).
 
-The default distribution is Alpine; settings can switch it to Debian 13 ([android/setup map](../../.claude/maps/android/setup.md)). glibc programs (manylinux wheels, Node.js prebuilt modules, rustup, OpenJDK) run without changes to the kernel layer.
+The default distribution is Alpine; settings can switch it to Debian 13 ([android/setup map](../../.agents/maps/android/setup.md)). glibc programs (manylinux wheels, Node.js prebuilt modules, rustup, OpenJDK) run without changes to the kernel layer.
 
 ### 1.3 Performance goals
 

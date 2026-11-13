@@ -1,4 +1,4 @@
-//! Guest address spaces (the kernel/mm map: `.claude/maps/kernel/mm.md`): a VMA table plus a
+//! Guest address spaces (the kernel/mm map: `.agents/maps/kernel/mm.md`): a VMA table plus a
 //! soft-MMU page table. Filling entries, keeping threads consistent and code groups are described
 //! by the kernel/mmu map, the resident-memory measures and `Mm::release` by the kernel/oom map.
 //!

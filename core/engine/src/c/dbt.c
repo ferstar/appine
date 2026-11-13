@@ -1,5 +1,5 @@
 /*
- * Tier 1: a same-ISA pass-through DBT (the engine map: `.claude/maps/engine.md`).
+ * Tier 1: a same-ISA pass-through DBT (the engine map: `.agents/maps/engine.md`).
  *
  * Register convention while translated code runs (this is the default set; Go programs use
  * another set, see struct regs):

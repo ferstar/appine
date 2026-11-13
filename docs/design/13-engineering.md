@@ -36,7 +36,7 @@ void appine_fault_guard_install(void);
 
 - On a FAULT exit, pc points at the faulting instruction, and `fault_addr`/`fault_access`/`fault_kind` give the address, the access type, and whether it was a page fault, an alignment fault or an SP alignment fault; the instruction has had no side effects.
 - A CODE exit means the guest executed `ic ivau`: pc already points at the next instruction, `fault_addr` is the address the instruction names, and the kernel layer records that page in the code invalidation log.
-- A HOST_FAULT exit means a bug in the engine itself made the host receive a fault signal ([engine map](../../.claude/maps/engine.md)): the guest state cannot be trusted, the kernel layer ends the process, and `appine_host_fault_last()` gives the details.
+- A HOST_FAULT exit means a bug in the engine itself made the host receive a fault signal ([engine map](../../.agents/maps/engine.md)): the guest state cannot be trusted, the kernel layer ends the process, and `appine_host_fault_last()` gives the details.
 
 The guest state (`struct appine_cpu`) holds `x[31]`, `sp`, `pc`, `nzcv`, `fpcr`, `fpsr`, `tpidr_el0`, `orig_x0`, the fault information, `exit_info`, the pending flags, the mmu pointer, the exclusive monitor (address, size, value read), a few fields Tier 1 uses internally (exit reason, jump cache, shadow return stack), the software TLB and the instruction-fetch TLB, and `v[32]` (128-bit). The fields that Tier 1's generated code addresses directly with immediate offsets come before the TLB. The Rust side mirrors the struct field by field, and `appine_cpu_layout_check()` verifies the layout in tests.
 

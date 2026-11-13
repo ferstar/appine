@@ -9,13 +9,13 @@ on:
   push:
     paths-ignore:
       - "docs/**"
-      - ".claude/**"
+      - ".agents/**"
       - "**.md"
       - "android/**"
   pull_request:
     paths-ignore:
       - "docs/**"
-      - ".claude/**"
+      - ".agents/**"
       - "**.md"
       - "android/**"
 
