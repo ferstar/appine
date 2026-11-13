@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the release's versionName, 1.0.0)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: bash and its libraries bundled beside doas, listed in the notices and covered by the released sources, and tests of bash as the login shell and of logins installing at once or after the user's apk)
 
 ## Responsibilities
 
@@ -14,7 +14,7 @@
 - the JNI library `libappine.so` (`hosts/android`): a handle table of kernels, one static function
   per kernel or store operation, error mapping, panic containment, stderr to logcat;
 - `Native.kt`, the Kotlin facade;
-- the Gradle build: the native library via cargo-ndk, the rootfs, doas and notice assets,
+- the Gradle build: the native library via cargo-ndk, the rootfs, bundled package and notice assets,
   per-variant features, SDK levels, packaging, warnings as errors;
 - building libghostty-vt, the terminal emulator, with Zig from its fetched source release;
 - the manifest and the debug source set;
@@ -47,8 +47,9 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   `rootfsAsset` shared by all variants), `NoticesTask` (one per variant,
   `generateNotices<Variant>`), the first and last on `CargoTask` (the workspace and which cargo
   to run); helpers `byVersion` (compares file names by their runs of digits, then by how many
-  runs), `newestFetched` (the newest file in `target/rootfs` whose name matches) and
-  `alpineBranch` (from the tarball's name, `edge` without one).
+  runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
+  (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
+  and `alpineBranch` (from the tarball's name, `edge` without one).
 - `MachineTest` — the only instrumentation test class.
 
 ## Public entry points
@@ -163,8 +164,9 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
-  since AAPT would unpack `.gz`) and the newest `doas.apk` (both by `byVersion`; `rootfsAsset`
-  fails with "run scripts/fetch-rootfs first" when either is missing), generated `notices/`, and
+  since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
+  with their own file names (all by `byVersion`; `rootfsAsset` fails with "run
+  scripts/fetch-rootfs first" when any is missing), generated `notices/`, and
   the terminal font (`fonts/`, `android/vtview`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
 - SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
@@ -183,7 +185,9 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   terminal's components with their texts from `android/licenses/` (libghostty-vt 1.0.0, uucode
   with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
   translate-c, Zig's compiler_rt, JetBrains Mono's OFL); Alpine (each package's version, licence, origin and commit
-  from the tarball's `lib/apk/db/installed`, plus doas's `.PKGINFO`); the Android libraries on the
+  from the tarball's `lib/apk/db/installed`, then the bundled packages' from their `.PKGINFO`, doas
+  and bash's four in sections of their own, all counted in the entry's package count and
+  licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
   texts of GPL-3.0, GPL-2.0, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
   file), which `LicensesActivity` reads.
@@ -217,8 +221,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   `libghostty-vt-<version>-deps.tar.gz` (the release and its Zig packages, copied as
   `fetch-ghostty` checked them; together about 10 MB), and
   `alpine-<version>-gpl-sources.tar` (uncompressed, with a README listing the packages).
-- The Alpine part takes the tarball `scripts/fetch-rootfs` prints last, picks packages whose
-  licence line in `lib/apk/db/installed` contains `GPL` (LGPL included), downloads each origin's
+- The Alpine part takes the tarball `scripts/fetch-rootfs` prints last and the bundled packages
+  it prints before it, picks packages whose licence (the tarball's `lib/apk/db/installed`, each
+  package's `.PKGINFO`) contains `GPL` (LGPL included; so bash and readline, not doas or ncurses),
+  downloads each origin's
   aports directory at its commit (GitLab archive of `main/<origin>`), and for every file in the
   APKBUILD's `sha512sums` hashes the copy in that directory or fetches it from Alpine's distfiles
   mirror (the branch's directory, then `edge`); any miss or mismatch stops the script. APKBUILDs
@@ -231,13 +237,15 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   each handle and `@After` stops them; tests change guest files, accounts and preferences and put
   them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
   trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
-  the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas, NOPASSWD
+  the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
   rules following a password set later, saved tabs, the Files provider (home, no home, writes,
   changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
   mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
-  the notices. Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
+  the notices, prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
+  new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
+  install, the `/bin/sh` fallback, bash's marks and nested shells'). Only `downloadedDistributionsRun` (about 50 MB of Debian, its own store) downloads
   from the internet, behind the `network=true` argument; `routesComeFromLinkProperties` has no
   gate but fails without a default network with an IPv4 gateway.
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
@@ -287,10 +295,13 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - The K2 compiler reports unused variables and never-read assignments only with its extra
   warnings, which are off: they flag a variable read only by a local function as never read.
 - The instrumentation tests are not isolated from the app: they use its store, preferences and
-  saved tabs (a store switched to another distribution breaks the Alpine assertions).
+  saved tabs (a store switched to another distribution breaks the Alpine assertions). Root logs
+  in with bash on a store this version imported and with busybox ash on an older one, so
+  assertions on a command's output in a login go through `plain`, which drops control sequences
+  and CRs (bash puts its marks and bracketed paste right before the output).
 - `release-sources` relies on `fetch-ghostty` printing `fetch-ghostty: <source>` with the two
   tarballs at `<source>.tar.gz` and `<source>-deps.tar.gz`, and on `fetch-rootfs` printing the
-  tarball's path last.
+  bundled packages' paths (ending in `.apk`) and the tarball's path last.
 
 ## Confirmed bugs / technical debt
 
@@ -303,17 +314,16 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   to start, fd 2 is already the pipe and nobody reads it, so stderr writes block once it fills.
 - `scripts/fetch-ghostty` checks only the pinned sha256s; the release's minisign signatures are to
   be checked by hand once when upgrading, before pinning the new sha256s.
-- `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball while the
-  APK bundles the newest tarball in `target/rootfs`, so the two can differ; it publishes nothing for
-  the bundled `doas.apk`; its aports path is fixed to `main/`; and it vendors the whole workspace
-  although its header speaks of the crates linked into the app.
+- `scripts/release-sources` takes the Alpine sources from `fetch-rootfs`'s pinned tarball and
+  packages while the APK bundles the newest ones in `target/rootfs`, so the two can differ; its
+  aports path is fixed to `main/`; and it vendors the whole workspace although its header speaks
+  of the crates linked into the app.
 
 ## Open questions
 
 - Should browse errors other than a missing file (`EEXIST`, `EACCES`, `ENOSPC`) surface as
   `FileNotFoundException`?
-- Is the release variant meant to ship as configured, and should `doas.apk`'s sources be
-  published with the Alpine ones?
+- Is the release variant meant to ship as configured?
 
 ## To verify
 

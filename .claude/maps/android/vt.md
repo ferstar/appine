@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-13 (targeted verification only since the split; latest change: the pump reads output in runs by writer, and a background job's output at ash's prompt no longer ends the input or starts command timing, and is marked as output)
+> Maintained: 2026-11-13 (targeted verification only since the split; latest change: bash is the login shell of new Alpine systems, and a nested bash there marks its prompts too)
 
 ## Responsibilities
 
@@ -320,7 +320,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   input read through vt.c's shell integration functions; a mouse's Ctrl+triple-click selects a
   command's output through libghostty-vt's selection gesture, and a right-click looks for one for
   the menu's Select output. A shell without the marks (zsh on Debian, dash, mksh, tcsh, elvish, a
-  nested non-login shell other than busybox ash, a remote one over ssh that sends none) leaves every cell output: it is
+  nested non-login shell other than busybox ash and, on Alpine, bash, a remote one over ssh that sends none) leaves every cell output: it is
   never at a prompt, there is nothing to jump to and no output to select, and no command is timed.
 - A prompt start or prompt mark (OSC 133;A or P, on the primary screen) with `appine_lf=output`
   has `appine_vt_feed` read the shell's line feeds from there on, outside OSC and DCS strings,
@@ -375,7 +375,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 - android/service through `VtSession`'s `Events`, posted on the main thread; android/vtview through
   `VtSession.view` (an invalidate on output, `onStarted`); `Native` (`openConsole`, `spawn`,
   `write`, `closeConsole`, `waitFor`, `consoleCwd`), hence the kernel's host console; `login.sh`,
-  and the prompt marks of android/setup's profile (`profile.sh`).
+  and the prompt marks of android/setup's profile (`profile.sh` and the files it has the shells
+  read).
 - libghostty-vt 1.0.0, Ghostty's terminal library released apart from the app (the terminal
   state and its full reset, the default cursor's shape and blinking, writes that stop at OSC and
   DCS strings' starts and ends, render state with one overscan row, key and mouse encoders, paste,
@@ -549,7 +550,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   SIGWINCH (bash's marks ask for the last row only, `redraw=last`, as readline redraws). busybox
   ash, bash and zsh redraw on every resize, rows only included; a shell given the marks that did not
   would lose its prompt and typed input until the next one.
-- Shell integration lives in the guest (`/etc/profile.d/appine.sh`): a tab's behaviour (closing
+- Shell integration lives in the guest (`/etc/profile.d/appine.sh` and the files it has the shells
+  read): a tab's behaviour (closing
   without asking, jumps, Select output) follows whatever the shell in it sends, so a user's own
   prompt or shell changes it, and a remote shell over ssh can send marks too.
 - Text the app prints does not consume the title-changed flag, so a title it sets is reported at
@@ -559,7 +561,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 ## Confirmed bugs / technical debt
 
 - **Shell integration is partial**: the profile marks prompts only for bash, busybox ash and zsh
-  (not for nested non-login shells other than ash, or zsh on Debian, whose zprofile does not read `/etc/profile`;
+  (not for nested non-login shells other than ash and, on Alpine, bash, or zsh on Debian, whose
+  zprofile does not read `/etc/profile`;
   fish and nushell mark their own); zsh's right prompt counts as input and the later rows of a PS1
   of several lines are not continuation rows; after a background
   job's output at ash's prompt, a tap on a row above the one the input resumed on counts arrow
@@ -601,8 +604,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
 - Tried only on a Pixel 4a API 34 emulator (4 KB pages) and through vt.c's harnesses on a macOS
   build, where the figures for scrollback rows and memory also come from; not on real or 16 KB-page
   devices. Unverified beyond that:
-  - shell integration: bash's and zsh's marks in the app, and those fish 4.6 and nushell 0.104 send
-    themselves (all seen only in containers); the console's password state at sudo, passwd, ssh or
+  - shell integration: zsh's marks in the app, bash's on Debian (on Alpine only closing a tab at
+    its prompt was tried), and those fish 4.6 and nushell 0.104 send themselves (all seen only in
+    containers); the console's password state at sudo, passwd, ssh or
     doas prompts;
   - output: progress and status from real programs (cargo, systemd, AI coding CLIs); the copy toast
     on Android 12 and earlier; tmux -CC with versions other than 3.5a and 3.7c; how programs that

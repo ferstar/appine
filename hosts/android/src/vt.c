@@ -1411,10 +1411,10 @@ void appine_vt_scroll(AppineVt *vt, int32_t delta) {
 
 // ---- Shell integration ----
 //
-// The shells' prompt marks (OSC 133, sent by /etc/profile.d/appine.sh for bash, busybox ash and
-// zsh) tell libghostty-vt which rows are prompts and which cells are a prompt, the input typed at
-// it or a command's output. Without them there are no prompts: the cursor is never at one, there
-// is nothing to scroll to, and no output to select.
+// The shells' prompt marks (OSC 133, sent for bash, busybox ash and zsh by /etc/profile.d/appine.sh
+// and the files it has them read) tell libghostty-vt which rows are prompts and which cells are a
+// prompt, the input typed at it or a command's output. Without them there are no prompts: the
+// cursor is never at one, there is nothing to scroll to, and no output to select.
 
 // Whether the cursor is at the shell's prompt or in the input typed at it, on the primary screen:
 // no command runs in the foreground, as far as the marks tell (closing the tab then ends nothing

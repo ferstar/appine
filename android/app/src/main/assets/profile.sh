@@ -7,8 +7,10 @@
 # without asking, Ctrl+Shift+Up and Down scroll to the previous and the next prompt, a long press
 # in a command's output offers to select all of it, and a tap on the command being typed moves the
 # cursor there (cl=line: the terminal sends left and right arrows). bash and zsh put the marks back
-# around whatever PS1 is before each prompt; ash gets them from /etc/profile.d/appine.ashrc, which
-# ENV names so that ash reads it again after ~/.profile and in nested shells.
+# around whatever PS1 is before each prompt: bash from /etc/profile.d/appine.bashrc, which this file
+# reads, and on Alpine every interactive bash too (/etc/bash/appine.sh), so nested ones are marked;
+# ash gets them from /etc/profile.d/appine.ashrc, which ENV names so that ash reads it again after
+# ~/.profile and in nested shells.
 cat /etc/motd 2>/dev/null
 export TERM=xterm-256color
 export LANG=C.UTF-8
@@ -19,23 +21,9 @@ if [ -z "${ENV-}" ] && [ -r /etc/profile.d/appine.ashrc ]; then
     export ENV=/etc/profile.d/appine.ashrc
 fi
 if [ -n "${BASH_VERSION-}" ]; then
+    # Its marks come from appine.bashrc, which puts them around whatever PS1 is before each prompt
     PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
-    # Before each prompt: the end of the last command with its status (D), then the prompt's start
-    # on a fresh line (A; readline redraws only the prompt's last line, and moves the cursor with
-    # the arrows); the marks around PS1 (P, B: the input starts) and PS2, and the start of the
-    # output (C, from PS0), are added again whenever something replaced them
-    __appine_prompt() {
-        local status=$?
-        printf '\033]133;D;%s\007\033]133;A;redraw=last;cl=line\007' "$status"
-        case $PS1 in *'133;B'*) ;; *) PS1='\[\e]133;P;k=i\a\]'$PS1'\[\e]133;B\a\]' ;; esac
-        case ${PS2-} in *'133;B'*) ;; *) PS2='\[\e]133;P;k=s\a\]'${PS2-}'\[\e]133;B\a\]' ;; esac
-        case ${PS0-} in *'133;C'*) ;; *) PS0=${PS0-}'\e]133;C\a' ;; esac
-        return "$status"
-    }
-    case ${PROMPT_COMMAND-} in
-    *__appine_prompt*) ;;
-    *) PROMPT_COMMAND="__appine_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
-    esac
+    if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 elif [ -n "${BB_ASH_VERSION-}" ]; then
     # ash runs nothing before a command or a prompt, so its marks are in PS1 and PS2 themselves:
     # appine.ashrc puts them there, now and again when ash reads ENV

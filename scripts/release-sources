@@ -7,9 +7,10 @@
 #   appine-<commit>.tar.gz            Appine itself (git archive HEAD; an error when the work tree
 #                                     has changes)
 #   appine-<commit>-vendor.tar.gz     cargo vendor: the crates statically linked into the app
-#   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK: each
-#                                     one's directory at its aports commit (APKBUILD, patches) and
-#                                     the upstream sources
+#   alpine-<version>-gpl-sources.tar  the GPL packages of the Alpine minirootfs in the APK and of
+#                                     the packages bundled beside it (bash, readline): each one's
+#                                     directory at its aports commit (APKBUILD, patches) and the
+#                                     upstream sources
 #   libghostty-vt-<version>.tar.gz    the libghostty-vt source release the terminal is built
 #                                     from, as published (sha256 checked by fetch-ghostty)
 #   libghostty-vt-<version>-deps.tar.gz
@@ -64,8 +65,10 @@ for tarball in "$src.tar.gz" "$src-deps.tar.gz"; do
     echo "$out/$(basename "$tarball")"
 done
 
-# ---- The GPL packages in the Alpine minirootfs ----
-tarball=$("$root/scripts/fetch-rootfs" | tail -n 1)
+# ---- The GPL packages in the Alpine minirootfs and among the packages bundled beside it ----
+# fetch-rootfs prints the bundled packages, then the tarball
+fetched=$("$root/scripts/fetch-rootfs")
+tarball=$(printf '%s\n' "$fetched" | tail -n 1)
 version=$(basename "$tarball" | sed -n 's/^alpine-minirootfs-\([0-9.]*\)-.*/\1/p')
 branch=v${version%.*}
 name=alpine-$version-gpl-sources
@@ -77,6 +80,14 @@ tar -xzOf "$tarball" lib/apk/db/installed | awk -F: '
     /^o:/ { o = substr($0, 3) } /^c:/ { c = substr($0, 3) }
     /^$/ { if (p != "") print p, v, o, c, l; p = "" }
     END { if (p != "") print p, v, o, c, l }' >"$work/packages"
+# The bundled packages, from each one's .PKGINFO (in the second of its three concatenated gzip
+# parts: signature, control information, data)
+printf '%s\n' "$fetched" | grep '\.apk$' | while read -r apk; do
+    tar -xzOf "$apk" .PKGINFO | awk -F' = ' '
+        $1 == "pkgname" { p = $2 } $1 == "pkgver" { v = $2 } $1 == "license" { l = $2 }
+        $1 == "origin" { o = $2 } $1 == "commit" { c = $2 }
+        END { print p, v, o, c, l }'
+done >>"$work/packages"
 grep 'GPL' "$work/packages" >"$work/gpl" || true
 if [ ! -s "$work/gpl" ]; then
     echo "release-sources: no GPL packages in $tarball?" >&2
@@ -84,10 +95,11 @@ if [ ! -s "$work/gpl" ]; then
 fi
 {
     echo "Source code of the GPL-licensed packages in the Alpine Linux $version minirootfs"
-    echo "that the Appine app bundles ($(basename "$tarball")). Each directory holds the"
-    echo "package's directory in Alpine's aports repository at the given commit (the"
-    echo "APKBUILD and patches) and the upstream sources that the APKBUILD names, checked"
-    echo "against its sha512sums."
+    echo "that the Appine app bundles ($(basename "$tarball")) and among the Alpine"
+    echo "packages it bundles beside it, which it installs in the system. Each directory"
+    echo "holds the package's directory in Alpine's aports repository at the given commit"
+    echo "(the APKBUILD and patches) and the upstream sources that the APKBUILD names,"
+    echo "checked against its sha512sums."
     echo
     echo "package version origin aports-commit license"
     cat "$work/gpl"

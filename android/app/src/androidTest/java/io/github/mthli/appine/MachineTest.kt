@@ -101,6 +101,16 @@ class MachineTest {
     }
 
     /**
+     * [out] without control sequences (CSI, ESC 7 and 8, OSC ended by BEL) and carriage returns,
+     * so a command's output is on lines of its own: bash puts its prompt marks and bracketed paste
+     * right before it.
+     */
+    private fun plain(out: String) = out
+        .replace(Regex("""\u001b\][^\u0007]*\u0007"""), "")
+        .replace(Regex("""\u001b\[[0-?]*[ -/]*[@-~]|\u001b[78]"""), "")
+        .replace("\r", "")
+
+    /**
      * Runs the login script like [login] (choosing the account automatically), but interactively
      * step by step: each step waits up to two minutes for `wait` to appear in the output (after the
      * point the previous step waited for), then types `send`. Returns all the output.
@@ -314,30 +324,80 @@ class MachineTest {
     }
 
     /**
-     * The profile gives the login shell (busybox ash) its shell integration (the android/vt
-     * map): each prompt reports the last command's status (OSC 133 D) and starts the prompt (A,
-     * whose cursor taps move with the arrows, and which asks the terminal to read ash's line feeds),
-     * the typed command starts after it (B), and continuation lines are secondary prompts. The marks come from the file ENV
-     * names (the android/setup map).
+     * The profile gives busybox ash as the login shell (root's here, as on the systems imported
+     * before bash was the login shell; [newSystemsLogInWithBash] has bash's) its shell integration
+     * (the android/vt map): each prompt reports the last command's status (OSC 133 D) and starts
+     * the prompt (A, whose cursor taps move with the arrows, and which asks the terminal to read
+     * ash's line feeds), the typed command starts after it (B), and continuation lines are
+     * secondary prompts. The marks come from the file ENV names (the android/setup map).
      */
     @Test
     fun profileMarksPrompts() {
         val machine = start(1)
-        val out = login(machine, "false\nfor i in 1; do\ntrue; done\nexit\n", ConsolePty.LOGIN_ROOT)
-        assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;cl=line;appine_lf=output\u0007"))
-        assertTrue(out, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007.*# \u001b]133;B\u0007""").containsMatchIn(out))
-        assertTrue(out, out.contains("\u001b]133;P;k=s;appine_lf=output\u0007> \u001b]133;B\u0007"))
-        // The loop's status, after its continuation line
-        assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))
-        // A prompt that ~/.profile sets gets the marks when ash reads ENV after it, and so does a
-        // nested ash, which reads no profile
+        val shell = sh(machine, "awk -F: '\$1 == \"root\" { print \$7 }' /etc/passwd").first.trim()
+        assertEquals("" to 0, sh(machine, "sed -i '1s|:[^:]*\$|:/bin/sh|' /etc/passwd"))
         try {
-            sh(machine, "echo 'PS1=\"mine> \"' > /root/.profile")
-            val own = login(machine, "ash\nexit\nexit\n", ConsolePty.LOGIN_ROOT)
-            assertTrue(own, own.contains("\u001b]133;A;cl=line;appine_lf=output\u0007mine> \u001b]133;B\u0007"))
-            assertTrue(own, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007[^\u001b]*# \u001b]133;B\u0007""").containsMatchIn(own))
+            val out = login(machine, "false\nfor i in 1; do\ntrue; done\nexit\n", ConsolePty.LOGIN_ROOT)
+            assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;cl=line;appine_lf=output\u0007"))
+            assertTrue(out, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007.*# \u001b]133;B\u0007""").containsMatchIn(out))
+            assertTrue(out, out.contains("\u001b]133;P;k=s;appine_lf=output\u0007> \u001b]133;B\u0007"))
+            // The loop's status, after its continuation line
+            assertTrue(out, out.contains("true; done\n\u001b]133;D;0\u0007"))
+            // A prompt that ~/.profile sets gets the marks when ash reads ENV after it, and so does
+            // a nested ash, which reads no profile
+            try {
+                sh(machine, "echo 'PS1=\"mine> \"' > /root/.profile")
+                val own = login(machine, "ash\nexit\nexit\n", ConsolePty.LOGIN_ROOT)
+                assertTrue(own, own.contains("\u001b]133;A;cl=line;appine_lf=output\u0007mine> \u001b]133;B\u0007"))
+                assertTrue(own, Regex("""\u001b]133;A;cl=line;appine_lf=output\u0007[^\u001b]*# \u001b]133;B\u0007""").containsMatchIn(own))
+            } finally {
+                sh(machine, "rm -f /root/.profile")
+            }
         } finally {
-            sh(machine, "rm -f /root/.profile")
+            sh(machine, "sed -i '1s|:[^:]*\$|:$shell|' /etc/passwd")
+        }
+    }
+
+    /**
+     * A system imported from Alpine logs in with bash (the android/setup map): root's shell is
+     * /bin/bash, and while the packages the app bundles are missing (moved away here) the login
+     * uses /bin/sh; the next login with them installs them offline and deletes them. bash's
+     * prompts have its marks (D with the status, then A; P and B around PS1; C from PS0), a nested
+     * bash marks its own through Alpine's bashrc and a nested sh has ash's, and an account adduser
+     * makes from there gets bash. Imports into a store of its own.
+     */
+    @Test
+    fun newSystemsLogInWithBash() {
+        val store = File(context.cacheDir, "store-bash")
+        store.deleteRecursively()
+        Rootfs.prepare(context, Rootfs.Distro.ALPINE, store = store)
+        val machine = Native.start(store.path, 1)
+        try {
+            assertEquals("" to 0, sh(machine, "mv /var/cache/appine/bash /var/cache/appine/bash.off"))
+            val fallback = plain(login(machine, "echo shell=\$0\nexit\n", ConsolePty.LOGIN_ROOT))
+            assertTrue(fallback, fallback.contains("\nshell=/bin/sh\n"))
+            assertEquals("" to 0, sh(machine, "mv /var/cache/appine/bash.off /var/cache/appine/bash"))
+            val out = login(
+                machine,
+                "echo shell=\$0 \$BASH_VERSION\nfalse\nbash\nexit\nsh\nexit\n" +
+                    "adduser -D bob; grep ^bob: /etc/passwd\n" +
+                    "[ -e /var/cache/appine/bash ] || echo bundle-gone; grep -qx bash /etc/apk/world && echo in-world\n" +
+                    "exit\n",
+                ConsolePty.LOGIN_ROOT,
+            )
+            val text = plain(out)
+            assertTrue(out, text.contains("\nshell=/bin/bash 5."))
+            assertTrue(out, out.contains("\u001b]133;D;1\u0007\u001b]133;A;redraw=last;cl=line\u0007"))
+            assertTrue(out, Regex("""\u001b]133;P;k=i\u0007.*# \u001b]133;B\u0007""").containsMatchIn(out))
+            assertTrue(out, out.contains("\u001b]133;C\u0007"))
+            // The nested bash's prompt (Alpine's, without colours) and the nested sh's
+            assertTrue(out, Regex("""\u001b]133;P;k=i\u0007[^\u001b]*# \u001b]133;B\u0007""").containsMatchIn(out))
+            assertTrue(out, out.contains("\u001b]133;A;cl=line;appine_lf=output\u0007"))
+            assertTrue(out, text.contains(":/home/bob:/bin/bash\n"))
+            assertTrue(out, text.contains("\nbundle-gone\n") && text.contains("\nin-world\n"))
+        } finally {
+            Native.stop(machine)
+            store.deleteRecursively()
         }
     }
 
@@ -351,9 +411,9 @@ class MachineTest {
         Rootfs.ensureLoginTools(context)
         val machine = start(1)
         try {
-            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/etc").contains("\n/etc\n"))
-            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/no/such/dir").contains("\n/root\n"))
-            assertTrue(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT).contains("\n/root\n"))
+            assertTrue(plain(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/etc")).contains("\n/etc\n"))
+            assertTrue(plain(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT, "/no/such/dir")).contains("\n/root\n"))
+            assertTrue(plain(login(machine, "pwd; exit\n", ConsolePty.LOGIN_ROOT)).contains("\n/root\n"))
             assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
             assertTrue(login(machine, "pwd; exit\n", "alice", "/usr/share").contains("\n/usr/share\n"))
             val denied = login(machine, "pwd; exit\n", "alice", "/root")
@@ -380,7 +440,7 @@ class MachineTest {
         val machine = start(1)
         val show = "id -un; id -nG; doas -n id -un; exit\n"
         try {
-            assertTrue(login(machine, "id -un; exit\n").contains("\nroot\n"))
+            assertTrue(plain(login(machine, "id -un; exit\n")).contains("\nroot\n"))
             assertEquals(0, sh(machine, "adduser -D -s /bin/sh alice").second)
             assertEquals(listOf("alice"), Rootfs.regularAccounts(context).map { it.name })
             val first = login(machine, show)
@@ -390,9 +450,63 @@ class MachineTest {
             val withPassword = login(machine, show)
             assertFalse(withPassword, withPassword.contains("can become root"))
             assertTrue(withPassword, withPassword.contains("doas: Authentication required"))
-            assertTrue(login(machine, "id -un; exit\n", ConsolePty.LOGIN_ROOT).contains("\nroot\n"))
-            val missing = login(machine, "id -un; exit\n", "bob")
+            assertTrue(plain(login(machine, "id -un; exit\n", ConsolePty.LOGIN_ROOT)).contains("\nroot\n"))
+            val missing = plain(login(machine, "id -un; exit\n", "bob"))
             assertTrue(missing, missing.contains("there is no user bob") && missing.contains("\nroot\n"))
+        } finally {
+            sh(
+                machine,
+                "deluser --remove-home alice; apk del -q --no-network --repositories-file /dev/null doas; " +
+                    "rm -rf /var/lib/appine /etc/doas.d",
+            )
+        }
+    }
+
+    /**
+     * Two tabs logging in at once as an admin without doas yet both install it (the android/setup
+     * map): the login script's installs take turns, as apk fails at once on the lock another apk
+     * holds, which left one tab with apk's errors and "not installed yet". While an apk the user
+     * runs holds that lock, the login says so, waits for it and then installs.
+     */
+    @Test
+    fun loginsInstallOneAtATime() {
+        Rootfs.ensureLoginTools(context)
+        val machine = start(1)
+        try {
+            assertEquals(
+                0,
+                sh(
+                    machine,
+                    "adduser -D -s /bin/sh alice && addgroup alice wheel && mkdir -p /var/lib/appine && " +
+                        "echo alice > /var/lib/appine/admins",
+                ).second,
+            )
+            val outs = arrayOfNulls<String>(2)
+            val logins = outs.indices.map { i -> thread { outs[i] = plain(login(machine, "command -v doas; exit\n", "alice")) } }
+            logins.forEach { it.join() }
+            for (out in outs.map { it.orEmpty() }) {
+                assertFalse(out, out.contains("Unable to lock") || out.contains("not installed yet"))
+                assertTrue(out, out.contains("\n/usr/bin/doas\n"))
+            }
+            // The user's apk: a process holding apk's lock for 3 s from before the login
+            assertEquals(
+                0,
+                sh(machine, "apk del -q --no-network --repositories-file /dev/null doas && rm -f /var/lib/appine/doas-installed").second,
+            )
+            val holder = Native.spawn(
+                machine, -1, "/bin/sh",
+                arrayOf("sh", "-c", "flock /lib/apk/db/lock sh -c 'touch /tmp/apk-held; sleep 3'; rm -f /tmp/apk-held"),
+                ConsolePty.ENVIRONMENT,
+            )
+            assertEquals(
+                0,
+                sh(machine, "i=0; while [ ! -e /tmp/apk-held ] && [ \$i -lt 100 ]; do sleep 0.05; i=\$((i + 1)); done; [ -e /tmp/apk-held ]").second,
+            )
+            val waited = plain(login(machine, "command -v doas; exit\n", "alice"))
+            Native.waitFor(machine, holder)
+            assertTrue(waited, waited.contains("another apk is running; waiting for it to finish"))
+            assertFalse(waited, waited.contains("Unable to lock") || waited.contains("not installed yet"))
+            assertTrue(waited, waited.contains("\n/usr/bin/doas\n"))
         } finally {
             sh(
                 machine,
@@ -440,11 +554,11 @@ class MachineTest {
 
     /**
      * In the login script's output: `id -un` is alice, `id -nG` contains [group],
-     * `doas`/`sudo -n id -un` is root (compared by line, as terminal output has control sequences
-     * and CRs mixed in).
+     * `doas`/`sudo -n id -un` is root (compared by line, without the control sequences and CRs
+     * terminal output has mixed in).
      */
     private fun becameAdmin(out: String, group: String): Boolean {
-        val lines = out.lines().map { it.trim() }
+        val lines = plain(out).lines().map { it.trim() }
         val i = lines.indexOf("alice")
         return i >= 0 && lines.getOrNull(i + 1)?.split(' ')?.containsAll(listOf("alice", group)) == true &&
             lines.getOrNull(i + 2) == "root"
@@ -1268,7 +1382,7 @@ class MachineTest {
      * The open-source notices generated at build time (design doc §13.4) are in the APK: Appine's
      * own AGPL notice and full text, Fuchsia's license for the parts of the line discipline adapted
      * from Starnix, libghostty-vt with what it links and the terminal font, the GPL
-     * packages in Alpine (with the aports commit), the Android libraries, the crates linked into the
+     * packages in Alpine (with the aports commit) and those bundled beside it, the Android libraries, the crates linked into the
      * library (no proc macros), and the full license texts; every file in the index is present.
      */
     @Test
@@ -1288,6 +1402,10 @@ class MachineTest {
         assertFalse(titles.any { it.contains("Termux") })
         val alpine = text("Alpine Linux")
         assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
+        // The packages bundled beside it: doas, and bash with the libraries it needs
+        assertTrue(alpine, Regex("""\ndoas \S+\n\s+License: ISC\n""").containsMatchIn(alpine))
+        assertTrue(alpine, Regex("""\nbash \S+\n\s+License: GPL-3.0-or-later\n\s+aports: main/bash at [0-9a-f]{40}""").containsMatchIn(alpine))
+        assertTrue(alpine, alpine.contains("\nreadline ") && alpine.contains("\nlibncursesw "))
         assertTrue(text("Android libraries").contains("androidx.core:core:"))
         assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
         assertTrue(titles.any { it.startsWith("SQLite ") })

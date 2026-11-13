@@ -35,6 +35,16 @@ val rootfsTarball: File? = newestFetched(Regex("""alpine-minirootfs-.*-aarch64\.
  */
 val doasPackage: File? = newestFetched(Regex("""doas-.*\.apk"""))
 
+/**
+ * bash and the libraries it needs that the minirootfs lacks, bundled with the app and installed
+ * offline at the first login of a system the app imported, whose login shell bash is; null when
+ * any of them is missing.
+ */
+val bashPackages: List<File>? = listOf("bash", "readline", "libncursesw", "ncurses-terminfo-base")
+    .map { newestFetched(Regex("""$it-\d.*\.apk""")) }
+    .takeIf { null !in it }
+    ?.filterNotNull()
+
 /** For example 3.24.3 → v3.24, written into apk's repository URLs. */
 val alpineBranch: String = rootfsTarball
     ?.name?.let { Regex("""alpine-minirootfs-(\d+)\.(\d+)\.""").find(it) }
@@ -113,6 +123,7 @@ dependencies {
 val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     rootfsTarball?.let { tarball.set(it) }
     doasPackage?.let { doas.set(it) }
+    bashPackages?.let { bash.from(it) }
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
@@ -132,6 +143,7 @@ androidComponents {
             texts.set(layout.projectDirectory.dir("../licenses"))
             rootfsTarball?.let { tarball.set(it) }
             doasPackage?.let { doas.set(it) }
+            bashPackages?.let { bash.from(it) }
             cargoLock.set(repoRoot.file("Cargo.lock"))
             workspace.set(repoRoot)
             // Modules in the dependency graph (not in-project modules), resolving only the graph without downloading.
@@ -200,8 +212,9 @@ abstract class CargoNdkTask : CargoTask() {
 }
 
 /**
- * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), and the
- * doas package too (for the login account).
+ * Puts the rootfs tarball into the assets (imported on first start, the android/setup map), the
+ * doas package (for the login account) as `doas.apk`, and bash's packages (the login shell of the
+ * systems the app imports) under `bash/` with their own names.
  */
 abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
@@ -211,6 +224,9 @@ abstract class RootfsAssetTask : DefaultTask() {
     @get:InputFile
     @get:Optional
     abstract val doas: RegularFileProperty
+
+    @get:InputFiles
+    abstract val bash: ConfigurableFileCollection
 
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
@@ -226,6 +242,8 @@ abstract class RootfsAssetTask : DefaultTask() {
         val doasFile = doas.orNull?.asFile
             ?: throw GradleException("doas package not found: run scripts/fetch-rootfs first")
         doasFile.copyTo(File(out, "doas.apk"))
+        if (bash.isEmpty) throw GradleException("bash packages not found: run scripts/fetch-rootfs first")
+        for (apk in bash) apk.copyTo(File(out, "bash/${apk.name}"))
     }
 }
 
@@ -235,7 +253,8 @@ abstract class RootfsAssetTask : DefaultTask() {
  * the files are plain text. In order: Appine itself (AGPL), the parts of Appine adapted from
  * Fuchsia's Starnix (the terminal line discipline, BSD-style), the terminal (libghostty-vt and the
  * libraries it links, and the JetBrains Mono font, from texts in `android/licenses/`), the packages
- * of the Alpine minirootfs in the APK, the Android libraries, the Rust crates linked into
+ * of the Alpine minirootfs in the APK and those bundled beside it (doas, and bash with its
+ * libraries), the Android libraries, the Rust crates linked into
  * libappine.so (with the license files each one publishes attached as they are), SQLite, and last
  * a few full license texts (`android/licenses/`).
  *
@@ -256,6 +275,9 @@ abstract class NoticesTask : CargoTask() {
     @get:InputFile
     @get:Optional
     abstract val doas: RegularFileProperty
+
+    @get:InputFiles
+    abstract val bash: ConfigurableFileCollection
 
     @get:InputFile
     abstract val cargoLock: RegularFileProperty
@@ -379,8 +401,8 @@ abstract class NoticesTask : CargoTask() {
     }
 
     /**
-     * The Alpine minirootfs in the APK: title, description, body (each package's version, license,
-     * aports commit).
+     * The Alpine minirootfs in the APK and the packages bundled beside it: title, description, body
+     * (each package's version, license, aports commit).
      */
     private fun alpine(): Triple<String, String, String>? {
         val file = tarball.orNull?.asFile ?: return null
@@ -399,7 +421,18 @@ abstract class NoticesTask : CargoTask() {
                 fields[line[0]] = line.substring(2)
             }
         }
-        val licenses = rows.map { it[2] }.distinct().sorted()
+        // The packages the app bundles beside the tarball: package, version, license, origin and
+        // commit from each one's .PKGINFO, in its second part (three gzip parts concatenated:
+        // signature, control information, data)
+        fun bundled(apk: File): List<String> {
+            val info = tarEntry(apk, ".PKGINFO").orEmpty().lines()
+                .mapNotNull { it.split(" = ", limit = 2).takeIf { kv -> kv.size == 2 } }
+                .associate { (k, v) -> k to v }
+            return listOf("pkgname", "pkgver", "license", "origin", "commit").map { info[it].orEmpty() }
+        }
+        val doasRows = listOfNotNull(doas.orNull?.asFile).map(::bundled)
+        val bashRows = bash.files.sortedBy { it.name }.map(::bundled)
+        val licenses = (rows + doasRows + bashRows).map { it[2] }.distinct().sorted()
         val body = StringBuilder()
         body.append(
             wrap(
@@ -412,24 +445,30 @@ abstract class NoticesTask : CargoTask() {
                 "is also published together with Appine's source code at $SOURCE.",
             ) + "\n\n",
         )
-        for ((p, v, l, o, c) in rows) body.append("$p $v\n    License: $l\n    aports: main/$o at $c\n")
-        doas.orNull?.asFile?.let { apk ->
-            // .PKGINFO is in the package's second part (three gzip parts concatenated: signature,
-            // control information, data)
-            val info = tarEntry(apk, ".PKGINFO").orEmpty().lines()
-                .mapNotNull { it.split(" = ", limit = 2).takeIf { kv -> kv.size == 2 } }
-                .associate { (k, v) -> k to v }
+        fun list(packages: List<List<String>>) {
+            for ((p, v, l, o, c) in packages) body.append("$p $v\n    License: $l\n    aports: main/$o at $c\n")
+        }
+        list(rows)
+        if (doasRows.isNotEmpty()) {
+            body.append("\n").append(
+                wrap("The app also includes this package, which it installs when a regular user first becomes the login account:"),
+            ).append("\n\n")
+            list(doasRows)
+        }
+        if (bashRows.isNotEmpty()) {
             body.append("\n").append(
                 wrap(
-                    "The app also includes this package, which it installs when a regular user first becomes the " +
-                        "login account:",
+                    "And these, which it installs at the first login of a system it imports, as bash is the login " +
+                        "shell there:",
                 ),
             ).append("\n\n")
-            body.append("${info["pkgname"]} ${info["pkgver"]}\n    License: ${info["license"]}\n")
-            body.append("    aports: main/${info["origin"]} at ${info["commit"]}\n")
+            list(bashRows)
         }
-        body.append("\n").append(wrap("The full texts of the GPL 2.0, Apache 2.0 and MPL 2.0 are at the end of this list.")).append('\n')
-        return Triple("Alpine Linux $version minirootfs", "${rows.size} packages: ${licenses.joinToString(", ")}", body.toString())
+        body.append("\n").append(
+            wrap("The full texts of the GPL 3.0, GPL 2.0, Apache 2.0 and MPL 2.0 are at the end of this list."),
+        ).append('\n')
+        val count = rows.size + doasRows.size + bashRows.size
+        return Triple("Alpine Linux $version minirootfs", "$count packages: ${licenses.joinToString(", ")}", body.toString())
     }
 
     /** Reads [path] from a tar.gz (ustar; GNU long names and pax headers are skipped). */

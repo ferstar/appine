@@ -1,8 +1,11 @@
 #!/bin/sh
-# Downloads and verifies the Alpine minirootfs (design doc §11.4) and the doas package bundled with
-# the app (installed offline when a regular user first becomes the login account, §11.1). The
-# versions and sha256s are fixed here and changed together on upgrades. Usage:
-# scripts/fetch-rootfs [output directory], target/rootfs by default.
+# Downloads and verifies the Alpine minirootfs (design doc §11.4) and the packages bundled with the
+# app (the android/setup map): doas, installed offline when a regular user first becomes the login
+# account (§11.1), and bash with the libraries it needs that the minirootfs lacks, installed offline
+# at the first login of a system the app imported, whose login shell bash is. The versions and
+# sha256s are fixed here and changed together on upgrades. Usage:
+# scripts/fetch-rootfs [output directory], target/rootfs by default. Prints the path of each
+# package, then the tarball's last.
 #
 # After downloading, the signature is first verified with Alpine's release key
 # (scripts/alpine-ncopa.asc, Natanael Copa, fingerprint in fingerprint), then the sha256 is
@@ -18,11 +21,18 @@ name=alpine-minirootfs-$version-aarch64.tar.gz
 url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/releases/aarch64/$name
 fingerprint=0482D84022F52DF1C4E7CD43293ACD0907D9495A
 
-# doas from the same branch: the package itself carries Alpine's signature, and apk checks it with
-# the public keys in the rootfs when installing
-doas=doas-6.8.2-r8.apk
-doas_sha256=7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
-doas_url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main/aarch64/$doas
+# The bundled packages, from the same branch's main repository, with their sha256s: each package
+# carries Alpine's signature, and apk checks it with the public keys in the rootfs when installing.
+# The branch's mirrors keep only the latest build of each package, so a rebuild (a new -rN) makes
+# the old file disappear and a fresh download fail: then pin the new file
+packages="
+doas-6.8.2-r8.apk 7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
+bash-5.3.9-r1.apk 95f4f976bdf2f4ca18ff41c32916eb6d7b12a0dae12504d55d04427460d6542f
+readline-8.3.3-r1.apk 9f0ae0923c02b0d6aba62e9173542b65396ba3f0efefcbf087ea32f1120e7b34
+libncursesw-6.6_p20260516-r0.apk 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6
+ncurses-terminfo-base-6.6_p20260516-r0.apk e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d
+"
+packages_url=https://dl-cdn.alpinelinux.org/alpine/v${version%.*}/main/aarch64
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-$root/target/rootfs}
@@ -43,19 +53,25 @@ check() {
     [ "$(digest "$1")" = "$sha256" ]
 }
 
-# The doas package: only compared with the fixed sha256 (the signature is inside the package and
+# A bundled package: only compared with its fixed sha256 (the signature is inside the package and
 # checked by apk)
-fetch_doas() {
-    [ -f "$out/$doas" ] && [ "$(digest "$out/$doas")" = "$doas_sha256" ] && return 0
-    curl -fsSL --retry 3 -o "$out/$doas.part" "$doas_url"
-    if [ "$(digest "$out/$doas.part")" != "$doas_sha256" ]; then
-        echo "fetch-rootfs: sha256 mismatch for $doas_url: got $(digest "$out/$doas.part")" >&2
-        rm -f "$out/$doas.part"
-        exit 1
+fetch_package() {
+    if ! { [ -f "$out/$1" ] && [ "$(digest "$out/$1")" = "$2" ]; }; then
+        curl -fsSL --retry 3 -o "$out/$1.part" "$packages_url/$1"
+        if [ "$(digest "$out/$1.part")" != "$2" ]; then
+            echo "fetch-rootfs: sha256 mismatch for $packages_url/$1: got $(digest "$out/$1.part")" >&2
+            rm -f "$out/$1.part"
+            exit 1
+        fi
+        mv "$out/$1.part" "$out/$1"
     fi
-    mv "$out/$doas.part" "$out/$doas"
+    echo "$out/$1"
 }
-fetch_doas
+while read -r package package_sha256; do
+    [ -z "$package" ] || fetch_package "$package" "$package_sha256"
+done <<EOF
+$packages
+EOF
 
 if [ -f "$file" ] && check "$file"; then
     echo "$file"

@@ -15,6 +15,15 @@
 # login according to the password at that time, and, while Appine runs, within a few seconds of the
 # guest changing /etc (passwd replaces /etc/shadow): the app then runs this script with
 # --refresh-rules as $1, which only rewrites the rules.
+# On a system the app imported from Alpine, the login shell is bash (root's, and that of the
+# accounts busybox's adduser makes after it): the app puts bash's packages in
+# /var/cache/appine/bash, and the first login with an account whose shell is /bin/bash installs
+# them offline and deletes them, so bash is not installed again if the user removes it. While bash
+# cannot be installed (Ctrl-C, below), the login uses /bin/sh, and the next one tries again.
+# apk takes its database lock without waiting, so logins install the bundled packages (doas, bash)
+# one at a time, and while an apk the user runs holds the lock, a login says so and waits for it;
+# Ctrl-C then skips installing until the next login. Installing sudo waits for an apt the user runs
+# in the same way.
 # The install commands all read from /dev/null: what the user types before the prompt appears is
 # left for the login shell.
 #
@@ -58,6 +67,83 @@ else
     rules=/etc/sudoers.d/appine
 fi
 ingroup() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -Fqx "$group"; }
+
+# Runs "$@" holding the lock that every login's installs of bundled packages share, so they run one
+# after another: whatever the command installs, it checks first whether a login that held the lock
+# before has installed it already
+locked() {
+    (
+        flock 9
+        "$@"
+    ) 9>/run/appine-install.lock
+}
+
+# apk add, offline (without reading the repository index). When another apk holds apk's lock (the
+# user's, in another tab), says so and adds again, this time waiting for the lock (an hour at
+# most: Ctrl-C stops waiting before that)
+apk_add() {
+    apk_errors=$(apk add -q --no-network --repositories-file /dev/null "$@" </dev/null 2>&1) && return 0
+    case $apk_errors in
+    *'Unable to lock database'*)
+        echo "appine: another apk is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
+        apk add -q --wait 3600 --no-network --repositories-file /dev/null "$@" </dev/null
+        ;;
+    *)
+        printf '%s\n' "$apk_errors" >&2
+        return 1
+        ;;
+    esac
+}
+
+# Installs the bundled doas; then adds it once more by name, so world records doas rather than the
+# file and apk upgrade upgrades it as usual
+install_doas() {
+    command -v doas >/dev/null || { apk_add /var/cache/appine/doas.apk && apk_add doas; }
+}
+
+# Installs bash from the bundled packages; then adds it once more by name, as for doas
+bundle=/var/cache/appine/bash
+install_bash() {
+    [ -x /bin/bash ] || { apk_add "$bundle"/*.apk && apk_add bash; }
+}
+
+# apt-get update, its progress shown as usual. apt-get fails at once when another apt holds the lock
+# of the package lists (the user's, in another tab; DPkg::Lock::Timeout does not cover that lock),
+# so this then says so and tries again every two seconds until it gets through, or until Ctrl-C.
+# apt's errors and warnings are shown after it ends, without those about the lock
+apt_update() {
+    apt_errors=$(mktemp) || return 1
+    waiting=
+    while :; do
+        if apt-get update </dev/null 2>"$apt_errors"; then
+            status=0
+            break
+        fi
+        status=1
+        [ -z "$interrupted" ] && grep -q 'Could not get lock' "$apt_errors" || break
+        if [ -z "$waiting" ]; then
+            echo "appine: another apt is running; waiting for it to finish (Ctrl-C skips installing until the next login)" >&2
+            waiting=1
+        fi
+        sleep 2
+        [ -z "$interrupted" ] || break
+    done
+    grep -q 'Could not get lock' "$apt_errors" || cat "$apt_errors" >&2
+    rm -f "$apt_errors"
+    return "$status"
+}
+
+# Installs bash when $1, an account's login shell, is /bin/bash and bash is missing, and deletes its
+# packages once it is there
+ensure_shell() {
+    [ "$1" = /bin/bash ] && [ ! -x /bin/bash ] && [ -d "$bundle" ] || return 0
+    locked install_bash
+    if [ -x /bin/bash ]; then
+        rm -rf "$bundle"
+    else
+        echo "appine: cannot install bash now, using /bin/sh; Appine tries again at the next login" >&2
+    fi
+}
 
 # Admins without a password (still in the group) are not asked for a password when escalating. The
 # rules are rewritten at every login, root's included, and with --refresh-rules, according to the
@@ -120,6 +206,7 @@ if [ "$user" = root ]; then
     home=$(field root 6 /etc/passwd)
     { [ -n "$dir" ] && cd "$dir"; } 2>/dev/null || cd "$home" 2>/dev/null || cd /
     shell=$(field root 7 /etc/passwd)
+    ensure_shell "$shell"
     [ -x "$shell" ] || shell=/bin/sh
     export SHELL="$shell" HOME="$home"
     exec "$shell" -l
@@ -155,20 +242,17 @@ tried=
 if [ ! -e "$installed" ] && ! command -v "$tool" >/dev/null; then
     tried=1
     if [ "$group" = wheel ]; then
-        # Install offline from the package the app bundles (without reading the repository index);
-        # then add it once more by name, so world records doas rather than this file and apk upgrade
-        # upgrades it as usual
-        apk add -q --no-network --repositories-file /dev/null /var/cache/appine/doas.apk </dev/null &&
-            apk add -q --no-network --repositories-file /dev/null doas </dev/null
+        locked install_doas
     else
         # Downloading the index and the package from the network takes a few minutes, so apt's
         # output (the progress) is shown as usual. Ctrl-C during the download interrupts apt-get and
         # skips installing this time; for the dpkg step apt starts a new session in a
         # pseudo-terminal of its own, so Ctrl-C cannot reach it, and apt stops only after it has
-        # finished installing
+        # finished installing. While another apt runs, apt-get install waits for dpkg's lock itself
+        # (an hour at most), saying so
         echo "appine: installing sudo so that $user can become root (Ctrl-C skips it until the next login)"
-        apt-get update </dev/null &&
-            DEBIAN_FRONTEND=noninteractive apt-get install -y sudo </dev/null
+        apt_update &&
+            DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=3600 install -y sudo </dev/null
     fi
 fi
 if command -v "$tool" >/dev/null; then
@@ -187,6 +271,13 @@ fi
 
 refresh_rules
 
+# The account's shell, installed first if it is the bundled bash; while it is missing, su runs
+# /bin/sh instead (its arguments are kept in "$@"), as otherwise it would fail and close the tab
+shell=$(field "$user" 7 /etc/passwd)
+ensure_shell "$shell"
+set --
+[ -x "$shell" ] || set -- -s /bin/sh
+
 # Run as a login shell (reads /etc/profile); su sets HOME, SHELL, USER and LOGNAME. su -l is not
 # used: it always goes to the home directory. The restored directory is entered as this account (a
 # directory root can enter is not necessarily enterable by it); when it cannot be entered, go to the
@@ -201,6 +292,6 @@ cmd="{ [ -n '$q' ] && cd '$q'; } 2>/dev/null || cd 2>/dev/null; exec \"\$SHELL\"
 # reading the terminal as root. busybox su (Alpine) never starts a new session and has no such
 # option
 if su --help 2>&1 | grep -q -- --session-command; then
-    exec su --session-command="$cmd" "$user"
+    exec su "$@" --session-command="$cmd" "$user"
 fi
-exec su "$user" -c "$cmd"
+exec su "$@" "$user" -c "$cmd"

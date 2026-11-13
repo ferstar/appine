@@ -202,6 +202,7 @@ internal object Rootfs {
         write(store, "/etc/hostname", "localhost\n")
         if (distro == Distro.ALPINE) {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost\n", overwrite = false)
+            useBash(context, store)
         } else {
             // Debian's has no hosts, and resolv.conf points at 1.1.1.1. DNS must go through the
             // kernel layer's stub (the kernel/net map) for the system's Private DNS and VPNs to
@@ -209,7 +210,7 @@ internal object Rootfs {
             write(store, "/etc/hosts", "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n")
             write(store, "/etc/resolv.conf", "nameserver 127.0.0.53\n")
         }
-        writeProfile(context, store)
+        writeProfile(context, store, distro)
         val install = when (distro) {
             Distro.ALPINE -> "apk add git python3"
             Distro.DEBIAN -> "apt update && apt install git python3"
@@ -248,21 +249,67 @@ internal object Rootfs {
     }
 
     /**
+     * Makes bash the login shell of a system imported from Alpine instead of busybox ash: puts the
+     * packages bundled with the app (bash and the libraries it needs that the minirootfs lacks) into
+     * `/var/cache/appine/bash/`, from which the login script installs them offline at the first
+     * login (using `/bin/sh` until they are installed), and has root's entry in `/etc/passwd` name
+     * `/bin/bash`. Accounts made later with busybox's `adduser` get bash too, as it gives them the
+     * shell of the account running it (`$SHELL`, which the login script sets). Systems imported
+     * before keep their shells.
+     */
+    @Throws(IOException::class)
+    private fun useBash(context: Context, store: String) {
+        val packages = context.assets.list("bash").orEmpty()
+        if (packages.isEmpty()) return
+        for (name in packages) {
+            val data = context.assets.open("bash/$name").use { it.readBytes() }
+            write(store, "/var/cache/appine/bash/$name", data)
+        }
+        val passwd = Native.readFile(store, "/etc/passwd") ?: return
+        val lines = String(passwd).split('\n').map { line ->
+            val fields = line.split(':')
+            if (fields.size == 7 && fields[0] == "root" && fields[6] == "/bin/sh") {
+                (fields.dropLast(1) + "/bin/bash").joinToString(":")
+            } else {
+                line
+            }
+        }
+        write(store, "/etc/passwd", lines.joinToString("\n"))
+    }
+
+    /**
      * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
      * language environment variables, and gives bash, busybox ash and zsh a coloured prompt with
      * shell integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
      * android/vt map). ash's marks are in `/etc/profile.d/appine.ashrc`, the assets' `ashrc.sh`,
      * which the profile names in `ENV`, so that every interactive ash reads it (a login shell after
-     * `~/.profile`); it is written first, as the profile uses it only when it is there, and its
-     * name does not end in `.sh`, so `/etc/profile` does not read it. Which directory the shell starts in is decided by the assets'
+     * `~/.profile`); bash's in `/etc/profile.d/appine.bashrc`, the assets' `bashrc.sh`, which the
+     * profile reads, and on Alpine every interactive bash through `/etc/bash/appine.sh`
+     * ([BASH_HOOK]). They are written first, as the profile uses them only when they are there, and
+     * their names do not end in `.sh`, so `/etc/profile` does not read them. Which directory the shell starts in is decided by the assets'
      * `login.sh` (restored tabs start in their original directory, the android/service map, new
      * tabs in the current tab's, the android/terminal map).
      */
     @Throws(IOException::class)
-    private fun writeProfile(context: Context, store: String) {
+    private fun writeProfile(context: Context, store: String, distro: Distro) {
         write(store, "/etc/profile.d/appine.ashrc", asset(context, "ashrc.sh"))
+        write(store, "/etc/profile.d/appine.bashrc", asset(context, "bashrc.sh"))
+        if (distro == Distro.ALPINE) write(store, "/etc/bash/appine.sh", BASH_HOOK)
         write(store, "/etc/profile.d/appine.sh", asset(context, "profile.sh"))
     }
+
+    /**
+     * `/etc/bash/appine.sh` on Alpine, whose `/etc/bash/bashrc` reads every `.sh` file in
+     * `/etc/bash` in every interactive bash (a login one too, through
+     * `/etc/profile.d/00-bashrc.sh`): bash's prompt
+     * marks for a nested bash, which reads no profile. Debian's `/etc/bash.bashrc` reads no such
+     * directory, so a nested bash there has no marks.
+     */
+    private const val BASH_HOOK = """# Written by Appine beside /etc/profile.d/appine.sh, and replaced together with it: Alpine's
+# /etc/bash/bashrc reads this file in every interactive bash, so a nested bash (bash, su without
+# -l) marks its prompts too.
+if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
+"""
 
     private fun asset(context: Context, name: String): String =
         context.assets.open(name).bufferedReader().readText()
@@ -456,7 +503,8 @@ netns = "host"
      * The sha256s of the assets' `profile.sh` as later versions replaced it, whose texts (shell
      * code full of `$`) are not kept here: the first with prompt marks, until taps on the prompt
      * moved the cursor, the one that marked them for bash and busybox ash only, until zsh got
-     * its marks, and the one with ash's marks in itself, until `ashrc.sh` took them. A change to
+     * its marks, the one with ash's marks in itself, until `ashrc.sh` took them, and the one with
+     * bash's marks in itself, until `bashrc.sh` took them. A change to
      * `profile.sh` adds the sha256 of the text it replaces
      * (`git show HEAD:android/app/src/main/assets/profile.sh | shasum -a 256` before committing).
      */
@@ -464,12 +512,14 @@ netns = "host"
         "4a35d44e55e23aaf94543d87dc02deafcc7b324902e90ae18872fe20242642fc",
         "d4daedd69558e1efe41b143f71b74b67708388299584706a9bf55052a7fc3f21",
         "b6dbef9f24826d036570704f8ed15439375032f0f72163e3c6cd219ef5e83336",
+        "86785a156574627210ded386f59ca574cb69292672688287c7b7dc7c8e7a4233",
     )
 
     /**
      * Replaces the profile the app wrote into a previously imported store with the current one
-     * ([writeProfile], with the file of ash's marks), if it is an earlier version left unchanged. A
-     * change to `ashrc.sh` alone reaches no existing store: change `profile.sh` with it.
+     * ([writeProfile], with the files of ash's and bash's marks), if it is an earlier version left
+     * unchanged. A change to `ashrc.sh` or `bashrc.sh` alone reaches no existing store: change
+     * `profile.sh` with it.
      */
     @Throws(IOException::class)
     fun updateProfile(context: Context) {
@@ -478,7 +528,7 @@ netns = "host"
         val old = runCatching { Native.readFile(store, path) }.getOrNull() ?: return
         val earlier = String(old) in listOf(OLD_PROFILE, UNMARKED_PROFILE) ||
             hex(MessageDigest.getInstance("SHA-256").digest(old)) in REPLACED_PROFILES
-        if (earlier) writeProfile(context, store)
+        if (earlier) writeProfile(context, store, installed(context) ?: Distro.ALPINE)
     }
 
     /**
