@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -37,11 +37,11 @@
 - **Source**: round 98 (`98-routes`)
 
 ### D5: DNS goes through a stub at 127.0.0.53 answered by the host resolver
-- **What**: `resolv.conf` points at `127.0.0.53`; UDP queries to it are intercepted in the socket layer and resolved by `android_res_nsend` (other hosts forward to the host's servers) on a `dns-stub` host thread per query, whose answer or SERVFAIL the timer thread queues on the socket.
+- **What**: The initial namespace intercepts only UDP DNS at 127.0.0.53, resolves through the host on query threads, connects or autobinds the host socket to expose a real local endpoint, caps in-flight queries at 128 and drops queued answers once SO_RCVBUF has been exceeded.
 - **Why**: Going through the system resolver makes Android's Private DNS, VPNs and per-network routing apply to the guest; failing fast with SERVFAIL stops resolvers from waiting for their timeouts.
-- **Tradeoffs**: Each query starts a host thread and answers arrive in resolution order, not send order; TCP DNS and container namespaces are not intercepted.
-- **Watch out**: Keep `resolv.conf` written only when missing so user edits survive; the DNS threads hold only the answer queue and the timer event, never the kernel, which they could outlive.
-- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`); fe4bb2b
+- **Tradeoffs**: Each admitted query starts a host thread, answers can arrive out of order, overload drops queries for resolver timeout, payload lengths approximate skb accounting, and TCP/container DNS is not intercepted.
+- **Watch out**: Preserve edited resolv.conf files, keep worker threads independent of kernel lifetime, and leave raw/ping traffic to the host rather than the DNS stub.
+- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`); fe4bb2b; 73127176
 
 ### D6: Low ports first try the real port, then fixed offsets, hidden from the guest
 - **What**: Binding a port below 1024 tries the port itself on the host, then +10000, +20000, +30000, then a host-chosen port; the guest always sees its own port, and the app is told about the first non-loopback listen.
@@ -68,8 +68,8 @@
 - **What**: kernel/net covers `net.rs` and `syscall/net.rs` except their netlink sections, `netlink_*` functions and `Socket::Netlink` arms, raw ICMP, the routing table (`route.rs`, with the route and rule messages and `ip route get` that netlink sends), the port map, traffic counters, `/proc/net`'s socket, protocol and route files, the DNS stub and `SO_ORIGINAL_DST`, with host socket wrappers in hal, the namespace hooks described from kernel/netns's side and netlink sockets in kernel/netlink.
 - **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits, and by 2026-11-11 more than half the map postdated its verification and its full refresh reached 48.8 KB, near one Read, with netlink a subsystem of its own.
 - **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources, socket dispatch, the changing ioctls and route messages read two maps, and decisions on netlink sockets made before the split keep their kernel/net tags here (D3, D24, D26 and the netlink halves of D19 and D23, listed in kernel/netlink's preamble).
-- **Watch out**: Changing socket ioctls must run between kernel/netlink's `rtnl_watched` and `rtnl_notify` (a map invariant), and bugs open in the map include an error after part of a `MSG_WAITALL` read being lost, option passthrough with host semantics, `SO_ATTACH_FILTER` on TCP refused by newer hosts, `MSG_TRUNC` writing zeros on TCP, one echo id per raw ICMP socket, raw ICMP sockets that cannot be rebound or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split)
+- **Watch out**: Changing socket ioctls must run between kernel/netlink's `rtnl_watched` and `rtnl_notify` (a map invariant), and bugs open in the map include an error after part of a `MSG_WAITALL` read being lost, option passthrough with host semantics, one echo id per raw ICMP socket, raw ICMP sockets that cannot be rebound or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split); 52dcc177; 211a5867
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -93,18 +93,18 @@
 - **Source**: 412ffba
 
 ### D13: Socket read, write, readv and writev are one recv or send
-- **What**: `net::rw` does one recv of the iovecs' total (capped at `MSG_MAX`) scattered in order, and gathers writes into one send for message sockets or 1 MiB sends for streams until done or short (kernel/vfs D22).
+- **What**: `net::rw` scatters one receive and gathers one message send or successive 1 MiB stream sends, suppressing SIGPIPE on later pieces and returning partial progress when a subsequent send hits EPIPE.
 - **Why**: Linux's `sock_read_iter`/`sock_write_iter` make each call one recvmsg or sendmsg, while Appine wrote 64 KiB chunks per iovec and capped reads at 64 KiB.
-- **Tradeoffs**: A message over 1 MiB is cut to `MSG_MAX`, as sendmsg already did.
+- **Tradeoffs**: Messages and direct send/sendto calls remain capped at 1 MiB, while stream write can span pieces; AF_UNIX shares the partial-write rule.
 - **Watch out**: A blocking stream write of many MiB now goes in 1 MiB sends, which shows only in partial progress under signals.
-- **Source**: b295644
+- **Source**: b295644; 211a5867
 
 ### D14: MSG_WAITALL waits for the whole length on TCP
-- **What**: recv keeps reading and waiting between pieces until it has the length or meets nonblocking, a timeout, a signal, end of file or a host error, a peek re-reads from the head with the host's `SO_RCVLOWAT` raised for the wait, and recvfrom and recvmsg continue past 1 MiB piece by piece.
+- **What**: recv keeps reading and waiting between pieces until it has the length or meets nonblocking, a timeout, a signal, end of file or a host error, a peek re-reads from the head with the host's `SO_RCVLOWAT` raised for the wait, and recvfrom and recvmsg continue past 1 MiB piece by piece; MSG_TRUNC keeps the received length without copying payload, including continued MSG_WAITALL reads.
 - **Why**: Fixed-size readers using MSG_WAITALL got short reads, and `MSG_PEEK|MSG_WAITALL` returned corrupted data, once data arrived in more than one piece.
 - **Tradeoffs**: An error after a partial read is lost (the host already took it), a peek against a buffer that can never hold the length returns the part where Linux blocks, and AF_UNIX is not covered.
 - **Watch out**: Another thread polling the socket sees the raised `SO_RCVLOWAT` while a peek waits, and a fault on a later piece loses that piece's data.
-- **Source**: 58ce3df
+- **Source**: 58ce3df; 211a5867
 
 ### D15: recvmsg and sendmsg check iovecs in `import_iovec`'s order
 - **What**: A negative length is `EINVAL`, an iovec reaching past 2^48 (arm64's `TASK_SIZE_MAX`) is `EFAULT`, and the total is cut to `MAX_RW_COUNT` by shortening the iovec that reaches it.
@@ -142,11 +142,11 @@
 - **Source**: b3e134a
 
 ### D20: accept4 installs only a complete socket, and socket timeouts are parsed strictly
-- **What**: accept4 finds a free fd slot before taking a connection and writes the address before installing the fd (a fault drops the socket), accepted sockets copy the listener's `SO_RCVTIMEO` and `SO_SNDTIMEO`, and the timeout parser returns `EINVAL` for short values, `EDOM` for out-of-range microseconds and a zero timeout for negative seconds.
+- **What**: accept4 checks fd and flags, reserves an fd before resolving and waiting on the listener, writes the address before installation, releases reservations on errors, inherits timeouts and v6only, and returns EINTR for interrupted timed accepts while retaining strict timeout parsing.
 - **Why**: accept4 installed the fd before writing the address and took a connection before finding no free fd, accepted sockets lost the listener's timeouts, and the lenient parser let a negative timeout block forever.
-- **Tradeoffs**: None.
-- **Watch out**: Programs passing bad timeouts now see `EDOM` or `EINVAL`.
-- **Source**: 5d23297
+- **Tradeoffs**: A supplied address with a NULL length is EFAULT, including recvfrom after consuming data, and a kernel panic between reserve and fill can leave a reservation until the process ends.
+- **Watch out**: Other wait-then-install paths still choose slots without reserving them; preserve the existing short-timeout EINVAL, invalid-microseconds EDOM and negative-seconds-as-zero rules.
+- **Source**: 5d23297; 4e01f78b
 
 ### D21: A refused blocking connect leaves the host socket ready for another connect
 - **What**: When a blocking connect fails, the failure branch connects the host socket once more and ignores the answer (`ECONNABORTED`, nothing sent).
@@ -190,12 +190,20 @@
 - **Watch out**: Each change request with a listener rebuilds the namespace's link, address and route messages twice (quadratic for batches over thousands of addresses, with host getifaddrs and route reads in the boot namespace), and a dump encoding that varies between calls would notify spuriously.
 - **Source**: 7a13dd2
 
-### D27: `SO_GET_FILTER` asks the host with a count of instructions
-- **What**: An inet socket's `SO_GET_FILTER` goes to `hal::net::get_filter` (hal D20) with min(optlen, 4096) instructions and answers as Linux's `sk_get_filter`: 0 asks only for the count, fewer than the program holds is `EINVAL`, otherwise the instructions are copied out and optlen becomes the program's count; setsockopt's filter check shares the `SO_ATTACH_FILTER` and `BPF_MAXINSNS` constants.
-- **Why**: The option went to the host with the guest's optlen (at most 256) as a byte count, but Linux reads it as instructions and copies 8 bytes for each, so a guest that attached a filter could write past Appine's heap and abort `appine-run`, ending every guest process.
-- **Tradeoffs**: Netlink and AF_UNIX sockets still accept filters without effect and answer as before (netlink `ENOPROTOOPT`, where Linux reports no filter), one host call copies at most 32 KiB, and hosts that refuse the attach are left to the `SO_ATTACH_FILTER` bug.
-- **Watch out**: Another passed-through option whose optlen is not a byte count would overflow the same way.
-- **Source**: c65da9d (recorded in 0c1b416)
+### D27: Socket filters retain Linux checks even when the host refuses TCP attachment
+- **What**: Filter attachment follows Linux 6.1 capability, optlen, lock and program checks; a host-refused TCP program is validated on a scratch UDP socket and retained for count-based SO_GET_FILTER, detach and accept inheritance, while normal host programs still use `hal::net::get_filter`.
+- **Why**: SO_GET_FILTER’s instruction count must not be treated as bytes, and newer hosts’ TCP attachment refusal otherwise breaks Docker’s published-port setup.
+- **Tradeoffs**: Retained TCP programs filter no traffic, attachment adds host checks and possibly a scratch socket, and netlink/AF_UNIX filter behavior remains limited.
+- **Watch out**: SO_LOCK_FILTER relies on host state, count-based copies remain bounded to 4096 instructions, and test hook 14 is needed to force host refusal on accepting hosts.
+- **Source**: c65da9d (recorded in 0c1b416); 52dcc177
+
+### D28: Legacy route ioctls translate into namespace route requests
+
+- **What**: SIOCADDRT and SIOCDELRT decode arm64 IPv4/IPv6 structures, check namespace CAP_NET_ADMIN, translate Linux’s masks, metrics, labels and gateway rules, and reuse `netdev::request` with rtnetlink notifications.
+- **Why**: BusyBox and net-tools route use these ioctls rather than rtnetlink.
+- **Tradeoffs**: Only virtual-device routes change, unreachable and IPv6 source routes are refused, and MTU/window/IRTT flags are ignored.
+- **Watch out**: Structure offsets are arm64-specific, and IPv4 unicast classification approximates the local table from interface addresses.
+- **Source**: 29e59fd3
 
 ## Superseded
 

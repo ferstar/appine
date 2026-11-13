@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/documents"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D6 were seeded by hand from the retired design doc
 > §11.3 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -55,11 +55,11 @@
 - **Source**: 12c4afa (bug list since updated by 3f761df)
 
 ### D8: Provider helpers follow the framework callbacks that use them
-- **What**: `Documents` keeps its framework callbacks in order (roots, queries, open, changes, search) and puts each helper after its first use, `closer` next to `openDocument`, its only user.
-- **Why**: The user wanted each Kotlin file to read in the order its code runs, and Documents' helpers were not in the order its callbacks use them.
-- **Tradeoffs**: The companion's path and MIME helpers keep their old order.
-- **Watch out**: git blame on the moved lines points at a546fea unless read with -M.
-- **Source**: a546fea
+- **What**: Documents orders types, roots, queries, ancestry/path callbacks, opens and changes with nearby helpers, sharing `percentDecode` for link/display names and `within` for containment checks.
+- **Why**: Execution order was hard to follow and decoding/containment logic was duplicated.
+- **Tradeoffs**: Moved lines need blame -M, and the shared companion helper remains public despite only provider use.
+- **Watch out**: Device checks did not cover navigation/decoding and visibility after the deduplication.
+- **Source**: a546fea; 9d485e6e
 
 ### D9: `file:` links open as the provider's documents
 - **What**: `Documents.fileLink` maps a `file:` URI whose host is empty, `localhost` or the name in `/etc/hostname` to the document with the same guest path (percent-decoded, written back as an ID, empty and `.` components dropped, `..` refused), typed by the provider's own `getType` so its visibility rules apply; the terminal resolves it off the main thread and grants the viewer read access only (android/terminal D31), `findDocumentPath` lets the Files app open a directory it is sent to, and remote, hidden and missing files get their own toasts.
@@ -85,3 +85,4 @@
 ## Superseded
 
 - ~~Write fds reopened by their `/proc/self/fd` path to get a close callback, since `wrap` needed API 30 above minSdk 29 (D4 in part, round 201)~~ → replaced by **D4** in 88b9138 (2026-11-07)
+- ~~D8’s companion path/MIME helpers keeping their old order~~ → replaced by **D8** in 9d485e6e (2026-11-12)

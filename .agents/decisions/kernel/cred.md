@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/cred"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384). D1–D6 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D6 were seeded by hand from the retired design doc
 > §11.1 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -105,6 +105,14 @@
 - **Tradeoffs**: The namespace is kept per process, as dumpable is, rather than per address space.
 - **Watch out**: A new caller of `may_ptrace` must pass the group's `dump_scope()`, since passing None lets the target's own namespace decide.
 - **Source**: ef68770
+
+### D15: seccomp ADDFD closes replaced descriptors as the target
+
+- **What**: `addfd` uses `syscall::close_replaced` with the target fd table and tgid, including `fuse::flush_as`.
+- **Why**: Supervisor-context close used the wrong mqueue notification and FUSE lock ownership.
+- **Tradeoffs**: The path now shares the fd-replacement helper with normal replacement operations.
+- **Watch out**: New replacement paths must also close in the target process context.
+- **Source**: 01bfd882
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/vtview"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229)
+> Last distilled: 2026-11-14 (HEAD = 410ef192)
 >
 > Decisions on the terminal view made before android/vtview was split from android/terminal keep their `android/terminal` tags and live in `.agents/decisions/android/terminal.md`: D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48.
 
@@ -28,3 +28,27 @@
 - **Tradeoffs**: `VtView` is still about 2100 lines, the interaction half, which stays coupled to its own state, and the frame header is read through accessors instead of inline offsets.
 - **Watch out**: A frame format change now touches `VtFrame` and vt.c (android/terminal D5), and the drawing path moved with its locals hoisted (screen arrays read once per row), so a slowdown would show in the appine-vt frame statistics.
 - **Source**: 49e8b08
+
+### D4: Each search change forces a count notification
+
+- **What**: VtView.search resets searchTotal to -1 so the next frame reports even an unchanged zero-match count.
+- **Why**: A first unmatched query otherwise left the count blank.
+- **Tradeoffs**: There is one extra count callback per query change, with the old count visible until the frame.
+- **Watch out**: A frame preceding library search progress can briefly report the prior count before correcting it.
+- **Source**: 5e1f851d
+
+### D5: View members follow their event flows and frame logging is removed
+
+- **What**: VtView groups metrics, frames, cursor, focus, input/IME, clipboard, selection, touch, mouse and scrolling, shares an inputMethod getter and removes frame statistics while renderer helpers follow drawing order.
+- **Why**: Following an event required jumps between unrelated sections.
+- **Tradeoffs**: The large file and gesture properties remain, and frame timing now needs a profiler or temporary logging.
+- **Watch out**: Kotlin gesture/scaler initializers must remain after the state they read.
+- **Source**: aaa1e7d5
+
+### D6: Prompt taps cross rows broken by ash
+
+- **What**: With the ash option enabled, non-soft-wrapped continuation rows without prompt cells count as the same input line in either direction.
+- **Why**: Taps on later rows of long ash commands previously did nothing.
+- **Tradeoffs**: PS2 prompts remain separate lines and other shells need their own declared behavior.
+- **Watch out**: Arrow counts were tested with the host program rather than touch input; background-output limitations remain in android/vt D6.
+- **Source**: a809c5a8

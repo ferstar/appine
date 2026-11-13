@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mount"`
 >
-> Last distilled: 2026-11-10 (HEAD = 300d384)
+> Last distilled: 2026-11-14 (HEAD = 410ef192)
 >
 > Mount decisions made before kernel/mount was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53.
 
@@ -39,3 +39,11 @@
 - **Tradeoffs**: Each mount holds a strong reference to its owner, keeping a user namespace alive and counted against `max_user_namespaces` while a mount of an instance it owns exists, as Linux's superblock does, and the owners of sysfs, cgroup2 and the store follow knowledge of 6.1's fs_context code, observed natively only for sysfs.
 - **Watch out**: A new way of creating a mount of a new instance must record its owner, or remounting it without `MS_BIND` needs `CAP_SYS_ADMIN` in the initial namespace, and container setups that remounted a shared instance without `MS_BIND` from a user namespace now get `EPERM`, as on Linux.
 - **Source**: 0e4d261
+
+### D5: Read-only remounts inspect detached writers and deleted holders
+
+- **What**: `sb_busy` checks writers across attached and detached mounts plus deleted store/overlay files held by fds, Unix messages, loops, task roots/cwds or executables, excluding memfds; bind remounts and mount_setattr check writers only.
+- **Why**: Remounts missed deleted files and detached writers, while unrelated memfds incorrectly blocked remounting the root.
+- **Tradeoffs**: Each remount scans holders, and mapping-only holders and deleted FUSE files still do not count.
+- **Watch out**: Shutdown may now need to kill holders of deleted files before remounting read-only, and memfd identification must follow future storage changes.
+- **Source**: 01bfd882

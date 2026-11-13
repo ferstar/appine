@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/setup"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design doc
 > §11.1 and §11.4 and the round records in `docs/rounds/`, so their sources cite rounds; later
 > entries cite commits.
 
@@ -15,10 +15,11 @@
 - **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`)
 
 ### D2: Tarballs are trusted by pinned digests, whatever the source
-- **What**: Version, length and sha256 are fixed in `scripts/fetch-rootfs` and `Rootfs.kt`; several sources are probed and tried in order; interrupted downloads resume with `Range`; a verified tarball is cached until the import succeeds.
+- **What**: Pinned version, length and sha256 validate tarballs from ordered sources; resume continues on 206, restarts on 200 and fails the source without resetting on other statuses, while a failed attempt already at the full length proceeds to verification.
 - **Why**: With the digest fixed in the app, every source is equally trustworthy; a Debian signature would add no trust beyond the digest the app already carries.
-- **Tradeoffs**: Updating a distro means changing the pinned values and shipping a new app.
-- **Source**: round 99 (`99-choose-rootfs`); design doc §11.4
+- **Tradeoffs**: Distro updates require new pins, transient resume errors can exhaust Debian’s sole source, and partial files do not survive the download call.
+- **Watch out**: A non-200 reply to an unsupported Range ends the source, and only the final hash checks the 206 payload’s correctness.
+- **Source**: round 99 (`99-choose-rootfs`); design doc §11.4; 30d0fab3
 
 ### D3: Switching or resetting downloads first and replaces the system only when ready
 - **What**: The new tarball is downloaded and verified in the background while the old system keeps running (progress and cancel in Settings and the notification); only then are sessions ended, the store deleted and the new one imported; a failed download leaves the old system, a failed import falls back to the bundled Alpine; reset and switch stay available after a start failure.
@@ -26,11 +27,12 @@
 - **Tradeoffs**: After a cancel the old download thread must finish (up to a 30 s timeout) before another switch; a download killed with the app restarts from zero.
 - **Source**: round 190 (`190-settings-default-alpine`)
 
-### D4: Mirrors are chosen by measured throughput, and only built-in mirror hosts are rewritten
-- **What**: Built-in mirrors are probed concurrently (up to 512 KB or 5 s each) and the fastest is written unless the user picked one; writing replaces only the built-in mirror part of each line, keeping the scheme, other sources and commented lines.
-- **Why**: Timing only the first 128 KB could not detect a mirror running at 14 KB/s through a proxy; rewriting the whole file dropped lines users had added (Alpine testing, Debian backports, third-party repositories).
-- **Tradeoffs**: Probes use the app's HTTP stack and the system proxy, which guest package managers do not use, so the winner is not always fastest for the guest.
-- **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`), 203 (`203-mirror-keeps-lines`)
+### D4: Mirrors are measured once after import and only an untouched template is replaced
+- **What**: The post-import throughput probe selects a mirror and rewrites sources from the import template only if the file still exactly matches that template; manual mirror settings and records are no longer used.
+- **Why**: Changing mirrors in a running system could overwrite user repositories and leave manual/measured state inconsistent.
+- **Tradeoffs**: There is no later in-app mirror choice or retry, a failed first probe leaves official sources, and app HTTP/proxy measurements may differ from guest performance.
+- **Watch out**: The compare and write are not atomic against a guest edit, old preference keys remain unread, and edited or deleted source files must remain untouched.
+- **Source**: rounds 99 (`99-choose-rootfs`), 190 (`190-settings-default-alpine`), 203 (`203-mirror-keeps-lines`); a1367531
 
 ### D5: Tabs log in as the first regular user by default, who is set up to become root
 - **What**: The login setting defaults to "auto" (the regular account with the lowest UID, else root); the first time a regular user becomes the login account it is added to wheel with doas (Alpine, installed offline from the bundled package) or to sudo (Debian, installed online), and NOPASSWD rules are written only while the account has no password.
@@ -56,53 +58,53 @@
 - **Source**: round 99 (`99-choose-rootfs`); design doc §11.4
 
 ### D9: Distributions, first boot, logins and Settings are one android/setup module
-- **What**: android/setup covers `Rootfs.kt`, `SettingsActivity.kt`, `login.sh` and `scripts/fetch-rootfs`, separate from android/service.
+- **What**: android/setup covers Rootfs, SettingsActivity/SettingsFragment, login and shell-integration assets, and fetch-rootfs, while service lifecycle stays in android/service.
 - **Why**: §11.1's login account and §11.4's first boot and settings needed a home when the design doc was retired.
 - **Tradeoffs**: The service drives switches and imports, so those flows span two maps, and D8's reason was never recorded.
-- **Watch out**: The map's open bug is a password change that renames nothing in `/etc` (an in-place shadow edit) keeping NOPASSWD until the next login (D19); a switch interrupted by a kill no longer becomes Alpine (D17).
-- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6)
+- **Watch out**: The 2026-11-12 full verification corrected import/login behavior and recorded mirror defects subsequently removed by import-only selection; in-place shadow edits can still delay NOPASSWD refresh, and shell-hook/device checks remain open.
+- **Source**: 12c4afa (bug list since updated by 237d663, d03c9b6); 5d506bfb; a1367531; 7aa817af; f8822b8b
 
-### D10: The execution tier row exists only in debug builds
-- **What**: Settings creates the tier row only when `BuildConfig.DEBUG`, with its strings left in `main`, which references them.
-- **Why**: Tier 0 only tells engine bugs from kernel bugs, and in a release build choosing it made everything tens of times slower and could stay on unnoticed.
-- **Tradeoffs**: Release users cannot be asked to retry on Tier 0 to locate a reported bug, and the release APK carries six strings it never shows.
-- **Watch out**: Where Tier 1 cannot start, a release build has no fallback to Tier 0 (the row was already disabled while the kernel was down, so this is no regression).
-- **Source**: 62a8c07
+### D10: Every build exposes execution mode with restart confirmation
+- **What**: Settings always creates the Debugging group and execution-mode preference, uses a separate current-mode summary and confirms before a mode change restarts the kernel.
+- **Why**: Release users need to compare modes without installing a debug build.
+- **Tradeoffs**: Users can persist the slower Tier 0, and switching ends existing sessions.
+- **Watch out**: The row stays disabled when the kernel is not running, and device layout and switching were not exercised.
+- **Source**: 62a8c07; cf4f5e20
 
 ### D11: Filling two cells with CJK is an on-off switch, not a scale
-- **What**: Settings offers a toggle row "CJK characters fill two cells" ("中日韩文字占满两格"), usable at any time, with summaries for on and off, rather than a choice of scales.
+- **What**: Settings offers a CJK-enlargement toggle, usable at any time, with summaries for on and off, rather than a choice of scales.
 - **Why**: The user asked for a switch in Settings between filling two cells and the old centring.
 - **Tradeoffs**: No intermediate scale.
 - **Watch out**: The row speaks of CJK characters, but every wide glyph narrower than two cells is enlarged.
-- **Source**: 0478dd5
+- **Source**: 0478dd5; 75123eef (shared labels and default)
 
-### D12: Settings is a Material 3 page of grouped rows
-- **What**: Rows inflated from `list_item.xml` into a `NestedScrollView` are grouped under System, Android, Terminal, Debugging (debug builds only) and About; toggles show a display-only `MaterialSwitch` presented to accessibility services as a switch, disabled rows are drawn at 38%, every dialog goes through `MaterialAlertDialogBuilder`, and state handling and the service calls are unchanged.
-- **Why**: The user asked for the settings screen to be restyled first, and it was a flat list of nine hand-coloured rows with a text arrow for back.
-- **Tradeoffs**: The groups and their names are the assistant's choice, not yet confirmed by the user, rows are plain views driven by the service's state rather than Preferences, and the login change stays a toast.
-- **Watch out**: The first state jumps into place through `SwitchCompat.jumpDrawablesToCurrentState` ending its thumb animator (read from AppCompat 1.7.1's bytecode), so a later AppCompat could slide the switches on every open again.
-- **Source**: 55be399
+### D12: Settings uses service-driven AndroidX Preferences in a Material page
+- **What**: SettingsActivity supplies the frame and targets the preference RecyclerView for app-bar lift, while SettingsFragment builds stable-key nonpersistent categories, switches and lists driven by service setters, discards stale account loads and restores scrolling only after state and insets are ready.
+- **Why**: Standard preferences replace custom row/accessibility code, and an explicit scrolling target prevents preference updates from resetting app-bar lift.
+- **Tradeoffs**: Service rendering and destructive confirmations stay explicit, standard preference spacing replaces custom rows, and Material list dialogs retain AndroidX selection/recreation behavior.
+- **Watch out**: Choice dialogs use AndroidX’s deprecated target-fragment contract, lift depends on its RecyclerView ID, restoration must await bottom padding and service state, and real-device/TalkBack behavior remains unverified.
+- **Source**: 55be399; f8822b8b; dd200589
 
 ### D13: Login rules, admin setup, mirror choice and downloads fail closed
-- **What**: NOPASSWD rules are refreshed at every login, root's included, and granted only when the account's shadow field after any leading `!` is empty or `*`; an admin is matched with `grep -F` and recorded only once `id -nG` shows the group (else retried at the next login); a failed mirror write leaves the sources and the record alone; and a download fails as soon as a source sends more than the pinned length.
+- **What**: NOPASSWD rules are refreshed at every login, root's included, and granted only when the account's shadow field after any leading `!` is empty or `*`; an admin is matched with `grep -F` and recorded only once `id -nG` shows the group (else retried at the next login); an import-only mirror write leaves edited sources alone (D4); and a download fails as soon as a source sends more than the pinned length.
 - **Why**: Locked accounts with a password, missing shadow entries and a missing `/etc/shadow` counted as passwordless, root logins never rewrote the rules, failed group changes were recorded, names were matched as regexes, a mirror that failed to write was recorded and fetch had no cap.
 - **Tradeoffs**: A password set inside a running session keeps NOPASSWD until the refresh of D19 runs, or until the next login when nothing in `/etc` was renamed, and a locked account without a hash still counts as passwordless, as `adduser -D` accounts must.
 - **Watch out**: Shadow formats other than Alpine's and Debian's (`!`, `!!`, `*`, `!*`) are judged by the same rule, and the Debian sudo path was not run in a container, only shared with the Alpine path.
-- **Source**: 711b034; d03c9b6 (the refresh, D19)
+- **Source**: 711b034; d03c9b6 (the refresh, D19); a1367531
 
 ### D14: Rootfs and Settings read in the order a start uses them
-- **What**: `Rootfs` runs types and constants, the store, the import, mirror probing and writing, the per-start files, boot, accounts, then downloads and reset; `SettingsActivity` runs lifecycle, row building, listener callbacks, display, then actions in the order of the rows.
+- **What**: `Rootfs` runs types and constants, the store, the import, mirror probing and writing, the per-start files, boot, accounts, then downloads and reset; `SettingsActivity` now supplies the frame and `SettingsFragment` owns binding, preferences and actions (D12).
 - **Why**: Rootfs interleaved import, mirror, login and download code, unlike the order a start uses them.
 - **Tradeoffs**: The texts earlier profiles are matched against (`UNMARKED_PROFILE`, `OLD_PROFILE`, `REPLACED_PROFILES`) sit apart from the code that writes the profile, each next to its user.
 - **Watch out**: `OLD_PROFILE` is built from `UNMARKED_PROFILE` and must stay after it.
-- **Source**: a546fea; 6c5f921 (the profile moved to an asset)
+- **Source**: a546fea; 6c5f921 (the profile moved to an asset); f8822b8b
 
-### D15: Lint fixes go through androidx compat and KTX helpers
-- **What**: Toggle rows set their accessibility state through `AccessibilityNodeInfoCompat`'s tri-state setter (`setChecked(int)` from API 36, the boolean below), and Rootfs's preference writes use `edit { }`, with `edit(commit = true)` where the import record was committed synchronously.
-- **Why**: `AccessibilityNodeInfo.setChecked(boolean)` is deprecated since Android 16 (compileSdk 37), and UseKtx warnings now fail the build (android/native D10).
-- **Tradeoffs**: A compat wrapper is created for each accessibility query of a toggle row.
-- **Watch out**: The toggles' accessibility state (D12) was not checked with TalkBack on a device.
-- **Source**: 4c1a3ce
+### D15: Preference writes retain KTX commit semantics
+- **What**: Rootfs preference writes use `edit { }`, with `edit(commit = true)` for synchronous import records; standard Preferences now provide toggle accessibility (D12).
+- **Why**: UseKtx and deprecated hand-written accessibility calls failed lint, and the latter were subsequently removed with the custom rows.
+- **Tradeoffs**: Accessibility behavior now depends on AndroidX Preference rather than a custom compat wrapper.
+- **Watch out**: TalkBack behavior still needs device verification.
+- **Source**: 4c1a3ce; f8822b8b
 
 ### D16: Guest messages name the app Appine; prefixes and paths stay lowercase
 - **What**: The motd says "Welcome to Appine", and login.sh says "Appine tries again at the next login" and writes "# Written by Appine" into the NOPASSWD rules; the "appine:" prefixes, `/var/lib/appine`, `/var/cache/appine`, `30-appine.conf`, `sudoers.d/appine` and `profile.d/appine.sh` are unchanged.
@@ -115,8 +117,8 @@
 - **What**: `prepare` commits `KEY_DISTRO` for the app's store before importing and deletes the tarball only after the rename and directory sync, and `Rootfs.importing` returns that record (Alpine when there is none) for a launch without a store (android/service D16).
 - **Why**: The distro was recorded only just before the store was renamed into place and the tarball was deleted right after importing, so a kill midway left nothing saying which distro was being imported and could lose the download.
 - **Tradeoffs**: A kill between deleting the old store and `prepare` starting still resumes the old distro; the cache holds the tarball a little longer during configure and sync.
-- **Watch out**: A distro whose download keeps failing is tried again at every launch without a store, each time falling back to Alpine with a notice.
-- **Source**: 237d663
+- **Watch out**: Fallback prepare records Alpine before importing it, so a failed Debian download is not retried at every later storeless launch; the pre-prepare deletion window still resumes the previously recorded distro.
+- **Source**: 237d663; 5d506bfb (recorded correction); a1367531
 
 ### D18: Rootless podman uses the host network, and container storage keeps the packages' defaults
 - **What**: Before every start (android/service D17) `Rootfs.ensureContainersConfig` writes `containers.rootless.conf.d/appine.conf` (`netns = "host"`) when missing and nothing else, so podman's overlay driver and docker's overlayfs snapshotter, the packages' defaults, run on the kernel's overlayfs rootful and rootless.
@@ -132,12 +134,12 @@
 - **Watch out**: Changes that rename nothing in `/etc` (an in-place edit) or fall past the 256-directory limit between polls still wait for the next login (map debt), and changed directories are recorded only from the service's first take.
 - **Source**: d03c9b6
 
-### D20: Login shells mark their prompts from the asset `profile.sh`, and replaced profiles are recognised by text or hash
-- **What**: `assets/profile.sh` gives bash a first `PROMPT_COMMAND` function and marked PS1, PS2 and PS0, and busybox ash a marked PS1 and PS2 (OSC 133 A with `cl=line`, B or I, C, and D with the status), setting PS1 only for bash and ash; `updateProfile` replaces an unchanged earlier profile, matching the two unmarked versions by text (`UNMARKED_PROFILE`, `OLD_PROFILE`) and later asset versions by their sha256 in `REPLACED_PROFILES`.
-- **Why**: The terminal's prompt features (closing at the prompt, jumping, selecting output, command notices and moving the cursor by taps, android/terminal D43 and D48) need marks from the login shells; Ghostty's integration scripts are GPLv3 (bash's) and need injection; and the old bash PS1 showed its escapes under zsh and dash.
-- **Tradeoffs**: zsh, fish, nested non-login shells and an ash PS1 set after the profile get no marks; D is also sent at ash's redraws and bash's empty lines; edited profiles never get the marks; the hash list is opaque without git history.
-- **Watch out**: Changing `profile.sh` without adding the replaced version's sha256 leaves existing stores on the old profile; the bash path was tried only in a Docker container (Ubuntu 26.04, bash 5.3), not on Debian in the app or with prompt tools that rewrite PS1; the `profileMarksPrompts` instrumentation test (android/native D19) matches ash's marks byte for byte.
-- **Source**: 6c5f921, 2b04a43
+### D20: Profile migration installs companion prompt hooks without overwriting user edits
+- **What**: Recognized unmodified profiles migrate by text/hash, install bashrc/ashrc companions, integrate bash through the profile and Alpine’s system bashrc, expose ash hooks through an unset ENV, and wrap zsh prompts with precmd/preexec hooks.
+- **Why**: Prompt features need marks after user startup files and in supported nested shells, while new Alpine logins use bash.
+- **Tradeoffs**: Edited profiles and user ENV win, doas -s clears ash’s ENV, Debian nested bash and zsh remain unintegrated, and later PS1/PROMPT_COMMAND/theme changes can remove marks; fish 4 and nushell supply their own marks (android/vt D5).
+- **Watch out**: Companion-only edits do not migrate existing stores without a profile change and recorded hash; zsh percent escapes/right or multiline prompts and broader device prompt gestures remain limited or unverified.
+- **Source**: 6c5f921, 2b04a43; a7d8c9f5; a809c5a8; 7aa817af
 
 ### D21: Settings' Terminal group chooses the cursor's shape and blinking
 - **What**: The Terminal group gains "Cursor shape" (Block, Bar or Underline in a single-choice dialog, the summary naming the current one) and "Blinking cursor" (a toggle, on by default), both usable at any time and forwarding to the service (android/service D22), with English and Chinese strings.
@@ -149,9 +151,49 @@
 ### D22: Settings is recreated on a display size change
 - **What**: `SettingsActivity` leaves `density` out of `configChanges`, so a display size change recreates it as a dark-mode change does.
 - **Why**: Settings handled `density` itself, so a display size change left its views at their old sizes, as it did the terminal's (android/terminal D50).
-- **Tradeoffs**: A display size change drops an open Settings dialog.
+- **Tradeoffs**: Login/cursor ListPreference dialogs now survive recreation through AndroidX, while other dialogs still close.
 - **Watch out**: None beyond the existing recreation path, which rebinds and renders again.
-- **Source**: e12f560
+- **Source**: e12f560; f8822b8b
+
+### D23: Volume-key tab switching is a default-on setting
+
+- **What**: The Terminal group exposes an always-available toggle forwarding volume-key behavior to the service, with English and Chinese summaries.
+- **Why**: Users need control over using volume buttons to switch tabs.
+- **Tradeoffs**: This adds one row and offers no modifier-key mode.
+- **Watch out**: Single or absent tabs fall back to system volume, and device/localization coverage remains limited.
+- **Source**: 61df6915
+
+### D24: New Alpine imports install bundled bash with serialized package setup
+
+- **What**: Alpine imports cache four pinned bash packages, select bash for root and install offline under `/run/appine-install.lock`, preserving existing systems and shell fallback while serializing bash/doas and waiting for apk/apt locks.
+- **Why**: New systems need full bash compatibility without network access or package contention breaking first login.
+- **Tradeoffs**: The APK gains about 0.86 MB and first-login work, existing users keep their shells, and apt update may wait until interrupted.
+- **Watch out**: Retain a usable fallback and retry cache on failure, refresh disappearing Alpine pins, and keep network sudo installation outside the bundled-install lock.
+- **Source**: 7aa817af
+
+### D25: Settings summaries keep the selected value and move operational detail to confirmations
+
+- **What**: Distribution choices omit sizes, automatic login shows the resolved username with root fallback, and reset summaries omit the distribution name.
+- **Why**: Users asked for shorter descriptions while retaining meaningful current state.
+- **Tradeoffs**: The initial chooser no longer previews download size or explains account selection.
+- **Watch out**: Switch confirmations must retain download and deletion details.
+- **Source**: b2f96a63
+
+### D26: Screen-off policy is a service-backed choice list
+
+- **What**: A nonpersistent ListPreference replaces the keep-awake switch and uses the shared Material choice dialog with the service’s SLEEP, BUSY and ALWAYS policy descriptions.
+- **Why**: Settings must expose three policies and stay synchronized with notification toggles.
+- **Tradeoffs**: Changing policy opens a list, and BUSY needs its idle-timeout limitations explained.
+- **Watch out**: Vendor presentation and accessibility remain unverified.
+- **Source**: a3f7507e, 1e5de64e
+
+### D27: New Alpine imports stage an independent offline procps-ng bundle
+
+- **What**: Imports cache pinned procps-ng dependencies separately from bash, install before account selection under the install lock using apk’s package database, re-add procps-ng by name and remove the cache only after success.
+- **Why**: New systems need procps tools offline regardless of the selected shell.
+- **Tradeoffs**: Existing stores are not migrated and first login performs another transaction.
+- **Watch out**: Failed bundles must survive for retry, later user removal must stay respected, and disappearing upstream packages require refreshed pins.
+- **Source**: 410ef192
 
 ## Superseded
 
@@ -159,3 +201,10 @@
 - ~~`ensureContainersConfig` also chooses vfs in `/etc/containers/storage.conf` (rewriting an active `driver = "overlay"` line) and the native snapshotter in `/etc/docker/daemon.json` (0eb9e19)~~ → replaced by **D18** in 869de68 (2026-11-08)
 - ~~A password set inside a running session keeps NOPASSWD until the next tab logs in (D13's tradeoff, 711b034, and D9's watch-out, 12c4afa)~~ → replaced by **D19** in d03c9b6 (2026-11-09)
 - ~~`OLD_PROFILE` is built from `PROFILE`, the profile kept as a Kotlin string (D14's watch-out, a546fea)~~ → replaced by **D20** in 6c5f921 (2026-11-10)
+- ~~D4’s manual mirror selection and rewriting of built-in hosts in existing sources~~ → replaced by **D4** in a1367531 (2026-11-12)
+- ~~D10’s debug-only execution-tier row~~ → replaced by **D10** in cf4f5e20 (2026-11-13)
+- ~~D12’s inflated custom Settings rows and hand-written switch accessibility~~ → replaced by **D12** in f8822b8b (2026-11-13)
+- ~~D15’s custom toggle accessibility compat wrapper~~ → replaced by **D12** in f8822b8b (2026-11-13, implicit refinement)
+- ~~D20’s ash marks written only by the login profile~~ → replaced by **D20** in a809c5a8 (2026-11-13, existing-entry match; the cited a7d8c9f5 Decision describes zsh)
+- ~~D20’s bash hooks kept inline in the login profile~~ → replaced by **D20** in 7aa817af (2026-11-13, implicit refinement)
+- ~~The keep-awake switch introduced by a3f7507e~~ → replaced by **D26** in 1e5de64e (2026-11-13, predecessor predates structured Decision records)

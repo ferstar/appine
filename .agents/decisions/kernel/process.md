@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -161,6 +161,22 @@
 - **Tradeoffs**: Nine relaxed stores and one release store per kernel entry, and with no sequence lock a reader can mix two entries of a thread that leaves and re-enters while it reads (procfs shows such a running thread as `running` anyway).
 - **Watch out**: A new path out of guest code that skips the record leaves a stale entry visible until the next exit.
 - **Source**: f1212d8
+
+### D56: Test hook 14 forces host refusal of TCP filters
+
+- **What**: Test hook 14 toggles `REFUSE_TCP_FILTERS` for the whole kernel, while `host_refuses_tcp_filters` is always false without test hooks.
+- **Why**: The retained TCP-filter path needs deterministic coverage on hosts that accept filters.
+- **Tradeoffs**: The hook persists until explicitly disabled.
+- **Watch out**: Tests must turn it off before later sockets in the same run.
+- **Source**: 52dcc177
+
+### D57: Guest CPU samples combine live and exited threads
+
+- **What**: `Machine::cpu_time_ns` saturating-adds exited-thread CPU totals and every live thread’s CPU time under the BKL.
+- **Why**: The screen-off policy needs guest activity without counting the UI or host polling.
+- **Tradeoffs**: Each sample takes the BKL and visits the live threads.
+- **Watch out**: An exit-stage panic can skip CPU credit, so consumers must compare changes rather than assume monotonicity.
+- **Source**: 1e5de64e
 
 ## Superseded
 

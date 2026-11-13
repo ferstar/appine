@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -60,8 +60,8 @@
 - **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
 - **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
 - **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
-- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, `/proc/<tid>`'s ptrace-gated files failing with `ESRCH`, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, a `cgroup.subtree_control` panic on a multi-byte token, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8)
+- **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -160,6 +160,14 @@
 - **Tradeoffs**: With no Yama, any reader passing the ptrace check reads another process's file where Linux's ptrace_scope 1 limits it to ancestors, and the record is a snapshot whose registers can be a moment old.
 - **Watch out**: Only `syscall` checks the target thread itself; the other per-thread checks use the main thread's credentials (D39).
 - **Source**: f1212d8
+
+### D41: Cgroup tokens are byte-safe and cpu.max retains an omitted period
+
+- **What**: `subtree_control` rejects anything except a one-byte + or - prefix, and quota-only cpu.max writes retain the stored period or default to 100000.
+- **Why**: Multibyte tokens could panic the kernel, and quota-only updates lost the period.
+- **Tradeoffs**: Extra words and nonnumeric periods still fail where Linux’s sscanf can ignore them.
+- **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
+- **Source**: 45be9fae
 
 ## Superseded
 

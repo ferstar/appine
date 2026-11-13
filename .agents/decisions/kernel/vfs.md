@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/vfs"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D14 were seeded by hand from the retired design
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D14 were seeded by hand from the retired design
 > doc §8.2–§8.3 and §11.1 and the round records in `docs/rounds/`, so their sources cite rounds;
 > later entries cite commits.
 
@@ -23,7 +23,7 @@
 - **D16** — timerfd parses timespecs through the shared `timespec()` helper (kernel/process D15) and the lease-break deadline clamps at KTIME_MAX, so neither can overflow `Instant` (96cd8bd)
 - **D17** — Open keeps `O_DSYNC` and `__O_SYNC` (`KEPT_AT_OPEN`), so `F_GETFL` shows them, `F_SETFL` cannot clear them and `write_sync` syncs after each write (sendfile, copy_file_range and splice still do not), and `CLOSE_RANGE_UNSHARE` copies the fd table only above two references, like `unshare(CLONE_FILES)` (68cafce)
 - **D18** — A chown that would clear the set-id bits of a store non-directory needs the owner or `CAP_FOWNER` (`EPERM` otherwise), following 6.2's `setattr_should_drop_sgid` as an exception to the 6.1 contract, while writes still clear setgid only with group exec as 6.1 does (ce7d0d8)
-- **D19** — `exe_file` and `open_pseudo` find a pid node's process with `pseudo::group_of`, so `/proc/<tid>` works like its thread group's, and code treating a pid node's id as a thread-group id misses threads (kernel/procfs D12) (173da76)
+- **D19** — `exe_file` and `open_pseudo` find a pid node's process with `pseudo::group_of`, so `/proc/<tid>` works like its thread group's, and code treating a pid node's id as a thread-group id misses threads (kernel/procfs D12) (173da76, 45be9fae)
 - **D20** — The VFS's Rust files read in the order their code runs (syscall/fs.rs from opening to its helpers, `impl Vfs` top-down), and code appended at the end of a file drifts from that order (866b1cf)
 - **D21** — Loop devices in `Kernel::loops` forward I/O through the backing open file at the device offset with 6.1's loop and block ioctl errors (no page cache, partitions, discard, mmap or mounting), differential cases must wait for native kernels after 6.1 to unbind an autoclear device, and a loop over a loop keeps the lower device open until the upper one is unbound (a26c8b4)
 - **D23** — A timerfd keeps an `Expiry` on its clock (kernel/process D19), and with `TFD_TIMER_CANCEL_ON_SET` a later realtime clock jump counts as one expiration and makes the next read return `ECANCELED` once while the timer stays armed (63b9e59)
@@ -87,12 +87,12 @@
 - **Watch out**: Keep the no-watch cost at one emptiness check per event.
 - **Source**: rounds 11 (`11-m8-jvm`), 19 (`19-deferred`), 201 (`201-documents-notify`); d7076fc, affb1e2
 
-### D15: kernel/vfs covers paths, fds, file I/O and tmpfs; mounts, overlayfs, locks, pipes, xattrs, inotify, AIO and loop devices are modules of their own
-- **What**: kernel/vfs covers path resolution, the mount-flag checks in file operations, tmpfs instances, fd tables and file I/O, clones, metadata and namespace syscalls, device nodes and the calls into the overlay, lock, pipe and inotify code, while mounts are kernel/mount's, overlayfs kernel/overlay's, locks and leases kernel/locks's, pipes, FIFOs and splice kernel/pipe's, xattrs kernel/xattr's, inotify kernel/inotify's, native AIO kernel/aio's, loop devices kernel/loop's, timerfd and eventfd kernel/poll's and FUSE connections kernel/fuse's.
-- **Why**: The map, read whole before every VFS change, reached 1426 lines and then 99 KB, past one Read, while each moved part has code of its own and a Linux counterpart that most VFS changes never touch.
-- **Tradeoffs**: tmpfs, readv/writev's per-kind split and copy-to-guest faults stay here; overlay changes, mount-flag checks and splices to files read two maps; boundaries inside `vfs/mod.rs`, `syscall/fs.rs` and `syscall/mount.rs` exist only in the registry's wording; condensing dropped detail from key types and bug entries that the code and commits still hold; decisions made before each split keep their kernel/vfs tags here (listed in kernel/mount D2 and the other new modules' preambles).
-- **Watch out**: Bugs still open in the map include `/proc/<pid>/fd` reopens skipping open checks, tmpfs charges drifting for unlinked open files, writes keeping a setgid bit chown would clear, file position races and the fidelity gaps; one invariant keeps the overlay rules every file operation must follow, described in kernel/overlay's map.
-- **Source**: c5236a1, a536142, cc160c1, 5f327de (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c, 9b99931 and a36860b)
+### D15: kernel/vfs owns resolution, metadata and tmpfs; open files belong to kernel/files
+- **What**: kernel/vfs keeps path resolution, mount-flag checks, tmpfs instances and accounting, metadata and namespace calls, getdents64 and device nodes, while kernel/files owns fd tables, opening, data I/O, truncation and syncing alongside the already separate filesystem modules.
+- **Why**: The fully refreshed VFS map reached 61.5 KB, beyond one read, and open files form a coherent subsystem apart from resolution and metadata.
+- **Tradeoffs**: Boundaries run inside shared files, opens and writes need both maps for mount flags and tmpfs duties, and pre-split decisions retain their original tags and IDs here.
+- **Watch out**: The confirmed reopen and file-position bugs moved to kernel/files, where 01bfd882 fixes reopens and write-position checks but leaves the lseek race; tmpfs accounting and remaining VFS fidelity gaps stay in this module’s map.
+- **Source**: c5236a1, a536142, cc160c1, 5f327de (scope since extended by 3f3db11 and 2a244d2 and narrowed by d2b1dc3; bug list since updated by 3f3db11, 4e64e74, 70c1bc6, ce8a9ce, 2aca260, d9e1f0c, 9b99931 and a36860b); ce193253; 01bfd882
 
 ### D22: Vectored I/O on pipes, terminals, sockets and host stdio streams is one operation
 - **What**: Following Linux's split between `read_iter`/`write_iter` and plain operations (checked against 6.1), sockets go to kernel/net's `rw` (D13 there), pipe, PTY and eventfd reads do one 64 KiB read scattered over the iovecs, pipe and PTY writes go in 64 KiB pieces across iovecs until one is short, `stream_vectored` sends `appine-run`'s host stdio down the same pipe path unless `host_regular` finds a regular file on the host, and positional files and such regular files keep the per-iovec loop.
@@ -118,9 +118,9 @@
 ### D40: Overlay copy-up runs in one store transaction per node
 - **What**: A change copies its node up in one store transaction (`Overlays::upper_of`), parents first, keeping mode, owner, attributes, times and holes; creations replace a whiteout in the same transaction and make a directory there opaque; `unlink_overlay` and `rename_overlay` follow Linux's check order (merged-directory renames are `EXDEV`); permission is checked on what the overlay shows before copying up; `store_dir` refuses overlay directories so no store path can change a layer; read-only fds move to the upper object on their next read; an instance pins the tmpfs instances its layers are in; origins are kept in memory only.
 - **Why**: Container engines need writable overlays (copy-up on change, whiteouts on removal, opaque directories, `EXDEV` for merged-directory renames), and podman's probe (a premade whiteout, then `rm -rf` through the overlay) must pass.
-- **Tradeoffs**: The work directory is created but never used; a copied-up file shares the lower one's object until either is written (D45); copied-up files change inode number at the next mount, and links made through the overlay show the upper inode's number; writes through an overlay are not counted against a tmpfs upper layer's limits; parents are copied up before a creation's permission check.
+- **Tradeoffs**: The work directory is created but never used; a copied-up file shares the lower one's object only when no host writer or writable mapping requires an immediate copy (kernel/overlay D2); copied-up files change inode number at the next mount, and links made through the overlay show the upper inode's number; writes through an overlay are not counted against a tmpfs upper layer's limits; parents are copied up before a creation's permission check.
 - **Watch out**: Code that builds a `Node::Store` from an overlay file's store inode or calls store mutations on a layer bypasses copy-up and whiteouts.
-- **Source**: 4b4af75 (since changed by df6ee70 and 0d82807)
+- **Source**: 4b4af75 (since changed by df6ee70 and 0d82807); 01bfd882 (kernel/overlay D2)
 
 ### D42: Pending AIO polls complete outside io_getevents, and io_submit follows 6.1
 - **What**: io_getevents waits on its pending polls' files as ppoll would, plus the context's wake object (kernel/poll D16); io_cancel first completes ready polls; the timer thread watches the contexts with eventfd-signalling polls (`Kernel::aio_polls`, kernel/process D11); the resfd eventfd is taken at submission, and releasing a context signals its cancelled polls' eventfds; writes take `append_offset` and `write_sync` as pwritev2 does; io_submit follows `io_submit_one` and the per-command checks, with a `read_iter`/`write_iter` table (`has_iter`) and `has_fsync`; events whose copy faults go back to the queue.
@@ -213,6 +213,22 @@
 - **Watch out**: A new path taking data out of a pipe must call `wait_splice_done` first or the late drain removes bytes it never wrote, and a FUSE daemon reading the pipe that a splice into `/dev/fuse` comes from deadlocks, as on Linux.
 - **Source**: 9b99931
 
+### D55: An fd can be reserved before its open description is installed
+
+- **What**: `FdTable::reserve`, `fill` and `unreserve` keep allocations away from pending slots, make explicit replacement return EBUSY, hide reservations from other operations and discard them on clone.
+- **Why**: accept4 needs Linux’s separation between choosing an fd and installing it after a blocking accept.
+- **Tradeoffs**: Allocations scan a normally tiny reservation list, and `fill` ignores a subsequently lowered limit.
+- **Watch out**: Every replacement must use `install_at`; musl dup2 can retry EBUSY indefinitely, and this pre-split decision now concerns kernel/files.
+- **Source**: 4e01f78b
+
+### D56: Bind-root traversal and tmpfs owner options respect their boundaries
+
+- **What**: `dotdot` returns ENOENT outside a bind root, and tmpfs mount/remount maps uid/gid options through the caller’s user namespace, rejecting unmapped IDs.
+- **Why**: Renaming directories out of a bind subtree escaped its walk boundary, and tmpfs options used host-side IDs.
+- **Tradeoffs**: Each parent traversal under a non-root bind walks the store’s parent chain.
+- **Watch out**: Deep bind trees pay for the walk, and previously accepted unmapped owner options now fail with EINVAL.
+- **Source**: 01bfd882
+
 ## Superseded
 
 - ~~There are no block devices or loop devices (D5's tradeoff, rounds 04, 05, 184)~~ → replaced by **D21** in a26c8b4 (2026-11-06)
@@ -231,3 +247,5 @@
 - ~~Host stdio fds stay per-iovec (D22's tradeoff, b295644)~~ → replaced by **D22** in a36860b (2026-11-10, no SUPERSEDES declared)
 - ~~kernel/vfs also covers inotify, native AIO, loop devices and timerfd (D15, c5236a1, a536142)~~ → replaced by **D15** in cc160c1 (2026-11-11)
 - ~~kernel/vfs also covers overlayfs, locks and leases, pipes and xattrs, overlayfs having stayed when inotify, AIO and loop devices left (D15; cc160c1)~~ → replaced by **D15** in 5f327de (2026-11-11)
+- ~~D15’s ownership of fd tables, open files and file I/O~~ → replaced by **D15** in ce193253 (2026-11-12)
+- ~~D40’s unconditional sharing of a regular file’s lower object after copy-up (df6ee70)~~ → replaced by **kernel/overlay D2** in 01bfd882 (2026-11-12, cross-module SUPERSEDES)

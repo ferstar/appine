@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: harness"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D8 were seeded by hand from the design doc §13.3
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the design doc §13.3
 > and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite commits.
 
 ## Constraint index (compressed active decisions)
@@ -54,11 +54,11 @@
 - **Source**: b38d29c, 172be7c
 
 ### D13: Kernel fixes and features get a differential case that reproduces their calls
-- **What**: Each fix adds a case that reproduces the calls in Python, C or busybox to a differential group (an existing one such as edge-cases, namespaces, pty, fork, nsports, compat2 or mount, since the third map-bug triage one privileged group per batch, compat5 to compat9, and for a new feature a case of its own such as vdso or overlay-inotify) instead of a kernel unit test or the real program (nginx, tmux), checks that it fails with the previous binary (moving a check whose trigger a later fix removes to one that still fails without the earlier fix, as `stale.c` in edge-cases moved to a seccomp filter installed with TSYNC), has C cases define the kernel constants and structures they need, since the image has no Linux headers, runs anything that could hang under `timeout`, and removes the Starnix and gVisor skips the fix makes pass.
+- **What**: Each fix adds a case that reproduces the calls in Python, C or busybox to a differential group (an existing one such as edge-cases, namespaces, pty, fork, nsports, compat2 or mount, since the third map-bug triage one privileged group per batch, compat5 to compat10, and for a new feature a case of its own such as vdso or overlay-inotify) instead of a kernel unit test or the real program (nginx, tmux), checks that it fails with the previous binary (moving a check whose trigger a later fix removes to one that still fails without the earlier fix, as `stale.c` in edge-cases moved to a seccomp filter installed with TSYNC), has C cases define the kernel constants and structures they need, since the image has no Linux headers, runs anything that could hang under `timeout`, and removes the Starnix and gVisor skips the fix makes pass.
 - **Why**: Native Linux is the reference for each fix's semantics, the programs that hit the bugs are not in the difftest store, gtests skipped for a fixed bug guard nothing until their skips are removed, and a C case that fails to compile on both sides prints the same and passes.
-- **Tradeoffs**: The programs themselves are not exercised, each interrupted wait costs 100 ms, timing cases such as `stale.c` take seconds on each side, `O_SYNC` durability is not checked, compat5 to compat9 need `--privileged` on the native side, values that differ between the sides are compared by range or relation (oom_score) or filtered to the case's own (`/proc/locks`), and checks whose answer depends on the host (block counts on the macOS development host's APFS, tmpfs `O_DIRECT` where 6.8 differs from the 6.1 contract, writing the VM's global fs.mount-max) are left out.
-- **Watch out**: CI's newer native kernel may differ (netlink group counts, block accounting, the fs.mount-max default, the order of overlay events, sealed system mappings for vdso's mprotect checks), unprivileged user namespaces depend on the native host's settings (Ubuntu's `apparmor_restrict_unprivileged_userns`), the nftables rate case needs ten sends to finish well within half a second, and `stale.c` loses its reproductions without failing when the waiting thread takes more than 0.3 s to start its wait.
-- **Source**: 96cd8bd, 65c44f6, d8136b6, e020977, ea08993, 68cafce, 0a4712e, f6a82cc, b43ff37, dcacfb6, 5d7b936, 39ea702, 99b4216, 16364c0, d7076fc, edd7f95, 970cf6a, f5c09f7, 9593bae, 27609fe
+- **Tradeoffs**: The programs themselves are not exercised, each interrupted wait costs 100 ms, timing cases such as `stale.c` take seconds on each side, `O_SYNC` durability is not checked, compat5 to compat10 need `--privileged` on the native side, values that differ between the sides are compared by range or relation (oom_score) or filtered to the case's own (`/proc/locks`), and checks whose answer depends on the host (block counts on the macOS development host's APFS, tmpfs `O_DIRECT` where 6.8 differs from the 6.1 contract, writing the VM's global fs.mount-max) are left out.
+- **Watch out**: CI's newer native kernel may differ (netlink group counts, block accounting, the fs.mount-max default, the order of overlay events, sealed system mappings for vdso's mprotect checks), unprivileged user namespaces depend on the native host's settings (Ubuntu's `apparmor_restrict_unprivileged_userns`), the nftables rate case needs ten sends to finish well within half a second, and `stale.c` loses its reproductions without failing when the waiting thread takes more than 0.3 s to start its wait; cgroup quota/period comparisons require a native CPU controller, and thread procfs checks compare readability rather than unstable contents.
+- **Source**: 96cd8bd, 65c44f6, d8136b6, e020977, ea08993, 68cafce, 0a4712e, f6a82cc, b43ff37, dcacfb6, 5d7b936, 39ea702, 99b4216, 16364c0, d7076fc, edd7f95, 970cf6a, f5c09f7, 9593bae, 27609fe; 45be9fae
 
 ### D18: Starnix's PTY scenarios run from files packed into the difftest script
 - **What**: A `# difftest-files:` line makes scripts/difftest pack that `tests/diff/<dir>` as a gzipped, base64 ustar archive prepended to the script, which both sides unpack with busybox into `/tmp/difftest-files/<dir>`, and the line-discipline case runs all 83 of Starnix's recorded scenarios (copied unchanged with Fuchsia's licence) one by one against the native kernel.
@@ -93,7 +93,7 @@
 - **Why**: Each of the frequent pushes waited 16 minutes (30 or more with the Starnix and gVisor cases) for suites that rarely change their verdict between two pushes.
 - **Tradeoffs**: Regressions only the differential tests catch show up the next morning, so risky changes need a local difftest or a manual full run; the nightly run uses master's copy of full.yml; a rust-cache miss adds the release build to full.yml; Tier 1's overhead on Neoverse N2 is no longer recorded in CI logs.
 - **Watch out**: GitHub runs scheduled workflows only from the default branch, so the nightly run picks up a change to full.yml only once master has it (without 48dce39's build step the differential tests never ran from 0202f1e on), while a `workflow_dispatch` started with `--ref <branch>` runs that branch's copy; CI's newer native kernel answers some cases otherwise than colima's 6.8 (D36); and a new Android build input outside the path filters goes unbuilt until a run that matches.
-- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch)
+- **Source**: 0202f1e, 48dce39; ba6200f (D36); 4083007 (`-R` and manual runs' branch); 36083476
 
 ### D25: Signals to appine-run go through the guest, so shutdown still runs
 - **What**: `appine-run` catches SIGINT, SIGTERM and SIGHUP with `appine_hal::stop_notifier` (hal D14) and hands them to the kernel's run through `RunOptions::stop` (kernel/process D30): the first is sent on to the program, one at least a second later ends every guest process, and the run then ends as usual.
@@ -199,6 +199,22 @@
 - **Tradeoffs**: One sleep and one date every 5 s for the whole run, a test can see one more process in the system, and on the native side Yama makes most `syscall` files unreadable (the watcher is no ancestor), so only Appine's dumps are useful.
 - **Watch out**: A test that kills its process group or every process stops the watcher for the rest of the run, and a dump finishing just after its test ended leaves a stale `hang.out` that only the name check keeps from the next test.
 - **Source**: f1212d8
+
+### D40: TCP filter fallback has forced-host and native comparison coverage
+
+- **What**: A both-tier test-hook guest program forces TCP attachment refusal, compat9 checks filter lengths, inheritance, detach and locks, and gVisor drops the fixed attach/detach skip while retaining the incomparable capability case.
+- **Why**: Host-dependent refusal otherwise left the retained-program path untested locally.
+- **Tradeoffs**: Native differential coverage depends on whether the host refuses TCP filters.
+- **Watch out**: If CI stops refusing attachment, only the forced hook test exercises retained programs.
+- **Source**: 52dcc177
+
+### D41: compat10 groups socket regressions while Appine-only queue limits stay in guest tests
+
+- **What**: Privileged compat10 compares TCP MSG_TRUNC/partial writes, IPv4/IPv6 route ioctls, accept4 reservations/timeouts and DNS-stub endpoints, while net.c bounds DNS queued answers by SO_RCVBUF plus one datagram.
+- **Why**: The socket fixes need Linux comparisons, but native Linux cannot expose Appine’s internal answer cap.
+- **Tradeoffs**: Large send can agree without exercising the fix, route tests omit unsupported unreachable/host routes, and the in-flight DNS cap lacks an independent test.
+- **Watch out**: Shutdown/accept cases rely on 300/200 ms scheduling and the queue case waits 1.5 s, which can hide undelivered answers on slow runners.
+- **Source**: 211a5867, 29e59fd3, 4e01f78b, 73127176
 
 ## Superseded
 

@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-11 (HEAD = c1a37da). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -168,6 +168,14 @@
 - **Tradeoffs**: A BKL acquisition per pump read and every 200 ms while a lock shows, and termios changes raise no event, so the app finds them only when it asks.
 - **Watch out**: Programs that read passwords in non-canonical mode (masking line editors) show no lock.
 - **Source**: 2b04a43
+
+### D24: Host console reads preserve foreground and background writer runs
+
+- **What**: Slave writes record ranges from non-foreground process groups, and `read_console_run` stops at writer changes while treating echoes as foreground; ordinary console and guest-master reads stay unchanged.
+- **Why**: Only the kernel can tell a background job’s bytes from shell output at a prompt.
+- **Tradeoffs**: Alternating writers shorten host reads and use a deque bounded by the 64 KiB output queue.
+- **Watch out**: Jobs without job control share the shell’s group, and a shell writing before reclaiming the terminal is classified as background.
+- **Source**: daab4446
 
 ## Superseded
 

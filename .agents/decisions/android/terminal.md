@@ -2,13 +2,15 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/terminal"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D3 were seeded by hand from the retired design
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D3 were seeded by hand from the retired design
 > doc §11.5 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
 ## Constraint index (compressed active decisions)
 
-> Full text of D2, D3, D6, D9, D11, D12, D14–D17, D20, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
+> Full text of D51–D52: `git show 410ef192ce13aa39fc4661c0cfa032f917066801:.agents/decisions/android/terminal.md`
+
+> Full text of D2, D3, D6, D9, D11, D12, D15–D17, D20, D22 and D23: `git show 248d79f637c8f05dadc6ef9fdb0733c568c6a468:.claude/decisions/android/terminal.md`
 
 > Full text of D13, D19, D21, D24, D26–D29, D31, D33–D35 and D37: `git show c1a37da58eada92fc78df580db7b870071cab435:.claude/decisions/android/terminal.md`
 
@@ -19,7 +21,6 @@
 - **D11** — Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Tab and Ctrl+Shift+Tab open, close and cycle tabs (listed by `onProvideKeyboardShortcuts`) and never reach programs, and Ctrl+Shift+W closes a running tab without ×'s confirmation (2af55e2)
 - **D12** — Extra keys act on release with a haptic, repeat the arrows every 80 ms and make CTRL, ALT and SHIFT one-shot on a tap and locked by a long press with a toast through `ExtraKeysView.Target.notice` (shared with tab titles), and they send presses only, so Kitty-protocol programs see no releases (c3c3b38; ba60e25)
 - **D13** — The app is Material 3 with dynamic colours (`Theme.Appine` DayNight for Settings and the licences, `Theme.Appine.Terminal` Material 3 Dark with black bars for `MainActivity`, which stays a framework `Activity` using Material dialogs and AppCompat's menus), so turning `MainActivity` into an `AppCompatActivity` changes its inflation, insets and key handling, and colours are read once per activity (55be399, 97707b7, d16025a)
-- **D14** — Extra keys are two black 32 dp rows (ESC / - HOME ↑ END | over TAB CTRL ALT ← ↓ → ~) in columns of max(45 dp, width / 8), scrolling below 360 dp, beside a fixed column of SHIFT over SYM folded into the key event's meta state, with no page keys or lines, and the column width relies on the rows and grid measuring again when it changes (883e652, 969e714, 394cd83, d70ee01, a8bdaa2)
 - **D15** — SYM swaps the scrolling keys for ` / - = ^ \ | [ ] { } < > ~ with % in SHIFT's cell until tapped again, unsaved, with CTRL and ALT carrying over, and a key held while the page turns relies on the removed view's touch being cancelled (2c024c1, d70ee01)
 - **D16** — Terminal Kotlin files read in execution order (types first, callbacks as they fire, each helper after its first caller, companion last) and vt.rs follows VtNative.kt's order, and reorders must keep initialised properties in their textual order, which is the order Kotlin initialises them in (a546fea, 3511da5)
 - **D17** — Drawing and preference writes use androidx.core's KTX helpers (`edit { }`, `createBitmap`, `Canvas.withClip`, `withScale`) because lint's UseKtx warnings fail the build (android/native D10) (4c1a3ce)
@@ -38,6 +39,10 @@
 - **D34** — Selection handles flip at the screen's edges, and their bounds plus the touch slop are excluded from gesture navigation from `onDraw`, sharing Android's 200 dp per edge with the bars (D23) (f77b591)
 - **D35** — Every `VtNative` body runs in `guarded!` without throwing, so a panic shows as a missing frame or an ignored key, and one inside the pump leaves that tab's output unread until it is reopened (be72f31)
 - **D37** — `KEYCODE_MENU` reaches programs as `CSI 29 ~`, ⋮ is labelled "More options", and `VtNative.resize` returns the resize replies (mode 2048) for `VtSession.resize` to write at once (64e5c33)
+
+- **D51** — Internal `TabNumber` owns its roll/blur constants and uses `TabBarView.STANDARD`, while shared `Ui.kt` dp/themeColor/themeDrawable/touchFeedback extensions read current resource density and can be silently shadowed by same-named members (4311150)
+
+- **D52** — `MainActivity` reads `Settings.fillWide` in onStart and onSettingsChanged for VtView.setFillWide, including before service binding (0553229)
 
 ## Active (full detail)
 
@@ -112,11 +117,11 @@
 - **Source**: b5980ae, 90911a2, 755a96b
 
 ### D39: Programs' progress and status reports show on the tabs until their program gives the terminal back
-- **What**: vt.c keeps the last OSC 9;4 report and queues every OSC 7501 report, `VtSession` keeps the 7501 records as the specification says (one per id, at most 64) and the one most in need of the user, and the pump notes the console's foreground group after a report (kernel/tty D22), dropping progress and the working, blocked and idle records once another group has the terminal while done and error go when the tab is seen; `ProgressLine` draws the current tab's progress as Ghostty does (2 dp, a sweep without a percentage, 15 s), the other tabs get a bar in the indicator's place and a status dot read by TalkBack, background statuses notify (android/service D21), and XTGETTCAP TN answers xterm-256color, the console's TERM.
+- **What**: vt.c keeps the last OSC 9;4 report and queues every OSC 7501 report, `VtSession` keeps the 7501 records as the specification says (one per id, at most 64) and the one most in need of the user, and the pump notes the console's foreground group after a report (kernel/tty D22), dropping progress and the working, blocked and idle records once another group has the terminal while done and error go when the tab is seen; `ProgressLine` draws the current tab's progress with the shared `Ui.line()` thickness (1 dp, at least one pixel), a sweep without a percentage and a 15 s duration, the other tabs get a bar in the indicator's place and a status dot read by TalkBack, background statuses notify (android/service D21), and XTGETTCAP TN answers xterm-256color, the console's TERM; switching to an equal non-null report takes the immediate jump path instead of retaining the previous animation.
 - **Why**: Programs' progress and status reports were dropped, so a tab could not show that its program was working or waiting for the user, and TN went unanswered.
 - **Tradeoffs**: A report from a command that exits at once is dropped at the next read, and a background job's report is tied to whatever group had the foreground; XTGETTCAP still answers other capabilities from Ghostty's own entry; the tab row redraws every frame during a sweep.
 - **Watch out**: A nearly full background progress bar looks like the current tab's indicator (open in the map); a program that hands the foreground to a child group of its own loses its marks; `AppineVtEffects` and `RawEffects` must change together; untried with real programs and on devices.
-- **Source**: 22c8ab0
+- **Source**: 22c8ab0; 37fa3f17
 
 ### D40: Taps, long presses and keys select through libghostty-vt's selection gesture, by words, lines or rectangles
 - **What**: Without mouse tracking `VtView` counts taps and starts libghostty-vt's selection gesture on a second or third tap's press (words, or lines through `ghostty_terminal_select_line` with semantic prompt boundaries, as Ghostty's double and triple clicks) and on a long press, finger drags extend it through the gesture while handle drags use `select_to`, the floating menu toggles a selection between linear and rectangular, and Shift with the arrows, Page Up/Down or Home/End adjusts an existing selection (`appine_vt_select_adjust`).
@@ -128,9 +133,9 @@
 ### D41: The scrollback is searched from a bar in the tab bar's place, with matches marked in the cells and on the scroll bar
 - **What**: `SearchBarView` stands in for `TabBarView` (Find in ⋮ or Ctrl+Shift+F; Enter or ↑ for older, Shift+Enter or ↓ for newer, nothing selected until a step; Back, ×, Esc or another tab closing it, the last text kept); vt.c drives one `GhosttySearch` from `appine_vt_frame` for at most 4 ms per frame, marks the viewport's matches in cell attribute bits 14–15 with the count in the header and steps back to the selected match's place after a resize, and `appine_vt_search_rows` gives the matches' rows for 2 dp marks under the scroll bar's thumb, taken again when the count or the selected match changes or every 500 ms while frames change.
 - **Why**: There was no way to find text in the scrollback, though libghostty-vt searches the screen and scrollback and lists every match.
-- **Tradeoffs**: The tab bar is hidden while searching, so tabs switch only with Ctrl+Tab, which ends the search; the extra keys still type into the terminal; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
-- **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device.
-- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`)
+- **Tradeoffs**: The tab bar is hidden while searching, so Ctrl+Tab or enabled volume-key switching ends the search; the extra keys still type into the terminal; a resize with a match selected blocks on finishing the search; vt.c keeps a copy of all matches (about 64 bytes each) while searching, and marks may lag a pruned scrollback by up to 500 ms.
+- **Watch out**: The frame format changes in vt.c and `VtFrame` together; reselecting by place could pick another match if a resize changed which exist; libghostty-vt's search (case-insensitive for ASCII only) may change with an upgrade; the Android 16 Back path is untried on a device; the field disables fallback line spacing and the count uses 14 dp labels, risking tall-glyph clipping and less input width on narrow screens.
+- **Source**: ddbfb9b, 48982fe; 49e8b08 (read by `VtFrame`); 61df6915; dfbf8eab; 5e1f851d
 
 ### D42: Idle tabs' scrollback is compressed, and all of it on a memory trim
 - **What**: Releasing vt.rs's `TermGuard` asks vt.c (`appine_vt_compress_wanted`) whether the activity token changed or a read restored pages and then schedules the tab on the `vt-compress` thread, which waits 250 ms per change (at most 5 s from scheduling, `COMPRESS_MAX_WAIT`) and runs incremental steps 1 ms apart under the tab's lock; `appine_vt_transcript` returns NULL while `transcribed`, so `VtSession` keeps its last transcript, and `VtNative.compressAll` runs a full pass on every tab when the service trims (android/service D4).
@@ -142,9 +147,9 @@
 ### D43: Prompt marks let tabs close at the prompt, jump between commands, select output and time commands
 - **What**: vt.c reads libghostty-vt's prompt state only: `appine_vt_at_prompt` makes `VtSession.busy` false so closing does not ask (D18), `appine_vt_jump_prompt` serves Ctrl+Shift+Up/Down on the primary screen (passed to the program on the alternate one), `appine_vt_output_at` backs the menu's Select output, new tabs start in the current tab's foreground-group directory (`consoleCwd`), and `on_semantic_prompt` times a command from the C mark (for busybox ash, from the cursor leaving the prompt) to the next D for `VtSession.onCommandFinished` (android/service D21); OSC 7 stays unwired.
 - **Why**: Every × on a live tab asked even with the shell idle at its prompt, there was no way to move between commands or take one command's output, new tabs always started at home and long commands ended unnoticed, though libghostty-vt tracks prompts, input and output once shells mark them (android/setup D20).
-- **Tradeoffs**: Shells without marks (zsh, fish, dash, nested non-login shells, ssh) still ask on every close and get no jumps, output or timing; ash counts a long command's wrapped part as output and starts its timing early after background output; Ctrl+Shift+Up/Down never reach programs on the primary screen; `consoleCwd` takes the BKL on the main thread when a tab opens.
+- **Tradeoffs**: Unmarked shells still ask on close and lack prompt features, but zsh, fish/nushell and supported nested bash/ash now have integration (android/setup D20 and android/vt D5–D7); Ctrl+Shift+Up/Down remain reserved on the primary screen and consoleCwd takes the BKL on tab creation.
 - **Watch out**: With marks libghostty-vt clears the prompt's rows on every resize and relies on the shell to redraw them; `busy` follows whatever the shell sends, so a user's own prompt changes it; bash in the app on Debian, real devices, hardware keyboards and TalkBack are untried.
-- **Source**: 6c5f921, 5256ae2
+- **Source**: 6c5f921, 5256ae2; a7d8c9f5; a809c5a8; daab4446; 7aa817af (child-module refinements)
 
 ### D44: Restored tabs come back from libghostty-vt snapshots recorded with the library's version
 - **What**: A terminal is encoded as a snapshot only after a change (at most 16 MiB, with 64 KiB continuation tracking) and recorded with libghostty-vt's own version ("1.0.0"); a restored terminal is settled (CAN, primary screen, DECSTR, program modes reset by name, Kitty flags popped, link closed, title cleared, OSC 133;C before a new line, the rest erased) with the same options set through a shared `wrap()`, and a snapshot from another version is not decoded, the tab falling back to its transcript (android/service D5).
@@ -177,9 +182,9 @@
 ### D48: Taps move the shell's cursor, password prompts show a lock, and OSC 22 sets the pointer
 - **What**: vt.c keeps `prompt_click` from OSC 133;A (read from an OSC of at most 64 bytes, forgotten on a reset) and `appine_vt_prompt_click` leaves arrows (or Kitty's SGR press for `click_events`) in the replies for a tap without mouse tracking that opened no link; the frame's cursor style 4 is a padlock while vt.c's `password_input` is set (by the pump at each read and every 200 ms while the lock shows in a visible window, kernel/tty D23), and the IME then gets `TYPE_TEXT_VARIATION_PASSWORD` with `IME_FLAG_NO_PERSONALIZED_LEARNING` through a posted `restartInput`; header byte 59 carries OSC 22's shape, and `VtView` sets Android's closest system pointer (a hand over a link without mouse tracking) and returns it from `onResolvePointerIcon` for non-mouse events.
 - **Why**: After comparing libghostty-vt 1.0.0's C API with vt.c, the user chose three Ghostty behaviours the tabs lacked: taps on the prompt moving the shell's cursor (most useful on a touch screen), the lock cursor at password prompts with the IME's password mode as the counterpart of macOS secure input, and OSC 22 pointers.
-- **Tradeoffs**: Taps move nothing for shells that declare no `cl=` or `click_events` and on ash's rows after the first of a long command; a program that turns echo off without printing shows no lock until its next output; each password prompt restarts the IME, ending a composition and changing Gboard's layout; hovering calls `VtNative.link` once per cell; Ghostty's modifier pointers have no counterpart.
+- **Tradeoffs**: Taps move nothing for shells that declare no `cl=` or `click_events` while marked ash continuation rows now work (android/vtview D6); after background output, earlier-row movement remains limited (android/vt D6); a program that turns echo off without printing shows no lock until its next output; each password prompt restarts the IME, ending a composition and changing Gboard's layout; hovering calls `VtNative.link` once per cell; Ghostty's modifier pointers have no counterpart.
 - **Watch out**: The frame format changed on both sides (cursor style 4, byte 59); `onResolvePointerIcon`'s handling of non-mouse events was seen on API 34 only, and the IME restart is untried with CJK IMEs and hardware keyboards.
-- **Source**: 2b04a43
+- **Source**: 2b04a43; a809c5a8; daab4446 (child-module refinements)
 
 ### D49: tmux control mode is detached, not supported
 - **What**: `appine_vt_feed` stops at DCS starts and ends, finds tmux's `1000p` header, puts a carriage return among the replies to detach it and reports the ST end as `onTmuxDetached`, which the service shows as a notice in the tab (android/service D15).
@@ -195,19 +200,45 @@
 - **Watch out**: An open clipboard question lost to a recreation leaves that tab's reads unanswered (open in the map), and Back on Android 11 was not tried on a device.
 - **Source**: e12f560
 
-### D51: `TabNumber` has a file of its own, and the screens share their view helpers from `Ui.kt`
-- **What**: `TabNumber.kt` holds the tab number view as an internal top-level class with its roll timing and blur constants, reading `TabBarView.STANDARD`'s easing through its companion, and `Ui.kt` gives `Context` and `View` the extensions `dp`, `themeColor`, `themeDrawable` and `touchFeedback`, replacing the private copies.
-- **Why**: `TabBarView.kt` held a second view class, and `dp`, `themeColor` and `touchFeedback` were copied into `MainActivity`, `LicensesActivity`, `TabBarView`, `SearchBarView` and `ExtraKeysView` (VtView had its own `themeDrawable`).
-- **Tradeoffs**: The helpers are package-wide names rather than private members, and a View's `dp` reads the density from resources on each call rather than from a cached field.
-- **Watch out**: A member named `dp` or `themeColor` in one of these classes would silently shadow the shared extension.
-- **Source**: 4311150
+### D14: Extra keys add a persistent function-key page through SYM
 
-### D52: `MainActivity` reads the wide-cell setting through `Settings`
-- **What**: `onStart` and `onSettingsChanged` call `Settings.fillWide` (android/service D11 and D23) for `VtView.setFillWide` (D9).
-- **Why**: The static `TerminalService.fillWide` moved to `Settings`.
-- **Tradeoffs**: None beyond one more class the activity names.
-- **Watch out**: None known; it is still read before the service is bound.
-- **Source**: 0553229
+- **What**: The black two-row grid retains fixed SHIFT/SYM and width/scroll behavior; SYM long press toggles a function page with F1–F12 and repeating PGUP/PGDN, tap returns to the main page, and long-click accessibility shares modifier-aware key handling.
+- **Why**: Function-key programs need keys and Shift combinations absent from the soft keyboard.
+- **Tradeoffs**: The page has no hint, arrows/CTRL/ALT are on other pages, SHIFT persists between main and function pages, and SYM has no lock or one-shot state.
+- **Watch out**: Only the shown grid is attached and refreshed, column-width changes need remeasurement, and real-program/device/TalkBack long clicks remain unverified.
+- **Source**: 883e652, 969e714, 394cd83, d70ee01, a8bdaa2, ed8c208a, b79baa10
+
+### D53: Volume keys switch once per press when another tab exists
+
+- **What**: MainActivity reads the preference per volume-key press, switches up to the previous tab or down to the next, consumes repeats/releases only after switching, and otherwise leaves system volume handling intact.
+- **Why**: Phone users need one-handed tab switching without reaching the bar.
+- **Tradeoffs**: Holding does not cycle, switching ends search, and menus/dialogs retain volume control.
+- **Watch out**: Testing used emulator adb events; IMEs/accessibility can intercept keys and a lost release can leave shortcut state set.
+- **Source**: 61df6915
+
+### D54: Tab-bar members follow rendering and animation flow
+
+- **What**: TabBarView orders render, slide/indicator movement, reveal/return helpers, status marks and Tab helpers, matching sessions by identity.
+- **Why**: Interleaved state and distant helpers made rendering difficult to follow.
+- **Tradeoffs**: Marks and animations remain in one file with duplicated alpha arithmetic.
+- **Watch out**: Property callbacks must keep safe initialization order; the change relies on VtSession identity equality.
+- **Source**: 807e9ba1
+
+### D55: Settings and licenses share a frame but use distinct rows
+
+- **What**: Settings binds MaterialSwitch through the standard preference widget slot, while licenses keeps a simplified title/summary row and shared page frame, with scoped asset readers and a common page transition.
+- **Why**: Standard Preferences replace custom Settings rows, and license creation/transition code repeated responsibilities.
+- **Tradeoffs**: License asset reads remain synchronous, and the screens no longer share row implementations.
+- **Watch out**: Preference upgrades must preserve switch binding; license navigation, restoration and theme recreation were not exercised on a device.
+- **Source**: 55be399, d35669e1, f8822b8b
+
+### D56: Settings labels distinguish choices, current values and screen-off policy
+
+- **What**: English and Chinese copy keeps automatic-login intent in choices and usernames in summaries, identifies root versus writable home, simplifies CJK/cursor/volume hints, retains execution Tier numbers and uses session state plus the selected screen-off policy in notifications.
+- **Why**: Verbose labels obscured actionable state and exposed transient wake-lock details.
+- **Tradeoffs**: Summaries omit tutorials, performance ratios, wraparound examples and instantaneous lock status.
+- **Watch out**: Keep hidden-file hints aligned with setting names and preserve confirmation details; narrow vendor layouts and both locales still need device review.
+- **Source**: b2f96a63, 75123eef, cf4f5e20, 1e5de64e
 
 ## Superseded
 
@@ -238,3 +269,6 @@
 - ~~Mouse and touchpad presses always bypass the gestures (D25 in part, 62f6092)~~ → replaced by **D25** in 77d7f36 (2026-11-11)
 - ~~android/terminal holds the `Vt*` view and session files, `ConsolePty`, the terminal fonts and the vt.c/vt.rs shim (D4, 12c4afa)~~ → replaced by **D4** in d42013d (2026-11-11)
 - ~~Views keep the sizes they were built with after a display size change (D4's watch-out, d9e1f0c)~~ → replaced by **D50** in e12f560 (2026-11-11, no SUPERSEDES declared)
+- ~~D14’s lack of page keys~~ → replaced by **D14** in ed8c208a (2026-11-12)
+- ~~D41’s Ctrl+Tab-only tab switching during search~~ → replaced by **D41** in 61df6915 (2026-11-12)
+- ~~Shared Settings/licenses list_item rows and the Settings-only list_header from 55be399~~ → replaced by **D55** in f8822b8b (2026-11-13)

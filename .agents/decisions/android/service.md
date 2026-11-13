@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/service"`
 >
-> Last distilled: 2026-11-12 (HEAD = 0553229). D1–D6 were seeded by hand from the retired design
+> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D6 were seeded by hand from the retired design
 > doc §11.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries
 > cite commits.
 
@@ -21,11 +21,12 @@
 - **Watch out**: `exitAll` must clear the listeners immediately: a shutdown that finished before the Activity's `onStop` once looked like the user returning and restarted the kernel.
 - **Source**: round 187 (`187-app-init`); design doc §11.2
 
-### D3: Keeping the CPU awake is an opt-in partial wake lock, with no battery-optimisation exemption
-- **What**: A setting and a notification toggle (default off) hold an unreferenced `PARTIAL_WAKE_LOCK` while the kernel runs or shuts down.
-- **Why**: AOSP disables partial wake locks in Doze only for apps whose process state is below `BOUND_FOREGROUND_SERVICE`, and network access uses the same threshold, so a foreground-service app keeps both; requesting the exemption directly is restricted on Play to app categories that exclude terminals.
-- **Tradeoffs**: The lock is held whenever the kernel runs, even with only an idle shell; vendor background managers (MIUI, ColorOS) are not handled; Play's vitals may count the lock.
-- **Source**: round 191 (`191-keep-awake`)
+### D3: Screen-off behavior is SLEEP, BUSY or ALWAYS, without an exemption request
+- **What**: Persist SLEEP, BUSY or ALWAYS with legacy false/true mapping and a remembered non-ALWAYS notification toggle; BUSY compares guest CPU every 2 s, releases after 30 s idle, protects transitions/downloads and renews grace for unavailable or delayed samples.
+- **Why**: Idle terminals should save power while users can explicitly keep workloads running with a partial wake lock, without a battery-optimisation exemption.
+- **Tradeoffs**: Network waits and scheduled work may need ALWAYS, polling cannot wake a suspended device, and completed polls determine lock transitions.
+- **Watch out**: Reject pre-reset samples and treat CPU changes rather than monotonic growth as activity; real-device suspend and power savings remain unverified, and repeated sampling delays prolong wakefulness.
+- **Source**: round 191 (`191-keep-awake`); a3f7507e; 1e5de64e
 
 ### D4: Memory is trimmed a minute after the UI disappears, and background tabs' images only under pressure
 - **What**: When the last listener leaves, a 60 s timer runs `Machine::trim_memory` and then `VtNative.compressAll` (every tab's cold scrollback, android/terminal D42) in one worker task, and returning cancels it; `RUNNING_LOW` and above (except `UI_HIDDEN`) trim at once with `pressure = true`, which first has `VtNative.dropImages` cut the Kitty images of every started tab other than `current` (android/vt D3).
@@ -38,8 +39,8 @@
 - **What**: A `running` marker detects an abnormal end; each running tab's login (an "auto" tab as the account `Rootfs.loginAccount` resolves at its first save, kept in `VtSession.resolvedLogin`), foreground cwd, plain-text scrollback (last 256 K, in transcripts named by their content) and, when its terminal changed, a deflated libghostty-vt snapshot (`s-*.snap`, named by content, android/terminal D44) are saved on the worker every minute, when the UI hides, on memory pressure and after tabs open, close or end, with `VtNative.version` in the index; on restart each tab gets a new shell in its directory below its restored screen (the snapshot, read at the tab's first show, else the transcript) and a notice, snapshots from another version are dropped, and saved tabs are kept until a killed run's tabs have been restored; a `name` key in an index from an earlier version is ignored.
 - **Why**: v1 restores the layout, directories and screens but not programs, and says so; plain transcripts lost colours, images and layout; kills mostly happen in the background, hence the save on hide; unchanged files are not rewritten so the minute timer does not wear the flash; an "auto" tab resolved again at restore could become another user after accounts changed.
 - **Tradeoffs**: Programs are not restored; each save may write both a transcript and a snapshot; a libghostty-vt upgrade sends tabs back to their transcripts once; tabs never shown since the restore keep their old files; names saved by earlier versions are lost at the next restore; an account added between a tab's opening and its first save (up to a minute) can still be the one recorded.
-- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged).
-- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b
+- **Watch out**: Old indexes load only because fields are looked up by name and extra keys are skipped, and no test reads such an index; the first save of each "auto" tab reads `/etc/passwd` through the store; an index naming a snapshot deleted by other means falls back to the transcript silently (logged); the sole index hash is `writtenLayout`, a nullable Int cleared under the Tabs lock.
+- **Source**: round 194 (`194-restore-tabs`); design doc §11.2; 2af55e2, 89ad551; 7c35183; 3beb038; 600700b; 807e9ba1
 
 ### D6: Kernel kills are explained in the tab or a notification; Appine bugs always notify with a copyable report
 - **What**: Each kill report goes to the tab of its controlling console as a yellow line, and to a notification when the UI is away, the program is full-screen or there is no tab; Appine's own bugs always notify, with "copy report" (app, device, distro, tier, the kernel's report line with panic location, recent kernel log records, and the unimplemented paths the killed process reached); OpenRC services that failed at boot are notified too.
@@ -56,11 +57,11 @@
 - **Source**: 12c4afa (bug list since updated by 89ad551, 3beb038, d9e1f0c, 6560af6); 0553229 (files, D23)
 
 ### D8: The service holds `VtSession`s and releases them before the kernel stops
-- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`.
+- **What**: `sessions`, `unshown`, `focus` and `current` are `VtSession`s; saving reads each session's console and login on the worker (no separate pty map); `removeSession`, `detach` and `onDestroy` release sessions (hang up and free the emulator) before the kernel is shut down or stopped; kill reports go to the tab whose console with that number is still open (`VtSession.consoleOpen`, android/terminal D8), else the newest tab that had it; title changes and ends arrive through `VtSession.Events` as `onSessionsChanged`; `releaseSessions` centralizes detach/onDestroy release, notification removal and clearing `sessions` and `unshown`.
 - **Why**: The service held Termux `TerminalSession`s directly with a separate session → `ConsolePty` map, so the libghostty-vt terminal could not be one of its tabs (android/terminal D8).
 - **Tradeoffs**: Listeners get no per-text-change callback; tabs redraw their view directly; a kill of a tab's own shell goes to a tab that took its console number before the next poll.
 - **Watch out**: `ConsolePty.console` keeps its number after close, so routing must check `consoleOpen`; ended tabs keeping the service alive, saved tabs lost or paired with other tabs' transcripts and colliding kill notification ids were fixed in 89ad551 (D9).
-- **Source**: 6ffb912; 89ad551; 6560af6 (reports to ended tabs, recorded in d9e1f0c)
+- **Source**: 6ffb912; 89ad551; 6560af6 (reports to ended tabs, recorded in d9e1f0c); e35f9f7c
 
 ### D9: Exit all, restart and replace finish around an ongoing start instead of racing it
 - **What**: While `starting` or `transitioning` is set, Exit all only marks and detaches and the start, restart or replace finishes the exit; the wake lock is held throughout, a download finished during a restart waits in `pendingReplace` until the new kernel is up or has failed, a failed start says so in the notification and stops the service once no UI is left and no switch is downloading (checked again when a download fails or is cancelled), `onDestroy` cancels a switch and sets `destroyed`, after which `updateNotification` posts nothing, and kill notifications take ids counting up from 100000.
@@ -69,26 +70,26 @@
 - **Watch out**: Every new path that ends `starting` or `transitioning` must check `exiting` (a map invariant), every new way of posting notification 1 must go through `updateNotification`, and kill notification ids from a new service instance can still collide with old ones after wrapping.
 - **Source**: 89ad551; 6560af6 (a switch's completion crashing a destroyed service, recorded in d9e1f0c)
 
-### D10: The execution tier is read from preferences only in debug builds
-- **What**: `TerminalService.tier` reads the `tier` preference only in a debug build and is 1 otherwise, `setTier` does nothing in a release build, and the copied bug report keeps "Tier N".
-- **Why**: A release build must run Tier 1 even on a device where an earlier debug install recorded Tier 0.
-- **Tradeoffs**: A stale `tier` key stays in the preferences of devices that once ran a debug build.
-- **Watch out**: Code reading `KEY_TIER` directly would bypass the gate, so every read goes through `tier`.
-- **Source**: 62a8c07
+### D10: Every build honors the saved execution tier
+- **What**: All builds read the saved tier with Tier 1 as the default, and `setTier` saves a changed choice and restarts the kernel while bug reports retain Tier numbers.
+- **Why**: Release users need the same execution-mode control exposed by Settings.
+- **Tradeoffs**: Tier 0 persists across launches until changed.
+- **Watch out**: A Tier 0 preference saved by an earlier debug installation now applies in release builds.
+- **Source**: 62a8c07; cf4f5e20
 
 ### D11: Display settings the terminal needs before binding live in the service's `settings` file
-- **What**: `fill_wide` (default on) is kept in the `settings` preferences, changed through the service's `setFillWide`, which writes it through `Settings` and notifies listeners via `settingsChanged`, and read by `MainActivity` through `Settings.fillWide` (D23, android/terminal D52).
+- **What**: `Settings` keeps `fill_wide` defaulting off and `volume_keys_switch_tabs` defaulting on, preserves saved values, and exposes plain reads while service setters save and notify listeners; MainActivity rereads fill_wide on start and volume behavior on each press.
 - **Why**: Settings rows display and forward state the service keeps, and the terminal's activity needs the value before it binds the service.
-- **Tradeoffs**: It is one more setting read across modules through `Settings`, like the login and the whole-system root (android/documents D11), and the service keeps a display preference it never uses itself.
-- **Watch out**: `MainActivity` is not a listener while stopped (Settings covers it), so it must keep rereading the value in `onStart`.
-- **Source**: 0478dd5; 0553229 (read through `Settings`)
+- **Tradeoffs**: The service owns display preferences it does not use, unsaved CJK enlargement now defaults off, and each volume press reads an in-memory preference.
+- **Watch out**: MainActivity must reread fill_wide after returning from Settings, and writes bypassing the service skip listeners; existing explicitly saved true values still enlarge wide glyphs.
+- **Source**: 0478dd5; 0553229 (read through `Settings`); 61df6915; 75123eef
 
 ### D12: `TerminalService` reads in the order a service runs
-- **What**: TerminalService runs `onCreate` and what it calls, `onStartCommand` and `onBind`, listeners, sessions, poll reports in poll order, memory trimming, settings in the settings screen's order, then the exit and stop paths ending with `onDestroy`; `Listener`'s callbacks and their implementations are in firing order, and `Tabs` runs `takeKilled` and `load`, `markRunning`, `save` and `clear`.
-- **Why**: The service's file mixed settings, lifecycle and session code, so its start and stop paths could not be read in order.
-- **Tradeoffs**: Settings setters that restart or replace the kernel sit before the stop paths they call.
-- **Watch out**: `wakeLock` and `sessionEvents` moved among the properties, which stays safe only while neither initialiser reads another property (Kotlin initialises in textual order).
-- **Source**: a546fea
+- **What**: The service orders types/state, creation and start helpers, commands/binding/listeners, sessions/saving, reports/routes, memory/settings, distro replacement and shutdown; start dispatches guarded main-thread outcomes to `started` or `startFailed`, while Tabs retains its lifecycle order.
+- **Why**: Lifecycle helpers had drifted from callers and nested start outcomes obscured the start/exit guard.
+- **Tradeoffs**: Callback objects stay among properties, and helpers can remain far from secondary callers.
+- **Watch out**: Kotlin initializers must keep safe textual order, and `started`/`startFailed` must run only after start’s main-thread post clears `starting` and checks `exiting`.
+- **Source**: a546fea; 4de8aacd; e35f9f7c
 
 ### D13: Preference writes use androidx.core's `edit { }`
 - **What**: TerminalService's six preference writes use `SharedPreferences.edit { }`, still applied asynchronously.
@@ -150,8 +151,8 @@
 - **What**: `notifyStatus` posts the tab's notification (D19's) once per status for blocked, done and error, titled by the record's or the tab's title with the status in words and its message, and withdraws it when the status goes without the user unless a bell or OSC 9/777 replaced it (`statusNotified`); `onCommandFinished` posts it for a command of at least 10 s in a tab not in front ("Command succeeded", "Command failed" or "Command finished", the time taken in ICU's short units and a failure's exit code), replacing a status notification; in the tab in front done and error count as seen at once, and listeners hear `onTabStatus`.
 - **Why**: A phone shows one tab at a time, so a program waiting for the user, finishing or failing, or a long command ending in another tab or with the app away, goes unnoticed, and only the service knows which tab the user sees.
 - **Tradeoffs**: Statuses, finished commands, bells and OSC 9/777 share one notification per tab and replace each other; no setting turns command notices off, and their text cannot name the command; the record's app name is never shown.
-- **Watch out**: CLIs that send both OSC 9 and 7501 for one event alert twice, the withdrawal relies on every other path that posts the tab's notification clearing `statusNotified` first, and command notices depend on prompt marks that only the bash and ash login shells send (android/setup D20).
-- **Source**: 22c8ab0, 5256ae2
+- **Watch out**: CLIs that send both OSC 9 and 7501 for one event alert twice, the withdrawal relies on every other path that posts the tab's notification clearing `statusNotified` first, and command notices depend on each shell’s prompt integration (android/setup D20 and android/vt D5–D7).
+- **Source**: 22c8ab0, 5256ae2; a7d8c9f5; a809c5a8; 7aa817af (prompt integration)
 
 ### D22: The service keeps the cursor settings and gives them to every session
 - **What**: `cursor_style` (Ghostty's names block, bar and underline) and `cursor_blink` live in the `settings` preferences; `setCursorStyle` and `setCursorBlink` save them and call `cursorChanged`, which sets every session's values and tells listeners, and `createSession` gives each new or restored session the current ones (android/terminal D47).
@@ -167,6 +168,22 @@
 - **Watch out**: Notification ids are split between the service (the ongoing 1) and Notifications' companion, so a new id must be checked against both, and writing a setting through `Settings` instead of the service skips its effects (wake lock, Files roots, cursor to every tab, restart).
 - **Source**: 0553229
 
+### D24: Notification localization follows configuration changes
+
+- **What**: Shared builders create non-ongoing notifications, ICU formats failed-service lists, and changed channel locales trigger channel renaming and reposting the ongoing notification while bug reports stay English.
+- **Why**: Repeated builders and English separators drifted, and running services kept old notification/channel languages.
+- **Tradeoffs**: Already posted notifications retain their old language, and Notifications remembers channel locales.
+- **Watch out**: The service must see updated resources in onConfigurationChanged; the locale-change path was not exercised on a device.
+- **Source**: aed99afb
+
+### D25: Mirror probing runs only after import and is joined before replacement
+
+- **What**: The service launches a silent post-import mirror probe, removes manual mirror/measuring APIs and still joins the probe before deleting the store.
+- **Why**: Import-only mirror selection no longer needs Settings choices or progress callbacks.
+- **Tradeoffs**: Probe outcomes appear only in logs.
+- **Watch out**: The probe can still overlap the first kernel store open, with the existing possible skipped boot cleanup.
+- **Source**: a1367531
+
 ## Superseded
 
 - ~~A `Session` interface in the service, with `createSession` building a `TermuxSession` or a `VtSession` by `VtNative.available` (6ffb912)~~ → narrowed to `VtSession` only by android/terminal **D8** in b38d29c (2026-11-04)
@@ -174,3 +191,7 @@
 - ~~The trim releases only the kernel's caches (D4, round 37)~~ → replaced by **D4** in 3f45ad0 (2026-11-10)
 - ~~Restored tabs show their old scrollback as plain text, losing colours (D5's tradeoff, round 194)~~ → replaced by **D5** in 600700b (2026-11-10, no SUPERSEDES declared)
 - ~~Settings read across modules through the static `TerminalService.fillWide(context)`, `login()` and `showSystemDocuments()` (D11, 0478dd5)~~ → replaced by **D23** in 0553229 (2026-11-12)
+- ~~D3’s boolean keep-awake preference and notification toggle~~ → replaced by **D3** in 1e5de64e (2026-11-13)
+- ~~D10’s release-only Tier 1 enforcement~~ → replaced by **D10** in cf4f5e20 (2026-11-13)
+- ~~D11’s default-on fill_wide preference~~ → replaced by **D11** in 75123eef (2026-11-13)
+- ~~D12’s former ordering of settings followed directly by exit and stop paths~~ → replaced by **D12** in 4de8aacd (2026-11-13)
