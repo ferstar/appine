@@ -33,6 +33,7 @@
     <string name="find">查找</string>
     <string name="clear_screen">清屏</string>
     <string name="reset_terminal">重置终端</string>
+    <string name="keep_screen_on">保持屏幕常亮</string>
     <string name="find_previous">上一个匹配</string>
     <string name="find_next">下一个匹配</string>
     <string name="find_close">关闭查找</string>

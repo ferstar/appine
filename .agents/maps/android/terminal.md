@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: English and Chinese About labels separate the project website and shorten the license summary to its name)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: the terminal's overflow menu adds a saved Keep screen on checkbox, with a popup theme that removes the checkbox's own ripple)
 
 ## Responsibilities
 
@@ -13,15 +13,16 @@
 `android/vtview`):
 
 - `MainActivity`: the screen's layout and status text, the tab shown and its successor, closing
-  tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size, insets and
-  the IME's animation, opening links,
+  tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size and the
+  screen-on choice, insets and the IME's animation, opening links,
   and the question whether a program may read the clipboard, with the tab bar (`TabBarView`), the
   search bar in its place while searching (`SearchBarView`), the current tab's progress line over
   the terminal (`ProgressLine`) and the extra keys (`ExtraKeysView`);
 - `LicensesActivity`: the notices generated at build time;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
-  a black window and system bars, for `MainActivity`), the ⋮ menu's `Widget.Appine.MorePopup`, and
+  a black window and system bars, for `MainActivity`), the ⋮ menu's `Widget.Appine.MorePopup`,
+  its `ThemeOverlay.Appine.CheckPopup` (a framework checkbox without its own ripple),
   the Material 3 page frame (`page.xml`, shared by Settings and the licenses), the licenses'
   `list_item.xml`, and `preference_switch.xml` (Settings' MaterialSwitch with the standard
   AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
@@ -100,8 +101,9 @@ notices task and the build (`android/native`).
   recreated and was not opened from Recents: such an activity still has the intent that first
   started it), reads the font size (kept in dp as `font_size_dp`, so it scales with a display size
   change; a pixel size an earlier version kept as `font_size` is converted at the current density
-  and removed), builds the views (the status line says "Starting…"), sets up insets and, on
-  Android 13 and later, asks for the notification permission. `onStart` applies the wide-cell
+  and removed), applies the saved Keep screen on choice (off by default), builds the views
+  (the status line says "Starting…"), sets up insets and, on Android 13 and later, asks for the
+  notification permission. `onStart` applies the wide-cell
   setting, starts and binds the service; `onServiceConnected` registers the listener and replays
   the start's result or progress and pending notices; `onStop` unregisters and unbinds.
 - When the kernel is ready the tab shown is, in order: one a notification asked for (`EXTRA_TAB`,
@@ -131,8 +133,9 @@ notices task and the build (`android/native`).
   "Find", disabled with no current tab, "Clear screen", disabled without a current tab whose
   terminal exists or while it shows the alternate screen, "Reset terminal", disabled without such a
   tab, "Close other tabs", disabled when there is no other, "Close all tabs", disabled with no tabs,
-  and Settings; Clear screen and Reset terminal are android/vt's; Find is enabled for a current tab
-  whose terminal does not exist yet, where searching does nothing) over its end, every tab and
+  "Keep screen on" (a checkbox), and Settings; Clear screen and Reset terminal are android/vt's;
+  Find is enabled for a current tab whose terminal does not exist yet, where searching does
+  nothing) over its end, every tab and
   button a 32 dp square with its label centred. The tabs pass under the buttons, which hide them,
   and an end padding as wide as the buttons lets the last tab scroll out from under them; while more
   tabs lie beyond, the row fades out over 32 dp ending 12 dp inside `×`, in the blank before its
@@ -194,6 +197,14 @@ notices task and the build (`android/native`).
   Android 12 and later (`DynamicColors`). The tab bar, the extra keys and what lies under the
   system bars are black like the terminal; their labels, buttons and the status text take the
   muted on-surface-variant colour, and the current tab's number and indicator the primary one.
+- "Keep screen on" is available even without a current tab and applies to the whole terminal
+  window. Its right-side checkbox reflects the activity's choice, persisted as `keep_screen_on`
+  in the activity's private preferences, so recreating or reopening the activity keeps it.
+  The choice sets or clears `FLAG_KEEP_SCREEN_ON`: only the visible terminal window keeps the
+  screen lit; opening Settings or leaving the app allows the system's normal screen timeout.
+  It is independent of the service's screen-off run policy and partial wake lock. The popup's
+  context uses `ThemeOverlay.Appine.CheckPopup`, removing the checkbox's own background while
+  retaining the menu row's press feedback and the overflow menu's placement.
 
 ### Hardware-keyboard shortcuts
 

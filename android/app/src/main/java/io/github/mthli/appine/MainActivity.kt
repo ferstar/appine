@@ -21,6 +21,7 @@ import android.view.KeyboardShortcutInfo
 import android.view.Menu
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -28,6 +29,7 @@ import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
 import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.view.ContextThemeWrapper
 import androidx.appcompat.widget.PopupMenu
 import androidx.core.content.edit
 import androidx.core.net.toUri
@@ -85,6 +87,13 @@ class MainActivity : Activity(), TerminalService.Listener {
      * taken too.
      */
     private var shortcutKey = 0
+
+    /** The saved menu choice; Android honours the flag only while this window is visible. */
+    private var keepScreenOn = false
+        set(value) {
+            field = value
+            window.setFlags(if (value) FLAG_KEEP_SCREEN_ON else 0, FLAG_KEEP_SCREEN_ON)
+        }
 
     /**
      * Back's callback while the search bar is open, from Android 16 on (an OnBackInvokedCallback,
@@ -173,6 +182,7 @@ class MainActivity : Activity(), TerminalService.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         super.onCreate(savedInstanceState)
+        keepScreenOn = getPreferences(MODE_PRIVATE).getBoolean(PREF_KEEP_SCREEN_ON, false)
         // A notification's tab only when it starts this activity: one recreated (a configuration
         // change, or the system bringing it back after killing the app) or opened from Recents
         // still has the intent that first started it, whose tab the user has left since
@@ -461,12 +471,13 @@ class MainActivity : Activity(), TerminalService.Listener {
      * `⋮`: finding text in the current tab (none: disabled), clearing its screen (also disabled on
      * the alternate screen, where Ghostty's clear_screen does nothing) or resetting its terminal
      * (disabled before its shell starts), closing the other tabs (none other: disabled) or all of
-     * them, and Settings.
+     * them, keeping the screen on, and Settings.
      */
     private fun showMenu(anchor: View) {
         val sessions = service?.sessions.orEmpty().toList()
         val others = sessions.filter { it != current }
-        PopupMenu(this, anchor, Gravity.END, 0, R.style.Widget_Appine_MorePopup).apply {
+        val context = ContextThemeWrapper(this, R.style.ThemeOverlay_Appine_CheckPopup)
+        PopupMenu(context, anchor, Gravity.END, 0, R.style.Widget_Appine_MorePopup).apply {
             menu.add(R.string.find).apply { isEnabled = current != null }.setOnMenuItemClickListener {
                 openSearch()
                 true
@@ -487,6 +498,15 @@ class MainActivity : Activity(), TerminalService.Listener {
             }
             menu.add(R.string.close_all_tabs).apply { isEnabled = sessions.isNotEmpty() }.setOnMenuItemClickListener {
                 confirmClose(sessions)
+                true
+            }
+            menu.add(R.string.keep_screen_on).apply {
+                isCheckable = true
+                isChecked = keepScreenOn
+            }.setOnMenuItemClickListener { item ->
+                keepScreenOn = !item.isChecked
+                item.isChecked = keepScreenOn
+                getPreferences(MODE_PRIVATE).edit { putBoolean(PREF_KEEP_SCREEN_ON, keepScreenOn) }
                 true
             }
             menu.add(R.string.menu_settings).setOnMenuItemClickListener {
@@ -805,6 +825,8 @@ class MainActivity : Activity(), TerminalService.Listener {
 
         /** The font size in pixels, as versions before [PREF_FONT_SIZE] kept it (an int). */
         private const val PREF_FONT_SIZE_PX = "font_size"
+
+        private const val PREF_KEEP_SCREEN_ON = "keep_screen_on"
 
         private const val DEFAULT_FONT_DP = 12f
 

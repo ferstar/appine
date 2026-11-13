@@ -18,6 +18,15 @@
         <item name="android:windowBackground">@android:color/black</item>
     </style>
 
+    <!-- The menu row handles presses; its checkbox needs no separate ripple background. -->
+    <style name="ThemeOverlay.Appine.CheckPopup" parent="">
+        <item name="controlBackground">@android:color/transparent</item>
+        <item name="android:checkboxStyle">@style/Widget.Appine.CheckPopup</item>
+    </style>
+    <style name="Widget.Appine.CheckPopup" parent="android:Widget.Material.CompoundButton.CheckBox">
+        <item name="android:background">@android:color/transparent</item>
+    </style>
+
     <!-- The tab bar's ⋮ menu, placed like a toolbar's overflow menu (actionOverflowMenuStyle): over
          the button (overlapAnchor), its top at the bar's and its end at the button's (Gravity.END
          in MainActivity.showMenu), which is the screen's; then moved down 4 dp and left 3.5 dp. A

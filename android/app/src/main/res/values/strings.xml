@@ -35,6 +35,7 @@
     <string name="find">Find</string>
     <string name="clear_screen">Clear screen</string>
     <string name="reset_terminal">Reset terminal</string>
+    <string name="keep_screen_on">Keep screen on</string>
     <string name="find_previous">Previous match</string>
     <string name="find_next">Next match</string>
     <string name="find_close">Close find</string>
