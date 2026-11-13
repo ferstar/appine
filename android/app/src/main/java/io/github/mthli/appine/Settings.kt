@@ -65,9 +65,9 @@ internal object Settings {
 
     /**
      * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,
-     * on by default, the android/vtview map); [MainActivity] reads it whenever it starts.
+     * off by default, the android/vtview map); [MainActivity] reads it whenever it starts.
      */
-    fun fillWide(context: Context): Boolean = prefs(context).getBoolean(KEY_FILL_WIDE, true)
+    fun fillWide(context: Context): Boolean = prefs(context).getBoolean(KEY_FILL_WIDE, false)
 
     fun setFillWide(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_FILL_WIDE, on) }
 

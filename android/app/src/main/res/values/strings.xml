@@ -129,21 +129,21 @@
     <string name="copy_report">Copy report</string>
     <string name="report_copied">Report copied</string>
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
-    <string name="settings_system_documents">Show the whole system in Files</string>
-    <string name="system_documents_summary">Besides your home directory, the Files app also lists everything from /, read-only.</string>
-    <string name="settings_fill_wide">CJK characters fill two cells</string>
-    <string name="fill_wide_on">Chinese, Japanese and Korean characters are enlarged to fill their two cells, without wide gaps between them.</string>
-    <string name="fill_wide_off">Chinese, Japanese and Korean characters keep the system font\'s size, centred in their two cells, with wide gaps between them.</string>
+    <string name="settings_system_documents">Show system directories in Files</string>
+    <string name="system_documents_summary">Browse Appine from /. Your home directory is writable; other directories are read-only.</string>
+    <string name="settings_fill_wide">Enlarge CJK characters</string>
+    <string name="fill_wide_on">Scale proportionally to fill two cells, reducing gaps between characters.</string>
+    <string name="fill_wide_off">Keep the original size, centred within two cells.</string>
     <string name="settings_cursor_style">Cursor shape</string>
     <string name="cursor_block">Block</string>
     <string name="cursor_bar">Bar</string>
     <string name="cursor_underline">Underline</string>
     <string name="settings_cursor_blink">Blinking cursor</string>
-    <string name="cursor_blink_on">The cursor blinks, unless a program asks for a steady one.</string>
-    <string name="cursor_blink_off">The cursor stays steady, unless a program asks for it to blink.</string>
+    <string name="cursor_blink_on">Blinks by default. Programs can override this.</string>
+    <string name="cursor_blink_off">Steady by default. Programs can override this.</string>
     <string name="settings_volume_keys">Volume keys switch tabs</string>
-    <string name="volume_keys_on">Volume up shows the previous tab and volume down the next, going round; with a single tab they change the volume.</string>
-    <string name="volume_keys_off">The volume keys change the volume.</string>
+    <string name="volume_keys_on">Volume up: previous tab. Volume down: next tab. With one tab, adjust volume.</string>
+    <string name="volume_keys_off">Adjust volume as usual.</string>
     <string name="documents_home" translatable="false">%1$s · %2$s</string>
     <string name="documents_system">The whole system (read-only) · %1$s</string>
     <plurals name="sessions_running">
@@ -166,6 +166,6 @@
     <string name="select_output">Select output</string>
     <string name="link_no_app">No app can open this link</string>
     <string name="link_remote_file">This file is on %1$s, not in Appine</string>
-    <string name="link_hidden_file">Outside your home: turn on “Show the whole system in Files” in Settings</string>
+    <string name="link_hidden_file">Outside your home directory. Enable in Settings: Show system directories in Files</string>
     <string name="link_missing_file">Cannot find this file</string>
 </resources>
