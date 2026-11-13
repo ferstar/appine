@@ -303,12 +303,12 @@ abstract class NoticesTask : CargoTask() {
         fun text(name: String) = File(textDir, name).readText()
 
         entry(
-            "Appine", "AGPL-3.0-or-later · $SOURCE", "appine.txt",
+            "Appine", "AGPL-3.0-or-later", "appine.txt",
             wrap(APPINE_NOTICE) + "\n\n" + license.get().asFile.readText(),
         )
         // Code adapted into Appine itself (core/kernel/src/tty.rs, which names the same commit)
         entry(
-            "Fuchsia Starnix line discipline", "BSD-style · parts of the terminal line discipline", "fuchsia.txt",
+            "Fuchsia Starnix line discipline", "BSD-style", "fuchsia.txt",
             "Parts of Appine's terminal line discipline (the echo queue, erasing and output processing) are " +
                 "adapted from the line discipline of Fuchsia's Starnix (https://fuchsia.googlesource.com/fuchsia/" +
                 "+/86962cb40d56e1a2bc033ead5b4c89bb02c34ca2/src/starnix/lib/line_discipline), " +
@@ -317,7 +317,7 @@ abstract class NoticesTask : CargoTask() {
         // The terminal: libghostty-vt and what it links, and the font (texts in ../licenses, from
         // the sources scripts/fetch-ghostty downloads; change them together with its version)
         entry(
-            "libghostty-vt 1.0.0", "MIT · the terminal emulator", "ghostty.txt",
+            "libghostty-vt 1.0.0", "MIT", "ghostty.txt",
             wrap(GHOSTTY_NOTICE) + "\n\n" + text("ghostty-LICENSE"),
         )
         entry(
@@ -350,7 +350,7 @@ abstract class NoticesTask : CargoTask() {
             "compiler_rt of Zig 0.17.0 (https://ziglang.org), linked into libghostty-vt:\n\n" + text("zig-LICENSE"),
         )
         entry(
-            "JetBrains Mono 2.304", "OFL-1.1 · the terminal font", "jetbrains-mono.txt",
+            "JetBrains Mono 2.304", "OFL-1.1", "jetbrains-mono.txt",
             "JetBrains Mono 2.304 (https://github.com/JetBrains/JetBrainsMono), the variable upright and italic " +
                 "fonts:\n\n" + text("JetBrainsMono-OFL.txt"),
         )
@@ -363,7 +363,7 @@ abstract class NoticesTask : CargoTask() {
             }
         }
         entry(
-            "Android libraries", "Apache-2.0 · AndroidX, Material Components, Kotlin, kotlinx.coroutines and others", "android.txt",
+            "Android libraries", "Apache-2.0", "android.txt",
             wrap(
                 "These libraries are built into the app and are licensed under the Apache License 2.0 " +
                     "(the full text is at the end of this list):",
