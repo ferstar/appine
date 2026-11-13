@@ -142,6 +142,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         insetsApplied = false
         super.onViewCreated(view, savedInstanceState)
+        listView.itemAnimator = null
         listView.clipToPadding = false
         ViewCompat.setOnApplyWindowInsetsListener(view) { _, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
