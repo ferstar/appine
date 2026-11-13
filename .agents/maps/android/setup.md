@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: bash, the login shell of new Alpine imports, installed offline at the first login; installs of bash, doas and sudo wait for other installs and the user's apk or apt)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings uses AndroidX Preferences, with service-owned values and Material 3 switches and choice dialogs)
 
 ## Responsibilities
 
@@ -52,10 +52,11 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   file is android/service's `Settings` (`tier`, read by debug builds only; `login`, `keep_awake`,
   `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
   which Settings shows through the service.
-- `SettingsActivity` — an `AppCompatActivity` and `TerminalService.Listener` on the Material 3
-  page that it shares with the licenses (`android/terminal`'s `page.xml`, `list_item.xml`,
-  `list_header.xml`); `Row` (title, summary, an optional display-only `MaterialSwitch`,
-  `set(text, enabled, checked)`). Rows in groups under headings: System (distro, login account,
+- `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
+  `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
+  with the licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
+  `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
+  `ListPreference` choices (login account and cursor shape). Groups: System (distro, login account,
   reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (tier,
   debug builds only) and About (licenses).
@@ -288,9 +289,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Settings
 
-- Binding: `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
+- Binding: the fragment's `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
   renders, shows a pending notice and loads the regular accounts on a background thread, again
-  when the kernel is ready. `onSettingsChanged` renders; `onProgress`, `onRestarting` and
+  when the kernel is ready; account loads use the application context and a generation to discard
+  results after stopping or a newer load. `onSettingsChanged` renders; `onProgress`, `onRestarting` and
   `onExitAll` finish the screen, so a switch, reset or restart goes back to the terminal, which
   shows the progress.
 - Every row reads the service's state and calls it:
@@ -306,16 +308,23 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
     (android/terminal).
-- Before the service is bound the rows are enabled with empty summaries; reset can then open its
-  dialog, whose choice does nothing only if the service is still unbound when it is made. The licenses row is always usable.
-- Display: a row is a title over its value or description; a toggle row adds a `MaterialSwitch`
-  that only shows the state (tapping the row toggles, and accessibility services see the row as a
-  switch), whose first state jumps into place instead of sliding; a disabled row is drawn at 38%
-  opacity and takes no taps. Choices and confirmations are `MaterialAlertDialogBuilder` dialogs.
+- Service-dependent preferences are disabled before binding, on disconnect and on stopping;
+  licenses remains usable. All preferences have stable resource-name keys and persistence
+  disabled: they render service values and their change listeners call service setters, never
+  writing a second preference store. AndroidX manages row binding, disabled states and
+  accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
+- Login and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
+  builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
+  state, and Cancel, Back or an outside tap commits nothing. Distribution, reset, tier and notices
+  keep their explicit Material dialogs and confirmation flows.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
   (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
-  handles neither `uiMode` nor `density`), which rebinds and renders again and drops an open
-  dialog.
+  handles neither `uiMode` nor `density`), which restores the fragment, scroll position and an
+  open login/cursor choice dialog, then rebinds and renders. Other open dialogs are dropped.
+  The activity applies top and side insets; the fragment pads its RecyclerView above navigation
+  bars with clipping disabled, so the final preference can scroll clear of them.
+  Adapter state restoration waits for the first service render and window insets, so initially
+  empty summaries and missing bottom padding cannot shift the saved scroll position.
 
 ## Dependencies (inbound / outbound)
 

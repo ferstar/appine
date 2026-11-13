@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: a long press on SYM shows a page of function keys with PGUP and PGDN)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings shares only the page frame with licenses and uses a MaterialSwitch widget for standard AndroidX preferences)
 
 ## Responsibilities
 
@@ -22,8 +22,9 @@
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
   a black window and system bars, for `MainActivity`), the ⋮ menu's `Widget.Appine.MorePopup`, and
-  the Material 3 page layouts (`page.xml` and `list_item.xml`, shared by Settings and the licenses;
-  `list_header.xml`, Settings only).
+  the Material 3 page frame (`page.xml`, shared by Settings and the licenses), the licenses'
+  `list_item.xml`, and `preference_switch.xml` (Settings' MaterialSwitch with the standard
+  AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
 Root: `MainActivity.kt`, `TabBarView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`,
 `ExtraKeysView.kt`, `LicensesActivity.kt` and `Ui.kt` in
@@ -340,7 +341,7 @@ notices task and the build (`android/native`).
   `onExitAll`) and the notification intent with `EXTRA_TAB`.
 - android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
   `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
-- `SettingsActivity` (licenses; it also uses the page layouts).
+- `SettingsActivity` (licenses; it also uses the page frame and preference switch widget).
 
 ### Outbound
 

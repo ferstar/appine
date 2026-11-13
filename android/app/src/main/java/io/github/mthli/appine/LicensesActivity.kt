@@ -24,7 +24,7 @@ import com.google.android.material.color.DynamicColors
  * Open source licenses from `assets/notices/`, generated at build time
  * (`NoticesTask`). A list first, and tapping an entry shows its full text; the full text keeps its
  * original line breaks (licenses are laid out at seventy-some columns) and scrolls sideways when it
- * does not fit. The same Material 3 page as Settings (page.xml, list_item.xml).
+ * does not fit. Shares the Material 3 page frame with Settings (page.xml).
  */
 class LicensesActivity : AppCompatActivity() {
 

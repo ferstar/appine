@@ -115,6 +115,7 @@ kotlin {
 
 dependencies {
     implementation(libs.androidx.core)
+    implementation(libs.androidx.preference)
     implementation(libs.material)
     androidTestImplementation(libs.androidx.runner)
     androidTestImplementation(libs.androidx.junit)

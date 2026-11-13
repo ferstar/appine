@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: bash and its libraries bundled beside doas, listed in the notices and covered by the released sources, and tests of bash as the login shell and of logins installing at once or after the user's apk)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: AndroidX Preference 1.2.1 is a direct catalog dependency for the settings screen)
 
 ## Responsibilities
 
@@ -160,7 +160,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - Toolchain: AGP 9.4.1 with its built-in Kotlin, Gradle 9.9.1, Java 17, NDK 29.0.14206865; plugins
   and dependencies from `google()` and `mavenCentral()` (project repositories fail the build). The
   version catalog (`android/gradle/libs.versions.toml`) holds the libraries' versions, and AGP's
-  is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1 and Material Components 1.14.0 (which
+  is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
+  `androidx.preference:preference` 1.2.1 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
@@ -266,7 +267,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 - `appine_kernel` (`Machine`, `MachineOptions`, routes, store and browse functions), `jni` 0.21,
   `libc`, Android `liblog` and `libjnigraphics`; cargo-ndk and NDK 29; AGP, Gradle;
-  `androidx.core`, Material Components and androidx.test from Google's Maven repository and Maven
+  `androidx.core`, AndroidX Preference, Material Components and androidx.test from Google's Maven repository and Maven
   Central.
 - Zig 0.17.x, the libghostty-vt 1.0.0 source release and its dependency tarball, the `cc` crate;
   `scripts/fetch-rootfs`'s output in `target/rootfs`.
