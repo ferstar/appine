@@ -22,6 +22,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import io.github.mthli.appine.TerminalService.Companion.POLL_MS
@@ -33,6 +34,37 @@ import java.util.Date
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 import kotlin.concurrent.write
+
+/** Guest CPU samples only: app rendering and the service's own polling must not keep it awake. */
+internal class GuestActivity {
+    private var cpu: Long? = null
+    private var activeAt = 0L
+
+    fun reset(now: Long) {
+        cpu = null
+        activeAt = now
+    }
+
+    fun sample(value: Long, now: Long, receivedAt: Long = now) {
+        // A queued worker result can predate a policy change that reset the grace period.
+        if (now < activeAt) return
+        // Do not release on evidence that waited behind a busy main thread or device suspend.
+        if (receivedAt - now >= SAMPLE_MS) {
+            reset(receivedAt)
+            return
+        }
+        // Unknown samples keep the grace period open; failures must not look like idle time.
+        if (value < 0 || cpu != value) activeAt = now
+        cpu = value.takeIf { it >= 0 }
+    }
+
+    fun isBusy(now: Long): Boolean = now - activeAt < IDLE_MS
+
+    companion object {
+        const val IDLE_MS = 30_000L
+        const val SAMPLE_MS = 2_000L
+    }
+}
 
 /**
  * The foreground service that holds the guest kernel and all terminal sessions (the android/service
@@ -166,8 +198,12 @@ class TerminalService : Service() {
                         Documents.dirsChanged(this@TerminalService, it)
                         runCatching { Rootfs.dirsChanged(this@TerminalService, m, it) }
                     }
+                    val cpu = Native.guestCpuTime(m)
+                    val sampledAt = SystemClock.elapsedRealtime()
                     main.post {
                         if (machine != m) return@post
+                        guestActivity.sample(cpu, sampledAt, SystemClock.elapsedRealtime())
+                        updateWakeLock()
                         lines?.forEach(notifications::listen)
                         kills?.forEach(::reportKill)
                         when (power) {
@@ -256,6 +292,8 @@ class TerminalService : Service() {
 
     /** The `PARTIAL_WAKE_LOCK` held while keeping running with the screen off. */
     private var wakeLock: PowerManager.WakeLock? = null
+    private val guestActivity = GuestActivity()
+    private var booting = false
 
     /** The tabs. */
     internal val sessions = mutableListOf<VtSession>()
@@ -422,11 +460,12 @@ class TerminalService : Service() {
             n == 0 && machine != 0L -> getString(R.string.background_running)
             else -> resources.getQuantityString(R.plurals.sessions_running, n, n)
         }
-        val text = if (wakeLock != null) getString(R.string.kept_awake, state) else state
+        val text = getString(R.string.run_notification, state, getString(runPolicy.label))
         val builder = Notification.Builder(this, Notifications.SESSIONS_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -446,7 +485,7 @@ class TerminalService : Service() {
                 this, 3, Intent(this, TerminalService::class.java).setAction(ACTION_TOGGLE_KEEP_AWAKE),
                 PendingIntent.FLAG_IMMUTABLE,
             )
-            val label = getString(if (keepAwake) R.string.allow_sleep else R.string.keep_awake)
+            val label = getString(Settings.nextRunPolicy(this).label)
             builder.addAction(Notification.Action.Builder(null, label, toggle).build())
         }
         return builder
@@ -542,6 +581,8 @@ class TerminalService : Service() {
      */
     private fun started(m: Long) {
         machine = m
+        booting = true
+        guestActivity.reset(SystemClock.elapsedRealtime())
         progress = null
         // The store may have just been imported (first run, distro switch)
         Documents.rootsChanged(this)
@@ -569,7 +610,13 @@ class TerminalService : Service() {
             // Boot finished: notify when OpenRC services did not start (the output is in
             // boot.log, which nobody reads)
             val failed = Rootfs.failedServices(this)
-            if (failed.isNotEmpty()) main.post { if (machine == m) notifications.bootFailures(failed) }
+            main.post {
+                if (machine != m) return@post
+                booting = false
+                guestActivity.reset(SystemClock.elapsedRealtime())
+                updateWakeLock()
+                if (failed.isNotEmpty()) notifications.bootFailures(failed)
+            }
         }
         getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(network)
         watchingNetwork = true
@@ -612,22 +659,20 @@ class TerminalService : Service() {
     }
 
     /**
-     * Holds or releases `PARTIAL_WAKE_LOCK` according to the switch and the kernel's state: held
-     * while the switch is on and the kernel is starting, running, restarting, being replaced or
-     * shutting down ([exitAll], before the service stops); otherwise the CPU sleeps after the screen
-     * goes off and the guest's processes stop with it.
-     *
-     * The app always has a foreground service, so the lock stays effective in Doze:
-     * `PowerManagerService` disables partial wake locks only for apps whose process state comes
-     * after `BOUND_FOREGROUND_SERVICE`, and the network is let through by the same threshold
-     * (`NetworkPolicyManager.FOREGROUND_THRESHOLD_STATE`), so no battery optimisation exemption is
-     * needed.
+     * ALWAYS holds throughout the kernel's lifetime. BUSY protects lifecycle transitions too,
+     * but allows sleep after 30 seconds without guest CPU activity. The normal poll can reacquire
+     * the lock only while Android is awake; it is not an alarm that wakes a suspended device.
      */
-    // A switch the user turned on: held until the kernel stops or the user turns it off, with no
-    // fixed duration, and not released within the same call
+    // User-selected policy; BUSY releases through the poll, ALWAYS has no fixed duration.
     @SuppressLint("WakelockTimeout", "Wakelock")
     private fun updateWakeLock() {
-        val want = keepAwake && (machine != 0L || exiting || starting || transitioning)
+        val transition = exiting || starting || transitioning || booting
+        val want = when (runPolicy) {
+            RunPolicy.SLEEP -> false
+            RunPolicy.ALWAYS -> machine != 0L || transition
+            RunPolicy.BUSY -> transition || switching != null ||
+                (machine != 0L && guestActivity.isBusy(SystemClock.elapsedRealtime()))
+        }
         val held = wakeLock
         if (want && held == null) {
             wakeLock = getSystemService(PowerManager::class.java)
@@ -667,7 +712,7 @@ class TerminalService : Service() {
         when (intent?.action) {
             ACTION_EXIT_ALL -> exitAll()
             ACTION_CANCEL_SWITCH -> cancelSwitch()
-            ACTION_TOGGLE_KEEP_AWAKE -> setKeepAwake(!keepAwake)
+            ACTION_TOGGLE_KEEP_AWAKE -> setRunPolicy(Settings.nextRunPolicy(this))
             Notifications.ACTION_COPY_REPORT -> notifications.copyReport(intent)
         }
         return START_NOT_STICKY
@@ -929,10 +974,12 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    val keepAwake: Boolean get() = Settings.keepAwake(this)
+    internal val runPolicy: RunPolicy get() = Settings.runPolicy(this)
 
-    fun setKeepAwake(on: Boolean) {
-        Settings.setKeepAwake(this, on)
+    internal fun setRunPolicy(policy: RunPolicy) {
+        if (policy == runPolicy) return
+        Settings.setRunPolicy(this, policy)
+        guestActivity.reset(SystemClock.elapsedRealtime())
         updateWakeLock()
         settingsChanged()
     }
@@ -1013,6 +1060,7 @@ class TerminalService : Service() {
         val sw = Switch(distro)
         switching = sw
         downloader = sw
+        updateWakeLock()
         settingsChanged()
         thread(name = "appine-download") {
             val result = runCatching {
@@ -1045,6 +1093,7 @@ class TerminalService : Service() {
                     // The old system stays: after a failed start, nothing is left to keep running
                     stopIfFailed()
                 }
+                updateWakeLock()
                 settingsChanged()
             }
         }
@@ -1055,6 +1104,7 @@ class TerminalService : Service() {
         val sw = switching ?: return
         sw.cancelled = true
         switching = null
+        updateWakeLock()
         settingsChanged()
         stopIfFailed()
     }
@@ -1164,6 +1214,7 @@ class TerminalService : Service() {
             watchingNetwork = false
         }
         machine = 0
+        booting = false
         updateWakeLock()
         main.removeCallbacks(poll)
         main.removeCallbacks(periodicSave)
@@ -1229,7 +1280,7 @@ class TerminalService : Service() {
 
         /** The ongoing notification (the other ids are [Notifications]'). */
         private const val NOTIFICATION_ID = 1
-        private const val POLL_MS = 2_000L
+        private const val POLL_MS = GuestActivity.SAMPLE_MS
         private const val ACTION_EXIT_ALL = "io.github.mthli.appine.EXIT_ALL"
         private const val ACTION_CANCEL_SWITCH = "io.github.mthli.appine.CANCEL_SWITCH"
         private const val ACTION_TOGGLE_KEEP_AWAKE = "io.github.mthli.appine.TOGGLE_KEEP_AWAKE"

@@ -237,6 +237,10 @@ internal object Native {
     @JvmStatic
     external fun processes(machine: Long): Int
 
+    /** Guest CPU nanoseconds, including exited threads; -1 when unavailable. Takes the BKL. */
+    @JvmStatic
+    external fun guestCpuTime(machine: Long): Long
+
     /**
      * Takes the directories whose entries (create, delete, rename) the guest changed, written as
      * document IDs, so the Files app refreshes them. Recording starts only with the first call.

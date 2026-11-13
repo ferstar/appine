@@ -3,6 +3,13 @@ package io.github.mthli.appine
 import android.content.Context
 import androidx.core.content.edit
 
+/** Persisted screen-off policy; the notification remembers the last non-ALWAYS choice. */
+internal enum class RunPolicy(val value: String, val label: Int, val summary: Int) {
+    SLEEP("sleep", R.string.allow_sleep, R.string.run_sleep_summary),
+    BUSY("busy", R.string.run_busy, R.string.run_busy_summary),
+    ALWAYS("always", R.string.run_always, R.string.run_always_summary),
+}
+
 /**
  * The settings kept in the `settings` preferences (the android/service map). Settings shows and
  * changes them through [TerminalService], which acts on each change; [Documents] and
@@ -13,6 +20,8 @@ internal object Settings {
     private const val KEY_TIER = "tier"
     private const val KEY_LOGIN = "login"
     private const val KEY_KEEP_AWAKE = "keep_awake"
+    private const val KEY_RUN_POLICY = "run_policy"
+    private const val KEY_IDLE_POLICY = "idle_policy"
     private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
     private const val KEY_FILL_WIDE = "fill_wide"
     private const val KEY_CURSOR_STYLE = "cursor_style"
@@ -46,13 +55,25 @@ internal object Settings {
     /** Back to automatic: the accounts went with the store. */
     fun clearLogin(context: Context) = prefs(context).edit { remove(KEY_LOGIN) }
 
-    /**
-     * Keep running with the screen off (a switch in Settings and in the notification, off by
-     * default, the android/service map).
-     */
-    fun keepAwake(context: Context): Boolean = prefs(context).getBoolean(KEY_KEEP_AWAKE, false)
+    /** Old boolean preferences keep their behaviour until the first policy change. */
+    fun runPolicy(context: Context): RunPolicy {
+        val p = prefs(context)
+        return RunPolicy.entries.firstOrNull { it.value == p.getString(KEY_RUN_POLICY, null) }
+            ?: if (p.getBoolean(KEY_KEEP_AWAKE, false)) RunPolicy.ALWAYS else RunPolicy.SLEEP
+    }
 
-    fun setKeepAwake(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_KEEP_AWAKE, on) }
+    /** The other end of the notification's ALWAYS toggle, SLEEP until explicitly chosen. */
+    fun idlePolicy(context: Context): RunPolicy =
+        if (prefs(context).getString(KEY_IDLE_POLICY, null) == RunPolicy.BUSY.value) RunPolicy.BUSY else RunPolicy.SLEEP
+
+    fun setRunPolicy(context: Context, policy: RunPolicy) = prefs(context).edit {
+        putString(KEY_RUN_POLICY, policy.value)
+        if (policy != RunPolicy.ALWAYS) putString(KEY_IDLE_POLICY, policy.value)
+        remove(KEY_KEEP_AWAKE)
+    }
+
+    fun nextRunPolicy(context: Context): RunPolicy =
+        if (runPolicy(context) == RunPolicy.ALWAYS) idlePolicy(context) else RunPolicy.ALWAYS
 
     /**
      * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by

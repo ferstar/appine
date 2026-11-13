@@ -23,9 +23,9 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import kotlin.concurrent.thread
 
 /**
@@ -165,6 +165,34 @@ class MachineTest {
             assertTrue(out, lines[2].startsWith("3."))
             assertEquals(out, "73cb3858a687a849", lines[3])
             assertTrue(out, lines[5].startsWith("/dev/pts/"))
+        }
+    }
+
+    @Test
+    fun guestCpuTimeTracksRunningAndExitedThreads() {
+        for (tier in 0..1) {
+            val machine = start(tier)
+            val before = Native.guestCpuTime(machine)
+            assertTrue(before >= 0)
+            val pid = Native.spawn(machine, -1, "/bin/sh", arrayOf("sh", "-c", "while :; do :; done"), ConsolePty.ENVIRONMENT)
+            val deadline = System.nanoTime() + 5_000_000_000L
+            var live = before
+            while (live <= before && System.nanoTime() < deadline) {
+                Thread.sleep(20)
+                live = Native.guestCpuTime(machine)
+            }
+            assertTrue("Running guest CPU must be visible", live > before)
+            assertEquals(0, sh(machine, "kill -TERM $pid").second)
+            Native.waitFor(machine, pid)
+            val exited = Native.guestCpuTime(machine)
+            assertTrue("Reaping must retain CPU time", exited >= live)
+            repeat(5) { assertEquals(0, sh(machine, "true").second) }
+            val pooled = Native.guestCpuTime(machine)
+            assertTrue("Short-lived tasks on pooled threads must count", pooled > exited)
+            Thread.sleep(100)
+            assertEquals("Host polling and timers must not count as guest activity", pooled, Native.guestCpuTime(machine))
+            Native.stop(machine)
+            assertEquals(-1L, Native.guestCpuTime(machine))
         }
     }
 

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: test hook 14, a host that refuses TCP socket filters)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Machine exposes live-plus-exited guest CPU nanoseconds for Android's busy-only wake lock)
 
 ## Responsibilities
 
@@ -123,7 +123,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   `signal_later`/`flush_signals`, `Shared::fast_changed`, `kernel::doing`/`done`.
 - **Host-facing** (`Machine`): `start` (creates PID 1, the timer thread and the BKL watchdog; a
   panic is an internal error), `stall` (the latest too-long hold; takes no BKL), `spawn`, `boot`,
-  `shutdown`, `kill_all`, `take_power`, `processes`, `wait`/`try_wait`/`wait_or_power`, `signal`
+  `shutdown`, `kill_all`, `take_power`, `processes`, `cpu_time_ns`, `wait`/`try_wait`/`wait_or_power`, `signal`
   (a host signal to a guest process, `SI_KERNEL`); `run` (`appine-run`), which with
   `RunOptions::stop` passes the first stop signal the host got on to the program and ends every
   process at one arriving at least a second later, then finishes as usual.
@@ -133,6 +133,10 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
 
 ### Tasks and host threads
 
+- `Machine::cpu_time_ns` sums `Kernel.cpu.total_ns` (exited threads) and live tasks' `cpu_ns`
+  under the BKL, without reading `/proc` or adding hot-loop instrumentation. Android polls it
+  for activity; host UI/timer CPU is excluded. An exit-stage panic can skip the existing exit
+  credit, so consumers compare changes rather than require a strictly increasing counter.
 - Each guest thread runs on its own host pthread, scheduled by the host kernel. A finished thread's
   host thread is pooled (at most 8 idle, 5 s) and its engine CPU state goes to the engine's spare
   list (up to 8), so creating threads rarely creates host threads.

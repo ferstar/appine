@@ -1120,6 +1120,18 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_processes<'l>(
     })
 }
 
+/// Guest CPU nanoseconds, including exited threads; unavailable samples must not imply idleness.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_mthli_appine_Native_guestCpuTime<'l>(
+    _: JNIEnv<'l>,
+    _: JClass<'l>,
+    handle: jlong,
+) -> jlong {
+    guarded!("Native.guestCpuTime", -1, {
+        machine(handle).map_or(-1, |m| m.cpu_time_ns().min(jlong::MAX as u64) as jlong)
+    })
+}
+
 /// Takes the directories whose entries the guest changed (written as by [`browse::encode_path`],
 /// that is, document IDs): the Files app refreshes them.
 #[unsafe(no_mangle)]

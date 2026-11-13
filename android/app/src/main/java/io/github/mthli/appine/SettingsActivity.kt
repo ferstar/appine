@@ -80,7 +80,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private var accountLoad = 0
 
     private lateinit var tier: Preference
-    private lateinit var keepAwake: SwitchPreferenceCompat
+    private lateinit var runPolicy: ListPreference
     private lateinit var systemDocuments: SwitchPreferenceCompat
     private lateinit var fillWide: SwitchPreferenceCompat
     private lateinit var cursorStyle: ListPreference
@@ -118,7 +118,12 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             Toast.makeText(requireContext(), getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
         }
         tier = action(R.string.settings_tier) { onTier() }
-        keepAwake = toggle(R.string.settings_keep_awake, TerminalService::setKeepAwake)
+        runPolicy = choice(R.string.settings_run_policy) { s, value ->
+            s.setRunPolicy(RunPolicy.entries.first { it.value == value })
+        }.apply {
+            entries = RunPolicy.entries.map { getString(it.label) }.toTypedArray()
+            entryValues = RunPolicy.entries.map { it.value }.toTypedArray()
+        }
         systemDocuments = toggle(R.string.settings_system_documents, TerminalService::setSystemDocuments)
         fillWide = toggle(R.string.settings_fill_wide, TerminalService::setFillWide)
         cursorStyle = choice(R.string.settings_cursor_style) { s, value -> s.setCursorStyle(value.toInt()) }.apply {
@@ -135,7 +140,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         licenses.setSummary(R.string.licenses_summary)
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, keepAwake, systemDocuments)
+        group(R.string.settings_group_android, runPolicy, systemDocuments)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         group(R.string.settings_group_debug, tier)
         group(R.string.settings_group_about, licenses)
@@ -302,7 +307,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOf(distro, reset, account, tier, keepAwake, systemDocuments,
+            for (row in listOf(distro, reset, account, tier, runPolicy, systemDocuments,
                 fillWide, cursorStyle, cursorBlink, volumeKeys)) row.isEnabled = false
             return
         }
@@ -328,7 +333,8 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         account.set(loginSummary(s.login), installed != null && sw == null)
         // Can be changed at any time: while the kernel is not running it is only recorded, and the
         // lock is held accordingly once it is up
-        keepAwake.set(getString(if (s.keepAwake) R.string.keep_awake_on else R.string.keep_awake_off), true, s.keepAwake)
+        runPolicy.value = s.runPolicy.value
+        runPolicy.set(getString(s.runPolicy.summary), true)
         systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
         cursorStyle.value = s.cursorStyle.toString()

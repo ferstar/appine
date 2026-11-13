@@ -747,6 +747,16 @@ impl Machine {
             .count()
     }
 
+    /// CPU nanoseconds used by guest threads, including those already exited. Host UI, polling
+    /// and timer threads are excluded, so the host can detect guest activity without keeping
+    /// itself awake through its own sampling. Takes the BKL.
+    pub fn cpu_time_ns(&self) -> u64 {
+        let k = self.shared.lock();
+        k.tasks.values().fold(k.cpu.total_ns, |sum, task| {
+            sum.saturating_add(task.cpu_ns())
+        })
+    }
+
     /// Takes the ports the guest first listened on at non-loopback addresses (design doc §12 item
     /// 7): the app posts a notification from them, telling the user which port other devices
     /// should connect to (low ports are mapped elsewhere, [`crate::portmap`]).

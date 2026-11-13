@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings explicitly targets its RecyclerView for the app bar's lift-on-scroll state)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: the screen-off running preference offers allow sleep, run while busy and always run, synchronized with the notification)
 
 ## Responsibilities
 
@@ -49,15 +49,15 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - The first mirror of each list is the official one: the import writes it, and probing falls
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
-  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `keep_awake`,
+  file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
   `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
   `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
   with the licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
-  `ListPreference` choices (login account and cursor shape). Groups: System (distro, login account,
-  reset), Android (keep-awake, system documents), Terminal (CJK characters filling two
+  `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
+  reset), Android (running policy, system documents), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
   mode, in all builds) and About (licenses).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -304,7 +304,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   - execution mode (tier, in all builds): while the kernel runs with no switch, a different tier
     asking to restart; the summary names the current mode and Tier number, with a slower hint
     for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
-  - keep-awake, system documents, CJK fill, cursor shape (Block, Bar or Underline, the summary
+  - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
+    description; BUSY explains its 30 s idle grace and network/scheduled-work limitation), system
+    documents, CJK fill, cursor shape (Block, Bar or Underline, the summary
     naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
@@ -314,14 +316,14 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   disabled: they render service values and their change listeners call service setters, never
   writing a second preference store. AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
-- Login and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
+- Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
   state, and Cancel, Back or an outside tap commits nothing. Distribution, reset, tier and notices
   keep their explicit Material dialogs and confirmation flows.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
   (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
   handles neither `uiMode` nor `density`), which restores the fragment, scroll position and an
-  open login/cursor choice dialog, then rebinds and renders. Other open dialogs are dropped.
+  open login/running-policy/cursor choice dialog, then rebinds and renders. Other open dialogs are dropped.
   The activity applies top and side insets; the fragment pads its RecyclerView above navigation
   bars with clipping disabled, so the final preference can scroll clear of them.
   Adapter state restoration waits for the first service render and window insets, so initially

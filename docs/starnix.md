@@ -135,13 +135,19 @@ b3e134a's netlink dumps and 6d05aa9's namespace limits came from the maps instea
 7b7f73b, 39ea702, 99b4216, 64a6107, df6ee70, 16364c0 and c008749, which take ideas from the list
 below.
 
+“Stay awake while busy” is implemented: Settings offers allow sleep, run while busy
+and always run. Busy mode releases after 30 seconds without observed guest CPU activity (checked
+every 2 seconds), protecting startup, boot, shutdown and distro downloads. The notification
+toggles always run against the last chosen non-always policy. This is an activity heuristic:
+network waits and scheduled work can still need always run; the poll does not wake a sleeping device.
+
 ## Not yet taken
 
 Ordered by value for effort.
 
 | Idea | What Starnix does | For Appine | Effort |
 |---|---|---|---|
-| Stay awake while busy | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | The keep-awake switch holds the Android wake lock for as long as the kernel runs. Hold it only while the guest has used CPU recently and drop it after N idle seconds; map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED` | Medium |
+| Guest power interfaces | Wake locks, `/sys/power/wake_lock`, alarms that wake the device | Map `/sys/power/wake_lock`; offer `/sys/class/power_supply` from `ACTION_BATTERY_CHANGED`. The host's run-while-busy policy is implemented above. | Medium |
 
 ## Not worth taking
 
@@ -158,7 +164,7 @@ Ordered by value for effort.
 - **PSI beyond empty files:** Starnix has real data only for memory. A zero-filled
   `/proc/pressure` would at most quiet the tools that refuse to start without it.
 - **Alarm clocks through AlarmManager, and a `CLOCK_MONOTONIC` that counts suspend:** the first
-  needs exact-alarm permission and is useless without the wake-lock change. The second changes
+  needs exact-alarm permission and is not part of the run-while-busy policy. The second changes
   the 6.1 contract.
 - **Netlink stubs that only answer `NLMSG_DONE`:** Appine stopped doing this for unsupported
   families in round 83.

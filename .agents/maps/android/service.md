@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: all builds read and save the execution tier, defaulting to Tier 1, and restart on a tier change)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: the notification shows the selected screen-off policy without the instantaneous wake-lock state)
 
 ## Responsibilities
 
@@ -23,7 +23,7 @@ outlives an Activity:
   program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
   finish;
 - the settings state that the activities only display and forward (tier in all builds,
-  keep-awake, login account, system documents, CJK characters filling two cells, the cursor's
+  screen-off running policy, login account, system documents, CJK characters filling two cells, the cursor's
   shape and blinking, whether the volume keys switch tabs, distro switch), the preferences
   kept in `Settings`.
 
@@ -73,7 +73,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   The service decides what is told (the tab in front, a message
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
-  tier (default 1 in all builds), login, keep-awake, system documents, wide cells, the
+  tier (default 1 in all builds), login, running policy and its remembered non-always choice,
+  system documents, wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default); `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
@@ -94,7 +95,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `START_NOT_STICKY`), `onBind`, `onTrimMemory`, `onDestroy`.
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
-  `setKeepAwake`, `switchTo`/`cancelSwitch`/`canSwitch`,
+  `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
   `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
   `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
@@ -143,7 +144,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - On the main thread, while a kernel runs: first `bklStall` (it takes no BKL, and the worker
   would wait behind a hold that does not end) reports a too-long hold of the BKL (Reports below);
   then the worker fetches `takeListens`, `takeKills`, `takePower`, `processes` and
-  `takeChangedDirs`; the poll reschedules itself at once, whether or not the fetch has run.
+  `takeChangedDirs`, then `guestCpuTime`; the poll reschedules itself at once, whether or not the fetch has run.
 - Changed directories are handled on the worker straight away: `Documents.dirsChanged`, then
   `Rootfs.dirsChanged` (a change in `/etc` rewrites the login's NOPASSWD rules, android/setup).
 - The rest is applied on the main thread only if the kernel is still the same: listens, kills,
@@ -189,16 +190,26 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Wake lock and notification
 
-- `PARTIAL_WAKE_LOCK` held when keep-awake is on and the kernel is starting (import included),
-  running, restarting, being replaced or shutting down; not reference-counted, no timeout.
+- `RunPolicy`: SLEEP (default) allows sleep; ALWAYS holds `PARTIAL_WAKE_LOCK` throughout start,
+  import, boot, running, restart, replacement and shutdown; BUSY protects those transitions and
+  distro downloads, but releases during normal running after 30 s without observed guest CPU activity.
+  Locks are not reference-counted. Legacy `keep_awake` false/true reads as SLEEP/ALWAYS until a
+  policy write saves `run_policy` and removes it; non-ALWAYS writes also save `idle_policy`.
+- `GuestActivity` compares live-plus-exited guest CPU samples from the worker's 2 s poll, excluding
+  host UI and timer CPU. Changed or failed samples renew grace; pre-reset samples are ignored,
+  delivery delayed by 2 s renews grace, and a new kernel, completed boot or policy change resets it.
+  Release/reacquisition happens on a completed poll; polling cannot wake a suspended device.
+  CPU inactivity can include network waits and scheduled work, which need ALWAYS for continuity.
 - The ongoing notification (id 1) shows, by precedence: "Stopping services…" while exiting; the
   import or download progress while no kernel runs; "Cannot start: …" after a failed start;
   "Running in the background" while a kernel runs and no tab does; else the count of running
   sessions ("0 sessions running" while a start is under way, except that a start after an exit,
-  because a listener came back, keeps "Stopping services…" until it ends when keep-awake is off,
+  because a listener came back, keeps "Stopping services…" until it ends under SLEEP,
   as nothing refreshes the notification). A switch adds its progress, subtext
-  and a cancel action; "kept awake" is added while the lock is held, the keep-awake toggle is hidden
-  while exiting, and "Exit all" is always there.
+  and a cancel action. Text includes the selected policy without the instantaneous wake-lock state;
+  expanded text wraps. The single toggle names its target: ALWAYS from either non-always policy,
+  otherwise the saved `idle_policy` (SLEEP until chosen). Settings and notification stay in sync.
+  The toggle is hidden while exiting, and "Exit all" is always there.
 
 ### Memory
 
@@ -394,6 +405,8 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ## To verify
 
+- Screen-off power consumption and reacquisition on physical devices; busy/idle lock transitions
+  and notification toggling were exercised on an API 34 emulator, not across real device suspend.
 - The channel names and the ongoing notification following a language change while the service
   runs (`onConfigurationChanged`) was compiled only, not tried on a device.
 - Whether tapping "copy report" after the service stopped recreates the service (and starts a

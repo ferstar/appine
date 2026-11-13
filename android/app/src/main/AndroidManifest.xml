@@ -13,7 +13,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- PARTIAL_WAKE_LOCK is held when "Keep running with the screen off" is on in Settings (the android/service map) -->
+    <!-- PARTIAL_WAKE_LOCK follows the screen-off running policy (the android/service map). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application

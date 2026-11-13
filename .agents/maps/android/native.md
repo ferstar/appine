@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: AndroidX Preference 1.2.1 is a direct catalog dependency for the settings screen)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: guestCpuTime exposes live and exited guest CPU time for the screen-off running policy, with preference and CPU sampling tests)
 
 ## Responsibilities
 
@@ -38,7 +38,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - `MACHINES` — a mutex-protected map from handle (`jlong`, from `NEXT_HANDLE`, counting up from 1
   and never reused in a process) to `Arc<Machine>`; a poisoned lock is recovered. `vt.rs` looks
   kernels up in the same table.
-- `Native` — `internal object` with 36 `@JvmStatic external` functions, 17 of them
+- `Native` — `internal object` with 37 `@JvmStatic external` functions, 17 of them
   `@Throws(IOException::class)`; its initialiser loads the library and calls the private
   `init(BuildConfig.DEBUG)`.
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
@@ -50,7 +50,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
   and `alpineBranch` (from the tarball's name, `edge` without one).
-- `MachineTest` — the only instrumentation test class.
+- `MachineTest` — kernel and app instrumentation tests; `RunPolicyTest` — isolated preferences and idle-grace tests.
 
 ## Public entry points
 
@@ -64,7 +64,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   0 and an `IOException("cannot start: …")` on failure), `boot`, `setRoutes`, `takeListens`,
   `takeKills`, `bklStall` (the latest too-long hold of the BKL as
   `<id>\t<seconds>\t<report>\t<end record or empty>`, tabs and line breaks in the last two turned
-  into spaces, or null; it does not take the BKL), `takePower`, `processes`, `takeChangedDirs`,
+  into spaces, or null; it does not take the BKL), `takePower`, `processes`, `guestCpuTime`
+  (live-plus-exited guest CPU nanoseconds under the BKL; −1 for a stopped handle or caught panic), `takeChangedDirs`,
   `trimMemory`, `shutdown`, `stop`.
 - Consoles and processes: `openConsole`, `spawn` (negative console = the app's stdio), `read`,
   `write` (until all bytes are written), `resize`, `closeConsole`, `waitFor`, `consoleCwd`. The app
@@ -89,7 +90,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   last call on a removed kernel runs that drop.
 - After the kernel is gone: `read` and `write` return −1, `waitFor` −9, `openConsole` and `spawn`
   throw "the machine is stopped", `takeListens`, `takeKills` and `takeChangedDirs` return empty
-  arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, and the rest
+  arrays, `bklStall` and `consoleCwd` null, `takePower` and `processes` 0, `guestCpuTime` −1, and the rest
   (`boot`, `setRoutes`, `resize`, `closeConsole`, `trimMemory`, `shutdown`, `stop`) do nothing.
 - Errors become `IOException`, or `FileNotFoundException` for every browse error whatever its
   errno, or sentinel values. `openConsole` and `resize` clamp rows and columns to 1–65535.
@@ -117,7 +118,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - Panics are contained at two layers. The kernel wraps most `Machine` methods in `host_call`,
   which turns a panic into an error of the call when containment is on (`APPINE_ON_BUG=kill`, or
   by default whenever debug assertions are off, which is always on Android) and aborts the process
-  otherwise. Everything else is caught by `guarded!`: `Machine::wait`, `processes`, `take_power`,
+  otherwise. Everything else is caught by `guarded!`: `Machine::wait`, `processes`, `cpu_time_ns`, `take_power`,
   `stall`, `sync_store`, the Tier 1 pool trim, the wait loops of console reads and writes, the
   unwrapped parts of `boot`, `shutdown`, `kill_all` and `Machine`'s drop (their wait loops, flags,
   inittab plan parsing and thread joins; their signals, inittab reads, spawns and syncs run in
@@ -233,6 +234,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Tests
 
+- `RunPolicyTest` uses a separate preference file for legacy migration and remembered toggle
+  targets, and checks idle expiry, activity, failed samples and delayed delivery with a fake clock.
+  `MachineTest.guestCpuTimeTracksRunningAndExitedThreads` checks both tiers, exited and pooled
+  threads, idle stability and stopped handles.
 - `MachineTest` runs in the debug app's own process against the app's real store and
   preferences: `@Before` imports the bundled rootfs when no store is ready, `start(tier)` records
   each handle and `@After` stops them; tests change guest files, accounts and preferences and put
