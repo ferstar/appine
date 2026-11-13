@@ -1460,47 +1460,6 @@ class MachineTest {
         Native.stop(machine)
     }
 
-    /**
-     * The open-source notices generated at build time (design doc §13.4) are in the APK: Appine's
-     * own AGPL notice and full text, Fuchsia's license for the parts of the line discipline adapted
-     * from Starnix, libghostty-vt with what it links and the terminal font, the GPL
-     * packages in Alpine (with the aports commit) and those bundled beside it, the Android libraries, the crates linked into the
-     * library (no proc macros), and the full license texts; every file in the index is present.
-     */
-    @Test
-    fun noticesCoverTheApp() {
-        val index = context.assets.open("notices/index.tsv").bufferedReader().readLines().map { it.split('\t') }
-        assertTrue(index.all { it.size == 3 })
-        fun text(title: String) = index.first { it[0].startsWith(title) }
-            .let { context.assets.open("notices/${it[2]}").bufferedReader().readText() }
-        val titles = index.map { it[0] }
-        assertTrue(text("Appine").contains("GNU AFFERO GENERAL PUBLIC LICENSE"))
-        assertTrue(text("Fuchsia Starnix").let { it.contains("The Fuchsia Authors") && it.contains("Redistribution and use") })
-        assertTrue(text("libghostty-vt ").contains("Mitchell Hashimoto"))
-        for (component in listOf("uucode ", "simdutf ", "Highway", "Wuffs", "translate-c ", "Zig ")) {
-            assertTrue(component, text(component).contains("Permission is hereby granted") || text(component).contains("Redistribution and use"))
-        }
-        assertTrue(text("JetBrains Mono").contains("SIL OPEN FONT LICENSE"))
-        assertFalse(titles.any { it.contains("Termux") })
-        val alpine = text("Alpine Linux")
-        assertTrue(alpine, Regex("""busybox \S+\n\s+License: GPL-2.0-only\n\s+aports: main/busybox at [0-9a-f]{40}""").containsMatchIn(alpine))
-        // The packages bundled beside it: doas, bash and procps-ng with their libraries
-        assertTrue(alpine, Regex("""\ndoas \S+\n\s+License: ISC\n""").containsMatchIn(alpine))
-        assertTrue(alpine, Regex("""\nbash \S+\n\s+License: GPL-3.0-or-later\n\s+aports: main/bash at [0-9a-f]{40}""").containsMatchIn(alpine))
-        assertTrue(alpine, alpine.contains("\nreadline ") && alpine.contains("\nlibncursesw "))
-        for (name in listOf("procps-ng", "libproc2", "libintl", "utmps-libs", "skalibs-libs")) {
-            assertTrue(alpine, alpine.contains("\n$name "))
-        }
-        assertEquals(1, Regex("""\nlibncursesw """).findAll(alpine).count())
-        assertTrue(text("GNU Lesser General Public License 2.1").contains("Version 2.1, February 1999"))
-        assertTrue(text("Android libraries").contains("androidx.core:core:"))
-        assertTrue(text("rusqlite ").contains("Permission is hereby granted"))
-        assertTrue(titles.any { it.startsWith("SQLite ") })
-        assertFalse("proc macros are not in the library", titles.any { it.startsWith("syn ") || it.startsWith("thiserror-impl ") })
-        assertTrue(text("GNU General Public License 2.0").contains("Version 2, June 1991"))
-        for (row in index) context.assets.open("notices/${row[2]}").close()
-    }
-
     private companion object {
         const val SIGHUP = 1
         const val SIGILL = 4

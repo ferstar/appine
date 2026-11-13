@@ -104,6 +104,12 @@
     <string name="run_notification">%1$s · %2$s</string>
     <string name="settings_licenses">Open source licenses</string>
     <string name="licenses_summary">GNU AGPL 3.0 or later</string>
+    <string name="license_public_domain">Public domain</string>
+    <string name="license_unavailable">Cannot display this license. Go back and open it again.</string>
+    <plurals name="license_packages">
+        <item quantity="one">%d package · Multiple licenses</item>
+        <item quantity="other">%d packages · Multiple licenses</item>
+    </plurals>
     <string name="settings_project">Project website</string>
     <string name="settings_version">Version</string>
     <string name="settings_login">Login account</string>

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 
 <!-- The frame of Settings and the license pages: a small top app bar that lifts while the content
-     below it is scrolled. The content hosts the settings fragment or the licenses' scroll view;
+     below it is scrolled. The content hosts Settings, the license list or the HTML reader;
      each screen applies the window insets. -->
 <androidx.coordinatorlayout.widget.CoordinatorLayout
         xmlns:android="http://schemas.android.com/apk/res/android"

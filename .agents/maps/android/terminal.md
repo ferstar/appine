@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: terminal HTTP and HTTPS links use AndroidX Custom Tabs)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: license components sorted alphabetically by name, ignoring case)
 
 ## Responsibilities
 
@@ -18,7 +18,7 @@
   and the question whether a program may read the clipboard, with the tab bar (`TabBarView`), the
   search bar in its place while searching (`SearchBarView`), the current tab's progress line over
   the terminal (`ProgressLine`) and the extra keys (`ExtraKeysView`);
-- `LicensesActivity`: the notices generated at build time;
+- `LicensesActivity`, `LicenseActivity` and `LicenseCatalog`: the static notices list and its offline HTML reader;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
   a black window and system bars, for `MainActivity`), the ⋮ menu's `Widget.Appine.MorePopup`,
@@ -28,13 +28,13 @@
   AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
 Root: `MainActivity.kt`, `TabBarView.kt`, `TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`,
-`ExtraKeysView.kt`, `LicensesActivity.kt` and `Ui.kt` in
+`ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`, `LicenseCatalog.kt` and `Ui.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
 
 Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
 native emulator shim around libghostty-vt (`android/vt`); session ownership, saving, kill reports
 and where bells, notifications, program statuses and clipboard reads go (`android/service`); the
-notices task and the build (`android/native`).
+notice assets and the build (`android/native`).
 
 ## Key types
 
@@ -78,9 +78,12 @@ notices task and the build (`android/native`).
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
   `selectableItemBackground`).
-- `LicensesActivity` — an `AppCompatActivity` on the Material 3 page: list from
-  `assets/notices/index.tsv` (one `list_item.xml` row per line with three fields), full text view;
-  an `OnBackPressedCallback`, enabled while a full text is shown, returns to the list.
+- `LicenseCatalog` — reads `assets/notices/index.json`: stable ID, name, version, chosen license,
+  HTML file, optional package count and standalone-license kind; formats localized summaries.
+- `LicensesActivity` — the Material 3 list, one `list_item.xml` per component entry (excluding
+  standalone license texts), sorted by name ignoring case, with a stable scroll-view ID.
+- `LicenseActivity` — a separate non-exported Activity, opened with a catalog ID; an offline
+  WebView reader on the Material 3 page, with relative scroll position saved across recreation.
 
 ## Public entry points
 
@@ -91,7 +94,8 @@ notices task and the build (`android/native`).
   `onMachineReady`, `onSessionsChanged`, `onBell`, `onClipboardRead`, `onTabStatus`,
   `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`.
-- `LicensesActivity`, opened from Settings.
+- `LicensesActivity`, opened from Settings; `LicenseActivity`, opened from the list or a local
+  license link with `EXTRA_ID` (unknown IDs finish without loading a URL).
 
 ## Data flow / lifecycle
 
@@ -334,21 +338,29 @@ notices task and the build (`android/native`).
   license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
   Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
   version summary and Google Play navigation.
-- The build writes `notices/` (Appine's licence; Fuchsia's for the line discipline; Ghostty's
-  libghostty-vt, uucode, simdutf, Highway, Wuffs, translate-c, Zig's compiler_rt and JetBrains
-  Mono; Alpine
-  packages from the rootfs database, the doas package, Android libraries, Rust crates, SQLite,
-  then full texts); a full text is monospace, selectable and sized so 74 columns fit (at most
-  13 sp), scrolling sideways when it does not.
+- `notices/` is checked in (android/native): Appine, Fuchsia, libghostty-vt and its linked
+  components, JetBrains Mono, Alpine and the bundled doas/bash/procps packages, Android
+  libraries, Rust crates, SQLite and standalone license texts. Subtitles show the chosen
+  license; Alpine shows a localized package count and "Multiple licenses", and SQLite "Public
+  domain". Standalone texts stay in the catalog and assets for links from Android libraries and
+  Alpine, but do not appear in the main list. Upstream alternatives remain in the body.
 - The page (`page.xml`): a `MaterialToolbar` (title, back arrow) in an `AppBarLayout` that lifts
   while the content below it is scrolled, over a `FrameLayout` with the app bar's scrolling
-  behaviour, into which the activity puts a `NestedScrollView` it makes; edge to edge (wallpaper
+  behaviour, containing the list's `NestedScrollView` or the reader's WebView; edge to edge (wallpaper
   colours from Android 12 on through `DynamicColors`), with the bar padded under the status bar
-  and the scroll view clear of the navigation bar. The toolbar shows the entry's title over its
-  full text; the back arrow and back both return to the list, then close.
-- It follows the system's dark mode: a change recreates the activity, which shows the same full
-  text again (saved state), as a display size change does. A rotation does not recreate it, so a
-  full text shown keeps its size.
+  and content clear of the navigation bar. The reader's toolbar names the entry, Back and Up
+  finish it, and the list's scroll view retains its place, including across recreation.
+- The reader uses AndroidX `WebViewAssetLoader` on `appassets.androidplatform.net`; only the
+  selected HTML file, shared CSS and an in-memory theme stylesheet can load. JavaScript, file,
+  content and network access are disabled. HTTP(S) links open Custom Tabs; local links to other
+  catalog documents open another reader, and same-document anchors stay in the current reader.
+  A renderer exit destroys the WebView and shows a localized message to reopen the page.
+- Shared CSS gives selectable, wrapping 16 px body text, 1.65 line height, 24 px side padding
+  and a 48 rem maximum reading width. WebView text zoom follows system font scale; pinch zoom
+  is available. Material colours are resolved before background asset requests.
+- The reader recreates for configuration changes, loads its ID again and restores its relative
+  scroll position after visual layout; the list handles orientation in place. Both recreate
+  for dark mode, density, locale and font-scale changes.
 
 ## Dependencies (inbound / outbound)
 
@@ -373,7 +385,8 @@ notices task and the build (`android/native`).
   (android/documents); `assets/notices`.
 - Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
   and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation
-  compat; androidx.browser's Custom Tabs for web links; the app the system picks for a link.
+  compat; androidx.browser's Custom Tabs for web links; AndroidX WebKit's asset loader for
+  notices; the app the system picks for a link.
 
 ## Invariants and gotchas
 
@@ -487,6 +500,9 @@ none
 
 ## To verify
 
+- The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and
+  tablet layouts remain untried. API 34 emulator checks cover offline rendering, no horizontal
+  overflow, scroll restoration on recreation, list navigation and light/dark Material colours.
 - Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
   10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
   real phones, tablets or foldables. Unverified beyond that:

@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: add AndroidX Browser for the About project link)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: checked-in HTML notices replace Gradle generation, with AndroidX WebKit and isolated reader tests)
 
 ## Responsibilities
 
@@ -25,7 +25,7 @@
 Root: `hosts/android/` (except `src/vt.c` and `src/vt.rs`),
 `android/app/src/main/java/io/github/mthli/appine/Native.kt`, `android/app/build.gradle.kts` and
 the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app/src/debug/`,
-`android/app/src/androidTest/`, `android/licenses/`, `scripts/release-sources`,
+`android/app/src/androidTest/`, `android/licenses/`, `android/app/src/main/assets/notices/`, `scripts/release-sources`,
 `scripts/fetch-ghostty`.
 
 Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
@@ -44,14 +44,14 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - `guarded!` — the macro every JNI body runs in: `(name, fallback, body)`, or
   `(name, throws env, fallback, body)` for the functions Kotlin declares `@Throws`.
 - Gradle tasks: `CargoNdkTask` (one per variant, `buildRust<Variant>`), `RootfsAssetTask` (one
-  `rootfsAsset` shared by all variants), `NoticesTask` (one per variant,
-  `generateNotices<Variant>`), the first and last on `CargoTask` (the workspace and which cargo
+  `rootfsAsset` shared by all variants), the first on `CargoTask` (the workspace and which cargo
   to run); helpers `byVersion` (compares file names by their runs of digits, then by how many
   runs), `newestFetched` (the newest file in `target/rootfs` whose name matches), `bashPackages`
   (the newest of bash, readline, libncursesw and ncurses-terminfo-base, null when any is missing)
   and `procpsPackages` (procps-ng, libproc2, libintl, utmps-libs, skalibs-libs and the two ncurses
   packages, null when any is missing), and `alpineBranch` (from the tarball's name, `edge` without one).
-- `MachineTest` — kernel and app instrumentation tests; `RunPolicyTest` — isolated preferences and idle-grace tests.
+- `MachineTest` — kernel and app instrumentation tests; `RunPolicyTest` — isolated preferences and idle-grace tests;
+  `LicenseTest` — static notice coverage and offline reader rendering/restoration, without opening the store.
 
 ## Public entry points
 
@@ -163,14 +163,15 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   and dependencies from `google()` and `mavenCentral()` (project repositories fail the build). The
   version catalog (`android/gradle/libs.versions.toml`) holds the libraries' versions, and AGP's
   is in `android/build.gradle.kts`. Android libraries: `androidx.core` 1.19.1,
-  `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0 and Material Components 1.14.0 (which
+  `androidx.preference:preference` 1.2.1, `androidx.browser:browser` 1.10.0,
+  `androidx.webkit:webkit` 1.18.0 and Material Components 1.14.0 (which
   brings AppCompat and androidx.activity); tests use androidx.test's runner 1.7.0 and ext.junit
   1.3.0.
 - Assets: the newest Alpine minirootfs tarball in `target/rootfs` by version (as `rootfs.tgz`,
   since AAPT would unpack `.gz`), the newest `doas.apk`, and bash's four packages under `bash/`
   with their own file names, plus procps-ng's seven packages under `procps/` (including copies of
   ncurses so either bundle installs independently; all by `byVersion`; `rootfsAsset` fails with "run
-  scripts/fetch-rootfs first" when any is missing), generated `notices/`, and
+  scripts/fetch-rootfs first" when any is missing), checked-in `notices/`, and
   the terminal font (`fonts/`, `android/vtview`); `BuildConfig.ALPINE_BRANCH` carries the
   branch.
 - SDK: min 30, compile and target 37; no ABI filter (only `arm64-v8a` is built); uncompressed
@@ -184,7 +185,9 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Notices
 
-- `NoticesTask` writes, in order: Appine (its notice and the repository's `LICENSE`); Fuchsia's
+- `app/src/main/assets/notices/` holds static HTML, a shared stylesheet and `index.json`, packaged
+  without a Gradle generation task. The catalog lists, in order: Appine (its notice and the
+  repository's `LICENSE`); Fuchsia's
   BSD-style licence for the line-discipline parts adapted from Starnix (`kernel/tty`); the
   terminal's components with their texts from `android/licenses/` (libghostty-vt 1.0.0, uucode
   with the Unicode and Hoehrmann licences, simdutf, Highway and Wuffs under their MIT or BSD option,
@@ -194,25 +197,27 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   counted only once), all counted in the entry's package count and
   licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
-  texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0; and `notices/index.tsv` (title, description,
-  file), which `LicensesActivity` reads.
-- Every Android library must belong to a group known to be Apache-2.0 (a prefix match against
-  AndroidX, Kotlin, kotlinx, JetBrains annotations, Guava's listenablefuture, Material Components,
-  Error Prone annotations, JSpecify), or the task fails.
-- Crates: `cargo metadata --locked --all-features --filter-platform aarch64-linux-android`, walked
-  from `appine-android` over normal dependencies, skipping proc-macros and workspace members; when a
-  crate's licence offers MIT, only the MIT (and unrelated) licence files are attached; a crate
-  without a licence file only warns.
-- The component texts and versions in `android/licenses/` (16 files, all used) are copies kept by
-  hand and change with the libghostty-vt version; the release's
+  texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0. `LicenseCatalog` (android/terminal)
+  reads stable IDs, names, versions, chosen licenses and HTML file names, plus optional package
+  counts and standalone-license kinds. Detail pages retain upstream alternatives and notices.
+- Dependency and bundled-package upgrades must update these files in the same change; Gradle
+  no longer discovers licenses or rejects unknown Android groups. Compare both runtime
+  classpaths, the Android-target normal Rust dependency graph (excluding workspace members and
+  proc-macros), and the selected Alpine artifacts. The initial debug/release inventories agree.
+- `LicenseTest` checks the catalog's unique IDs, readable files and component notice coverage;
+  it is not a general dependency freshness check. `android/README.md` describes maintenance.
+- The component texts in `android/licenses/` (16 files) remain upstream reference copies,
+  maintained with their corresponding HTML notices; the release's
   `deps/libghostty-vt-third-party.json` lists which projects are linked (translate-c among them,
   though nothing of it shows as an object of its own in `libghostty-vt.a`).
 
 ### Manifest
 
-- Launcher, settings and licenses activities (the application theme `Theme.Appine`, Material 3; the
+- Launcher, settings, licenses list and license reader activities (the application theme
+  `Theme.Appine`, Material 3; the
   launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave `uiMode` out of
-  their configuration changes), the `specialUse` foreground service with its subtype property, the
+  their configuration changes; the non-exported reader handles no configuration changes itself),
+  the `specialUse` foreground service with its subtype property, the
   documents provider, backup turned off (`allowBackup`, `fullBackupContent`, data extraction
   rules), normal permissions plus `POST_NOTIFICATIONS`, which `MainActivity` requests at run time;
   no storage permission. The debug source set's network security config allows cleartext to
@@ -253,7 +258,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
   reports (including an OOM from a cgroup `memory.max`), a guest crash reaching the kernel log, and
-  the notices, prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
+  prompt marks (busybox ash's with root's shell set to `/bin/sh` for the test), and a
   new Alpine import logging in with bash (`newSystemsLogInWithBash`, its own store: the offline
   install, the `/bin/sh` fallback, bash's marks and nested shells'). `newSystemsInstallProcpsOffline`
   uses its own store and ash, omits a dependency to check failure/retry, retries in two concurrent
@@ -271,15 +276,16 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 ### Inbound
 
 - `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; `vt.rs`
-  (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` and `LicensesActivity`
-  through the assets and `BuildConfig`; CI's `android.yml` (`assembleDebug lintDebug`, clippy
+  (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` through the assets and
+  `BuildConfig`; `LicenseCatalog` and `LicenseActivity` read the static notices;
+  CI's `android.yml` (`assembleDebug lintDebug`, clippy
   through cargo-ndk); the terminal (`android/vt`) through the libghostty-vt build.
 
 ### Outbound
 
 - `appine_kernel` (`Machine`, `MachineOptions`, routes, store and browse functions), `jni` 0.21,
   `libc`, Android `liblog` and `libjnigraphics`; cargo-ndk and NDK 29; AGP, Gradle;
-  `androidx.core`, AndroidX Preference, AndroidX Browser, Material Components and androidx.test from Google's Maven repository and Maven
+  `androidx.core`, AndroidX Preference, AndroidX Browser, AndroidX WebKit, Material Components and androidx.test from Google's Maven repository and Maven
   Central.
 - Zig 0.17.x, the libghostty-vt 1.0.0 source release and its dependency tarball, the `cc` crate;
   `scripts/fetch-rootfs`'s output in `target/rootfs`.

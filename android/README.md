@@ -48,14 +48,41 @@ HTTP downloads and leaves 127.0.0.1 alone; clear it afterwards with
 
 ## Open source licenses
 
-`NoticesTask` in `app/build.gradle.kts` writes the notices shown under Settings → Open source
-licenses into the assets (`notices/`): Appine's AGPL notice, Fuchsia's BSD-style license for
-the parts of the line discipline adapted from Starnix (`licenses/fuchsia-LICENSE`, the same
-commit `core/kernel/src/tty.rs` names), Ghostty's libghostty-vt with the
-libraries it links (uucode, simdutf, Highway, Wuffs, Zig's compiler_rt) and the JetBrains Mono
-font (their texts are in `licenses/`, taken from the sources `scripts/fetch-ghostty` downloads;
-update them with its version), the packages of the bundled Alpine minirootfs (from its `lib/apk/db/installed`, with the aports commit of
-each), the Android libraries on the runtime classpath, every Rust crate linked into
-`libappine.so` with the license files it ships (only the MIT ones when MIT is one of the
-choices), SQLite, and the full texts in `licenses/`. The build fails when a new Android library
-is not in one of the groups it knows to be Apache 2.0; check its license before adding it.
+The notices under Settings → Open source licenses are checked-in resources in
+`app/src/main/assets/notices/`; Gradle does not generate them. `index.json` records each
+entry's stable ID, project name, version, short license label and HTML file. The optional
+`packageCount` produces the localized Alpine summary, and `kind: "license"` identifies a
+standalone license text, hidden from the main list but reachable through component detail
+links. Each HTML document links to the shared `style.css`. The reader
+supplies `/theme/colors.css` from the current Material theme, opens external web links in
+Custom Tabs and needs no network connection to read a notice.
+
+Keep notices in the same change as dependency updates:
+
+- Appine's notice includes the repository's `LICENSE`, copyright, warranty and source link.
+- Fuchsia, libghostty-vt and its linked components, and JetBrains Mono retain their original
+  notices; `licenses/` keeps the upstream source copies for comparison.
+- Rust entries cover the normal dependencies reachable from `appine-android` on
+  `aarch64-linux-android`, excluding workspace members, build dependencies and proc-macros.
+  Record the chosen MIT license when offered as an alternative, and retain the upstream
+  expression and any additional notices in the detail page. Keep separate entries for
+  simultaneously linked versions, such as jni-sys 0.3 and 0.4.
+- `android.html` lists the resolved Android runtime libraries, including transitive ones;
+  check both debug and release runtime classpaths when changing the version catalog.
+- `alpine.html` records the bundled rootfs and doas/bash/procps packages, with versions,
+  license expressions and aports commits. Compare with the artifacts Gradle selects in
+  `target/rootfs`, and count shared ncurses packages only once.
+- Preserve license wording, copyright notices and all required component notices when
+  editing HTML. Use paragraphs and headings for reflow; do not shrink fixed-width text.
+  Keep IDs stable across upgrades, and update the separate source bundles as before
+  (`scripts/release-sources`).
+
+`LicenseTest` checks coverage and offline rendering/scroll restoration without starting the
+kernel or changing its store. It does not detect every dependency upgrade; reviewing the
+resolved dependencies and bundled package metadata remains part of updating the static files.
+
+```sh
+./gradlew assembleDebug lintDebug
+./gradlew connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=io.github.mthli.appine.LicenseTest
+```

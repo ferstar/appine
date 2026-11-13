@@ -55,6 +55,12 @@
                 android:exported="false"
                 />
 
+        <activity
+                android:name=".LicenseActivity"
+                android:label="@string/settings_licenses"
+                android:exported="false"
+                />
+
         <!-- The android/documents map: the home directory in the system Files app (and optionally
              the whole system, read-only); only the system (the Files app, which holds
              MANAGE_DOCUMENTS) has direct access, other apps go through grants the user picks
