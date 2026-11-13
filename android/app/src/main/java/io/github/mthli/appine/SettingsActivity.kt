@@ -23,6 +23,7 @@ import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -44,7 +45,10 @@ class SettingsActivity : AppCompatActivity() {
                 .replace(R.id.content, SettingsFragment())
                 .commitNow()
         }
-        val appBar = findViewById<View>(R.id.app_bar)
+        val appBar = findViewById<AppBarLayout>(R.id.app_bar)
+        // The list is inside the fragment's container; layout and scroll callbacks must use
+        // the same scrolling view when deciding whether to lift the app bar.
+        appBar.liftOnScrollTargetViewId = androidx.preference.R.id.recycler_view
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { v, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
             v.setPadding(bars.left, 0, bars.right, 0)

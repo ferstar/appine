@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: execution mode is available in all builds, with separate summaries and choice labels)
+> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Settings explicitly targets its RecyclerView for the app bar's lift-on-scroll state)
 
 ## Responsibilities
 
@@ -345,6 +345,10 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ## Invariants and gotchas
 
+- Settings must set the app bar's `liftOnScrollTargetViewId` to AndroidX Preference's
+  `recycler_view`: the list is nested inside the fragment container. Without that target,
+  Material's layout and nested-scroll callbacks inspect different views, so preference updates
+  can reset the app bar's lifted background even while the list remains scrolled.
 - `Rootfs.access`: provider calls hold the read lock; starting the kernel and deleting the store
   hold the write lock, so the kernel's exclusive boot open never overlaps a provider open. The
   mirror write, the import (on `rootfs.tmp`) and the per-start files run without it.
