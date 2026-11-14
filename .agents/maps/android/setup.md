@@ -31,9 +31,9 @@ Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsAct
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
-(`kernel/store`, `kernel/vfs`); bundling the assets (`android/native`); the shared page layouts and
-the licences (`android/terminal`); what the terminal does with the prompt marks (`android/vt`,
-`android/vtview`).
+(`kernel/store`, `kernel/vfs`); bundling the assets (`android/native`); the shared page layouts
+(`android/terminal`), the licences (`android/licenses`) and the authentication gate (`android/privacy`);
+what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
 
 ## Key types
 
@@ -54,7 +54,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
   `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
-  with the licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
+  with android/licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (running policy, privacy mode, file access), Terminal (CJK characters filling two
@@ -390,7 +390,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - `Native.importRootfs`, `syncRootfs`, `writeFile` (creates parent directories, does not follow
   symlinks), `readFile` (null when missing), `spawn` and `waitFor`; `HttpURLConnection` (system
   proxy); `BuildConfig` (Alpine branch, app version and application ID); the assets; `TerminalService` and its
-  `Listener` (Settings); `LicensesActivity`; Material Components and AndroidX (Settings),
+  `Listener` (Settings); `LicensesActivity` (android/licenses); android/privacy's mode changes,
+  export authorization and dialog protection; Material Components and AndroidX (Settings),
   including AndroidX Browser for the project website.
 
 ## Invariants and gotchas

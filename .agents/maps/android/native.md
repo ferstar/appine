@@ -199,7 +199,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   counted only once), plus bubblewrap and libcap2, all counted in the entry's package count (28) and
   licences); the Android libraries on the
   runtime classpath; the Rust crates; SQLite (its version from libsqlite3-sys's `sqlite3.h`); full
-  texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0. `LicenseCatalog` (android/terminal)
+  texts of GPL-3.0, GPL-2.0, LGPL-2.1, Apache-2.0 and MPL-2.0. `LicenseCatalog` (android/licenses)
   reads stable IDs, names, versions, chosen licenses and HTML file names, plus optional package
   counts and standalone-license kinds. Detail pages retain upstream alternatives and notices.
 - Dependency and bundled-package upgrades must update these files in the same change; Gradle
@@ -215,7 +215,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Manifest
 
-- Manifest application `MainApplication` lives in its own file and installs the shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
+- Manifest application `MainApplication` lives in its own file and installs android/privacy's shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` (android/privacy) authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
 - `MainApplication` also installs `Diagnostics` after the privacy gate. Non-exported
   `DiagnosticProvider` uses the existing AndroidX FileProvider with manifest path metadata,
   granting only generated archives from `cache/diagnostic-exports`; no new permission or
@@ -323,7 +323,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 - `TerminalService`, `VtSession`, `ConsolePty`, `Rootfs`, `Documents`, `MachineTest`; `vt.rs`
   (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` through the assets and
-  `BuildConfig`; `LicenseCatalog` and `LicenseActivity` read the static notices;
+  `BuildConfig`; `LicenseCatalog` and `LicenseActivity` (android/licenses) read the static notices;
   CI's `android.yml` (`assembleDebug lintDebug`, clippy
   through cargo-ndk); the terminal (`android/vt`) through the libghostty-vt build.
 

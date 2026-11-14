@@ -1,11 +1,11 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the decisions on the tabs' sessions and the terminal view made before they were split out into `android/vt` and `android/vtview`).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtview` and `android/licenses`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: background-tab status dots use a 1.5 dp radius with a 2 dp gap from the number)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: split privacy authentication and license pages into android/privacy and android/licenses, retaining shared UI resources here)
 
 ## Responsibilities
 
@@ -21,24 +21,25 @@
   `TerminalLinks`: opening web, mail and guest-file links, using the activity's shared toast queue;
 - `TerminalFiles`: importing selected Android documents into the login account's home and
   retaining the request, copy and result across activity recreation;
-- `LicensesActivity`, `LicenseActivity` and `LicenseCatalog`: the static notices list and its offline HTML reader;
 - the app's strings (English and Simplified Chinese) and themes: `Theme.Appine` (Material 3
   DayNight, for Settings and the licenses), `Theme.Appine.Terminal` (Material 3, always dark, with
   a black window and system bars, for `MainActivity`), the ⋮ menu's `Widget.Appine.MorePopup`,
   its `ThemeOverlay.Appine.CheckPopup` (a framework checkbox without its own ripple),
-  the Material 3 page frame (`page.xml`, shared by Settings and the licenses), the licenses'
-  `list_item.xml`, and `preference_switch.xml` (Settings' MaterialSwitch with the standard
-  AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
+  the Material 3 page frame (`page.xml`, shared by Settings and android/licenses), and
+  `preference_switch.xml` (Settings' MaterialSwitch with the standard AndroidX `switchWidget` ID). Settings' categories and rows use AndroidX's layouts.
 
-Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TerminalFiles.kt`, `TabBarView.kt`, `TabNumber.kt`,
-`SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt`, `LicensesActivity.kt`, `LicenseActivity.kt`,
-`LicenseCatalog.kt`, `Privacy.kt`, `NotificationActivity.kt` and `Ui.kt` in
-`android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/`.
+Root: `MainActivity.kt`, `TerminalLayout.kt`, `TerminalLinks.kt`, `TerminalFiles.kt`, `TabBarView.kt`,
+`TabNumber.kt`, `SearchBarView.kt`, `ProgressLine.kt`, `ExtraKeysView.kt` and `Ui.kt` in
+`android/app/src/main/java/io/github/mthli/appine/`, and `android/app/src/main/res/` except
+android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and `drawable/ic_lock.xml`,
+and android/licenses' `layout/list_item.xml` and `values/ids.xml`. Shared strings, themes,
+`page.xml` and `preference_switch.xml` remain here.
 
 Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
 native emulator shim around libghostty-vt (`android/vt`); session ownership, saving, kill reports
 and where bells, notifications, program statuses and clipboard reads go (`android/service`); the
-notice assets and the build (`android/native`).
+notice assets and the build (`android/native`); shared authentication, secure windows and
+protected notification actions (`android/privacy`); the notices list and reader (`android/licenses`).
 
 ## Key types
 
@@ -61,10 +62,6 @@ notice assets and the build (`android/native`).
   its import button and present the result. `importSelected` reports whether it started a worker,
   `copySelected` performs the batch, and MainActivity's `showImportResult` builds its dialog.
   It keeps the Application, never the activity.
-- `Privacy` — process-local authentication and epoch, with a `Gate` per FragmentActivity and a
-  `Request` ViewModel holding that activity's authentication purpose, epoch snapshot and completion.
-  `ExportAuthorization` scopes fresh log-export approval; `NotificationActivity` authenticates
-  private report-copy actions before finishing.
 - `SearchBarView` — the search bar, a row as tall as the tab bar: the text to find (an `EditText`
   without suggestions, its IME action Search), the count ("selected/total"), `↑`, `↓` and `×`; it
   shows the count it is given (`setCount`) and sends text changes, steps and closing to a
@@ -97,15 +94,9 @@ notice assets and the build (`android/native`).
 - `Ui.kt` — what the screens and views share (`VtView` too): `LINE_DP` and `line()` (how thick
   the indicators and the progress line are: 1 dp, at least a pixel), `dp`, `themeColor`
   (white when the theme lacks the colour), `themeDrawable` and `touchFeedback` (the theme's
-  `selectableItemBackground`); `showPrivate` registers dialog security before showing it.
+  `selectableItemBackground`); `showPrivate` registers dialog security with android/privacy before showing it.
   `monospaceMessage` substitutes a styled value into a localized `^1` template with TextUtils,
   leaving the explanation in the dialog's normal font.
-- `LicenseCatalog` — reads `assets/notices/index.json`: stable ID, name, version, chosen license,
-  HTML file, optional package count and standalone-license kind; formats localized summaries.
-- `LicensesActivity` — the Material 3 list, one `list_item.xml` per component entry (excluding
-  standalone license texts), sorted by name ignoring case, with a stable scroll-view ID.
-- `LicenseActivity` — a separate non-exported Activity, opened with a catalog ID; an offline
-  WebView reader on the Material 3 page, with relative scroll position saved across recreation.
 
 ## Public entry points
 
@@ -117,31 +108,8 @@ notice assets and the build (`android/native`).
   `onSettingsChanged`,
   `onNotice`, `onRestarting`, `onExitAll`, `onOpenUrl`; `onPrivacyUnlocked` from the privacy gate,
   and the `OpenMultipleDocuments` activity-result callback for import.
-- `LicensesActivity`, opened from Settings; `LicenseActivity`, opened from the list or a local
-  license link with `EXTRA_ID` (unknown IDs finish without loading a URL).
 
 ## Data flow / lifecycle
-
-### Privacy
-
-- `Privacy.requestLogExport` always requests a fresh `EXPORT_LOGS` authentication when privacy
-  is enabled, even if the page was already unlocked. Only success on a resumed, available
-  device with the matching epoch delivers `ExportAuthorization` to `ExportListener`.
-  Settings checks that epoch, the current privacy setting and foreground/device availability
-  before generation and again before sharing or handing a prepared save to the document picker.
-  Save's process-local pending file reference authorizes only that archive's transfer when the
-  picker returns, even though the page locks while backgrounded; it cannot generate another ZIP.
-  Its result may call `deferNextUnlock`: while the gate is paused this suppresses automatic unlock
-  on its next resume without revealing protected content. This flag does not survive gate recreation.
-  Ordinary page unlock never starts an export. Authentication purpose survives configuration
-  recreation in the existing ViewModel, not process death. Cancellation, failure or screen-off
-  invalidation before the handoff cannot export; an intentional handoff may complete while locked.
-- `MainApplication` (`android/native`) installs `Privacy` on every FragmentActivity, including Settings, licenses and the non-exported `NotificationActivity`. Default-off `privacy_mode` accepts AndroidX Biometric 1.1.0 strong biometrics or device credentials; enabling and disabling both authenticate, enabling after a confirmation.
-- Authentication lives only in memory. The last stopped activity locks and covers pages unless recreating; overlapping internal navigation preserves it. Screen-off invalidates pending authentication and locks immediately. Pausing alone leaves visible content in place; resumed locked pages authenticate or offer Unlock/Leave after cancellation or unavailability.
-- Each activity's ViewModel retains the prompt's purpose/generation through recreation, never through process death. Successful callbacks complete only when resumed with an interactive, unlocked device; report-copy/clipboard/input checks also refuse access while no page is resumed.
-- Enabled pages and all app dialogs use `FLAG_SECURE`; `showPrivate`/`Privacy.protect` track dialog windows weakly and update existing ones on changes. The shield also covers restored dialog windows. Terminal input, clipboard answers, browser launches and title toasts check the gate; pausing cancels title toasts and denies an open clipboard question.
-- `privacy_shield.xml` presents a decorative lock, heading, authentication hint, filled Unlock button and text Leave button using the covered page's theme. Its scrollable content centers within system insets, has 24 dp horizontal/32 dp vertical padding and caps the inner column at 360 dp as the window resizes; text and buttons can grow with the font scale.
-- Only report-copy actions created during privacy mode enter `NotificationActivity`, never the exported launcher. It copies after the gate opens and then finishes. Normal report copying uses a non-exported receiver; exit, download cancellation and running-policy actions run directly in the service even while locked. Background programs, saved terminals and rootfs data are retained; this is access protection, not encryption or history removal.
 
 ### Binding and choosing a tab
 
@@ -413,36 +381,6 @@ notice assets and the build (`android/native`).
   document providers hold up rootfs reset/replacement. Process termination or cleanup failure can
   leave an incomplete file; imports are not transactional across the whole batch.
 
-### Licenses
-
-- Settings' About group has a separate localized Project website action (android/setup); the
-  license summary names GNU AGPL 3.0 or later, with copyright and warranty details in the Appine notice.
-  Its final Version action is labeled "Version" / "版本号"; android/setup supplies the build
-  version summary and Google Play navigation.
-- `notices/` is checked in (android/native): Appine, Fuchsia, libghostty-vt and its linked
-  components, JetBrains Mono, Alpine and the bundled doas/bash/procps/bubblewrap packages with libcap2, Android
-  libraries, Rust crates, SQLite and standalone license texts. Subtitles show the chosen
-  license; Alpine shows a localized package count and "Multiple licenses", and SQLite "Public
-  domain". Standalone texts stay in the catalog and assets for links from Android libraries and
-  Alpine, but do not appear in the main list. Upstream alternatives remain in the body.
-- The page (`page.xml`): a `MaterialToolbar` (title, back arrow) in an `AppBarLayout` that lifts
-  while the content below it is scrolled, over a `FrameLayout` with the app bar's scrolling
-  behaviour, containing the list's `NestedScrollView` or the reader's WebView; edge to edge (wallpaper
-  colours from Android 12 on through `DynamicColors`), with the bar padded under the status bar
-  and content clear of the navigation bar. The reader's toolbar names the entry, Back and Up
-  finish it, and the list's scroll view retains its place, including across recreation.
-- The reader uses AndroidX `WebViewAssetLoader` on `appassets.androidplatform.net`; only the
-  selected HTML file, shared CSS and an in-memory theme stylesheet can load. JavaScript, file,
-  content and network access are disabled. HTTP(S) links open Custom Tabs; local links to other
-  catalog documents open another reader, and same-document anchors stay in the current reader.
-  A renderer exit destroys the WebView and shows a localized message to reopen the page.
-- Shared CSS gives selectable, wrapping 16 px body text, 1.65 line height, 24 px side padding
-  and a 48 rem maximum reading width. WebView text zoom follows system font scale; pinch zoom
-  is available. Material colours are resolved before background asset requests.
-- The reader recreates for configuration changes, loads its ID again and restores its relative
-  scroll position after visual layout; the list handles orientation in place. Both recreate
-  for dark mode, density, locale and font-scale changes.
-
 ## Dependencies (inbound / outbound)
 
 ### Inbound
@@ -452,7 +390,9 @@ notice assets and the build (`android/native`).
   `onExitAll`) and the notification intent with `EXTRA_TAB`.
 - android/vtview: `VtView.Host` (`onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`,
   `shift` and `modifiersUsed`, `onLink`, `onSearchCount`).
-- `SettingsActivity` (licenses; it also uses the page frame and preference switch widget).
+- android/setup and android/licenses use the shared page frame, themes and view helpers;
+  Settings also uses the preference switch widget. android/privacy uses the shared theme and helpers.
+- android/privacy: `onPrivacyUnlocked` resumes deferred terminal UI work.
 
 ### Outbound
 
@@ -463,13 +403,14 @@ notice assets and the build (`android/native`).
 - `TerminalService` (`createSession`, with the current tab's directory for a new tab,
   `removeSession`, `current`, `focus`, `sessions`), `Settings.fillWide` and
   `volumeKeysSwitchTabs`; `Documents.fileLink`
-  (android/documents); `assets/notices`.
+  (android/documents).
 - `TerminalFiles` uses ContentResolver document streams, `Rootfs` account resolution/store lock,
   `Documents` naming/path helpers and `Native.browse*` for private copies into the home.
-- Material Components 1.14.0 with AppCompat and androidx.activity (both themes, `LicensesActivity`
-  and the page layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation
-  compat; androidx.browser's Custom Tabs for web links; AndroidX WebKit's asset loader for
-  notices; the app the system picks for a link.
+- android/privacy: `Privacy.locked` guards input, clipboard, imports, browser launches and title
+  toasts; `Ui.showPrivate` delegates dialog-window security to `Privacy.protect`.
+- Material Components 1.14.0 with AppCompat and androidx.activity (the shared themes and page
+  layouts, `MainActivity`'s dialogs and menus); androidx.core's insets and animation compat;
+  androidx.browser's Custom Tabs for web links; the app the system picks for a link.
 
 ## Invariants and gotchas
 
@@ -551,10 +492,11 @@ notice assets and the build (`android/native`).
 - The tab bar's buttons are characters in the system font: `+`, `@`, `⋮` and `×` (the multiplication
   sign, which Roboto draws like its `+`). `✕` (U+2715) is not in Roboto, and the fallback font's
   glyph is larger and thinner than the others. `@` opens file import.
-- Settings and the licenses leave `uiMode` out of their `configChanges` so that a dark-mode
-  change recreates them with the other colours; an AppCompat activity that handles `uiMode`
-  itself would keep the views it already made in the old ones. No activity handles `density`,
-  for the same reason: every view is sized in dp when built.
+- No activity handles `density`: every view is sized in dp when built. Settings and the license
+  pages also recreate for dark mode (android/setup and android/licenses).
+- The privacy gate is android/privacy's. Keep checks at the final input and clipboard sinks,
+  including delayed IME/paste callbacks; pausing cancels title toasts and denies the open clipboard
+  question. Dialogs use `showPrivate`, and deferred import results require a resumed unlocked page.
 - An activity the system recreates (a configuration change it does not handle, or after killing
   the app) or that is opened from Recents gets the intent that first started it, so `EXTRA_TAB`
   is read in `onCreate` only without a saved state and without
@@ -570,6 +512,9 @@ notice assets and the build (`android/native`).
 
 ## Open questions
 
+- Should tab-bar rendering and extra-key handling get separate maps? Even after moving privacy
+  and licenses out, this map exceeds the single-read size target; a further split must assign the
+  shared indicators and activity callbacks without duplicating their contracts.
 - Should Ctrl+Shift+W ask before closing a running shell, as `×` does, and should "Close other
   tabs" with one other tab name it rather than ask "Close this tab?"?
 - Should a background tab's progress take another colour than the primary one? Nearly full, it
@@ -589,15 +534,8 @@ notice assets and the build (`android/native`).
   collision numbering and activity recreation, including redisplay of the result. Seven
   instrumentation cases cover native-store copies, read/close cleanup, guest reads, shell escaping
   and locked-picker retention. Cloud providers, process interruption and vendor pickers remain unverified.
-- Fresh diagnostic-export credential authentication, cancellation, wrong PIN and screen-off
-  invalidation were checked on API 34; ordinary unlock did not replay an export. Real biometric
-  hardware and vendor prompt behavior remain unverified.
-- Privacy credential enable/disable, background return, cancellation/retry, screen-off on Settings and notification actions were checked on API 34; cold/recreated locked pages and dialog flags have instrumentation coverage. Real biometrics, concurrent windows and vendor authentication/window behavior remain unverified.
 - Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
   checked on API 34; a complete Codex OAuth login and its callback remain unverified.
-- The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and
-  tablet layouts remain untried. API 34 emulator checks cover offline rendering, no horizontal
-  overflow, scroll restoration on recreation, list navigation and light/dark Material colours.
 - Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
   10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
   real phones, tablets or foldables. Unverified beyond that:
