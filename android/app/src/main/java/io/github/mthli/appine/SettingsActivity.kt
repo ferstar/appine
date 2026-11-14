@@ -7,17 +7,21 @@ import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import android.view.View
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.net.toUri
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.preference.ListPreference
 import androidx.preference.ListPreferenceDialogFragmentCompat
 import androidx.preference.Preference
@@ -30,10 +34,12 @@ import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import java.io.File
+import java.io.IOException
 import kotlin.concurrent.thread
 
 /** Material 3 frame for the standard AndroidX settings list. */
-class SettingsActivity : AppCompatActivity(), Privacy.Listener {
+internal class SettingsActivity : AppCompatActivity(), Privacy.Listener, Privacy.ExportListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         DynamicColors.applyToActivityIfAvailable(this)
         enableEdgeToEdge()
@@ -64,6 +70,10 @@ class SettingsActivity : AppCompatActivity(), Privacy.Listener {
     override fun onPrivacyUnlocked() {
         (supportFragmentManager.findFragmentById(R.id.content) as? SettingsFragment)?.onNotice()
     }
+
+    override fun onLogExportAuthorized(authorization: Privacy.ExportAuthorization) {
+        (supportFragmentManager.findFragmentById(R.id.content) as? SettingsFragment)?.exportLogs(authorization)
+    }
 }
 
 /**
@@ -88,6 +98,21 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private var accountLoad = 0
 
     private lateinit var tier: Preference
+    private lateinit var export: Preference
+    private var exporting = false
+    private var exportGeneration = 0
+    private val logSave by lazy { ViewModelProvider(this)[PendingLogSave::class.java] }
+    private val createLogDocument = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        // The process-local archive reference authorizes this result once, never a new export.
+        val archive = logSave.take() ?: return@registerForActivityResult
+        Privacy.deferNextUnlock(requireActivity())
+        if (uri == null) {
+            archive.delete()
+            setExportProgress()
+        } else {
+            saveLogs(archive, uri)
+        }
+    }
     private lateinit var runPolicy: ListPreference
     private lateinit var fileAccess: SwitchPreferenceCompat
     private lateinit var privacy: SwitchPreferenceCompat
@@ -127,6 +152,12 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             Toast.makeText(requireContext(), getString(R.string.login_changed, who), Toast.LENGTH_SHORT).show()
         }
         tier = action(R.string.settings_tier) { onTier() }
+        export = action(R.string.settings_export_logs) {
+            chooseLogExport()
+        }.apply {
+            setSummary(R.string.export_logs_summary)
+            isEnabled = !logSave.pending
+        }
         runPolicy = choice(R.string.settings_run_policy) { s, value ->
             s.setRunPolicy(RunPolicy.entries.first { it.value == value })
         }.apply {
@@ -174,7 +205,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         group(R.string.settings_group_system, distro, account, reset)
         group(R.string.settings_group_android, runPolicy, privacy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
-        group(R.string.settings_group_debug, tier)
+        group(R.string.settings_group_debug, tier, export)
         group(R.string.settings_group_about, project, licenses, version)
         render()
     }
@@ -214,13 +245,106 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
+    private fun chooseLogExport() {
+        if (exporting || logSave.pending || Privacy.locked(requireContext())) return
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.settings_export_logs)
+            .setItems(arrayOf(getString(R.string.export_logs_save), getString(R.string.export_logs_share))) { _, which ->
+                logSave.saveRequested = which == 0
+                Privacy.requestLogExport(requireActivity())
+            }
+            .showPrivate()
+    }
+
     override fun onStop() {
+        exportGeneration++
         service?.removeListener(this)
         requireContext().unbindService(connection)
         service = null
         accountLoad++
         render()
         super.onStop()
+    }
+
+    /** Never queue an export behind the service worker: the kernel may be stuck on its lock. */
+    internal fun exportLogs(authorization: Privacy.ExportAuthorization) {
+        if (exporting || logSave.pending || !isResumed || !Privacy.canExport(requireContext(), authorization)) return
+        setExportProgress(R.string.export_logs_preparing)
+        val owner = requireActivity()
+        val context = owner.applicationContext
+        val generation = exportGeneration
+        val save = logSave.saveRequested
+        logSave.saveRequested = false
+        thread(name = "appine-export") {
+            val result = runCatching { Diagnostics.export(context, forSave = save) }
+            owner.runOnUiThread {
+                setExportProgress()
+                // A detached/replaced page or a lock must never replay a delayed export.
+                if (!isAdded || !isResumed || generation != exportGeneration || !Privacy.canExport(context, authorization)) {
+                    result.getOrNull()?.delete()
+                    return@runOnUiThread
+                }
+                result.fold(onSuccess = { archive ->
+                    if (save) chooseLogDestination(archive) else shareLogs(archive)
+                }, onFailure = {
+                    Toast.makeText(context, R.string.export_logs_failed, Toast.LENGTH_LONG).show()
+                })
+            }
+        }
+    }
+
+    private fun chooseLogDestination(archive: File) {
+        // Authorize only this prepared archive before leaving for the picker.
+        logSave.stage(archive)
+        setExportProgress()
+        try {
+            createLogDocument.launch("appine-diagnostics-${System.currentTimeMillis()}.zip")
+        } catch (_: ActivityNotFoundException) {
+            logSave.take()?.delete()
+            setExportProgress()
+            Toast.makeText(requireContext(), R.string.export_logs_no_picker, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun shareLogs(archive: File) {
+        try {
+            val intent = Diagnostics.shareIntent(requireContext(), archive)
+            startActivity(Intent.createChooser(intent, getString(R.string.settings_export_logs)))
+        } catch (_: ActivityNotFoundException) {
+            archive.delete()
+            Toast.makeText(requireContext(), R.string.export_logs_no_app, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun setExportProgress(summary: Int? = null) {
+        exporting = summary != null
+        if (isAdded) {
+            export.isEnabled = !exporting && !logSave.pending
+            export.setSummary(summary ?: R.string.export_logs_summary)
+        }
+    }
+
+    private fun saveLogs(archive: File, destination: Uri) {
+        setExportProgress(R.string.export_logs_saving)
+        val owner = requireActivity()
+        val context = owner.applicationContext
+        // Like an intentional share, this already-authorized transfer can finish while locked.
+        thread(name = "appine-save-logs") {
+            val saved = runCatching {
+                archive.inputStream().use { input ->
+                    val output = context.contentResolver.openOutputStream(destination, "wt")
+                        ?: throw IOException("Document provider returned no output stream")
+                    output.use { input.copyTo(it) }
+                }
+            }
+            archive.delete()
+            owner.runOnUiThread {
+                setExportProgress()
+                if (isAdded) {
+                    Toast.makeText(context, if (saved.isSuccess) R.string.export_logs_saved else R.string.export_logs_failed, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     /** Stable keys let AndroidX restore list/dialog state without owning the setting's storage. */
@@ -528,5 +652,23 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         /** The cursor shapes offered, in order, and their names. */
         private val CURSOR_STYLES = intArrayOf(VtNative.CURSOR_BLOCK, VtNative.CURSOR_BAR, VtNative.CURSOR_UNDERLINE)
         private val CURSOR_LABELS = intArrayOf(R.string.cursor_block, R.string.cursor_bar, R.string.cursor_underline)
+    }
+}
+
+/** Retain one authorized archive across picker recreation, never across process death. */
+internal class PendingLogSave : ViewModel() {
+    var saveRequested = false
+    private var archive: File? = null
+    val pending: Boolean get() = archive != null
+
+    fun stage(file: File) {
+        check(archive == null) { "A log save is already pending" }
+        archive = file
+    }
+
+    fun take(): File? = archive.also { archive = null }
+
+    override fun onCleared() {
+        take()?.delete()
     }
 }

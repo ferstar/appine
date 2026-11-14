@@ -7,5 +7,6 @@ class MainApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         Privacy.install(this)
+        Diagnostics.install(this)
     }
 }

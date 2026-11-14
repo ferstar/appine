@@ -129,6 +129,7 @@ internal class Notifications(private val service: TerminalService) {
         if (seen == stallNotified) return
         val updating = stallNotified.first == m && stallNotified.second == id
         stallNotified = seen
+        val report = bugReport(f[2], f[3])
         if (updating && manager.activeNotifications.none { it.id == STALL_NOTIFICATION_ID }) return
         val secs = f[1].toIntOrNull() ?: 0
         val text = service.getString(if (ended) R.string.stall_ended_text else R.string.stall_text, secs)
@@ -136,7 +137,7 @@ internal class Notifications(private val service: TerminalService) {
         val notification = builder(PROBLEMS_CHANNEL_ID, title, text)
             .setOnlyAlertOnce(true)
             // The record of its end is a kernel log line
-            .addAction(copyReportAction(service, STALL_NOTIFICATION_ID, bugReport(f[2], f[3])))
+            .addAction(copyReportAction(service, STALL_NOTIFICATION_ID, report))
             .build()
         manager.notify(STALL_NOTIFICATION_ID, notification)
     }
@@ -146,6 +147,7 @@ internal class Notifications(private val service: TerminalService) {
      * output is, the services listed as the app's language lists things.
      */
     fun bootFailures(services: List<String>) {
+        Diagnostics.record("Boot services failed: ${services.joinToString(", ")}")
         val title = service.resources.getQuantityString(R.plurals.boot_failed_title, services.size, services.size)
         val text = service.getString(R.string.boot_failed_text, ListFormatter.getInstance(locale).format(services))
         manager.notify(BOOT_NOTIFICATION_ID, builder(PROBLEMS_CHANNEL_ID, title, text).build())
@@ -208,7 +210,7 @@ internal class Notifications(private val service: TerminalService) {
             append("\n\nUnimplemented paths reached:\n")
             append(stubs.split('\u001e').joinToString("\n"))
         }
-    }
+    }.also(Diagnostics::record)
 
     /** Legacy service actions use the same privacy check as the receiver and activity. */
     fun copyReport(intent: Intent) = copyReport(service, intent)

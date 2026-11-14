@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: authenticated privacy toggle disables external file access and protects settings dialogs)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: authenticate before preparing a save, with one-shot archive ownership across the document picker)
 
 ## Responsibilities
 
@@ -59,7 +59,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
   reset), Android (running policy, privacy mode, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
-  mode, in all builds) and About (project website, licenses, version).
+  mode and diagnostic export, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
   without a console with `--refresh-rules`.
 - `profile.sh` — copied verbatim, comments included, into the guest as
@@ -304,6 +304,26 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Settings
 
+- Diagnostic export is independent of service binding and kernel readiness. Its protected dialog
+  offers Save to file or Share. Both call `Privacy.requestLogExport` before generating a ZIP;
+  privacy mode requires fresh authentication even when Settings is already unlocked.
+  Only the authorized callback starts `appine-export`. A stopped/replaced fragment or expired
+  authorization deletes its prepared result instead of handing it off.
+- Save stages its already-prepared ZIP in a fragment-scoped `PendingLogSave` ViewModel and then
+  launches `CreateDocument("application/zip")`. The mode and pending file reference survive
+  configuration recreation, never process death; the authority only covers this archive.
+  A picker result consumes the reference once. Cancellation or permanent owner destruction while
+  pending deletes the file; a valid destination transfers ownership to `appine-save-logs`, which
+  opens the source before `openOutputStream("wt")` and deletes the ZIP after success or failure.
+  Save files use `cache/diagnostic-saves`, isolated from share-cache pruning; startup attempts to
+  remove orphans from a dead process. The row stays disabled while preparing, pending or saving.
+- A consumed picker result calls `Privacy.deferNextUnlock` while the page is paused. Its next
+  gate resume can show the locked shield without a redundant automatic authentication prompt;
+  this never unlocks Settings or permits new exports. The already-authorized transfer may finish
+  while locked/backgrounded. Ordinary unlock cannot replay a cancelled or consumed save.
+  Share instead grants temporary read-only access through `Diagnostics` after its final check.
+  Failures restore the row and show a localized message. A provider failure may leave an empty or
+  incomplete destination; cancelling authentication occurs before the picker creates any document.
 - Privacy mode is an authenticated exception to service-owned changes: its nonpersistent switch asks before enabling, then calls the shared `Privacy` gate; disabling also authenticates. No setting changes on cancellation or failed/unavailable authentication. File access stays disabled while privacy is on, with a localized explanation; turning privacy off leaves file access off. Material dialogs use `showPrivate`, and restored choice dialogs use `Privacy.protect`.
 - Binding: the fragment's `onStart` starts and binds the service, `onStop` unbinds; once bound it listens,
   renders, shows a pending notice and loads the regular accounts on a background thread, again
@@ -337,7 +357,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
   without a package if no Play Store activity handles it; no URL handler shows `link_no_app`.
   The link can be built before publication, but the store listing is unavailable until published.
 - Service-dependent preferences are disabled before binding, on disconnect and on stopping;
-  project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
+  diagnostic export, project website, licenses and version remain usable. All preferences have stable resource-name keys and persistence
   disabled: they render service values and their change listeners call service setters, never
   writing a second preference store (privacy uses its shared authenticated controller). AndroidX manages row binding, disabled states and
   accessibility; `SwitchPreferenceCompat` binds the Material widget through `switchWidget`.
@@ -437,6 +457,13 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ## To verify
 
+- Diagnostic export was exercised on API 34 with privacy off and with device credentials:
+  success, cancellation, wrong PIN, screen-off invalidation and no replay after unlock.
+  Save now authenticates before opening the picker: API 34 covered wrong PIN/cancellation before
+  picker launch, successful save to Downloads with ZIP integrity, cancelled-picker cleanup,
+  no repeat prompt on return while the shield stays locked, and orphan cleanup after process death.
+  Debug/release build and lint and thirteen diagnostic/privacy tests passed. Real biometric
+  hardware, cloud document providers and receiving the ZIP in third-party apps remain unverified.
 - File-access consent on physical devices; API 34 covered English/Chinese layout, cancellation,
   Back/outside dismissal, recreation, enabling and immediate disabling; build and lint passed.
 - About's version row and Play Store navigation on a device, including web fallback, missing

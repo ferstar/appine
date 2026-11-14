@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: terminal input tests cover optional trailing-newline removal and can capture its Material 3 dialog)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: save ownership, share-pruning isolation and locked-return regression coverage)
 
 ## Responsibilities
 
@@ -216,6 +216,10 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 ### Manifest
 
 - Manifest application `MainApplication` lives in its own file and installs the shared page gate with `Privacy.install` in `onCreate`; non-exported `NotificationActivity` authenticates private report-copy actions, while non-exported `Notifications.ReportReceiver` copies ordinary reports without opening a page. AndroidX Biometric is listed in the static Android library notice; both runtime dependency inventories were checked.
+- `MainApplication` also installs `Diagnostics` after the privacy gate. Non-exported
+  `DiagnosticProvider` uses the existing AndroidX FileProvider with manifest path metadata,
+  granting only generated archives from `cache/diagnostic-exports`; no new permission or
+  dependency is required. Retained diagnostic files use the app's no-backup directory.
 - Launcher, settings, licenses list and license reader activities (the application theme
   `Theme.Appine`, Material 3; the
   launcher overrides it with `Theme.Appine.Terminal`; settings and licenses leave `uiMode` out of
@@ -257,6 +261,12 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Tests
 
+- `DiagnosticsTest` checks two-part byte limits and previous-run rotation, ZIP entries and
+  report retention, own-PID capture excluding another process, read-only share intents and
+  provider root confinement, plus rejection of locked/stale export callbacks and recreation.
+  Save coverage includes ViewModel ownership across recreation, one-shot consumption and owner
+  cleanup, plus isolation from share pruning and FileProvider access.
+  It uses API 34 and does not bypass biometric authentication.
 - `TerminalInputTest` uses an isolated store and native terminal, a shell-free session and a
   capturing view host to exercise IME replacement/commit/composition and clipboard menu callbacks.
   It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
@@ -378,6 +388,11 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ## To verify
 
+- Diagnostic exports passed six instrumentation cases and seven privacy cases on API 34;
+  debug/release assembly and lint passed. Manual checks covered authentication before picker
+  launch, saved ZIP integrity, picker cancellation cleanup, locked return without another prompt,
+  and process-death orphan cleanup. Real biometric devices, API 30 trace attachments
+  and 16 KB-page device behavior remain unverified.
 - The static browser launcher on Debian and a 16 KB-page device; current bridge tests use Alpine on API 34.
 
 - That NDK 29's default really gives 16 KB-aligned `LOAD` segments in `libappine.so` and that the

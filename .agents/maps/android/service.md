@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: notification controls run directly in the service; report copying uses a receiver or the privacy authentication page)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: isolate pending save archives from share-cache pruning and clean abandoned saves at startup)
 
 ## Responsibilities
 
@@ -28,7 +28,7 @@ outlives an Activity:
   kept in `Settings`.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
-`Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`.
+`Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`, `Diagnostics.kt`.
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
 and its tab bar (`android/terminal`); rendering (`android/vtview`); sessions' internals and the
@@ -310,6 +310,34 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### Reports and notifications
 
+- `Diagnostics` starts from `MainApplication`, without starting the service or loading Native.
+  `DiagnosticFiles` retains logcat and report streams in `noBackupFilesDir/diagnostics`: two
+  256 KiB parts per stream for the current process and one previous process (2 MiB total).
+  A shared instance lock protects rotation, appends and snapshots; older bytes are discarded.
+  A daemon reader captures only the current PID's main/crash logcat, warnings and errors plus
+  INFO for `appine`, `Rootfs` and `TerminalService`. Capture failure is reported in exports.
+  Native stderr reaches this stream through the existing JNI redirect; release builds still
+  leave detailed kernel debug logging off. Sudden process death can lose the final logcat lines.
+- Fault reports are saved when built, even if notifications are later dismissed; a stall's
+  ending is saved even after its notification was dismissed. Boot failures and start exceptions
+  are saved too. The uncaught-exception hook records Java stacks before chaining Android's
+  previous handler. Persistence is best effort and never changes normal crash handling.
+- `Diagnostics.export` runs separately from the service worker and calls no native kernel API.
+  Its ZIP contains environment metadata, retained logs/reports, up to five Android exit records,
+  and optionally the latest ANR/native-exit trace if available and at most 1 MiB (API 31+ native
+  protobuf, otherwise ANR text). Unavailable or oversized traces are described in the archive.
+  It does not read terminal transcripts, command history, environment variables or guest files;
+  diagnostic messages themselves can contain names, paths and error details.
+- Generated Share ZIPs live in `cache/diagnostic-exports`; serialized exports retain at most three
+  archives, failing if older files cannot be removed. `DiagnosticProvider` is non-exported and
+  exposes only that directory through FileProvider. Settings grants temporary read-only access
+  to one archive after its final privacy check. An intentional share remains readable by its
+  recipient while Appine is backgrounded; raw retention files and rootfs are not provider roots.
+  `Diagnostics.export(forSave = true)` instead uses `cache/diagnostic-saves`, outside the provider
+  root and share pruning. Each pending picker/transfer owns its ZIP; cancellation, owner destruction
+  while pending, or completed transfer deletes it. `install` attempts to delete save orphans from
+  the previous process. Settings authenticates and prepares before opening SAF, then consumes
+  the pending reference once to copy only that ZIP to the selected document on a separate thread.
 - With privacy enabled, all notification title/body details are replaced by generic text, including ongoing start errors/download progress. Enabling removes old non-ongoing notifications and refreshes the ongoing one; tab numbers and action labels remain. The `Privacy` mode-change listener refreshes service/UI settings.
 - Exit all, cancel download and running-policy actions always target `TerminalService`, including while locked. Report-copy actions target non-exported `Notifications.ReportReceiver` normally and non-exported `NotificationActivity` during privacy mode; only the latter opens the authentication page. Both copy directly without starting the kernel, and all copy paths (including legacy service intents) check `Privacy.locked` at delivery. Reports are not copied into notification text.
 - `Privacy` owns authenticated mode changes without requiring a service binding: enabling clears file access, revokes grants and refreshes roots; disabling restores neither access nor grants. The service also refuses enabling file access while privacy is on.
@@ -423,6 +451,9 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ## To verify
 
+- Diagnostic retention, app-only capture, archive contents and provider confinement passed API 34
+  instrumentation. Abrupt native-crash capture, real ANR/native trace attachments and vendor
+  logcat availability remain unverified; unavailable logs/traces are described in the ZIP.
 - Screen-off power consumption and reacquisition on physical devices; busy/idle lock transitions
   and notification toggling were exercised on an API 34 emulator, not across real device suspend.
 - The channel names and the ongoing notification following a language change while the service

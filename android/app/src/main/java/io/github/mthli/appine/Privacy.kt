@@ -31,6 +31,10 @@ import java.util.WeakHashMap
 /** Process-local authentication. Neither saved instance state nor preferences can unlock the UI. */
 internal object Privacy : Application.ActivityLifecycleCallbacks {
     interface Listener { fun onPrivacyUnlocked() }
+    interface ExportListener { fun onLogExportAuthorized(authorization: ExportAuthorization) }
+
+    /** Preparing and handing off an export requires the authenticated foreground run. */
+    class ExportAuthorization internal constructor(internal val generation: Int, internal val privacyEnabled: Boolean)
     private const val AUTHENTICATORS = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
 
     private val gates = mutableMapOf<Activity, Gate>()
@@ -67,6 +71,24 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
     fun requestMode(activity: FragmentActivity, enabled: Boolean) {
         gates[activity]?.authenticate(if (enabled) Purpose.ENABLE else Purpose.DISABLE)
     }
+
+    fun requestLogExport(activity: FragmentActivity) {
+        if (Settings.privacyMode(activity)) {
+            gates[activity]?.authenticate(Purpose.EXPORT_LOGS)
+        } else {
+            (activity as? ExportListener)?.onLogExportAuthorized(ExportAuthorization(epoch, false))
+        }
+    }
+
+    /** A completed external handoff may return to the shield without another automatic prompt. */
+    fun deferNextUnlock(activity: FragmentActivity) {
+        gates[activity]?.let { if (!it.resumed) it.deferUnlock = true }
+    }
+
+    /** Checked on the main thread again before granting another app access to the archive. */
+    fun canExport(context: Context, authorization: ExportAuthorization): Boolean =
+        authorization.generation == epoch && authorization.privacyEnabled == Settings.privacyMode(context) &&
+            !locked(context) && deviceAvailable(context)
 
     override fun onActivityPostCreated(activity: Activity, savedInstanceState: Bundle?) {
         if (activity is FragmentActivity) gates[activity] = Gate(activity).also { it.refresh() }
@@ -129,7 +151,7 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
         gates.values.toList().forEach { it.cover() }
     }
 
-    enum class Purpose { UNLOCK, ENABLE, DISABLE }
+    enum class Purpose { UNLOCK, ENABLE, DISABLE, EXPORT_LOGS }
 
     /** AndroidX retains the prompt across recreation; retain its purpose and generation too. */
     class Request : ViewModel() {
@@ -167,7 +189,11 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
             if (locked(activity)) cover() else if (resumed || !enabled) reveal()
         }
 
+        var deferUnlock = false
+
         fun resume() {
+            val deferred = deferUnlock
+            deferUnlock = false
             resumed = true
             complete()
             if (!deviceAvailable(activity)) {
@@ -178,7 +204,7 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
                 // Restored DialogFragments may have opened after onCreate. Cover their windows too.
                 dismissShield()
                 cover()
-                if (request.purpose == null) authenticate(Purpose.UNLOCK)
+                if (request.purpose == null && !deferred) authenticate(Purpose.UNLOCK)
             } else {
                 reveal()
             }
@@ -242,7 +268,7 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
             request.epoch = epoch
             request.succeeded = false
             prompt.authenticate(BiometricPrompt.PromptInfo.Builder()
-                .setTitle(activity.getString(R.string.settings_privacy))
+                .setTitle(activity.getString(if (purpose == Purpose.EXPORT_LOGS) R.string.settings_export_logs else R.string.settings_privacy))
                 .setSubtitle(activity.getString(R.string.privacy_authenticate))
                 .setAllowedAuthenticators(AUTHENTICATORS)
                 .build())
@@ -260,9 +286,12 @@ internal object Privacy : Application.ActivityLifecycleCallbacks {
             when (purpose) {
                 Purpose.ENABLE -> changeMode(activity, true)
                 Purpose.DISABLE -> changeMode(activity, false)
-                Purpose.UNLOCK -> Unit
+                Purpose.UNLOCK, Purpose.EXPORT_LOGS -> Unit
             }
             gates.values.toList().forEach { it.refresh() }
+            if (purpose == Purpose.EXPORT_LOGS) {
+                (activity as? ExportListener)?.onLogExportAuthorized(ExportAuthorization(epoch, true))
+            }
         }
     }
 }

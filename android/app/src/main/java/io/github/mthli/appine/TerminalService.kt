@@ -649,6 +649,7 @@ class TerminalService : Service() {
      */
     private fun startFailed(distro: Rootfs.Distro?, e: Throwable) {
         Log.e(TAG, "cannot start", e)
+        Diagnostics.record("Cannot start:\n${Log.getStackTraceString(e)}")
         val error = e.message ?: e.toString()
         if (distro != null && distro != Rootfs.Distro.ALPINE && !Rootfs.isReady(this)) {
             // The import failed while switching to another distro (the download was already

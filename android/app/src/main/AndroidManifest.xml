@@ -73,6 +73,17 @@
                 android:exported="false"
                 />
 
+        <provider
+                android:name=".DiagnosticProvider"
+                android:authorities="${applicationId}.diagnostics"
+                android:grantUriPermissions="true"
+                android:exported="false">
+            <meta-data
+                    android:name="android.support.FILE_PROVIDER_PATHS"
+                    android:resource="@xml/diagnostic_paths"
+                    />
+        </provider>
+
         <!-- The android/documents map: opt-in access to the home and whole system (read-only outside
              the home); only the system (the file picker, which holds MANAGE_DOCUMENTS) has direct access,
              other apps go through grants the user picks there -->

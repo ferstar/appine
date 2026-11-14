@@ -79,6 +79,29 @@ class PrivacyTest {
     }
 
     @Test
+    fun deferringTheReturnPromptDoesNotUnlockThePage() {
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val privacy = Settings.privacyMode(context)
+        prefs.edit(commit = true) { putBoolean("privacy_mode", false) }
+        try {
+            ActivityScenario.launch<LicensesActivity>(Intent(context, LicensesActivity::class.java)).use { scenario ->
+                scenario.onActivity { prefs.edit(commit = true) { putBoolean("privacy_mode", true) } }
+                scenario.moveToState(Lifecycle.State.CREATED)
+                scenario.onActivity { Privacy.deferNextUnlock(it) }
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                scenario.onActivity { activity ->
+                    assertTrue(Privacy.locked(activity))
+                    assertEquals(View.INVISIBLE, activity.findViewById<View>(android.R.id.content).visibility)
+                    assertTrue(activity.window.attributes.flags and FLAG_SECURE != 0)
+                    assertFalse(Privacy.canExport(activity, Privacy.ExportAuthorization(-1, true)))
+                }
+            }
+        } finally {
+            prefs.edit(commit = true) { putBoolean("privacy_mode", privacy) }
+        }
+    }
+
+    @Test
     fun pausedPagesStayVisibleUntilTheLastPageStops() {
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
         val privacy = Settings.privacyMode(context)

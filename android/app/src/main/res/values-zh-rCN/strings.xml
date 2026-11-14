@@ -81,6 +81,16 @@
     <string name="settings_group_android">Android</string>
     <string name="settings_group_terminal">终端</string>
     <string name="settings_group_debug">调试</string>
+    <string name="settings_export_logs">导出诊断日志</string>
+    <string name="export_logs_summary">保存或分享近期日志和设备信息，帮助排查问题</string>
+    <string name="export_logs_save">保存到文件</string>
+    <string name="export_logs_share">分享</string>
+    <string name="export_logs_saving">正在保存诊断日志…</string>
+    <string name="export_logs_saved">诊断日志已保存</string>
+    <string name="export_logs_no_picker">没有可用于选择保存位置的应用</string>
+    <string name="export_logs_preparing">正在准备诊断日志…</string>
+    <string name="export_logs_failed">无法导出日志，请检查可用存储空间后重试</string>
+    <string name="export_logs_no_app">没有可用于分享日志的应用</string>
     <string name="settings_group_about">关于</string>
     <string name="settings_distro">发行版</string>
     <string name="settings_reset">重置 rootfs</string>

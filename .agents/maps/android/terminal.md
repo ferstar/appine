@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: pausing no longer shows the privacy shield; the last activity stop or screen-off still locks it)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: archive-scoped save continuation and a locked return from the document picker)
 
 ## Responsibilities
 
@@ -109,6 +109,18 @@ notice assets and the build (`android/native`).
 
 ### Privacy
 
+- `Privacy.requestLogExport` always requests a fresh `EXPORT_LOGS` authentication when privacy
+  is enabled, even if the page was already unlocked. Only success on a resumed, available
+  device with the matching epoch delivers `ExportAuthorization` to `ExportListener`.
+  Settings checks that epoch, the current privacy setting and foreground/device availability
+  before generation and again before sharing or handing a prepared save to the document picker.
+  Save's process-local pending file reference authorizes only that archive's transfer when the
+  picker returns, even though the page locks while backgrounded; it cannot generate another ZIP.
+  Its result may call `deferNextUnlock`: while the gate is paused this suppresses automatic unlock
+  on its next resume without revealing protected content. This flag does not survive gate recreation.
+  Ordinary page unlock never starts an export. Authentication purpose survives configuration
+  recreation in the existing ViewModel, not process death. Cancellation, failure or screen-off
+  invalidation before the handoff cannot export; an intentional handoff may complete while locked.
 - `MainApplication` (`android/native`) installs `Privacy` on every FragmentActivity, including Settings, licenses and the non-exported `NotificationActivity`. Default-off `privacy_mode` accepts AndroidX Biometric 1.1.0 strong biometrics or device credentials; enabling and disabling both authenticate, enabling after a confirmation.
 - Authentication lives only in memory. The last stopped activity locks and covers pages unless recreating; overlapping internal navigation preserves it. Screen-off invalidates pending authentication and locks immediately. Pausing alone leaves visible content in place; resumed locked pages authenticate or offer Unlock/Leave after cancellation or unavailability.
 - Each activity's ViewModel retains the prompt's purpose/generation through recreation, never through process death. Successful callbacks complete only when resumed with an interactive, unlocked device; report-copy/clipboard/input checks also refuse access while no page is resumed.
@@ -523,6 +535,9 @@ none
 
 ## To verify
 
+- Fresh diagnostic-export credential authentication, cancellation, wrong PIN and screen-off
+  invalidation were checked on API 34; ordinary unlock did not replay an export. Real biometric
+  hardware and vendor prompt behavior remain unverified.
 - Privacy credential enable/disable, background return, cancellation/retry, screen-off on Settings and notification actions were checked on API 34; cold/recreated locked pages and dialog flags have instrumentation coverage. Real biometrics, concurrent windows and vendor authentication/window behavior remain unverified.
 - Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
   checked on API 34; a complete Codex OAuth login and its callback remain unverified.
