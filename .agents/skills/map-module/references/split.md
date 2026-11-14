@@ -3,7 +3,7 @@
 Split one module into a narrower parent and one or more child modules when the user asks, for
 example because its map is too large to read conveniently. A split moves verified facts and the
 boundary that owns them; it does not research the subsystem again. Do the work locally; use
-explorers only when a child needs its own full mapping.
+research and verification subagents only when a child needs its own full mapping.
 
 ## Contents
 

@@ -26,8 +26,8 @@ See `README.md` for development commands and `android/README.md` for Android-spe
 
 ### After finishing a task
 
-- If implementation changes invalidate an existing module map, refresh it against the source: targeted refresh when the impact is bounded, otherwise full refresh. Use the `map-module` skill when available, with `.agents/maps/` as the destination; otherwise perform the same verification directly. If verification cannot be completed, report the map as stale.
-- When preparing a commit, fill `MODULE`, `WHY`, `ALTERNATIVES`, `CHOSEN`, `TRADEOFFS`, and `RISKS` in each Decision block; add `SUPERSEDES` when replacing a prior Decision. This format does not require a tool-specific command and does not by itself request a commit.
+- If implementation changes invalidate an existing module map, use the `map-module` skill: targeted refresh when the impact is bounded, otherwise full refresh. If unavailable, report the map as stale.
+- In every Decision block created by the `commit-context` skill, fill `MODULE`, `WHY`, `ALTERNATIVES`, `CHOSEN`, `TRADEOFFS`, and `RISKS`; add `SUPERSEDES` when replacing a prior Decision.
 
 ### Records
 

@@ -1,6 +1,6 @@
 ---
 name: commit-context
-description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use only when the user explicitly requests the commit-context skill by name or selects it through the host's skill invocation mechanism. Do not select it from a generic request to create a commit.
+description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use only when the user explicitly requests the commit-context skill by name. Do not select it from a generic request to create a commit.
 ---
 
 # Commit Context

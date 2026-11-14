@@ -1,6 +1,6 @@
 ---
 name: distill-module
-description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.agents/decisions/`. Use only when the user explicitly requests the distill-module skill by name or selects it through the host's skill invocation mechanism. Do not select it from a generic request to summarize module decisions."
+description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.agents/decisions/`. Use only when the user explicitly requests the distill-module skill by name. Do not select it from a generic request to summarize module decisions."
 ---
 
 # Distill Module

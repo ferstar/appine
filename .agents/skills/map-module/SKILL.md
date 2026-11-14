@@ -1,7 +1,7 @@
 ---
 name: map-module
 description: |
-  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly requests the map-module skill, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only explorer subagents for research and verification.
+  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly requests the map-module skill, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only subagent research and verification.
 ---
 
 # Map Module
@@ -42,15 +42,14 @@ report contracts and final map template. Read `references/split.md` before split
 ## Ownership and collaboration
 
 - Keep synthesis, verdict judgment, file edits, module registration, and the final response in the
-  root agent.
-- Use `explorer` subagents only for read-only code research and verification. Full mapping uses the
-  research and verification waves below. A bounded targeted refresh may be verified locally; use
-  explorers when the affected flow crosses concerns or repositories. Tell every explorer not to
+  coordinating agent.
+- Use subagents only for read-only code research and verification. Full mapping uses the
+  research and verification phases below. A bounded targeted refresh may be verified locally; use
+  subagents when the affected flow crosses concerns or repositories. Tell every subagent not to
   edit files.
-- Respect the available concurrency limit. Keep one slot for the root agent, run explorers in
-  waves, and reuse an explorer with `followup_task` only for a related concern.
-- Make verification independent: do not let an explorer verify its own research concern. Prefer
-  fresh explorers; if capacity is constrained, cross-assign unrelated claims.
+- Schedule subagent tasks within the available capacity. Reuse an existing research subagent only
+  for a related concern.
+- Make verification independent: a subagent must not verify its own research concern.
 - Before mapping multiple modules or a very large subsystem, state the expected concern and
   verification counts so the cost is visible.
 
@@ -123,10 +122,10 @@ are met.
 
 ## Phase 1: Full research
 
-1. Dispatch one explorer per concern, in bounded waves, using the reader task contract.
+1. Assign one research subagent per concern using the research task contract.
 2. Require first-hand source inspection and evidence as repository-relative `path:line` in the
    research report. Evidence is for synthesis confidence and must not enter the final map.
-3. Collect every report. If a reader fails, cover the gap locally or mark the concern for
+3. Collect every report. If a research subagent fails, cover the gap locally or mark the concern for
    extra first-hand verification; never synthesize a failed concern as established fact.
 4. Synthesize a baseline map using the final map template. Merge overlaps, distinguish public
    names from class or package names, and place uncertainty only under `Open questions` or
@@ -141,11 +140,11 @@ are met.
    - routing, error codes, defaults, feature gates, and implementation differences;
    - invariants, suspected bugs, and all inferred or unverified assertions.
 2. Use 8–10 claims for a small subsystem, 12–15 for a medium subsystem, and at least 15 for a
-   large subsystem. Weight failed-reader and state-machine concerns more heavily.
-3. Group claims into independent verifier assignments by concern and dispatch bounded explorer
-   waves using the verifier task contract. Require one verdict per claim and fresh source reads.
+   large subsystem. Weight failed research assignments and state-machine concerns more heavily.
+3. Group claims by concern and assign them to independent verification subagents using the
+   verification task contract. Require one verdict per claim and fresh source reads.
 4. Judge the returned evidence yourself. Treat low-confidence or unsupported verdicts as
-   unresolved even if an explorer labels them confirmed.
+   unresolved even if a verification subagent labels them confirmed.
 
 ## Phase 3: Full patch
 
@@ -192,8 +191,8 @@ text. For large section rewrites, anchor on unique headings and stop if the targ
 
 ## Failure handling
 
-- If all readers fail, stop before writing a map and report the research blocker.
-- If one reader fails, recover through local inspection or extra verifier coverage and disclose
+- If all research subagents fail, stop before writing a map and report the research blocker.
+- If one research subagent fails, recover through local inspection or extra verification coverage and disclose
   any remaining gap.
 - If dependency source cannot be found, record what source is missing; do not guess or mark it
   confirmed.

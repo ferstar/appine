@@ -1,17 +1,17 @@
 # Map Module Report Contracts
 
-Use these contracts in explorer tasks. Keep evidence in task reports; remove all `path:line`
+Use these contracts in research and verification tasks. Keep evidence in task reports; remove all `path:line`
 citations from the final map.
 
 ## Contents
 
-- Reader task
-- Verifier task
+- Research task
+- Verification task
 - Final map template
 
-## Reader task
+## Research task
 
-Provide the explorer with:
+Provide the research subagent with:
 
 - module id and repository-relative root;
 - one concern key and a focused list of classes, methods, states, or flows;
@@ -53,14 +53,14 @@ Require this report:
 - `<repo-relative-path>:<line>` — <what this proves>
 ```
 
-Ask the explorer to ground every factual claim in evidence, distinguish direct facts from
+Ask the research subagent to ground every factual claim in evidence, distinguish direct facts from
 inference, search only relevant slices of god-files, and return `none` for empty sections.
 
-## Verifier task
+## Verification task
 
-Provide numbered claims with a verification hint. Tell the explorer to reopen source, default to
-skepticism, inspect any external dependency source supplied in the shared context, and return one
-item per claim:
+Provide numbered claims with a verification hint. Tell the verification subagent to reopen source,
+default to skepticism, inspect any external dependency source supplied in the shared context, and
+return one item per claim:
 
 ```markdown
 ### <claim-id>
