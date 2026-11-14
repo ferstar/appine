@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/net"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D8 were seeded by hand from the retired design doc
 > §10 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -41,7 +41,7 @@
 - **Why**: Going through the system resolver makes Android's Private DNS, VPNs and per-network routing apply to the guest; failing fast with SERVFAIL stops resolvers from waiting for their timeouts.
 - **Tradeoffs**: Each admitted query starts a host thread, answers can arrive out of order, overload drops queries for resolver timeout, payload lengths approximate skb accounting, and TCP/container DNS is not intercepted.
 - **Watch out**: Preserve edited resolv.conf files, keep worker threads independent of kernel lifetime, and leave raw/ping traffic to the host rather than the DNS stub.
-- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`); fe4bb2b; 73127176
+- **Source**: rounds 06 (`06-m4`), 07 (`07-m5`); fe4bb2b; 73127176; 20137e4c
 
 ### D6: Low ports first try the real port, then fixed offsets, hidden from the guest
 - **What**: Binding a port below 1024 tries the port itself on the host, then +10000, +20000, +30000, then a host-chosen port; the guest always sees its own port, and the app is told about the first non-loopback listen.
@@ -69,7 +69,7 @@
 - **Why**: The retired design doc's §10 rows for sockets, ICMP, netlink, routes, DNS, low ports and counters had drifted and omitted their limits, and by 2026-11-11 more than half the map postdated its verification and its full refresh reached 48.8 KB, near one Read, with netlink a subsystem of its own.
 - **Tradeoffs**: The map's Linux comparisons come from knowledge of the kernel sources, socket dispatch, the changing ioctls and route messages read two maps, and decisions on netlink sockets made before the split keep their kernel/net tags here (D3, D24, D26 and the netlink halves of D19 and D23, listed in kernel/netlink's preamble).
 - **Watch out**: Changing socket ioctls must run between kernel/netlink's `rtnl_watched` and `rtnl_notify` (a map invariant), and bugs open in the map include an error after part of a `MSG_WAITALL` read being lost, option passthrough with host semantics, one echo id per raw ICMP socket, raw ICMP sockets that cannot be rebound or woken by a read shutdown, odd sendto destinations reaching the host unchecked and the host's counters in a new namespace's loopback statistics.
-- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split); 52dcc177; 211a5867
+- **Source**: c3df5d3 (bug list since updated by 58ce3df, 4e64e74, ce8a9ce, 5d23297, 5d7b936 and 7a13dd2); 0c1b416 (full refresh and the netlink split); 52dcc177; 211a5867; 20137e4c
 
 ### D10: Socket timeouts of KTIME_MAX or more mean none
 - **What**: An `SO_RCVTIMEO` or `SO_SNDTIMEO` of at least KTIME_MAX means no timeout and reads back as 0, like Linux's `MAX_SCHEDULE_TIMEOUT`.
@@ -97,14 +97,14 @@
 - **Why**: Linux's `sock_read_iter`/`sock_write_iter` make each call one recvmsg or sendmsg, while Appine wrote 64 KiB chunks per iovec and capped reads at 64 KiB.
 - **Tradeoffs**: Messages and direct send/sendto calls remain capped at 1 MiB, while stream write can span pieces; AF_UNIX shares the partial-write rule.
 - **Watch out**: A blocking stream write of many MiB now goes in 1 MiB sends, which shows only in partial progress under signals.
-- **Source**: b295644; 211a5867
+- **Source**: b295644; 211a5867; 20137e4c
 
 ### D14: MSG_WAITALL waits for the whole length on TCP
 - **What**: recv keeps reading and waiting between pieces until it has the length or meets nonblocking, a timeout, a signal, end of file or a host error, a peek re-reads from the head with the host's `SO_RCVLOWAT` raised for the wait, and recvfrom and recvmsg continue past 1 MiB piece by piece; MSG_TRUNC keeps the received length without copying payload, including continued MSG_WAITALL reads.
 - **Why**: Fixed-size readers using MSG_WAITALL got short reads, and `MSG_PEEK|MSG_WAITALL` returned corrupted data, once data arrived in more than one piece.
 - **Tradeoffs**: An error after a partial read is lost (the host already took it), a peek against a buffer that can never hold the length returns the part where Linux blocks, and AF_UNIX is not covered.
 - **Watch out**: Another thread polling the socket sees the raised `SO_RCVLOWAT` while a peek waits, and a fault on a later piece loses that piece's data.
-- **Source**: 58ce3df; 211a5867
+- **Source**: 58ce3df; 211a5867; 20137e4c
 
 ### D15: recvmsg and sendmsg check iovecs in `import_iovec`'s order
 - **What**: A negative length is `EINVAL`, an iovec reaching past 2^48 (arm64's `TASK_SIZE_MAX`) is `EFAULT`, and the total is cut to `MAX_RW_COUNT` by shortening the iovec that reaches it.
@@ -146,7 +146,7 @@
 - **Why**: accept4 installed the fd before writing the address and took a connection before finding no free fd, accepted sockets lost the listener's timeouts, and the lenient parser let a negative timeout block forever.
 - **Tradeoffs**: A supplied address with a NULL length is EFAULT, including recvfrom after consuming data, and a kernel panic between reserve and fill can leave a reservation until the process ends.
 - **Watch out**: Other wait-then-install paths still choose slots without reserving them; preserve the existing short-timeout EINVAL, invalid-microseconds EDOM and negative-seconds-as-zero rules.
-- **Source**: 5d23297; 4e01f78b
+- **Source**: 5d23297; 4e01f78b; 20137e4c
 
 ### D21: A refused blocking connect leaves the host socket ready for another connect
 - **What**: When a blocking connect fails, the failure branch connects the host socket once more and ignores the answer (`ECONNABORTED`, nothing sent).
@@ -195,7 +195,7 @@
 - **Why**: SO_GET_FILTER’s instruction count must not be treated as bytes, and newer hosts’ TCP attachment refusal otherwise breaks Docker’s published-port setup.
 - **Tradeoffs**: Retained TCP programs filter no traffic, attachment adds host checks and possibly a scratch socket, and netlink/AF_UNIX filter behavior remains limited.
 - **Watch out**: SO_LOCK_FILTER relies on host state, count-based copies remain bounded to 4096 instructions, and test hook 14 is needed to force host refusal on accepting hosts.
-- **Source**: c65da9d (recorded in 0c1b416); 52dcc177
+- **Source**: c65da9d (recorded in 0c1b416); 52dcc177; 20137e4c
 
 ### D28: Legacy route ioctls translate into namespace route requests
 
@@ -203,7 +203,7 @@
 - **Why**: BusyBox and net-tools route use these ioctls rather than rtnetlink.
 - **Tradeoffs**: Only virtual-device routes change, unreachable and IPv6 source routes are refused, and MTU/window/IRTT flags are ignored.
 - **Watch out**: Structure offsets are arm64-specific, and IPv4 unicast classification approximates the local table from interface addresses.
-- **Source**: 29e59fd3
+- **Source**: 29e59fd3; 20137e4c
 
 ## Superseded
 

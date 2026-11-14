@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/process"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D13 were seeded by hand from the retired design
+> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D13 were seeded by hand from the retired design
 > doc §6 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -78,12 +78,12 @@
 - **Watch out**: The fast path caches the offsets and must be invalidated on namespace entry, and a new way to enter a time namespace must patch the vDSO too.
 - **Source**: round 162 (`162-time-namespaces`); 16364c0
 
-### D14: kernel/process covers processes, threads, dispatch, the BKL and timers; execve, namespaces and futexes are modules of their own
-- **What**: kernel/process covers tasks, syscall dispatch, the BKL with its watchdog and fast path, kernel bugs that end one process and their kill reports, waits, timers and the timer thread, and PID 1, leaving execve and the ELF loader to kernel/exec, namespaces to kernel/ns, futexes to kernel/futex, mount trees to kernel/mount, network namespaces to kernel/netns and credentials to kernel/cred.
-- **Why**: The retired design doc's §6 was the only current-state description of processes, threads and scheduling and had drifted from the source, and by 2026-11-11 the map (65.5 KB) could not be read in one Read while execve, namespaces and futexes have files of their own and are mostly changed alone.
-- **Tradeoffs**: The timer thread stays as the hub of every periodic check, clone still creates namespaces and exit still hands on PI locks and robust lists so those changes read two maps, the boundaries inside `syscall/proc.rs`, `syscall/misc.rs` and `syscall/fast.rs` exist only in the registry's wording, and decisions made before the split keep their kernel/process tags here (listed in the kernel/exec, kernel/ns, kernel/futex and kernel/overlay preambles).
-- **Watch out**: Bugs still open in the map include `sched_setattr` changing the policy before the nice check, an exited main thread's CPU clock being gone at once (D54) and wake-up matching during the BKL release running outside `bug::catch`.
-- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54)
+### D14: kernel/process owns task execution, dispatch, the BKL, waits and accounting
+- **What**: kernel/process keeps tasks, dispatch, the BKL and watchdog, fast paths, waits, accounting and diagnostics; time and periodic checks belong to kernel/time, machine lifecycle and PID 1 to kernel/boot, with the existing exec, namespace, futex and credential boundaries retained.
+- **Why**: The process map still mixed task execution with independently maintained timers and boot policy after its earlier splits.
+- **Tradeoffs**: Shared-file boundaries remain explicit in the registry, cross-boundary changes require several maps, and earlier decisions keep their parent tags and IDs.
+- **Watch out**: Preserve fast_sleep deadline handover, BKL charging and vfork freezer accounting; sched_setattr still changes policy before validating nice and BKL-release wake-up matching still runs outside bug::catch, while the exited-leader CPU-clock debt is inherited by kernel/time.
+- **Source**: dd6c288, d2b1dc3, b320f8e (bug list since updated by 1459292, 4e64e74, ce8a9ce and d9e1f0c, and shortened by D29, D30, D32, D43, D44, D52, D53 and D54); cf029f9a, 8a17e4a9
 
 ### D18: Process files read in the order their code runs
 - **What**: kernel.rs runs global state, the BKL and the syscall context before waiting and waking; syscall/proc.rs follows the module docs from clone and execve through exit and reaping to pidfds, unshare and sessions; `impl Machine` follows a machine's life; syscall/mod.rs puts dispatch first and the shared argument helpers last; the other files move single helpers after their callers, bug.rs and debug.rs included (the registry now puts debug.rs in kernel/signal).
@@ -168,7 +168,7 @@
 - **Why**: The retained TCP-filter path needs deterministic coverage on hosts that accept filters.
 - **Tradeoffs**: The hook persists until explicitly disabled.
 - **Watch out**: Tests must turn it off before later sockets in the same run.
-- **Source**: 52dcc177
+- **Source**: 52dcc177; 20137e4c
 
 ### D57: Guest CPU samples combine live and exited threads
 
@@ -176,7 +176,7 @@
 - **Why**: The screen-off policy needs guest activity without counting the UI or host polling.
 - **Tradeoffs**: Each sample takes the BKL and visits the live threads.
 - **Watch out**: An exit-stage panic can skip CPU credit, so consumers must compare changes rather than assume monotonicity.
-- **Source**: 1e5de64e
+- **Source**: 1e5de64e; 20137e4c
 
 ## Superseded
 
@@ -185,3 +185,4 @@
 - ~~bug.rs, debug.rs and syscall/mod.rs are filed in kernel/process though the registry does not list them (D18 in part, 0758e3c)~~ → replaced by **D14** in d2b1dc3 (2026-11-10)
 - ~~The futex handler re-reads the timeout of an interrupted wait, and only relative deadlines are handed over (9593bae's tradeoff)~~ → replaced by **D52** in 27609fe (2026-11-10, no SUPERSEDES declared)
 - ~~kernel/process also covers execve and the ELF loader, futexes and namespaces (D14, dd6c288, d2b1dc3)~~ → replaced by **D14** in b320f8e (2026-11-11)
+- ~~D14 ownership of timers, periodic checks and PID 1~~ → replaced by **D14** in 8a17e4a9 (2026-11-14)

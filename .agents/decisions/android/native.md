@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: android/native"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D4 were seeded by hand from the retired design
+> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D4 were seeded by hand from the retired design
 > doc §11 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -32,29 +32,29 @@
 - **What**: `scripts/release-sources` bundles Appine at clean HEAD, vendored crates, aports/checksum-verified upstream sources for GPL origins found in the rootfs and bundled APK metadata, and libghostty-vt’s published source/dependency tarballs without evaluating downloaded build code.
 - **Why**: Under GPLv3/AGPLv3 the APK must come with the complete corresponding source, including statically linked crates, and the bundled busybox, apk-tools and other GPL packages need their sources too; evaluating an APKBUILD's `source=` would mean running downloaded shell code, so the files are found through its `sha512sums` instead.
 - **Tradeoffs**: Whether the repository is published or a written offer accompanies the APK is still the user's decision.
-- **Watch out**: Gradle chooses the newest fetched artifacts while release-sources follows fetch-rootfs pins, so stale local packages can mismatch the archive; fixed aports assumptions and whole-workspace vendoring remain recorded gaps, and the full archive was not generated for the procps addition.
-- **Source**: rounds 192 (`192-license`), 200 (`200-release-sources`); b38d29c; d9e1f0c (gaps recorded); 172be7c; 7aa817af; 410ef192
+- **Watch out**: Gradle chooses the newest fetched artifacts while release-sources follows fetch-rootfs pins, so stale local packages can mismatch the archive; fixed aports assumptions and whole-workspace vendoring remain recorded gaps, and the full archive was not generated for the procps or bubblewrap additions.
+- **Source**: rounds 192 (`192-license`), 200 (`200-release-sources`); b38d29c; d9e1f0c (gaps recorded); 172be7c; 7aa817af; 410ef192; 20137e4c; 0815b3e4
 
 ### D5: The JNI bridge, the build and release packaging are one module
-- **What**: android/native holds `hosts/android` (except the vt.c/vt.rs terminal shim), `Native.kt`, the Gradle files, the manifest, the debug and instrumentation-test sources, `android/licenses` and the `fetch-ghostty` and `release-sources` scripts.
+- **What**: android/native holds `hosts/android` (except the vt.c/vt.rs terminal shim), `Native.kt`, `MainApplication.kt`, the Gradle files, the manifest, the debug and instrumentation-test sources, `android/licenses`, static `assets/notices` and the `fetch-ghostty` and `release-sources` scripts.
 - **Why**: JNI, Gradle and the manifest had no map (§11 only touched on them), and `scripts/release-sources` fit neither harness nor android/setup, since it packages the sources the APK release must ship.
-- **Tradeoffs**: `MachineTest` exercises every android module but is filed here; the module grew from the bridge and build to release packaging.
+- **Tradeoffs**: `MachineTest` exercises every android module but is filed here; the module grew from the bridge and build to release packaging, with UI ownership in android/licenses/android/privacy, fonts in android/vtrender, the terminal shim in android/vtcore and kernel boot in kernel/boot.
 - **Watch out**: The full refresh d9e1f0c recorded open debts: the release build is signed with the debug key and unminified, lib.rs's array loops never delete local references, and the release source bundles have gaps (D4) that matter for AGPL compliance once the APK ships; both risks recorded at the first mapping are fixed (D1, D15).
-- **Source**: 12c4afa, 16ac7a2; d9e1f0c (bug list); ef7a803 (versionName 1.0.0, unrecorded); 67d40c70 (version correction)
+- **Source**: 12c4afa, 16ac7a2; d9e1f0c (bug list); ef7a803 (versionName 1.0.0, unrecorded); 67d40c70 (version correction); f61072f3; bd580227; 9c6c51a7; 9015b244, 8a17e4a9, 81f60bef
 
 ### D6: libghostty-vt 1.0.0 is built offline with Zig into every Android library and shipped with its notices and sources
 - **What**: `scripts/fetch-ghostty` downloads libghostty-vt-1.0.0.tar.gz and its `-deps` tarball with pinned sha256s and runs no Zig; for Android targets build.rs runs `zig build -Demit-lib-vt -Dcpu=baseline -Doptimize=ReleaseFast --system <src>-deps` (Zig 0.17.0) with a global cache of its own in the source (`.zig-global-cache`), adds the Wuffs C directory found by pkg/wuffs's `build.zig.zon` hash to vt.c's include path, and links libghostty-vt.a, vt.c and the system's libjnigraphics into libappine.so; the notices list libghostty-vt 1.0.0, uucode (with the Unicode and Hoehrmann licences), simdutf, Highway, Wuffs, translate-c 2.0.0, Zig's compiler_rt and JetBrains Mono from copies in `android/licenses`.
 - **Why**: libghostty-vt (android/terminal D5) now ships as its own release with a stable C ABI, a signed source tarball and a dependency tarball for offline builds, while the app had built it from the whole Ghostty 1.4.0 release with packages gathered by the build's configure phase; it has to end up in libappine.so with the notices and released sources (D4) covering it, and vt.c decodes Kitty PNGs with the linked Wuffs and copies pixels into Android bitmaps.
 - **Tradeoffs**: Every Android build needs Zig 0.17.0, and the first build after an upgrade compiles Zig's own artifacts into the new cache (about 2 min); only sha256s are checked, the signatures by hand; an `APPINE_GHOSTTY_SRC` must be writable; the build relies on Ghostty's internal Wuffs package name, the deps tarball's layout and `wuffs-v0.4.c`; licence copies and versions are kept by hand.
 - **Watch out**: A global cache that ever held a package archive (such as `~/.cache/zig`) makes Zig 0.17 panic with "reached unreachable code", so the build must keep its own; an upgrade can change the C API silently, need a newer Zig or add linked components the notices miss (list libghostty-vt.a's objects again); build.rs reruns only on vt.c, the source's `LIB_VERSION` and `build.zig.zon` and its environment variables, not when pkg/wuffs's `.zon` changes; the notices test now expects libghostty-vt and translate-c titles, while shared app state or stale emulator stores can still break login tests.
-- **Source**: 394aecf, b38d29c, 8811c32, 172be7c; a1367531
+- **Source**: 394aecf, b38d29c, 8811c32, 172be7c; a1367531; 20137e4c
 
-### D7: Material Components is a direct dependency, with its licences allow-listed
-- **What**: `com.google.android.material:material:1.14.0` is declared in the version catalog (`android/gradle/libs.versions.toml`, D20) like androidx.core, and NoticesTask's Apache groups gain `com.google.android.material` and `com.google.errorprone:error_prone_annotations`, both POMs checked.
-- **Why**: The Material 3 restyle needs Material Components on the classpath, and NoticesTask fails the build for any Android library outside the groups known to be Apache-2.0.
-- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout are used but arrive only through Material (noted only in the map since the catalog), and versions are still bumped by hand.
-- **Watch out**: A Material upgrade can bring a library outside the known groups, which stops the build until its licence is checked (as intended), and the APK's growth was not measured.
-- **Source**: 55be399; ef7a803 (catalog)
+### D7: Material Components remains a direct catalog dependency
+- **What**: com.google.android.material:material:1.14.0 stays in the version catalog, while its license and transitive attributions are maintained in static notices (D24).
+- **Why**: Material 3 controls require a direct dependency and matching packaged attribution.
+- **Tradeoffs**: AppCompat, androidx.activity and CoordinatorLayout arrive transitively, and versions and notices require manual maintenance.
+- **Watch out**: Dependency upgrades no longer trigger a license allow-list failure, so resolved components must be reviewed explicitly.
+- **Source**: 55be399; ef7a803 (catalog); bd580227
 
 ### D8: Instrumentation tests cover oversized downloads, homeless accounts and repeated reads of saved tabs
 - **What**: `downloadsAreVerified` expects a download one byte past its pinned length to fail with no partial file, `documentsWithoutAHomeDirectory` checks the roots and refused writes for a home of `/` and a missing home, and the saved-tabs test (its tabs built without names since 7c35183) reads the same tabs twice before the kernel is up and expects one content-named transcript per saved tab.
@@ -84,26 +84,26 @@
 - **Watch out**: None known; since D15 a panic in any JNI function returns a failure value instead of aborting the app.
 - **Source**: 09188ec
 
-### D12: Builds package independent offline Alpine bundles with metadata-derived notices
-- **What**: Version ordering selects fetched rootfs/packages, with four bash and seven procps bundle files required, ncurses assets kept in both independent bundles but counted once in notices, and bundled package metadata feeding notices and release-source origins.
-- **Why**: Offline login installation needs complete dependencies and packaging that tracks their notices and sources.
-- **Tradeoffs**: Bash adds about 0.86 MB and procps about 0.62 MB compressed, accepting duplicate ncurses assets to avoid shell-dependent installation.
-- **Watch out**: Gradle’s newest-artifact selection can differ from release pins; preserve failed-install, concurrent/offline, bash-independence and user-removal tests, and 16 KB-page coverage remains absent.
-- **Source**: b014e84; 7aa817af; 410ef192
+### D12: Builds package independent offline Alpine bundles
+- **What**: Version ordering selects fetched artifacts, requiring four bash, seven procps and two bubblewrap/libcap2 assets in independent bundles, with shared ncurses payloads duplicated but attribution counted once and package metadata still driving release-source discovery.
+- **Why**: Each offline login bundle needs complete dependencies independent of the selected shell or other installers.
+- **Tradeoffs**: Bash adds about 0.86 MB, procps about 0.62 MB and bubblewrap/libcap2 53,886 compressed bytes, while notices are now updated manually.
+- **Watch out**: Newest fetched artifacts can differ from release pins; preserve failure/retry, concurrent offline login, independent-install, user-removal and sandbox tests, with full source-archive and 16 KB-page validation still outstanding.
+- **Source**: b014e84; 7aa817af; 410ef192; 20137e4c; bd580227, 0815b3e4
 
 ### D13: Fuchsia Starnix's licence ships with the app
-- **What**: `android/licenses/fuchsia-LICENSE` (identical to Fuchsia's LICENSE at 86962cb and to the copy in `tests/diff/line-discipline`) backs a "Fuchsia Starnix line discipline" entry right after Appine's own in NoticesTask, checked by `MachineTest.noticesCoverTheApp`.
+- **What**: The Fuchsia Starnix line-discipline entry in the static catalog is backed by the upstream reference license in android/licenses and checked by isolated LicenseTest coverage.
 - **Why**: libappine.so contains line-discipline code adapted from Starnix, and its BSD licence requires the notice in the materials shipped with the binary.
-- **Tradeoffs**: The repository holds two identical copies of Fuchsia's LICENSE, and the entry's commit and years are written by hand.
-- **Watch out**: Changing the Starnix-derived code or tty.rs's notice needs the Gradle entry changed with it.
-- **Source**: f2d3264
+- **Tradeoffs**: The repository retains duplicate reference license copies and manually maintained attribution.
+- **Watch out**: Changes to Starnix-derived code or tty.rs attribution require updating the static notice, not a removed Gradle generator.
+- **Source**: f2d3264; bd580227
 
 ### D14: The notices and tests name the app Appine
-- **What**: NoticesTask's first entry is titled "Appine", with the notice's heading and its "Appine's source code" sentences capitalised and the file still `appine.txt`, and MachineTest expects "Welcome to Appine" and looks the notice up by "Appine".
+- **What**: The static Appine notice and catalog use the capitalized product name, and instrumentation still expects Welcome to Appine and looks up the Appine component.
 - **Why**: The licence screen listed the app as "appine", and its AGPL notice began with the lowercase name.
-- **Tradeoffs**: The asset's file name and the build's comments keep the lowercase name.
-- **Watch out**: The instrumentation tests were compiled but not run on an emulator after the rename.
-- **Source**: 3f04bf5 (with android/terminal D28)
+- **Tradeoffs**: Asset identifiers and paths remain lowercase.
+- **Watch out**: New static documents must preserve product-name capitalization and matching catalog lookup IDs.
+- **Source**: 3f04bf5 (with android/terminal D28); bd580227
 
 ### D15: Every JNI function catches panics
 - **What**: `guarded!(name, [throws env,] fallback, { body })` runs each JNI body in `catch_unwind` with its parameters moved in; a panic logs "internal error in <function>" after the hook's message and returns a failure value (-1 for console I/O and int results, -9 from waitFor, 0 from processes and takePower, null for objects, nothing for unit), and the 17 functions Kotlin declares `@Throws` also throw `IOException` unless an exception is pending; the `VtNative` functions use it without throwing (android/terminal D35).
@@ -138,30 +138,30 @@
 - **Why**: The marks come from guest shell code the build never runs (android/setup D20), so a regression in profile.sh would only show as a terminal that quietly stops closing at the prompt.
 - **Tradeoffs**: Tests still share app state in places, and Debian integration and lock cases need separate coverage.
 - **Watch out**: Raw-byte prompt assertions must follow profile changes, and isolated instrumentation still needs the app stopped to release its store lock.
-- **Source**: 6c5f921, 2b04a43; a809c5a8 (test refinement); 7aa817af
+- **Source**: 6c5f921, 2b04a43; a809c5a8 (test refinement); 7aa817af; 20137e4c
 
 ### D20: The app's build script stays one file, configuration first, with a libraries-only version catalog
-- **What**: `android/app/build.gradle.kts` puts its configuration (plugins, inputs, android, kotlin, dependencies, task wiring) before its task classes, finds the rootfs tarball and the doas package through `newestFetched` (D12), and gives `CargoNdkTask` and `NoticesTask` an abstract `CargoTask` base, while `android/gradle/libs.versions.toml` holds the libraries' versions and AGP's stays in `android/build.gradle.kts`.
+- **What**: The app keeps one build.gradle.kts with configuration before task classes and a libraries-only version catalog, uses newestFetched for packaged inputs and no longer registers NoticesTask or generated notice assets.
 - **Why**: The script had grown to about 600 lines with its configuration split around the task classes, and the library versions were written inline.
 - **Tradeoffs**: The script is still long, its task classes stay untestable outside a build, and AGP's version sits apart from the catalog.
-- **Watch out**: A task class in a script must not use the script's top-level members or Gradle cannot instantiate it, so code tasks share goes through a base class like `CargoTask`.
-- **Source**: ef7a803
+- **Watch out**: Task classes must not capture script-level members, and static notice maintenance now replaces build-time discovery (D24).
+- **Source**: ef7a803; bd580227
 
 ### D21: License subtitles keep license names without descriptive suffixes
 
-- **What**: NoticesTask removes middle-dot descriptions from five subtitle literals while preserving license names, qualifiers and complete detail text.
+- **What**: Static catalog summaries retain license names and qualifiers without descriptive suffixes, while the Appine notice preserves copyright, warranty and complete license text.
 - **Why**: Descriptions added unnecessary text beside the license names.
 - **Tradeoffs**: Descriptions and Appine’s source URL remain in details rather than list subtitles.
-- **Watch out**: New notices need the same editorial choice because the activity renders subtitles verbatim.
-- **Source**: d35669e1
+- **Watch out**: Catalog changes must preserve the editorial rule in both locales; reader behavior belongs to android/licenses.
+- **Source**: d35669e1; 20137e4c; bd580227
 
 ### D22: AndroidX Preference is a direct non-KTX dependency
 
-- **What**: The version catalog declares androidx.preference:preference:1.2.1 and the app uses it under the existing AndroidX license allow-list.
+- **What**: The version catalog declares androidx.preference:preference:1.2.1 and the app uses it with attribution maintained in the static notices.
 - **Why**: Settings now directly uses AndroidX Preference classes.
 - **Tradeoffs**: The runtime gains a dependency without needing preference-ktx.
 - **Watch out**: Upgrades must stay compatible with Material/AppCompat and pass notice and lint checks.
-- **Source**: f8822b8b
+- **Source**: f8822b8b; 20137e4c; bd580227
 
 ### D23: JNI exposes one guarded guest-CPU aggregate for the screen-off policy
 
@@ -169,7 +169,55 @@
 - **Why**: The service needs safe guest-only activity accounting.
 - **Tradeoffs**: The aggregate does not identify workloads, and failures conservatively preserve wakefulness.
 - **Watch out**: Tests ran on an API 34 emulator rather than physical hardware or a 16 KB-page image.
-- **Source**: 1e5de64e
+- **Source**: 1e5de64e; 20137e4c
+
+### D24: Notices are checked-in catalog and HTML assets with isolated reader tests
+
+- **What**: The APK packages a static JSON catalog, body HTML and shared CSS with upstream references, replacing NoticesTask, generated assets and the allow-list; Browser 1.10.0 and WebKit 1.18.0 are catalog dependencies and LicenseTest covers offline reading/restoration.
+- **Why**: Notice content must be explicit repository resources while new browsing and reading APIs remain directly declared.
+- **Tradeoffs**: Automatic dependency discovery is gone, so dependency and bundled-package updates must manually synchronize versions, attribution and complete texts.
+- **Watch out**: Tests establish asset coverage rather than license correctness; keep resolved dependencies and chosen rootfs/package artifacts aligned with the static inventory.
+- **Source**: d0a74e94, bd580227, 0815b3e4
+
+### D25: A static musl guest client implements browser requests
+
+- **What**: Zig builds an aarch64-linux-musl client that rereads configuration for each call, bounds network waits to five seconds and requires acknowledgment, with packaged notices and integration tests.
+- **Why**: Browser requests need reported failures without curl, netcat or guest dynamic-libc assumptions.
+- **Tradeoffs**: The APK build gains an executable and a small transport protocol.
+- **Watch out**: Timeout means no acknowledgment rather than proof of no launch; Debian and 16 KB-page runtime checks remain outstanding.
+- **Source**: 8e211142
+
+### D26: Privacy registration and provider tests cover the access boundary
+
+- **What**: MainApplication initializes the separate privacy controller with Biometric 1.1.0 and its notice, registers non-exported report targets and tests lifecycle, secure dialogs, action routing, locked clipboard denial and provider consent/revocation.
+- **Why**: The shared gate needs an application entry point and regression coverage across notification and document surfaces.
+- **Tradeoffs**: Tests use shared preferences/store setup and explicit transient grants, while authentication remains outside the application entry point.
+- **Watch out**: API 34 emulator results do not cover real biometrics, vendor windows, persisted picker grants or 16 KB-page devices.
+- **Source**: d0ddf170, f61072f3
+
+### D27: Terminal input tests use real encoding and dialogs without a shell
+
+- **What**: TerminalInputTest uses an isolated rootfs, a shell-free session and capturing host to exercise immediate delivery, no replay, composition/Enter, confirmation, bracketed paste, unsafe terminators and optional trailing-newline removal.
+- **Why**: The real input connection and delayed confirmation callbacks lacked regression coverage.
+- **Tradeoffs**: Instrumentation needs Android and a rootfs, uses reflection to supply the terminal and can capture themed-dialog screenshots.
+- **Watch out**: API 34 with 4 KB pages does not establish real keyboard UI, physical-device or 16 KB-page behavior.
+- **Source**: 6f5be4da
+
+### D28: Diagnostics initialize at application startup and share only scoped archives
+
+- **What**: MainApplication installs Diagnostics and a non-exported FileProvider exposes only the share directory through read-only grants, with tests for retention, contents, ownership, confinement and privacy.
+- **Why**: Useful evidence must start before the service and only intentionally shared archives may leave private storage.
+- **Tradeoffs**: Capture adds startup work and cache use without new permissions or dependencies.
+- **Watch out**: API 30 trace attachments, real native-crash/ANR capture and 16 KB-page devices remain unverified.
+- **Source**: c7309c0c
+
+### D29: File-import tests exercise native storage and literal shell arguments
+
+- **What**: Seven TerminalFilesTest cases cover binary/empty copies, collisions, name sanitization, home restrictions, read/close failures, literal shell arguments and locked-picker retention across recreation.
+- **Why**: Import behavior needs real store and activity-lifecycle coverage rather than mock-only tests.
+- **Tradeoffs**: Tests require arm64 Android and the bundled rootfs and do not drive cloud providers.
+- **Watch out**: API 34 emulator coverage leaves vendor pickers, physical devices and process interruption unverified.
+- **Source**: 165b5f99
 
 ## Superseded
 
@@ -179,3 +227,4 @@
 - ~~The Ghostty 1.4.0 source with the Zig packages fetched by a configure run and proxy variables removed (D6, 394aecf, b38d29c), and released sources bundling the Ghostty release with its zig-pkg bundle (D4, b38d29c)~~ → replaced by **D6** and **D4** in 172be7c (2026-11-11)
 - ~~build.rs passes the Ghostty source directory's name as `APPINE_GHOSTTY` for the snapshot version (600700b)~~ → replaced by android/terminal **D44** in 172be7c (2026-11-11, recorded under android/terminal)
 - ~~Material Components and androidx.core declared inline in build.gradle.kts (D7 in part, 55be399)~~ → replaced by **D7** and **D20** in ef7a803 (2026-11-11)
+- ~~NoticesTask generation and license allow-list validation, including D7, D12–D14, D20–D22 qualifications~~ → replaced by **D24** in bd580227 (2026-11-14)

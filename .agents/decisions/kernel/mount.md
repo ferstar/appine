@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/mount"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192)
+> Last distilled: 2026-11-15 (HEAD = 221a89b1)
 >
 > Mount decisions made before kernel/mount was split from kernel/vfs keep their `kernel/vfs` tags and live in `.agents/decisions/kernel/vfs.md`: D2, D4, D6–D8, D10, D30, D32, D35, D48, D52 and D53.
 
@@ -12,9 +12,9 @@
 
 - **What**: kernel/mount owns `syscall/mount.rs` except vfs's tmpfs and overlay option parsing and the overlay node sweep, plus the mount table in `vfs/mod.rs` (`Mount`, `Mounts`, `MntNs`, `Propagation`, `Index`, `GroupAlloc` and the `Vfs` methods that add, copy, move, propagate, unmount and collect mounts and namespaces).
 - **Why**: The mount table, mount syscalls, propagation and mount namespaces made up a large part of the vfs map, while most VFS changes never touch them.
-- **Tradeoffs**: The boundary runs inside `vfs/mod.rs` and `syscall/mount.rs`, and mount-flag checks stay in kernel/vfs, so read-only or remount changes usually read both maps.
+- **Tradeoffs**: The boundary runs inside `vfs/mod.rs` and `syscall/mount.rs`, and mount-flag checks stay in kernel/vfs, so read-only or remount changes usually read both maps; cgroup mount adapters remain in kernel/procfs and tree/interface policy in kernel/cgroup.
 - **Watch out**: A mount-table method added in the vfs part of `vfs/mod.rs` needs the registry's description updated, or it falls between the two maps.
-- **Source**: d2b1dc3
+- **Source**: d2b1dc3; cf029f9a
 
 ### D2: Pre-split mount decisions stay in the vfs snapshot, listed here and in the map
 
@@ -46,4 +46,4 @@
 - **Why**: Remounts missed deleted files and detached writers, while unrelated memfds incorrectly blocked remounting the root.
 - **Tradeoffs**: Each remount scans holders, and mapping-only holders and deleted FUSE files still do not count.
 - **Watch out**: Shutdown may now need to kill holders of deleted files before remounting read-only, and memfd identification must follow future storage changes.
-- **Source**: 01bfd882
+- **Source**: 01bfd882; 20137e4c

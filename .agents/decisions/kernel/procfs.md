@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/procfs"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design
+> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D8 were seeded by hand from the retired design
 > doc §8.2 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -56,12 +56,12 @@
 - **Watch out**: Freezing must not look like a stop signal: parents and wait must not see it, and interrupted syscalls restart after thaw; `Task::frozen` also means waiting for a vfork child, so a new reader must not take it for a freezer stop.
 - **Source**: rounds 164 (`164-cgroup-limits`), 165 (`165-cgroup-freeze`); b593172, 1d3d559
 
-### D9: procfs, sysfs, devpts, cgroup2 and the bpf device subset are one module
-- **What**: kernel/procfs covers `pseudo.rs`, `cgroup.rs`, `bpf.rs` and `syscall/bpf.rs`, keeping cgroup2 and the bpf device subset here rather than in a cgroup module of their own.
-- **Why**: The retired design doc's §8.2 gave a few lines to about 6.7k lines of procfs, sysfs, devpts, cgroup and bpf code.
-- **Tradeoffs**: The name understates the cgroup and bpf content, and the boundaries with kernel/mm, kernel/process, kernel/signal, kernel/net and kernel/tty are kept by reference.
+### D9: kernel/procfs owns synthetic filesystem views and cgroup node adapters
+- **What**: kernel/procfs owns pseudo.rs and shared synthetic-node contracts, while cgroup tree policy, interface behavior and device BPF belong to kernel/cgroup.
+- **Why**: Synthetic filesystem views and the substantial cgroup policy implementation need separate maintenance boundaries.
+- **Tradeoffs**: Adapter and policy changes require both maps, and pre-split cgroup decisions remain here under their original tags.
 - **Watch out**: Bugs confirmed at the split or found since stay open in the map, among them per-thread fd views showing the leader's table, access checks under `task/<tid>` using the main thread's credentials, pagemap following the tid rather than the address space opened, writes that never advance a file's position, `/sys/class/net` statistics leaking the initial namespace's counters, partial change notifications, regeneration in the current reader's namespaces and no zoneinfo, pressure or kallsyms files.
-- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae
+- **Source**: c5236a1 (bug list since updated by 173da76, 4e64e74, 70c1bc6, 5d23297, f6a82cc, b43ff37, 5d7b936, 2aca260, 6d9a9e8, f5c09f7, affb1e2 and b593172; map fully refreshed in f1212d8); 45be9fae; 20137e4c; cf029f9a
 
 ### D16: Common sysctls exist, and root can write the read-only ones
 - **What**: 40 recorded sysctls with 6.1's ranges are kept in `Kernel::sysctls`, with kernel.modprobe, kernel.tainted and vm.overcommit_memory (kernel/mm D24) handled on their own and kptr_restrict, drop_caches and mmap_rnd_bits given Linux's permissions; debug.exception-trace starts at arm64's 0 and is read through `recorded_value` by kernel/signal's unhandled-exception reports (kernel/signal D23), and writing 2 or 3 to drop_caches requests a FUSE node sweep while the host keeps the page cache (kernel/fuse D2).
@@ -167,7 +167,7 @@
 - **Why**: Multibyte tokens could panic the kernel, and quota-only updates lost the period.
 - **Tradeoffs**: Extra words and nonnumeric periods still fail where Linux’s sscanf can ignore them.
 - **Watch out**: Native comparison requires the container to expose and enable the CPU controller.
-- **Source**: 45be9fae
+- **Source**: 45be9fae; 20137e4c
 
 ## Superseded
 
@@ -177,3 +177,4 @@
 - ~~Synthetic files that change do not notify pollers, mountinfo and `cgroup.events` included (D1's and D4's tradeoffs, §8.2, rounds 58, 163)~~ → narrowed by **D38** in affb1e2 (2026-11-09, no SUPERSEDES declared): mounts, mountinfo and four cgroup2 files report
 - ~~`memory.current` counts shared pages once per process (D5's tradeoff, round 164)~~ → replaced by **D5** in 1d3d559 (2026-11-10, no SUPERSEDES declared)
 - ~~`may_read`'s access checks go by the target thread (D39 in part, 1be1142)~~ → corrected in f1212d8 (2026-11-11): they use the main thread's credentials (a bug in the map), and only **D40**'s `syscall` checks the thread
+- ~~D9 combined ownership of procfs, cgroup policy and device BPF~~ → replaced by **D9** in cf029f9a (2026-11-14)

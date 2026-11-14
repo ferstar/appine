@@ -2,7 +2,7 @@
 
 > Snapshot of current consensus. Evolution: `git log --grep="MODULE: kernel/tty"`
 >
-> Last distilled: 2026-11-14 (HEAD = 410ef192). D1–D8 were seeded by hand from the retired design doc
+> Last distilled: 2026-11-15 (HEAD = 221a89b1). D1–D8 were seeded by hand from the retired design doc
 > §9 and the round records in `docs/rounds/`, so their sources cite rounds; later entries cite
 > commits.
 
@@ -174,8 +174,8 @@
 - **What**: Slave writes record ranges from non-foreground process groups, and `read_console_run` stops at writer changes while treating echoes as foreground; ordinary console and guest-master reads stay unchanged.
 - **Why**: Only the kernel can tell a background job’s bytes from shell output at a prompt.
 - **Tradeoffs**: Alternating writers shorten host reads and use a deque bounded by the 64 KiB output queue.
-- **Watch out**: Jobs without job control share the shell’s group, and a shell writing before reclaiming the terminal is classified as background.
-- **Source**: daab4446
+- **Watch out**: Jobs without job control share the shell’s group, and a shell writing before reclaiming the terminal is classified as background; native interpretation belongs to android/vtcore.
+- **Source**: daab4446; 20137e4c; 81f60bef
 
 ## Superseded
 
