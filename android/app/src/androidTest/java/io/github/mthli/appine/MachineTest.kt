@@ -1099,17 +1099,16 @@ class MachineTest {
     }
 
     /**
-     * What the system Files app sees ([Documents]): the root is the login account's home directory,
-     * and turning on "the whole system" adds `/`; listings follow symbolic links and leave out
-     * broken links and FIFOs; files can be read; things outside the home directory are visible only
-     * with "the whole system" on, and cannot be written; a tree grant cannot walk out with `..`;
+     * File access is opt-in for both the login account's home and `/`. Disabling refuses old URIs
+     * for queries, reads and changes. Listings follow symbolic links and leave out broken links
+     * and FIFOs; files outside the home cannot be written; a tree grant cannot walk out with `..`;
      * search by name. The files were just written by the running kernel: when the store is opened
      * separately, the kernel commits first, so they are visible.
      */
     @Test
     fun documentsShowTheHomeDirectory() {
         val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
-        prefs.edit().putString("login", ConsolePty.LOGIN_ROOT).putBoolean("system_documents", false).commit()
+        prefs.edit().putString("login", ConsolePty.LOGIN_ROOT).remove("file_access").commit()
         val machine = start(1)
         val setup = "rm -rf /root/dt && mkdir -p /root/dt/sub && printf hi > /root/dt/a.txt && " +
             "ln -s /etc/alpine-release /root/dt/release && ln -s /nowhere /root/dt/broken && " +
@@ -1131,8 +1130,45 @@ class MachineTest {
         fun roots() = rows(DocumentsContract.buildRootsUri(authority), DocumentsContract.Root.COLUMN_ROOT_ID, id)
         fun document(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
         fun read(doc: String) = resolver.openInputStream(document(doc))!!.use { String(it.readBytes()) }
+        fun assertDisabled() {
+            assertEquals(emptyList<List<String?>>(), roots())
+            assertEquals(null, rows(document("/root/dt/a.txt"), id))
+            assertEquals(null, rows(document("/etc/motd"), id))
+            assertThrows(java.io.FileNotFoundException::class.java) { read("/root/dt/a.txt") }
+            assertThrows(java.io.FileNotFoundException::class.java) { read("/etc/motd") }
+            assertEquals(Documents.FileLink.Hidden, Documents.fileLink(context, android.net.Uri.parse("file:///root/dt/a.txt")))
+            resolver.acquireContentProviderClient(authority)!!.use { client ->
+                val provider = client.localContentProvider as Documents
+                assertFalse(provider.isChildDocument("/root/dt", "/root/dt/a.txt"))
+                val refused: List<() -> Unit> = listOf(
+                    { provider.queryChildDocuments("/root/dt", null, sortOrder = null).close() },
+                    { provider.querySearchDocuments(Documents.ROOT_HOME, "a.txt", null).close() },
+                    { provider.querySearchDocuments(Documents.ROOT_SYSTEM, "motd", null).close() },
+                    { provider.findDocumentPath(null, "/root/dt/a.txt") },
+                    { provider.openDocument("/root/dt/a.txt", "wt", null).close() },
+                    { provider.createDocument("/root/dt", "text/plain", "denied.txt") },
+                    { provider.renameDocument("/root/dt/a.txt", "renamed.txt") },
+                    { provider.moveDocument("/root/dt/a.txt", "/root/dt", "/root/dt/sub") },
+                    { provider.deleteDocument("/root/dt/a.txt") },
+                )
+                for (call in refused) assertThrows(java.io.FileNotFoundException::class.java) { call() }
+            }
+        }
         try {
-            assertEquals(listOf(listOf("home", "/root")), roots())
+            assertFalse(Settings.fileAccess(context))
+            assertDisabled()
+            // The old visibility setting does not bypass the new explicit consent.
+            val old = prefs.all["system_documents"] as? Boolean
+            try {
+                prefs.edit().putBoolean("system_documents", true).commit()
+                assertDisabled()
+            } finally {
+                prefs.edit().apply {
+                    if (old == null) remove("system_documents") else putBoolean("system_documents", old)
+                }.commit()
+            }
+            Settings.setFileAccess(context, true)
+            assertEquals(listOf(listOf("home", "/root"), listOf("system", "/")), roots())
             assertEquals(
                 // What the extension cannot tell goes by content: text is text/plain (dot files, a
                 // linked-to version number); anything with a NUL is not
@@ -1150,10 +1186,8 @@ class MachineTest {
             assertEquals("hi", read("/root/dt/a.txt"))
             assertEquals("x", read("/root/dt/100%25 中文.txt"))
             assertTrue(read("/root/dt/release").startsWith("3."))
-            // Things outside the home directory and non-canonical IDs count as nonexistent (the
-            // query returns null)
+            // Non-canonical IDs count as nonexistent (the query returns null).
             assertEquals(listOf(listOf("text/plain")), rows(document("/root/dt/release"), mime))
-            assertEquals(null, rows(document("/etc/motd"), id))
             assertEquals(null, rows(document("/root/dt/../../etc/motd"), id))
             assertEquals(null, rows(document("/root//dt"), id))
             // Tree grants: what is inside works, walking out with `..` does not
@@ -1170,22 +1204,23 @@ class MachineTest {
             val args = android.os.Bundle().apply { putString(DocumentsContract.QUERY_ARG_DISPLAY_NAME, "A.TXT") }
             val found = rows(search, id, args = args)
             assertEquals(listOf(listOf("/root/dt/a.txt")), found)
-            // Turn on "the whole system"
-            prefs.edit().putBoolean("system_documents", true).commit()
-            assertEquals(listOf(listOf("home", "/root"), listOf("system", "/")), roots())
             assertEquals(listOf(listOf("motd")), rows(document("/etc/motd"), name))
             // Outside the home directory is read-only
             assertThrows(Exception::class.java) { resolver.openOutputStream(document("/etc/motd"))!!.close() }
             assertTrue(rows(DocumentsContract.buildChildDocumentsUri(authority, "/"), name)!!.contains(listOf("etc")))
+            Settings.setFileAccess(context, false)
+            assertDisabled()
+            Settings.setFileAccess(context, true)
+            assertEquals("hi", read("/root/dt/a.txt"))
         } finally {
-            prefs.edit().remove("login").remove("system_documents").commit()
+            prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "rm -rf /root/dt")
         }
     }
 
     /**
      * Without a usable home directory (the login account has none, or its home is `/`) there is no
-     * home root, while "the whole system" still appears when it is on, and stays read-only: a home
+     * home root, while the system root still appears with file access on, and stays read-only: a home
      * of `/` must not make every file writable.
      */
     @Test
@@ -1208,9 +1243,9 @@ class MachineTest {
         try {
             // Each account is its own login setting, so the provider's cached home is not reused
             for (account in listOf("carol", "dave")) {
-                prefs.edit().putString("login", account).putBoolean("system_documents", false).commit()
+                prefs.edit().putString("login", account).putBoolean("file_access", false).commit()
                 assertEquals(account, emptyList<String>(), roots())
-                prefs.edit().putBoolean("system_documents", true).commit()
+                prefs.edit().putBoolean("file_access", true).commit()
                 assertEquals(account, listOf("system"), roots())
                 assertThrows(account, Exception::class.java) { resolver.openOutputStream(document("/etc/motd"))!!.close() }
                 val created = runCatching { DocumentsContract.createDocument(resolver, document("/"), "text/plain", "x") }
@@ -1218,7 +1253,7 @@ class MachineTest {
             }
             assertEquals(1, sh(machine, "test -e /x").second)
         } finally {
-            prefs.edit().remove("login").remove("system_documents").commit()
+            prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "deluser carol; deluser dave")
         }
     }
@@ -1238,7 +1273,7 @@ class MachineTest {
         val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir /home/bob/dw && " +
             "ln -s /etc /home/bob/dw/etc-link && chown -h bob:bob /home/bob/dw /home/bob/dw/etc-link"
         assertEquals(0, sh(machine, setup).second)
-        prefs.edit().putString("login", "bob").putBoolean("system_documents", false).commit()
+        prefs.edit().putString("login", "bob").putBoolean("file_access", true).commit()
         val resolver = context.contentResolver
         val authority = Documents.authority(context)
         fun uri(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
@@ -1295,8 +1330,42 @@ class MachineTest {
             assertTrue(DocumentsContract.deleteDocument(resolver, uri("$dw/etc-link")))
             assertEquals(0, sh(machine, "test ! -e $dw/etc-link && test -d /etc").second)
         } finally {
-            prefs.edit().remove("login").remove("system_documents").commit()
+            prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "deluser --remove-home bob")
+        }
+    }
+
+    /** Disabling file access revokes grants across document and tree URI paths, also after re-enabling. */
+    @Test
+    fun documentsRevokeAccess() {
+        val recipient = InstrumentationRegistry.getInstrumentation().context
+        val uid = recipient.applicationInfo.uid
+        assertTrue(uid != android.os.Process.myUid())
+        val mode = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val authority = Documents.authority(context)
+        val uris = listOf(
+            DocumentsContract.buildDocumentUri(authority, "/root/a.txt"),
+            DocumentsContract.buildDocumentUri(authority, "/etc/motd"),
+            DocumentsContract.buildTreeDocumentUri(authority, "/root"),
+            DocumentsContract.buildTreeDocumentUri(authority, "/"),
+        )
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        try {
+            Settings.setFileAccess(context, true)
+            for (uri in uris) {
+                context.grantUriPermission(recipient.packageName, uri, mode)
+                assertEquals(android.content.pm.PackageManager.PERMISSION_GRANTED, context.checkUriPermission(uri, -1, uid, mode))
+            }
+            Settings.setFileAccess(context, false)
+            Documents.revokeAccess(context)
+            Settings.setFileAccess(context, true)
+            for (uri in uris) {
+                assertEquals(android.content.pm.PackageManager.PERMISSION_DENIED, context.checkUriPermission(uri, -1, uid, mode))
+            }
+        } finally {
+            Documents.revokeAccess(context)
+            prefs.edit().remove("file_access").commit()
         }
     }
 
@@ -1346,7 +1415,7 @@ class MachineTest {
         val dw = "/home/bob/dw"
         val setup = "deluser --remove-home bob 2>/dev/null; adduser -D -u 1500 bob && mkdir $dw && chown bob:bob $dw"
         assertEquals(0, sh(machine, setup).second)
-        prefs.edit().putString("login", "bob").putBoolean("system_documents", false).commit()
+        prefs.edit().putString("login", "bob").putBoolean("file_access", true).commit()
         val resolver = context.contentResolver
         val authority = Documents.authority(context)
         fun uri(doc: String) = DocumentsContract.buildDocumentUri(authority, doc)
@@ -1390,7 +1459,7 @@ class MachineTest {
                 resolver.unregisterContentObserver(observer)
             }
         } finally {
-            prefs.edit().remove("login").remove("system_documents").commit()
+            prefs.edit().remove("login").remove("file_access").commit()
             sh(machine, "deluser --remove-home bob")
         }
     }

@@ -1005,10 +1005,11 @@ class TerminalService : Service() {
         settingsChanged()
     }
 
-    val systemDocuments: Boolean get() = Settings.systemDocuments(this)
+    val fileAccess: Boolean get() = Settings.fileAccess(this)
 
-    fun setSystemDocuments(on: Boolean) {
-        Settings.setSystemDocuments(this, on)
+    fun setFileAccess(on: Boolean) {
+        Settings.setFileAccess(this, on)
+        if (!on) Documents.revokeAccess(this)
         Documents.rootsChanged(this)
         settingsChanged()
     }

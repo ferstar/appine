@@ -1,6 +1,7 @@
 package io.github.mthli.appine
 
 import android.content.Context
+import android.content.Intent
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
@@ -22,8 +23,9 @@ import java.io.IOException
 import kotlin.concurrent.read
 
 /**
- * Appine in the system Files app (the android/documents map): the login account's home directory is
- * one root, and once turned on in Settings there is also the whole system (`/`), read-only.
+ * Appine in the system file picker (the android/documents map): file access is off by default.
+ * Once enabled in Settings, the login account's home directory is one root and the whole system
+ * (`/`) is another, read-only outside the home.
  *
  * Document IDs are the guest's absolute paths (written as described in [Native]) and are looked up
  * directly in the store ([Native.browseList] and the like), without the kernel running: while it
@@ -40,9 +42,8 @@ import kotlin.concurrent.read
  * directory entries (create, delete, rename), the service takes them periodically
  * ([Native.takeChangedDirs]) and tells the Files app to refresh that directory ([dirsChanged]).
  *
- * With the whole system turned off, only documents inside the home directory are recognised: grants
- * on `/` given to other apps while it was on no longer work after it is turned off; likewise for
- * the old home directory after the login account changes.
+ * With file access turned off, no roots or documents are accessible, including through old URIs.
+ * Disabling also revokes URI grants; already opened file descriptors and copied data remain usable.
  */
 class Documents : DocumentsProvider() {
     /** What a `file:` link names ([fileLink]). */
@@ -53,7 +54,7 @@ class Documents : DocumentsProvider() {
         /** A file on another machine: a program there (over ssh) wrote the link. */
         data class Remote(val host: String) : FileLink
 
-        /** A file outside the home directory while the whole system is not shown. */
+        /** A file in the store while file access is disabled. */
         data object Hidden : FileLink
 
         /** No directory or regular file there in the store (or no store). */
@@ -72,7 +73,7 @@ class Documents : DocumentsProvider() {
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val result = MatrixCursor(projection ?: ROOT_COLUMNS)
         val context = context ?: return result
-        if (!Rootfs.isReady(context)) return result
+        if (!Settings.fileAccess(context) || !Rootfs.isReady(context)) return result
         val distro = Rootfs.installed(context)?.label.orEmpty()
         // Free space includes caches the system can clear, matching what Settings shows
         val free = runCatching {
@@ -94,16 +95,14 @@ class Documents : DocumentsProvider() {
             add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
             add(Root.COLUMN_AVAILABLE_BYTES, free)
         }
-        if (Settings.systemDocuments(context)) {
-            result.newRow().apply {
-                add(Root.COLUMN_ROOT_ID, ROOT_SYSTEM)
-                add(Root.COLUMN_DOCUMENT_ID, "/")
-                add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
-                add(Root.COLUMN_SUMMARY, context.getString(R.string.documents_system, distro))
-                add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_SEARCH)
-                add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
-                add(Root.COLUMN_AVAILABLE_BYTES, free)
-            }
+        result.newRow().apply {
+            add(Root.COLUMN_ROOT_ID, ROOT_SYSTEM)
+            add(Root.COLUMN_DOCUMENT_ID, "/")
+            add(Root.COLUMN_TITLE, context.getString(R.string.app_name))
+            add(Root.COLUMN_SUMMARY, context.getString(R.string.documents_system, distro))
+            add(Root.COLUMN_FLAGS, Root.FLAG_LOCAL_ONLY or Root.FLAG_SUPPORTS_IS_CHILD or Root.FLAG_SUPPORTS_SEARCH)
+            add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
+            add(Root.COLUMN_AVAILABLE_BYTES, free)
         }
         result.setNotificationUri(context.contentResolver, DocumentsContract.buildRootsUri(authority(context)))
         return result
@@ -163,9 +162,10 @@ class Documents : DocumentsProvider() {
 
     override fun querySearchDocuments(rootId: String, query: String, projection: Array<out String>?): Cursor {
         val context = attached()
+        requireFileAccess(context)
         val dir = when (rootId) {
             ROOT_HOME -> home(context)?.path
-            ROOT_SYSTEM -> "/".takeIf { Settings.systemDocuments(context) }
+            ROOT_SYSTEM -> "/"
             else -> null
         } ?: throw FileNotFoundException("no root $rootId")
         val result = MatrixCursor(projection ?: DOCUMENT_COLUMNS)
@@ -185,11 +185,12 @@ class Documents : DocumentsProvider() {
      * as nonexistent.
      */
     private fun visible(context: Context, documentId: String): String {
-        val path = canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
-        if (Settings.systemDocuments(context)) return path
-        val home = home(context)?.path ?: throw FileNotFoundException("no home directory")
-        if (within(home, path)) return path
-        throw FileNotFoundException("$documentId is outside $home")
+        requireFileAccess(context)
+        return canonical(documentId) ?: throw FileNotFoundException("bad document $documentId")
+    }
+
+    private fun requireFileAccess(context: Context) {
+        if (!Settings.fileAccess(context)) throw FileNotFoundException("file access is disabled")
     }
 
     private fun <T> browse(call: (String) -> T): T {
@@ -253,6 +254,7 @@ class Documents : DocumentsProvider() {
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        if (!Settings.fileAccess(attached())) return false
         val parent = canonical(parentDocumentId) ?: return false
         val doc = canonical(documentId) ?: return false
         return doc != parent && within(parent, doc)
@@ -309,8 +311,10 @@ class Documents : DocumentsProvider() {
     /** Close callbacks for files handed out for writing run on this thread ([openDocument]). */
     private val closer: Handler by lazy { Handler(HandlerThread("documents-close").apply { start() }.looper) }
 
-    private fun writableHome(context: Context): Home =
-        home(context) ?: throw FileNotFoundException("no home directory")
+    private fun writableHome(context: Context): Home {
+        requireFileAccess(context)
+        return home(context) ?: throw FileNotFoundException("no home directory")
+    }
 
     /**
      * A document to modify: canonical and inside the home directory (with [top], also the home
@@ -411,11 +415,17 @@ class Documents : DocumentsProvider() {
         fun authority(context: Context) = "${context.packageName}.documents"
 
         /**
-         * The login account, the store or "show the whole system" changed: the Files app reads the
+         * The login account, the store or file access changed: the Files app reads the
          * roots again.
          */
         fun rootsChanged(context: Context) {
             context.contentResolver.notifyChange(DocumentsContract.buildRootsUri(authority(context)), null)
+        }
+
+        /** Revoke document and tree grants, persisted and transient, across this provider. */
+        fun revokeAccess(context: Context) {
+            val uri = Uri.Builder().scheme("content").authority(authority(context)).build()
+            context.revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         }
 
         /**

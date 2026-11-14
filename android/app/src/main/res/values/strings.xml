@@ -142,8 +142,11 @@
     <string name="copy_report">Copy report</string>
     <string name="report_copied">Report copied</string>
     <string name="boot_failed_text">%1$s. The boot output is in /var/log/boot.log.</string>
-    <string name="settings_system_documents">Show system directories in Files</string>
-    <string name="system_documents_summary">Browse Appine from /. Your home directory is writable; other directories are read-only.</string>
+    <string name="settings_file_access">Allow other apps to access files</string>
+    <string name="file_access_summary">Access Appine files through the system file picker. Your home directory is writable; other directories are read-only.</string>
+    <string name="file_access_title">Allow other apps to access files?</string>
+    <string name="file_access_message">Your home and system directories will appear in the system file picker. Apps you authorize can read or copy SSH private keys, passwords and other sensitive information stored there, even from read-only files.</string>
+    <string name="file_access_enable">Enable</string>
     <string name="settings_fill_wide">Enlarge CJK characters</string>
     <string name="fill_wide_on">Scale proportionally to fill two cells, reducing gaps between characters.</string>
     <string name="fill_wide_off">Keep the original size, centred within two cells.</string>
@@ -179,6 +182,6 @@
     <string name="select_output">Select output</string>
     <string name="link_no_app">No app can open this link</string>
     <string name="link_remote_file">This file is on %1$s, not in Appine</string>
-    <string name="link_hidden_file">Outside your home directory. Enable in Settings: Show system directories in Files</string>
+    <string name="link_hidden_file">File access is disabled. Enable in Settings: Allow other apps to access files</string>
     <string name="link_missing_file">Cannot find this file</string>
 </resources>

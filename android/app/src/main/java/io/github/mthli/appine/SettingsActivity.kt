@@ -84,7 +84,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
 
     private lateinit var tier: Preference
     private lateinit var runPolicy: ListPreference
-    private lateinit var systemDocuments: SwitchPreferenceCompat
+    private lateinit var fileAccess: SwitchPreferenceCompat
     private lateinit var fillWide: SwitchPreferenceCompat
     private lateinit var cursorStyle: ListPreference
     private lateinit var cursorBlink: SwitchPreferenceCompat
@@ -127,7 +127,14 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
             entries = RunPolicy.entries.map { getString(it.label) }.toTypedArray()
             entryValues = RunPolicy.entries.map { it.value }.toTypedArray()
         }
-        systemDocuments = toggle(R.string.settings_system_documents, TerminalService::setSystemDocuments)
+        fileAccess = toggle(R.string.settings_file_access, TerminalService::setFileAccess).apply {
+            setOnPreferenceChangeListener { _, value ->
+                if (service == null) return@setOnPreferenceChangeListener false
+                if (value as Boolean) confirmFileAccess() else service?.setFileAccess(false)
+                // Only the service's render changes the switch, after confirmation when enabling.
+                false
+            }
+        }
         fillWide = toggle(R.string.settings_fill_wide, TerminalService::setFillWide)
         cursorStyle = choice(R.string.settings_cursor_style) { s, value -> s.setCursorStyle(value.toInt()) }.apply {
             entries = CURSOR_LABELS.map { getString(it) }.toTypedArray()
@@ -152,7 +159,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         }
 
         group(R.string.settings_group_system, distro, account, reset)
-        group(R.string.settings_group_android, runPolicy, systemDocuments)
+        group(R.string.settings_group_android, runPolicy, fileAccess)
         group(R.string.settings_group_terminal, fillWide, cursorStyle, cursorBlink, volumeKeys)
         group(R.string.settings_group_debug, tier)
         group(R.string.settings_group_about, project, licenses, version)
@@ -333,7 +340,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     private fun render() {
         val s = service
         if (s == null) {
-            for (row in listOf(distro, reset, account, tier, runPolicy, systemDocuments,
+            for (row in listOf(distro, reset, account, tier, runPolicy, fileAccess,
                 fillWide, cursorStyle, cursorBlink, volumeKeys)) row.isEnabled = false
             return
         }
@@ -361,7 +368,7 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
         // lock is held accordingly once it is up
         runPolicy.value = s.runPolicy.value
         runPolicy.set(getString(s.runPolicy.summary), true)
-        systemDocuments.set(getString(R.string.system_documents_summary), true, s.systemDocuments)
+        fileAccess.set(getString(R.string.file_access_summary), true, s.fileAccess)
         fillWide.set(getString(if (s.fillWide) R.string.fill_wide_on else R.string.fill_wide_off), true, s.fillWide)
         cursorStyle.value = s.cursorStyle.toString()
         cursorStyle.set(getString(CURSOR_LABELS[CURSOR_STYLES.indexOf(s.cursorStyle).coerceAtLeast(0)]), true)
@@ -406,6 +413,15 @@ class SettingsFragment : PreferenceFragmentCompat(), TerminalService.Listener {
     }
 
     // ---- Actions ----
+
+    private fun confirmFileAccess() {
+        MaterialAlertDialogBuilder(requireContext())
+            .setTitle(R.string.file_access_title)
+            .setMessage(R.string.file_access_message)
+            .setPositiveButton(R.string.file_access_enable) { _, _ -> service?.setFileAccess(true) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
 
     private fun onDistro() {
         val s = service ?: return

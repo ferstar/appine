@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: own an authenticated browser endpoint per kernel and acknowledge launches through the focused terminal)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: default-off file access controls both roots and revokes URI grants when disabled)
 
 ## Responsibilities
 
@@ -23,7 +23,7 @@ outlives an Activity:
   program statuses, clipboard writes and reads) and of commands the shells' prompt marks see
   finish;
 - the settings state that the activities only display and forward (tier in all builds,
-  screen-off running policy, login account, system documents, CJK characters filling two cells, the cursor's
+  screen-off running policy, login account, file access, CJK characters filling two cells, the cursor's
   shape and blinking, whether the volume keys switch tabs, distro switch), the preferences
   kept in `Settings`.
 
@@ -74,7 +74,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   shown in the tab); `Notifications` builds, posts and cancels.
 - `Settings` — the `settings` preferences: getters and plain setters taking a `Context` for the
   tier (default 1 in all builds), login, running policy and its remembered non-always choice,
-  system documents, wide cells, the
+  file access (`file_access`, default off; old `system_documents` ignored), wide cells, the
   cursor's shape (stored as Ghostty's names) and blinking, and whether the volume keys switch tabs
   (on by default); `clearLogin` for a replaced store.
 - `Switch` — a distro download in progress (volatile `done`, `total`, `cancelled`): `switching` is
@@ -96,14 +96,16 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - Called by activities: `addListener`/`removeListener`, `createSession(account = login setting,
   cwd = null)`/`removeSession`, the `current` setter, `exitAll`, `setTier`,
   `setRunPolicy`, `switchTo`/`cancelSwitch`/`canSwitch`,
-  `setLogin`, `setSystemDocuments`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
+  `setLogin`, `setFileAccess`, `setFillWide`, `setCursorStyle`, `setCursorBlink`,
   `setVolumeKeysSwitchTabs`, `takeNotice`; state read by them: `machine`, `startError`,
   `progress`, `switching`, `sessions`, `focus`, the settings.
-- Settings read without the service: `Settings.login` and `systemDocuments` by `Documents`,
+- Settings read without the service: `Settings.login` and `fileAccess` by `Documents`,
   `Settings.fillWide` by `MainActivity` (in `onStart` and `onSettingsChanged`) and
   `Settings.volumeKeysSwitchTabs` by it at each volume key press; the service's getters read
   `Settings` too, and its setters write it and act on the change (`setVolumeKeysSwitchTabs` only
   tells the listeners).
+- `setFileAccess` saves the gate, revokes all provider URI grants when disabling via
+  `Documents.revokeAccess`, refreshes roots and tells listeners. Settings confirms before enabling.
 
 ## Data flow / lifecycle
 

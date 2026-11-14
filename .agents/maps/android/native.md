@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: package a static Linux browser client with bounded IPC and cover multiplexer-independent launching)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: provider tests cover default-off file access, disabled operations and authority-wide URI grant revocation)
 
 ## Responsibilities
 
@@ -271,7 +271,9 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   them back in `finally`. It covers both tiers (guest page size 4096), calls after stop, memory
   trim, boot and shutdown by inittab (under 10 s), osclock, consoles (input, Ctrl-C, concurrency,
   the foreground cwd), login from `/etc/passwd`, the saved directory, accounts and doas (two logins installing it at once, and one waiting for apk's lock, included), NOPASSWD
-  rules following a password set later, saved tabs, the Files provider (home, no home, writes,
+  rules following a password set later, saved tabs, the Files provider (default-off access including
+  legacy preferences, disabled queries/reads/changes and file links, authority-wide grant revocation,
+  home, no home, writes,
   changes both ways, grants below a directory as a pure check of `Documents.grantedUnder`), manual
   mirrors, verified, resumed and cancelled downloads (`file:` URLs and a local server), routes, low
   ports, bugs injected through the test hooks killing only the guest process on both tiers, kill
@@ -290,7 +292,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
   not run the tests (they need KVM). Nothing here covers `Native.bklStall` (the stall itself is
-  tested in `hosts/cli`), broader terminal behavior beyond browser requests or the revocation of grants end to end.
+  tested in `hosts/cli`), broader terminal behavior beyond browser requests or persisted grants end to end.
 
 ## Dependencies (inbound / outbound)
 

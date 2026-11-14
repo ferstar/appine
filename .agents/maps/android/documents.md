@@ -5,15 +5,15 @@
 >
 > Verified: 2026-11-03 (full mapping: 1 research concern; 5 claims checked by 1 independent verifier — 5 confirmed; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: the login and system-root settings read from `Settings`)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: opt-in access gates both roots and all document operations, with authority-wide grant revocation on disable)
 
 ## Responsibilities
 
 `android/documents` is the `DocumentsProvider` that shows the guest's files in the system Files
 app and in other apps' pickers:
 
-- the roots: the login account's home (writable) and, behind a setting, the whole system
-  (read-only);
+- the roots, both behind default-off file access: the login account's home (writable) and the
+  whole system (read-only outside the home);
 - document IDs, columns, flags and MIME types;
 - reading, writing, creating, deleting, renaming, moving and searching through the store's browse
   API, without the kernel;
@@ -37,22 +37,22 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
   `createDocument`, `deleteDocument`, `renameDocument`, `moveDocument`, `isChildDocument`,
   `findDocumentPath`, `querySearchDocuments` (no `copyDocument`, `removeDocument`, recents or
   thumbnails).
-- Static, for the service: `rootsChanged`, `dirsChanged`; for the terminal: `fileLink`, with its
+- Static, for the service: `rootsChanged`, `dirsChanged`, `revokeAccess`; for the terminal: `fileLink`, with its
   result `FileLink` (`Found` with the document's URI and MIME type, `Remote`, `Hidden`, `Missing`).
 
 ## Data flow / lifecycle
 
 ### Roots and IDs
 
-- With a ready rootfs, the home comes from the login setting through `Rootfs.loginAccount`
+- With file access enabled and a ready rootfs, the home comes from the login setting through `Rootfs.loginAccount`
   (`/etc/passwd` read from the store; root with `/root` when unreadable) and is shown only if it
   exists and is not `/` (which would make the whole system writable). Home root: summary
   "account · distro", flags local-only, is-child, search, create (making it a "Save to" target),
-  free space from `getAllocatableBytes`. System root `/`: same without create, when the setting
-  (default off) is on, with or without a home root.
+  free space from `getAllocatableBytes`. System root `/`: same without create, with or without
+  a home root. `Settings.fileAccess` uses `file_access`, default false; old `system_documents` is ignored.
 - Document IDs are absolute guest paths with `%`, control characters and non-UTF-8 bytes written
-  as `%XX`; only canonical IDs (no empty, `.` or `..` components) count. With the system root off
-  only the home and IDs under it are visible; IDs under the home are writable, the home itself only
+  as `%XX`; only canonical IDs (no empty, `.` or `..` components) count. With file access off,
+  neither root nor any document is accessible; IDs under the home are writable when enabled, the home itself only
   as a create or move target.
 - Columns: ID, display name (decoded, U+FFFD for bad bytes), MIME type, size (files), modified
   time, flags from the literal path (home: create; under home: delete, rename, move, plus write or
@@ -69,6 +69,10 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 - Every call holds `Rootfs.access`'s read lock and opens the store afresh per JNI call; errors
   surface as `FileNotFoundException`.
 - Read: the host object file opened read-only and adopted as the returned fd.
+- Disabling gates queries, search, ancestry/path lookup, opens and changes even for old URIs.
+  The service calls `revokeAccess` on the authority URI to revoke persisted and transient document/tree
+  grants, then refreshes roots. Already-open fds and copied data cannot be recalled; calls already
+  past the access check may finish. Re-enabling does not restore revoked grants.
 - Write modes: the native side checks the real path against the home, truncates if asked, opens
   with `O_APPEND` for append modes and returns an fd; the provider hands that fd out wrapped with a
   close listener (`ParcelFileDescriptor.wrap`, run on a `documents-close` thread) that reports the
@@ -114,18 +118,18 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 ### Outbound
 
 - `Native.browse*`; `Rootfs` (`isReady`, `installed`, `access`, `loginAccount`); `Settings`
-  (`login`, `systemDocuments`; android/service).
+  (`login`, `fileAccess`; android/service).
 
 ## Invariants and gotchas
 
-- Visibility is decided on the literal path while writes are limited by real path; reads follow
+- When enabled, writes are limited by real path; reads follow
   symlinks wherever they point, so an app holding a grant on the home tree can read outside it
   through a link the guest user made (an accepted limitation: no guest permission checks apply).
 - Flags shown in the Files app are a hint; the real write check is in the native code.
 - `fileLink` writes IDs in Kotlin by the same rules as the native `encode_path` (`%`, Unicode
   control characters and bytes outside well-formed UTF-8 as `%XX`); the two change together. A
   differing ID would still reach the file (the native side decodes any `%XX`) but not compare
-  equal to the home's ID in the visibility check.
+  equal to the home's ID for write flags and path lookup.
 - A link's host is matched against `/etc/hostname` in the store, not the running system's name:
   after `hostname` alone, without the file, the machine's own links count as `Remote`.
 - If wrapping a write fd fails (the socket pair that carries the close cannot be created), the
@@ -146,6 +150,7 @@ resolution and the store lock (`android/setup`); the JNI calls (`android/native`
 
 ## To verify
 
-- The framework's grant semantics for path-shaped IDs (taken from AOSP, not checked on a device).
+- Persisted and picker-issued grant revocation on a device; explicit document/tree grants were
+  revoked on API 34, with all six provider tests passing, including disabled queries, reads and changes.
 - `fileLink` and `findDocumentPath` on real devices and other file managers; tried only on a Pixel
   4a API 34 emulator with Google's Files app, HTML Viewer and Chrome.

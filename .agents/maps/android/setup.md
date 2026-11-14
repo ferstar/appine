@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: refresh the browser client and per-kernel connection information on both distributions)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: file access requires confirmation before enabling either home or system documents)
 
 ## Responsibilities
 
@@ -50,14 +50,14 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     back to it.
 - Preferences: file `rootfs`, owned here (`distro`); the `settings`
   file is android/service's `Settings` (`tier`, default 1 in all builds; `login`, `run_policy`, `idle_policy`,
-  `system_documents`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
+  `file_access`, `fill_wide`, `cursor_style`, `cursor_blink`, `volume_keys_switch_tabs`),
   which Settings shows through the service.
 - `SettingsActivity` — an `AppCompatActivity` hosting `SettingsFragment` (in the same file), a
   `PreferenceFragmentCompat` and `TerminalService.Listener`, on the Material 3 frame it shares
   with the licenses (`android/terminal`'s `page.xml`). `PreferenceCategory` groups standard
   `Preference` actions, `SwitchPreferenceCompat` toggles (a `MaterialSwitch` widget) and
   `ListPreference` choices (login account, screen-off running and cursor shape). Groups: System (distro, login account,
-  reset), Android (running policy, system documents), Terminal (CJK characters filling two
+  reset), Android (running policy, file access), Terminal (CJK characters filling two
   cells, the cursor's shape, whether it blinks, the volume keys switching tabs), Debugging (execution
   mode, in all builds) and About (project website, licenses, version).
 - `login.sh` — `sh -c <script> appine-login <login> <cwd>`, run as root on each tab's console, or
@@ -320,8 +320,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
     asking to restart; the summary names the current mode and Tier number, with a slower hint
     for Tier 0. Separate choice labels mark Tier 1 as the default and Tier 0 for troubleshooting;
   - screen-off running (Allow sleep, Run while busy or Always run, with the selected policy's
-    description; BUSY explains its 30 s idle grace and network/scheduled-work limitation), system
-    documents, CJK fill, cursor shape (Block, Bar or Underline, the summary
+    description; BUSY explains its 30 s idle grace and network/scheduled-work limitation),
+    file access, CJK fill, cursor shape (Block, Bar or Underline, the summary
     naming the current one), cursor blink (on by default) and the volume keys switching tabs (on
     by default): usable at any time; the service gives every tab the new cursor values at once
     (android/service), and the terminal reads the CJK and volume-key values itself
@@ -343,7 +343,9 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 - Login, running policy and cursor choices use `ChoiceDialog`, a `ListPreferenceDialogFragmentCompat` whose
   builder is `MaterialAlertDialogBuilder`: AndroidX keeps the entries, selection and dialog
   state, and Cancel, Back or an outside tap commits nothing. Distribution, reset, tier and notices
-  keep their explicit Material dialogs and confirmation flows.
+  keep their explicit Material dialogs and confirmation flows. File access also asks on every enable,
+  warning about reading or copying sensitive home/system files; only Enable saves true, while
+  Cancel, Back, outside tap or recreation leaves it off. Disabling acts immediately through the service.
 - Look: Material 3 light or dark with the system, with the wallpaper's colours from Android 12 on
   (`DynamicColors`), edge to edge. A dark-mode or display size change recreates the screen (it
   handles neither `uiMode` nor `density`), which restores the fragment, scroll position and an
@@ -434,6 +436,8 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ## To verify
 
+- File-access consent on physical devices; API 34 covered English/Chinese layout, cancellation,
+  Back/outside dismissal, recreation, enabling and immediate disabling; build and lint passed.
 - About's version row and Play Store navigation on a device, including web fallback, missing
   handlers and returning to Settings; `assembleDebug` and `lintDebug` passed.
 - About's project link and return to Settings on a device, including Custom Tabs, a browser

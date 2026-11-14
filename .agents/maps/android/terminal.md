@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: acknowledge guest browser requests only when the terminal is focused and Android accepts its Custom Tab intent)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: localized file-access consent and disabled-file hints cover home and system directories)
 
 ## Responsibilities
 
@@ -336,8 +336,9 @@ notice assets and the build (`android/native`).
   A `file:` link (`ls --hyperlink`) is looked up off
   the main thread through the Files app's provider (`Documents.fileLink`) and opened as its
   document, typed by it and with read access granted: a directory in the Files app, a file in the
-  app the system picks. A link from another host, outside the home while the whole system is not
-  shown, or to nothing in the store gets a toast instead, as does a link no app takes.
+  app the system picks. A link from another host, to an existing file while file access is off,
+  or to nothing in the store gets a toast instead, as does a link no app takes. The disabled-file
+  hint names "Allow other apps to access files" in both locales, matching Settings' consent dialog.
   The lookup result returns on the UI thread and is ignored if its activity has been destroyed.
 - A tab's clipboard read reaches the activity through the service (`onClipboardRead`; the queue and
   the answers are `VtSession`'s, android/vt). `MainActivity` reads the clipboard's first item as

@@ -22,7 +22,7 @@ internal object Settings {
     private const val KEY_KEEP_AWAKE = "keep_awake"
     private const val KEY_RUN_POLICY = "run_policy"
     private const val KEY_IDLE_POLICY = "idle_policy"
-    private const val KEY_SYSTEM_DOCUMENTS = "system_documents"
+    private const val KEY_FILE_ACCESS = "file_access"
     private const val KEY_FILL_WIDE = "fill_wide"
     private const val KEY_CURSOR_STYLE = "cursor_style"
     private const val KEY_CURSOR_BLINK = "cursor_blink"
@@ -76,12 +76,13 @@ internal object Settings {
         if (runPolicy(context) == RunPolicy.ALWAYS) idlePolicy(context) else RunPolicy.ALWAYS
 
     /**
-     * Whether the Files app also shows the whole system, read-only (a switch in Settings, off by
-     * default, the android/documents map).
+     * Whether other apps may access documents, including the home directory (off by default,
+     * the android/documents map). The old system_documents preference is intentionally ignored:
+     * enabling file access now requires confirmation of the sensitive-file warning.
      */
-    fun systemDocuments(context: Context): Boolean = prefs(context).getBoolean(KEY_SYSTEM_DOCUMENTS, false)
+    fun fileAccess(context: Context): Boolean = prefs(context).getBoolean(KEY_FILE_ACCESS, false)
 
-    fun setSystemDocuments(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_SYSTEM_DOCUMENTS, on) }
+    fun setFileAccess(context: Context, on: Boolean) = prefs(context).edit { putBoolean(KEY_FILE_ACCESS, on) }
 
     /**
      * Whether the terminal enlarges CJK characters to fill their two cells (a switch in Settings,

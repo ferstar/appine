@@ -61,10 +61,9 @@
                 android:exported="false"
                 />
 
-        <!-- The android/documents map: the home directory in the system Files app (and optionally
-             the whole system, read-only); only the system (the Files app, which holds
-             MANAGE_DOCUMENTS) has direct access, other apps go through grants the user picks
-             there -->
+        <!-- The android/documents map: opt-in access to the home and whole system (read-only outside
+             the home); only the system (the file picker, which holds MANAGE_DOCUMENTS) has direct access,
+             other apps go through grants the user picks there -->
         <provider
                 android:name=".Documents"
                 android:authorities="${applicationId}.documents"

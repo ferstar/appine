@@ -139,8 +139,11 @@
     <string name="copy_report">复制报告</string>
     <string name="report_copied">已复制报告</string>
     <string name="boot_failed_text">%1$s。开机的输出在 /var/log/boot.log。</string>
-    <string name="settings_system_documents">在文件 App 中显示系统目录</string>
-    <string name="system_documents_summary">浏览 Appine 中从 / 开始的目录和文件，home 目录可读写，其他目录只读</string>
+    <string name="settings_file_access">允许其他应用访问文件</string>
+    <string name="file_access_summary">通过系统文件选择器访问 Appine 文件，home 目录可读写，其他目录只读</string>
+    <string name="file_access_title">允许其他应用访问文件？</string>
+    <string name="file_access_message">开启后，home 和系统目录会出现在系统文件选择器中。获准访问的应用可读取或复制其中的 SSH 私钥、密码等敏感信息，即使文件只读。</string>
+    <string name="file_access_enable">开启</string>
     <string name="settings_fill_wide">放大中日韩文字</string>
     <string name="fill_wide_on">等比放大至两格宽，减少字间留白</string>
     <string name="fill_wide_off">保持原始大小，在两格内居中显示</string>
@@ -173,6 +176,6 @@
     <string name="select_output">选中输出</string>
     <string name="link_no_app">没有能打开这个链接的应用</string>
     <string name="link_remote_file">这个文件在 %1$s 上，不在 Appine 里</string>
-    <string name="link_hidden_file">文件位于 home 目录之外，请在设置中开启：在文件 App 中显示系统目录</string>
+    <string name="link_hidden_file">文件访问已关闭，请在设置中开启“允许其他应用访问文件”</string>
     <string name="link_missing_file">找不到这个文件</string>
 </resources>
