@@ -1,13 +1,13 @@
 ---
 name: map-module
 description: |
-  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.codex/maps/`. Use when the user explicitly invokes `$map-module`, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only explorer subagents for research and verification.
+  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly invokes `$map-module`, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only explorer subagents for research and verification.
 ---
 
 # Map Module
 
 Produce a “how it works today” snapshot. Keep decision history in the paired
-`.codex/decisions/<module-id>.md`; do not turn the map into a design proposal or changelog.
+`.agents/decisions/<module-id>.md`; do not turn the map into a design proposal or changelog.
 
 Read `references/report-contracts.md` before dispatching research or verification tasks. Use its
 report contracts and final map template. Read `references/split.md` before splitting a module.
@@ -58,7 +58,7 @@ report contracts and final map template. Read `references/split.md` before split
 
 1. Resolve `<module-id>` and the subsystem root. Derive them from the request and repository when
    safe; ask only if different interpretations would materially change the map.
-2. Read `.codex/MODULES.md`, the paired decision file if present, and the current map if refreshing.
+2. Read `.agents/MODULES.md`, the paired decision file if present, and the current map if refreshing.
    Read a related map only when an identified boundary or unresolved question crosses into it.
 3. Confirm that the root exists at the current `HEAD`. If it is missing, inspect Git history and
    symbol moves to distinguish a deleted historical subsystem from a renamed successor. Do not map
@@ -131,7 +131,7 @@ are met.
 4. Synthesize a baseline map using the final map template. Merge overlaps, distinguish public
    names from class or package names, and place uncertainty only under `Open questions` or
    `To verify`.
-5. Write or update `.codex/maps/<module-id>.md` with `apply_patch`.
+5. Write or update `.agents/maps/<module-id>.md` with `apply_patch`.
 
 ## Phase 2: Full adversarial verification
 
@@ -166,7 +166,7 @@ section rewrites, anchor on unique headings and fail on ambiguous matches.
 
 ## Phase 4: Register, connect, and validate
 
-1. If the module is new, add it to the matching section of `.codex/MODULES.md` only after the map
+1. If the module is new, add it to the matching section of `.agents/MODULES.md` only after the map
    is verified. Keep the registry near its documented size and describe the verified boundary.
 2. Check whether the root `AGENTS.md` or `AGENTS.override.md` tells Codex to resolve affected module IDs,
    read the matching map and decision files before editing, and conditionally run a targeted map
@@ -178,7 +178,7 @@ section rewrites, anchor on unique headings and fail on ambiguous matches.
    - follows the reference template;
    - contains no source `path:line` citations;
    - separates facts, confirmed bugs, open questions, and external residuals;
-   - pairs to the same module id under `.codex/decisions/`.
+   - pairs to the same module id under `.agents/decisions/`.
 4. If this run wrote the map, measure its bytes (`wc -c`) and estimate tokens as bytes / 2.3,
    labeling that estimate as approximate. Compare with the output budget available for a single
    file read (for example, the active shell tool's `max_output_tokens`), not the model's entire

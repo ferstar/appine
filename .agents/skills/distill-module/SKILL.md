@@ -1,18 +1,18 @@
 ---
 name: distill-module
-description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.codex/decisions/`. Use only when the user explicitly invokes `$distill-module`; do not select it from natural-language requests alone."
+description: "Distill structured `MODULE` Decision blocks from Git history into stable snapshots for registered modules under `.agents/decisions/`. Use only when the user explicitly invokes `$distill-module`; do not select it from natural-language requests alone."
 ---
 
 # Distill Module
 
-Distill immutable Decision records from `git log` into one reviewable snapshot for a registered module. Treat Git history as the source of truth and `.codex/decisions/<id>.md` as a derived view.
+Distill immutable Decision records from `git log` into one reviewable snapshot for a registered module. Treat Git history as the source of truth and `.agents/decisions/<id>.md` as a derived view.
 
 Never amend, rebase, delete, or otherwise rewrite commits. Record corrections in new commits with `SUPERSEDES`.
 
 ## Identify the module
 
 1. Run from the repository root.
-2. Read `.codex/MODULES.md`.
+2. Read `.agents/MODULES.md`.
    - Do not silently create the registry when it is missing.
    - Stop and tell the user to use `$commit-context` to create the registry.
 3. Resolve the target:
@@ -20,7 +20,7 @@ Never amend, rebase, delete, or otherwise rewrite commits. Record corrections in
    - If the ID is unknown, list the registered IDs and ask the user to choose.
    - If no target was supplied, ask for one instead of guessing.
    - For requests such as "the next due module," calculate pending Decision counts and let the user choose from the candidates.
-4. Map the ID to `.codex/decisions/<id>.md`, preserving `/` as a subdirectory separator. For example, map `native/jni` to `.codex/decisions/native/jni.md`.
+4. Map the ID to `.agents/decisions/<id>.md`, preserving `/` as a subdirectory separator. For example, map `native/jni` to `.agents/decisions/native/jni.md`.
 5. Read the existing destination before mining history. Preserve its `D<n>` identifiers and manual annotations.
 
 ## Mine Decision blocks
@@ -137,15 +137,15 @@ carry the parent's `MODULE` tag, so mining the child never finds them, and an en
 child would come back to the parent on its next distill. The child's map lists them on its `See`
 line.
 
-- Before drafting a child's snapshot, read the `See` line of `.codex/maps/<id>.md` when the map
+- Before drafting a child's snapshot, read the `See` line of `.agents/maps/<id>.md` when the map
   exists. If it lists decisions from before a split, add a preamble line after `Last distilled`,
   separated by a bare `>` line, and do not copy those decisions:
 
   ```markdown
-  > Decisions on <child> made before it was split from <parent> keep their `<parent>` tags and live in `.codex/decisions/<parent>.md`: D2, D4 and D6–D8.
+  > Decisions on <child> made before it was split from <parent> keep their `<parent>` tags and live in `.agents/decisions/<parent>.md`: D2, D4 and D6–D8.
   ```
 
-- When distilling a parent, search `.codex/maps/` and `.codex/decisions/` for split-off modules
+- When distilling a parent, search `.agents/maps/` and `.agents/decisions/` for split-off modules
   that list its decisions. Report under the review warnings any listed ID this distill supersedes,
   and any new decision tagged with the parent that concerns a child's area, which is likely
   mis-tagged. Do not edit the children's files from this skill.
@@ -157,7 +157,7 @@ When a snapshot grows past roughly 30 full-detail active entries, or is otherwis
 - Insert `## Constraint index (compressed active decisions)` before `## Active (full detail)`. Move settled decisions there as one-line bullets shaped like `- **D<n>** — <surviving constraint, trap, or contract> (<source-sha>)`.
 - Keep IDs unchanged. Indexed decisions remain active and continue to participate in ID reuse and `SUPERSEDES` resolution; the two sections together are the complete current consensus, while `Active (full detail)` contains the recent, in-flight, or nuanced entries that still need full detail.
 - Do not compress an entry when an actionable qualification or manual annotation cannot be preserved safely in one sentence.
-- Keep each compressed batch recoverable from Git. Record a batch-specific reference in the index preamble, such as `D1–D20: git show <full-sha>:.codex/decisions/<id>.md`, and retain earlier references on later rounds.
+- Keep each compressed batch recoverable from Git. Record a batch-specific reference in the index preamble, such as `D1–D20: git show <full-sha>:.agents/decisions/<id>.md`, and retain earlier references on later rounds.
 - Before proposing compression, verify that the referenced reachable commit contains the full text of every entry in that batch. If it does not, leave those entries uncompressed and warn the user.
 - Do not create a sibling archive file. The pinned snapshot and per-entry source commits provide the detailed history without duplicating stale text in the working tree.
 
@@ -179,7 +179,7 @@ Ask for explicit approval to write the proposed snapshot. Apply requested edits,
 
 ## Write the approved snapshot
 
-Write only the approved content to `.codex/decisions/<id>.md`, creating parent directories when needed. Do not stage, commit, or push.
+Write only the approved content to `.agents/decisions/<id>.md`, creating parent directories when needed. Do not stage, commit, or push.
 
 After writing:
 

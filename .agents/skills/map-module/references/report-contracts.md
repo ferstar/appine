@@ -86,7 +86,7 @@ Interpret verdicts strictly:
 # <module-id> Map
 
 > Static understanding snapshot, not a decision history.
-> See `.codex/decisions/<module-id>.md` for the paired decision history.
+> See `.agents/decisions/<module-id>.md` for the paired decision history.
 >
 > Verified: YYYY-MM-DD (verification summary)
 

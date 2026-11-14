@@ -74,7 +74,7 @@ is still over, propose another cut instead of condensing facts away.
   they stay in the parent's snapshot:
 
   ```markdown
-  > See `.codex/decisions/<child-id>.md` for the paired decision history (not yet created; decisions from before the split are D1, D13 and the page-table half of D4 in `.codex/decisions/<parent-id>.md`).
+  > See `.agents/decisions/<child-id>.md` for the paired decision history (not yet created; decisions from before the split are D1, D13 and the page-table half of D4 in `.agents/decisions/<parent-id>.md`).
   ```
 
   Do not copy or move those decisions. They keep the parent's `MODULE` tag, and `$distill-module`
@@ -107,7 +107,7 @@ is still over, propose another cut instead of condensing facts away.
 - Search the repository for the parent id and for the moved concepts: other maps, the registry,
   docs, and source comments that name a map. Repoint every statement that attributes a moved fact
   or file to the parent. Expect several other maps to change.
-- In `.codex/MODULES.md`, narrow the parent's entry and register each child next to it. When the
+- In `.agents/MODULES.md`, narrow the parent's entry and register each child next to it. When the
   boundary runs inside a file, name the sections or symbols each side owns and write the parent's
   entry with `except`; the registry is then the only record of that boundary.
 

@@ -33,31 +33,31 @@ Re-run `git diff --staged` after any staging operation. Base every later section
 Omit the entire `# Decisions` section when either condition holds:
 
 - The change is genuinely trivial: typo-only, comment-only, formatting-only, or a single obvious fix with at most five net changed lines and no new imports, methods, classes, or configuration behavior.
-- The repository lacks `.codex/MODULES.md` and the user declines to create it.
+- The repository lacks `.agents/MODULES.md` and the user declines to create it.
 
 Keep one motivation line in the prose body even when omitting Decisions.
 
-For nontrivial changes, use `.codex/MODULES.md` as the module registry:
+For nontrivial changes, use `.agents/MODULES.md` as the module registry:
 
 1. Read IDs from entries shaped like ``- `<id>` — description`` under any level-two section.
 2. Treat only those exact IDs as legal `MODULE` values.
 3. Match structural modules by changed paths and cross-cutting modules by change semantics.
 4. Write one Decision per matched module.
 
-If `.codex/MODULES.md` is missing:
+If `.agents/MODULES.md` is missing:
 
 1. Explain that the repository has no Codex module registry and propose one to three entries inferred
    from the staged diff.
 2. Show the complete draft and write it only after explicit approval.
-3. Stage the approved `.codex/MODULES.md`.
+3. Stage the approved `.agents/MODULES.md`.
 4. If the user declines, omit Decisions for this commit.
 
 If no existing module matches, ask the user for the new module name and whether to add it. Require ASCII lowercase letters and digits, hyphens between words, and slashes for hierarchy, such as `live-call/role-dialog`. Reject invalid names without silently rewriting them. Report the current registry size and note that keeping roughly 15–25 entries improves usability. Append and stage an approved entry.
 
 ## Reconcile Codex knowledge-loop rules
 
-Run this reconciliation when the final staged diff creates or modifies `.codex/MODULES.md`, a file
-under `.codex/maps/`, or a file under `.codex/decisions/`. This covers both first-time bootstrap and
+Run this reconciliation when the final staged diff creates or modifies `.agents/MODULES.md`, a file
+under `.agents/maps/`, or a file under `.agents/decisions/`. This covers both first-time bootstrap and
 later rule upgrades without prompting during unrelated commits. Do not run it merely because a
 registry already exists.
 
@@ -74,7 +74,7 @@ registry already exists.
    module maps will not be consumed or maintained automatically.
 
 Use this block, translating its prose to match an existing instruction file when appropriate. Keep
-literal identifiers and all-uppercase field names unchanged, including `.codex/` paths and
+literal identifiers and all-uppercase field names unchanged, including `.agents/` paths and
 `$commit-context` / `$map-module` invocations. Paste it flush-left under its own top-level H2 so it
 does not collide with existing sections.
 
@@ -83,8 +83,8 @@ does not collide with existing sections.
 
 ### Before editing code
 
-1. Resolve every module the change touches through `.codex/MODULES.md`; map `/` in an ID to subdirectories.
-2. Read `.codex/maps/<module>.md` and `.codex/decisions/<module>.md` when present for every affected module. Do not load unrelated module files; if output is truncated, continue with focused ranges until each required file is complete.
+1. Resolve every module the change touches through `.agents/MODULES.md`; map `/` in an ID to subdirectories.
+2. Read `.agents/maps/<module>.md` and `.agents/decisions/<module>.md` when present for every affected module. Do not load unrelated module files; if output is truncated, continue with focused ranges until each required file is complete.
 3. Expand source context only to answer a named unresolved question. Stop when the behavior, change boundary, constraints, and verification path are clear.
 4. Run `git log --oneline -10 -- <path>` for files about to change. Use `git show` only for recent commits relevant to the current behavior, including those with matching `MODULE: <current module>` Decision blocks.
 
@@ -132,7 +132,7 @@ Append the following sections after a `---` separator:
 # Decisions
 
 ## Decision 1
-- MODULE: <exact ID from .codex/MODULES.md>
+- MODULE: <exact ID from .agents/MODULES.md>
 - WHY: <one-line motivation>
 - ALTERNATIVES: <considered approaches separated by " / ">
 - CHOSEN: <implemented approach>
