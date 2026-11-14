@@ -6,7 +6,7 @@ import android.graphics.Path
 import android.graphics.RectF
 
 /**
- * Characters drawn as shapes instead of from a font (the terminal view, the android/vtview
+ * Characters drawn as shapes instead of from a font (the terminal view, the android/vtrender
  * map): box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline triangles
  * (U+E0B0–U+E0B3). Fonts draw these with their own heights and stroke widths, which leave gaps
  * between rows and misalign with the cell grid; drawn here, every line is pixel-aligned and runs to

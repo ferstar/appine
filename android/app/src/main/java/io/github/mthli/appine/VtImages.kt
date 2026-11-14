@@ -7,7 +7,7 @@ import android.graphics.Rect
 import androidx.core.graphics.createBitmap
 
 /**
- * The Kitty images a tab's frames show (the android/vtview map): the last frame's placements in
+ * The Kitty images a tab's frames show (the android/vtrender map): the last frame's placements in
  * drawing order (from a pool kept across frames), which [VtRenderer] paints into the rows they
  * reach, and the bitmaps of the images they show by id, copied from libghostty-vt
  * ([VtNative.image]) when their pixels change and dropped once no placement shows them.

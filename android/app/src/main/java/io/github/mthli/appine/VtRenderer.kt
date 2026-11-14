@@ -19,7 +19,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * How [VtView] draws its [VtScreen] (the android/vtview map): with JetBrains Mono on a fixed cell
+ * How [VtView] draws its [VtScreen] (the android/vtrender map): with JetBrains Mono on a fixed cell
  * grid, each row a frame brings painted into a bitmap the size of the grid (and the overscan row),
  * and the cursor and the input method's composing text drawn over it.
  *

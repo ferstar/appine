@@ -31,9 +31,9 @@ Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `No
 `Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`, `Diagnostics.kt`.
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
-and its tab bar (`android/terminal`); rendering (`android/vtview`); sessions' internals and the
-console adapter (`android/vt`); the Files app
-provider (`android/documents`); JNI and the kernel API (`android/native`, `kernel/process`).
+and its tab bar (`android/terminal`); the view (`android/vtview`) and rendering (`android/vtrender`);
+sessions' internals and the console adapter (`android/vt`); the Files app provider
+(`android/documents`); JNI and the kernel API (`android/native`, `kernel/process`).
 
 ## Key types
 

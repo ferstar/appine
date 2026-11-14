@@ -6,7 +6,7 @@ import java.nio.ByteOrder
 import kotlin.math.min
 
 /**
- * A frame from [VtNative.frame] (the android/vtview map), read in place: its header, its image
+ * A frame from [VtNative.frame] (the android/vtrender map), read in place: its header, its image
  * placements and its rows, in the format `hosts/android/src/vt.c` documents and writes (the two
  * change together). Valid until the next frame is taken.
  */

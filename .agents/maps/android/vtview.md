@@ -1,36 +1,35 @@
 # android/vtview Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/vtview.md` for the paired decision history (decisions from before the split are D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48 in `.agents/decisions/android/terminal.md`).
+> See `.agents/decisions/android/vtview.md` for the paired decision history (decisions from before the split are D5, D7, D9, D16, D17, D25, D30–D32, D34, D36, D37, D40, D41, D43 and D46–D48 in `.agents/decisions/android/terminal.md`; this snapshot also keeps D1–D3 and the rendering part of D5 from before android/vtrender was split out).
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the split; latest change: paste-confirmation previews use monospace while the explanation keeps the dialog font)
+> Maintained: 2026-11-14 (targeted verification only since the split; latest change: split the frame format, rendering classes and font into android/vtrender, retaining view lifecycle and interaction here)
 
 ## Responsibilities
 
-`android/vtview` is the view that draws a tab's terminal and takes its input: `VtView` (frames,
-the cursor's blinking and the bell, keys, the IME and pastes, selection by touch and by mouse,
-links, search, gestures and scrolling by pixels, and the uses of the shell's prompt marks: jumping,
-selecting a command's output and moving the cursor by taps), with `VtFrame` (reading a frame),
-`VtScreen` (the screen as of the last frame), `VtRenderer` (drawing it with the bundled JetBrains
-Mono), `VtImages` (the images programs show), `VtKeys` (key codes) and `VtGlyphs` (characters
-drawn as shapes), and vt.c's side of each: the frame format, key, paste and mouse encoding,
-selection, links, taps on the prompt and search.
+`android/vtview` is the terminal view's lifecycle and interaction: `VtView` attaches a tab,
+requests frames and applies their interaction state, schedules redraws and cursor/password timers,
+and handles keys, the IME, pastes, gestures, pixel scrolling, selection by touch and mouse, links,
+search, zoom and the uses of prompt marks (jumping, selecting output and moving the cursor by taps).
+`VtKeys` maps Android key codes to libghostty-vt's key numbers.
 
-Root: `VtView.kt`, `VtFrame.kt`, `VtScreen.kt`, `VtRenderer.kt`, `VtImages.kt`, `VtGlyphs.kt` and
-`VtKeys.kt` in `android/app/src/main/java/io/github/mthli/appine/`, the terminal font in
-`android/app/src/main/assets/fonts/`, and the Frames, Input, Paste, Mouse and focus, Selection,
-Links, Taps on the prompt and Search sections of `hosts/android/src/vt.c`.
+Root: `VtView.kt` and `VtKeys.kt` in `android/app/src/main/java/io/github/mthli/appine/`, and the
+Input, Paste, Mouse and focus, Selection, Links, Taps on the prompt and Search sections of
+`hosts/android/src/vt.c`.
 
-Outside the module: the sessions, the terminal handle and its lock, the JNI functions (`VtNative`,
-`vt.rs`) and the rest of vt.c (`android/vt`); the screen around the view, the search bar and
-opening links (`android/terminal`).
+Outside the module: the frame format, Frames section of vt.c, screen mirror, rendering classes
+and font (`android/vtrender`); the sessions, terminal handle and lock, JNI functions (`VtNative`,
+`vt.rs`) and the rest of vt.c (`android/vt`); the surrounding screen, search bar and opening links
+(`android/terminal`). All of `VtView`, including `onDraw`, `apply` and drawing interaction overlays,
+stays here; it calls android/vtrender to decode frames and paint the grid, cursor and preedit.
 
 ## Key types
 
 - `VtView` — the view: the attached `VtSession`; its `VtScreen`, `VtImages` and `VtRenderer`
-  (whose cell metrics it reads); the font size and the wide-cell setting; the last frame's modes
+  (android/vtrender, whose cell metrics it reads); the font size and the wide-cell setting; the
+  last frame's modes
   (`altScreen`), scroll position (and whether the viewport is at the bottom) and selection bounds
   and shape; `scrollPx` (pixels, less than a row, the grid is drawn above its place while the
   viewport scrolls) with the drag's sub-pixel remainder; the search's state and count and the rows
@@ -42,19 +41,6 @@ opening links (`android/terminal`).
   timer; the password check (`passwordCheck`, `imePassword`); the bell's last vibration. `Host`
   (the activity): `onGrid`, `onInput`, `onZoom`, the extra keys' `ctrl`, `alt`, `shift` and
   `modifiersUsed`, `onLink` and `onSearchCount`.
-- `VtFrame` — a frame read in place (an inline class over the direct buffer): the header's
-  fields, each image placement, and copying the rows into a `VtScreen`.
-- `VtScreen` — the screen as of the last frame: a mirror of the cells (codepoint, colours,
-  attributes with search marks, grapheme clusters, each row's selected columns), one row taller
-  than the grid (the overscan row), the default colours and the cursor.
-- `VtRenderer` — four paints (regular/bold × upright/italic) and the cell metrics from them, the
-  backing bitmap (one row taller than the grid, like the mirror) and the drawing: rows into the
-  bitmap, the bitmap, the cursor (or the lock) and the composing text into the view's canvas; the
-  cell attribute, underline, cursor and search colour constants.
-- `VtImages` — the last frame's image placements (`Placement`, pooled) and the bitmaps they show
-  by id and generation (`Picture`), copied, drawn per layer into a row and dropped.
-- `VtGlyphs` — box drawing (U+2500–U+257F), block elements (U+2580–U+259F) and the Powerline
-  triangles (U+E0B0–U+E0B3) drawn as shapes.
 - `VtKeys` — Android key codes to libghostty-vt's `GhosttyKey` numbers (`of`, 0 when unknown),
   modifier bits (Shift, Ctrl, Alt, Meta as Super; no lock bits), actions, `isModifier`.
 
@@ -69,115 +55,21 @@ opening links (`android/terminal`).
 
 ## Data flow / lifecycle
 
-### Frames and drawing
+### Frame integration
 
-- `onOutput` posts an invalidate on animation to the attached view; `onDraw` takes a frame
-  (`VtNative.frame`, main thread only) and applies it: `frame` clears `dirty`, shows the animation
-  frames due (unless a synchronized-output hold is active), updates the render state (likewise),
-  reads the image placements again when their generation changed, catches a running search up
-  with the terminal for at most 4 ms and marks its matches in the viewport, and writes a 64-byte
-  header, the image placements (56 bytes each) and the dirty rows and the rows whose search marks
-  changed since the last frame (all rows when the view asks for a full frame, or when the
-  placements changed while some were or are on the screen) in the format documented in `vt.c`
-  (12-byte row headers, 16-byte cells, a grapheme's extra codepoints after its row); the direct
-  `ByteBuffer` is valid until the next `frame`. A search not yet caught up sets a header flag, and
-  the view draws again on the next animation frame to go on.
-- Overscan: while the viewport is scrolled back the render state captures the row after it too,
-  the header says so (byte 58) and that row comes as row `rows` (vt.c numbers rows by the
-  iterator, which is right while nothing above the viewport is asked for), with the same cells,
-  dirty flag and selection columns as the others but no search marks (they come once it is in the
-  viewport). The view then draws the grid up to a row higher (`scrollPx`, Gestures and selection),
-  so as much of that row shows at the bottom as is hidden of the first.
-- Images (the Kitty graphics protocol): libghostty-vt stores what programs send (PNG decoded at
-  once with Wuffs, which libghostty-vt.a links, into straight-alpha RGBA; larger than the storage
-  refused) and its render state lists what to draw: per placement the image, a source rectangle,
-  a destination in pixels from the grid's corner (which may start above or left of it), a layer
-  (below the backgrounds, below the text, above it) and a z-index. `frame` sorts them as Ghostty
-  does (layer, z-index, image), then by placement and position, and joins the rows of a virtual
-  placement (one per row of placeholder cells) back into one rectangle where they meet, since
-  each row's source comes in whole image pixels and rows scaled apart leave seams. Every frame
-  carries the whole list, and the header the milliseconds to the next animation frame (at least
-  8, 0 when none plays), for which the view draws again.
-- The view keeps a bitmap per image shown (`VtImages`), by id with the generation of its pixels:
-  a placement of another generation has them copied (`VtNative.image`, through libjnigraphics' bitmap
-  locking, premultiplied as `ARGB_8888` holds them; gray and RGB images widened), reusing the
-  bitmap when the size is the same; a copy fails when the terminal has moved on to another
-  generation, and the next frame names that. Bitmaps no placement shows are recycled; attaching
-  another tab drops them all, and so does the window being hidden (the activity stopped), after
-  which the next frame copies them again from libghostty-vt while the backing bitmap still holds
-  the rows painted with them. Pixels that arrive in a frame that does not repaint every row ask
-  for a full frame.
-- A hold (mode 2026) captures the screen when it begins; it ends with the program, a resize or a
-  full reset, or by force once a frame is taken more than 1 s after it began. During a hold the
-  rows, cursor and colours come from the capture, and so does the overscan byte, while the
-  header's modes, selection and scroll position are read live.
-- The view asks for a full frame after a regrid, a new bitmap, new default colours (OSC 10 or 11,
-  reverse video), a change of the wide-cell setting, attaching another tab or the attached tab's
-  shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
-  also resizes the tab's terminal and console to the view's grid when it differs.
-- The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
-  focus events 1004, a selection exists, it is a rectangle, the search is still catching up), the
-  selection's first and last cells in the viewport (a rectangle's top left and bottom right
-  corners), the scroll position libghostty-vt reports for the scroll bar (the scrollable area in
-  rows, the viewport's first row in it and the rows it shows), the search's count (matches so
-  far, the selected one's place from the newest) and the mouse pointer's shape the program asked
-  for (OSC 22, byte 59); each row carries its selected columns (a
-  rectangle's columns on each of its rows) and each cell its search mark (attributes bits 14 and
-  15). `VtView` reads the dirty byte only to tell whether late image pixels need a full frame and,
-  while searching, whether to take the matches' rows again, the focus-events flag not at all, and
-  reports the count to the activity when it changes.
-- Cell metrics: the width is the font's advance rounded to whole pixels and the text size is
-  adjusted so the advance equals it; the height is the ceiling of ascent+descent, with the baseline
-  centred; the light line width is the font's underline thickness. The wide scale is two cells over
-  the advance of "水" (the system's CJK fallback, one em, so 1.2 with JetBrains Mono; a font's own
-  ideograph when it has one), at least 1, or 1 with the setting off.
-- `onDraw` fills the view with the default background, applies the frame, draws the bitmap
-  clipped to the grid's whole cells (the margin below keeps the background) and shifted up by
-  `scrollPx`, then the cursor and the composing text translated by it, then the handles (whose
-  places subtract it). Applying a frame repaints each row it brings into the bitmap under a
-  clip: default background,
-  the images below the backgrounds (showing through cells of the default background), runs of
-  other backgrounds (a search match's colour over a cell's own), the images below the text, the
-  selection's translucent highlight, text (black in a search match), then the images above the
-  text; images are scaled from their source to their destination with bilinear filtering, as
-  Ghostty samples them, and only the part in the row is drawn. Plain ASCII runs of
-  one paint, colour and decoration go out in one draw call; other glyphs are centred in their one
-  or two cells, a wide cell's glyph enlarged evenly by the wide scale about the cell's vertical
-  middle, and any glyph still wider than its cells shrunk evenly to fit (never stretched); single
-  codepoints `VtGlyphs` covers are shapes across their one or two cells; Kitty placeholder cells
-  (U+10EEEE, with or without their diacritics) have no glyph drawn, as in Ghostty; four paints
-  (regular/bold × upright/italic) from the variable font with ligatures off. Underlines (single,
-  double, curly, dotted, dashed), strikethrough and overline are drawn; inverse and faint apply;
-  invisible hides the glyph but not its decorations; blink is ignored.
-- The cursor (bar and underline two light lines thick, block with the glyph redrawn in the
-  background colour, underline, hollow; a block is drawn hollow while the view lacks focus; all
-  but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
-  a lock while the console reads a password, below), the IME's composing text (shifted
-  left at the right edge) and the theme's text selection handles are drawn over the bitmap each
-  draw.
-- While the console reads a password the frame gives the cursor as a lock (style 4), as Ghostty
-  shows one at password prompts: wherever the cursor is in the viewport, even when the program
-  hid it, never blinking, with or without the focus; `VtRenderer` draws a padlock about as tall as a
-  capital letter on the baseline (Ghostty draws its Nerd Font's U+F023, which JetBrains Mono
-  lacks), and a block instead while the IME composes. The pump notes the state at every read;
-  while the lock shows in a visible window, `VtView` asks the kernel again every 200 ms (Ghostty
-  polls termios as often, all the time), since a program can turn echo back on without printing
-  anything (sudo writes its line break before restoring the terminal), and stops once it ends.
-  While the lock shows, the IME is told a password is typed (Input), as Ghostty turns macOS's
-  secure input on at password prompts.
-- The cursor blinks (shown and hidden every 500 ms, as Android's text fields) while the frame
-  header says it blinks (the setting, on by default; a program changes it with DECSCUSR or mode
-  12) and the view has the focus in a focused window; otherwise no timer runs. Input and a cursor
-  move show it again for a whole period.
-- The cursor setting (Settings' shape, block, bar or underline, and blinking; android/service
-  gives it to every tab, restored ones not shown yet included, as `VtSession.setCursor`) is
-  libghostty-vt's default cursor: a change shows at once unless a program chose its own cursor
-  (DECSCUSR with a nonzero style), and is kept for DECSCUSR 0, DECSTR, a program's RIS and the
-  app's Reset terminal, which bring it back; while the cursor follows its defaults, a change also
-  overrides a program's mode 12. No full frame is needed: every frame's header carries the shape
-  and blinking. A restored tab shows the current setting whatever its snapshot recorded (`settle`'s
-  DECSTR, then the session's setting). The lock ignores it while it shows. Changing it does not
-  make the last snapshot stale.
+- `onOutput` invalidates the attached view; `onDraw` takes `VtNative.frame` on the main thread,
+  reads it through android/vtrender's `VtFrame`, and applies the header to interaction state and
+  `VtScreen`. `VtImages.take` copies image pixels and `VtRenderer.takeRows` updates the grid bitmap;
+  the renderer draws the grid, cursor and preedit, then the view draws scroll-bar search marks and handles.
+- The view owns regridding, full-frame requests, animation redraws and applying mode, selection,
+  scroll, pointer and search-count fields. It rejects frames at an old grid size and requests a
+  full frame after attaching, shell start, regridding, default-colour or wide-cell changes, or late
+  image pixels; the rendering contract and image lifetimes are in android/vtrender.
+- The frame's lock cursor switches the IME's password mode (Input); while visible the view polls
+  the console every 200 ms until that state ends. Cursor blinking runs every 500 ms only while
+  requested by the frame and the view/window have focus; input or cursor movement restarts it.
+  Cursor appearance, default-style semantics and drawing are in android/vtrender.
+
 - The bell of the tab shown vibrates once through `performHapticFeedback(REJECT)` (a double
   click, subject to the system's touch feedback setting), at most once per 100 ms.
 
@@ -433,8 +325,8 @@ opening links (`android/terminal`).
   shown (the scroll bar shows only when it scrolled; a step stops a fling and puts the grid on a
   whole row). The count, reported to the activity when it changes and once after every `search` (so a needle
   that is not found reads "0/0"), grows as a long scrollback is
-  searched over several frames (Frames and drawing). `endSearch` (`VtNative.searchEnd`) ends it and
-  takes its marks away.
+  searched over several frames (android/vtrender drives the search from frame capture).
+  `endSearch` (`VtNative.searchEnd`) ends it and takes its marks away.
 - Matches are drawn as Ghostty draws them: black text on yellow, the selected match on orange, the
   second cell of a wide character with its first. Along the scroll bar, as browsers mark found
   text, a 2 dp mark as wide as the scroll bar in the same yellow (the selected match's in orange)
@@ -488,6 +380,8 @@ select a command's output and move the cursor by taps:
 
 ### Inbound
 
+- android/vtrender: frame capture uses the Selection section's `viewport_ref` and `screen_point`
+  helpers for viewport coordinates and search highlights.
 - `MainActivity` (android/terminal): the entry points above; it also passes the service's bell for
   the tab in front (`bell`) and the wide-cell setting.
 - android/vt: `VtSession.view`, through which the session invalidates the view and reports its
@@ -495,22 +389,22 @@ select a command's output and move the cursor by taps:
 
 ### Outbound
 
+- android/vtrender: `VtFrame`, `VtScreen`, `VtImages` and `VtRenderer`; the view supplies grid and
+  font settings, applies headers, requests full frames and draws the interaction overlays. Frame
+  capture advances the search and encodes its cell marks; this module owns query changes, match
+  selection and the marks along the scroll bar.
 - android/vt: the attached `VtSession` (`tab`, the terminal handle, and `resize`) and `VtNative`'s
-  functions for frames, images, the password state, input, scrolling, selection, output, copies,
+  functions for frames, the password state, input, scrolling, selection, output, copies,
   links, taps on the prompt and search, which hold the tab's lock.
 - android/terminal's `MainActivity` through `Host` (`onGrid`, `onInput`, `onZoom`, the extra keys'
   `ctrl`, `alt`, `shift` and `modifiersUsed`, `onLink`, `onSearchCount`); input reaches the tab's
   writer that way.
-- libghostty-vt through vt.c: the render state with one overscan row and its image list, the key
-  and mouse encoders, paste, focus encoding, selection gestures (a finger's untimed word and line
-  presses and drags; a mouse's timed clicks with their count, cell, word, line and output
+- libghostty-vt through vt.c: the key and mouse encoders, paste, focus encoding, selection gestures
+  (a finger's untimed word and line presses and drags; a mouse's timed clicks with their count, cell, word, line and output
   behaviours, rectangle drags, releases, dragged flag and anchor), word selection and selection
   containment (right-click), output derivation and keyboard adjustment, scrolling by prompts,
   search with the list of all its matches, plain-text formatting of copies.
-- The system's libjnigraphics (images' pixels), the clipboard, Material Components' dialog for the
-  paste confirmation, the system pointers, haptics; JetBrains Mono 2.304 (variable, upright and
-  italic) in the assets and the system's fallback fonts for everything else (CJK from Noto Sans CJK
-  on AOSP images).
+- The clipboard, Material Components' dialog for paste confirmation, system pointers and haptics.
 
 ## Invariants and gotchas
 
@@ -560,31 +454,14 @@ select a command's output and move the cursor by taps:
   from the last left press. A cell press yields no selection (vt.c clears it on a first click, and
   a cell drag not yet past its threshold leaves none, neither resetting the gesture), and a repeat
   keeps the first click's cell, so a release on another cell counts as a drag.
-- A cursor shape set while a full-screen program shows the alternate screen reaches only that
-  screen: libghostty-vt keeps the shape per screen, and leaving the alternate screen with mode 1049
-  restores no shape (its saved cursor carries none), so the primary keeps the old one until the
-  next DECSCUSR 0, DECSTR, RIS or setting change; leaving with mode 47 or 1047 copies the whole
-  cursor, shape included, back (from libghostty-vt's source, not tried).
-- The frame format is defined in `vt.c` and read by `VtFrame`; the two change together. The
-  key numbers in `VtKeys` are `GhosttyKey` values, which `key/event.h` spells out and libghostty-vt's
+- The key numbers in `VtKeys` are `GhosttyKey` values, which `key/event.h` spells out and libghostty-vt's
   ABI keeps from 1.0 on; key, action and mouse-button values it does not know make its setters
   fail (vt.c then encodes nothing), where the copy in Ghostty 1.4.0 took them and could crash.
-- The render state's source rectangles are whole image pixels, so a virtual placement's rows,
-  drawn one by one, overlap or gap by a pixel each and show seams (Ghostty's renderer draws them
-  so); vt.c joins rows that meet. Rows only partly in the viewport keep the rounding at their top.
-- The view paints images into its row bitmap, so a changed placement list must repaint every row:
-  vt.c makes such a frame a full one, and the view asks for one when pixels arrive late. An image
-  read for a frame during a synchronized-output hold may be gone or replaced by then; its copy
-  fails (by generation) and the frame after the hold names the new one.
 - Grid references from libghostty-vt are valid only until the terminal changes, so every selection
   call takes fresh ones; the anchor of a handle's drag and the gesture's pressed cell are tracked,
   and the gesture's selections are installed at once. A changed selection makes the next frame a
   full one (the render state redraws everything when the screen's selection changes), as does
   scrolling the viewport.
-- libghostty-vt's render state keeps search highlights internally, but the C API does not expose
-  them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
-  ones fail for a match that starts above the viewport), and resends a row whose marks differ from
-  the last frame's, since the render state does not count them as a change.
 - A resize restarts libghostty-vt's search and drops its selected match. vt.c notes the match's
   place from the newest before resizing, runs the search to the end afterwards and steps to that
   place again (the steps scroll nothing but the last); a resize that changed which matches exist
@@ -595,35 +472,19 @@ select a command's output and move the cursor by taps:
   set.
 - vt.c's tracked cell of an output frees its tracking only after the output's selection is
   installed: untracking may change the page list the references taken from it point into.
+- A frame is valid only until the next capture. Keep android/vtrender's full-frame invalidation,
+  image-drop and overscan contracts when changing view lifecycle or scrolling; a frame-format or
+  frame-consumer change may require both maps.
 
 ## Confirmed bugs / technical debt
 
-- **libghostty-vt's selection and drawing features left unused**:
-  - selection: the gesture's click counting for a finger, its autoscroll ticks and data (the view
-    scrolls on its own timer), deep presses, behaviour data and word-boundary characters;
-  - drawing: the default palette option (the colour scheme reply is fixed to dark); overscan above
-    the viewport; `row_iterator_next_dirty`; the two-phase render update: `frame` holds the tab's
-    lock while it encodes every row (about 95% of its time on a macOS build), where only
-    libghostty-vt's deferred style work would leave it, and taking the encoding out would need the
-    render state kept apart from the terminal's lock; `ghostty_render_state_row_cells_get_multi`
-    in place of the four to six reads `frame` makes per cell (it stops at the first failing key, so
-    the colours would go last; gain unmeasured); the colour utilities (`palette_generate`, contrast
-    and luminance), of use only with themes;
-- **libghostty-vt's images are trimmed only under pressure before Android 14**: each screen of
-  each tab keeps up to 32 MiB of decoded Kitty images, and while a tab is shown the view holds a
-  second copy of those placed on its screen (dropped while the window is hidden). Only the
-  `RUNNING_LOW` and higher trim levels, which Android 14 and later no longer send, cut the tabs
-  not shown down to 4 MiB a screen (android/vt), deleting the oldest images outright; the routine
-  trim after the UI leaves keeps them all. A tab restored from its snapshot gets its images back
-  (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though a comment
-  in its `snapshot/terminal.zig` says otherwise); one restored from its plain transcript has text
-  only.
+- **libghostty-vt's selection features left unused**: the gesture's click counting for a finger,
+  its autoscroll ticks and data (the view scrolls on its own timer), deep presses, behaviour data
+  and word-boundary characters.
 
 ## Open questions
 
-- Should a Nerd Font or a CJK fallback font be bundled?
 - Should showing another tab send focus-out and focus-in (mode 1004) to the two tabs?
-- Should invisible cells keep their decorations (as now) or hide them as Ghostty's renderer does?
 - Should a mouse wheel or touchpad scrolling the viewport go by pixels and by the event's size
   (high-resolution wheels, touchpads) rather than 3 rows a scroll event?
 - Should a mouse's middle button paste the clipboard (Ghostty's `middle-click-action`; Android has
@@ -631,7 +492,6 @@ select a command's output and move the cursor by taps:
   `copy-on-select`) or bring up the menu?
 - Should a double click on a URL, or a right-click on a link, select the whole link, as Ghostty
   does, and should the extra keys' CTRL make Ctrl+click and the hand pointer work?
-- Should a cursor shape changed while a full-screen program shows reach the primary screen too?
 
 ## To verify
 
@@ -654,7 +514,6 @@ select a command's output and move the cursor by taps:
     autoscroll of a drag held past the grid's edges; taps on the input with fish, or ash with wide
     characters or a command of several rows (tried only through vt.c's harness, the latter with
     bytes recorded from ash 1.37);
-  - drawing: Kitty graphics with yazi, timg, `kitten icat`, tmux passthrough and the 32 MiB storage
-    filled; the bell with haptics off; the cursor setting in Chinese or while a full-screen program
-    shows; the lock cursor with other IMEs composing at it; the search's marks while rows leave a
-    full scrollback.
+  - the bell with haptics off.
+
+Rendering-specific checks remain in android/vtrender.

@@ -24,11 +24,12 @@ the service:
 
 Root: `VtSession.kt`, `ConsolePty.kt` and `VtNative.kt` in
 `android/app/src/main/java/io/github/mthli/appine/`, `hosts/android/src/vt.rs`, and
-`hosts/android/src/vt.c` but its Frames, Input, Paste, Mouse and focus, Selection, Links, Taps on
-the prompt and Search sections.
+`hosts/android/src/vt.c` except its frame-format specification and Frames, Input, Paste, Mouse
+and focus, Selection, Links, Taps on the prompt and Search sections.
 
-Outside the module: drawing, input, selection, search and the view's uses of the prompt marks,
-with those sections of vt.c (`android/vtview`); the screen around the view (`android/terminal`);
+Outside the module: frame encoding and drawing (`android/vtrender`, including vt.c's Frames
+section); view lifecycle, input, selection, search requests and uses of prompt marks
+(`android/vtview`, with the other excluded sections); the surrounding screen (`android/terminal`);
 session ownership, saving, kill reports and where bells, notifications, program statuses,
 clipboard writes and clipboard reads go (`android/service`); the host console in the kernel
 (`kernel/tty`); the JNI crate, `guarded!` and the build, including compiling libghostty-vt with Zig
@@ -120,7 +121,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   beyond; default colours white on black and no default cursor colour, so the cursor follows the
   foreground as in Ghostty; the cursor's default from Settings, a blinking block unless changed
   (`wrap` only turns blinking on over libghostty-vt's steady block, and the session sets the user's
-  choice right after, `VtNative.setCursor`, before the pending text; android/vtview's Frames and
+  choice right after, `VtNative.setCursor`, before the pending text; android/vtrender's Frames and
   drawing); grapheme clustering, mode 2027, on by default as in Ghostty; the render state asks for
   one overscan row below the viewport; the OSC 133 callback (command timing) and unimplemented OSC
   and APC strings reported with 16 bytes kept, of which only an OSC's leading number or an APC's
@@ -369,6 +370,8 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   and `reset`.
 - android/vtview: `VtNative`'s functions for frames, input, selection, links, taps on the prompt
   and search, on the attached session's terminal (`VtSession.tab`), and `VtSession.resize`.
+- android/vtrender: `VtImages` uses `VtNative.image`; its frame and image functions are entered
+  through this module's JNI under the tab lock.
 
 ### Outbound
 
@@ -392,7 +395,7 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   graphics with their render-state image list and animation), and the Wuffs PNG decoder it
   carries, linked into
   `libappine.so` (`android/native`); the system's libjnigraphics (bitmap locking for images'
-  pixels, android/vtview's); `Machine::read_console_run`,
+  pixels, used by android/vtrender); `Machine::read_console_run`,
   `write_console`, `resize_console`, `console_foreground` and `console_password_input`
   (kernel/tty) and the
   bridge's `guarded!`, handle table and string helpers, used from `vt.rs` directly.

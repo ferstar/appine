@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The tabs' terminal emulator (android/vt map; its Frames, Input, Paste, Mouse and focus,
-// Selection, Links, Taps on the prompt and Search sections are the android/vtview map's): one
-// libghostty-vt terminal per tab, behind a small C ABI that vt.rs calls. This file only talks to
-// libghostty-vt; the console, threads and locking are vt.rs's.
+// The tabs' terminal emulator (android/vt map): one libghostty-vt terminal per tab, behind a
+// small C ABI that vt.rs calls. The frame-format specification and Frames section belong to
+// android/vtrender; Input, Paste, Mouse and focus, Selection, Links, Taps on the prompt and Search
+// belong to android/vtview. This file only talks to libghostty-vt; the console, threads and locking
+// are vt.rs's.
 //
 // Threading: libghostty-vt is not thread-safe, and neither is anything here. vt.rs holds one lock
 // around every call, so the terminal, the render state and the buffers below are only used by one

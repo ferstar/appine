@@ -3,7 +3,7 @@ package io.github.mthli.appine
 import android.graphics.Color
 
 /**
- * The screen as of the last frame (the android/vtview map): a mirror of the grid's cells, one row
+ * The screen as of the last frame (the android/vtrender map): a mirror of the grid's cells, one row
  * taller than the grid (the frame's overscan row after the viewport, which shows in part while the
  * grid is drawn shifted up by [VtView]'s pixel scrolling), each row's selected columns, the
  * default colours and the cursor. [VtFrame.takeRows] fills the cells, [VtView] the rest, and

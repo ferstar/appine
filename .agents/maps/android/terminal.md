@@ -1,7 +1,7 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtview` and `android/licenses`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtview`, `android/vtrender` and `android/licenses`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
@@ -9,8 +9,8 @@
 
 ## Responsibilities
 
-`android/terminal` is the terminal screen around the tabs' terminals (`android/vt`, drawn by
-`android/vtview`):
+`android/terminal` is the terminal screen around the tabs' terminals (`android/vt`, shown by
+`android/vtview` using android/vtrender):
 
 - `MainActivity`: the screen's lifecycle and status text, the tab shown and its successor, closing
   tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size and the
@@ -35,8 +35,9 @@ android/privacy's `layout/privacy_shield.xml`, `drawable/privacy_emblem.xml` and
 and android/licenses' `layout/list_item.xml` and `values/ids.xml`. Shared strings, themes,
 `page.xml` and `preference_switch.xml` remain here.
 
-Outside the module: the terminal view (`android/vtview`); the tabs' sessions and consoles and the
-native emulator shim around libghostty-vt (`android/vt`); session ownership, saving, kill reports
+Outside the module: the terminal view (`android/vtview`) and rendering (`android/vtrender`);
+the tabs' sessions and consoles and the native emulator shim around libghostty-vt (`android/vt`);
+session ownership, saving, kill reports
 and where bells, notifications, program statuses and clipboard reads go (`android/service`); the
 notice assets and the build (`android/native`); shared authentication, secure windows and
 protected notification actions (`android/privacy`); the notices list and reader (`android/licenses`).
@@ -257,8 +258,8 @@ protected notification actions (`android/privacy`); the notices list and reader 
   (the tab bar is gone, the place keeps its 32 dp, so the terminal keeps its rows) and brings the
   keyboard up on its text, which is kept from the last search and selected, so typing replaces it;
   that text is searched for again at once. Every change of the text searches anew in the tab shown
-  (`VtView.search`; matching, steps and marks are android/vtview's Search). Empty text searches for
-  nothing and clears the count.
+  (`VtView.search`; query, steps and scroll-bar marks are android/vtview's Search, frame progress
+  and cell highlights android/vtrender's). Empty text searches for nothing and clears the count.
 - No match is selected until a step: `↑`, Enter or the keyboard's Search key selects the next match
   above (towards older output; the first step selects the newest), `↓` or Shift+Enter the one
   below, going round at either end (`VtView.searchStep`). The count reads "selected/total" as the
