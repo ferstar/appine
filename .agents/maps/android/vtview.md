@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: preserve resize previews across full-frame requests and subrow layouts, and wait for settled output)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: suppress keyboard opening for link taps while the program tracks the mouse)
 
 ## Responsibilities
 
@@ -151,10 +151,11 @@ stays here; it calls android/vtrender to decode frames and paint the grid, curso
 
 - A finger's (or a stylus's) tap ends a selection or its menu; a mouse's or touchpad's press takes
   the pointer paths below. Otherwise, when the program does not track the mouse and the
-  tap is on a link, it opens the link instead of the IME; otherwise it opens the IME and, when the
-  program tracks the mouse, also sends a left click (press and release at the tap's pixel position,
-  in the program's format), or else moves the shell's cursor when it is on the input at the prompt
-  (Prompt marks). A tap that stopped a fling does nothing else (one during settling on
+  tap is on a link, it opens the link instead of the IME. When the program tracks the mouse, it
+  sends a left click (press and release at the tap's pixel position, in the program's format)
+  and opens the IME only if the tap is not on a link accepted by `linkAt`; opening the link stays
+  with the program or the long-press menu. Otherwise it opens the IME and moves the shell's cursor
+  when it is on the input at the prompt (Prompt marks). A tap that stopped a fling does nothing else (one during settling on
   a whole row is no fling stop and acts). Taps act at once:
   `VtView` counts taps in a row itself (each within the system's double-tap timeout and slop of
   the last tap's lift). With mouse tracking every tap is a click, for
@@ -513,6 +514,8 @@ select a command's output and move the cursor by taps:
 
 ## To verify
 
+- Link taps with mouse tracking preserve the program's click and skip the explicit IME request;
+  actual keyboard visibility and browser handoff still need end-to-end device verification.
 - `TerminalResizeTest` passes seven API 34 cases: pixel preservation with a queued full frame
   and subrow layouts, incomplete mode 2026 prefixes, quiet output, the 200 ms fallback, accepting
   a full redraw and detach cleanup. Four cases failed with the first preview implementation.

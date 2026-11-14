@@ -56,8 +56,8 @@ import kotlin.math.roundToInt
  * with the images programs show (the Kitty graphics protocol, [VtImages], whose pixels are copied
  * once per change); the cursor and the input method's composing text are drawn over it.
  *
- * Touch: a tap opens the keyboard (and clicks, when the program tracks the mouse); a drag scrolls
- * the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
+ * Touch: a tap opens the keyboard unless on a link (and clicks when the program tracks the mouse);
+ * a drag scrolls the scrollback, or sends wheel events to a program tracking the mouse, or arrow keys on the
  * alternate screen (alternate scroll, mode 1007), and a fling goes on scrolling the same way; while
  * the scrollback scrolls, a scroll bar like a ScrollView's shows where the viewport is in it. A long
  * press or a double tap selects a word and a triple tap a line, and dragging on after a long press
@@ -1618,21 +1618,21 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
                 }
                 // A link opens instead of the keyboard (in mouse mode the tap is the program's,
                 // and the long press's menu opens links); a tap after it is a first tap again
-                val link = if (tab != 0L && !mouseTracking) linkAt(e.x, e.y) else null
-                if (link != null) {
+                val link = if (tab != 0L) linkAt(e.x, e.y) else null
+                if (link != null && !mouseTracking) {
                     lastTapTime = 0L
                     host.onLink(link)
                     return true
                 }
                 // A tap on the input typed at the shell's prompt moves the shell's cursor there, as
-                // Ghostty's cursor-click-to-move does; the keyboard comes up all the same
+                // Ghostty's cursor-click-to-move does
                 if (tab != 0L && mouseTracking) {
                     click(e)
                 } else if (tab != 0L) {
                     send(VtNative.promptClick(tab, cellX(e.x), cellY(e.y)))
                 }
                 requestFocus()
-                inputMethod.showSoftInput(this@VtView, 0)
+                if (link == null) inputMethod.showSoftInput(this@VtView, 0)
                 return true
             }
 
