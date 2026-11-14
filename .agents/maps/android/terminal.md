@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: SYM replaces duplicate symbols with $, *, & and ; while retaining bracket pairs and the other symbol positions)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: background-tab status dots use a 1.5 dp radius with a 2 dp gap from the number)
 
 ## Responsibilities
 
@@ -206,7 +206,7 @@ notice assets and the build (`android/native`).
   indicator's place, its track the progress colour at 30% opacity, filled from the left to the
   percentage or with a quarter of it sweeping across and back, in the progress line's colours (a
   progress report; else a working status, or a blocked one with a percentage, in the primary
-  colour); and a dot of 2 dp radius 1 dp right of the number's ink, centred on the top of its
+  colour); and a dot of 1.5 dp radius 2 dp right of the number's ink, centred on the top of its
   digits, for a status: blocked in the primary colour, failed in the error colour, done in the muted
   one. The row draws them over its tabs, following a sliding tab and fading with its number, and
   redraws every frame while a sweep is drawn.

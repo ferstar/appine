@@ -565,8 +565,8 @@ internal class TabBarView(context: Context, private val target: Target) : FrameL
          * A status dot's radius, and the room between the number's ink and the dot (dp): a dot
          * by the top right of the digits, as a badge on an icon.
          */
-        private const val DOT_RADIUS_DP = 2f
-        private const val DOT_GAP_DP = 1f
+        private const val DOT_RADIUS_DP = 1.5f
+        private const val DOT_GAP_DP = 2f
 
         /**
          * How long the row rests, with no finger on it, before it brings a current tab it was
