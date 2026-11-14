@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-11 (targeted verification only since the split: CPU clock ids translated by their handlers last)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -29,7 +29,7 @@ Root: `core/kernel/src/nsproxy.rs`, `pidns.rs`, `syscall/ns.rs`, the unshare sec
 
 Outside the module: what each namespace holds — mount trees (`kernel/mount`), network devices,
 addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tree
-(`kernel/procfs`); clone itself, pid allocation and a pid-namespace init's exit
+(`kernel/cgroup`); clone itself, pid allocation and a pid-namespace init's exit
 (`kernel/process`); credentials and capability sets (`kernel/cred`); the vDSO stubs' mapping
 (`kernel/mm`); the procfs files' structure (`kernel/procfs`).
 
@@ -149,7 +149,7 @@ addresses and ports (`kernel/netns`), IPC objects (`kernel/ipc`), the cgroup tre
 ### Outbound
 
 - `kernel/mount` (`copy_ns`, `find_ns`, `pinned_ns`, `ns_root`), `kernel/netns` (new network
-  namespaces), `kernel/ipc` (new IPC namespaces, `Ipc::exit`), `kernel/procfs` (cgroup namespace
+  namespaces), `kernel/ipc` (new IPC namespaces, `Ipc::exit`), `kernel/cgroup` (cgroup namespace
   roots), `kernel/cred` (credentials and capability sets), `kernel/mm` (`vdso_syscalls`),
   `kernel/process` (thread groups, `fast_changed`, ptrace access for a pidfd's setns).
 

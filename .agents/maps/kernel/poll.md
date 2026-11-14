@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: netlink socket readiness attributed to kernel/netlink, split out of kernel/net)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -78,8 +78,8 @@ count (`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
   connection's reader object); synthetic files with change notifications (`fd::ProcEvent`:
   mounts and mountinfo `POLLIN|POLLRDNORM`, sysfs and cgroup2 files readable and writable, both
   plus `POLLERR|POLLPRI` while changed, their counter as wake object and read arrival,
-  `kernel/procfs`); `O_PATH` files `POLLNVAL`; everything else (regular files, directories, other
-  devices, other synthetic files, bpf) is always readable and writable. A report of `POLLPRI` or
+  `kernel/procfs` and `kernel/cgroup`); `O_PATH` files `POLLNVAL`; everything else (regular files,
+  directories, other devices, other synthetic files, bpf) is always readable and writable. A report of `POLLPRI` or
   `POLLERR` from mounts or mountinfo, by ppoll, pselect6 or epoll, takes the change in
   (`took_change`, as `mounts_poll` does). The bits are each Linux
   poll operation's: eventfd, timerfd and signalfd report `POLLIN`/`POLLOUT` without the

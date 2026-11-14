@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (split out of the kernel/vfs full mapping of 2026-11-12; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-12 (targeted verification only since the split; latest change: sendfile needs ends that splice, as /dev/full and /dev/null are EINVAL, and takes seekable FUSE inputs)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -377,13 +377,14 @@ pipes, FIFOs and splice (`kernel/pipe`); FUSE opens and I/O (`kernel/fuse`); sto
   `kernel/pipe` (pipes, FIFOs, pipe-size fcntl, which files splice at either end for sendfile),
   `kernel/loop`, and `kernel/fuse` (opens and I/O on
   FUSE files, flushes).
+- `kernel/cgroup` (device BPF checks, cgroup file-change observation and keys).
 - `kernel/procfs` (synthetic opens and content), `kernel/tty` (terminal opens and ioctls),
   `kernel/ipc` (mqueue objects), `kernel/poll` (eventfd and timerfd reads, fasync), `kernel/net`
   (socket I/O and ioctls), `kernel/unix` (files in flight).
 - `kernel/mm` for clones, unsharing and truncation: `writably_maps`, `maps_file`, `file_moving`,
   `file_moved`, `file_truncated`.
 - Credentials (`permission`, `owns`, `capable_wrt`, `new_owner`, `FileCaps`),
-  `bpf::check_device`, `pidns`; signals (`SIGPIPE`, `SIGIO`, `SIGXFSZ`, `F_SETSIG`);
+  `pidns`; signals (`SIGPIPE`, `SIGIO`, `SIGXFSZ`, `F_SETSIG`);
   `kernel/signal`'s `stub` for unimplemented fcntl commands and ioctls.
 - `appine_hal` (pread, pwrite, poll, lseek, fsync, `copy_file`, fallocate, `sync_file_range`,
   `cachestat`, `fill_random`); the kernel's wake objects and `Cx::unlocked`.

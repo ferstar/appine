@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: Machine exposes live-plus-exited guest CPU nanoseconds for Android's busy-only wake lock)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -38,7 +38,7 @@ umask in `kernel/vfs`, and the capability and seccomp prctls in `kernel/cred`.
 Outside the module: execve and the ELF loader (`kernel/exec`), namespaces, unshare, setns and ID
 translation (`kernel/ns`), futexes and robust lists (`kernel/futex`), address spaces and fork
 copy-on-write (`kernel/mm`), CPU state and translation (`engine`), signals and ptrace, credentials,
-mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and procfs files
+mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`kernel/cgroup`), procfs files
 (`kernel/procfs`), the OOM policy.
 
 ## Key types
@@ -180,7 +180,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   execve or exit) the child's `Task::vfork` is set, so the OOM killer can pass it over
   (`kernel/mm`). The waiting parent counts as frozen for `cgroup.events` (`Task::frozen`, as
   Linux's `wait_for_vfork_done`), and stays counted after the wait while its cgroup is freezing,
-  until it stops on the way out (`kernel/procfs`).
+  until it stops on the way out (`kernel/cgroup`).
 
 ### Run loop
 
@@ -569,7 +569,7 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups and p
   pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
   robust lists and PI owners at exit).
 - vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags),
-  `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, cgroups
+  `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, `kernel/cgroup`
   (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
   killer (`kernel/oom`), loadavg, the store's deferred commits, signals (`send_to_group`,
   `send_cpu_timer`, `force_fatal`), the kernel log.

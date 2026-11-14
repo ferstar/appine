@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping of its own after the split from kernel/vfs: five research concerns; 23 claims checked by four independent verifiers, 17 confirmed and 6 partial and corrected; comparisons with Linux 6.1 rest on knowledge of the kernel)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: turning an instance read-only is busy with deleted files in use and writers through detached mounts, memfds are not root writers)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -37,8 +37,9 @@ Outside the module:
 - `kernel/overlay`: overlayfs instances, their options and the overlay node sweep, though the
   option parsing and the sweep sit in `syscall/mount.rs`.
 - `kernel/fuse`: FUSE connections and their mount options.
-- `kernel/procfs`: the content of procfs, sysfs, devpts and cgroup2, the mountinfo text and the
-  `fs.mount-max` sysctl file.
+- `kernel/procfs`: the content of procfs, sysfs and devpts, cgroup2 node adapters, the mountinfo
+  text and the `fs.mount-max` sysctl file.
+- `kernel/cgroup`: the cgroup tree and cgroup2 interface-file policy.
 - `kernel/ns`: the namespace mechanism and its counts (`max_mnt_namespaces`), clone and
   unshare, and setns's dispatch and checks.
 

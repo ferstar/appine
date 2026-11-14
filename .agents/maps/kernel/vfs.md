@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 6 research concerns; 46 claims checked by 3 independent verifiers — 36 confirmed and 10 partial, all corrected below; new bugs and fidelity gaps recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `..` out of a bind's subtree, tmpfs `uid=`/`gid=` mapping, reopened files' display paths)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -34,7 +34,8 @@ syscalls and mount namespaces (`kernel/mount`); overlayfs mounts, lookups, copy-
 and rename (`kernel/overlay`, branched to from here); advisory locks and leases (`kernel/locks`);
 pipes, FIFOs and splice (`kernel/pipe`); extended attributes (`kernel/xattr`); store semantics
 (`kernel/store`); FUSE connections, their node cache and the file syscalls on FUSE nodes
-(`kernel/fuse`, dispatched to from here); procfs/sysfs/cgroup2/devpts content (`kernel/procfs`);
+(`kernel/fuse`, dispatched to from here); procfs/sysfs/devpts content and cgroup2 node adapters
+(`kernel/procfs`); cgroup policy and device BPF (`kernel/cgroup`);
 terminals (`kernel/tty`); sockets (`kernel/net`, `kernel/unix`); poll/epoll, eventfd and timerfd
 (`kernel/poll`); inotify instances, watches and event rules (`kernel/inotify`); native AIO
 (`kernel/aio`); loop devices (`kernel/loop`); message queues (`kernel/ipc`); the BKL and the no-BKL
@@ -320,8 +321,9 @@ capabilities (`kernel/cred`).
   operation; the sweep at syscall end), and `kernel/fuse` (everything on FUSE nodes).
 - `kernel/procfs` (the `Pseudo` views, `pseudo::stat`, writability), `kernel/tty` (devpts),
   `kernel/ipc` (mqueue objects).
-- Credentials (`permission`, `owns`, `capable_wrt`, `new_owner`, `for_access`), `bpf::check_device`,
-  `cgroup`, `pidns`/`nsproxy`; `kernel/signal`'s `stub` for devices without a driver.
+- `kernel/cgroup`: `bpf::check_device`, cgroup mkdir/rmdir.
+- Credentials (`permission`, `owns`, `capable_wrt`, `new_owner`, `for_access`),
+  `pidns`/`nsproxy`; `kernel/signal`'s `stub` for devices without a driver.
 - `appine_hal` (`statvfs`, `memory_info`).
 
 ## Invariants and gotchas

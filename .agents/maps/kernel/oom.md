@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/oom.md` for the paired decision history (decisions from before the split are D26, D29, D32, D35 and D44 in `.agents/decisions/kernel/mm.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -23,7 +25,7 @@ Root: `core/kernel/src/oom.rs`; in `mm.rs` the resident-memory measures (`reside
 
 Outside the module: VMAs, host backing and copy-on-write, which the measures read (`kernel/mm`);
 the timer thread that runs the check and the stop/resume of periodic checks (`kernel/process`);
-the cgroup tree, its memory files and controller (`kernel/procfs`); the procfs files that print the
+the cgroup tree, its memory files and controller (`kernel/cgroup`); the procfs files that print the
 measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kernel/process`).
 
 ## Key types
@@ -169,9 +171,10 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 - The timer thread (`check`, `unmap_code_views`) and the run loop (`resume_checks`),
   `kernel/process`.
-- `kernel/procfs`: status, statm, stat, smaps, pagemap and `oom_score`; the cgroup files
-  (`measure`, `limit`, peak, `app_memory`, `Events`, `out_of_memory` for a lowered `memory.max`)
-  and the write path's `recheck`.
+- `kernel/procfs`: status, statm, stat, smaps, pagemap and `oom_score`.
+- `kernel/cgroup`: the cgroup files (`measure`, `limit`, peak, `app_memory`, `Events`,
+  `out_of_memory` for a lowered `memory.max`).
+- `kernel/files`: the write path's `recheck` after writing cgroup `memory.max`.
 - rusage and exit (`peak_resident_pages`), `Machine` (the memory limit at start), the
   process_mrelease syscall.
 
@@ -180,7 +183,7 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 - `kernel/mm`: VMAs, CoW sets and loans, `FileMaps`, `UNMAPPING`, `shmem_like`; `shootdown`
   (`kernel/mmu`) for borrowed pages a release re-points.
 - `appine_hal` (`memory_usage` from `/proc/self/status`, `memory_info`, `mincore` and pagemap
-  reads), `appine_engine` (`written_code_bytes`, `unmap_written_code`), cgroups (`memory_limits`,
+  reads), `appine_engine` (`written_code_bytes`, `unmap_written_code`), `kernel/cgroup` (`memory_limits`,
   `measure_memory`, `memory_event`, `oom_group`), `signal::group_exit`, the kernel log (`printk`)
   and kill reports (`bug::record_kill`).
 

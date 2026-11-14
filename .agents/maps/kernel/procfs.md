@@ -1,11 +1,11 @@
 # kernel/procfs Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/procfs.md` for the paired decision history.
+> See `.agents/decisions/kernel/procfs.md` for the paired decision history (it still holds the decisions on cgroups and device BPF made before they were split out into `kernel/cgroup`).
 >
 > Verified: 2026-11-11 (full mapping: 6 research concerns; 22 claims checked by 3 independent verifiers — 19 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: `/proc/<tid>`'s ptrace-gated opens, `cgroup.subtree_control` token parsing and `cpu.max`'s kept period)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroups and device BPF split into kernel/cgroup; synthetic node adapters remain here)
 
 ## Responsibilities
 
@@ -18,11 +18,14 @@ stored:
   devices), overlayfs's module parameters, the cgroup mount point;
 - devpts as a filesystem (instances, nodes, owners and modes), nsfs nodes and the node views of
   the mqueue filesystem;
-- cgroup v2: the cgroup tree, its interface files, membership and migration, and the limits that
-  are enforced (pids, memory via the OOM killer, freeze, kill, depth/descendants);
-- a bpf(2) subset that verifies and interprets cgroup device programs.
+- the cgroup2 node adapter: lookup, metadata, directory listing and dispatch to `kernel/cgroup`
+  for interface-file content and writes, plus the procfs entries that show cgroup membership.
 
-Root: `core/kernel/src/pseudo.rs`, `cgroup.rs`, `bpf.rs`, `syscall/bpf.rs`.
+Root: `core/kernel/src/pseudo.rs`.
+
+The cgroup tree, migration, controllers, change observation and device BPF belong to
+`kernel/cgroup` (`cgroup.rs`, `bpf.rs`, `syscall/bpf.rs`). The shared synthetic node and
+open/read/write contracts remain here; cgroup policy is described in that map.
 
 Outside the module: the `Pseudo` trait, the walker, mounts and mountinfo order and magic-link
 resolution (`kernel/vfs`); open/read/write dispatch for pseudo nodes (`kernel/files`, whose
@@ -57,14 +60,6 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   `/proc/kmsg`, the opener's credentials (`opener`, Linux's `f_cred`) and change state
   (`fd::ProcEvent`: a shared counter, what the file last reported and when its contents were
   made).
-- `Cgroup` (name, parent, children, `subtree_control`, owner, mode, written `values`, pids and
-  memory events, memory peak, `freeze`, attached device programs and their flags) and `Cgroups`
-  (the tree; ids never reused, root 1; `observed` notifying files); `CONTROLLERS` (8 in Linux's
-  order, of which cpuset, cpu, memory and pids are available), `FILES` (39 interface files with
-  modes and controllers), `Writer` (writing thread, pid namespace, cgroup-namespace root, opener's
-  credentials); `CgroupNs` (in nsproxy).
-- `bpf::Prog` (id, instructions, name, tag, gpl, load time, loader's uid), `bpf::Registry` (weak,
-  by id, ids never reused), `FileKind::Bpf`.
 - `PtsOptions` (kept by the VFS per devpts instance) and the owner, mode and times kept on `Tty`.
 
 ## Public entry points
@@ -75,11 +70,6 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   `open_unwritable`, `unreadable`, `pollable`, `sysctl_kind`, `write`, `written`, `read_pagemap`,
   `read_mem`, `write_mem`, `describe`, `sockets`, `socket_ino`, `pty`, `group_of`, `comm_str`,
   `mark_deleted`, `recorded_value`, `uptime_ns`.
-- cgroup: `file`, `write`, `Cgroups::mkdir`, `rmdir`, `proc_cgroup`, `proc_cgroups`, `may_enter`,
-  `pids_charge`, `memory_limits`, `measure_memory`, `memory_event`, `oom_group`,
-  `effective_device_progs`, `hierarchy_allows_attach`, `file_mode`, `observe`, `observe_all`,
-  `notify_changes`, `key`.
-- bpf(2) (`syscall::bpf::bpf`) and `check_device`.
 
 ## Data flow / lifecycle
 
@@ -185,13 +175,9 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   has changed since the open or since the last change a poll or epoll reported (reading does not
   take it in); one counter (`Vfs::mount_events`) serves every mount namespace. sysfs and cgroup2
   files poll as always readable and writable, plus `POLLERR|POLLPRI` before their first read from
-  the start and, for `cgroup.events`, `memory.events`, `memory.events.local` and `pids.events`,
-  after each change of their contents until read again (kernfs). Those four files are compared
-  with what they showed while an open file or an inotify watch observes them (`cgroup::observe`,
-  `notify_changes`, after BKL syscalls, thread exits, freezer stops and the timer thread's
-  checks); a change wakes pollers and reports `IN_MODIFY` to watches on the file and its
-  directory, and a write to any cgroup2 file reports `IN_MODIFY` too. inotify keys cgroup2 files
-  with the top bits 01 (`cgroup::key`); other synthetic files never report.
+  the start. Cgroup change observation, the four notifying files and their inotify keys belong to
+  `kernel/cgroup`; the shared open/read path consumes its counters. Other synthetic files never
+  report inotify events.
 
 ### Per-process files
 
@@ -389,105 +375,16 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
 - mqueue: the root and queue nodes of an IPC namespace's queues take their stat from the queue
   directory and the queues; chmod, chown and utimensat are stored there.
 
-### cgroup v2
-
-- One global tree; the root (id 1, owned by root, 0755) looks like a docker container's root
-  under a cgroup namespace with cpuset, cpu, memory and pids available. cgroup2 is mounted
-  read-write at boot on sysfs's `fs/cgroup` (options `nsdelegate,memory_recursiveprot`); any
-  mount needs `CAP_SYS_ADMIN` over the owner of the caller's cgroup namespace and is rooted at
-  that namespace's root. A directory holds its children plus the core files and those of the
-  controllers its parent enables (the root: all available ones).
-- mkdir: `EROFS` on ro mounts; `EEXIST` for `.`, `..`, existing names and interface-file names;
-  write and search on the parent; newline in the name `EINVAL`; ancestors' `cgroup.max.depth` /
-  `max.descendants` `EAGAIN`; the new cgroup and its files belong to the creator's fsuid/fsgid,
-  which is the only way to own one (path chown/chmod `EACCES`, or `EROFS` on ro mounts; fd-based
-  `EBADF`), and the directory has the mode mkdir gave (umask applied, `S_IRWXUGO|S_ISVTX`), which
-  path lookups through it, chdir and chroot check for search, as kernfs does. So only privileged
-  processes create top-level cgroups. rmdir: write and search on the parent; children or live
-  processes `EBUSY` (zombies do not count); the root `EBUSY`; removal is immediate, with no dying
-  state. Creating plain files is `EACCES`, renaming `EPERM`.
-- Membership: every process starts in the root; fork places the child in the parent's cgroup or a
-  `clone3(CLONE_INTO_CGROUP)` target after `pids_charge` (`EAGAIN`) and starts it frozen if the
-  target is freezing; the target has to exist (`ENODEV`), the caller must be allowed to write its
-  `cgroup.procs` and that of the nearest cgroup above both it and the parent's (`EACCES`, judged
-  by mode and owner as an open would be), both must lie inside the caller's cgroup-namespace root
-  (`ENOENT`), the target must have no controllers enabled for children (`EBUSY`), and a thread
-  cannot go elsewhere than its process (`EOPNOTSUPP`). Zombies stay until reaped;
-  `CLONE_NEWCGROUP`/unshare roots the new namespace at the current cgroup. The BKL is held from
-  the charge until the child is registered, so no fork escapes a concurrent `cgroup.kill`.
-- `cgroup.procs` writes: pid 0 is the caller; pids resolve in the writer's pid namespace
-  (`ESRCH`); kernel init `EINVAL`; the opener's credentials must allow writing the `cgroup.procs`
-  of the nearest cgroup above both source and destination (`EACCES`, Linux's
-  `cgroup_procs_write_permission`; the destination's own was checked at open); source or
-  destination outside the writer's cgroup-namespace root `ENOENT`; a non-root destination with
-  controllers enabled for children `EBUSY`; then the group moves (`pids.max` is not checked, and
-  the process counts in the destination's `pids.current` at once, the count being recomputed from
-  membership) and freezing is re-evaluated. Reads of `cgroup.procs`/`cgroup.threads` print ids in the reader's pid namespace,
-  0 for ones it cannot see (Linux's task_pid_vnr). `cgroup.threads` only accepts moves within the
-  same cgroup (`EOPNOTSUPP` otherwise); `cgroup.type` is always `domain` (`threaded` is
-  `EOPNOTSUPP`).
-- Writes, in order: a removed cgroup `ENODEV`; on the root and on the writer's namespace root only
-  `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` are writable (`EPERM`); a
-  read-only file `EINVAL`. `cgroup.subtree_control`: `+name`/`-name` tokens (anything else,
-  including a token starting with a multi-byte character, `EINVAL`); enabling a
-  controller not in `cgroup.controllers` `ENOENT`; enabling while the cgroup has processes `EBUSY`
-  (except at the real root); disabling one a child still delegates `EBUSY`; disabling clears the
-  children's stored values, events and peak for it. Limits are format-checked as Linux reads them
-  (`memory.*` with size suffixes rounded to pages, `pids.max` up to 2^22, `cpu.max` with a period
-  of 1000 to 1000000, a quota alone keeping the stored period as `cpu_max_write` does, 100000 by
-  default, `cpu.weight`, `cpuset.cpus` against the guest CPUs, and so on) and read back
-  as stored; a stored value always wins over the computed default.
-- Enforced: `pids.max` (fork and thread creation; `pids.current` counts live threads plus one for
-  a zombie or an exited main thread), `memory.max` (the root shows the OOM killer's limit and measurement; a child's
-  usage is its members' resident memory with what they share counted once (`kernel/oom`'s
-  `Usage`), checked periodically by the OOM killer and immediately when a lower limit is written;
-  `memory.oom.group` widens the kill), `cgroup.freeze` (threads stop before returning to guest
-  code, waits return and restart after thaw; `cgroup.events` reports frozen once every task has
-  stopped or is a vfork parent waiting for its child, as Linux counts that wait), `cgroup.kill`
-  (SIGKILL to every live process in the subtree), `cgroup.max.depth`/`max.descendants` (at
-  mkdir), the device programs. Everything else (`memory.high`, `cpu.max`, `cpuset.cpus`, …) is
-  format-checked and stored.
-- `/proc/<pid>/cgroup` is `0::<path>` relative to the reader's cgroup-namespace root;
-  `/proc/cgroups` reports hierarchy 0 for the v1 controller names.
-
-### bpf(2) and device programs
-
-- Commands: program load, attach, detach, query, get-fd-by-id, info by fd (no maps or links).
-  When `unprivileged_bpf_disabled` is nonzero (default 2; once 1 it cannot change) every command
-  needs `CAP_BPF` or `CAP_SYS_ADMIN`; loading a device program always needs one of them and also
-  `CAP_NET_ADMIN` or `CAP_SYS_ADMIN` (6.1's `is_net_admin_prog_type`, `EPERM`); query needs
-  `CAP_NET_ADMIN`, get-fd-by-id `CAP_SYS_ADMIN`; all in the initial user namespace. Attach and
-  detach check nothing on the target cgroup fd (any live cgroup directory fd, `O_PATH` included),
-  and detaching a non-multi program needs no program fd. Attach follows Linux's flag rules
-  (`OVERRIDE`, `MULTI`, `REPLACE`; an ancestor's non-override program forbids attaching below,
-  mixed flags `EPERM`, at most 64 programs).
-- Only `BPF_PROG_TYPE_CGROUP_DEVICE`. The verifier allows forward jumps only and requires every
-  instruction to be reachable; no maps, bpf-to-bpf calls or atomics; the stack holds scalars
-  (512 bytes, aligned); the context is read-only (12 bytes, aligned, through the unmodified
-  pointer); pointer arithmetic is limited to constant offsets; R0 must be 0 or 1 at exit; seven
-  helpers. The interpreter treats any out-of-range access as returning 0 (deny).
-- Programs live while an fd or a cgroup holds them (rmdir drops a cgroup's). At device open
-  (except rdev 0), devpts terminal and `ptmx` opens by path and mknod (after `CAP_MKNOD`,
-  whiteouts exempt), the effective programs of the caller's cgroup run with its real uid and gid:
-  walking up from the cgroup, the first programs found (its own, or else the nearest ancestor's,
-  whatever its flags), then those of further ancestors that attached with `MULTI` (Linux's
-  `compute_effective_progs`); every one must return 1, else `EPERM`. `TIOCGPTPEER` runs none, as
-  Linux's `ptm_open_peer` skips the permission check.
-
 ## Dependencies (inbound / outbound)
 
 ### Inbound
 
-- `kernel/files` (pseudo open/read/write/lseek), `kernel/vfs` (walker and magic links, pseudo
-  stat/getdents, chmod/chown/utimensat on devpts nodes, mkdir/rmdir in cgroup2, mount options for
-  devpts and cgroup2, device checks, `mount_events`); `kernel/process` (clone/clone3 cgroup
-  placement and pids charge, the freezer stop in the signal path, `notify_changes` at thread exit,
-  the kernel-entry record); `kernel/ns` (unshare/setns, nsfs files); the OOM killer
-  (`memory_limits`, `measure_memory`, `oom_group`, events); `syscall/poll.rs` (epoll refusal,
-  readiness); `syscall/inotify.rs` (cgroup watches and keys); the machine (`Offline` before boot,
-  the timer thread's `notify_changes`); `kernel/signal` (`recorded_value` for
-  `debug.exception-trace`, `mark_deleted` for the file named in unhandled-exception reports);
-  `kernel/net` (`sockets`, `socket_ino`).
+- `kernel/files` (pseudo open/read/write/lseek); `kernel/vfs` (walker and magic links, pseudo
+  stat/getdents, chmod/chown/utimensat on devpts nodes); `kernel/mount` (synthetic mounts, devpts
+  options and `mount_events`); `kernel/ns` (unshare/setns, nsfs files); `kernel/poll` (epoll
+  refusal and readiness); the machine (`Offline` before boot); `kernel/signal` (`recorded_value`
+  for `debug.exception-trace`, `mark_deleted` for unhandled-exception reports); `kernel/net`
+  (`sockets`, `socket_ino`).
 
 ### Outbound
 
@@ -497,8 +394,12 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   owner/mode/times, `new_pty`), `netdev`/`netconf`/`route`/`net`/`unix`/`traffic`, `ipc`
   tunables, `mqueue` limits, `seccomp`, `klog`, `loadavg`, the VFS (`reach`, `path_of`), the locks
   (`proc_locks` and `fd_locks`, `kernel/locks`), the loop devices' `Loops` (`kernel/loop`), the
-  mount table (`mounts_from`, devpts options; `kernel/mount`), the OOM killer (`proc_score`,
-  `out_of_memory`), unimplemented-path counting (`stub::record`), `vfs::fuse::drop_caches`.
+  mount table (`mounts_from`, devpts options; `kernel/mount`), the OOM killer (`proc_score`),
+  unimplemented-path counting (`stub::record`), `vfs::fuse::drop_caches`.
+- `kernel/cgroup`: cgroup directory lookup and metadata use `Cgroups` and `file_mode`;
+  `content` delegates to `file`, `proc_cgroup` and `proc_cgroups`; `write` supplies a `Writer`
+  with the writer's namespaces and the opener's credentials. Device filtering and change
+  observation are called by the file syscalls, not owned by this adapter.
 - Host: `appine_hal` (`host_meminfo`, `host_vmstat`, `host_swaps`, `host_cpus`, `cpu_sysfs`,
   `clock_gettime`, `fill_random`, `thread_ctxt_switches`, routes, `tx_queue_len`); the engine
   (`guest_hwcap*`, `guest_midr`).
@@ -508,6 +409,8 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
 - Content always reflects the kernel at generation time; nothing is cached across opens, and a
   regeneration uses the opener's credentials but the current reader's namespaces.
 - `/proc/sys` lookups use the reader's namespaces; `/proc/<pid>/net` uses the target's.
+- Cgroup node adapters must preserve `kernel/cgroup`'s directory modes, controller-dependent
+  file visibility and opener-credential checks; policy changes belong in that module.
 - Synthetic nodes have no store inode, so store-only operations (chown/chmod outside devpts and
   mqueue, xattrs, links) fail on them.
 - `dev_ino` (epoll fdinfo) and inotify use `ino_of`, which omits the thread group's serial and the
@@ -527,11 +430,8 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   when the thread has its own (clone without `CLONE_FILES`, `unshare(CLONE_FILES)`).
 - **Change notifications are partial:** a mount change in any namespace marks every mounts and
   mountinfo reader (Linux counts per namespace), as do propagation-type changes (Linux does not
-  touch the namespace for them); a cgroup2 change is noticed when the next syscall, thread exit,
-  freezer stop or timer-thread pass looks (not at once), and changes that come and go between two
-  looks are missed; `cgroup.stat` and other files Linux notifies in later kernels are not
-  watched; sysctl poll (`hostname`, `domainname`) never reports `POLLPRI`; other synthetic files
-  report no inotify events (opens, reads, writes).
+  touch the namespace for them); sysctl poll (`hostname`, `domainname`) never reports `POLLPRI`;
+  other synthetic files report no inotify events (opens, reads, writes).
 - **Regeneration uses the current reader's namespaces:** a file reread from offset 0 is generated in
   the reading task's namespaces, while Linux binds a network or IPC sysctl to the namespace it was
   looked up in, so a descriptor of `/proc/sys/net/*` or an IPC limit passed to a process in another
@@ -539,9 +439,8 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
 - **Fidelity gaps:** modes and owners differ (`environ` 0444, `fd/` and `ns/` 0555, `comm`
   read-only, `fdinfo/<n>` and `ns/*` owned by root, devpts root 0555, a master's fstat fixed);
   `/sys/class/net` follows the reader rather than the mounter's network namespace; procfs mount
-  options are ignored; chown delegation of cgroups is impossible; no threaded cgroups; many
-  standard files are absent; `kernel/pid_max` writes are ignored; `status` has no
-  `Cpus_allowed` mask line.
+  options are ignored; many standard files are absent; `kernel/pid_max` writes are ignored;
+  `status` has no `Cpus_allowed` mask line.
 - **No `/sys/dev/block` or block `uevent`s:** tools that go from a device number to sysfs
   (`tst_find_backing_dev`, so LTP ioctl_loop05; udev-style lookups) find nothing, and the root
   filesystem has no block device behind it at all.
@@ -570,14 +469,6 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
   `lo` counters are read by name from the kernel-wide traffic table without a namespace check, so
   a new namespace's `lo` shows the initial loopback's counts, while `/proc/net/dev` and netlink
   show zeros there.
-- **cgroup write and read edge cases differ from kernfs:** writes are checked against
-  the global file table, not the cgroup's current files, so a descriptor opened before a
-  controller was disabled still stores a value (which returns when the controller is re-enabled;
-  a `memory.max` one runs the OOM check) where Linux gives `ENODEV`; a regenerating read of a
-  removed cgroup's file is `EINVAL` (Linux `ENODEV`).
-- **mknod on FUSE skips the device programs:** it returns to `kernel/fuse` before the cgroup device
-  check, which checks `CAP_MKNOD` itself but exempts every device 0:0, block ones included (Linux
-  exempts only the character whiteout).
 - **A reaped process's held directory behaves like a live or missing one:** through a kept
   `/proc/<pid>` fd, lookups give `ENOENT` (Linux `ESRCH`), listing still succeeds (Linux
   `ENOENT`) and the first read of an open file returns the content from open (Linux `ESRCH`); as
@@ -594,14 +485,13 @@ network semantics behind `/proc/net` and `net.*` (`kernel/net`, `kernel/netns`);
 
 ## To verify
 
-- Linux 6.1's permission rules for cgroup device program attach/detach (believed to need no
-  capability since CAP_BPF; Appine checks nothing on the target cgroup) and for SysV IPC/mqueue
-  sysctls in child user namespaces (believed to be refused until about 6.8).
+- Linux 6.1's permission rules for SysV IPC/mqueue sysctls in child user namespaces (believed
+  to be refused until about 6.8).
 - Whether reopening a deleted file through `/proc/<pid>/fd/N` (the open-file node) checks
   permission (pipes do not).
 - Field-by-field fdinfo layouts against Linux (eventfd ids, timerfd formatting).
 - The Linux 6.1 behaviour behind the items found by Starnix's syscall tests (a zombie leader's
-  files, `proc_sys_permission`, write opens of read-only proc files, `ENODEV` from removed cgroups)
+  files, `proc_sys_permission`, write opens of read-only proc files)
   was observed on a native 6.8 kernel and attributed to 6.1 from knowledge of the kernel; so was
   which write each kind of read-only file fails with.
 - The bounds Linux puts on the mqueue, `aio-max-nr` and `lease-break-time` sysctls (Appine accepts

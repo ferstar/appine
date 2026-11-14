@@ -1,4 +1,4 @@
-//! cgroup v2 (the kernel/procfs map): a cgroup tree in `/sys/fs/cgroup`.
+//! cgroup v2 (the kernel/cgroup map): a cgroup tree in `/sys/fs/cgroup`.
 //!
 //! It started as a way to tell runtimes the app's memory limit: the JVM's default heap is 1/4 of
 //! physical memory and Node.js sets V8's heap limit from physical memory, but the guest can only

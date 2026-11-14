@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/inotify.md` for the paired decision history (decisions from before the split are D13, D46 and D51 in `.agents/decisions/kernel/vfs.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/vfs full mapping of 2026-11-10, whose inotify claims its independent verifiers checked; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -24,7 +26,7 @@ Root: `core/kernel/src/syscall/inotify.rs`.
 
 Outside the module: where the hooks are called — the file syscalls and renames in `kernel/vfs`,
 opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 file changes in
-`kernel/procfs`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
+`kernel/cgroup`; readiness, epoll and `O_ASYNC` of inotify fds (`kernel/poll`);
 `/proc/sys/fs/inotify/*` and the fdinfo text's place (`kernel/procfs`); the Files app's change list
 (`kernel/store`) and the machine's `store_changed`, which finds each kernel and takes its BKL
 (`kernel/process`); overlay node lifetime and the sweep that keeps watched nodes (`kernel/overlay`).
@@ -65,7 +67,7 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
   (`ENOSPC`) limits and the queue limit come from `/proc/sys/fs/inotify/*` (defaults 128
   instances, 2^20 watches, 16384 queued events).
 - Watches are keyed by store inode number, an overlay node's key, a FUSE node's key or a cgroup2
-  node's key, whose changes `kernel/procfs` reports as `IN_MODIFY`; watches on other synthetic
+  node's key, whose changes `kernel/cgroup` reports as `IN_MODIFY`; watches on other synthetic
   nodes are accepted, counted and never report. Adding one needs read permission on what the
   store or the overlay shows (a FUSE node `fuse_permission`'s; synthetic nodes are not checked);
   a watch is identified by its node, mount included. `IN_MASK_ADD`/`IN_MASK_CREATE`,
@@ -122,8 +124,8 @@ opens and file I/O in `kernel/files`, FUSE operations in `kernel/fuse`, cgroup2 
 - `kernel/files`: the hooks from opens (`opened`), I/O and closes; the instance's read and
   `FIONREAD`.
 - `kernel/fuse`: hooks for FUSE namespace changes; `watched` in `in_use`.
-- `kernel/procfs`: `kernfs_modified` for cgroup2 file changes; the registry's limits behind
-  `/proc/sys/fs/inotify/*`; the instance's fdinfo lines.
+- `kernel/cgroup`: `kernfs_modified` for cgroup2 file changes.
+- `kernel/procfs`: the registry's limits behind `/proc/sys/fs/inotify/*`; the instance's fdinfo lines.
 - `kernel/poll`: readiness (`ready`), the `queued` generation and the instance's wake object.
 - The machine (`kernel/process`): `store_changed` calling `host_change` for the Files app.
 - The dispatcher: the three syscalls.

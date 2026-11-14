@@ -1,4 +1,4 @@
-//! A subset of eBPF (the kernel/procfs map): cgroup device filter programs
+//! A subset of eBPF (the kernel/cgroup map): cgroup device filter programs
 //! (`BPF_PROG_TYPE_CGROUP_DEVICE`).
 //!
 //! cgroup v2 has no v1 `devices.allow`; runc and crun attach an eBPF program to each container's

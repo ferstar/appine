@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 15 claims checked by 2 independent verifiers — 11 confirmed and 4 partial; bugs and debts recorded)
 >
-> Maintained: 2026-11-12 (targeted verification only since the full mapping; latest change: an fd ADDFD replaces is closed as the target process's)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
 
 ## Responsibilities
 
@@ -26,7 +26,7 @@ Root: `core/kernel/src/cred.rs` (except user namespaces), `syscall/cred.rs`, `se
 Outside the module: user namespace creation, id maps and namespace entry (`kernel/ns`); the syscalls
 that call the access helpers and their error ordering, xattr storage of `security.capability`
 (`kernel/vfs`, `kernel/files`, `kernel/xattr`); signal delivery and ptrace stops (`kernel/signal`);
-procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/procfs`).
+procfs views of credentials (`kernel/procfs`); the cgroup device eBPF (`kernel/cgroup`).
 
 ## Key types
 
