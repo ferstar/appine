@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: preserve resize previews across full-frame requests and subrow layouts, and wait for settled output)
 
 ## Responsibilities
 
@@ -65,6 +65,19 @@ stays here; it calls android/vtrender to decode frames and paint the grid, curso
   scroll, pointer and search-count fields. It rejects frames at an old grid size and requests a
   full frame after attaching, shell start, regridding, default-colour or wide-cell changes, or late
   image pixels; the rendering contract and image lifetimes are in android/vtrender.
+- When the view shrinks at the same width to fewer rows (as the IME opens), at the bottom with
+  no selection or search and a painted grid, it captures the old grid, cursor and preedit in a
+  bitmap clipped to the new bounds. The terminal and console resize immediately, but this preview
+  stays in place until a frame reports settled output after resize (32 ms quiet at parser ground,
+  with no synchronized-output hold), or
+  the next draw after 200 ms. Frames rejected while waiting require another full frame, since
+  native capture consumes dirty rows. Draws continue on animation frames even without output.
+  Another shrink, even within the same grid row, keeps the original deadline; a growing or
+  width-changing layout, font/wide-cell change, tab
+  change, touch, encoded input, hidden window or detach discards the preview. Scrolled-back,
+  selected and searched content, width changes and growing grids use the normal immediate path.
+  `hasFrame` tracks whether the current bitmap is painted independently of `full`: asking for
+  every row again does not make the already-painted content unavailable for a preview.
 - The frame's lock cursor switches the IME's password mode (Input); while visible the view polls
   the console every 200 ms until that state ends. Cursor blinking runs every 500 ms only while
   requested by the frame and the view/window have focus; input or cursor movement restarts it.
@@ -408,6 +421,11 @@ select a command's output and move the cursor by taps:
 
 ## Invariants and gotchas
 
+- Output readiness is not an acknowledgement of SIGWINCH: even a quiet gap at parser ground
+  may precede a later redraw. A partial control sequence or UTF-8 character never releases the
+  preview through readiness; the 200 ms deadline still bounds it. The preview is
+  bounded rather than waiting indefinitely for a program that ignores the size change; it adds
+  one temporary bitmap of the smaller view. Null frame captures preserve the full-frame request.
 - `BaseInputConnection.replaceText` (Android 14+) edits its buffer without calling the view's
   `commitText`; inheriting it silently buffers IME clipboard text. A later finish can then send
   that text unexpectedly. All committed IME entry points must use the same paste safety checks;
@@ -495,6 +513,12 @@ select a command's output and move the cursor by taps:
 
 ## To verify
 
+- `TerminalResizeTest` passes seven API 34 cases: pixel preservation with a queued full frame
+  and subrow layouts, incomplete mode 2026 prefixes, quiet output, the 200 ms fallback, accepting
+  a full redraw and detach cleanup. Four cases failed with the first preview implementation.
+  A physical-device report still found occasional old text at IME opening with that first
+  version; whether the corrected cases explain it, actual IME animation interruptions and
+  touch/tab cleanup still need end-to-end verification.
 - `TerminalInputTest` exercises the real connection, paste encoder and confirmation dialogs on
   API 34: immediate replacement, no replay on finish, confirmation/cancellation, IME menu paste,
   bracketed paste/terminator checks, ordinary Chinese composition/Enter, and trailing-newline

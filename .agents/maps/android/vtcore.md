@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/vtcore.md` for the paired decision history (not yet created; pre-split decisions D1, D3, D4 and the parsing side of D5–D7 stay in `.agents/decisions/android/vt.md`; earlier terminal implementation decisions D2, D5, D6, D8, D16, D17, D32, D33, D35–D39 and D42–D49 stay in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-14 (split out of android/vt, whose facts descend from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: settle resize output at parser ground before releasing the view's preview)
 
 ## Responsibilities
 
@@ -46,7 +48,8 @@ the host console (`kernel/tty`); the JNI crate, `guarded!`, kernel handle table 
 - In `vt.c`: `AppineVt`, one per terminal: the terminal, its render state, key and mouse encoders,
   the grid and cell pixel sizes; reply, frame and scratch buffers and one text buffer shared by
   title, copy, link and transcript; the title-changed flag, the synchronized-output hold and
-  `password_input` (the cursor then a lock); the selection gesture, shared by touch and mouse (with
+  `password_input` (the cursor then a lock), and `resize_pending` with `resize_output_at` (output
+  after a grid resize has not settled); the selection gesture, shared by touch and mouse (with
   reusable events: an untimed press and a drag for a finger, a timed press and a release for a
   mouse), and the tracked anchor of a handle's drag; the last reported mouse cell; the effects
   since they were last taken (bells, the last clipboard write, notification and progress report,
@@ -108,6 +111,12 @@ the host console (`kernel/tty`); the JNI crate, `guarded!`, kernel handle table 
 
 ### Console output and effects
 
+- A grid-size change sets `resize_pending` and resets its output timestamp. Each nonempty feed
+  while pending records `resize_output_at`; a frame clears pending only after 32 ms without more
+  bytes, at parser ground (no partial UTF-8/control sequence), with no synchronized-output hold.
+  android/vtrender exposes pending OR the hold in frame flags bit 7. android/vtview uses it only
+  during a bounded height-shrink preview. This delays neither resize nor SIGWINCH; a quiet gap
+  is a heuristic, not proof that the program finished redrawing.
 - The pump reads the console into a 64 KB buffer, asks the kernel whether the console now reads a
   password (`Machine::console_password_input`: lines without echo, which programs set before
   printing their prompt) and notes it in vt.c, feeds the terminal under the tab's lock (in parts

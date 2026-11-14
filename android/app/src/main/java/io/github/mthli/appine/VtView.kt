@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -34,6 +35,7 @@ import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.TextAttribute
 import android.widget.OverScroller
 import androidx.annotation.RequiresApi
+import androidx.core.graphics.createBitmap
 import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -238,6 +240,13 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Ask the next frame for every row (after a resize, a new bitmap, new default colours). */
     private var full = true
 
+    /** The current bitmap has been painted; requesting a full frame does not invalidate it. */
+    private var hasFrame = false
+
+    /** The last drawn content, clipped in place while a smaller grid awaits the program's redraw. */
+    private var resizePreview: Bitmap? = null
+    private var resizePreviewUntil = 0L
+
     /** The input method's composing text, drawn at the cursor. */
     private var preedit = ""
 
@@ -390,6 +399,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     fun attach(s: VtSession?) {
         if (s === session) return
+        clearResizePreview()
         endSearch()
         session?.let { if (it.view === this) it.view = null }
         menu?.finish()
@@ -415,6 +425,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         scrollLen = 0
         dropImages()
         session = s
+        hasFrame = false
         s?.view = this
         if (s != null && cols > 0) {
             s.resize(cols, rows, cellWidth, cellHeight)
@@ -521,7 +532,29 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     // ---- Metrics and the grid ----
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = regrid()
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        // IME insets shrink the view at the start of their animation. Keep the old text in
+        // place until output follows SIGWINCH, rather than showing the emulator's moved rows.
+        val shrinking = w == oldw && h > 0 && h < oldh
+        if (shrinking && tab != 0L && atBottom && !selected && !searching && renderer.hasGrid) {
+            if (h / cellHeight < rows && resizePreview == null && hasFrame) {
+                resizePreview = createBitmap(w, h).also {
+                    val c = Canvas(it)
+                    c.drawColor(screen.defaultBg)
+                    drawContent(c)
+                }
+                resizePreviewUntil = SystemClock.uptimeMillis() + RESIZE_PREVIEW_MS
+            }
+        } else {
+            clearResizePreview()
+        }
+        regrid()
+    }
+
+    private fun clearResizePreview() {
+        resizePreview?.recycle()
+        resizePreview = null
+    }
 
     /**
      * Fits the grid to the view. The screen and the bitmap hold one row more than the grid, the
@@ -533,6 +566,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val c = max(1, width / cellWidth)
         val r = max(1, height / cellHeight)
         if (!renderer.resize(c, r)) return
+        hasFrame = false
         scrollPx = 0
         full = true
         session?.resize(c, r, cellWidth, cellHeight)
@@ -545,6 +579,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val density = resources.displayMetrics.density
         val size = px.coerceIn(6 * density, 32 * density)
         if (size == fontPx) return
+        clearResizePreview()
         fontPx = size
         renderer.setFont(fontPx, fillWide)
         regrid()
@@ -553,6 +588,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /** Enlarges glyphs in wide cells to fill them, or draws them at their size (the setting). */
     fun setFillWide(on: Boolean) {
         if (on == fillWide) return
+        clearResizePreview()
         fillWide = on
         renderer.setFont(fontPx, fillWide)
         full = true
@@ -570,19 +606,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     override fun onDraw(c: Canvas) {
         c.drawColor(screen.defaultBg)
         if (!renderer.hasGrid) return
+        if (SystemClock.uptimeMillis() >= resizePreviewUntil) clearResizePreview()
         if (tab != 0L) {
             val f = full
             full = false
-            VtNative.frame(tab, f)?.let { apply(VtFrame(it)) }
+            val buffer = VtNative.frame(tab, f)
+            if (buffer != null) apply(VtFrame(buffer)) else full = f
         }
-        // The grid, shifted up by part of a row while the viewport scrolls; the margin below the
-        // last whole row keeps the background
-        renderer.drawGrid(c, scrollPx)
-        c.withTranslation(0f, -scrollPx.toFloat()) {
-            // Not in a blinking cursor's hidden phase
-            if (tab != 0L && (!blinkRunning || blinkOn)) renderer.drawCursor(c, hasFocus(), preedit.isNotEmpty())
-            renderer.drawPreedit(c, preedit)
+        resizePreview?.let {
+            c.drawBitmap(it, 0f, 0f, null)
+            postInvalidateOnAnimation()
+            return
         }
+        drawContent(c)
         drawMatchMarks(c)
         drawHandles(c)
         if (menuPending) {
@@ -590,6 +626,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             post { showMenu() }
         } else {
             menu?.invalidateContentRect()
+        }
+    }
+
+    private fun drawContent(c: Canvas) {
+        // The grid, shifted up by part of a row while the viewport scrolls; the margin below the
+        // last whole row keeps the background
+        renderer.drawGrid(c, scrollPx)
+        c.withTranslation(0f, -scrollPx.toFloat()) {
+            // Not in a blinking cursor's hidden phase
+            if (tab != 0L && (!blinkRunning || blinkOn)) renderer.drawCursor(c, hasFocus(), preedit.isNotEmpty())
+            renderer.drawPreedit(c, preedit)
         }
     }
 
@@ -603,6 +650,14 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             full = true
             postInvalidateOnAnimation()
             return
+        }
+        if (resizePreview != null) {
+            if (frame.outputPending) {
+                // Taking a frame consumes native dirty rows even when it is not displayed.
+                full = true
+                return
+            }
+            clearResizePreview()
         }
         val oldCursorX = screen.cursorX
         val oldCursorY = screen.cursorY
@@ -689,6 +744,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         val animationMs = frame.animationMs
         if (animationMs > 0) postDelayed(animationTick, animationMs.toLong())
         renderer.takeRows(frame)
+        hasFrame = true
     }
 
     /** Takes the rows of the search's matches along the scroll bar, at a count and selected match. */
@@ -794,6 +850,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        clearResizePreview()
         // Still counted as attached during this call
         blinkRunning = false
         blinkOn = true
@@ -808,6 +865,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         if (visibility != VISIBLE) {
+            clearResizePreview()
             stopPasswordCheck()
             dropImages()
         } else {
@@ -960,6 +1018,7 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     private fun send(data: ByteArray?, scrolling: Boolean = false) {
         if (data == null || data.isEmpty()) return
+        clearResizePreview()
         if (!scrolling) scroller.forceFinished(true)
         restartBlink()
         if (!atBottom && tab != 0L) {
@@ -1385,6 +1444,10 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
      */
     @SuppressLint("ClickableViewAccessibility") // Taps open the keyboard; selection has its own menu
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (resizePreview != null) {
+            clearResizePreview()
+            invalidate()
+        }
         val handled = touch(event)
         val action = event.actionMasked
         if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && scrollPx != 0 && scroller.isFinished) {
@@ -1998,6 +2061,9 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     private fun cellY(y: Float) = floor((y + scrollPx) / cellHeight).toInt().coerceIn(0, rows - 1)
 
     private companion object {
+        /** A program that ignores SIGWINCH must not leave the preview on screen. */
+        const val RESIZE_PREVIEW_MS = 200L
+
         /** Shift with these keys moves a selection's end ([VtNative.selectAdjust]), as in Ghostty. */
         val ADJUSTMENTS = mapOf(
             KeyEvent.KEYCODE_DPAD_LEFT to VtNative.ADJUST_LEFT,

@@ -49,6 +49,9 @@ internal value class VtFrame(private val b: ByteBuffer) {
     /** The search has not caught up with the terminal yet: draw again to go on. */
     val searchPending: Boolean get() = flags and FLAG_SEARCH_PENDING != 0
 
+    /** Output after resize has not settled at parser ground, or synchronized output is held. */
+    val outputPending: Boolean get() = flags and FLAG_OUTPUT_PENDING != 0
+
     // The selection's first and last cell in the viewport, -1 when outside it
     val selStartX: Int get() = coordinate(28)
     val selStartY: Int get() = coordinate(30)
@@ -168,5 +171,6 @@ internal value class VtFrame(private val b: ByteBuffer) {
         private const val FLAG_SELECTION = 1 shl 4
         private const val FLAG_RECTANGLE = 1 shl 5
         private const val FLAG_SEARCH_PENDING = 1 shl 6
+        private const val FLAG_OUTPUT_PENDING = 1 shl 7
     }
 }

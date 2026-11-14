@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: output-pending flag covers unsettled or incomplete resize output and synchronized holds)
 
 ## Responsibilities
 
@@ -98,7 +98,8 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   shell starting; a frame captured at an old size is dropped and a full one requested. Attaching
   also resizes the tab's terminal and console to the view's grid when it differs.
 - The header also carries mode flags (mouse tracking, alternate screen, alternate scroll 1007,
-  focus events 1004, a selection exists, it is a rectangle, the search is still catching up), the
+  focus events 1004, a selection exists, it is a rectangle, the search is still catching up), plus
+  output pending (flags bit 7: resize output has not settled at parser ground, or a synchronized-output hold), the
   selection's first and last cells in the viewport (a rectangle's top left and bottom right
   corners), the scroll position libghostty-vt reports for the scroll bar (the scrollable area in
   rows, the viewport's first row in it and the rows it shows), the search's count (matches so
@@ -136,7 +137,9 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   but the bar cover two cells on a wide cell; in the OSC 12 colour, else the default foreground;
   a lock while the console reads a password, below), the IME's composing text (shifted
   left at the right edge) and the theme's text selection handles are drawn over the bitmap each
-  draw.
+  draw. During android/vtview's bounded height-shrink preview, that view can reject a frame whose
+  output-pending bit is set and draw its own capture of the prior grid, cursor and preedit instead.
+  It requests all rows again until it accepts a frame; the renderer's bitmap still resizes at once.
 - While the console reads a password the frame gives the cursor as a lock (style 4), as Ghostty
   shows one at password prompts: wherever the cursor is in the viewport, even when the program
   hid it, never blinking, with or without the focus; `VtRenderer` draws a padlock about as tall as a

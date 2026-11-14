@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
+> Maintained: 2026-11-15 (targeted verification only since the full mapping; latest change: isolated terminal resize readiness and pixel regression tests)
 
 ## Responsibilities
 
@@ -262,6 +262,9 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
 
 ### Tests
 
+- `TerminalResizeTest` uses isolated stores and shell-free terminals for seven API 34 checks:
+  preview pixels under full-frame requests and subrow layouts, split control sequences, quiet
+  output, timeout, complete repaint and detach cleanup. It drives layout/draw directly, not the IME.
 - `TerminalFilesTest` uses isolated stores for binary/empty imports, collisions, name/home
   escaping, read/close failure cleanup and missing homes; a real guest shell checks reads and
   clipboard quoting. A locked MainActivity checks pending-picker retention across recreation;
@@ -316,7 +319,7 @@ terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
   not run the tests (they need KVM). Nothing here covers `Native.bklStall` (the stall itself is
-  tested in `hosts/cli`), terminal gestures/rendering, real IME UI or persisted grants end to end.
+  tested in `hosts/cli`), terminal gestures, real IME UI or persisted grants end to end.
 
 ## Dependencies (inbound / outbound)
 

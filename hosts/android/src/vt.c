@@ -30,7 +30,8 @@
 //     u8  flags            bit 0 mouse tracking on, 1 alternate screen, 2 alternate scroll
 //                          (mode 1007), 3 focus events (mode 1004), 4 a selection exists,
 //                          5 it is rectangular, 6 the search has not caught up with the
-//                          terminal yet (draw again to go on)
+//                          terminal yet (draw again to go on), 7 output after resize has not
+//                          settled at parser ground or synchronized output is still held
 //     u16 selection_start_x, u16 selection_start_y
 //                          the selection's first cell (in terminal order; a rectangle's top
 //                          left corner) in the viewport, 0xffff for both when there is none or
@@ -127,6 +128,7 @@
 #define FLAG_SELECTION 0x10
 #define FLAG_RECTANGLE 0x20
 #define FLAG_SEARCH_PENDING 0x40
+#define FLAG_OUTPUT_PENDING 0x80
 
 // The frame's cursor style while the console reads a password, after GhosttyCursorStyle's four
 #define CURSOR_LOCK 4
@@ -161,6 +163,10 @@ static const GhosttyColorRgb DEFAULT_BACKGROUND = {.r = 0, .g = 0, .b = 0};
 // Synchronized output (mode 2026) holds the screen at most this long, so a program that never
 // ends its hold cannot freeze the tab
 #define HOLD_LIMIT_NS (1000LL * 1000 * 1000)
+
+// A PTY read is not a redraw boundary. Allow adjacent chunks (including a split mode 2026
+// prefix) to arrive before the view releases its resize preview.
+#define RESIZE_QUIET_NS (32LL * 1000 * 1000)
 
 // The largest clipboard write (OSC 52) taken: Android's clipboard goes through a binder
 // transaction, which fails beyond about 1 MB (the text is sent as UTF-16)
@@ -478,6 +484,10 @@ typedef struct AppineVt {
   // again until it ends (or HOLD_LIMIT_NS passes)
   bool held;
   int64_t held_since;
+  // A resize has not yet been followed by settled output. Resize itself dirties rows before
+  // the program redraws; a nonempty feed starts the quiet period, not an immediate release.
+  bool resize_pending;
+  int64_t resize_output_at;
   // The console reads a password (appine_vt_set_password_input): frames give the cursor as a lock
   bool password_input;
   // The cell of the last mouse event reported, to report motion once per cell rather than for
@@ -1263,6 +1273,7 @@ void appine_vt_feed(AppineVt *vt, const uint8_t *data, size_t len, bool backgrou
   bool at_prompt = appine_vt_at_prompt(vt);
   if (vt->was_at_prompt && !at_prompt && vt->command_start == 0) vt->command_start = now_ns();
   vt->was_at_prompt = at_prompt;
+  if (len > 0 && vt->resize_pending) vt->resize_output_at = now_ns();
   changed(vt);
 }
 
@@ -1371,6 +1382,10 @@ static void search_reselect(AppineVt *vt, size_t index);
 // which here comes with every keyboard shown or hidden
 void appine_vt_resize(AppineVt *vt, uint16_t cols, uint16_t rows, uint32_t cell_width,
                       uint32_t cell_height) {
+  if (cols != vt->cols || rows != vt->height) {
+    vt->resize_pending = true;
+    vt->resize_output_at = 0;
+  }
   vt->cols = cols;
   vt->height = rows;
   vt->cell_width = cell_width;
@@ -1585,6 +1600,14 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
     ghostty_terminal_set(vt->term, GHOSTTY_TERMINAL_OPT_MODE, &sync);
     vt->held = false;
   }
+  if (vt->resize_pending && vt->resize_output_at != 0 && !vt->held &&
+      now_ns() - vt->resize_output_at >= RESIZE_QUIET_NS) {
+    bool ground = false;
+    if (ghostty_terminal_get(vt->term, GHOSTTY_TERMINAL_DATA_VT_GROUND, &ground) ==
+            GHOSTTY_SUCCESS && ground) {
+      vt->resize_pending = false;
+    }
+  }
   // The animation frames due now go into the update that follows
   uint32_t animation_ms = vt->held ? 0 : tick_animations(vt);
   if (!vt->held && ghostty_render_state_update(vt->state, vt->term) != GHOSTTY_SUCCESS) {
@@ -1669,6 +1692,7 @@ const uint8_t *appine_vt_frame(AppineVt *vt, bool full, size_t *len) {
     put_viewport(vt, h + 32, &ordered.end);
   }
   if (search_pending) flags |= FLAG_SEARCH_PENDING;
+  if (vt->resize_pending || vt->held) flags |= FLAG_OUTPUT_PENDING;
   h[27] = flags;
   put_u32(h + 36, clamp_u32(scrollbar.total));
   put_u32(h + 40, clamp_u32(scrollbar.offset));
