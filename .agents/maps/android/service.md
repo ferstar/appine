@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -32,7 +32,8 @@ Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `No
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
 and its tab bar (`android/terminal`); the view (`android/vtview`) and rendering (`android/vtrender`);
-sessions' internals and the console adapter (`android/vt`); the Files app provider
+sessions' internals and the console adapter (`android/vt`), native terminals and compression
+(`android/vtcore`); the Files app provider
 (`android/documents`); JNI and the kernel API (`android/native`, `kernel/boot`, `kernel/process`).
 
 ## Key types
@@ -217,10 +218,10 @@ sessions' internals and the console adapter (`android/vt`); the Files app provid
 
 - The last listener leaving saves tabs at once and starts a 60 s timer that trims memory (on the
   worker: `Native.trimMemory`, the kernel's rebuildable caches, then `VtNative.compressAll`, every
-  tab's cold scrollback at once, android/vt); a returning listener cancels it. `onTrimMemory` at
+  tab's cold scrollback at once, android/vtcore); a returning listener cancels it. `onTrimMemory` at
   `RUNNING_LOW` and above (except `UI_HIDDEN`) trims and saves immediately, and also cuts the Kitty
   images of every started tab but `current` down to 4 MiB a screen, deleting the oldest
-  (`VtNative.dropImages`, android/vt); since Android 14 those levels are no longer sent, so this
+  (`VtNative.dropImages`, android/vtcore); since Android 14 those levels are no longer sent, so this
   happens only on Android 11–13. Tabs also compress their own scrollback within seconds of their
   output, so the trim mostly finds what the last few seconds left.
 
@@ -297,12 +298,12 @@ sessions' internals and the console adapter (`android/vt`); the Files app provid
   tab it is answered at once with an empty clipboard (`VtSession.answerClipboardRead(null)`):
   Android lets an app read the clipboard only while it has the focus, and the program would
   otherwise wait for a timeout.
-- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vt),
+- tmux's control mode (tmux -CC), which the terminal detaches as it starts (android/vtcore),
   ending (`onTmuxDetached`) is told in that tab as a yellow `[appine]` line
   (`VtSession.showMessage`): it cannot be shown, its session goes on, and `tmux attach` brings it
   back.
 - A command the shell's prompt marks (OSC 133) saw finish (`onCommandFinished`, timed by the
-  terminal, android/vt) after at least 10 s, in a tab not in front (another tab shown, or
+  terminal, android/vtcore) after at least 10 s, in a tab not in front (another tab shown, or
   the terminal Activity not listening), becomes the tab's notification, as Ghostty's
   `notify-on-command-finish = unfocused` (Ghostty's default is `never` and its threshold 5 s);
   shorter ones and those in the tab in front post nothing. Like a program's notification it

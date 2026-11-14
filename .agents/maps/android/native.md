@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -31,7 +31,7 @@ the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app
 Outside the module: the `Machine` lifecycle (`kernel/boot`), process API (`kernel/process`)
 and store functions (`kernel/store`);
 what the app does with them (the other `android/*` modules), including the libghostty-vt
-terminal's emulator shim, its JNI functions and sessions (`android/vt`), its view
+terminal's emulator shim and JNI functions (`android/vtcore`), Kotlin sessions (`android/vt`), its view
 (`android/vtview`) and rendering (`android/vtrender`).
 
 ## Key types
@@ -326,7 +326,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`), its vie
   (`guarded!`, `machine`, `string`, `throw`, the handle table); `Rootfs` through the assets and
   `BuildConfig`; `LicenseCatalog` and `LicenseActivity` (android/licenses) read the static notices;
   CI's `android.yml` (`assembleDebug lintDebug`, clippy
-  through cargo-ndk); the terminal (`android/vt`) through the libghostty-vt build.
+  through cargo-ndk); the terminal (`android/vtcore`) through the libghostty-vt build.
 
 ### Outbound
 

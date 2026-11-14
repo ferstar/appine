@@ -4,6 +4,8 @@
 > See `.agents/decisions/android/vtrender.md` for the paired decision history (not yet created; pre-split decisions remain D1–D3 and the rendering part of D5 in `.agents/decisions/android/vtview.md`, and D5, D9, D16, D17, D32 and the frame/rendering parts of D7, D30, D36, D41 and D46–D48 in `.agents/decisions/android/terminal.md`).
 >
 > Verified: 2026-11-14 (split out of android/vtview, inherited from the android/terminal full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -19,7 +21,7 @@ search progress, viewport match encoding and Kitty image extraction).
 Outside the module: all of `VtView`, its frame orchestration, redraw and cursor/password timers,
 interaction overlays, input, selection, scrolling and search requests (`android/vtview`); terminal
 creation, state ownership, PNG decoding, synchronized-output hold lifecycle, cursor defaults,
-resize, the JNI functions and locking (`android/vt`). The flow below describes the view's duties
+resize, the JNI functions and locking (`android/vtcore`). The flow below describes the view's duties
 as a caller as well as rendering; it does not transfer those lifecycle methods here.
 
 ## Key types
@@ -40,7 +42,7 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
 
 ## Public entry points
 
-- Native: `appine_vt_frame` and `appine_vt_image`, reached through android/vt's `VtNative.frame`
+- Native: `appine_vt_frame` and `appine_vt_image`, reached through android/vtcore's `VtNative.frame`
   and `VtNative.image` with its tab lock and JNI buffer/bitmap handling.
 - `VtFrame`: header accessors, `placement` and `takeRows`; the format is shared with vt.c.
 - `VtScreen`: `resize`, `span`, cell arrays, default colours and cursor state.
@@ -167,11 +169,11 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   state, copies images, repaints rows and calls the renderer; owns font/grid settings, full-frame
   requests, clipping/scroll offset, animation and cursor timers, and dropping view images on tab
   changes or hiding the window. Handles and scroll-bar search marks remain view overlays.
-- android/vt's JNI frame and image functions: enter the native Frames section under the tab lock.
+- android/vtcore's JNI frame and image functions: enter the native Frames section under the tab lock.
 
 ### Outbound
 
-- android/vt: terminal and render-state ownership, `VtNative.frame`/`image`, the frame buffer's
+- android/vtcore: terminal and render-state ownership, `VtNative.frame`/`image`, the frame buffer's
   lifetime, cursor-style constants, PNG decoding and image storage/trimming; libjnigraphics copies
   pixels into Android bitmaps through that module's JNI.
 - android/vtview: query, selection and viewport changes are reflected in frames. Frame capture
@@ -200,11 +202,11 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   them: vt.c marks the matches itself, from the viewport's matches in screen coordinates (viewport
   ones fail for a match that starts above the viewport), and resends a row whose marks differ from
   the last frame's, since the render state does not count them as a change.
-- Capture and consume frames on the main thread. android/vt holds the tab lock during native
+- Capture and consume frames on the main thread. android/vtcore holds the tab lock during native
   capture; the direct buffer remains valid until the next frame call, so it is read after unlocking.
 - `VtView` remains the owner of full-frame requests and repaint scheduling. Changing the frame
   format or its view consumers requires checking both this map and android/vtview; search queries,
-  selection and scrolling use the same terminal state through android/vt's lock.
+  selection and scrolling use the same terminal state through android/vtcore's lock.
 
 ## Confirmed bugs / technical debt
 
@@ -220,7 +222,7 @@ as a caller as well as rendering; it does not transfer those lifecycle methods h
   each tab keeps up to 32 MiB of decoded Kitty images, and while a tab is shown the view holds a
   second copy of those placed on its screen (dropped while the window is hidden). Only the
   `RUNNING_LOW` and higher trim levels, which Android 14 and later no longer send, cut the tabs
-  not shown down to 4 MiB a screen (android/vt), deleting the oldest images outright; the routine
+  not shown down to 4 MiB a screen (android/vtcore), deleting the oldest images outright; the routine
   trim after the UI leaves keeps them all. A tab restored from its snapshot gets its images back
   (libghostty-vt's snapshot encoder writes them when built with Kitty graphics, though a comment
   in its `snapshot/terminal.zig` says otherwise); one restored from its plain transcript has text

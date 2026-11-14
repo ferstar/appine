@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: authenticate before preparing a save, with one-shot archive ownership across the document picker)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -33,7 +33,8 @@ Outside the module: when imports, switches, restarts and logins happen, and the 
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
 (`kernel/store`, `kernel/vfs`); bundling the assets (`android/native`); the shared page layouts
 (`android/terminal`), the licences (`android/licenses`) and the authentication gate (`android/privacy`);
-what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
+what the terminal does with the prompt marks (`android/vtcore`, `android/vtview`) and the Kotlin
+session consuming their state and events (`android/vt`).
 
 ## Key types
 
@@ -187,7 +188,7 @@ what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
 
 ### Prompt marks
 
-- For the terminal's shell integration (android/vt) the profile has login shells mark their
+- For the terminal's shell integration (android/vtcore) the profile has login shells mark their
   prompts with OSC 133:
   - bash: the profile sets the coloured PS1 and reads `appine.bashrc`, whose `__appine_prompt`
     function, put first in `PROMPT_COMMAND` (once, however often the file is read), prints, before
@@ -204,7 +205,7 @@ what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
     after the prompt B (the input starts); PS2 is P with `k=s` and B. ash marks no output start
     and breaks a command longer than the screen's width into rows itself, so A and P also carry
     `appine_lf=output`, the app's own option, asking the terminal to read ash's line feeds
-    (android/vt): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
+    (android/vtcore): one ash breaks a line with continues the input, any other ends it. `appine.ashrc`
     wraps whatever PS1 and PS2 are when they have no marks, and only in busybox ash: the profile
     sources it after setting its coloured PS1, and every interactive ash reads it again through
     `ENV`, a login shell after `/etc/profile` and `~/.profile`, so a PS1 that `~/.profile` sets is
@@ -225,7 +226,7 @@ what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
   Alpine, `su` without `-l`, also under bash or zsh) marks its own prompt, the distro's; one
   started through `doas -s`, which resets the environment, does not. Other nested non-login shells
   (but bash on Alpine, above; a nested bash on Debian has none) and
-  other shells get no marks from it (fish and nushell send their own, android/vt), and shells that
+  other shells get no marks from it (fish and nushell send their own, android/vtcore), and shells that
   do not read it still have `TERM`, `LANG` and `NMAP_UNPRIVILEGED` from the console's fixed login
   environment (android/vt), but show no motd.
 - ash, bash and dash parse the zsh branch too, so what only zsh understands (the hook arrays) is
@@ -432,7 +433,7 @@ what the terminal does with the prompt marks (`android/vt`, `android/vtview`).
   so a rebuild of a pinned package makes a fresh `scripts/fetch-rootfs` fail until it is pinned
   anew.
 - The marks rely on the shell redrawing its prompt on SIGWINCH (the terminal clears the prompt's
-  rows on a resize; android/vt): bash, busybox ash and zsh do.
+  rows on a resize; android/vtcore): bash, busybox ash and zsh do.
 - The rules refresh writes in `/etc/doas.d` or `/etc/sudoers.d`, not `/etc` itself, so it does not
   trigger itself; the first login's group change and `mkdir /etc/doas.d` cause one more refresh.
 - `login.sh` runs without job control, so its children share its process group: a Ctrl-C that

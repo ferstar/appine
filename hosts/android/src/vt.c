@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// The tabs' terminal emulator (android/vt map): one libghostty-vt terminal per tab, behind a
+// The tabs' terminal emulator (android/vtcore map): one libghostty-vt terminal per tab, behind a
 // small C ABI that vt.rs calls. The frame-format specification and Frames section belong to
 // android/vtrender; Input, Paste, Mouse and focus, Selection, Links, Taps on the prompt and Search
 // belong to android/vtview. This file only talks to libghostty-vt; the console, threads and locking

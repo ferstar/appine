@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 7 confirmed, 4 partial and 1 refuted, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: output written by another group than the foreground one is remembered, and the host console can read output in runs by writer, `read_console_run`)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -280,7 +280,7 @@ exit-time orphan signals (`kernel/process`); the host terminal's raw mode and si
   and the terminal's slaves are all closed, by any process; `take_output_run`, which the app
   uses: the same, but only up to where the writer changes between the foreground group and
   another, with whether another wrote it, so the app's terminal does not take a background job's
-  line feed at the shell's prompt for the shell's, android/vt), feeds input under `input_room`
+  line feed at the shell's prompt for the shell's, android/vtcore), feeds input under `input_room`
   backpressure (`feed` delivers resulting signals), resizes (`SIGWINCH` on change), asks for the
   foreground group (`fg_pgrp`: its id as the kernel sees it, untranslated, `ESRCH` with none; the
   app drops what a program reported about its progress once another group has the terminal) and

@@ -1,4 +1,4 @@
-//! The libghostty-vt terminals of the app's tabs (the android/vt map): each
+//! The libghostty-vt terminals of the app's tabs (the android/vtcore map): each
 //! `VtSession` has a terminal here, fed straight from its kernel console, so console output never
 //! crosses JNI as bytes.
 //!

@@ -1346,7 +1346,7 @@ impl Tty {
     /// One read by the host console: takes output up to where its writer changes between the
     /// foreground process group (or the line discipline's echo) and another, and says whether
     /// another wrote it, so the app's terminal can tell a background job's output at the shell's
-    /// prompt from the shell's own (the android/vt map).
+    /// prompt from the shell's own (the android/vtcore map).
     pub fn take_output_run(&mut self, max: usize) -> (Vec<u8>, bool) {
         let (run, background) = match self.background.front() {
             Some(b) if b.start <= self.taken => (b.end - self.taken, true),

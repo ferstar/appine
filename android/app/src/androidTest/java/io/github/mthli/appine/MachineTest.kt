@@ -354,7 +354,7 @@ class MachineTest {
     /**
      * The profile gives busybox ash as the login shell (root's here, as on the systems imported
      * before bash was the login shell; [newSystemsLogInWithBash] has bash's) its shell integration
-     * (the android/vt map): each prompt reports the last command's status (OSC 133 D) and starts
+     * (the android/vtcore map): each prompt reports the last command's status (OSC 133 D) and starts
      * the prompt (A, whose cursor taps move with the arrows, and which asks the terminal to read
      * ash's line feeds), the typed command starts after it (B), and continuation lines are
      * secondary prompts. The marks come from the file ENV names (the android/setup map).

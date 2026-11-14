@@ -1,16 +1,16 @@
 # android/terminal Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtview`, `android/vtrender` and `android/licenses`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
+> See `.agents/decisions/android/terminal.md` for the paired decision history (it still holds the pre-split decisions for `android/vt`, `android/vtcore`, `android/vtview`, `android/vtrender` and `android/licenses`; pre-split privacy decisions and newer license decisions remain in their original android/terminal commits until distilled).
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: split privacy authentication and license pages into android/privacy and android/licenses, retaining shared UI resources here)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
-`android/terminal` is the terminal screen around the tabs' terminals (`android/vt`, shown by
-`android/vtview` using android/vtrender):
+`android/terminal` is the terminal screen around the tabs' sessions (`android/vt`, with native
+terminals in `android/vtcore`, shown by `android/vtview` using android/vtrender):
 
 - `MainActivity`: the screen's lifecycle and status text, the tab shown and its successor, closing
   tabs, keyboard shortcuts and the volume keys switching tabs, keeping the font size and the
@@ -36,7 +36,8 @@ and android/licenses' `layout/list_item.xml` and `values/ids.xml`. Shared string
 `page.xml` and `preference_switch.xml` remain here.
 
 Outside the module: the terminal view (`android/vtview`) and rendering (`android/vtrender`);
-the tabs' sessions and consoles and the native emulator shim around libghostty-vt (`android/vt`);
+the tabs' sessions and consoles (`android/vt`) and the native emulator shim around libghostty-vt
+(`android/vtcore`);
 session ownership, saving, kill reports
 and where bells, notifications, program statuses and clipboard reads go (`android/service`); the
 notice assets and the build (`android/native`); shared authentication, secure windows and

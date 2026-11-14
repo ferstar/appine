@@ -290,7 +290,7 @@ internal object Rootfs {
      * `/etc/profile.d/appine.sh`, the assets' `profile.sh`: shows the motd, sets the terminal and
      * language environment variables, and gives bash, busybox ash and zsh a coloured prompt with
      * shell integration, the OSC 133 marks the terminal finds prompts, commands and their output by (the
-     * android/vt map). ash's marks are in `/etc/profile.d/appine.ashrc`, the assets' `ashrc.sh`,
+     * android/vtcore map). ash's marks are in `/etc/profile.d/appine.ashrc`, the assets' `ashrc.sh`,
      * which the profile names in `ENV`, so that every interactive ash reads it (a login shell after
      * `~/.profile`); bash's in `/etc/profile.d/appine.bashrc`, the assets' `bashrc.sh`, which the
      * profile reads, and on Alpine every interactive bash through `/etc/bash/appine.sh`

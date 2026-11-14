@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the split; latest change: split the frame format, rendering classes and font into android/vtrender, retaining view lifecycle and interaction here)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references distinguish Kotlin sessions in android/vt from native terminals and JNI in android/vtcore)
 
 ## Responsibilities
 
@@ -20,9 +20,9 @@ Input, Paste, Mouse and focus, Selection, Links, Taps on the prompt and Search s
 `hosts/android/src/vt.c`.
 
 Outside the module: the frame format, Frames section of vt.c, screen mirror, rendering classes
-and font (`android/vtrender`); the sessions, terminal handle and lock, JNI functions (`VtNative`,
-`vt.rs`) and the rest of vt.c (`android/vt`); the surrounding screen, search bar and opening links
-(`android/terminal`). All of `VtView`, including `onDraw`, `apply` and drawing interaction overlays,
+and font (`android/vtrender`); the sessions (`android/vt`); terminal handles and locks, JNI functions
+(`VtNative`, `vt.rs`) and the rest of vt.c (`android/vtcore`); the surrounding screen, search bar
+and opening links (`android/terminal`). All of `VtView`, including `onDraw`, `apply` and drawing interaction overlays,
 stays here; it calls android/vtrender to decode frames and paint the grid, cursor and preedit.
 
 ## Key types
@@ -342,7 +342,7 @@ stays here; it calls android/vtrender to decode frames and paint the grid, curso
 
 ### Prompt marks
 
-The view reads the shell's prompt marks (android/vt's Shell integration) to jump between prompts,
+The view reads the shell's prompt marks (android/vtcore's Shell integration) to jump between prompts,
 select a command's output and move the cursor by taps:
 
 - Jumping (`VtView.jumpToPrompt`, `VtNative.jumpPrompt`): libghostty-vt scrolls the viewport so the
@@ -367,7 +367,7 @@ select a command's output and move the cursor by taps:
   first one (found going up from the cursor, at most 64 rows) moves the cursor there: with `cl`,
   left or right arrows (in the cursor key mode's form), one for each input cell between the cursor
   and the tapped cell over the soft-wrapped rows of the cursor's line and, for a shell whose line feeds are
-  read (busybox ash, android/vt), the rows it broke the line into itself: continuation rows that
+  read (busybox ash, android/vtcore), the rows it broke the line into itself: continuation rows that
   do not start with a secondary prompt (rows after it must continue
   the prompt), a tap on the prompt going to the input's start and one past it or below to its end
   (one more arrow when the cursor is on input); unlike Ghostty, which counts both halves, a wide
@@ -393,9 +393,9 @@ select a command's output and move the cursor by taps:
   font settings, applies headers, requests full frames and draws the interaction overlays. Frame
   capture advances the search and encodes its cell marks; this module owns query changes, match
   selection and the marks along the scroll bar.
-- android/vt: the attached `VtSession` (`tab`, the terminal handle, and `resize`) and `VtNative`'s
-  functions for frames, the password state, input, scrolling, selection, output, copies,
-  links, taps on the prompt and search, which hold the tab's lock.
+- android/vt: the attached `VtSession` (`tab`, the terminal handle, and `resize`).
+- android/vtcore: `VtNative`'s functions for frames, the password state, input, scrolling,
+  selection, output, copies, links, taps on the prompt and search, which hold the tab's lock.
 - android/terminal's `MainActivity` through `Host` (`onGrid`, `onInput`, `onZoom`, the extra keys'
   `ctrl`, `alt`, `shift` and `modifiersUsed`, `onLink`, `onSearchCount`); input reaches the tab's
   writer that way.
