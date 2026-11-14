@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-14 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 15 confirmed and 3 partial, corrected below)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: copied import paths use backslash escaping instead of surrounding quotes)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: SYM replaces duplicate symbols with $, *, & and ; while retaining bracket pairs and the other symbol positions)
 
 ## Responsibilities
 
@@ -79,9 +79,9 @@ notice assets and the build (`android/native`).
   drawing its digits itself so they can roll).
 - `ExtraKeysView` — Termux's default keys widened to two rows of eight (ESC, `/`, `-`, HOME, ↑, END,
   `|`, SHIFT; TAB, CTRL, ALT, ←, ↓, →, `~`, SYM), with a second page of symbols for every key but
-  SYM (`` ` ``, `/`, `-`, `=`, `^`, `\`, `|`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `~`: the ASCII
-  symbols Gboard gives neither on its letters nor from a long press on one, with `/ - | ~` where
-  they are on the first page) and a third of function keys for every key but SHIFT and SYM (F1–F6,
+  SYM (`` ` ``, `$`, `*`, `=`, `^`, `\`, `&`, `%`; `[`, `]`, `{`, `}`, `<`, `>`, `;`: shell
+  symbols absent from the first page, with bracket pairs together and `&` above `;` in the
+  last scrolling column) and a third of function keys for every key but SHIFT and SYM (F1–F6,
   PGUP; F7–F12, PGDN): a `Page` is a grid of the first seven columns and the key above
   SYM; the grid shown is in a `HorizontalScrollView` across the view, the last column (SHIFT or `%`
   over SYM) fixed over its end. It keeps CTRL, ALT and SHIFT (one-shot or locked; `shift` reads

@@ -33,9 +33,9 @@ import kotlin.math.roundToInt
 /**
  * The keys the soft keyboard lacks: Termux's default two rows with the arrows as an inverted T,
  * widened to eight columns, with Shift and SYM in the last. Until it is tapped again, SYM puts
- * symbols in place of the keys that are not, so that page has every ASCII symbol Gboard types
- * neither directly nor from a long press on a letter. A long press on SYM puts the function keys
- * there instead, with Page Up and Down beside them as on fn's layer of a laptop and Shift kept,
+ * shell symbols in place of every other key, without duplicating the first page's symbols.
+ * A long press on SYM puts the function keys there instead, with Page Up and Down beside them
+ * as on fn's layer of a laptop and Shift kept,
  * until SYM is tapped or long-pressed again. SYM is under Shift as the symbol key of a phone
  * keyboard is and fn on a laptop, and on the edge next to the IME, where a stray tap turns the
  * whole page rather than silently shifting the IME's next letter.
@@ -44,8 +44,8 @@ import kotlin.math.roundToInt
  * ESC  /   -  HOME  ↑  END  |  │ SHIFT
  * TAB CTRL ALT  ←   ↓   →   ~  │ SYM
  *
- *  `   /   -   =   ^   \   |   │  %
- *  [   ]   {   }   <   >   ~   │ SYM
+ *  `   $   *   =   ^   \   &   │  %
+ *  [   ]   {   }   <   >   ;   │ SYM
  *
  *  F1  F2  F3  F4  F5  F6 PGUP │ SHIFT
  *  F7  F8  F9 F10 F11 F12 PGDN │ SYM
@@ -222,10 +222,9 @@ internal class ExtraKeysView(context: Context, private val target: Target) : Fra
             ),
             last = fixedView(modifier("SHIFT", shiftKey)),
         )
-        // The ASCII symbols that Gboard's letters do not give from a long press (as they give
-        // $ & ; : and the like), and -: / - | ~ where they are on the first page, ` in the corner
-        // it has on a keyboard, - = and \ | side by side as there, and ^ in place of ↑
-        page(chars("`/-=^\\|"), chars("[]{}<>~"), last = fixedView(char("%")))
+        // Keep bracket pairs together, $ and * on the left, and the shell control operators
+        // & and ; in the rightmost grid column. The other symbols retain their positions.
+        page(chars("`$*=^\\&"), chars("[]{}<>;"), last = fixedView(char("%")))
         // F1 to F12 in order, six to a row, then Page Up and Down, which fn's arrows type on a
         // laptop and have no other place; SHIFT stays for the shifted function keys (mc's
         // Shift+F4 and Shift+F6)
