@@ -1,7 +1,12 @@
 ---
 name: map-module
-description: |
-  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture map under `.agents/maps/`. Use when the user explicitly requests the map-module skill, asks to map or document a subsystem's current architecture or split an oversized map, or project instructions require targeted maintenance after implementation changes invalidate mapped facts. Do not use for ad hoc code explanation, a single-file question, or changes that leave the existing map accurate. Authorizes bounded, read-only subagent research and verification.
+description: >-
+  Create, fully refresh, incrementally maintain, or split a source-verified subsystem architecture
+  map under `.agents/maps/`. Use when the user explicitly requests the map-module skill, asks to map
+  or document a subsystem's current architecture or split an oversized map, or project instructions
+  require targeted maintenance after implementation changes invalidate mapped facts. Do not use for
+  ad hoc code explanation, a single-file question, or changes that leave the existing map accurate.
+  Authorizes bounded, read-only subagent research and verification.
 ---
 
 # Map Module
@@ -34,8 +39,8 @@ report contracts and final map template. Read `references/split.md` before split
   before opening adjacent files or related maps.
 - Expand context only to answer a named unresolved question about a boundary, contract, lifecycle
   edge, dependency, invariant, or mapped claim. Record the question before expanding.
-- If tool output is truncated, do not treat the file or result as covered; repeat with focused ranges
-  until the required content is read.
+- If tool output is truncated, do not treat the file or result as covered; repeat with focused
+  ranges until the required content is read.
 - Stop loading when the subsystem boundary and required claims have enough first-hand evidence for
   the selected mode. More context is not itself verification.
 
@@ -57,8 +62,9 @@ report contracts and final map template. Read `references/split.md` before split
 
 1. Resolve `<module-id>` and the subsystem root. Derive them from the request and repository when
    safe; ask only if different interpretations would materially change the map.
-2. Read `.agents/MODULES.md`, the paired decision file if present, and the current map if refreshing.
-   Read a related map only when an identified boundary or unresolved question crosses into it.
+2. Read `.agents/MODULES.md`, the paired decision file if present, and the current map if
+   refreshing. Read a related map only when an identified boundary or unresolved question crosses
+   into it.
 3. Confirm that the root exists at the current `HEAD`. If it is missing, inspect Git history and
    symbol moves to distinguish a deleted historical subsystem from a renamed successor. Do not map
    a historical commit or switch module ids without user confirmation.
@@ -170,9 +176,10 @@ text. For large section rewrites, anchor on unique headings and stop if the targ
 2. Check only the root `AGENTS.md` for rules telling agents to resolve affected module IDs,
    read the matching map and decision files before editing, and conditionally run a targeted map
    refresh when implementation changes invalidate mapped facts. If those rules are missing or only
-   mention decisions, do not edit the instruction file. Tell the user that the `commit-context` skill will
-   propose the canonical Knowledge Loop Conventions upgrade when the map is staged for commit. If
-   the `commit-context` skill is unavailable, warn that the map will not be consumed automatically.
+   mention decisions, do not edit the instruction file. Tell the user that the `commit-context`
+   skill will propose the canonical Knowledge Loop Conventions upgrade when the map is staged for
+   commit. If the `commit-context` skill is unavailable, warn that the map will not be consumed
+   automatically.
 3. Confirm that the final map:
    - follows the reference template;
    - contains no source `path:line` citations;
@@ -192,8 +199,8 @@ text. For large section rewrites, anchor on unique headings and stop if the targ
 ## Failure handling
 
 - If all research subagents fail, stop before writing a map and report the research blocker.
-- If one research subagent fails, recover through local inspection or extra verification coverage and disclose
-  any remaining gap.
+- If one research subagent fails, recover through local inspection or extra verification coverage
+  and disclose any remaining gap.
 - If dependency source cannot be found, record what source is missing; do not guess or mark it
   confirmed.
 - If the requested root exists only in history, stop after identifying the likely successor and
