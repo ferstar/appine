@@ -11,7 +11,7 @@
 3. [Overall architecture](#3-overall-architecture)
 4. CPU engine, moved to the [engine map](../../.agents/maps/engine.md)
 5. Memory: a lightweight user-space soft-MMU, moved to the [kernel/mm map](../../.agents/maps/kernel/mm.md)
-6. Processes, threads and scheduling, moved to the [kernel/process map](../../.agents/maps/kernel/process.md)
+6. Processes, threads and scheduling, moved to the [kernel/process](../../.agents/maps/kernel/process.md), [kernel/time](../../.agents/maps/kernel/time.md) and [kernel/boot](../../.agents/maps/kernel/boot.md) maps
 7. Signals and ABI, moved to the [kernel/signal map](../../.agents/maps/kernel/signal.md)
 8. File system, moved to the [kernel/store](../../.agents/maps/kernel/store.md), [kernel/vfs](../../.agents/maps/kernel/vfs.md), [kernel/procfs](../../.agents/maps/kernel/procfs.md) and [kernel/cgroup](../../.agents/maps/kernel/cgroup.md) maps
 9. TTY and terminal, moved to the [kernel/tty map](../../.agents/maps/kernel/tty.md); the terminal UI is in the [android/terminal](../../.agents/maps/android/terminal.md), [android/vt](../../.agents/maps/android/vt.md), [android/vtview](../../.agents/maps/android/vtview.md) and [android/vtrender](../../.agents/maps/android/vtrender.md) maps
@@ -42,7 +42,7 @@
 | C difficult runtimes | static Go binaries, node/V8, JVM | **correct behavior, speed not required** |
 | D not promised | containers, init systems, kernel modules, X11/GUI | — |
 
-Classes A–C are all met. In class D, podman and docker (namespaces in the [kernel/process map](../../.agents/maps/kernel/process.md), the [kernel/netns map](../../.agents/maps/kernel/netns.md)) and OpenRC (PID 1 in the [kernel/process map](../../.agents/maps/kernel/process.md)) actually work; systemd, kernel modules and GUI are out of scope. strace and gdb work ([kernel/signal map](../../.agents/maps/kernel/signal.md)).
+Classes A–C are all met. In class D, podman and docker (namespaces in the [kernel/process map](../../.agents/maps/kernel/process.md), the [kernel/netns map](../../.agents/maps/kernel/netns.md)) and OpenRC (PID 1 in the [kernel/boot map](../../.agents/maps/kernel/boot.md)) actually work; systemd, kernel modules and GUI are out of scope. strace and gdb work ([kernel/signal map](../../.agents/maps/kernel/signal.md)).
 
 The default distribution is Alpine; settings can switch it to Debian 13 ([android/setup map](../../.agents/maps/android/setup.md)). glibc programs (manylinux wheels, Node.js prebuilt modules, rustup, OpenJDK) run without changes to the kernel layer.
 

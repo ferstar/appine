@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/exec.md` for the paired decision history (decisions from before the split are D7, D17, D31, D41, D43, D46 and D51 in `.agents/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -24,7 +26,8 @@ Root: `core/kernel/src/loader.rs` and the execve section of `core/kernel/src/sys
 `interp_label`/`label_image`, `kill_other_threads`).
 
 Outside the module: thread groups, the wait used while other threads die, vfork completion,
-POSIX timers and the run loop that re-attaches the translator (`kernel/process`); the credential
+the run loop that re-attaches the translator (`kernel/process`), POSIX timers (`kernel/time`)
+and host spawn (`kernel/boot`); the credential
 transition and file capabilities (`kernel/cred`); entering the time namespace for children
 (`kernel/ns`); building and laying out the address space (`kernel/mm`); signal handler reset,
 forced fatal signals, the ptrace exec event and the vDSO image (`kernel/signal`); close-on-exec and
@@ -138,13 +141,14 @@ writer checks (`kernel/files`); noexec and nosuid (`kernel/mount`); FUSE program
 
 - The syscall dispatcher (`kernel/process`): execve and execveat; a successful execve returns
   before the post-syscall sweeps and `Mm::sync`.
-- `Machine::spawn` (`kernel/process`): `loader::load` for a host-started process.
+- `Machine::spawn` (`kernel/boot`): `loader::load` for a host-started process.
 - `kernel/procfs`: `/proc/<pid>/exe` and `/proc/<pid>/fd/<n>` as targets, the mapping names.
 
 ### Outbound
 
 - `kernel/process`: killing and waiting for the other threads, the tgid takeover and
-  `leader_exit`, vfork completion (`release_mm`), POSIX timers, `fast_changed`, `ExeFile`.
+  `leader_exit`, vfork completion (`release_mm`), `fast_changed`, `ExeFile`.
+- `kernel/time`: POSIX timer state cleared at execve.
 - `kernel/mm`: `Mm::new`, `share_files`, `into_shared`, `set_layout`, `mmap` and `munmap`
   (segments), `map_anonymous`, `map_vvar`, `find_free` (interpreter and vDSO placement),
   `set_brk`, `map_stack`, `set_start_stack`, `label`, `write_kernel` (segments, `.bss`).

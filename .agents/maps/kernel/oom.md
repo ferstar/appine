@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the kernel/mm full mapping of 2026-11-10 and its later maintenance; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -24,7 +24,7 @@ Root: `core/kernel/src/oom.rs`; in `mm.rs` the resident-memory measures (`reside
 `Usage`) and `Mm::release`; process_mrelease's syscall in `syscall/mem.rs`.
 
 Outside the module: VMAs, host backing and copy-on-write, which the measures read (`kernel/mm`);
-the timer thread that runs the check and the stop/resume of periodic checks (`kernel/process`);
+the timer thread that runs the check and the stop/resume of periodic checks (`kernel/time`);
 the cgroup tree, its memory files and controller (`kernel/cgroup`); the procfs files that print the
 measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kernel/process`).
 
@@ -169,8 +169,8 @@ measures (`kernel/procfs`); group exit and kill reports (`kernel/signal`, `kerne
 
 ### Inbound
 
-- The timer thread (`check`, `unmap_code_views`) and the run loop (`resume_checks`),
-  `kernel/process`.
+- `kernel/time`: the timer thread (`check`, `unmap_code_views`) and its idle handshake;
+  `kernel/process`: the run loop calling `resume_checks`.
 - `kernel/procfs`: status, statm, stat, smaps, pagemap and `oom_score`.
 - `kernel/cgroup`: the cgroup files (`measure`, `limit`, peak, `app_memory`, `Events`,
   `out_of_memory` for a lowered `memory.max`).

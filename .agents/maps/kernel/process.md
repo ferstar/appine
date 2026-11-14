@@ -1,11 +1,11 @@
 # kernel/process Map
 
 > Static understanding snapshot, not a decision history.
-> See `.agents/decisions/kernel/process.md` for the paired decision history (it still holds the decisions on execve, namespaces and futexes made before they were split out into `kernel/exec`, `kernel/ns` and `kernel/futex`).
+> See `.agents/decisions/kernel/process.md` for the paired decision history (it still holds the decisions on execve, namespaces, futexes, time and boot made before they were split out into `kernel/exec`, `kernel/ns`, `kernel/futex`, `kernel/time` and `kernel/boot`).
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 10 confirmed and 8 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: clocks and timers split into kernel/time, and machine boot and PID 1 into kernel/boot)
 
 ## Responsibilities
 
@@ -17,25 +17,29 @@
   dispatcher's hooks, the no-BKL fast path, and the watchdog that reports holds of it lasting too
   long;
 - the unified wait and wake-up mechanism;
-- the timer thread (interval and POSIX timers, CPU-time limits, periodic checks);
-- the built-in virtual init (PID 1) and inittab boot/shutdown, and the host-facing `Machine`;
+- the host-facing process statistics, signals and wait helpers on `Machine`;
 - scheduling parameters applied to host threads;
 - kernel-layer bugs: a panic or host fault ends only the guest process that hit it, with a kill
   report for the app, and test hooks plant such bugs;
-- the other process-wide calls in `syscall/misc.rs` (clocks and CPU times, resource use and
-  limits, host and domain names, reboot, sysinfo, getcpu, getrandom).
+- the other process-wide calls in `syscall/misc.rs` (CPU accounting, resource use and
+  limits, host and domain names, sysinfo, getcpu, getrandom).
 
-Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`, the
-`wake` module), `cell.rs`, `syscall/proc.rs` (except its execve and unshare sections),
-`syscall/fast.rs`, `machine.rs` (timer thread, boot/shutdown, host-facing calls), `watchdog.rs`,
-`itimer.rs`, `syscall/posix_timer.rs`, `loadavg.rs`, `inittab.rs`, `syscall/sched.rs`, `bug.rs`, the
-dispatcher in `syscall/mod.rs` (its restart and unimplemented-syscall handling are
-`kernel/signal`'s), and `syscall/misc.rs` except the handlers `kernel/signal` lists there (uname,
-syslog, adjtimex, clock setting, restart_syscall), the futex and robust-list handlers and the
-time-namespace offsets. Of the rest of `syscall/misc.rs`, membarrier is described in `kernel/mmu`,
-umask in `kernel/vfs`, and the capability and seccomp prctls in `kernel/cred`.
+Root: `core/kernel/src/task.rs`, `process.rs`, `kernel.rs` (`Kernel`, `Shared`, `Bkl`, `Cx`,
+the `wake` module, except `kernel/boot`'s `INIT` and `kernel/time`'s
+`Shared::stop_checks`/`resume_checks`), `cell.rs`,
+`syscall/proc.rs` (except its execve and unshare sections), `syscall/fast.rs` (except the futex
+call), `machine.rs` except the lifecycle types and functions listed by `kernel/boot` and
+`kernel/time`'s `timers`, `watchdog.rs`, `syscall/sched.rs`, `bug.rs`, and the dispatcher in
+`syscall/mod.rs` (except `kernel/signal`'s restart and unimplemented-syscall handling and
+`kernel/time`'s `read_timespec`, `timespec`, `KTIME_MAX`). In `syscall/misc.rs`, the remaining
+process-wide calls exclude `kernel/time`'s clocks, sleeps and interval timers, `kernel/boot`'s
+`reboot`, and what `kernel/signal`, `kernel/futex` and `kernel/ns` list there. Of the rest,
+membarrier is described in `kernel/mmu`, umask in `kernel/vfs`, and capability and seccomp
+prctls in `kernel/cred`.
 
-Outside the module: execve and the ELF loader (`kernel/exec`), namespaces, unshare, setns and ID
+Outside the module: clocks, sleeps, timers and periodic checks (`kernel/time`); machine
+startup, host spawn, inittab, PID 1 power requests and teardown (`kernel/boot`); execve and the
+ELF loader (`kernel/exec`), namespaces, unshare, setns and ID
 translation (`kernel/ns`), futexes and robust lists (`kernel/futex`), address spaces and fork
 copy-on-write (`kernel/mm`), CPU state and translation (`engine`), signals and ptrace, credentials,
 mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`kernel/cgroup`), procfs files
@@ -96,23 +100,12 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 - `fast::Fast` — a thread's fast-path record (epoch, tracing, resolved root and cwd, tid, CPU-clock
   base, address-space id and its shared writable mappings, vDSO address, time-namespace offsets).
 
-### Timers and init
-
-- `itimer::ITimer` (`ITIMER_REAL`, a monotonic instant), `CpuTimer`, `PosixTimer`;
-  `itimer::Expiry` — a wall-clock deadline on Linux's hrtimer base: `Mono(Instant)` (monotonic,
-  absolute times converted; relative realtime; relative times of other clocks but boottime and
-  TAI) or `On(host clock, time)` (absolute realtime, boottime and TAI either way; the `_ALARM`
-  clocks as realtime and boottime), compared with that clock whenever looked at; the global
-  wall-clock jump count (`clock_epoch`, shared by every kernel in the host process);
-  `loadavg::LoadAvg`; `inittab::Entry`, `Power`.
-
 ## Public entry points
 
 - **Syscalls**: `clone` (220), `clone3`, `exit`, `exit_group`, `set_tid_address`, `wait4`, `waitid`,
-  `nanosleep`/`clock_nanosleep`, `setitimer`/`getitimer`, `timer_*`, `getpriority`/`setpriority`,
+  `getpriority`/`setpriority`,
   `ioprio_*`, `sched_*`, `setsid`/`setpgid`/`getpgid`/`getsid`, `pidfd_open`, `pidfd_getfd`, `kcmp`,
-  `prctl` (`PR_SET/GET_PDEATHSIG`, `PR_SET/GET_CHILD_SUBREAPER`), `kill` to pid 1 (power requests),
-  `clock_gettime`/`clock_getres`/ `gettimeofday`, `times`, `getrusage`, `prlimit`, `reboot`,
+  `prctl` (`PR_SET/GET_PDEATHSIG`, `PR_SET/GET_CHILD_SUBREAPER`), `times`, `getrusage`, `prlimit`,
   `personality`, `sethostname`/ `setdomainname`, `getcpu`, `sysinfo`, `getrandom`, and the test
   syscall 0xa991 (debug and `test-hooks` builds).
 - **Kernel bugs**: `bug::catch`, `host_call`, `kill`/`kill_process`, `record_kill` (also the OOM
@@ -121,12 +114,10 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 - **Kernel-internal**: `task::start`, `thread_main` → `run` → `exit`, `process::finish_group`,
   `Shared::lock`, `block`/`block_for`, `Cx::wait*`, `Cx::unlocked`, `request_wake*`,
   `signal_later`/`flush_signals`, `Shared::fast_changed`, `kernel::doing`/`done`.
-- **Host-facing** (`Machine`): `start` (creates PID 1, the timer thread and the BKL watchdog; a
-  panic is an internal error), `stall` (the latest too-long hold; takes no BKL), `spawn`, `boot`,
-  `shutdown`, `kill_all`, `take_power`, `processes`, `cpu_time_ns`, `wait`/`try_wait`/`wait_or_power`, `signal`
-  (a host signal to a guest process, `SI_KERNEL`); `run` (`appine-run`), which with
-  `RunOptions::stop` passes the first stop signal the host got on to the program and ends every
-  process at one arriving at least a second later, then finishes as usual.
+- **Host-facing** (`Machine`): `stall` (the latest too-long hold; takes no BKL), `processes`,
+  `cpu_time_ns`, `wait`/`try_wait`/`wait_or_power`, `signal` (a host signal to a guest process,
+  `SI_KERNEL`). Machine start, host spawn, boot, shutdown, power requests and `run` are
+  `kernel/boot`'s lifecycle; its blocking calls use these wait helpers.
 - **procfs**: `threads-max`, `/proc/<pid>/task/<tid>/children`.
 
 ## Data flow / lifecycle
@@ -384,10 +375,8 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 - `block_for`: register the waiter (unless its interest is empty), release the BKL, poll, re-take
   the BKL, clear the event, deregister. Host `EINTR` counts as a wake. Callers re-check their
   condition, deadline and interruption.
-- Timeouts and timer values read from the guest (every `timespec` reader, `itimerval`) saturate at
-  `KTIME_MAX` (about 292 years) as Linux's `timespec64_to_ktime` does, so GNU `sleep infinity`
-  waits until interrupted and timers report the saturated time left; a socket timeout of
-  `KTIME_MAX` or more means none.
+- Guest time validation and saturation at `KTIME_MAX` are `kernel/time`'s shared contract;
+  waits here consume its `Expiry` deadlines.
 - Wake requests made under the BKL are recorded per thread (several kernel instances may share the
   host process) as channels and objects; requests made without the BKL go to a global fallback.
   At BKL release, a waiter fires if its interest shares a channel with the request, or if objects
@@ -409,51 +398,6 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   thread's ptrace stop (t) and group stop (T) take precedence.
 - Pipes wake like Linux: a write wakes readers only if the pipe was empty; a read wakes writers only
   when enough space for the writer's request appears or `PIPE_BUF` is crossed.
-
-### Timer thread
-
-- One host thread ("timers") loops, holding the BKL while it works, each step but the clock check
-  contained (interval timers per process): if its host `ClockWatch` reports a wall-clock jump, run `clock_jumped` (bump the jump count, signal
-  every task's event: BKL waiters, futex waiters and no-BKL sleepers alike look at their deadlines
-  again); expire interval timers, POSIX timers and CPU-time limits; run the OOM check (only with a
-  memory limit or a cgroup `memory.max`), compare watched cgroup files, the translator code-view
-  release, load-average sampling, deferred store commits, `O_ASYNC` and `EPOLLEXCLUSIVE` checks,
-  AIO polls that signal eventfds (`kernel/aio`), DNS stub answers (`kernel/net`) and raw ICMP taps;
-  then wait (BKL released) until the earliest deadline (timerfds of those AIO polls and of
-  exclusive gates included), its event or the host fds of those checks and the clock watch. It
-  listens on `OTHER` (or all channels while `O_ASYNC` files, exclusive gates or such AIO polls
-  exist). A panic in a step turns that feature off for the kernel's life (the memory limit, `O_ASYNC`
-  signals, exclusive gates, AIO polls), or kills only the process whose timers it was handling.
-- Setting a timer writes the deadline into the thread group and signals the timer thread's event.
-  POSIX timers on wall clocks keep an `Expiry`, so absolute realtime and boottime timers fire by
-  their own clock; the watch's fd is in the timer thread's poll.
-- `ITIMER_REAL` is a monotonic instant (wall-clock jumps leave it); `ITIMER_VIRTUAL`/`PROF` and
-  process CPU-time timers use total host thread CPU time and wake a running thread. Armed CPU
-  timers whose clock still advances or a finite `RLIMIT_CPU` make it tick every 10 ms. Over the
-  soft `RLIMIT_CPU` (whole seconds) sends `SIGXCPU` and raises the soft limit by 1 s; over the hard
-  limit `SIGKILL`.
-- POSIX timers: the `_ALARM` clocks need `CAP_WAKE_ALARM`, CPU-clock ids of other threads and
-  processes are accepted, at most 4096 per process with the lowest free id; without a `sigevent`
-  the signal is `SIGALRM` with the id as value; a `SIGEV_THREAD_ID` target must be in the process.
-  A CPU clock id (`clock_getcpuclockid`, `pthread_getcpuclockid`) names its pid as the caller's
-  pid namespace numbers it, for clock_gettime, clock_getres and clock_nanosleep too.
-- A CPU-clock timer keeps to the thread or process it was made for (number and serial, as Linux's
-  timer holds a `struct pid`), never one that takes the number over. Once that thread has left
-  the task table (an exited main thread included) or that process is reaped, the timer is gone:
-  it never fires and is disarmed, timer_gettime reads all zeros (the interval too) and
-  timer_settime is `ESRCH`, while timer_delete still works. A process whose threads have all
-  exited and that is not reaped yet still reads its stopped clock and can be set, but its timers
-  neither fire nor keep the timer thread ticking.
-  A timer whose previous signal is still pending counts an overrun instead (`timer_getoverrun`
-  reports the count when the last signal was dequeued). A `SIGEV_THREAD_ID` timer signals its
-  thread only while that thread lives in the process; after it exits the signal is dropped, as on
-  Linux.
-- When every thread is waiting, the periodic checks (OOM, code views, load average) stop until a
-  thread next enters guest code; armed timers still wake it. Stopping sets `checks_idle` and then
-  looks at the threads again (`Shared::stop_checks`), while a waking thread clears its `sleeping`
-  flag before reading `checks_idle` (`resume_checks`), all SeqCst, so a thread waking in between
-  either wakes the timer thread or is seen running. Changing `RLIMIT_CPU` does not wake the timer
-  thread; the new limit takes effect at its next pass.
 
 ### BKL watchdog
 
@@ -479,31 +423,6 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   look, so they are right to within one look. Nothing is ended.
 - `Machine::stall` returns the latest `Stall` without the BKL; the watchdog is stopped and joined
   last in `Machine`'s drop.
-
-### PID 1
-
-- The virtual init is a thread group with no threads and no guest program. Host-started processes
-  (each terminal tab's login shell) are its children; it adopts orphans and its children are never
-  zombies. `Machine::spawn` registers such a process (in the group table, init's children and the
-  watched table) only once its host thread has started; when its task or thread cannot be
-  created, it gives the console it attached back (`kernel/tty`) and leaves nothing registered.
-- On request (the app always; `appine-run --init`) it boots from a subset of `/etc/inittab` (a
-  store file; anything else is an empty table): `sysinit` (waited), then `boot` and `bootwait`
-  together in file order (only `bootwait` waited), then `wait` (waited) and `once` (not waited) for
-  the default runlevel (`initdefault`, else 2). Commands run through `/bin/sh -c` with stdin from
-  `/dev/null` and output appended to `/var/log/boot.log` (the first command that runs truncates
-  it, and the log is emptied when none ran; `/dev/null` if `/var/log` is missing); entries whose
-  absolute program path does not exist are skipped; `respawn` and `askfirst` never run; a shutdown
-  stops a boot in progress.
-- Shutdown: after a boot, run `shutdown` entries and `wait`/`once` entries that list the requested
-  runlevel (0 for halt and poweroff, 6 for reboot) in order, all within one caller-supplied
-  deadline (30 s from the hosts; entries not started by then are skipped); then, always, SIGTERM
-  everything, wait up to 1 s, and kill the rest. The Android host always requests poweroff.
-- From the start of boot, `kill(1, SIGTERM|SIGUSR1|SIGUSR2)` by a sender allowed to signal root is
-  a reboot, halt or poweroff request handed to the host (`Machine::take_power`; only the first is
-  kept until taken); senders not allowed get `EPERM`; other signals to pid 1 are ignored.
-  `pidfd_send_signal` to it checks permission and delivers nothing, broadcasts skip it and
-  `rt_sigqueueinfo` to it is `ESRCH`.
 
 ### Scheduling and TLS
 
@@ -552,11 +471,12 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 
 ### Inbound
 
-- Syscall dispatch (`syscall/mod.rs`), `Machine` and the hosts (CLI, Android JNI: boot, shutdown,
-  power, spawn, stall), signals and ptrace (group exit, delivery, exit hooks), procfs, every
+- Syscall dispatch (`syscall/mod.rs`), `kernel/boot` (machine lifecycle and host spawn),
+  `kernel/time` (timer thread, waits and CPU accounting), and the hosts (CLI, Android JNI: stats,
+  waits, stall), signals and ptrace (group exit, delivery, exit hooks), procfs, every
   blocking syscall (via the wait API), `kernel/mmu` (kicks through `TaskSync`, `quiesce`),
   `kernel/mount` (`fast_changed`), `kernel/exec` (killing the other threads, the tgid takeover,
-  vfork completion, POSIX timers), `kernel/ns` (thread groups, ptrace access for setns), the
+  vfork completion), `kernel/ns` (thread groups, ptrace access for setns), the
   terminal bridge (`block_for`).
 
 ### Outbound
@@ -565,16 +485,18 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   `guest_hwcap`, the spare CPU list.
 - `kernel/mm`: `fork`, `translate`, `defer_unmaps`/`release_unmapped`/`spare::refill`;
   `kernel/mmu`: `quiesce`, users, `Mm::sync`, generations and code spaces in the run loop.
-- `kernel/exec` (execve, `loader::load` for `Machine::spawn`), `kernel/ns` (namespaces at clone,
+- `kernel/exec` (execve), `kernel/ns` (namespaces at clone,
   pid translation at dispatch and wait), `kernel/futex` (the futex syscalls and their fast path,
   robust lists and PI owners at exit).
 - vfs (resolution, store, the metadata cache's `Cached`), `kernel/mount` (mount flags),
   `kernel/fuse` (serving retries, prefault, sweeps, the exit flush), credentials, `kernel/cgroup`
   (charging, freezer, `notify_changes`), SysV IPC (`kernel/ipc`), AIO (`kernel/aio`), the OOM
-  killer (`kernel/oom`), loadavg, the store's deferred commits, signals (`send_to_group`,
-  `send_cpu_timer`, `force_fatal`), the kernel log.
+  killer (`kernel/oom`), signals (`send_to_group`, `force_fatal`), the kernel log.
+- `kernel/time`: clocks, sleep and timer handlers, deadline helpers and the periodic-check
+  idle handshake; `kernel/boot`: virtual init as the fallback reaper, with general process
+  exit and adoption still implemented here.
 - `appine_hal`: `poll`, `Event`, thread CPU clocks and system time, host thread
-  nice/affinity/ioprio, host thread activity (watchdog reports), host CPUs, `ClockWatch`, random
+  nice/affinity/ioprio, host thread activity (watchdog reports), host CPUs, random
   bytes; `std::thread`, `std::sync::Mutex`.
 
 ## Invariants and gotchas
@@ -594,9 +516,9 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 - `Hold` is written on every BKL acquisition: anything added to it must stay on its cache line and
   cost a plain store, or every syscall pays. A thread that takes the BKL outside an entry after
   running guest code (the run loop's translator re-attach) is attributed to its previous entry.
-- A finite soft `RLIMIT_CPU` alone keeps the timer thread ticking every 10 ms even while idle.
-- A deadline is `Instant::now()` plus a guest duration, which panics on overflow: new readers of
-  guest times must saturate through the shared `timespec` helper in `syscall/mod.rs`.
+- New readers of guest times must use `kernel/time`'s shared `timespec` helper in
+  `syscall/mod.rs`, so guest durations cannot overflow host instants. The run loop must call
+  `Shared::resume_checks` before guest execution to honor the periodic-check idle handshake.
 - A syscall handler may run several times for one syscall (FUSE retries): whatever it does before
   a walk that can fail with `FUSE_RETRY` is done again, so handlers change nothing before their
   last walk (`kernel/exec`'s execve changes no process state before killing the other threads).
@@ -612,9 +534,6 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
 
 ## Confirmed bugs / technical debt
 
-- **An exited main thread's CPU clock is gone at once:** clock_gettime on it is `EINVAL`, and a
-  timer on it reads zeros and cannot be set (`ESRCH`), while the other threads run on; Linux keeps
-  the zombie leader's clock, stopped, until the process is reaped.
 - **`sched_setattr` changes the policy before the nice check**, so a refused nice value can leave
   the policy (and reset-on-fork) changed.
 - **Latent hazards:** matching wake-ups during BKL release runs outside `bug::catch` before the guard
@@ -628,12 +547,11 @@ mount trees (`kernel/mount`), network namespaces (`kernel/netns`), cgroups (`ker
   handler)?
 - Is counting `RLIMIT_NPROC` by kernel uid across user namespaces, and never consulting
   `RLIMIT_RTPRIO`, intended?
-- Is it intended that Android always shuts down as poweroff (runlevel 6 entries never run)?
 
 ## To verify
 
 - The Linux 6.1 comparisons above that rest on kernel behaviour rather than repository source
-  (`eligible_child`, `do_notify_parent` and `copy_process` exit signals, `send_sigqueue` for dead
-  threads, `zap_pid_ns_processes`, the keep and uclamp flags of `sched_setattr`, `INIT_RLIMITS`)
+  (`eligible_child`, `do_notify_parent` and `copy_process` exit signals,
+  `zap_pid_ns_processes`, the keep and uclamp flags of `sched_setattr`, `INIT_RLIMITS`)
   were checked from knowledge of the kernel, not against its source; the items found by Starnix's
   syscall tests were also observed on a native 6.8 kernel.

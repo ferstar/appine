@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 6 research concerns; 18 claims checked by 3 independent verifiers — 13 confirmed and 5 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -33,7 +33,7 @@ Root:
 Outside the module (dependencies only): the page table, TLB, entry population, shootdowns and code
 groups (`kernel/mmu`); resident-memory measures, the OOM killer and process_mrelease (`kernel/oom`);
 the CPU engine and the Tier 1 translator (`engine`), SysV IPC objects (`kernel/ipc`), futexes
-(`kernel/futex`), the ELF loader (`kernel/exec`), the timer thread (`kernel/process`), procfs
+(`kernel/futex`), the ELF loader (`kernel/exec`), the timer thread (`kernel/time`), procfs
 (`kernel/procfs`) and the cgroup files (`kernel/cgroup`), core dumps and the vDSO image (`kernel/signal`), FUSE reads
 (`kernel/fuse`) and the host abstraction layer (`core/hal`).
 

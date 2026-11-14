@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 3 research concerns; 12 claims checked by 2 independent verifiers — 11 confirmed and 1 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: cgroup and device BPF references follow the split into kernel/cgroup)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -21,12 +21,12 @@
 Root: `core/kernel/src/syscall/poll.rs` and `syscall/timerfd.rs` (the `EventFd` and `TimerFd` state
 lives in `fd.rs`, a `kernel/files` file).
 
-Outside the module: the wait mechanism, wake objects, the BKL and the timer thread
-(`kernel/process`); per-kind readiness of sockets (`kernel/net`, `kernel/netlink`, `kernel/unix`),
+Outside the module: the wait mechanism, wake objects and the BKL (`kernel/process`);
+the timer thread (`kernel/time`); per-kind readiness of sockets (`kernel/net`, `kernel/netlink`, `kernel/unix`),
 terminals (`kernel/tty`), pipes (`kernel/pipe`), inotify (`kernel/inotify`), signalfd
 (`kernel/signal`), message queues (`kernel/ipc`) and seccomp notify (`kernel/cred`); fcntl and ioctl
 entry points and the read paths (`kernel/files`); clock bases, `Expiry` and the wall-clock jump
-count (`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
+count (`itimer`, `kernel/time`); signal delivery (`kernel/signal`).
 
 ## Key types
 
@@ -103,7 +103,7 @@ count (`itimer`, `kernel/process`); signal delivery (`kernel/signal`).
 ### ppoll and pselect6
 
 - ppoll: `nfds` above the soft `RLIMIT_NOFILE` `EINVAL`; timespec validated (`EINVAL`) and, as
-  in every timed wait here, saturated at `KTIME_MAX` (the `kernel/process` map); each fd
+  in every timed wait here, saturated at `KTIME_MAX` (the `kernel/time` map); each fd
   looked up once (closed → `POLLNVAL`, negative → ignored); revents written back and counted,
   also when the wait is interrupted (zeros, before the error is returned, as `do_sys_poll`).
 - pselect6: `nfds` negative `EINVAL`, otherwise clamped to Linux's fd table size computed from

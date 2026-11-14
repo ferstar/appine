@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: file-import store and lifecycle regression coverage)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -28,7 +28,8 @@ the other Gradle files, `android/app/src/main/AndroidManifest.xml`, `android/app
 `android/app/src/androidTest/`, `android/licenses/`, `android/app/src/main/assets/notices/`, `scripts/release-sources`,
 `scripts/fetch-ghostty`.
 
-Outside the module: the `Machine` API and the store functions (`kernel/process`, `kernel/store`);
+Outside the module: the `Machine` lifecycle (`kernel/boot`), process API (`kernel/process`)
+and store functions (`kernel/store`);
 what the app does with them (the other `android/*` modules), including the libghostty-vt
 terminal's emulator shim, its JNI functions and sessions (`android/vt`), its view
 (`android/vtview`) and rendering (`android/vtrender`).

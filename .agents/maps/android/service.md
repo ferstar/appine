@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: isolate pending save archives from share-cache pruning and clean abandoned saves at startup)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -33,7 +33,7 @@ Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `No
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
 and its tab bar (`android/terminal`); the view (`android/vtview`) and rendering (`android/vtrender`);
 sessions' internals and the console adapter (`android/vt`); the Files app provider
-(`android/documents`); JNI and the kernel API (`android/native`, `kernel/process`).
+(`android/documents`); JNI and the kernel API (`android/native`, `kernel/boot`, `kernel/process`).
 
 ## Key types
 

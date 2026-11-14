@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/futex.md` for the paired decision history (decisions from before the split are D26, D44 and the futex halves of D32, D33 and D37 in `.agents/decisions/kernel/process.md`).
 >
 > Verified: 2026-11-11 (split out of the kernel/process full mapping of 2026-11-10; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -108,8 +110,8 @@ copy-on-write (`kernel/mm`); counting unimplemented commands (`kernel/signal`).
 
 ### Outbound
 
-- `kernel/process`: `Shared`'s futex lock and queue, wait events, restart blocks, `Expiry`
-  deadlines, the task table for PI owners.
+- `kernel/process`: `Shared`'s futex lock and queue, wait events, restart blocks and the task
+  table for PI owners; `kernel/time`: `Expiry` deadlines and clock-jump handling.
 - `kernel/mm`: `futex_key`, `translate`, `cow_break`; `kernel/mmu`: `fault_in`.
 - `kernel/ns`: owner tids as their pid namespace sees them; `kernel/signal`: counting
   unimplemented commands (`stub`).

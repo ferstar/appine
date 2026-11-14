@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 4 research concerns; 15 claims checked by 3 independent verifiers — 12 confirmed and 3 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: difftest's -R retry of failed cases, used by full.yml, and the gtest runner's dump of a hung test's threads)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -30,7 +30,7 @@ Root: `hosts/cli/`, `tests/guest/`, `tests/bench/`, `tests/diff/`, `tests/survey
 `scripts/build-gvisor-tests`, `scripts/survey`, `.github/workflows/`.
 
 Outside the module: the instruction-level lockstep tests (`engine`); unit tests inside each crate;
-the kernel's `run`, boot and console bridge (`kernel/process`, `kernel/tty`); the kernel's bug
+the kernel's `run`, boot and console bridge (`kernel/boot`, `kernel/tty`); the kernel's bug
 reports and test hooks (`bug.rs`, `kernel/process`); Android instrumentation tests
 (`android/native`); rootfs downloads (`android/setup`).
 

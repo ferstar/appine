@@ -1,4 +1,5 @@
-//! The guest kernel as the host sees it (the kernel/process map, the android/service map).
+//! The guest kernel as the host sees it (the kernel/boot, kernel/process and kernel/time maps,
+//! and android/service).
 //!
 //! A [`Machine`] holds one kernel instance: it can start several processes one after another
 //! ([`Machine::spawn`]), and each process can have its own console (an in-process PTY whose master

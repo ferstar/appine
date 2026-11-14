@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-03 (full mapping: 4 research concerns; 16 claims checked by 2 independent verifiers — 13 confirmed and 3 partial, all corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-11 (targeted verification only since the full mapping; latest change: delivery forgets the syscall it follows, for `/proc/<pid>/syscall`)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -117,7 +117,7 @@ credentials), procfs.
   a live process does the same for every process-directed signal pending.
 - Permissions: `may_signal` (same user or `CAP_KILL`) against the target thread's credentials
   for tkill/tgkill and the main thread's for a process; `kill` handles `-1` (all except init and
-  self), `0` and negative process groups; pid 1 is handled by `kernel/process` (power requests).
+  self), `0` and negative process groups; virtual pid 1 follows `kernel/boot`'s power-request policy.
 
 ### Delivery
 

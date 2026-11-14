@@ -1,6 +1,7 @@
 //! Miscellaneous syscalls: futex, time, resource limits and so on (the kernel/process map; uname,
 //! syslog, adjtimex, clock setting and restart_syscall: the kernel/signal map; futexes and robust
-//! lists: the kernel/futex map; time-namespace offsets: the kernel/ns map).
+//! lists: the kernel/futex map; clocks, sleeps and interval timers: the kernel/time map;
+//! reboot: the kernel/boot map; time-namespace offsets: the kernel/ns map).
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

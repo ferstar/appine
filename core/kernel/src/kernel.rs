@@ -51,7 +51,7 @@ use crate::vfs::{Node, Vfs};
 /// Thread ID; the thread group ID (pid) is the tid of the group's first thread.
 pub(crate) type Tid = i32;
 
-/// The kernel layer's built-in init (the kernel/process map): it only adopts orphans and reaps
+/// The kernel layer's built-in init (the kernel/boot map): it only adopts orphans and reaps
 /// zombies.
 pub(crate) const INIT: Tid = 1;
 

@@ -1,4 +1,4 @@
-//! The built-in init runs a subset of `/etc/inittab` (the kernel/process map): `sysinit`, `boot`,
+//! The built-in init runs a subset of `/etc/inittab` (the kernel/boot map): `sysinit`, `boot`,
 //! `bootwait`, `wait` and `once` at boot, and at shutdown `shutdown` (busybox format) and the
 //! `wait` and `once` entries of runlevels 0 and 6 (sysvinit format). Alpine's inittab runs OpenRC
 //! through these steps, and Debian's sysvinit-core runs `/etc/init.d/rc`. There is no terminal, so

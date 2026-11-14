@@ -4,6 +4,8 @@
 > See `.agents/decisions/kernel/cgroup.md` for the paired decision history (not yet created; decisions from before the split are D4–D6, D9, D24, D26, D37, D41 and the cgroup parts of D1–D3, D13, D25, D31 and D38 in `.agents/decisions/kernel/procfs.md`; they stay in the parent's snapshot).
 >
 > Verified: 2026-11-14 (split out of the kernel/procfs full mapping of 2026-11-11; the boundary was checked against the source at the split)
+>
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: references follow the kernel/time and kernel/boot split from kernel/process)
 
 ## Responsibilities
 
@@ -170,7 +172,8 @@ primitives, the OOM killer and victim selection (`kernel/oom`); poll and inotify
 - `kernel/vfs`: cgroup mkdir/rmdir and device checks at mknod; `kernel/files`: device checks at
   opens (including devpts), file-change observation and write notifications.
 - `kernel/process`: clone/clone3 placement, pids charge, inherited freezer state, change checks
-  after BKL syscalls, at thread exit and on the timer thread; `kernel/signal`: freezer stops.
+  after BKL syscalls and at thread exit; `kernel/time`: change checks on the timer thread;
+  `kernel/signal`: freezer stops.
 - `kernel/ns`: cgroup-namespace roots; `kernel/mount`: the cgroup2 mount's root node.
 - `kernel/oom`: limits, membership-based memory measurement, OOM-group policy and events.
 - `kernel/inotify`: watched files and directories, `observe`/`observe_all` and keys.

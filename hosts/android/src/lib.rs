@@ -694,7 +694,7 @@ pub extern "system" fn Java_io_github_mthli_appine_Native_start<'l>(
     })
 }
 
-/// Boots by `/etc/inittab` (the kernel/process map): blocks until the sysinit and wait commands
+/// Boots by `/etc/inittab` (the kernel/boot map): blocks until the sysinit and wait commands
 /// have all finished.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_mthli_appine_Native_boot<'l>(
