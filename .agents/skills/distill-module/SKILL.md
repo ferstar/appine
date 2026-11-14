@@ -187,7 +187,7 @@ After writing:
 2. Summarize what changed and repeat any accepted warnings.
 3. Tell the user to review the file and commit it when ready, optionally with `$commit-context`,
    whose own Decision block is then tagged with the module being distilled.
-4. If the root `AGENTS.md` or `AGENTS.override.md` does not direct Codex to read relevant module
+4. If the root `AGENTS.md` or `AGENTS.override.md` does not direct agents to read relevant module
    maps and decisions, mention that `$commit-context` will propose the canonical knowledge-loop
    rules when the snapshot is staged for commit. Do not edit instruction files from this skill.
 

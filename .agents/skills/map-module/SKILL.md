@@ -168,7 +168,7 @@ section rewrites, anchor on unique headings and fail on ambiguous matches.
 
 1. If the module is new, add it to the matching section of `.agents/MODULES.md` only after the map
    is verified. Keep the registry near its documented size and describe the verified boundary.
-2. Check whether the root `AGENTS.md` or `AGENTS.override.md` tells Codex to resolve affected module IDs,
+2. Check whether the root `AGENTS.md` or `AGENTS.override.md` tells agents to resolve affected module IDs,
    read the matching map and decision files before editing, and conditionally run a targeted map
    refresh when implementation changes invalidate mapped facts. If those rules are missing or only
    mention decisions, do not edit the instruction file. Tell the user that `$commit-context` will

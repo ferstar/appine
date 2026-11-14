@@ -20,8 +20,8 @@ explorers only when a child needs its own full mapping.
 ## Size target
 
 Aim for maps that each fit in one file-read output with about 20–25% room for growth. Use the
-active tool's output budget, not the model's context window; Codex has no fixed budget shared by
-all file-reading tools and configurations. If the budget is unknown, choose a practical size
+active tool's output budget, not the model's context window; output budgets vary across
+file-reading tools and configurations. If the budget is unknown, choose a practical size
 target from the current reading workflow and report that assumption.
 
 Measure bytes with `wc -c`. Bytes / 2.3 is a rough token estimate for identifier-heavy maps, not an
