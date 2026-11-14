@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (full mapping: 5 research concerns; 18 claims checked by 3 independent verifiers — 11 confirmed and 7 partial, corrected below; no bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: MainActivity delegates layout and IME animation to TerminalLayout and link opening to TerminalLinks)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: acknowledge guest browser requests only when the terminal is focused and Android accepts its Custom Tab intent)
 
 ## Responsibilities
 
@@ -324,12 +324,15 @@ notice assets and the build (`android/native`).
 
 ### Links and the clipboard question
 
+- `onOpenUrl` receives a validated guest web URL from the service's kernel-wide browser bridge.
+  With window focus it calls `TerminalLinks.openBrowser`; otherwise it returns false. Its Boolean
+  acknowledges Android accepting the intent; the guest receives a failure when it is refused.
 - The view reports a link to open (`Host.onLink`: a tap or Ctrl+click on one, or the menu's Open
   link; which links count and which schemes open are android/vtview's). The activity delegates to
   `TerminalLinks.open`, which opens HTTP and HTTPS links with AndroidX Custom Tabs, without binding
   a browser package or session, and other
   non-file schemes (such as mail) with plain `ACTION_VIEW`; both carry `CATEGORY_BROWSABLE`.
-  `startViewer` passes the Custom Tabs launch options and shows a toast if no app handles the link.
+  `startViewer` passes the Custom Tabs launch options and returns false with a toast if no app handles the link.
   A `file:` link (`ls --hyperlink`) is looked up off
   the main thread through the Files app's provider (`Documents.fileLink`) and opened as its
   document, typed by it and with read access granted: a directory in the Files app, a file in the
@@ -513,13 +516,15 @@ none
 
 ## To verify
 
+- Guest launcher → Chrome CustomTabActivity → Back, plus background refusal with exit 1, were
+  checked on API 34; a complete Codex OAuth login and its callback remain unverified.
 - The offline license reader's renderer-exit fallback, pinch zoom, very large system fonts and
   tablet layouts remain untried. API 34 emulator checks cover offline rendering, no horizontal
   overflow, scroll restoration on recreation, list navigation and light/dark Material colours.
 - Everything here was tried only on emulators (a Pixel 4a API 34, and the outer display of a Pixel
   10 Pro Fold API 37 for the cutout and the IME), with Gboard in English and input from adb; not on
   real phones, tablets or foldables. Unverified beyond that:
-  - terminal Custom Tabs navigation and return, App Links, browsers without Custom Tabs and missing
+  - App Links, browsers without Custom Tabs and missing
     handlers; links with other mail apps, viewers and file managers, and `mailto` at all;
   - the cutout insets and the keys following the IME with other IMEs;
   - the tab bar's 32 dp tabs and buttons (below the 48 dp touch target) under real fingers, and the

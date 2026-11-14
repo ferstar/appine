@@ -63,6 +63,13 @@
     "file": "zig.html"
   },
   {
+    "id": "musl",
+    "name": "musl (guest browser launcher)",
+    "version": "Zig 0.17.0 bundle",
+    "license": "MIT",
+    "file": "musl.html"
+  },
+  {
     "id": "jetbrains-mono",
     "name": "JetBrains Mono",
     "version": "2.304",

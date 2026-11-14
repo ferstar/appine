@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 14 claims checked by 2 independent verifiers — 9 confirmed and 5 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-13 (targeted verification only since the full mapping; latest change: the notification shows the selected screen-off policy without the instantaneous wake-lock state)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: own an authenticated browser endpoint per kernel and acknowledge launches through the focused terminal)
 
 ## Responsibilities
 
@@ -28,7 +28,7 @@ outlives an Activity:
   kept in `Settings`.
 
 Root: `android/app/src/main/java/io/github/mthli/appine/TerminalService.kt`, `Notifications.kt`,
-`Settings.kt`, `Tabs.kt`.
+`Settings.kt`, `Tabs.kt`, `BrowserBridge.kt`.
 
 Outside the module: rootfs import, downloads, mirrors and `login.sh` (`android/setup`); the screen
 and its tab bar (`android/terminal`); rendering (`android/vtview`); sessions' internals and the
@@ -43,7 +43,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
   `onMachineReady(error)`, `onSessionsChanged`, `onBell` (the tab in front), `onClipboardRead`
   (a program in the tab in front, the current one, asks to read the clipboard), `onTabStatus` (a
   tab's progress or program status changed), `onSettingsChanged`,
-  `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
+  `onOpenUrl` (guest browser request; true acknowledges Android accepted it), `onNotice`, `onRestarting`, `onExitAll` (sessions redraw their view themselves). Activities
   register in `onServiceConnected` and leave in `onStop`; "UI visible" means at least one listener
   (Settings included).
 - `worker` — a single-thread executor (`appine-worker`) for the calls that take a kernel handle
@@ -118,7 +118,7 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 - `start` clears `startError`, sets `starting` (the wake lock follows) and runs on an
   `appine-start` thread: import when a distro is given (`Rootfs.prepare`, with progress to the
   notification and listeners, then an `appine-mirrors` thread choosing a mirror once, android/setup),
-  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `updateProfile`, then
+  `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`, `updateProfile`, then
   `Native.start(store, tier)` under `Rootfs.access`'s write lock (`tier` is the saved setting in
   all builds, defaulting to 1).
 - Back on the main thread it clears `starting`; if "exit all" came meanwhile it finishes the exit
@@ -266,6 +266,18 @@ provider (`android/documents`); JNI and the kernel API (`android/native`, `kerne
 
 ### What programs ask of the app
 
+- `BrowserBridge` owns a random-port IPv4 loopback listener and per-kernel UUID capability.
+  Start creates it before `ensureBrowser` writes the guest configuration; failed/abandoned starts,
+  detach and service destruction close it. Closed endpoints cannot dispatch queued UI work.
+  Initial-netns guest AF_INET reaches Android loopback; isolated netns remap it and cannot reach
+  this endpoint. Guest AF_UNIX stays emulated (kernel/netns, kernel/unix).
+- Its single daemon worker reads two UTF-8 lines (token, URL), bounded to 64/8192 bytes and a
+  2 s total read deadline. Only authenticated HTTP(S) URLs with a host and no controls or spaces
+  reach the main thread. The callback has a 2 s wait; expired queued work is cancelled.
+  `onOpenUrl` succeeds only with a live kernel and a listener accepting it; MainActivity requires
+  window focus and reports Android intent acceptance. The reply is `OK` or an ASCII `ERROR`.
+  This is kernel-wide, with no originating-tab identity: any guest process may ask while the
+  terminal is focused, including detached multiplexers. Background-app requests fail, not queue.
 - A bell in the tab in front (`inFront`: it is `current` and `MainActivity` is a listener, so not
   another tab and not Settings in front) goes to the listeners' `onBell`; elsewhere it becomes the
   tab's notification, at most once a second per tab and alerting only once. An OSC 9 or OSC 777

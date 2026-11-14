@@ -76,6 +76,7 @@ internal class ConsolePty(
             "SHELL=/bin/sh",
             "USER=root",
             "LOGNAME=root",
+            "BROWSER=/usr/local/bin/xdg-open",
             // Run as root, nmap does scans that need raw sockets by default, which the app cannot
             // create (like root without CAP_NET_RAW), so nmap just exits; with this set it uses
             // connect scans instead

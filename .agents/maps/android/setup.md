@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-12 (full mapping: 3 research concerns; 10 claims checked by 3 independent verifiers — 6 confirmed and 4 partial, corrected below; bugs recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: new Alpine imports stage bubblewrap and libcap for offline installation at first login)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: refresh the browser client and per-kernel connection information on both distributions)
 
 ## Responsibilities
 
@@ -27,7 +27,7 @@
 Root: `android/app/src/main/java/io/github/mthli/appine/Rootfs.kt`, `SettingsActivity.kt`,
 `android/app/src/main/assets/login.sh`, `android/app/src/main/assets/profile.sh`,
 `android/app/src/main/assets/ashrc.sh`, `android/app/src/main/assets/bashrc.sh`,
-`scripts/fetch-rootfs`.
+`android/app/src/main/assets/xdg-open.sh`, `scripts/fetch-rootfs`.
 
 Outside the module: when imports, switches, restarts and logins happen, and the `settings`
 preferences (`android/service`); the import and `write_file`/`read_file` implementations
@@ -80,7 +80,7 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 - `Rootfs.prepare(distro)` (with an optional store, used by the instrumentation tests), `download`,
   `fetch`, `isReady`, `installed`, `importing`, `store`, `reset`, `access`.
-- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`,
+- Before every start: `ensureNetworkConfig`, `ensureContainersConfig`, `ensureLoginTools`, `ensureBrowser`,
   `updateProfile`; around boot: `PREFER_OSCLOCK`, `failedServices`.
 - Mirrors: `chooseMirror`, `useMirror`.
 - Accounts: `loginAccount`, `regularAccounts`, `dirsChanged` (with `REFRESH_RULES`).
@@ -157,6 +157,13 @@ the licences (`android/terminal`); what the terminal does with the prompt marks 
 
 ### Before every start and boot
 
+- `ensureBrowser` installs `xdg-open.sh` as `/usr/local/bin/xdg-open` (0755) on either distro.
+  It preserves custom launchers, replacing only the known previous Appine OSC helper by SHA-256.
+  Before every kernel start it refreshes the static `/usr/local/libexec/appine-open-url` (0755)
+  and `/etc/appine/browser` (0644: current loopback port and capability, shared by guest users).
+  The shim execs that client; `ConsolePty` sets `BROWSER` to the shim (android/vt).
+  Each invocation rereads the configuration and sends one HTTP(S) URL without using a TTY or
+  inherited tab token; success acknowledges Android intent acceptance, not page loading or login.
 - On the start thread, after an import and the start of its mirror probe when there is one, in
   this order, before the kernel starts under the write lock: a loopback-only `/etc/network/interfaces` when absent;
   `/etc/containers/containers.rootless.conf.d/appine.conf` setting `netns = "host"` when absent

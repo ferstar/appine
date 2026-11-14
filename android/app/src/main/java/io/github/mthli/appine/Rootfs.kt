@@ -7,6 +7,7 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import androidx.core.content.edit
+import io.github.mthli.appine.Rootfs.BASH_HOOK
 import io.github.mthli.appine.Rootfs.RESUMES
 import io.github.mthli.appine.Rootfs.UNMARKED_PROFILE
 import io.github.mthli.appine.Rootfs.configure
@@ -474,6 +475,20 @@ if [ -r /etc/profile.d/appine.bashrc ]; then . /etc/profile.d/appine.bashrc; fi
 [containers]
 netns = "host"
 """
+
+    /** Refreshes the bridge before kernel start, preserving user-provided local launchers. */
+    @Throws(IOException::class)
+    fun ensureBrowser(context: Context, configuration: String, store: String = store(context).path) {
+        val binary = context.assets.open("appine-open-url").use { it.readBytes() }
+        Native.writeFile(store, "/usr/local/libexec/appine-open-url", binary, 493 /* 0755 */, true)
+        Native.writeFile(store, BrowserBridge.CONFIG_PATH, configuration.toByteArray(), 420 /* 0644 */, true)
+        val path = "/usr/local/bin/xdg-open"
+        val old = try { Native.readFile(store, path) } catch (_: IOException) { null }
+        // Replace the previous Appine OSC helper, but leave a user's own launcher alone.
+        val replace = old != null && hex(MessageDigest.getInstance("SHA-256").digest(old)) ==
+            "abaf8d811e48df794b931f2fd5876e255c2c430464081e0d9fe880b80a3a1d76"
+        Native.writeFile(store, path, asset(context, "xdg-open.sh").toByteArray(), 493 /* 0755 */, replace)
+    }
 
     /**
      * On Alpine, puts the doas package bundled with the app into the store

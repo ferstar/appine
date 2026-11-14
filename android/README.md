@@ -26,7 +26,8 @@ Requirements: the Android SDK with NDK 29.0.14206865, JDK 17 or later,
 `rustup target add aarch64-linux-android`, `cargo install cargo-ndk`, Zig 0.17.0 on `PATH`
 (or in `ZIG`), the rootfs tarball (`scripts/fetch-rootfs`) and the libghostty-vt source release
 with its Zig packages (`scripts/fetch-ghostty`), both run from the repository root. The Zig
-build then runs offline.
+build then runs offline. Zig also builds the static Linux browser launcher from
+`hosts/android/open-url.c`; its musl libc notice is included in the APK.
 
 ```sh
 ./gradlew installDebug                 # build and install on a connected arm64 device
@@ -36,8 +37,8 @@ build then runs offline.
 The native library is always built in release mode: the interpreter is too slow in a
 debug build. Only `arm64-v8a` is built. Run the instrumentation tests on both a 4K-page
 and a 16K-page system image. `downloadedDistributionsRun` downloads Debian
-(about 50 MB) and is skipped unless
-`-Pandroid.testInstrumentationRunnerArguments.network=true` is given. An emulator started
+(about 50 MB) and the browser bridge test installs tmux/screen in a separate temporary store. Both require
+`-Pandroid.testInstrumentationRunnerArguments.network=true`. An emulator started
 with `-http-proxy` sends connections to 127.0.0.1 to the proxy too, which breaks
 `downloadsResumeWhereTheyBrokeOff`. Setting the system proxy instead
 (`adb shell settings put global http_proxy 10.0.2.2:<port>`) only affects the app's own

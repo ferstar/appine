@@ -223,6 +223,8 @@ class MainActivity : Activity(), TerminalService.Listener {
     /** The program in the tab shown rang the bell (the service sends only those). */
     override fun onBell() = layout.screen.bell()
 
+    override fun onOpenUrl(url: String): Boolean = hasWindowFocus() && links.openBrowser(url)
+
     /**
      * A program in the tab shown asks to read the clipboard (OSC 52): the user is asked, with what
      * it holds shown, as Ghostty's clipboard-read = ask does; nothing to read (an empty clipboard,

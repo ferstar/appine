@@ -106,6 +106,9 @@ class TerminalService : Service() {
          */
         fun onClipboardRead() {}
 
+        /** A guest requests a browser; true means Android accepted the launch. */
+        fun onOpenUrl(url: String): Boolean = false
+
         /** A tab's progress or program status changed ([VtSession.progress], [VtSession.status]). */
         fun onTabStatus() {}
 
@@ -222,6 +225,9 @@ class TerminalService : Service() {
 
     /** Shutting down to exit ([exitAll]). */
     private var exiting = false
+
+    /** The browser endpoint for the current kernel, independent of terminal sessions. */
+    private var browserBridge: BrowserBridge? = null
 
     /**
      * [onDestroy] has run: a thread that outlives the service (a download) must not
@@ -544,6 +550,7 @@ class TerminalService : Service() {
         if (distro != null) preparing(getString(R.string.preparing, distro.label))
         val tier = tier
         thread(name = "appine-start") {
+            var bridge: BrowserBridge? = null
             val result = runCatching {
                 if (distro != null) {
                     Rootfs.prepare(this, distro, progress = { done, total ->
@@ -555,21 +562,36 @@ class TerminalService : Service() {
                 Rootfs.ensureNetworkConfig(this)
                 Rootfs.ensureContainersConfig(this)
                 Rootfs.ensureLoginTools(this)
+                val browser = BrowserBridge { url ->
+                    machine != 0L && !destroyed && listeners.any { it.onOpenUrl(url) }
+                }
+                bridge = browser
+                Rootfs.ensureBrowser(this, browser.configuration)
                 Rootfs.updateProfile(this)
                 // The kernel must be the only user of the store when it opens it (a separate
                 // opening by the DocumentsProvider does not count, see Rootfs.access)
                 Rootfs.access.write { Native.start(Rootfs.store(this).path, tier) }
             }
+            if (result.isFailure) bridge?.close()
             main.post {
                 starting = false
+                if (destroyed) {
+                    bridge?.close()
+                    result.onSuccess { m -> thread(name = "appine-stop") { Native.shutdown(m) } }
+                    return@post
+                }
                 if (exiting) {
                     // "Exit all" while starting: stop the kernel that has just come up (not booted
                     // yet, so without the inittab shutdown) and finish exiting
                     progress = null
+                    bridge?.close()
                     finishExit(result.getOrDefault(0L), booted = false)
                     return@post
                 }
-                result.onSuccess(::started).onFailure { startFailed(distro, it) }
+                result.onSuccess { m ->
+                    browserBridge = bridge
+                    started(m)
+                }.onFailure { startFailed(distro, it) }
             }
         }
     }
@@ -1207,6 +1229,8 @@ class TerminalService : Service() {
      * kernel still there when the sessions end, the Activity would think the last tab was closed.
      */
     private fun detach(): Long {
+        browserBridge?.close()
+        browserBridge = null
         val m = machine
         if (watchingNetwork) {
             getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(network)
@@ -1234,6 +1258,8 @@ class TerminalService : Service() {
 
     override fun onDestroy() {
         destroyed = true
+        browserBridge?.close()
+        browserBridge = null
         // A download still under way has nothing left to replace
         switching?.cancelled = true
         switching = null

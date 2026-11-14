@@ -25,14 +25,19 @@ internal class TerminalLinks(
         } else if (link.scheme.equals("http", ignoreCase = true) ||
             link.scheme.equals("https", ignoreCase = true)
         ) {
-            val tab = CustomTabsIntent.Builder().build()
-            startViewer(
-                tab.intent.setData(link).addCategory(Intent.CATEGORY_BROWSABLE),
-                tab.startAnimationBundle,
-            )
+            openBrowser(uri)
         } else {
             startViewer(Intent(Intent.ACTION_VIEW, link).addCategory(Intent.CATEGORY_BROWSABLE))
         }
+    }
+
+    /** Reports whether Android accepted the browser intent, for the guest launcher's reply. */
+    fun openBrowser(url: String): Boolean {
+        val tab = CustomTabsIntent.Builder().build()
+        return startViewer(
+            tab.intent.setData(url.toUri()).addCategory(Intent.CATEGORY_BROWSABLE),
+            tab.startAnimationBundle,
+        )
     }
 
     /**
@@ -57,11 +62,13 @@ internal class TerminalLinks(
         }
     }
 
-    private fun startViewer(intent: Intent, options: Bundle? = null) {
-        try {
+    private fun startViewer(intent: Intent, options: Bundle? = null): Boolean {
+        return try {
             activity.startActivity(intent, options)
+            true
         } catch (e: ActivityNotFoundException) {
             showToast(activity.getString(R.string.link_no_app), false)
+            false
         }
     }
 }

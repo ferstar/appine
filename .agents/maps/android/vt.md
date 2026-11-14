@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-13 (targeted verification only since the split; latest change: bash is the login shell of new Alpine systems, and a nested bash there marks its prompts too)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: expose the guest browser launcher through the shell environment)
 
 ## Responsibilities
 
@@ -411,6 +411,9 @@ clipboard writes and clipboard reads go (`android/service`); the host console in
   says as much.
 
 ## Invariants and gotchas
+
+- `ConsolePty.ENVIRONMENT` sets `BROWSER=/usr/local/bin/xdg-open`; browser requests use the
+  service's independent endpoint, with no VT escape sequence or per-tab capability.
 
 - A kill report opens its room with line feeds before moving back up, so the cursor's line moves
   down with the cursor; this needs the parser at ground, which the CAN ensures. A program that died

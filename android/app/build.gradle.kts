@@ -136,6 +136,12 @@ val rootfsAsset = tasks.register<RootfsAssetTask>("rootfsAsset") {
     outputDir.set(layout.buildDirectory.dir("generated/rootfs/assets"))
 }
 
+val browserAsset = tasks.register<BrowserAssetTask>("browserAsset") {
+    source.set(repoRoot.file("hosts/android/open-url.c"))
+    zig.set(providers.environmentVariable("ZIG").orElse("zig"))
+    outputDir.set(layout.buildDirectory.dir("generated/browser/assets"))
+}
+
 androidComponents {
     onVariants { variant ->
         val suffix = variant.name.replaceFirstChar(Char::uppercase)
@@ -147,6 +153,37 @@ androidComponents {
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, CargoNdkTask::outputDir)
         variant.sources.assets?.addGeneratedSourceDirectory(rootfsAsset, RootfsAssetTask::outputDir)
+        variant.sources.assets?.addGeneratedSourceDirectory(browserAsset, BrowserAssetTask::outputDir)
+    }
+}
+
+/** A static Linux launcher: no guest curl, netcat, shell extensions or libc installation needed. */
+abstract class BrowserAssetTask : DefaultTask() {
+    @get:InputFile
+    abstract val source: RegularFileProperty
+
+    @get:Input
+    abstract val zig: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val exec: ExecOperations
+
+    init {
+        // Zig's compilation cache also tracks the compiler and its bundled musl sources.
+        outputs.upToDateWhen { false }
+    }
+
+    @TaskAction
+    fun build() {
+        val out = outputDir.get().asFile.apply { mkdirs() }
+        exec.exec {
+            commandLine(zig.get(), "cc", "-target", "aarch64-linux-musl", "-static", "-O2", "-s",
+                "-std=c11", "-Wall", "-Wextra", "-Werror", source.get().asFile.path,
+                "-o", File(out, "appine-open-url").path)
+        }
     }
 }
 

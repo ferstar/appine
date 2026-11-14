@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: bundle bubblewrap and libcap2 with static notices and offline installation and sandbox coverage)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: package a static Linux browser client with bounded IPC and cover multiplexer-independent launching)
 
 ## Responsibilities
 
@@ -243,8 +243,24 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
   mirror (the branch's directory, then `edge`); any miss or mismatch stops the script. APKBUILDs
   are never executed.
 
+### Guest browser client
+
+- `BrowserAssetTask` builds `hosts/android/open-url.c` with Zig as static aarch64-linux-musl,
+  packaging `appine-open-url` as a generated asset for either distro; no guest package is needed.
+  The bundled musl copyright is in `android/licenses/` and the offline notices.
+- The client rereads `/etc/appine/browser`, connects to IPv4 loopback, sends token and URL lines
+  and waits up to 5 s total for an `OK` reply. Invalid arguments/configuration, connection failures,
+  refusal or a missing reply print an error and exit 1; URLs and tokens are never logged.
+  Only HTTP(S) URLs up to 8192 bytes are accepted; the service performs strict UTF-8/URI checks.
+  A timeout means no acknowledgment: it cannot prove no launch occurred or cancel buffered TCP requests.
+
 ### Tests
 
+- `BrowserTest` imports separate temporary stores and checks custom launcher preservation,
+  launching without a TTY or stdio, root and `su` users, endpoint replacement with a surviving
+  shell, authentication and URL validation, refusal/timeout, queued UI cancellation, and Custom Tab intents.
+  Its `network=true` test installs tmux/screen and checks reattach on another console and nesting.
+  It does not perform a real OAuth login.
 - `RunPolicyTest` uses a separate preference file for legacy migration and remembered toggle
   targets, and checks idle expiry, activity, failed samples and delayed delivery with a fake clock.
   `MachineTest.guestCpuTimeTracksRunningAndExitedThreads` checks both tiers, exited and pooled
@@ -274,7 +290,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
   not run the tests (they need KVM). Nothing here covers `Native.bklStall` (the stall itself is
-  tested in `hosts/cli`), the libghostty-vt terminal or the revocation of grants end to end.
+  tested in `hosts/cli`), broader terminal behavior beyond browser requests or the revocation of grants end to end.
 
 ## Dependencies (inbound / outbound)
 
@@ -350,6 +366,8 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - Is the release variant meant to ship as configured?
 
 ## To verify
+
+- The static browser launcher on Debian and a 16 KB-page device; current bridge tests use Alpine on API 34.
 
 - That NDK 29's default really gives 16 KB-aligned `LOAD` segments in `libappine.so` and that the
   test suite passes on a 16 KB-page image today; ART's local-reference limit on API 30 and later.
