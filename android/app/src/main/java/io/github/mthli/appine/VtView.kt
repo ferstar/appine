@@ -31,7 +31,9 @@ import android.view.inputmethod.CursorAnchorInfo
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
+import android.view.inputmethod.TextAttribute
 import android.widget.OverScroller
+import androidx.annotation.RequiresApi
 import androidx.core.graphics.withTranslation
 import androidx.core.net.toUri
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -988,8 +990,8 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
     /**
      * Committed text goes to the program at once; composing text is only shown at the cursor
      * until committed. The editable is kept empty otherwise, so Backspace with nothing composed
-     * arrives as deleteSurroundingText and becomes DEL. A commit of several lines (the IME's
-     * clipboard) is a paste.
+     * arrives as deleteSurroundingText and becomes DEL. Line breaks and escape sequences use
+     * paste safety checks, including replacements and finished compositions from IME clipboards.
      */
     private inner class Connection : BaseInputConnection(this, true) {
         override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
@@ -998,10 +1000,19 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             val s = text.toString()
             when {
                 s == "\n" -> press(KeyEvent.KEYCODE_ENTER)
-                s.length > 1 && (s.contains('\n') || s.contains('\r')) -> paste(s)
+                s.any { it == '\n' || it == '\r' || it == '\u001b' } -> paste(s)
                 else -> type(s)
             }
             return true
+        }
+
+        @RequiresApi(34)
+        override fun replaceText(
+            start: Int, end: Int, text: CharSequence, newCursorPosition: Int, textAttribute: TextAttribute?,
+        ): Boolean {
+            // The editable holds only preedit, not terminal text that the IME can replace.
+            // BaseInputConnection would leave this text buffered until finishComposingText.
+            return commitText(text, newCursorPosition)
         }
 
         override fun setComposingText(text: CharSequence, newCursorPosition: Int): Boolean {
@@ -1013,10 +1024,17 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
         override fun finishComposingText(): Boolean {
             val text = editable?.toString().orEmpty()
             super.finishComposingText()
-            editable?.clear()
-            setPreedit("")
-            if (text.isNotEmpty()) type(text)
-            return true
+            return commitText(text, 1)
+        }
+
+        override fun performContextMenuAction(id: Int): Boolean {
+            return when (id) {
+                android.R.id.paste, android.R.id.pasteAsPlainText -> {
+                    pasteClipboard()
+                    true
+                }
+                else -> super.performContextMenuAction(id)
+            }
         }
 
         override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
@@ -1097,14 +1115,20 @@ internal class VtView(context: Context, private val host: Host) : View(context) 
             return
         }
         val preview = if (text.length > PASTE_PREVIEW) text.take(PASTE_PREVIEW) + "…" else text
-        MaterialAlertDialogBuilder(context)
+        val dialog = MaterialAlertDialogBuilder(context)
             .setTitle(R.string.paste_unsafe_title)
             .setMessage(context.getString(R.string.paste_unsafe, preview))
-            .setPositiveButton(android.R.string.paste) { _, _ ->
+            .setPositiveButton(R.string.paste_as_is) { _, _ ->
                 if (tab != 0L) input(VtNative.paste(tab, text, true))
             }
             .setNegativeButton(android.R.string.cancel, null)
-            .showPrivate()
+        val trimmed = text.trimEnd('\r', '\n')
+        if (trimmed.isNotEmpty() && trimmed.length < text.length &&
+            VtNative.paste(tab, trimmed, false)?.isNotEmpty() == true
+        ) {
+            dialog.setNeutralButton(R.string.paste_without_trailing_newlines) { _, _ -> paste(trimmed) }
+        }
+        dialog.showPrivate()
     }
 
     // ---- Selection ----

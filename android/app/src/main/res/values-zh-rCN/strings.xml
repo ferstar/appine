@@ -176,6 +176,8 @@
         <item quantity="other">%d 个服务没有起来</item>
     </plurals>
     <string name="paste_unsafe_title">要粘贴可能会执行命令的文本吗？</string>
+    <string name="paste_as_is">原样粘贴</string>
+    <string name="paste_without_trailing_newlines">去掉末尾换行</string>
     <string name="paste_unsafe">程序会把每个换行当作回车，粘贴后这些行可能会立刻作为命令执行：\n\n%1$s</string>
     <string name="clipboard_read_title">要让程序读取剪贴板吗？</string>
     <string name="clipboard_read">此标签页中的程序请求读取剪贴板中的内容：\n\n%1$s</string>

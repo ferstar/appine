@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-11 (split out of the android/terminal full mapping of the same day: 5 research concerns, 18 claims checked by 3 independent verifiers; the boundary was checked against the source at the split)
 >
-> Maintained: 2026-11-14 (targeted verification only since the split; latest change: privacy gates copy/paste and secures paste-preview dialogs)
+> Maintained: 2026-11-14 (targeted verification only since the split; latest change: unsafe-paste dialogs offer an optional trailing-newline removal action through the Material 3 neutral button)
 
 ## Responsibilities
 
@@ -209,8 +209,12 @@ opening links (`android/terminal`).
   motion included) first scrolls the viewport back to the bottom (the grid on a whole row) and,
   but for scrolling's own wheel events and arrow keys, stops a fling or settling, then goes through
   the host to the tab's `vt-writer` thread (`Native.write`).
-- IME: committed text is sent at once (`\n` as `\r`, a lone `\n` as Enter, several lines as a
-  paste, which covers the IME's clipboard); finishing a composition types it; the editor action is
+- IME: committed text is sent at once (a lone `\n` as Enter; other text containing LF, CR or ESC
+  through paste encoding and its safety check). Android 14's `replaceText` and finishing a
+  composition use the same commit path and clear the editable before delivery or confirmation,
+  so later `finishComposingText` calls cannot replay it. Replacement offsets address only the
+  local preedit; already-sent terminal input cannot be replaced. IME context-menu Paste and
+  Paste as plain text use the same clipboard path as the view's menu. The editor action is
   Enter; composing text is only drawn at the cursor; the editable is kept empty so Backspace with
   nothing composed arrives as `deleteSurroundingText` and becomes as many DELs (text after the
   cursor is ignored). `requestCursorUpdates` is answered with the cursor and composing text's
@@ -227,7 +231,11 @@ opening links (`android/terminal`).
 - Paste (`VtNative.paste`, through `ghostty_terminal_paste`): bracketed with mode 2004, else line
   breaks become carriage returns; unsafe control bytes become spaces. Text that could run commands
   (line breaks without bracketed paste, or the bracketed terminator) is refused, and the view asks
-  in a dialog with a preview (300 characters) before pasting it anyway.
+  in a Material 3 dialog with a preview (300 characters), Paste as is and Cancel. A neutral
+  Drop trailing newlines action appears only when removing the final run of CR/LF leaves
+  nonempty text that the paste encoder accepts; it preserves all other whitespace. Checking
+  eligibility encodes without sending input; choosing the action rechecks privacy and encodes
+  against the current terminal modes rather than sending the earlier result.
 - Copy, clipboard reads and paste entry points refuse access while `Privacy.locked`; paste previews use `showPrivate` so their separate windows follow `FLAG_SECURE`. The activity also guards the final input sink against queued IME/paste callbacks after locking.
 - Focus: window focus changes are sent as focus events when the program asked (mode 1004); showing
   another tab sends none.
@@ -504,6 +512,10 @@ select a command's output and move the cursor by taps:
 
 ## Invariants and gotchas
 
+- `BaseInputConnection.replaceText` (Android 14+) edits its buffer without calling the view's
+  `commitText`; inheriting it silently buffers IME clipboard text. A later finish can then send
+  that text unexpectedly. All committed IME entry points must use the same paste safety checks;
+  `performContextMenuAction` also needs an override because the base implementation does nothing.
 - libghostty-vt's mouse encoder deduplicates motion only when asked (off by default) and forgets
   its last cell whenever `set_from_terminal` or the size option is set, which `appine_vt_mouse`
   does for every event; so vt.c keeps the last cell itself, updated only when an event was encoded.
@@ -621,6 +633,14 @@ select a command's output and move the cursor by taps:
 
 ## To verify
 
+- `TerminalInputTest` exercises the real connection, paste encoder and confirmation dialogs on
+  API 34: immediate replacement, no replay on finish, confirmation/cancellation, IME menu paste,
+  bracketed paste/terminator checks, ordinary Chinese composition/Enter, and trailing-newline
+  removal (whitespace preservation, unsafe/empty remainders and mode changes). Actual Gboard taps
+  on the recommendation strip and clipboard history still need end-to-end verification.
+- The three-action paste dialog was visually checked in English and Simplified Chinese on
+  API 34 with the terminal's dark Material 3 theme; long English labels use the standard stacked
+  button layout. Vendor fonts and larger accessibility font scales remain unverified.
 - Tried only on a Pixel 4a API 34 emulator (4 KB pages, Gboard in English, input from adb,
   `sendevent` and a `uinput` virtual mouse) and through vt.c's harnesses on a macOS build, where
   the search and frame times come from; not on real or 16 KB-page devices or Android 11–13.

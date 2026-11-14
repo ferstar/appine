@@ -182,6 +182,8 @@
         <item quantity="other">%d services did not start</item>
     </plurals>
     <string name="paste_unsafe_title">Paste text that may run commands?</string>
+    <string name="paste_as_is">Paste as is</string>
+    <string name="paste_without_trailing_newlines">Drop trailing newlines</string>
     <string name="paste_unsafe">The program will see each line break as Enter, so the lines may run as commands as soon as they are pasted:\n\n%1$s</string>
     <string name="clipboard_read_title">Let the program read the clipboard?</string>
     <string name="clipboard_read">A program in this tab asks for what the clipboard holds:\n\n%1$s</string>

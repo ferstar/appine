@@ -5,7 +5,7 @@
 >
 > Verified: 2026-11-10 (full mapping: 3 research concerns; 16 claims checked by 2 independent verifiers — 14 confirmed and 2 partial, corrected below; bugs and debts recorded)
 >
-> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: privacy lifecycle regression distinguishes pause-only visibility from stop-and-return locking)
+> Maintained: 2026-11-14 (targeted verification only since the full mapping; latest change: terminal input tests cover optional trailing-newline removal and can capture its Material 3 dialog)
 
 ## Responsibilities
 
@@ -257,6 +257,13 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 
 ### Tests
 
+- `TerminalInputTest` uses an isolated store and native terminal, a shell-free session and a
+  capturing view host to exercise IME replacement/commit/composition and clipboard menu callbacks.
+  It checks confirmation and cancellation, no delayed replay, bracketed paste and its terminator,
+  ordinary Chinese composition/Enter, and trailing-newline removal without trimming other
+  whitespace (including unsafe/empty remainders and changed terminal modes) on API 34. The
+  `screenshots=true` runner argument saves `cache/paste-preview.png` for visual inspection of
+  the terminal-themed dialog; the tests do not drive Gboard's UI.
 - `PrivacyTest` covers default-off/mutually exclusive file access, cold and recreated locked pages, pause-only visibility versus stop-and-return locking, secure dialog flags, non-exported action targets, service/broadcast/activity routing and locked-report clipboard denial without an authentication bypass. `MachineTest.documentsShowTheHomeDirectory` also checks every provider denial with privacy on and a stale true file-access preference.
 - `BrowserTest` imports separate temporary stores and checks custom launcher preservation,
   launching without a TTY or stdio, root and `su` users, endpoint replacement with a surviving
@@ -294,7 +301,7 @@ terminal's emulator shim, its JNI functions and sessions (`android/vt`) and its 
 - The hooks need the debug variant (`test-hooks`) and `APPINE_TEST_HOOKS=1`, which the tests set
   and never unset. The KDoc and README ask for runs on 4 KB and 16 KB-page arm64 emulators; CI does
   not run the tests (they need KVM). Nothing here covers `Native.bklStall` (the stall itself is
-  tested in `hosts/cli`), broader terminal behavior beyond browser requests or persisted grants end to end.
+  tested in `hosts/cli`), terminal gestures/rendering, real IME UI or persisted grants end to end.
 
 ## Dependencies (inbound / outbound)
 
