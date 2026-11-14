@@ -2,6 +2,3 @@ interface:
   display_name: "Commit Context"
   short_description: "Create commits from conversation context"
   default_prompt: "Use $commit-context to commit the current changes with relevant conversation context."
-
-policy:
-  allow_implicit_invocation: false

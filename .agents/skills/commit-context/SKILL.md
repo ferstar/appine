@@ -1,6 +1,6 @@
 ---
 name: commit-context
-description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use only when the user explicitly requests the commit-context skill by name. Do not select it from a generic request to create a commit.
+description: Create a Git commit that records the staged diff, relevant current-conversation context, and optional structured module decisions. Use when the user asks to commit changes.
 ---
 
 # Commit Context
@@ -159,7 +159,7 @@ Apply these section rules:
 ## Commit safely
 
 1. Show the complete proposed message before committing.
-2. Treat an explicit request to execute this skill as authorization to create the commit after any required staging or registry questions are resolved. Mentioning, reviewing, or editing the skill does not authorize a commit. Do not ask for a redundant final confirmation unless the proposed commit boundary changed materially.
+2. Treat a user request to create a commit or execute this skill as authorization to create the commit after any required staging or registry questions are resolved. Implicit skill selection alone does not authorize a commit. Mentioning, reviewing, or editing the skill does not authorize a commit. Do not ask for a redundant final confirmation unless the proposed commit boundary changed materially.
 3. Create a unique temporary directory with `mktemp -d`, write the message to a file inside it using an available file-editing tool, and pass that explicit file to `git commit -F`.
 4. Remove only that temporary directory after the commit attempt.
 5. Run:
